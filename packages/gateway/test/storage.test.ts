@@ -7,6 +7,84 @@ import type { CozyAppTree } from "cozygateway-contract";
 
 import { cozyAppPhysicalId, openStorage } from "../src/storage.ts";
 
+describe("setup code kinds (capability 52)", () => {
+  it("migrates a database written before the kind column and reads its codes as device codes", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-setup-code-kind-"));
+    const path = join(directory, "gateway.sqlite");
+    // A database exactly as a pre-52 gateway left it: the table without the column.
+    const legacy = new DatabaseSync(path);
+    legacy.exec("CREATE TABLE setup_codes (code TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, used_at INTEGER) STRICT");
+    legacy.prepare("INSERT INTO setup_codes (code, expires_at) VALUES (?, ?)").run("OLD1-CODE", Date.now() + 60_000);
+    legacy.close();
+
+    const storage = openStorage(path);
+    const now = Date.now();
+    // A row with no kind is a device code, which is what every code minted before 52 was.
+    expect(storage.consumeSetupCode("OLD1-CODE", now, "runner")).toBe("invalid");
+    expect(storage.consumeSetupCode("OLD1-CODE", now)).toBe("ok");
+    storage.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("keeps a runner code and a device code from being spent as each other", () => {
+    const storage = openStorage(":memory:");
+    const now = Date.now();
+    storage.createSetupCode("RUNR-CODE", now + 60_000, "runner");
+    expect(storage.consumeSetupCode("RUNR-CODE", now)).toBe("invalid");
+    expect(storage.consumeSetupCode("RUNR-CODE", now, "runner")).toBe("ok");
+    storage.createSetupCode("DEVC-CODE", now + 60_000);
+    expect(storage.consumeSetupCode("DEVC-CODE", now, "runner")).toBe("invalid");
+    expect(storage.consumeSetupCode("DEVC-CODE", now)).toBe("ok");
+    storage.close();
+  });
+});
+
+describe("paired runners (capability 52)", () => {
+  it("stores only a hash, keeps the token unique, and survives a restart", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-runners-"));
+    const path = join(directory, "gateway.sqlite");
+    const storage = openStorage(path);
+    storage.createRunner({ id: "r1", name: "one", tokenHash: "hash-1", createdAt: 10, isDefault: true });
+    storage.createRunner({ id: "r2", name: "two", tokenHash: "hash-2", createdAt: 20, isDefault: false });
+    expect(() =>
+      storage.createRunner({ id: "r3", name: "three", tokenHash: "hash-1", createdAt: 30, isDefault: false }),
+    ).toThrow();
+    storage.observeRunner("r2", { platform: "linux/x64", version: "0.1.0", backends: ["process"] });
+    storage.touchRunner("r2", 99);
+    storage.close();
+
+    const reopened = openStorage(path);
+    expect(reopened.listRunners().map((row) => row.id)).toEqual(["r1", "r2"]);
+    expect(reopened.runner("r2")).toMatchObject({
+      platform: "linux/x64", version: "0.1.0", backends: ["process"], lastSeenAt: 99, isDefault: false,
+    });
+    expect(reopened.runnerByTokenHash("hash-1")?.id).toBe("r1");
+    expect(reopened.runnerByTokenHash("hash-missing")).toBeUndefined();
+
+    // Moving the default clears the previous holder in the same transaction.
+    expect(reopened.setDefaultRunner("r2")).toBe(true);
+    expect(reopened.listRunners().filter((row) => row.isDefault).map((row) => row.id)).toEqual(["r2"]);
+    expect(reopened.setDefaultRunner("nobody")).toBe(false);
+    expect(reopened.listRunners().filter((row) => row.isDefault).map((row) => row.id)).toEqual(["r2"]);
+
+    expect(reopened.deleteRunner("r1")).toBe(true);
+    expect(reopened.deleteRunner("r1")).toBe(false);
+    expect(reopened.countRunners()).toBe(1);
+    reopened.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("leaves an unreported field alone rather than nulling it on the next hello", () => {
+    const storage = openStorage(":memory:");
+    storage.createRunner({ id: "r1", name: "one", tokenHash: "hash-1", createdAt: 10, isDefault: true });
+    storage.observeRunner("r1", { platform: "darwin/arm64", version: "0.1.0", backends: ["process"] });
+    // An older runner reconnecting reports nothing about itself; what it told us before stands.
+    storage.observeRunner("r1", {});
+    expect(storage.runner("r1")).toMatchObject({ platform: "darwin/arm64", version: "0.1.0", backends: ["process"] });
+    storage.close();
+  });
+});
+
 describe("setup code lifecycle", () => {
   it("keeps only the latest unpaired code and removes it when consumed", () => {
     const directory = mkdtempSync(join(tmpdir(), "cozygateway-setup-code-lifecycle-"));

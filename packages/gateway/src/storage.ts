@@ -78,7 +78,19 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE TABLE IF NOT EXISTS setup_codes (
   code TEXT PRIMARY KEY,
   expires_at INTEGER NOT NULL,
-  used_at INTEGER
+  used_at INTEGER,
+  kind TEXT
+) STRICT;
+CREATE TABLE IF NOT EXISTS runners (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  platform TEXT,
+  version TEXT,
+  backends TEXT,
+  is_default INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_seen_at INTEGER
 ) STRICT;
 CREATE TABLE IF NOT EXISTS agents (
   id TEXT PRIMARY KEY,
@@ -543,11 +555,63 @@ CREATE TABLE IF NOT EXISTS runner_operations (
 CREATE INDEX IF NOT EXISTS runner_operations_bot ON runner_operations (bot, created_at DESC);
 `;
 
+/** Capability 52. Which credential a setup code may mint. A code written before 52 has no kind
+ *  stored and reads as a device code. */
+export type SetupCodeKind = "device" | "runner";
+
+const RUNNER_COLUMNS =
+  "id, name, platform, version, backends, is_default AS isDefault, created_at AS createdAt,"
+  + " last_seen_at AS lastSeenAt";
+
 export interface DeviceRow {
   id: string;
   name: string;
   createdAt: number;
   lastSeenAt: number | null;
+}
+/** Capability 52. One paired computer that runs bots. `platform`, `version` and `backends` are
+ *  what that runner last reported on its `hello`, so they are null or empty until it has connected
+ *  once: the gateway records what it was told and invents nothing. */
+export interface RunnerRow {
+  id: string;
+  name: string;
+  platform: string | null;
+  version: string | null;
+  backends: readonly string[];
+  isDefault: boolean;
+  createdAt: number;
+  lastSeenAt: number | null;
+}
+interface RunnerDbRow {
+  id: string;
+  name: string;
+  platform: string | null;
+  version: string | null;
+  backends: string | null;
+  isDefault: number;
+  createdAt: number;
+  lastSeenAt: number | null;
+}
+function runnerRow(row: RunnerDbRow): RunnerRow {
+  let backends: string[] = [];
+  if (row.backends !== null) {
+    try {
+      const parsed: unknown = JSON.parse(row.backends);
+      if (Array.isArray(parsed)) backends = parsed.filter((item): item is string => typeof item === "string");
+    } catch {
+      backends = [];
+    }
+  }
+  return {
+    id: row.id,
+    name: row.name,
+    platform: row.platform,
+    version: row.version,
+    backends,
+    isDefault: row.isDefault === 1,
+    createdAt: row.createdAt,
+    lastSeenAt: row.lastSeenAt,
+  };
 }
 export interface AgentRow {
   id: string;
@@ -816,13 +880,15 @@ export class Storage {
     this.#db = db;
   }
 
-  createSetupCode(code: string, expiresAt: number): void {
+  createSetupCode(code: string, expiresAt: number, kind: SetupCodeKind = "device"): void {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       // Pairing is an explicit, single-current-invitation flow. Minting a replacement revokes
       // every older unredeemed code so repeated CLI calls cannot accumulate parallel credentials.
       this.#db.prepare("DELETE FROM setup_codes").run();
-      this.#db.prepare("INSERT INTO setup_codes (code, expires_at) VALUES (?, ?)").run(code, expiresAt);
+      this.#db
+        .prepare("INSERT INTO setup_codes (code, expires_at, kind) VALUES (?, ?, ?)")
+        .run(code, expiresAt, kind);
       this.#db.exec("COMMIT");
     } catch (error) {
       this.#db.exec("ROLLBACK");
@@ -830,14 +896,21 @@ export class Storage {
     }
   }
 
-  consumeSetupCode(code: string, now: number): "ok" | "invalid" {
+  /** Capability 52: a code carries the kind of credential it may mint. A row written before 52 has
+   *  a NULL kind and is a device code, which is what every code minted before 52 was. A code
+   *  presented for the wrong kind is `invalid`, the same answer an expired or unknown code gets, so
+   *  the two are indistinguishable from outside. */
+  consumeSetupCode(code: string, now: number, kind: SetupCodeKind = "device"): "ok" | "invalid" {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       this.#db.prepare("DELETE FROM setup_codes WHERE used_at IS NOT NULL OR expires_at < ?").run(now);
       // Delete-to-consume is atomic and leaves no used credential residue behind.
       const result = this.#db
-        .prepare("DELETE FROM setup_codes WHERE code = ? AND used_at IS NULL AND expires_at >= ?")
-        .run(code, now);
+        .prepare(
+          "DELETE FROM setup_codes WHERE code = ? AND used_at IS NULL AND expires_at >= ?"
+            + " AND COALESCE(kind, 'device') = ?",
+        )
+        .run(code, now, kind);
       this.#db.exec("COMMIT");
       return result.changes === 1 ? "ok" : "invalid";
     } catch (error) {
@@ -874,6 +947,90 @@ export class Storage {
 
   touchDevice(id: string, at: number): void {
     this.#db.prepare("UPDATE devices SET last_seen_at = ? WHERE id = ?").run(at, id);
+  }
+
+  /** Capability 52. A paired runner's row. The token is stored as a hash, exactly as a device
+   *  token is, so a database read never yields a usable credential. */
+  createRunner(runner: {
+    id: string;
+    name: string;
+    tokenHash: string;
+    createdAt: number;
+    isDefault: boolean;
+  }): void {
+    this.#db
+      .prepare(
+        "INSERT INTO runners (id, name, token_hash, is_default, created_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(runner.id, runner.name, runner.tokenHash, runner.isDefault ? 1 : 0, runner.createdAt);
+  }
+
+  runnerByTokenHash(tokenHash: string): RunnerRow | undefined {
+    const row = this.#db
+      .prepare(`SELECT ${RUNNER_COLUMNS} FROM runners WHERE token_hash = ?`)
+      .get(tokenHash) as RunnerDbRow | undefined;
+    return row === undefined ? undefined : runnerRow(row);
+  }
+
+  runner(id: string): RunnerRow | undefined {
+    const row = this.#db
+      .prepare(`SELECT ${RUNNER_COLUMNS} FROM runners WHERE id = ?`)
+      .get(id) as RunnerDbRow | undefined;
+    return row === undefined ? undefined : runnerRow(row);
+  }
+
+  listRunners(): RunnerRow[] {
+    return (
+      this.#db.prepare(`SELECT ${RUNNER_COLUMNS} FROM runners ORDER BY created_at`).all() as unknown as RunnerDbRow[]
+    ).map(runnerRow);
+  }
+
+  countRunners(): number {
+    const row = this.#db.prepare("SELECT COUNT(*) AS count FROM runners").get() as { count: number };
+    return row.count;
+  }
+
+  deleteRunner(id: string): boolean {
+    return this.#db.prepare("DELETE FROM runners WHERE id = ?").run(id).changes === 1;
+  }
+
+  /** Moves the account default. One transaction, because a moment with two defaults would send an
+   *  unaddressed operation to two machines. */
+  setDefaultRunner(id: string): boolean {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const moved = this.#db.prepare("UPDATE runners SET is_default = 1 WHERE id = ?").run(id).changes === 1;
+      if (moved) this.#db.prepare("UPDATE runners SET is_default = 0 WHERE id <> ?").run(id);
+      this.#db.exec("COMMIT");
+      return moved;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  touchRunner(id: string, at: number): void {
+    this.#db.prepare("UPDATE runners SET last_seen_at = ? WHERE id = ?").run(at, id);
+  }
+
+  /** What the runner reported about itself on its `hello`. Every field is optional on the wire, so
+   *  an older runner simply leaves the columns as they were. */
+  observeRunner(
+    id: string,
+    seen: { name?: string; platform?: string; version?: string; backends?: readonly string[] },
+  ): void {
+    this.#db
+      .prepare(
+        "UPDATE runners SET name = COALESCE(?, name), platform = COALESCE(?, platform),"
+          + " version = COALESCE(?, version), backends = COALESCE(?, backends) WHERE id = ?",
+      )
+      .run(
+        seen.name ?? null,
+        seen.platform ?? null,
+        seen.version ?? null,
+        seen.backends === undefined ? null : JSON.stringify([...seen.backends]),
+        id,
+      );
   }
 
   hermesGlobalSkillRequest(requestId: string, now: number): unknown | undefined {
@@ -3956,6 +4113,13 @@ export function openStorage(dbPath: string): Storage {
   // CREATE TABLE IF NOT EXISTS does not add delegation-enrichment columns to an existing database.
   // Migrate additively in place; each nullable column preserves the distinction between an older
   // unavailable result and an explicit `schema_valid = 0` verdict.
+  // Capability 52. An existing database's `setup_codes` predates the kind column; adding it
+  // nullable keeps every live invitation valid and reads it back as the device code it was.
+  const setupCodeColumns = new Set(
+    (db.prepare("PRAGMA table_info(setup_codes)").all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!setupCodeColumns.has("kind")) db.exec("ALTER TABLE setup_codes ADD COLUMN kind TEXT");
   const delegationColumns = new Set(
     (db.prepare("PRAGMA table_info(bot_chat_delegations)").all() as unknown as Array<{ name: string }>)
       .map((column) => column.name),

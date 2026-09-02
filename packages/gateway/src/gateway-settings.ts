@@ -55,7 +55,7 @@ function endpointSetting(id: string, label: string | undefined, config: HermesBr
 }
 
 export function settingsForConfig(config: GatewayConfig): GatewaySettings {
-  const endpoints = config.hermesEndpoints.map(({ id, label, ...endpoint }) =>
+  const endpoints = (config.hermesEndpoints ?? []).map(({ id, label, ...endpoint }) =>
     endpointSetting(id, label, endpoint));
   return { name: config.name, hermesEndpoints: endpoints };
 }

@@ -32,11 +32,14 @@ describe("loadConfig", () => {
     const config = loadConfig(path);
     expect(config.port).toBe(8787);
     expect(config.dbPath).toBe("cozygateway.db");
-    expect(config.hermesEndpoints[0]?.profiles.sage?.tokenEnv).toBe("SAGE_ATTACH_TOKEN");
+    expect(config.hermesEndpoints?.[0]?.profiles.sage?.tokenEnv).toBe("SAGE_ATTACH_TOKEN");
   });
 
-  it("requires Hermes and at least one attach profile", () => {
-    expect(() => loadConfig(writeConfig({ name: "g" }))).toThrow(ContractViolation);
+  it("accepts a gateway with no Hermes endpoint and still requires a profile on one that has it", () => {
+    // Capability 52: a CozyAgents-only gateway is a supported configuration, so an absent
+    // `hermesEndpoints` loads rather than being refused. A DECLARED endpoint with no profile is
+    // still a mistake, because it names a Hermes that serves nothing.
+    expect(loadConfig(writeConfig({ name: "g" })).hermesEndpoints).toBeUndefined();
     expect(() => loadConfig(writeConfig({ name: "g", hermesEndpoints: oneEndpoint({ url: hermes.url, profiles: {} }) }))).toThrow(
       ContractViolation,
     );
@@ -46,7 +49,7 @@ describe("loadConfig", () => {
       hermesEndpoints: oneEndpoint(),
     });
     const config = loadConfig(path);
-    expect(config.hermesEndpoints[0]?.url).toBe(hermes.url);
+    expect(config.hermesEndpoints?.[0]?.url).toBe(hermes.url);
   });
 
   it("carries the bridge's optional roster hide list through", () => {
@@ -54,7 +57,7 @@ describe("loadConfig", () => {
       name: "bots-only",
       hermesEndpoints: oneEndpoint({ ...hermes, hiddenProfiles: ["ops-runner"] }),
     });
-    expect(loadConfig(path).hermesEndpoints[0]?.hiddenProfiles).toEqual(["ops-runner"]);
+    expect(loadConfig(path).hermesEndpoints?.[0]?.hiddenProfiles).toEqual(["ops-runner"]);
   });
 
   it("accepts one direct attach identity per Hermes profile", () => {
@@ -69,7 +72,7 @@ describe("loadConfig", () => {
         },
       }),
     });
-    expect(loadConfig(path).hermesEndpoints[0]?.profiles).toEqual({
+    expect(loadConfig(path).hermesEndpoints?.[0]?.profiles).toEqual({
       sage: { tokenEnv: "SAGE_ATTACH_TOKEN", name: "Sage" },
       pixel: { tokenEnv: "PIXEL_ATTACH_TOKEN", avatar: "pixel.png" },
     });
@@ -80,14 +83,14 @@ describe("loadConfig", () => {
       name: "bots-only",
       hermesEndpoints: oneEndpoint({ ...hermes, profile: "  Ops-Host  " }),
     });
-    const parsed = parseHermesOptions(loadConfig(path).hermesEndpoints[0]!, { HERMES_TOKEN: "t" });
+    const parsed = parseHermesOptions(loadConfig(path).hermesEndpoints![0]!, { HERMES_TOKEN: "t" });
     expect(parsed.bridgeProfile).toBe("ops-host");
     // Absent by default: the guard is opt-in because the profile cannot be detected.
     const bare = writeConfig({
       name: "bots-only",
       hermesEndpoints: oneEndpoint(),
     });
-    expect(parseHermesOptions(loadConfig(bare).hermesEndpoints[0]!, { HERMES_TOKEN: "t" }).bridgeProfile).toBeUndefined();
+    expect(parseHermesOptions(loadConfig(bare).hermesEndpoints![0]!, { HERMES_TOKEN: "t" }).bridgeProfile).toBeUndefined();
   });
 
   it("rejects duplicate normalized profile ids", () => {
@@ -119,6 +122,19 @@ describe("loadConfig", () => {
       ],
     }))).toThrow(/duplicate Hermes endpoint id/i);
     expect(() => loadConfig(writeConfig({ name: "removed", hermes }))).toThrow(ContractViolation);
+  });
+
+  it("refuses a leftover top-level `hermes` block BY NAME rather than starting with no Hermes", () => {
+    // Capability 52 made `hermesEndpoints` optional, so this config would otherwise validate and
+    // come up as a CozyAgents-only gateway serving none of the profiles the operator declared. The
+    // refusal names the key and the field that replaced it, because a silent demotion of a
+    // configured Hermes to no Hermes is the one failure this check exists to prevent.
+    const path = writeConfig({ name: "leftover", hermes });
+    expect(() => loadConfig(path)).toThrow(/`hermes` block was replaced by `hermesEndpoints`/);
+    expect(() => loadConfig(path)).toThrow(ContractViolation);
+    // Moving it across is the repair, and it loads.
+    expect(loadConfig(writeConfig({ name: "moved", hermesEndpoints: oneEndpoint() })).hermesEndpoints)
+      .toHaveLength(1);
   });
 
   // Issue #16: capabilities is an optional gateway-level config field, surfaced as

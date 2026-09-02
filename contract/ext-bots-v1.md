@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 48. This extension is independent of the frozen core
+Status: v1 extension, capability version 52. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -31,7 +31,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 48 }
+"capabilities": { "com.cozylabs.bots": 52 }
 ```
 
 Versioned additions are additive and clients compare `>=`, never equality. Explicitly withdrawn or
@@ -91,6 +91,7 @@ and does not register `/bots` routes.
 | 49 | Runtime bots created from the app: `POST /bots` accepts `runtime: "cozyagents"` and creates a gateway-owned bot with no Hermes profile, minting its attach token and enqueueing a `create_runtime` operation for a CozyRunner. `GET /bots/:name/runtime` projects `{stage, specGeneration, observedGeneration, lastRunnerContactAt}`, and `DELETE /bots/:name` answers for a runtime bot instead of 409. |
 | 50 | Bot history: a runtime bot checkpoints its own workspace into git and serves it over the attach-v1 `bot_history` lane. Five new runtime-bot-only routes carry the Changes list, a per-file diff, restore, the try/keep/discard experiment, and the per-file conflict choice. A Hermes bot answers 409 `unsupported_for_runtime`, and so does a runtime bot whose peer did not negotiate `bot_history`. Nothing content-shaped crosses the lane: summaries and counts, never files or patches. |
 | 51 | Room turns can ask: a runtime member's approval and clarify events on a room turn land in the existing interaction inbox (`sessionId` is the `group:<room>:<member>` thread) and resolve through the existing `/bots/:member/approvals/...` and `/bots/:member/clarifications/...` routes unchanged; tool events project as ephemeral `bot_tool_activity` carrying `room`; `BotGroup` and `bot_group_state` gain the optional `pendingInteractions` pointer array. The room transcript gains nothing and Hermes members are unchanged. |
+| 52 | Paired runners: `POST /pair {setupCode, deviceName, kind: "runner"}` mints a per-runner token instead of a device token, `GET /runners`, `PATCH /runners/:id {default}` and `DELETE /runners/:id` manage the roster, `POST /runners/pair-code` mints a code from the app, `GET /runners/self` answers that one row under the runner's own bearer, and `/runner/v1` accepts any active per-runner token so two computers hold two sockets at once. The runner `hello` gains optional `name`, `platform` and `agentVersion`, recorded on its row on every hello that carries them, so a renamed computer renames its roster row. A gateway with no Hermes endpoint is a supported configuration; its roster answers from runtime bots and `/ready` reports the bridge as `absent`. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -602,6 +603,11 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `POST /bots` | `BotCreateRequest` | `201 BotCreateResponse` | Creates a Hermes profile and seeds it as a blank slate, or, with capability-49 `runtime: "cozyagents"`, a gateway-owned runtime bot with no Hermes profile at all. `409` extension code `conflict` when the name is taken. |
 | `GET /bots/:name/runtime` | — | `BotRuntimeProjection` | Capability 49. Where a runtime bot's container stands: stage, desired and observed generations, and last runner contact. Three answers: `200` while the runtime exists OR while its delete is still being cleaned up (`deletion_pending`, `deleting`), `409` `unsupported_for_runtime` for a bot that never had a gateway-owned runtime (a Hermes bot, or a name this gateway does not serve), and `404` once the runner's terminal `deleted` receipt lands and there is nothing left to project. |
 | `DELETE /bots/:name` | optional `?force=1` | `200 BotDeleteResponse` | Capability 37. Deletes the Hermes profile and purges every gateway row the bot owned. `409` extension code `conflict` (body carries `turnId`) when a native turn is running, unless `force=1`. `404` when neither Hermes nor this gateway knows the name. Capability 49: answers for a gateway-owned runtime bot too, revoking its credential and enqueueing `delete_runtime`. |
+| `GET /runners` | — | `{ runners: Runner[] }` | Capability 52. The paired computers that run bots, each with its name, reported platform and version, backends, `default` flag, `lastSeenAt` and live `online`. A gateway carrying the legacy shared `COZYGATEWAY_RUNNER_TOKEN` lists it as one row with id `legacy`. |
+| `POST /runners/pair-code` | — | `{ setupCode, expiresAt, gatewayUrl }` | Capability 52. Mints a runner-kind pairing code from the app: the same 10 minute TTL and the same gateway-wide 10-per-60-seconds bucket the unauthenticated `/pair` route spends, so a `429` with `retry-after` is the answer when it is exhausted. `gatewayUrl` is the origin the new computer should dial, which is the LAN address when the listener is on a wildcard. Minting any code revokes every older unredeemed one. |
+| `GET /runners/self` | — | `RunnerSelf` | Capability 52. Authenticated by the RUNNER's own bearer, not a device token, and the only route that credential opens. Answers `{id, name, platform, default, lastSeenAt, attached}` for that one runner; `attached` is whether it holds a live `/runner/v1` socket, which is a different question from whether the row exists. `401 unauthorized` for a missing, unknown, or revoked token. |
+| `PATCH /runners/:id` | `RunnerPatchRequest` | `{ runner: Runner }` | Capability 52. `{default: true}` moves the account default and clears the previous holder in the same transaction. `default: false` and the `legacy` id are `400 invalid_request`; an unknown id is `404 not_found`. |
+| `DELETE /runners/:id` | — | `{ ok: true }` | Capability 52. Revokes that runner's token and closes its socket. `404 not_found` for an unknown id, exactly as `DELETE /devices/:id` answers. The `legacy` row is revoked by unsetting the environment variable and answers `400 invalid_request`. |
 | `POST /bots/focus` | `BotFocusRequest` | `{ ok: true }` | Hints control-plane polling while roster/routines UI is visible. |
 | `GET /bots/catalog` | optional `q` | `BotCatalog` | Hermes profile/catalog read. |
 | `GET /bots/:name/profile` | — | `BotProfile` | Hermes profile read. |
@@ -694,6 +700,38 @@ memory content, secret, provider configuration, or host path is logged, traced, 
 
 An unavailable attach-v1 identity is a `503 backend_unavailable` on native chat actions. A profile
 that exists but is not configured as a native identity must not fall through to Dashboard chat.
+
+### Pairing a runner (capability 52)
+
+`POST /pair` is the core contract's unauthenticated pairing route and is unchanged for a device.
+With `kind: "runner"` it consumes a runner-kind setup code (minted by `cozygateway pair --kind
+runner`) and answers `RunnerPairResponse`: `{runnerToken, runner, gateway}`. `deviceName` carries
+the runner's name, so the request stays additive and a client below 52 never sends `kind` and pairs
+a device exactly as it always did. `deviceName` is required for a device pair and optional for a
+runner pair, checked at the route rather than in the schema.
+
+A code minted for a runner and presented as a device, or the reverse, answers the existing `401
+setup_code_invalid` with the existing message: a wrong-kind code is indistinguishable from an
+expired one. The 4 KiB body cap, the 10-attempts-per-60-seconds bucket, the 10-minute TTL and
+single use are unchanged and apply identically to both kinds.
+
+The runner token authenticates `/runner/v1` and `GET /runners/self` and nothing else. It cannot read
+chats, list devices or create bots, and `DELETE /runners/:id` revokes it, after which both answer as
+though it had never existed.
+
+A code is minted either at a terminal with `cozygateway pair --kind runner` or from the app with
+`POST /runners/pair-code`, which is device-authenticated and spends the same bucket. Both write the
+same row, so a code from either place pairs the same way.
+
+### A gateway with no Hermes endpoint (capability 52)
+
+`hermesEndpoints` is optional from 52. A gateway configured without one starts, serves `/bots` and
+`/runners` from its own runtime-bot rows, and advertises `com.cozylabs.bots`. The three
+Hermes-shaped capabilities beside it (`com.cozylabs.hermes-desktop-sessions`,
+`com.cozylabs.mobile-node`, `com.cozylabs.harness-settings`) are not advertised, because there is
+genuinely no Dashboard behind them. `/health` and `/ready` report `bridges: {"hermes": "absent"}`
+and `/ready` answers `200`: there is no bridge to alarm on or de-route from, and restarting the
+process would fix nothing.
 
 ## Interactive Hermes session continuation
 

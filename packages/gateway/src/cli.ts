@@ -10,7 +10,7 @@ import { parseArgs } from "node:util";
 import { promisify } from "node:util";
 
 import { applyEnvOverrides, loadConfig, validatePublicDeployment } from "./config.ts";
-import { openStorage } from "./storage.ts";
+import { openStorage, type SetupCodeKind } from "./storage.ts";
 import { startGateway, GATEWAY_VERSION } from "./server.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
 import { primaryLanAddress } from "./lan.ts";
@@ -24,7 +24,7 @@ import {
   validateListenerHost,
 } from "./configure.ts";
 
-const USAGE = `usage: cozygateway [status|configure|serve|pair] --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>]`;
+const USAGE = `usage: cozygateway [status|configure|serve|pair] --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>] [--kind device|runner]`;
 
 export interface CliIo {
   interactive: boolean;
@@ -269,15 +269,27 @@ async function configureListener(configPath: string, io: CliIo, runtime: CliRunt
   );
 }
 
-async function runPair(configPath: string, advertised: string | undefined, ttl: string | undefined): Promise<void> {
+async function runPair(
+  configPath: string,
+  advertised: string | undefined,
+  ttl: string | undefined,
+  kind: SetupCodeKind = "device",
+): Promise<void> {
   const config = validatePublicDeployment(applyEnvOverrides(loadConfig(configPath), process.env));
   const gatewayUrl = pairingUrl(config, advertised);
   const ttlMs = ttl === undefined ? SETUP_CODE_TTL_MS : parsedTtlMs(ttl);
   const storage = openStorage(config.dbPath);
   const code = newSetupCode();
-  storage.createSetupCode(code, Date.now() + ttlMs);
+  // Capability 52. The kind rides on the code itself, so a runner code pasted into the app's
+  // pairing prompt (or the reverse) is refused as an unknown code rather than minting the wrong
+  // credential. Absent means "device", which is every code minted before 52.
+  storage.createSetupCode(code, Date.now() + ttlMs, kind);
   storage.close();
-  const payload = { gatewayUrl, setupCode: code };
+  // The payload carries the kind for the same reason: a scan cannot be answered by the wrong
+  // client. A device payload is byte-identical to the one every shipped app already reads.
+  const payload = kind === "runner"
+    ? { gatewayUrl, setupCode: code, kind: "runner" as const }
+    : { gatewayUrl, setupCode: code };
   const payloadJson = JSON.stringify(payload);
   try {
     console.log(renderQrHalfBlocks(encodeQr(payloadJson), { color: process.stdout.isTTY === true }));
@@ -288,8 +300,15 @@ async function runPair(configPath: string, advertised: string | undefined, ttl: 
   console.log(payloadJson);
   console.log(`Gateway URL: ${payload.gatewayUrl}`);
   console.log(`Setup code:  ${code}`);
-  console.log("Scan the QR code with CozyChat, or type the gateway URL and setup code in the app.");
-  console.log(`Setup code ${code} is valid for ${describeTtl(ttlMs)}. Mint a fresh one with: cozygateway pair`);
+  console.log(
+    kind === "runner"
+      ? "Pair a computer with: cozyagents runner pair <code> --gateway <url>, or scan the QR from the installer."
+      : "Scan the QR code with CozyChat, or type the gateway URL and setup code in the app.",
+  );
+  console.log(
+    `Setup code ${code} is valid for ${describeTtl(ttlMs)}. Mint a fresh one with: cozygateway pair`
+      + (kind === "runner" ? " --kind runner" : ""),
+  );
   if (isLoopbackUrl(payload.gatewayUrl)) {
     console.log(
       "This URL is loopback, so only this machine can reach it. Remote access (Tailscale and friends) is documented at https://cozylabs.ai/docs/access/.",
@@ -326,6 +345,7 @@ export async function runCli(argv: string[], suppliedIo?: CliIo, runtime: CliRun
       config: { type: "string", default: "cozygateway.config.json" },
       url: { type: "string" },
       ttl: { type: "string" },
+      kind: { type: "string" },
     },
   });
   const configPath = values.config;
@@ -363,7 +383,13 @@ export async function runCli(argv: string[], suppliedIo?: CliIo, runtime: CliRun
   }
 
   if (command === "pair") {
-    await runPair(configPath, values.url, values.ttl);
+    // Capability 52. `--kind runner` mints a code that can only pair a computer that runs bots.
+    const kind = values.kind ?? "device";
+    if (kind !== "device" && kind !== "runner") {
+      console.error("--kind must be device or runner");
+      return 1;
+    }
+    await runPair(configPath, values.url, values.ttl, kind);
     return 0;
   }
 

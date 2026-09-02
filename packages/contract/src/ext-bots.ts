@@ -15,7 +15,7 @@
 import { type Static, Type } from "@sinclair/typebox";
 
 import { AttachmentBlockSchema } from "./rich-blocks.ts";
-import { ApprovalOutcomeSchema } from "./resources.ts";
+import { ApprovalOutcomeSchema, GatewayInfoSchema } from "./resources.ts";
 import {
   ModelProviderFieldUpdateSchema,
   ModelProviderOAuthCodeSchema,
@@ -1725,6 +1725,71 @@ export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>
  *    client renders in flow whenever positions are present. The emitting side is what gates on
  *    `>= 32`. An out-of-range value clamps into `0...blocks.length`; it never drops the
  *    attachment. */
+/** Capability 52. One paired computer that runs bots. `platform` and `version` are what the
+ *  runner reported on its last `hello`, null until it has connected once; `backends` is what that
+ *  host can actually do. Closed: a client reads exactly these fields. */
+export const RunnerSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 64 }),
+  name: Type.String({ minLength: 1, maxLength: 120 }),
+  platform: Type.Union([Type.String({ maxLength: 120 }), Type.Null()]),
+  version: Type.Union([Type.String({ maxLength: 40 }), Type.Null()]),
+  backends: Type.Array(Type.String({ maxLength: 20 }), { maxItems: 4 }),
+  /** The account default: the runner an unaddressed operation belongs to. The first paired runner
+   *  holds it; `PATCH /runners/:id {default: true}` moves it. */
+  default: Type.Boolean(),
+  createdAt: Type.Integer({ minimum: 0 }),
+  lastSeenAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  /** Whether that runner holds a live `/runner/v1` socket right now. */
+  online: Type.Boolean(),
+}, { additionalProperties: false });
+export type Runner = Static<typeof RunnerSchema>;
+
+/** `GET /runners`. An object rather than a bare array so the route can grow a cursor without a
+ *  breaking change. */
+export const RunnersResponseSchema = Type.Object({
+  runners: Type.Array(RunnerSchema, { maxItems: 256 }),
+}, { additionalProperties: false });
+export type RunnersResponse = Static<typeof RunnersResponseSchema>;
+
+/** `PATCH /runners/:id`. `default: true` moves the account default to this runner. */
+export const RunnerPatchRequestSchema = Type.Object({
+  default: Type.Boolean(),
+}, { additionalProperties: false });
+export type RunnerPatchRequest = Static<typeof RunnerPatchRequestSchema>;
+
+/** `GET /runners/self`, authenticated by the runner's own token and nothing else. It is what the
+ *  installer polls after registering the service: the row exists the moment the pair lands, so
+ *  `attached` is the separate question of whether that machine has dialed in yet. */
+export const RunnerSelfSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 64 }),
+  name: Type.String({ minLength: 1, maxLength: 120 }),
+  platform: Type.Union([Type.String({ maxLength: 120 }), Type.Null()]),
+  default: Type.Boolean(),
+  lastSeenAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  attached: Type.Boolean(),
+}, { additionalProperties: false });
+export type RunnerSelf = Static<typeof RunnerSelfSchema>;
+
+/** `POST /runners/pair-code`. The device-authenticated way to mint what `cozygateway pair --kind
+ *  runner` prints, with the same 10 minute TTL and the same gateway-wide attempt bucket.
+ *  `gatewayUrl` is the origin the new computer should dial, which is not always the one the phone
+ *  is talking to. */
+export const RunnerPairCodeResponseSchema = Type.Object({
+  setupCode: Type.String({ minLength: 1, maxLength: 64 }),
+  expiresAt: Type.Integer({ minimum: 0 }),
+  gatewayUrl: Type.String({ minLength: 1, maxLength: 2048 }),
+}, { additionalProperties: false });
+export type RunnerPairCodeResponse = Static<typeof RunnerPairCodeResponseSchema>;
+
+/** `POST /pair {kind: "runner"}`. `runnerToken` is shown once and never again: the gateway stores
+ *  only its hash, exactly as it does for a device token. */
+export const RunnerPairResponseSchema = Type.Object({
+  runnerToken: Type.String({ minLength: 1 }),
+  runner: RunnerSchema,
+  gateway: GatewayInfoSchema,
+}, { additionalProperties: false });
+export type RunnerPairResponse = Static<typeof RunnerPairResponseSchema>;
+
 export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
 /** Separately versioned because Hermes desktop discovery/adoption is neither a Dashboard fallback
  * nor native Bot Mode history. A client must gate this picker and its resume action on this id,
@@ -2115,4 +2180,33 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  *
  * Additive: no new route, no changed shape, every new field optional. A client that renders a room
  * approval card or a room activity view gates on `>= 51`; below it a room behaves as it did. */
-export const BOTS_CAPABILITY_VERSION = 51;
+/** Capability 52: PAIRED RUNNERS. A computer that runs bots is paired the same way a phone is:
+ * `POST /pair {setupCode, deviceName, kind: "runner"}` consumes a runner-kind setup code and
+ * answers `{runnerToken, runner, gateway}`, minting a 32-byte per-runner token instead of a device
+ * token. `deviceName` carries the runner's name, so the request shape is additive and a client
+ * below 52 (which never sends `kind`) pairs a device exactly as it always did. A code minted for a
+ * runner and presented as a device, or the reverse, answers the existing `401 setup_code_invalid`
+ * with the existing message, so a wrong-kind code is indistinguishable from an expired one.
+ *
+ * `GET /runners`, `PATCH /runners/:id {default}` and `DELETE /runners/:id` are device-authenticated
+ * and mirror the devices routes, including the 404 for an unknown id. `POST /runners/pair-code`
+ * mints a runner code from the app with the same TTL and bucket the CLI's `pair --kind runner`
+ * uses, and `GET /runners/self` answers one row under the runner's own bearer, which is the only
+ * route that credential opens and the one an installer's health check polls. The first paired runner is
+ * the default; setting a new default clears the flag on every other row in the same transaction; a
+ * delete revokes that runner's token and closes its socket.
+ *
+ * `/runner/v1` accepts any active per-runner token and attributes the connection to that runner
+ * row, so two computers hold two sockets at once and a supersede (close `4000`) is scoped to one
+ * runner id. The operator-placed `COZYGATEWAY_RUNNER_TOKEN` remains supported as the legacy shared
+ * credential with its old single-connection behaviour. The runner's `hello` gains optional `name`,
+ * `platform` and `agentVersion`, recorded on the row on every hello that carries them, so a renamed
+ * computer renames its roster row, and projected here.
+ *
+ * A gateway with no Hermes endpoint is a supported configuration from 52: the roster and readiness
+ * answer from runtime bots alone and `/ready` reports the Hermes bridge as `absent` rather than
+ * degraded.
+ *
+ * Additive: no existing route, request or response changes, and a client that renders the roster
+ * gates on `>= 52`. */
+export const BOTS_CAPABILITY_VERSION = 52;

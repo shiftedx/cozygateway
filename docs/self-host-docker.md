@@ -51,6 +51,26 @@ credential values.
 }
 ```
 
+### A CozyAgents-only gateway (no Hermes)
+
+`hermesEndpoints` is optional from capability 52. A gateway whose bots all run on paired CozyAgents
+runners omits it entirely:
+
+```json
+{
+  "name": "cozygateway",
+  "host": "127.0.0.1",
+  "port": 8787,
+  "dbPath": "/data/cozygateway.db"
+}
+```
+
+Such a gateway starts, serves `/bots` and `/runners` from its own rows, and advertises
+`com.cozylabs.bots`. It advertises no Hermes-shaped capability, and `/health` and `/ready` report
+`bridges: {"hermes": "absent"}` with `/ready` answering `200`: there is no bridge to alarm on. Pair
+a computer to it with `cozygateway pair --kind runner` and hand the code to the CozyAgents
+installer. Revoke one with `DELETE /runners/:id`, which closes that runner's socket.
+
 Use a service name such as `hermes` when the Dashboard is on a private Compose network. The shipped
 template uses `host.docker.internal` for a Dashboard deliberately reachable on the Docker host;
 Compose adds the Linux `host-gateway` mapping. A Dashboard bound only to host loopback is not

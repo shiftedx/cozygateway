@@ -11,10 +11,10 @@ documented in `ext-bots-v1.md`. The boundary this protocol implements is ADR 000
 fenced container runtime per Bot through CozyRunner): the gateway is the durable lifecycle
 authority and CozyRunner is the only component that touches Docker.
 
-Wave 3 deliberately implements the smallest slice of that ADR: create and delete. Pairing codes,
-short-lived per-runner credentials, upgrades, restart backoff, drain windows, isolation policy,
-capacity admission, and reconciliation of unknown containers are all out of scope and are not
-implied by anything below.
+Wave 3 implemented the smallest slice of that ADR: create and delete. Capability 52 adds pairing
+codes and per-runner credentials, described below. Upgrades, restart backoff, drain windows,
+isolation policy, capacity admission, and reconciliation of unknown containers remain out of scope
+and are not implied by anything below.
 
 ## Transport and authentication
 
@@ -24,17 +24,32 @@ on a bot container.
 ```
 GET /runner/v1
 Upgrade: websocket
-Authorization: Bearer <COZYGATEWAY_RUNNER_TOKEN>
+Authorization: Bearer <COZYRUNNER_TOKEN>
 ```
 
-- One token, placed by the local admin in the gateway's `COZYGATEWAY_RUNNER_TOKEN` and in the
-  runner's own `COZYRUNNER_TOKEN`. It is compared with the same constant-time scan every other
-  credential on this gateway goes through. A wrong or missing token closes the socket `1008`.
-- A gateway with no `COZYGATEWAY_RUNNER_TOKEN` does not register the path at all. It still accepts
-  and stores runtime operations; they simply wait.
-- One runner at a time. A second authenticated hello supersedes the first with close code `4000`,
-  because two reconcilers against one Docker host is exactly the failure the single-writer rule
-  exists to prevent.
+- **Per-runner token (capability 52, the current path).** `POST /pair {setupCode, deviceName,
+  kind: "runner"}` mints 32 random bytes, stores only their hash on a `runners` row, and hands the
+  token back once. The runner keeps it in its own `COZYRUNNER_TOKEN`. The gateway resolves the
+  bearer by hashing it and looking the hash up, so a wrong token is never compared byte by byte
+  against a real one. It authenticates this socket and nothing else: no chat, no device list, no
+  bot creation. `DELETE /runners/:id` revokes it and closes the socket.
+- **Shared token (legacy, still supported).** `COZYGATEWAY_RUNNER_TOKEN`, placed by the local admin
+  and matched with the same constant-time scan every other credential on this gateway goes through.
+  It keeps its old behaviour exactly: one connection, superseded by any other legacy hello. It
+  appears in `GET /runners` as one row with id `legacy`, which cannot be renamed or deleted from the
+  app; unsetting the variable is how it goes away.
+- A wrong or missing token closes the socket `1008`. The same credential also opens `GET
+  /runners/self`, which answers that one runner's row plus `attached`, and nothing else on this
+  gateway.
+- The path is always registered from 52, because a runner pairs at runtime and a lane built only for
+  an operator-placed variable would leave a freshly paired runner with nowhere to dial. A gateway
+  with no runner at all still accepts and stores runtime operations; they simply wait.
+- **One socket per runner, not one socket.** A second authenticated hello for the SAME `runnerId`
+  supersedes the first with close code `4000`, because two reconcilers against one host is exactly
+  the failure the single-writer rule exists to prevent. A hello for a DIFFERENT runner is a
+  different machine and gets its own socket: two runners are two hosts.
+- A `hello` whose `runnerId` does not match the row its bearer resolved to closes `1008`. A runner
+  may not claim another runner's identity, and that mismatch is skew or theft, never a rename.
 - Every frame is one JSON object with a `kind`.
 - **Additive by default.** Unknown PROPERTIES on any runner frame are ignored, never echoed and
   never persisted; a runner is free to start reporting an image digest or a measured isolation
@@ -52,11 +67,22 @@ Authorization: Bearer <COZYGATEWAY_RUNNER_TOKEN>
 {
   "kind": "hello",
   "version": 1,
-  "runnerId": "runner-1",
-  "backends": ["docker"],
+  "runnerId": "3f8c1b2e-6a4d-4f52-9c31-0d5a7e9b2c44",
+  "name": "kyle-mbp",
+  "platform": { "os": "darwin", "arch": "arm64", "release": "24.5.0" },
+  "agentVersion": "0.1.0",
+  "backends": ["process"],
   "inventory": [{ "botId": "sage", "specGeneration": 1, "stage": "ready" }]
 }
 ```
+
+`runnerId` is the gateway's own row id for a runner paired through `POST /pair {kind: "runner"}`;
+the pair response carries it and the runner keeps it in `COZYRUNNER_ID`. `name`, `platform` and
+`agentVersion` are capability 52, all optional, and are recorded on that row and projected by `GET
+/runners` (`platform` is flattened to `os/arch/release`). `name` is recorded on EVERY hello that
+carries one, so renaming a computer renames its roster row rather than leaving the name it had at
+pairing time. A runner that sends none of them leaves the row's columns as they were, and a runner that sends them to a gateway below 52 has them ignored,
+because unknown properties are ignored on every runner frame.
 
 `backends` is `docker`, `process`, or both. `process` is the development shim for a macOS box
 without Docker and is labelled `isolation: none` in every receipt it produces. `inventory` is
@@ -70,6 +96,9 @@ reconcile from it. A `version` other than `1` closes the socket.
 ```
 
 The answer to the gateway's heartbeat. It carries nothing else: liveness is the whole message.
+Every frame a runner sends, this one included, moves `lastSeenAt` on its roster row, which is what
+`GET /runners` reports. The 15 second interval and the 45 second silence ceiling are unchanged, and
+a runner silent past the ceiling has its own socket terminated without touching any other.
 
 ### `receipt`
 

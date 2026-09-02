@@ -140,8 +140,11 @@ const GatewayConfigSchema = Type.Object({
    *  gateway. Presence is a deployment posture, not merely display text: the listener must remain
    *  on exact loopback so the public proxy is the only network path into the plaintext origin. */
   publicUrl: Type.Optional(Type.String({ minLength: 1 })),
-  /** Hermes runtimes. Profile ids are bare for one endpoint and namespaced for multiple. */
-  hermesEndpoints: Type.Array(HermesEndpointConfigSchema, { minItems: 1, maxItems: 32 }),
+  /** Hermes runtimes. Profile ids are bare for one endpoint and namespaced for multiple.
+   *  OPTIONAL since capability 52: a CozyAgents-only gateway has no Hermes at all, and requiring
+   *  one meant such a gateway could not be configured. Absent and empty mean the same thing, no
+   *  Hermes bridge, and `/ready` then reports the bridge as `absent` rather than degraded. */
+  hermesEndpoints: Type.Optional(Type.Array(HermesEndpointConfigSchema, { maxItems: 32 })),
   tls: Type.Optional(TlsConfigSchema),
   /** Bots served by a non-Hermes runtime, e.g. CozyAgents. Additive to hermesEndpoints' profiles;
    *  ids share the same collision namespace (see loadConfig). */
@@ -157,8 +160,9 @@ export interface ResolvedHermesEndpoint {
 }
 
 export function hermesEndpoints(config: GatewayConfig): ResolvedHermesEndpoint[] {
-  const namespace = config.hermesEndpoints.length > 1;
-  return config.hermesEndpoints.map(({ id, label, ...endpoint }) => ({
+  const configured = config.hermesEndpoints ?? [];
+  const namespace = configured.length > 1;
+  return configured.map(({ id, label, ...endpoint }) => ({
     id,
     label,
     namespace,
@@ -223,9 +227,18 @@ export function loadConfig(path: string): GatewayConfig {
     typeof raw === "object" && raw !== null
       ? { port: 8787, dbPath: "cozygateway.db", turnTimeoutSeconds: 0, ...raw }
       : raw;
+  // The removed single-endpoint shape is refused BY NAME rather than ignored. Since capability 52
+  // an absent `hermesEndpoints` is a valid CozyAgents-only gateway, so a config still carrying the
+  // old top-level `hermes` block would otherwise start silently with no Hermes at all, which is the
+  // one failure this check exists to prevent.
+  if (typeof withDefaults === "object" && withDefaults !== null && "hermes" in withDefaults)
+    throw new ContractViolation(
+      "the top-level `hermes` block was replaced by `hermesEndpoints`; move it there, or remove it for a gateway with no Hermes",
+      "/hermes",
+    );
   const config = validatePublicDeployment(assertValid(GatewayConfigSchema, withDefaults) as GatewayConfig);
   const endpointIds = new Set<string>();
-  for (const endpoint of config.hermesEndpoints) {
+  for (const endpoint of config.hermesEndpoints ?? []) {
     if (endpointIds.has(endpoint.id))
       throw new ContractViolation(`duplicate Hermes endpoint id "${endpoint.id}"`, "/hermesEndpoints");
     endpointIds.add(endpoint.id);
@@ -304,7 +317,7 @@ export function applyEnvOverrides(
   if (pushRelayUrl !== undefined && pushRelayUrl.length > 0) next.pushRelayUrl = pushRelayUrl;
   // Container-friendly single-runtime target override. Credentials remain in the named env vars.
   const hermesUrl = env["COZYGATEWAY_HERMES_URL"];
-  if (hermesUrl !== undefined && hermesUrl.length > 0 && next.hermesEndpoints.length === 1) {
+  if (hermesUrl !== undefined && hermesUrl.length > 0 && next.hermesEndpoints?.length === 1) {
     next.hermesEndpoints = [{ ...next.hermesEndpoints[0]!, url: hermesUrl }];
   }
   // Gateway-native TLS, container-friendly: the paths ride the environment so a compose file can

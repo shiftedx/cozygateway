@@ -5,7 +5,13 @@ import { DeviceSchema, GatewayInfoSchema, MessageSchema } from "./resources.ts";
 
 export const PairRequestSchema = Type.Object({
   setupCode: Type.String({ minLength: 1 }),
-  deviceName: Type.String({ minLength: 1, maxLength: 120 }),
+  /** Capability 52. Absent means "device", so every client shipped before 52 is unaffected.
+   *  A `runner` pair mints a per-runner token for `/runner/v1` instead of a device token, and
+   *  `deviceName` carries the runner's name so the request shape stays additive. */
+  kind: Type.Optional(Type.Union([Type.Literal("device"), Type.Literal("runner")])),
+  /** Required for a device pair, optional for a runner pair. Validated at the route rather than
+   *  here, so no existing device client's request or error changes shape. */
+  deviceName: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
   devicePubkey: Type.Optional(Type.String()),
 });
 export type PairRequest = Static<typeof PairRequestSchema>;

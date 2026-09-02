@@ -69,7 +69,7 @@ describe("listener configuration", () => {
     expect(raw.host).toBe("127.0.0.1");
     expect(raw.port).toBe(9000);
     expect(raw.capabilities).toEqual({ "com.cozylabs.test": 7 });
-    expect(loadConfig(path).hermesEndpoints[0]?.profiles.default?.tokenEnv).toBe("COZYGATEWAY_TOKEN");
+    expect(loadConfig(path).hermesEndpoints?.[0]?.profiles.default?.tokenEnv).toBe("COZYGATEWAY_TOKEN");
   });
 
   it("does not modify the file when the requested listener is invalid", () => {

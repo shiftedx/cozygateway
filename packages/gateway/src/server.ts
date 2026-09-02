@@ -47,7 +47,10 @@ import {
 } from "./adapters/attach/adapter.ts";
 import { revokeAttachTokens } from "./adapters/attach/token-auth.ts";
 import { createApp } from "./http.ts";
+import { listenerOrigin } from "./configure.ts";
+import { primaryLanAddress } from "./lan.ts";
 import { RunnerLane } from "./runner/lane.ts";
+import { RunnerRoster } from "./runner/roster.ts";
 import { RuntimeBotService, mergeRuntimeBots, runtimeSpecDefaults } from "./runner/runtime-bots.ts";
 import type { PairingAttemptLimiter } from "./pairing-admission.ts";
 import { WsHub } from "./ws-hub.ts";
@@ -62,7 +65,7 @@ import {
   type UpgradeHandler,
 } from "./upgrade-dispatcher.ts";
 import { createHermesClient } from "./hermes-bridge/client.ts";
-import { parseHermesOptions } from "./hermes-bridge/config.ts";
+import { DEFAULT_CHAT_SUGGESTION, parseHermesOptions } from "./hermes-bridge/config.ts";
 import { HermesBridge, type BotsSurface } from "./hermes-bridge/bridge.ts";
 import { FederatedBotControlSurface, endpointStorage } from "./hermes-bridge/federation.ts";
 import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
@@ -224,10 +227,15 @@ export function gatewayInfoForConfig(
       [APPROVALS_CAPABILITY_ID]: APPROVALS_CAPABILITY_VERSION,
       [COZYAPPS_CAPABILITY_ID]: COZYAPPS_CAPABILITY_VERSION,
       ...(management ? { [GATEWAY_MANAGEMENT_CAPABILITY_ID]: GATEWAY_MANAGEMENT_CAPABILITY_VERSION } : {}),
+      // Capability 52: the bots capability is advertised whether or not a Hermes endpoint is
+      // configured, because a CozyAgents-only gateway serves `/bots`, `/runners` and the runtime
+      // projection from its own rows. The three Hermes-shaped surfaces beside it stay gated on an
+      // endpoint, since there is genuinely no Dashboard, no desktop session and no harness setting
+      // behind them.
+      [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION,
       ...(hermesEndpoints(config).length === 0
         ? {}
         : {
-            [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION,
             [HERMES_DESKTOP_SESSIONS_CAPABILITY_ID]: HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION,
             [MOBILE_NODE_CAPABILITY_ID]: MOBILE_NODE_CAPABILITY_VERSION,
             [HARNESS_SETTINGS_CAPABILITY_ID]: HARNESS_SETTINGS_CAPABILITY_VERSION,
@@ -335,7 +343,10 @@ export async function startGateway(
   // Built-in optional surfaces advertise vendor capability ids only when their backing config is
   // present. Each integer version advances independently of the frozen contract literal.
   const parsedEndpoints = endpoints.map((endpoint) => ({ endpoint, options: parseHermesOptions(endpoint.config, process.env) }));
-  const hermesOptions = parsedEndpoints[0]!.options;
+  // Capability 52. A gateway with no Hermes endpoint has no endpoint options to read, so the one
+  // setting the native plane borrows from them falls back to the same default `parseHermesOptions`
+  // would have produced. Nothing else below reads this object.
+  const chatSuggestion = parsedEndpoints[0]?.options.chatSuggestion ?? DEFAULT_CHAT_SUGGESTION;
   const clientMembers = parsedEndpoints.map(({ endpoint, options: memberOptions }) => ({
     endpoint,
     options: memberOptions,
@@ -345,12 +356,14 @@ export async function startGateway(
   // Start the transport now; HermesBridge.start() below is idempotent and still owns all bridge
   // subscriptions and roster work after the listener is ready.
   for (const member of clientMembers) member.client.start();
-  const candidateGlobalSkills = new GatewayHermesGlobalSkills(
-    clientMembers.flatMap(({ endpoint, client }) => Object.keys(endpoint.config.profiles).map((profile) => ({
-      id: publicProfileId(endpoint, profile), profile, client,
-    }))),
-    storage,
-  );
+  const candidateGlobalSkills = clientMembers.length === 0
+    ? undefined
+    : new GatewayHermesGlobalSkills(
+      clientMembers.flatMap(({ endpoint, client }) => Object.keys(endpoint.config.profiles).map((profile) => ({
+        id: publicProfileId(endpoint, profile), profile, client,
+      }))),
+      storage,
+    );
   const harnessModelAdapters = clientMembers.map(
     ({ endpoint, client }) => new HermesHarnessModelSettingsAdapter(endpoint, client),
   );
@@ -363,7 +376,9 @@ export async function startGateway(
       discoverHermesUpdates(client, harnessModelAdapters[index]!.descriptor()))),
     Promise.all(clientMembers.map(({ client }, index) =>
       discoverHermesSessionManagement(client, harnessModelAdapters[index]!.descriptor()))),
-    candidateGlobalSkills.probe().then(() => candidateGlobalSkills).catch(() => undefined),
+    candidateGlobalSkills === undefined
+      ? Promise.resolve(undefined)
+      : candidateGlobalSkills.probe().then(() => candidateGlobalSkills).catch(() => undefined),
   ]);
   const discoveredWorkspaceAdapters = workspaceResults.filter((adapter) => adapter !== undefined);
   const discoveredSessionAdapters = sessionResults.filter((adapter) => adapter !== undefined);
@@ -708,7 +723,7 @@ export async function startGateway(
     },
     botConfig: configSurface,
     botHistory: historySurface,
-    chatSuggestion: hermesOptions.chatSuggestion,
+    chatSuggestion,
     turnTimeoutMs: config.turnTimeoutSeconds * 1000,
     staleTurnSweepMs: millis(config.staleTurnSweepSeconds),
     staleTurnInterruptGraceMs: millis(config.staleTurnInterruptGraceSeconds),
@@ -748,24 +763,24 @@ export async function startGateway(
   // own deadline wheel and turn-settlement rule rather than growing a second copy. Wired here, like
   // the room turn transport above, because the plane is assembled after the bridge that owns rooms.
   if (bridge instanceof HermesBridge) bridge.setGroupInteractionExpiry(nativePlane.groupInteractions());
-  // Capability 49. The runner lane exists only when the local admin placed a credential; without
-  // one the gateway still accepts and stores runtime operations, they simply wait for a runner that
-  // can prove who it is. Pairing codes and short-lived per-runner credentials are ADR 0002 work
-  // deliberately left for a later wave.
+  // Capability 49, multi-tenant since 52. The lane is always assembled now: a runner paired through
+  // `POST /pair {kind: "runner"}` gets its token at runtime, long after this line ran, so a lane
+  // built only for an operator-placed `COZYGATEWAY_RUNNER_TOKEN` would leave a freshly paired
+  // runner with nowhere to dial. The shared token stays supported as the legacy credential.
   const runnerToken = process.env["COZYGATEWAY_RUNNER_TOKEN"];
-  const runnerLane =
-    runnerToken === undefined || runnerToken.length === 0
-      ? undefined
-      : new RunnerLane({
-          token: runnerToken,
-          storage,
-          attachTokenFor: (botId) => storage.runtimeBot(botId)?.token,
-          onReceipt: () => bridge.refreshSoon("runner receipt"),
-          now: () => Date.now(),
-        });
+  const legacyRunnerConfigured = runnerToken !== undefined && runnerToken.length > 0;
+  const runnerRoster = new RunnerRoster({ storage, now: () => Date.now() });
+  const runnerLane = new RunnerLane({
+    ...(legacyRunnerConfigured ? { token: runnerToken } : {}),
+    roster: runnerRoster,
+    storage,
+    attachTokenFor: (botId) => storage.runtimeBot(botId)?.token,
+    onReceipt: () => bridge.refreshSoon("runner receipt"),
+    now: () => Date.now(),
+  });
   runtimeBotService = new RuntimeBotService({
     storage,
-    ...(runnerLane === undefined ? {} : { lane: runnerLane }),
+    lane: runnerLane,
     spec: () => runtimeSpecDefaults(process.env),
     now: () => Date.now(),
     register: (bot) => {
@@ -870,8 +885,34 @@ export async function startGateway(
         input.deviceId,
       ),
     onDeviceRevoked: (deviceId) => hub.closeDevice(deviceId),
+    // Capability 52. The roster and the lane are two views of the same runners, so the routes read
+    // the rows from one and the liveness from the other rather than either inventing the other.
+    runners: runnerRoster,
+    runnerPresence: {
+      online: (runnerId) => runnerLane.connectedRunners().includes(runnerId),
+      lastContactAt: (runnerId) => runnerLane.lastContactAt(runnerId),
+    },
+    legacyRunnerConfigured,
+    // The LISTENING port, not the configured one: a host that asked for port 0 (every test, and a
+    // supervisor that hands out ports) would otherwise mint codes naming a port nothing serves.
+    pairingUrl: () => pairingOrigin(),
+    onRunnerRevoked: (runnerId) => { runnerLane.disconnectRunner(runnerId); },
+    hermesBridgeAbsent: endpoints.length === 0,
     now: () => Date.now(),
   });
+
+  // Filled in once the listener is bound, below. Read only from inside a request handler, which
+  // cannot run before then.
+  let boundPort = config.port;
+  const pairingOrigin = (): string => {
+    if (config.publicUrl !== undefined) return config.publicUrl;
+    const host = config.host;
+    const advertised =
+      host !== undefined && host !== "0.0.0.0" && host !== "::"
+        ? host
+        : primaryLanAddress() ?? "127.0.0.1";
+    return listenerOrigin(advertised, boundPort, scheme);
+  };
 
   const server = await new Promise<Server>((resolve) => {
     // The TLS branch swaps only the factory and its options; the fetch handler, the port, the
@@ -907,13 +948,10 @@ export async function startGateway(
   routes.set("/attach/v1", (req, socket, head) =>
     attachV1Ingress.handleUpgrade(req, socket, head),
   );
-  // Capability 49, beside `/attach/v1` and authenticated the same constant-time way, with one
-  // operator-placed token instead of a per-bot one. A gateway with no runner credential does not
-  // register the path at all, so the dispatcher answers a clean HTTP error rather than opening a
-  // socket nothing can authenticate.
-  if (runnerLane !== undefined) {
-    routes.set("/runner/v1", (req, socket, head) => runnerLane.handleUpgrade(req, socket, head));
-  }
+  // Capability 49, beside `/attach/v1` and authenticated the same way. Since 52 the path is always
+  // registered: a runner pairs at runtime and every credential is resolved per connection, so a
+  // socket nothing can authenticate is closed `1008` rather than never accepted.
+  routes.set("/runner/v1", (req, socket, head) => runnerLane.handleUpgrade(req, socket, head));
   server.on("upgrade", createUpgradeDispatcher(routes));
   // Started after the listener is up so the first roster refresh cannot race the hub it
   // broadcasts through.
@@ -936,6 +974,7 @@ export async function startGateway(
     address !== null && typeof address === "object"
       ? address.port
       : config.port;
+  boundPort = port;
 
   return {
     url: `${scheme}://${config.host ?? "127.0.0.1"}:${port}`,
@@ -961,7 +1000,7 @@ export async function startGateway(
       // The bots bridge holds a dial-out socket and its own timers; closing it cancels both.
       await Promise.all(bridgeMembers.map((member) => member.bridge.close()));
       nativeBotPlane.close();
-      runnerLane?.close();
+      runnerLane.close();
       mobileNode?.close();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));

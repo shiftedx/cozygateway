@@ -3,6 +3,13 @@ import { describe, expect, it } from "vitest";
 import type { BotGroup, BotGroupMessage, BotSummary, ServerFrame } from "../src/index.ts";
 import {
   AGENT_INBOX_CAPABILITY_ID,
+  RunnerSchema,
+  RunnersResponseSchema,
+  RunnerSelfSchema,
+  RunnerPairResponseSchema,
+  RunnerPairCodeResponseSchema,
+  RunnerPatchRequestSchema,
+  PairRequestSchema,
   BotCreateRequestSchema,
   BotRuntimeProjectionSchema,
   BotCreateResponseSchema,
@@ -661,8 +668,12 @@ describe("capability advertisement", () => {
     // turn land in the existing interaction inbox and resolve through the existing routes, tool
     // events project as ephemeral `bot_tool_activity` carrying `room`, and a room advertises its
     // pending interactions. Additive: no new route, every new field optional, Hermes members
-    // unchanged.
-    expect(BOTS_CAPABILITY_VERSION).toBe(51);
+    // unchanged. 52 pairs the computers themselves: `POST /pair {kind: "runner"}` mints a
+    // per-runner token, `GET /runners`, `PATCH /runners/:id` and `DELETE /runners/:id` manage the
+    // roster, `/runner/v1` carries one socket per runner, and a gateway with no Hermes endpoint is
+    // a supported configuration whose readiness reports the bridge as absent. A client below 52
+    // never sends `kind` and never calls the routes.
+    expect(BOTS_CAPABILITY_VERSION).toBe(52);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {
@@ -1118,5 +1129,116 @@ describe("capability 50 bot history", () => {
     expect(check(BotHistoryResolveRequestSchema, { choices: [] })).toBe(false);
     expect(check(BotHistoryResolveRequestSchema, { choices: [{ path: "a.ts", pick: "mine" }] })).toBe(false);
     expect(check(BotHistoryTryRequestSchema, { action: "abandon" })).toBe(false);
+  });
+});
+
+/** Capability 52. These five shapes are what the app reads to answer "which of my computers is
+ *  here", and what the installer reads to know it succeeded. Every case below is the EXACT JSON the
+ *  gateway routes emit (`packages/gateway/src/runner/roster.ts` and the `/runners` routes in
+ *  `http.ts`), so a change to either side that drifts from the other fails here rather than on a
+ *  phone. They are closed, so an unknown field is a refusal in every direction. */
+describe("paired runners (capability 52)", () => {
+  // The bytes `GET /runners` puts in each array element, and `POST /pair {kind: "runner"}` puts in
+  // `runner`: a machine that has connected once, so nothing is null.
+  const runner = {
+    id: "3f8c1b2e-6a4d-4f52-9c31-0d5a7e9b2c44",
+    name: "kyle-mbp",
+    platform: "darwin/arm64/24.5.0",
+    version: "0.1.0",
+    backends: ["process"],
+    default: true,
+    createdAt: 1_800_000_000_000,
+    lastSeenAt: 1_800_000_015_000,
+    online: true,
+  };
+  // The same row the moment after pairing, before the runner has ever dialed in. Every optional
+  // fact is null rather than absent or invented, which is what the gateway actually answers.
+  const fresh = { ...runner, platform: null, version: null, backends: [], lastSeenAt: null, online: false };
+
+  it("accepts a runner row, connected and freshly paired, and refuses an unknown field", () => {
+    expect(check(RunnerSchema, runner)).toBe(true);
+    expect(check(RunnerSchema, fresh)).toBe(true);
+    expect(check(RunnersResponseSchema, { runners: [runner, fresh] })).toBe(true);
+    expect(check(RunnersResponseSchema, { runners: [] })).toBe(true);
+    expect(check(RunnerSchema, { ...runner, token: "secret" })).toBe(false);
+    expect(check(RunnersResponseSchema, { runners: [runner], cursor: "next" })).toBe(false);
+  });
+
+  it("keeps every field of a runner row required, so a client never guesses at an absent one", () => {
+    for (const field of Object.keys(runner)) {
+      const { [field]: _dropped, ...without } = runner as Record<string, unknown>;
+      expect(check(RunnerSchema, without)).toBe(false);
+    }
+    // `default` and `online` are booleans, not the truthy strings a hand-written client might send.
+    expect(check(RunnerSchema, { ...runner, default: "true" })).toBe(false);
+    expect(check(RunnerSchema, { ...runner, online: 1 })).toBe(false);
+    // `platform` and `lastSeenAt` are nullable, never merely absent.
+    expect(check(RunnerSchema, { ...runner, platform: undefined })).toBe(false);
+  });
+
+  it("accepts the pair reply the runner installer reads, and refuses one carrying anything else", () => {
+    const gateway = { name: "cozygateway", version: "0.6.5", contract: "v1", capabilities: { "com.cozylabs.bots": 52 } };
+    expect(check(RunnerPairResponseSchema, {
+      runnerToken: "sYqQvJ0aVvkq3aQ4h4Jm2m8YxK2xkNRs9xVQ2m6vqfw",
+      runner: fresh,
+      gateway,
+    })).toBe(true);
+    // The token is on this reply and nowhere else, and nothing else rides along with it.
+    expect(check(RunnerPairResponseSchema, { runnerToken: "t", runner: fresh, gateway, setupCode: "AAAA-BBBB" })).toBe(false);
+    expect(check(RunnerPairResponseSchema, { runner: fresh, gateway })).toBe(false);
+  });
+
+  it("accepts what GET /runners/self answers, which is six fields and no credential", () => {
+    const self = {
+      id: runner.id,
+      name: "kyle-mbp",
+      platform: "darwin/arm64/24.5.0",
+      default: true,
+      lastSeenAt: 1_800_000_015_000,
+      attached: true,
+    };
+    expect(check(RunnerSelfSchema, self)).toBe(true);
+    // Paired but not yet dialed in: the row exists and says so honestly.
+    expect(check(RunnerSelfSchema, { ...self, platform: null, lastSeenAt: null, attached: false })).toBe(true);
+    expect(Object.keys(RunnerSelfSchema.properties).sort()).toEqual([
+      "attached", "default", "id", "lastSeenAt", "name", "platform",
+    ]);
+    // It is a runner's view of itself, not the roster row: no token, and no other machine's facts.
+    for (const leak of ["token", "runnerToken", "tokenHash", "backends"])
+      expect(RunnerSelfSchema.properties).not.toHaveProperty(leak);
+    expect(check(RunnerSelfSchema, { ...self, token: "secret" })).toBe(false);
+    expect(check(RunnerSelfSchema, { ...self, online: true })).toBe(false);
+  });
+
+  it("accepts the minted pairing code with the origin to dial, and nothing more", () => {
+    const minted = {
+      setupCode: "K7QP-3MRT",
+      expiresAt: 1_800_000_600_000,
+      gatewayUrl: "http://192.168.1.24:8787",
+    };
+    expect(check(RunnerPairCodeResponseSchema, minted)).toBe(true);
+    expect(check(RunnerPairCodeResponseSchema, { ...minted, kind: "runner" })).toBe(false);
+    expect(check(RunnerPairCodeResponseSchema, { setupCode: "K7QP-3MRT", expiresAt: 1 })).toBe(false);
+    // A code is minted, never echoed back with the credential it will become.
+    for (const leak of ["runnerToken", "deviceToken", "token"])
+      expect(RunnerPairCodeResponseSchema.properties).not.toHaveProperty(leak);
+  });
+
+  it("moves the default by naming one runner, and refuses a patch that says anything else", () => {
+    expect(check(RunnerPatchRequestSchema, { default: true })).toBe(true);
+    expect(check(RunnerPatchRequestSchema, { default: false })).toBe(true);
+    expect(check(RunnerPatchRequestSchema, {})).toBe(false);
+    expect(check(RunnerPatchRequestSchema, { default: true, name: "renamed" })).toBe(false);
+  });
+
+  it("keeps the pair request additive: a pre-52 device body is still exactly valid", () => {
+    // The body every shipped client sends, unchanged by 52.
+    expect(check(PairRequestSchema, { setupCode: "K7QP-3MRT", deviceName: "Kyle's iPhone" })).toBe(true);
+    // The runner body, where `deviceName` carries the runner's name (controller ruling 6).
+    expect(check(PairRequestSchema, { setupCode: "K7QP-3MRT", deviceName: "kyle-mbp", kind: "runner" })).toBe(true);
+    // `deviceName` is optional in the SCHEMA and required at the route for a device pair, which is
+    // what leaves every existing client's request and error untouched.
+    expect(check(PairRequestSchema, { setupCode: "K7QP-3MRT", kind: "runner" })).toBe(true);
+    expect(check(PairRequestSchema, { setupCode: "K7QP-3MRT", kind: "phone" })).toBe(false);
   });
 });
