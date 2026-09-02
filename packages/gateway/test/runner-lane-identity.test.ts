@@ -145,6 +145,25 @@ describe("the lane and a per-runner token", () => {
     expect(h.roster.get(silent.runner.id)).toMatchObject({ platform: null, version: null, backends: ["process"] });
   });
 
+  it("renames the row when the machine renames itself, and leaves it alone when it says nothing", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "old-name" });
+    const first = connect(h, paired.token);
+    await hello(first, { runnerId: paired.runner.id, name: "kyle-mbp" });
+    await until(() => acked(first));
+    // Renaming a computer renames its roster row: a name frozen at pairing time would be stale,
+    // not stable.
+    expect(h.roster.get(paired.runner.id)?.name).toBe("kyle-mbp");
+
+    first.ws.close();
+    await until(() => h.lane.connectedRunners().length === 0);
+    const second = connect(h, paired.token);
+    // An older runner reports no name at all; what the row already holds stands.
+    await hello(second, { runnerId: paired.runner.id });
+    await until(() => acked(second));
+    expect(h.roster.get(paired.runner.id)?.name).toBe("kyle-mbp");
+  });
+
   it("refuses a revoked token, and closes the socket that token had open", async () => {
     const h = await harness();
     const paired = h.roster.pair({ name: "gone" });

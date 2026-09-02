@@ -2,7 +2,15 @@ import { once } from "node:events";
 
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
-import type { BotCreateResponse } from "cozygateway-contract";
+import {
+  check,
+  RunnerSchema,
+  RunnersResponseSchema,
+  RunnerSelfSchema,
+  RunnerPairCodeResponseSchema,
+  RunnerPairResponseSchema,
+  type BotCreateResponse,
+} from "cozygateway-contract";
 
 import { startGateway, type RunningGateway } from "../src/server.ts";
 
@@ -100,7 +108,11 @@ describe("a gateway configured with no Hermes endpoint", () => {
     const l = await live();
     const minted = await l.authed("/runners/pair-code", { method: "POST" });
     expect(minted.status).toBe(200);
-    const code = (await minted.json()) as { setupCode: string; expiresAt: number; gatewayUrl: string };
+    const mintedBody: unknown = await minted.json();
+    // The published schema against the REAL bytes: a route that drifts from the contract fails
+    // here rather than on a phone.
+    expect(check(RunnerPairCodeResponseSchema, mintedBody)).toBe(true);
+    const code = mintedBody as { setupCode: string; expiresAt: number; gatewayUrl: string };
     // Port 0 was requested, so a `gatewayUrl` built from the CONFIG would name a port nothing serves.
     expect(new URL(code.gatewayUrl).port).toBe(String(l.gateway.port));
     expect(code.expiresAt).toBeGreaterThan(Date.now());
@@ -111,14 +123,18 @@ describe("a gateway configured with no Hermes endpoint", () => {
       body: JSON.stringify({ setupCode: code.setupCode, deviceName: "kyle-mbp", kind: "runner" }),
     });
     expect(paired.status).toBe(200);
-    const body = (await paired.json()) as { runnerToken: string; runner: { id: string } };
+    const pairedBody: unknown = await paired.json();
+    expect(check(RunnerPairResponseSchema, pairedBody)).toBe(true);
+    const body = pairedBody as { runnerToken: string; runner: { id: string } };
 
     // The installer's health check, over the real route: paired but not yet attached.
     const self = await fetch(`${l.gateway.url}/runners/self`, {
       headers: { authorization: `Bearer ${body.runnerToken}` },
     });
     expect(self.status).toBe(200);
-    expect(await self.json()).toEqual({
+    const selfBody: unknown = await self.json();
+    expect(check(RunnerSelfSchema, selfBody)).toBe(true);
+    expect(selfBody).toEqual({
       id: body.runner.id,
       name: "kyle-mbp",
       platform: null,
@@ -180,9 +196,12 @@ describe("a gateway configured with no Hermes endpoint", () => {
     expect(self.platform).toBe("darwin/arm64/24.5.0");
     expect(self.lastSeenAt).not.toBeNull();
 
-    const roster = (await (await l.authed("/runners")).json()) as {
+    const rosterBody: unknown = await (await l.authed("/runners")).json();
+    expect(check(RunnersResponseSchema, rosterBody)).toBe(true);
+    const roster = rosterBody as {
       runners: Array<{ id: string; name: string; platform: string | null; version: string | null; online: boolean; default: boolean; lastSeenAt: number | null }>;
     };
+    expect(check(RunnerSchema, roster.runners[0])).toBe(true);
     expect(roster.runners).toHaveLength(1);
     expect(roster.runners[0]).toMatchObject({
       id: paired.runner.id,

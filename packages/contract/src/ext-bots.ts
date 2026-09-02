@@ -1757,7 +1757,7 @@ export const RunnerPatchRequestSchema = Type.Object({
 }, { additionalProperties: false });
 export type RunnerPatchRequest = Static<typeof RunnerPatchRequestSchema>;
 
-/** `GET /runners/self`, authenticated by the runner\'s own token and nothing else. It is what the
+/** `GET /runners/self`, authenticated by the runner's own token and nothing else. It is what the
  *  installer polls after registering the service: the row exists the moment the pair lands, so
  *  `attached` is the separate question of whether that machine has dialed in yet. */
 export const RunnerSelfSchema = Type.Object({
@@ -2190,9 +2190,9 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  *
  * `GET /runners`, `PATCH /runners/:id {default}` and `DELETE /runners/:id` are device-authenticated
  * and mirror the devices routes, including the 404 for an unknown id. `POST /runners/pair-code`
- * mints a runner code from the app with the same TTL and bucket the CLI\'s `pair --kind runner`
- * uses, and `GET /runners/self` answers one row under the runner\'s own bearer, which is the only
- * route that credential opens and the one an installer\'s health check polls. The first paired runner is
+ * mints a runner code from the app with the same TTL and bucket the CLI's `pair --kind runner`
+ * uses, and `GET /runners/self` answers one row under the runner's own bearer, which is the only
+ * route that credential opens and the one an installer's health check polls. The first paired runner is
  * the default; setting a new default clears the flag on every other row in the same transaction; a
  * delete revokes that runner's token and closes its socket.
  *
@@ -2200,7 +2200,8 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * row, so two computers hold two sockets at once and a supersede (close `4000`) is scoped to one
  * runner id. The operator-placed `COZYGATEWAY_RUNNER_TOKEN` remains supported as the legacy shared
  * credential with its old single-connection behaviour. The runner's `hello` gains optional `name`,
- * `platform` and `agentVersion`, recorded on the row and projected here.
+ * `platform` and `agentVersion`, recorded on the row on every hello that carries them, so a renamed
+ * computer renames its roster row, and projected here.
  *
  * A gateway with no Hermes endpoint is a supported configuration from 52: the roster and readiness
  * answer from runtime bots alone and `/ready` reports the Hermes bridge as `absent` rather than

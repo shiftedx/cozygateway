@@ -124,6 +124,19 @@ describe("loadConfig", () => {
     expect(() => loadConfig(writeConfig({ name: "removed", hermes }))).toThrow(ContractViolation);
   });
 
+  it("refuses a leftover top-level `hermes` block BY NAME rather than starting with no Hermes", () => {
+    // Capability 52 made `hermesEndpoints` optional, so this config would otherwise validate and
+    // come up as a CozyAgents-only gateway serving none of the profiles the operator declared. The
+    // refusal names the key and the field that replaced it, because a silent demotion of a
+    // configured Hermes to no Hermes is the one failure this check exists to prevent.
+    const path = writeConfig({ name: "leftover", hermes });
+    expect(() => loadConfig(path)).toThrow(/`hermes` block was replaced by `hermesEndpoints`/);
+    expect(() => loadConfig(path)).toThrow(ContractViolation);
+    // Moving it across is the repair, and it loads.
+    expect(loadConfig(writeConfig({ name: "moved", hermesEndpoints: oneEndpoint() })).hermesEndpoints)
+      .toHaveLength(1);
+  });
+
   // Issue #16: capabilities is an optional gateway-level config field, surfaced as
   // GatewayInfo.capabilities.
   it("loads a config with no capabilities field", () => {

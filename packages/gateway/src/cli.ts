@@ -280,7 +280,7 @@ async function runPair(
   const ttlMs = ttl === undefined ? SETUP_CODE_TTL_MS : parsedTtlMs(ttl);
   const storage = openStorage(config.dbPath);
   const code = newSetupCode();
-  // Capability 52. The kind rides on the code itself, so a runner code pasted into the app\'s
+  // Capability 52. The kind rides on the code itself, so a runner code pasted into the app's
   // pairing prompt (or the reverse) is refused as an unknown code rather than minting the wrong
   // credential. Absent means "device", which is every code minted before 52.
   storage.createSetupCode(code, Date.now() + ttlMs, kind);

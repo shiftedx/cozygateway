@@ -79,8 +79,9 @@ Authorization: Bearer <COZYRUNNER_TOKEN>
 `runnerId` is the gateway's own row id for a runner paired through `POST /pair {kind: "runner"}`;
 the pair response carries it and the runner keeps it in `COZYRUNNER_ID`. `name`, `platform` and
 `agentVersion` are capability 52, all optional, and are recorded on that row and projected by `GET
-/runners` (`platform` is flattened to `os/arch/release`). A runner that sends none of them leaves
-the row's columns as they were, and a runner that sends them to a gateway below 52 has them ignored,
+/runners` (`platform` is flattened to `os/arch/release`). `name` is recorded on EVERY hello that
+carries one, so renaming a computer renames its roster row rather than leaving the name it had at
+pairing time. A runner that sends none of them leaves the row's columns as they were, and a runner that sends them to a gateway below 52 has them ignored,
 because unknown properties are ignored on every runner frame.
 
 `backends` is `docker`, `process`, or both. `process` is the development shim for a macOS box

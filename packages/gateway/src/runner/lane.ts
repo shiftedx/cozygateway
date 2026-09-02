@@ -60,7 +60,7 @@ interface RunnerConnection {
 /** The gateway half of the CozyRunner control stream (`/runner/v1`, capability 49, multi-tenant
  * since 52).
  *
- * One socket per paired runner, each authenticated by that runner\'s own token, plus the legacy
+ * One socket per paired runner, each authenticated by that runner's own token, plus the legacy
  * shared credential as one more tenant. It holds NO desired
  * state of its own: the durable truth is `runner_operations` in storage, and this lane is only the
  * transport that hands an operation to a runner and writes its receipts back. That is what lets a
@@ -142,7 +142,7 @@ export class RunnerLane {
     this.#wss.close();
   }
 
-  /** Closes a revoked runner\'s socket, which is the other half of `DELETE /runners/:id`: the row
+  /** Closes a revoked runner's socket, which is the other half of `DELETE /runners/:id`: the row
    *  is gone, so the socket it authenticated must not outlive it. */
   disconnectRunner(runnerId: string): boolean {
     const connection = this.#connections.get(runnerId);
@@ -276,7 +276,7 @@ export class RunnerLane {
           socket.close(1002, `this gateway speaks runner-v1 version ${RUNNER_V1_VERSION} only`);
           return;
         }
-        // A runner may not claim another runner\'s identity: the bearer decided which row this
+        // A runner may not claim another runner's identity: the bearer decided which row this
         // socket is, and a hello naming a different one is skew or theft, never a rename.
         if (connection.rowId !== undefined && frame.runnerId !== connection.rowId) {
           socket.close(1008, "hello runnerId does not match the paired runner");
@@ -297,6 +297,11 @@ export class RunnerLane {
         if (connection.rowId !== undefined) {
           this.#roster?.observe(connection.rowId, {
             backends: frame.backends,
+            // The machine's own name, recorded on every hello that carries one: a person who
+            // renames their computer expects the roster to follow rather than to keep showing the
+            // name it had the day it was paired. A runner that reports none leaves the row's name
+            // exactly as it is.
+            ...(frame.name === undefined ? {} : { name: frame.name }),
             ...(frame.platform === undefined ? {} : { platform: platformLabel(frame.platform)! }),
             ...(frame.agentVersion === undefined ? {} : { version: frame.agentVersion }),
           });

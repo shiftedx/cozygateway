@@ -52,9 +52,9 @@ export const RunnerHelloSchema = Type.Object({
   /** Capability 52, all optional and all recorded on the runner's roster row. A runner built
    *  before 52 sends none of them and simply has nulls on its row; a runner that sends them to a
    *  gateway below 52 has them ignored, because unknown properties are ignored on every runner
-   *  frame. `name` is what the machine calls itself; the roster row's name wins nothing back from
-   *  it once a person has renamed the row, which is why the gateway records it only when it has
-   *  none of its own. */
+   *  frame. `name` is what the machine calls itself, and every hello that carries one updates the
+   *  row: renaming a computer is a thing people do, and a roster still showing the name it had at
+   *  pairing time would be stale rather than stable. A hello without it changes nothing. */
   name: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
   platform: Type.Optional(
     Type.Object({

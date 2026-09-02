@@ -291,7 +291,7 @@ export interface AppDeps {
   /** Whether the legacy shared `COZYGATEWAY_RUNNER_TOKEN` is configured, which the roster shows as
    *  one row so the list and the lane never disagree about who exists. */
   legacyRunnerConfigured?: boolean;
-  /** Closes a revoked runner\'s socket. The row is gone, so the socket it authenticated must not
+  /** Closes a revoked runner's socket. The row is gone, so the socket it authenticated must not
    *  outlive it. */
   onRunnerRevoked?: (runnerId: string) => void;
   /** The origin a freshly minted pairing code should be dialed at, which is the LISTENING port
@@ -920,7 +920,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
       return c.json(errorBody("invalid_request", detail), 400);
     }
     // Capability 52. `deviceName` is required for a device pair and optional for a runner pair,
-    // enforced here rather than in the schema so no existing device client\'s request, response or
+    // enforced here rather than in the schema so no existing device client's request, response or
     // error message changes shape.
     const kind = pairRequest.kind ?? "device";
     if (kind === "device" && pairRequest.deviceName === undefined) {
@@ -1001,8 +1001,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
         ],
       }),
     );
-    // Authenticated by the runner\'s OWN token and nothing else. It is the only route a runner
-    // credential opens: no chat, no device list, no bot creation, and no other runner\'s row.
+    // Authenticated by the runner's OWN token and nothing else. It is the only route a runner
+    // credential opens: no chat, no device list, no bot creation, and no other runner's row.
     app.get("/runners/self", (c) => {
       const row = roster.resolve(c.req.header("authorization"));
       if (row === undefined)
