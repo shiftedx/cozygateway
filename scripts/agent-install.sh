@@ -1530,15 +1530,20 @@ stop_owned_windows_gateway() {
       foreach ($process in $remaining) {
         if ($stopped.Add([int]$process.ProcessId)) { & $taskkill /PID ([string]$process.ProcessId) /T /F *> $null }
       }
-      Start-Sleep -Milliseconds 100
+      Start-Sleep -Seconds 1
     }
     if (@(Managed-GatewayProcesses).Count -ne 0) { exit 45 }
     exit 0
   ' >/dev/null 2>&1
   code=$?
   set -e
-  [ "$code" -eq 3 ] && return 1
-  [ "$code" -eq 0 ] || die "port $PORT is owned by a process this installer cannot safely stop"
+  case "$code" in
+    0) ;;
+    3) return 1 ;;
+    42) die "port $PORT is owned by a process this installer cannot safely stop" ;;
+    45) die "the previous CozyGateway process did not exit after termination" ;;
+    *) die "Windows gateway ownership cleanup failed (code $code)" ;;
+  esac
   release_code=1
   for attempt in $(seq 1 10); do
     set +e
