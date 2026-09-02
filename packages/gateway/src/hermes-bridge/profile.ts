@@ -44,6 +44,10 @@ export const APPLIED_KEY_OF = {
   // this map stays total over every `BotProfilePatch` key and so a runtime bot's peer, which
   // answers this key in its own `applied` map, is echoed under the name the client already reads.
   guardrailLevel: "guardrails",
+  // Capability 58. `guardrailCeiling` is `Type.Optional(Type.Never())` on `BotProfilePatchSchema`,
+  // so `patch.guardrailCeiling` is never defined and `buildConfigurePayload` never produces this
+  // key: it exists only to keep this map total over every `BotProfilePatch` key.
+  guardrailCeiling: "guardrail_ceiling",
 } as const satisfies Record<keyof BotProfilePatch, string>;
 
 /** How a `profiles.configure` reply was understood, the same three-way reading `saveBotMeta` uses
