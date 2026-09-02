@@ -6,6 +6,7 @@ import type {
   BotChatAttachment,
   BotChatMessage,
   BotMobileReceipt,
+  BotGroupPendingInteraction,
   BotInteractionSettlement,
   BotPendingClarification,
   BotSummary,
@@ -3434,6 +3435,7 @@ export class Storage {
     ruleName: string;
     createdAt: number;
     resolutionRequestedAt?: number;
+    room?: string;
   }> {
     if (bots.length === 0) return [];
     const placeholders = bots.map(() => "?").join(", ");
@@ -3442,6 +3444,7 @@ export class Storage {
         `SELECT bot, session_id AS sessionId, turn_id AS turnId,
                 interaction_id AS toolCallId,
                 json_extract(payload_json, '$.name') AS ruleName,
+                json_extract(payload_json, '$.room.name') AS room,
                 updated_at AS createdAt,
                 resolution_requested_at AS resolutionRequestedAt
          FROM bot_native_interactions
@@ -3455,13 +3458,36 @@ export class Storage {
         turnId: string;
         toolCallId: string;
         ruleName: string;
+        room: string | null;
         createdAt: number;
         resolutionRequestedAt: number | null;
       }>;
-    return rows.map(({ resolutionRequestedAt, ...row }) => ({
+    return rows.map(({ resolutionRequestedAt, room, ...row }) => ({
       ...row,
       ...(resolutionRequestedAt === null ? {} : { resolutionRequestedAt }),
+      // Capability 51. A room approval is the same durable row with the room name recorded beside
+      // the rule name, so one inbox answers for both lanes and a 1:1 row is byte-identical.
+      ...(room === null ? {} : { room }),
     }));
+  }
+
+  /** Capability 51. What a room's members are currently blocked on, read off the same durable
+   * interaction table the 1:1 inbox reads. Room membership lives in the payload rather than in a
+   * new column on purpose: the row is byte-for-byte the row a 1:1 chat writes, so every existing
+   * resolve, expiry and retention path applies to it unchanged.
+   *
+   * A POINTER projection only: the member, the kind, the resolution id, and the room turn. No
+   * rule name, prompt or option list, because the room surface is not where a card is rendered. */
+  botGroupPendingInteractions(key: string): BotGroupPendingInteraction[] {
+    return this.#db
+      .prepare(
+        `SELECT bot AS member, kind, interaction_id AS id, turn_id AS turnId
+         FROM bot_native_interactions
+         WHERE status = 'pending' AND json_extract(payload_json, '$.room.key') = ?
+         ORDER BY updated_at, interaction_id
+         LIMIT 32`,
+      )
+      .all(key) as unknown as BotGroupPendingInteraction[];
   }
 
   /** Bounded display-safe clarification recovery. The original payload remains private in the
@@ -3492,13 +3518,16 @@ export class Storage {
         resolutionRequestedAt: number | null;
       }>;
     return rows.map(({ payloadJson, expiresAt, resolutionRequestedAt, ...row }) => {
-      const payload = JSON.parse(payloadJson) as { prompt?: unknown; options?: unknown };
+      const payload = JSON.parse(payloadJson) as { prompt?: unknown; options?: unknown; room?: { name?: unknown } };
+      const room = typeof payload.room?.name === "string" ? payload.room.name : undefined;
       return {
         ...row,
         prompt: typeof payload.prompt === "string" ? payload.prompt : "",
         options: Array.isArray(payload.options) ? payload.options as BotPendingClarification["options"] : [],
         ...(expiresAt === null ? {} : { expiresAt }),
         ...(resolutionRequestedAt === null ? {} : { resolutionRequestedAt }),
+        // Capability 51, as on the approval inbox.
+        ...(room === undefined ? {} : { room }),
       };
     });
   }

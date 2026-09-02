@@ -64,7 +64,7 @@ import type {
   BotClarifyResolveOutcome,
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
-import { GroupRooms } from "./group-rooms.ts";
+import { GroupRooms, type RoomInteractionExpiry } from "./group-rooms.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
 import {
   BotNameInvalid,
@@ -465,6 +465,9 @@ export class HermesBridge implements BotControlSurface {
           ? undefined
           : bots.some((bot) => bot.name === name);
       },
+      // Capability 51. Only a runtime member's room turn projects approvals, clarifications and
+      // tool steps; a Hermes member's room turn keeps dropping them.
+      isRuntimeMember: (name) => this.#runtimeBotNames().has(name),
       memberExists: async (name) => {
         // Checked before the round trip for the same reason: `profiles.list` never names a runtime
         // bot, so asking it would answer `false` and retire a perfectly live member.
@@ -520,6 +523,11 @@ export class HermesBridge implements BotControlSurface {
   }
   setGroupNativeTurns(endpoint: NativeGroupTurnEndpoint): void {
     this.#groups.setNativeTurns(endpoint);
+  }
+  /** Capability 51. Hands the rooms the native plane's interaction bookkeeping, once that plane
+   *  exists. Without it a room still projects its cards; it just cannot arm their deadlines. */
+  setGroupInteractionExpiry(expiry: RoomInteractionExpiry): void {
+    this.#groups.setInteractionExpiry(expiry);
   }
   canAcceptGroupAttachEvent(
     agentId: string,

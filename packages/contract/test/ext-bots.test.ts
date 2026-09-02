@@ -656,8 +656,13 @@ describe("capability advertisement", () => {
     // runtime bot outright: `POST /bots {runtime: "cozyagents"}` writes a gateway-owned row, mints
     // the attach token, and enqueues the operation a CozyRunner reconciles, with
     // `GET /bots/:name/runtime` projecting the stage and `DELETE /bots/:name` answering for it.
-    // A client below 49 never sends the field and never calls the route.
-    expect(BOTS_CAPABILITY_VERSION).toBe(50);
+    // A client below 49 never sends the field and never calls the route. 50 adds the bot history
+    // lane. 51 lets a room member turn ask: approval and clarify events on a runtime member's room
+    // turn land in the existing interaction inbox and resolve through the existing routes, tool
+    // events project as ephemeral `bot_tool_activity` carrying `room`, and a room advertises its
+    // pending interactions. Additive: no new route, every new field optional, Hermes members
+    // unchanged.
+    expect(BOTS_CAPABILITY_VERSION).toBe(51);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {

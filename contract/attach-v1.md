@@ -135,6 +135,15 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `del
   and must never dead-letter the stream.
 - Approval and clarify records have stable ids. Resolution commands are idempotent; the first
   terminal outcome wins. Pending records may carry expiry times and resolve to `expired` once.
+- Capability 51 (`com.cozylabs.bots`). A ROOM member turn may raise `approval`, `clarify` and
+  `tool` events, which the gateway previously acknowledged and dropped. Nothing on this wire
+  changes: the ids, the statuses, and the `resolve_approval` / `resolve_clarify` commands the
+  gateway sends back are the same ones a 1:1 turn uses, addressed to the same `threadId` (the
+  gateway-owned `group:<room>:<member>` thread) and `turnId` the `turn` command carried. A peer
+  therefore raises one in a room exactly as it does in a chat, `expiresAt` included: a room
+  interaction runs on the same deadline a chat one does. The gateway also EXPIRES a room
+  interaction still pending when its member turn seals, so a peer must not expect a resolution
+  after it has sealed the turn that asked.
 - `scheduled` is an unanchored durable delivery with a caller-owned occurrence key. Its target is either
   an explicit `threadId`, or `{ "kind": "canonical_home" }`. The latter is meaningful only for the
   authenticated native Bot Mode identity: admission atomically binds the delivery to that identity's

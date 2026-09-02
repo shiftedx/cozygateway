@@ -744,6 +744,10 @@ export async function startGateway(
     mobileNode,
   });
   const nativePlane = nativeBotPlane;
+  // Capability 51. A room member turn records ordinary interaction rows, so it borrows the plane's
+  // own deadline wheel and turn-settlement rule rather than growing a second copy. Wired here, like
+  // the room turn transport above, because the plane is assembled after the bridge that owns rooms.
+  if (bridge instanceof HermesBridge) bridge.setGroupInteractionExpiry(nativePlane.groupInteractions());
   // Capability 49. The runner lane exists only when the local admin placed a credential; without
   // one the gateway still accepts and stores runtime operations, they simply wait for a runner that
   // can prove who it is. Pairing codes and short-lived per-runner credentials are ADR 0002 work

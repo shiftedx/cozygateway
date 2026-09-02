@@ -808,6 +808,9 @@ export const BotClarifyPendingFrameSchema = Type.Object({
   options: Type.Array(BotClarifyOptionSchema),
   expiresAt: Type.Optional(Type.Integer()),
   updatedAt: Type.Integer(),
+  /** Capability 51. Present for a clarification raised by a member turn inside a group room; then
+   *  `bot` is the member and `sessionId` is the gateway-owned `group:<room>:<member>` thread. */
+  room: Type.Optional(Type.String()),
 });
 export type BotClarifyPendingFrame = Static<typeof BotClarifyPendingFrameSchema>;
 
@@ -832,6 +835,8 @@ export const BotClarifyResolvedFrameSchema = Type.Object({
   outcome: Type.Union([Type.Literal("selected"), Type.Literal("expired"), Type.Literal("cancelled")]),
   selectedOptionId: Type.Optional(Type.String()),
   updatedAt: Type.Integer(),
+  /** Capability 51. The group room the member turn belongs to, as on the pending frame. */
+  room: Type.Optional(Type.String()),
 });
 export type BotClarifyResolvedFrame = Static<typeof BotClarifyResolvedFrameSchema>;
 
@@ -1352,6 +1357,25 @@ export type BotGroupMessage = Static<typeof BotGroupMessageSchema>;
  *  with, and that order is what the per-round speaker rotation turns. `state` is the room's live
  *  orchestration state; `needsYou` is the sticky escalation flag (a member's reply mentioned
  *  `@user`), cleared when the user sends into the room or opens it. */
+/** Capability 51. One interaction a room member is currently blocked on, projected onto the room
+ *  so a client can badge the room itself rather than discovering it only in the interaction inbox.
+ *
+ *  It is a POINTER, never a card: the id is the same `toolCallId`/`clarifyId` the inbox and the
+ *  `POST /bots/:member/approvals/:id/approve` and `POST /bots/:member/clarifications/:id` routes
+ *  already use, so the room surface carries no prompt, no tool name, no option list, and nothing a
+ *  reader could mistake for the request itself. The room transcript is unchanged: a pending
+ *  interaction is live state, and it is gone from this array the moment it settles. */
+export const BotGroupPendingInteractionSchema = Type.Object({
+  /** The member whose turn is blocked. This is the bot the resolve route is addressed to. */
+  member: Type.String({ maxLength: 256 }),
+  kind: Type.Union([Type.Literal("approval"), Type.Literal("clarify")]),
+  /** The attach-v1 approval or clarify id: the resolution key on the existing routes. */
+  id: Type.String({ maxLength: 256 }),
+  /** The room member turn that raised it. */
+  turnId: Type.String({ maxLength: 256 }),
+});
+export type BotGroupPendingInteraction = Static<typeof BotGroupPendingInteractionSchema>;
+
 export const BotGroupSchema = Type.Object({
   name: Type.String(),
   members: Type.Array(Type.String()),
@@ -1363,6 +1387,9 @@ export const BotGroupSchema = Type.Object({
   epoch: Type.Integer(),
   /** Stamp of the newest log entry, or the room's creation when the log is empty. */
   updatedAt: Type.Integer(),
+  /** Capability 51. Interactions a member of this room is currently waiting on. Absent when there
+   *  are none, so a room that never blocks is byte-identical to what it was below 51. */
+  pendingInteractions: Type.Optional(Type.Array(BotGroupPendingInteractionSchema, { maxItems: 32 })),
 });
 export type BotGroup = Static<typeof BotGroupSchema>;
 
@@ -1416,6 +1443,10 @@ export const BotGroupStateFrameSchema = Type.Object({
   epoch: Type.Integer(),
   note: Type.Optional(BotGroupNoteSchema),
   updatedAt: Type.Integer(),
+  /** Capability 51. The room's pending interactions at the moment this frame was built, the same
+   *  array `BotGroup` carries. A frame is emitted when one opens and when one settles, so a client
+   *  holding the rooms screen can badge without re-reading the room. */
+  pendingInteractions: Type.Optional(Type.Array(BotGroupPendingInteractionSchema, { maxItems: 32 })),
 });
 export type BotGroupStateFrame = Static<typeof BotGroupStateFrameSchema>;
 
@@ -1482,6 +1513,10 @@ export const BotPendingApprovalSchema = Type.Object({
   createdAt: Type.Integer(),
   /** A device has durably submitted an action; wait for the terminal Hermes event. */
   resolutionRequestedAt: Type.Optional(Type.Integer()),
+  /** Capability 51. The group room whose member turn raised this approval. Absent for a 1:1 chat,
+   *  which is every row written before 51. `sessionId` is then the gateway-owned
+   *  `group:<room>:<member>` thread and `turnId` is the room member turn. */
+  room: Type.Optional(Type.String()),
 });
 export type BotPendingApproval = Static<typeof BotPendingApprovalSchema>;
 
@@ -1520,6 +1555,8 @@ export const BotPendingClarificationSchema = Type.Object({
   options: Type.Array(BotClarifyOptionSchema, { minItems: 1, maxItems: 20 }),
   expiresAt: Type.Optional(Type.Integer()),
   resolutionRequestedAt: Type.Optional(Type.Integer()),
+  /** Capability 51. The group room whose member turn raised it; absent for a 1:1 chat. */
+  room: Type.Optional(Type.String()),
 });
 export type BotPendingClarification = Static<typeof BotPendingClarificationSchema>;
 
@@ -2048,4 +2085,34 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  *
  * Additive: the routes did not exist below 50, so a client that offers Changes, Undo, or Try must
  * require `>= 50` and a gateway below 50 answers `404`. */
-export const BOTS_CAPABILITY_VERSION = 50;
+/** Capability 51: ROOM TURNS CAN ASK. A capability-45 runtime bot taking a room member turn may
+ * now raise an approval or a clarification and stream its tool steps, which below 51 were
+ * acknowledged and dropped because a room had no projection for them. That silence is why a peer
+ * had to run room turns with read-only tools; it no longer does.
+ *
+ * An approval or clarify event on a member turn is recorded in the SAME durable interaction table
+ * a 1:1 chat uses, keyed by the member bot and the attach id, with `sessionId` set to the
+ * gateway-owned `group:<room>:<member>` thread and `turnId` set to the room member turn. So it
+ * appears in `GET /bots/approvals` beside every other pending item, and `POST
+ * /bots/:member/approvals/:id/approve|deny` and `POST /bots/:member/clarifications/:id` resolve it
+ * with no new route and no changed request shape: the gateway sends the peer the same
+ * `resolve_approval` / `resolve_clarify` command it always sent. The inbox row, the
+ * `bot_approval_pending`/`bot_approval_resolved` frames (whose `room` this schema already
+ * reserved) and the `bot_clarify_pending`/`bot_clarify_resolved` frames (which gain it here) carry
+ * the room name, so a client can render the card above the right transcript.
+ *
+ * Tool events on a member turn project as `bot_tool_activity` carrying `room`: the 1:1 card shape,
+ * name and status only, EPHEMERAL and never persisted, so a room activity view can exist without
+ * a room turn's steps entering any history. Thinking and delegation activity in a room stay
+ * unprojected.
+ *
+ * The room transcript gains nothing. A pending interaction is live state, so it rides `BotGroup`
+ * and `bot_group_state` as the optional `pendingInteractions` pointer array (member, kind, id,
+ * turn) and is gone when it settles.
+ *
+ * HERMES MEMBERS ARE UNCHANGED. Only a member whose bot is a runtime bot projects any of this; a
+ * Hermes-backed member's room turn drops these events exactly as it did below 51.
+ *
+ * Additive: no new route, no changed shape, every new field optional. A client that renders a room
+ * approval card or a room activity view gates on `>= 51`; below it a room behaves as it did. */
+export const BOTS_CAPABILITY_VERSION = 51;

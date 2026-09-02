@@ -119,8 +119,12 @@ describe("bots approval frames", () => {
     };
     expect(check(BotPendingApprovalSchema, item)).toBe(true);
     expect(check(BotPendingApprovalsSchema, { approvals: [item] })).toBe(true);
+    // `room` (capability 51) names the group room whose member turn raised the approval. It is a
+    // room NAME, which the room surface already publishes: no rule payload, no tool arguments, and
+    // absent for every 1:1 row, which is every row written before 51.
     expect(Object.keys(BotPendingApprovalSchema.properties)).toEqual([
       "bot", "sessionId", "turnId", "toolCallId", "ruleName", "createdAt", "resolutionRequestedAt",
+      "room",
     ]);
   });
 });
