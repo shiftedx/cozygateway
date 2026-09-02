@@ -186,6 +186,27 @@ describe("attach-v1 history lane", () => {
     surface.close();
   });
 
+  // The peer is the side that knows whether a question is outstanding, because the gateway holds
+  // no experiment state. A `not_found` from it on `resolve`, `try.keep` or `try.discard` is that
+  // answer; on `try.start` it is the peer failing to do what it was asked, which is a 503.
+  it("answers a missing experiment as not_found and a refused start as unavailable", async () => {
+    const sent: AttachV1HistoryRequest[] = [];
+    const surface = new AttachHistorySurface({
+      sendHistoryRequest: (_agent, request) => { sent.push(request); return "sent" as const; },
+    });
+    const missing = [
+      surface.resolve("sage", [{ path: "a.ts", pick: "ours" }]),
+      surface.tryKeep("sage"),
+      surface.tryDiscard("sage"),
+    ];
+    const start = surface.tryStart("sage", "darker theme");
+    for (const request of sent)
+      surface.handle("sage", { kind: "history_result", requestId: request.requestId, status: "not_found" });
+    for (const pending of missing) await expect(pending).rejects.toBeInstanceOf(HistoryNotFound);
+    await expect(start).rejects.toBeInstanceOf(BackendUnavailable);
+    surface.close();
+  });
+
   it("reports a refused resolve as invalid input in the peer's own words", async () => {
     const sent: AttachV1HistoryRequest[] = [];
     const surface = new AttachHistorySurface({

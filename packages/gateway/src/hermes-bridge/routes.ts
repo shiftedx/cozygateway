@@ -493,9 +493,9 @@ export function registerBotRoutes(
   // two bounded labels. There is no route here that answers with a file, and adding one would be a
   // new capability rather than a field.
   if (history !== undefined) {
-    /** The three answers this lane adds to the shared mapping. Everything else -- a 404 for a
-     *  checkpoint that names nothing, a 409 for a Hermes bot, a 503 for an offline peer -- is
-     *  already said correctly by `failure`, so it is not said twice here. */
+    /** The three answers this lane adds to the shared mapping. Everything else is already said
+     *  correctly by `failure` and is not said twice here: a 404 for a checkpoint that names
+     *  nothing, a 409 for a Hermes bot, a 503 for an offline peer. */
     const historyFailure = (c: Context<Env>, error: unknown) => {
       // The ONE case: the working version moved while an experiment ran. Nothing is lost and
       // nothing failed; a person has to choose per file, so the answer carries the question. The

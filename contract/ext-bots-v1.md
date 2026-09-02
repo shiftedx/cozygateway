@@ -334,8 +334,8 @@ are RUNTIME BOTS ONLY: a Hermes bot answers `409` extension code `unsupported_fo
 a Hermes profile has no checkpointed workspace behind it and never did. That is not a `404`: the
 bot exists and its chat lane works, so a client hides the section rather than treating the bot as
 missing. A runtime bot whose peer did not negotiate `bot_history` gets the same `409` for the same
-reason -- the section is genuinely absent, not temporarily unreachable, and a `503` there would
-offer a retry that can never succeed. A peer that IS negotiated and simply offline answers `503
+reason: the section is genuinely absent rather than temporarily unreachable, and a `503` there
+would offer a retry that can never succeed. A peer that IS negotiated and simply offline answers `503
 backend_unavailable`, which is a retry worth offering.
 
 **Nothing content-shaped crosses this boundary, in either direction.** A checkpoint row carries a
@@ -364,6 +364,14 @@ lost and nothing failed; a person has to choose per file, and `ours` and `theirs
 labels naming the two sides. The client asks "Sage's version" or "the other change" and sends the
 answer to `POST /bots/:name/history/resolve`. The word conflict is the wire's name for this case,
 never the reader's.
+
+`resolve` with no experiment waiting on a choice answers `404 not_found`, and the PEER performs
+that check: the gateway holds no experiment state and never did, so the one side that knows
+whether there is a question outstanding is the side being asked. `keep` and `discard` with no
+experiment in flight answer the same `404` by the same route. `try.start` is the exception. A peer
+answering `not_found` to a start is failing to do something it was asked to do rather than
+reporting an absence a client can act on, so it maps to `503 backend_unavailable`, and `list` maps
+the same way for the same reason: an empty history is an empty list, never a missing one.
 
 ### Slash commands
 

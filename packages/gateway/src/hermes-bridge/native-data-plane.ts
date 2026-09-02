@@ -551,8 +551,8 @@ export class NativeBotDataPlane {
   }
 
   /** Capability 50's history surface, with the ONE rule those routes owe a client wrapped around
-   * it: history is a runtime-bot fact. A Hermes bot has no checkpointed workspace behind it -- the
-   * Dashboard stores no repository and never did -- so it gets the same `409
+   * it: history is a runtime-bot fact. A Hermes bot has no checkpointed workspace behind it,
+   * because the Dashboard stores no repository and never did, so it gets the same `409
    * unsupported_for_runtime` every other wrong-kind surface answers, never a `404` that would say
    * the bot is gone and never a `503` that would offer a retry.
    *
