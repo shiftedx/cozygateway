@@ -531,7 +531,11 @@ CREATE TABLE IF NOT EXISTS runtime_bots (
   token TEXT NOT NULL UNIQUE,
   runtime TEXT NOT NULL CHECK (runtime IN ('cozyagents')),
   spec_generation INTEGER NOT NULL CHECK (spec_generation >= 1),
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  -- Capability 54. Which paired runner runs this bot. Nullable and deliberately unconstrained by a
+  -- foreign key: a row written before 54 names nobody, and revoking a computer must leave the bots
+  -- that ran on it standing rather than cascade them away.
+  runner_id TEXT
 ) STRICT;
 -- Capability 49. The durable lifecycle operations a CozyRunner reconciles, keyed by "operation_id"
 -- (ADR 0002). "stage" starts at "waiting_for_runner" and only ever moves under a runner receipt, so
@@ -550,7 +554,11 @@ CREATE TABLE IF NOT EXISTS runner_operations (
   last_contact_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  sent_at INTEGER
+  sent_at INTEGER,
+  -- Capability 54. Which runner this operation belongs to, so a create, a delete and a later
+  -- upgrade for one bot all reach one machine. Null is a row written before 54: it goes to the
+  -- account default rather than to whichever socket happened to be attached.
+  runner_id TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS runner_operations_bot ON runner_operations (bot, created_at DESC);
 `;
@@ -657,7 +665,14 @@ export interface RuntimeBotRow {
   runtime: "cozyagents";
   specGeneration: number;
   createdAt: number;
+  /** Capability 54. The paired runner this bot was placed on, or null for a bot created before 54
+   *  and for a config-declared one. Never backfilled: the gateway never knew it. */
+  runnerId: string | null;
 }
+
+/** What a create hands `insertRuntimeBot`. `runnerId` is optional so a caller with no roster (the
+ *  legacy shared credential, and every pre-54 test) writes the same row it always did. */
+export type RuntimeBotInsert = Omit<RuntimeBotRow, "runnerId"> & { runnerId?: string | null };
 
 export type RunnerOperationKind = "create_runtime" | "delete_runtime";
 
@@ -695,6 +710,9 @@ export interface RunnerOperationRow {
   createdAt: number;
   updatedAt: number;
   sentAt: number | null;
+  /** Capability 54. The runner this operation is queued for, or null for a row written before 54,
+   *  which the lane hands to the account default. */
+  runnerId: string | null;
 }
 
 export interface BotRoutineOverrides {
@@ -3884,25 +3902,28 @@ export class Storage {
 
   /** Writes a runtime bot row. Throws when the id or the token is already held, so a create can
    *  never silently take over an existing identity. */
-  insertRuntimeBot(row: RuntimeBotRow): void {
+  insertRuntimeBot(row: RuntimeBotInsert): void {
     this.#db
       .prepare(
-        `INSERT INTO runtime_bots (id, name, avatar, token, runtime, spec_generation, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runtime_bots (id, name, avatar, token, runtime, spec_generation, created_at, runner_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(row.id, row.name, row.avatar, row.token, row.runtime, row.specGeneration, row.createdAt);
+      .run(
+        row.id, row.name, row.avatar, row.token, row.runtime, row.specGeneration, row.createdAt,
+        row.runnerId ?? null,
+      );
   }
 
   runtimeBots(): RuntimeBotRow[] {
     return (
       this.#db
         .prepare(
-          `SELECT id, name, avatar, token, runtime, spec_generation, created_at
+          `SELECT id, name, avatar, token, runtime, spec_generation, created_at, runner_id
            FROM runtime_bots ORDER BY created_at ASC`,
         )
         .all() as unknown as Array<{
         id: string; name: string; avatar: string | null; token: string;
-        runtime: string; spec_generation: number; created_at: number;
+        runtime: string; spec_generation: number; created_at: number; runner_id: string | null;
       }>
     ).map((row) => ({
       id: row.id,
@@ -3912,6 +3933,7 @@ export class Storage {
       runtime: "cozyagents" as const,
       specGeneration: row.spec_generation,
       createdAt: row.created_at,
+      runnerId: row.runner_id,
     }));
   }
 
@@ -3920,11 +3942,14 @@ export class Storage {
   runtimeBot(id: string): RuntimeBotRow | undefined {
     const row = this.#db
       .prepare(
-        `SELECT id, name, avatar, token, runtime, spec_generation, created_at
+        `SELECT id, name, avatar, token, runtime, spec_generation, created_at, runner_id
          FROM runtime_bots WHERE id = ?`,
       )
       .get(id) as unknown as
-      | { id: string; name: string; avatar: string | null; token: string; runtime: string; spec_generation: number; created_at: number }
+      | {
+          id: string; name: string; avatar: string | null; token: string; runtime: string;
+          spec_generation: number; created_at: number; runner_id: string | null;
+        }
       | undefined;
     return row === undefined
       ? undefined
@@ -3936,7 +3961,17 @@ export class Storage {
           runtime: "cozyagents",
           specGeneration: row.spec_generation,
           createdAt: row.created_at,
+          runnerId: row.runner_id,
         };
+  }
+
+  /** Capability 54. How many runtime bots this gateway placed on one computer, which is what the
+   *  roster screen shows and what a revoke warns about. */
+  countRuntimeBotsForRunner(runnerId: string): number {
+    const row = this.#db
+      .prepare("SELECT COUNT(*) AS count FROM runtime_bots WHERE runner_id = ?")
+      .get(runnerId) as { count: number };
+    return row.count;
   }
 
   /** Durably accepts a lifecycle operation. It waits in `waiting_for_runner` whether or not a
@@ -3948,21 +3983,45 @@ export class Storage {
     specGeneration: number;
     payload: Record<string, unknown>;
     at: number;
+    /** Capability 54. Which runner this operation belongs to. Absent leaves it unaddressed, which
+     *  is exactly what a pre-54 row is. */
+    runnerId?: string | null;
   }): void {
     this.#db
       .prepare(
         `INSERT INTO runner_operations
-           (operation_id, bot, kind, spec_generation, payload_json, stage, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'waiting_for_runner', ?, ?)`,
+           (operation_id, bot, kind, spec_generation, payload_json, stage, created_at, updated_at, runner_id)
+         VALUES (?, ?, ?, ?, ?, 'waiting_for_runner', ?, ?, ?)`,
       )
-      .run(op.operationId, op.bot, op.kind, op.specGeneration, JSON.stringify(op.payload), op.at, op.at);
+      .run(
+        op.operationId, op.bot, op.kind, op.specGeneration, JSON.stringify(op.payload), op.at, op.at,
+        op.runnerId ?? null,
+      );
   }
 
   /** Operations no runner has been handed yet, oldest first. A reconnecting runner is sent exactly
-   *  these, which is what makes a create accepted while offline reconcile later. */
-  unsentRunnerOperations(): RunnerOperationRow[] {
+   *  these, which is what makes a create accepted while offline reconcile later.
+   *
+   *  Capability 54: `target` narrows the queue to one computer. `runnerId` takes the rows that name
+   *  it, and `includeUnassigned` adds the rows that name nobody, which the lane sets only for the
+   *  runner an unaddressed row honestly belongs to. Called with nothing it is the whole queue, the
+   *  pre-54 behaviour a single-tenant caller still gets. */
+  unsentRunnerOperations(
+    target?: { runnerId: string; includeUnassigned?: boolean },
+  ): RunnerOperationRow[] {
+    if (target === undefined) {
+      return this.#runnerOperations(
+        "SELECT * FROM runner_operations WHERE sent_at IS NULL ORDER BY created_at ASC, operation_id ASC",
+      );
+    }
+    const where =
+      target.includeUnassigned === true
+        ? "(runner_id = ? OR runner_id IS NULL)"
+        : "runner_id = ?";
     return this.#runnerOperations(
-      "SELECT * FROM runner_operations WHERE sent_at IS NULL ORDER BY created_at ASC, operation_id ASC",
+      `SELECT * FROM runner_operations WHERE sent_at IS NULL AND ${where}`
+        + " ORDER BY created_at ASC, operation_id ASC",
+      target.runnerId,
     );
   }
 
@@ -4052,6 +4111,7 @@ export class Storage {
         payload_json: string; stage: string; code: string | null;
         observed_generation: number | null; last_contact_at: number | null;
         created_at: number; updated_at: number; sent_at: number | null;
+        runner_id: string | null;
       }>
     ).map((row) => ({
       operationId: row.operation_id,
@@ -4066,6 +4126,7 @@ export class Storage {
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       sentAt: row.sent_at,
+      runnerId: row.runner_id,
     }));
   }
 
@@ -4115,6 +4176,22 @@ export function openStorage(dbPath: string): Storage {
   // unavailable result and an explicit `schema_valid = 0` verdict.
   // Capability 52. An existing database's `setup_codes` predates the kind column; adding it
   // nullable keeps every live invitation valid and reads it back as the device code it was.
+  // Capability 54. An existing database's runtime bots and operations predate the runner column;
+  // adding it nullable is the whole migration. Nothing is backfilled: an operation written before
+  // 54 belongs to the account default, and inventing a runner id for it would be a guess this
+  // gateway cannot make honestly. Idempotent, so a restarted container runs it harmlessly again.
+  for (const table of ["runtime_bots", "runner_operations"]) {
+    const columns = new Set(
+      (db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!columns.has("runner_id")) db.exec(`ALTER TABLE ${table} ADD COLUMN runner_id TEXT`);
+  }
+  // Created here rather than in SCHEMA, because on an existing database the column it indexes does
+  // not exist until the line above has run.
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS runner_operations_unsent ON runner_operations (sent_at, runner_id, created_at)",
+  );
   const setupCodeColumns = new Set(
     (db.prepare("PRAGMA table_info(setup_codes)").all() as unknown as Array<{ name: string }>)
       .map((column) => column.name),
