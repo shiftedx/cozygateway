@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
-import type { GatewayMaintenanceStatus, Message, RichBlock } from "cozygateway-contract";
+import type { Message, RichBlock } from "cozygateway-contract";
 
 import { hashToken } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
 import {
   GatewayMaintenance,
   GatewayMaintenanceFailure,
+  type GatewayMaintenanceHostStatus,
   type GatewayMaintenanceSupervisor,
 } from "../src/gateway-maintenance.ts";
 import { createApp } from "../src/http.ts";
@@ -22,7 +23,7 @@ class Supervisor implements GatewayMaintenanceSupervisor {
   restarts = 0;
   updates = 0;
   hold: Promise<void> | undefined;
-  statusValue: GatewayMaintenanceStatus = {
+  statusValue: GatewayMaintenanceHostStatus = {
     currentVersion: "ignored-by-gateway", restartSupported: true,
     update: { state: "available" as const, latestVersion: "0.6.5", checkedAt: 1 },
   };
@@ -39,7 +40,14 @@ class Supervisor implements GatewayMaintenanceSupervisor {
 function appFor(supervisor = new Supervisor()) {
   const storage = openStorage(":memory:");
   storage.createDevice({ id: "device", name: "Phone", tokenHash: hashToken(TOKEN), createdAt: 1 });
-  const maintenance = new GatewayMaintenance(storage, supervisor, supervisor.statusValue, "0.6.4", () => 100);
+  const maintenance = new GatewayMaintenance(
+    storage,
+    supervisor,
+    supervisor.statusValue,
+    "0.6.4",
+    () => 100,
+    () => ({ harness: "hermes", attach: { configured: 1, online: 1, deadLetters: 0 } }),
+  );
   const app = createApp({
     storage, config: CONFIG, gatewayInfo: { name: "g", version: "0.6.4", contract: "v1" }, maintenance,
     presenceOf: () => "online",
@@ -56,7 +64,7 @@ describe("gateway maintenance paired routes", () => {
   it("advertises the capability only when the host supervisor was proven usable", () => {
     expect(gatewayInfoForConfig(CONFIG).capabilities?.["com.cozylabs.gateway-maintenance"]).toBeUndefined();
     expect(gatewayInfoForConfig(CONFIG, false, false, false, undefined, false, true)
-      .capabilities?.["com.cozylabs.gateway-maintenance"]).toBe(1);
+      .capabilities?.["com.cozylabs.gateway-maintenance"]).toBe(2);
   });
 
   it("is absent without a live supervisor and rejects unauthenticated maintenance access", async () => {
@@ -87,7 +95,14 @@ describe("gateway maintenance paired routes", () => {
     const { request } = appFor(supervisor);
     const response = await request("/gateway/maintenance");
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ currentVersion: "0.6.4", restartSupported: true, update });
+    expect(await response.json()).toEqual({
+      currentVersion: "0.6.4", restartSupported: true, update,
+      health: {
+        state: "working",
+        gateway: { state: "working", version: "0.6.4" },
+        harness: { product: "hermes", state: "attached" },
+      },
+    });
   });
 
   it("returns cached contract-safe status and accepts a restart once with a durable receipt", async () => {
@@ -97,6 +112,11 @@ describe("gateway maintenance paired routes", () => {
     expect(await status.json()).toEqual({
       currentVersion: "0.6.4", restartSupported: true,
       update: { state: "available", latestVersion: "0.6.5", checkedAt: 1 },
+      health: {
+        state: "working",
+        gateway: { state: "working", version: "0.6.4" },
+        harness: { product: "hermes", state: "attached" },
+      },
     });
     const input = { requestId: "restart-once" };
     const first = await request("/gateway/maintenance/restart", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
@@ -156,6 +176,13 @@ describe("gateway maintenance paired routes", () => {
     }, "0.6.4", () => 100);
     expect(maintenance.status().restartSupported).toBe(true);
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(maintenance.status()).toEqual({ currentVersion: "0.6.4", restartSupported: false, update: { state: "unavailable" } });
+    expect(maintenance.status()).toEqual({
+      currentVersion: "0.6.4", restartSupported: false, update: { state: "unavailable" },
+      health: {
+        state: "working",
+        gateway: { state: "working", version: "0.6.4" },
+        harness: { product: "hermes", state: "attached" },
+      },
+    });
   });
 });

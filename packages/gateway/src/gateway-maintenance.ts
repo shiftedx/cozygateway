@@ -2,10 +2,9 @@ import { randomUUID } from "node:crypto";
 import { connect } from "node:net";
 
 import {
-  assertValid,
-  GatewayMaintenanceStatusSchema,
   type GatewayMaintenanceReceipt,
   type GatewayMaintenanceStatus,
+  type GatewayMaintenanceUpdate,
 } from "cozygateway-contract";
 
 import type { Storage } from "./storage.ts";
@@ -31,9 +30,22 @@ export class GatewayMaintenanceFailure extends Error {
 /** This is intentionally a tiny, host-owned IPC protocol. The gateway container can request an
  * operation, but it never receives Docker credentials or executes compose itself. */
 export interface GatewayMaintenanceSupervisor {
-  status(): Promise<GatewayMaintenanceStatus>;
+  status(): Promise<GatewayMaintenanceHostStatus>;
   restart(operationId: string): Promise<void>;
   update(operationId: string, expectedTargetVersion: string): Promise<void>;
+}
+
+export interface GatewayMaintenanceHostStatus {
+  currentVersion: string;
+  restartSupported: boolean;
+  update: GatewayMaintenanceUpdate;
+  cozyAgents?: { installed: true; version?: string; ready: boolean; failureCode?: string; runnerId?: string };
+}
+
+export interface GatewayMaintenanceRuntimeHealth {
+  harness: "hermes" | "cozyagents";
+  attach?: { configured: number; online: number; deadLetters: number };
+  localRunnerAttached?: boolean;
 }
 
 type SupervisorRequest =
@@ -42,7 +54,7 @@ type SupervisorRequest =
   | { action: "update"; operationId: string; expectedTargetVersion: string };
 
 type SupervisorResponse =
-  | { ok: true; status: GatewayMaintenanceStatus }
+  | { ok: true; status: GatewayMaintenanceHostStatus }
   | { ok: true }
   | { ok: false; code?: string };
 
@@ -63,11 +75,11 @@ export class UnixSocketGatewayMaintenanceSupervisor implements GatewayMaintenanc
     this.timeoutMs = timeoutMs;
   }
 
-  async status(): Promise<GatewayMaintenanceStatus> {
+  async status(): Promise<GatewayMaintenanceHostStatus> {
     const response = await this.request({ action: "status" });
     if (!response.ok || !("status" in response))
       throw failureForSupervisor(response.ok ? undefined : response.code, "restart");
-    return assertValid(GatewayMaintenanceStatusSchema, response.status);
+    return response.status;
   }
 
   async restart(operationId: string): Promise<void> {
@@ -120,25 +132,31 @@ type StoredReceipt = {
  * process ownership remains entirely host-side. */
 export class GatewayMaintenance {
   #active = false;
-  #status: GatewayMaintenanceStatus;
+  #status: GatewayMaintenanceHostStatus;
   #inFlight = new Map<string, Promise<GatewayMaintenanceReceipt>>();
   private readonly storage: Storage;
   private readonly supervisor: GatewayMaintenanceSupervisor;
   private readonly currentVersion: string;
   private readonly now: () => number;
+  private readonly runtimeHealth: () => GatewayMaintenanceRuntimeHealth;
 
   constructor(
     storage: Storage,
     supervisor: GatewayMaintenanceSupervisor,
-    initialStatus: GatewayMaintenanceStatus,
+    initialStatus: GatewayMaintenanceHostStatus,
     currentVersion: string,
     now: () => number,
+    runtimeHealth: () => GatewayMaintenanceRuntimeHealth = () => ({
+      harness: "hermes",
+      attach: { configured: 1, online: 1, deadLetters: 0 },
+    }),
   ) {
     this.storage = storage;
     this.supervisor = supervisor;
     this.#status = initialStatus;
     this.currentVersion = currentVersion;
     this.now = now;
+    this.runtimeHealth = runtimeHealth;
   }
 
   /** Serve the last verified status immediately, then refresh without making a phone wait on the
@@ -153,7 +171,42 @@ export class GatewayMaintenance {
         update: { state: "unavailable" },
       };
     });
-    return { ...this.#status, currentVersion: this.currentVersion };
+    const runtime = this.runtimeHealth();
+    const attached = runtime.harness === "hermes"
+      ? runtime.attach !== undefined
+        && runtime.attach.configured > 0
+        && runtime.attach.online === runtime.attach.configured
+        && runtime.attach.deadLetters === 0
+      : runtime.localRunnerAttached === true;
+    const harness = attached
+      ? { product: runtime.harness, state: "attached" as const }
+      : {
+          product: runtime.harness,
+          state: "needs_attention" as const,
+          failureCode: runtime.harness === "hermes" ? "hermes_attach_not_ready" : "cozyagents_not_attached",
+          message: runtime.harness === "hermes" ? "Hermes attachment is not ready." : "CozyAgents is not attached.",
+          nextAction: "run_repair" as const,
+        };
+    return {
+      ...this.#status,
+      currentVersion: this.currentVersion,
+      health: {
+        state: attached ? "working" : "needs_attention",
+        gateway: { state: "working", version: this.currentVersion },
+        harness,
+        ...(this.#status.cozyAgents === undefined ? {} : {
+          cozyAgents: {
+            state: this.#status.cozyAgents.ready ? "working" as const : "needs_attention" as const,
+            ...(this.#status.cozyAgents.version === undefined ? {} : { version: this.#status.cozyAgents.version }),
+            ...(this.#status.cozyAgents.ready ? {} : {
+              failureCode: this.#status.cozyAgents.failureCode ?? "cozyagents_not_attached",
+              message: "CozyAgents is not ready.",
+              nextAction: "run_repair" as const,
+            }),
+          },
+        }),
+      },
+    };
   }
 
   async restart(requestId: string): Promise<GatewayMaintenanceReceipt> {
