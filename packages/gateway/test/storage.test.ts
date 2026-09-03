@@ -39,6 +39,83 @@ describe("setup code kinds (capability 52)", () => {
   });
 });
 
+describe("durable gateway maintenance operations", () => {
+  const input = (n = 1, requestId = `request-${n}`) => ({
+    operationId: `maintenance_${n.toString(16).padStart(32, "0")}`,
+    idempotencyKey: requestId,
+    fingerprint: `restart:${requestId}`,
+    action: "restart" as const,
+    step: "gateway" as const,
+    priorVersions: { gateway: "0.6.4" },
+    now: n,
+  });
+
+  it("persists one maintenance operation across reopen", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-maintenance-"));
+    const path = join(directory, "gateway.sqlite");
+    const storage = openStorage(path);
+    const created = storage.createGatewayMaintenanceOperation(input());
+    storage.close();
+    const reopened = openStorage(path);
+    expect(reopened.gatewayMaintenanceOperation(created.operationId)).toEqual(created);
+    reopened.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("returns an existing operation for the same idempotency key", () => {
+    const storage = openStorage(":memory:");
+    const first = storage.createGatewayMaintenanceOperation(input());
+    expect(storage.createGatewayMaintenanceOperation({ ...input(2, "request-1") })).toEqual(first);
+    storage.close();
+  });
+
+  it("refuses two active maintenance operations", () => {
+    const storage = openStorage(":memory:");
+    storage.createGatewayMaintenanceOperation(input());
+    expect(() => storage.createGatewayMaintenanceOperation(input(2))).toThrow("operation_in_progress");
+    storage.close();
+  });
+
+  it("compare-and-set prevents a stale worker transition", () => {
+    const storage = openStorage(":memory:");
+    const operation = storage.createGatewayMaintenanceOperation(input());
+    expect(storage.advanceGatewayMaintenanceOperation({
+      operationId: operation.operationId,
+      from: { status: "running", step: "gateway" },
+      to: { status: "succeeded", step: "postflight", nextAction: "wait", completedAt: 3 },
+      now: 3,
+    })).toBe(false);
+    expect(storage.gatewayMaintenanceOperation(operation.operationId)?.status).toBe("pending");
+    storage.close();
+  });
+
+  it("terminal maintenance receipts retain only the newest 100", () => {
+    const storage = openStorage(":memory:");
+    for (let n = 1; n <= 102; n += 1) {
+      const operation = storage.createGatewayMaintenanceOperation(input(n));
+      expect(storage.advanceGatewayMaintenanceOperation({
+        operationId: operation.operationId,
+        from: { status: "pending", step: "gateway" },
+        to: { status: "succeeded", step: "postflight", nextAction: "wait", completedAt: n },
+        now: n,
+      })).toBe(true);
+    }
+    expect(storage.gatewayMaintenanceOperation(input(1).operationId)).toBeUndefined();
+    expect(storage.gatewayMaintenanceOperation(input(2).operationId)).toBeUndefined();
+    expect(storage.gatewayMaintenanceOperation(input(3).operationId)).toBeDefined();
+    storage.close();
+  });
+
+  it("operation JSON never contains fixture secrets", () => {
+    const storage = openStorage(":memory:");
+    const operation = storage.createGatewayMaintenanceOperation({
+      ...input(), fingerprint: "restart:fixture-secret-token",
+    });
+    expect(JSON.stringify(operation)).not.toContain("fixture-secret-token");
+    storage.close();
+  });
+});
+
 describe("paired runners (capability 52)", () => {
   it("stores only a hash, keeps the token unique, and survives a restart", () => {
     const directory = mkdtempSync(join(tmpdir(), "cozygateway-runners-"));

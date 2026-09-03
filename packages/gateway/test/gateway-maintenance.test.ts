@@ -7,6 +7,7 @@ import {
   GatewayMaintenance,
   GatewayMaintenanceFailure,
   type GatewayMaintenanceHostStatus,
+  GatewayMaintenanceNotFound,
   type GatewayMaintenanceSupervisor,
 } from "../src/gateway-maintenance.ts";
 import { createApp } from "../src/http.ts";
@@ -20,8 +21,7 @@ const CONFIG: GatewayConfig = {
 };
 
 class Supervisor implements GatewayMaintenanceSupervisor {
-  restarts = 0;
-  updates = 0;
+  starts: string[] = [];
   hold: Promise<void> | undefined;
   statusValue: GatewayMaintenanceHostStatus = {
     currentVersion: "ignored-by-gateway", restartSupported: true,
@@ -29,10 +29,8 @@ class Supervisor implements GatewayMaintenanceSupervisor {
   };
 
   async status() { return this.statusValue; }
-  async restart() { this.restarts += 1; await this.hold; }
-  async update(_operationId: string, target: string) {
-    if (target !== "0.6.5") throw new GatewayMaintenanceFailure("update_unavailable", 422);
-    this.updates += 1;
+  async start(operationId: string) {
+    this.starts.push(operationId);
     await this.hold;
   }
 }
@@ -123,7 +121,7 @@ describe("gateway maintenance paired routes", () => {
     const second = await request("/gateway/maintenance/restart", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
     expect(first.status).toBe(202);
     expect(await second.json()).toEqual(await first.clone().json());
-    expect(supervisor.restarts).toBe(1);
+    expect(supervisor.starts).toHaveLength(1);
   });
 
   it("guards stale versions and blocks a second operation while supervisor handoff is active", async () => {
@@ -141,35 +139,48 @@ describe("gateway maintenance paired routes", () => {
     const stale = await fresh.request("/gateway/maintenance/update", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestId: "stale", expectedCurrentVersion: "0.6.3", expectedTargetVersion: "0.6.5" }) });
     expect(stale.status).toBe(409);
     expect((await stale.json())).toMatchObject({ error: { code: "stale_version" } });
-    expect(fresh.supervisor.updates).toBe(0);
+    expect(fresh.supervisor.starts).toHaveLength(0);
   });
 
-  it("persists a pending operation before IPC and retries it with the same host operation id", async () => {
+  it("settles a pre-ACK failure and returns the same authoritative receipt on retry", async () => {
     const storage = openStorage(":memory:");
     const operationIds: string[] = [];
-    let attempts = 0;
     const supervisor: GatewayMaintenanceSupervisor = {
       status: async () => ({ currentVersion: "0.6.4", restartSupported: true, update: { state: "unavailable" } }),
-      restart: async (operationId) => {
+      start: async (operationId) => {
         operationIds.push(operationId);
-        attempts += 1;
-        if (attempts === 1) throw new Error("simulated process loss before supervisor ACK");
+        throw new Error("simulated process loss before supervisor ACK fixture-secret");
       },
-      update: async () => {},
     };
     const maintenance = new GatewayMaintenance(storage, supervisor, await supervisor.status(), "0.6.4", () => 100);
     await expect(maintenance.restart("crash-window")).rejects.toMatchObject({ code: "maintenance_failed" });
-    const pending = storage.gatewayMaintenanceRequest("crash-window", 100) as { state: string; receipt: { operationId: string } };
-    expect(pending.state).toBe("pending");
+    const failed = storage.gatewayMaintenanceOperationByKey("crash-window")!;
+    expect(failed).toMatchObject({
+      status: "failed",
+      failureCode: "maintenance_handoff_failed",
+      message: "Gateway maintenance could not start.",
+      nextAction: "retry_update",
+    });
+    expect(JSON.stringify(failed)).not.toContain("fixture-secret");
     const receipt = await maintenance.restart("crash-window");
-    expect(receipt.operationId).toBe(pending.receipt.operationId);
-    expect(operationIds).toEqual([receipt.operationId, receipt.operationId]);
+    expect(receipt.operationId).toBe(failed.operationId);
+    expect(operationIds).toEqual([receipt.operationId]);
+  });
+
+  it("finds a durable operation and reports a missing one", async () => {
+    const storage = openStorage(":memory:");
+    const supervisor = new Supervisor();
+    const maintenance = new GatewayMaintenance(storage, supervisor, supervisor.statusValue, "0.6.4", () => 100);
+    const receipt = await maintenance.restart("poll-me");
+    expect(maintenance.operation(receipt.operationId)).toMatchObject({ operationId: receipt.operationId });
+    expect(() => maintenance.operation("maintenance_ffffffffffffffffffffffffffffffff"))
+      .toThrow(GatewayMaintenanceNotFound);
   });
 
   it("fails closed when its previously-live host supervisor stops answering", async () => {
     const storage = openStorage(":memory:");
     const supervisor: GatewayMaintenanceSupervisor = {
-      status: async () => { throw new Error("host socket gone"); }, restart: async () => {}, update: async () => {},
+      status: async () => { throw new Error("host socket gone"); }, start: async () => {},
     };
     const maintenance = new GatewayMaintenance(storage, supervisor, {
       currentVersion: "0.6.4", restartSupported: true, update: { state: "upToDate" },

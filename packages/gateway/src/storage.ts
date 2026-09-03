@@ -14,6 +14,12 @@ import type {
   MessageRole,
   RichBlock,
   CozyAppTree,
+  GatewayMaintenanceAction,
+  GatewayMaintenanceNextAction,
+  GatewayMaintenanceOperation,
+  GatewayMaintenanceOperationStatus,
+  GatewayMaintenanceStep,
+  GatewayMaintenanceVersions,
 } from "cozygateway-contract";
 import type {
   AttachV1Command,
@@ -156,13 +162,25 @@ CREATE TABLE IF NOT EXISTS hermes_global_skill_requests (
 -- Privileged host-maintenance requests use the paired device's request id as a durable 24-hour
 -- idempotency key. The response is intentionally only a receipt: no command, host path, or
 -- installer state ever crosses this boundary.
-CREATE TABLE IF NOT EXISTS gateway_maintenance_requests (
-  request_id TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS gateway_maintenance_operations (
+  operation_id TEXT PRIMARY KEY,
+  idempotency_key TEXT NOT NULL UNIQUE,
   fingerprint TEXT NOT NULL,
-  receipt_json TEXT NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('pending', 'handed_off')),
-  expires_at INTEGER NOT NULL
+  action TEXT NOT NULL CHECK (action IN ('restart','update')),
+  step TEXT NOT NULL CHECK (step IN ('agents','gateway','postflight')),
+  status TEXT NOT NULL CHECK (status IN ('pending','running','succeeded','rolled_back','failed')),
+  prior_versions_json TEXT NOT NULL,
+  resulting_versions_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  failure_code TEXT,
+  message TEXT,
+  next_action TEXT NOT NULL CHECK (next_action IN ('wait','retry_update','run_repair','confirm_hermes_repair','use_hermes_repair'))
 ) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS gateway_maintenance_one_active
+ON gateway_maintenance_operations ((1))
+WHERE status IN ('pending','running');
 -- Hermes Dashboard control-plane roster cache. Bot Mode conversations live in native attach-v1
 -- tables below.
 CREATE TABLE IF NOT EXISTS bot_roster (
@@ -900,6 +918,49 @@ function toMessage(row: MessageDbRow): Message {
   return message;
 }
 
+interface GatewayMaintenanceDbRow {
+  operationId: string;
+  idempotencyKey: string;
+  fingerprint: string;
+  action: string;
+  step: string;
+  status: string;
+  priorVersionsJson: string;
+  resultingVersionsJson: string;
+  createdAt: number;
+  updatedAt: number;
+  completedAt: number | null;
+  failureCode: string | null;
+  message: string | null;
+  nextAction: string;
+}
+
+function gatewayMaintenanceOperation(row: GatewayMaintenanceDbRow): GatewayMaintenanceOperation {
+  return {
+    operationId: row.operationId,
+    idempotencyKey: row.idempotencyKey,
+    action: row.action as GatewayMaintenanceAction,
+    step: row.step as GatewayMaintenanceStep,
+    status: row.status as GatewayMaintenanceOperationStatus,
+    priorVersions: JSON.parse(row.priorVersionsJson) as GatewayMaintenanceVersions,
+    resultingVersions: JSON.parse(row.resultingVersionsJson) as Partial<GatewayMaintenanceVersions>,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    ...(row.completedAt === null ? {} : { completedAt: row.completedAt }),
+    ...(row.failureCode === null ? {} : { failureCode: row.failureCode }),
+    ...(row.message === null ? {} : { message: row.message }),
+    nextAction: row.nextAction as GatewayMaintenanceNextAction,
+  };
+}
+
+const GATEWAY_MAINTENANCE_SELECT = `
+  SELECT operation_id AS operationId, idempotency_key AS idempotencyKey, fingerprint,
+    action, step, status, prior_versions_json AS priorVersionsJson,
+    resulting_versions_json AS resultingVersionsJson, created_at AS createdAt,
+    updated_at AS updatedAt, completed_at AS completedAt, failure_code AS failureCode,
+    message, next_action AS nextAction
+  FROM gateway_maintenance_operations`;
+
 export class Storage {
   readonly #db: DatabaseSync;
 
@@ -1083,29 +1144,116 @@ export class Storage {
     ).run(requestId, JSON.stringify(result), expiresAt);
   }
 
-  gatewayMaintenanceRequest(requestId: string, now: number): unknown | undefined {
-    this.#db.prepare("DELETE FROM gateway_maintenance_requests WHERE expires_at < ?").run(now);
+  createGatewayMaintenanceOperation(input: {
+    operationId: string;
+    idempotencyKey: string;
+    fingerprint: string;
+    action: GatewayMaintenanceAction;
+    step: GatewayMaintenanceStep;
+    priorVersions: GatewayMaintenanceVersions;
+    now: number;
+  }): GatewayMaintenanceOperation {
+    const existing = this.gatewayMaintenanceOperationByKey(input.idempotencyKey);
+    if (existing !== undefined) {
+      const { fingerprint: _fingerprint, ...operation } = existing;
+      return operation;
+    }
+    try {
+      this.#db.prepare(
+        `INSERT INTO gateway_maintenance_operations (
+          operation_id, idempotency_key, fingerprint, action, step, status,
+          prior_versions_json, resulting_versions_json, created_at, updated_at, next_action
+        ) VALUES (?, ?, ?, ?, ?, 'pending', ?, '{}', ?, ?, 'wait')`,
+      ).run(
+        input.operationId,
+        input.idempotencyKey,
+        input.fingerprint,
+        input.action,
+        input.step,
+        JSON.stringify(input.priorVersions),
+        input.now,
+        input.now,
+      );
+    } catch (error) {
+      const retried = this.gatewayMaintenanceOperationByKey(input.idempotencyKey);
+      if (retried !== undefined) {
+        const { fingerprint: _fingerprint, ...operation } = retried;
+        return operation;
+      }
+      if (this.activeGatewayMaintenanceOperation() !== undefined) throw new Error("operation_in_progress");
+      throw error;
+    }
+    return this.gatewayMaintenanceOperation(input.operationId)!;
+  }
+
+  gatewayMaintenanceOperation(operationId: string): GatewayMaintenanceOperation | undefined {
+    const row = this.#db.prepare(`${GATEWAY_MAINTENANCE_SELECT} WHERE operation_id = ?`)
+      .get(operationId) as GatewayMaintenanceDbRow | undefined;
+    return row === undefined ? undefined : gatewayMaintenanceOperation(row);
+  }
+
+  gatewayMaintenanceOperationByKey(
+    idempotencyKey: string,
+  ): (GatewayMaintenanceOperation & { fingerprint: string }) | undefined {
+    const row = this.#db.prepare(`${GATEWAY_MAINTENANCE_SELECT} WHERE idempotency_key = ?`)
+      .get(idempotencyKey) as GatewayMaintenanceDbRow | undefined;
+    return row === undefined ? undefined : { ...gatewayMaintenanceOperation(row), fingerprint: row.fingerprint };
+  }
+
+  activeGatewayMaintenanceOperation(): GatewayMaintenanceOperation | undefined {
     const row = this.#db.prepare(
-      "SELECT fingerprint, receipt_json AS receiptJson, state FROM gateway_maintenance_requests WHERE request_id = ? AND expires_at >= ?",
-    ).get(requestId, now) as { fingerprint: string; receiptJson: string; state: "pending" | "handed_off" } | undefined;
-    if (row === undefined) return undefined;
-    try { return { fingerprint: row.fingerprint, receipt: JSON.parse(row.receiptJson) as unknown, state: row.state }; } catch { return undefined; }
+      `${GATEWAY_MAINTENANCE_SELECT} WHERE status IN ('pending','running') ORDER BY created_at LIMIT 1`,
+    ).get() as GatewayMaintenanceDbRow | undefined;
+    return row === undefined ? undefined : gatewayMaintenanceOperation(row);
   }
 
-  rememberGatewayMaintenanceRequest(requestId: string, fingerprint: string, receipt: unknown, expiresAt: number): void {
-    this.#db.prepare(
-      `INSERT INTO gateway_maintenance_requests (request_id, fingerprint, receipt_json, state, expires_at)
-       VALUES (?, ?, ?, 'pending', ?) ON CONFLICT(request_id) DO NOTHING`,
-    ).run(requestId, fingerprint, JSON.stringify(receipt), expiresAt);
-  }
-
-  markGatewayMaintenanceHandedOff(requestId: string, operationId: string): void {
+  advanceGatewayMaintenanceOperation(input: {
+    operationId: string;
+    from: { status: GatewayMaintenanceOperationStatus; step: GatewayMaintenanceStep };
+    to: {
+      status: GatewayMaintenanceOperationStatus;
+      step: GatewayMaintenanceStep;
+      resultingVersions?: Partial<GatewayMaintenanceVersions>;
+      completedAt?: number;
+      failureCode?: string;
+      message?: string;
+      nextAction: GatewayMaintenanceNextAction;
+    };
+    now: number;
+  }): boolean {
+    const current = this.gatewayMaintenanceOperation(input.operationId);
+    if (current === undefined) return false;
     const result = this.#db.prepare(
-      `UPDATE gateway_maintenance_requests
-       SET state = 'handed_off'
-       WHERE request_id = ? AND state = 'pending' AND json_extract(receipt_json, '$.operationId') = ?`,
-    ).run(requestId, operationId);
-    if (result.changes !== 1) throw new Error("maintenance receipt state changed unexpectedly");
+      `UPDATE gateway_maintenance_operations SET
+        status = ?, step = ?, resulting_versions_json = ?, updated_at = ?, completed_at = ?,
+        failure_code = ?, message = ?, next_action = ?
+       WHERE operation_id = ? AND status = ? AND step = ?`,
+    ).run(
+      input.to.status,
+      input.to.step,
+      JSON.stringify(input.to.resultingVersions ?? current.resultingVersions),
+      input.now,
+      input.to.completedAt ?? null,
+      input.to.failureCode ?? null,
+      input.to.message ?? null,
+      input.to.nextAction,
+      input.operationId,
+      input.from.status,
+      input.from.step,
+    );
+    if (result.changes === 1 && !["pending", "running"].includes(input.to.status))
+      this.pruneGatewayMaintenanceOperations();
+    return result.changes === 1;
+  }
+
+  pruneGatewayMaintenanceOperations(keep = 100): void {
+    this.#db.prepare(
+      `DELETE FROM gateway_maintenance_operations WHERE operation_id IN (
+        SELECT operation_id FROM gateway_maintenance_operations
+        WHERE status NOT IN ('pending','running')
+        ORDER BY updated_at DESC, operation_id DESC LIMIT -1 OFFSET ?
+      )`,
+    ).run(keep);
   }
 
   upsertAgent(agent: AgentRow): void {

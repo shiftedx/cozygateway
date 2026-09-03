@@ -407,7 +407,13 @@ export async function startGateway(
   const harnessUpdates = new GatewayHarnessUpdates(
     updateResults.filter((adapter) => adapter !== undefined),
   );
-  const maintenance = await discoverGatewayMaintenance(process.env, storage, GATEWAY_VERSION, () => Date.now());
+  const maintenance = await discoverGatewayMaintenance(
+    process.env,
+    storage,
+    GATEWAY_VERSION,
+    () => ({ harness: hermesEndpoints(config).length === 0 ? "cozyagents" : "hermes" }),
+    () => Date.now(),
+  );
   const gatewayInfo = gatewayInfoForConfig(
     config,
     gatewaySettings !== undefined,
