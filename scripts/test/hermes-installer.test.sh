@@ -500,6 +500,43 @@ if grep -Eq ':gateway:(restart|start|install)$' "$tmp/configured-rerun-commands"
   exit 1
 fi
 
+# Content equality is never allowed to cross the validated profile tree. A
+# matching plugin with an extra symlink was the original bypass: the old matcher
+# enumerated only regular files, reported it current, and left Hermes loading
+# files reachable outside the selected profile.
+mkdir -p "$tmp/plugin-outside"
+ln -s "$tmp/plugin-outside" "$tmp/hermes/profiles/active/plugins/cozygateway/unexpected-link"
+if MATCHED_WITH_EXTRA_SYMLINK_OUTPUT="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/matched-with-extra-symlink-commands" COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"; then
+  printf 'MATCHED_WITH_EXTRA_SYMLINK must fail closed:\n%s\n' "$MATCHED_WITH_EXTRA_SYMLINK_OUTPUT" >&2
+  exit 1
+fi
+expect_contains "$MATCHED_WITH_EXTRA_SYMLINK_OUTPUT" 'unsafe filesystem entry'
+rm "$tmp/hermes/profiles/active/plugins/cozygateway/unexpected-link"
+
+# A plugin root itself cannot be an installer-owned symlink, even when the
+# symlink destination has the marker and matching files.
+mv "$tmp/hermes/profiles/active/plugins/cozygateway" "$tmp/escaped-active-plugin"
+ln -s "$tmp/escaped-active-plugin" "$tmp/hermes/profiles/active/plugins/cozygateway"
+if symlinked_plugin_root_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/symlinked-plugin-root-commands" COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"; then
+  printf 'symlinked plugin root must fail closed:\n%s\n' "$symlinked_plugin_root_output" >&2
+  exit 1
+fi
+expect_contains "$symlinked_plugin_root_output" 'symlinked plugin path'
+rm "$tmp/hermes/profiles/active/plugins/cozygateway"
+mv "$tmp/escaped-active-plugin" "$tmp/hermes/profiles/active/plugins/cozygateway"
+
+# The containing plugins directory is an ancestor escape, not an alternate
+# profile home. It must get the same fail-closed treatment as a symlink root.
+mv "$tmp/hermes/profiles/ops/plugins" "$tmp/escaped-ops-plugins"
+ln -s "$tmp/escaped-ops-plugins" "$tmp/hermes/profiles/ops/plugins"
+if symlinked_plugin_ancestor_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/symlinked-plugin-ancestor-commands" COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"; then
+  printf 'symlinked plugin ancestor must fail closed:\n%s\n' "$symlinked_plugin_ancestor_output" >&2
+  exit 1
+fi
+expect_contains "$symlinked_plugin_ancestor_output" 'symlinked plugin path'
+rm "$tmp/hermes/profiles/ops/plugins"
+mv "$tmp/escaped-ops-plugins" "$tmp/hermes/profiles/ops/plugins"
+
 # A stopped exact profile is still repaired even when its plugin did not
 # change. The other live profiles stay untouched: service state belongs to the
 # named Hermes profile, not to a generic `serve` process.
@@ -510,6 +547,19 @@ test "$(grep -Fxc 'ops:gateway:start' "$tmp/missing-process-commands")" = 1
 if grep -Eq '^(default|active):gateway:(restart|start|install)$' "$tmp/missing-process-commands"; then
   printf 'repair touched an unrelated Hermes profile for a missing ops process:\n' >&2
   cat "$tmp/missing-process-commands" >&2
+  exit 1
+fi
+
+# A current plugin does not gate recovery of an absent exact service. This is
+# the repair-specific cross-product: the replacement should use Hermes' owned
+# install/start path once, while the healthy siblings stay untouched.
+printf 'absent\n' > "$tmp/hermes/gateway-default.state"
+missing_service_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/missing-service-commands" COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"
+grep -Fq 'installed and started Hermes gateway service for profile default' <<<"$missing_service_output"
+test "$(grep -Fxc 'default:gateway:install' "$tmp/missing-service-commands")" = 1
+if grep -Eq '^(active|ops):gateway:(restart|start|install)$' "$tmp/missing-service-commands"; then
+  printf 'repair touched an unrelated Hermes profile for an absent default service:\n' >&2
+  cat "$tmp/missing-service-commands" >&2
   exit 1
 fi
 

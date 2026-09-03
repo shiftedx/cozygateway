@@ -750,13 +750,40 @@ plugin_changed_for() {
   done
   return 1
 }
+# The profile home has already been checked against Hermes' canonical config
+# path. Do not let a later `plugins` or plugin-root symlink redirect an update
+# outside that validated profile, even if a marker at the redirected location
+# makes it appear installer-owned.
+assert_plugin_target_path() {
+  local home="$1" target="$2" plugins physical_home path
+  physical_home="$(cd -P "$home" && pwd)" || die "could not resolve Hermes profile home for plugin installation: $home"
+  [ "$physical_home" = "$home" ] || die "refusing symlinked Hermes profile home for plugin installation: $home"
+  plugins="$home/plugins"
+  for path in "$plugins" "$target"; do
+    [ ! -L "$path" ] || die "refusing symlinked plugin path: $path"
+    [ ! -e "$path" ] || [ -d "$path" ] || die "refusing non-directory plugin path: $path"
+  done
+}
+# Plugin equality only applies to ordinary directory/file trees. A symlink,
+# FIFO, device, socket, or other special entry is not benign cache noise: it
+# can redirect Hermes loading or make a staged release compare as current while
+# carrying content the installer never examined.
+plugin_tree_is_safe() {
+  local root="$1" entry
+  [ -d "$root" ] && [ ! -L "$root" ] || return 1
+  while IFS= read -r -d '' entry; do
+    [ ! -L "$entry" ] || return 1
+    { [ -d "$entry" ] || [ -f "$entry" ]; } || return 1
+  done < <(find "$root" -mindepth 1 -print0)
+}
 # The release archive is already checksum-verified. Compare its extracted
 # plugin tree with the installer-owned copy before replacing it so a repair is
 # a true no-op for an already current profile. The marker is deliberately not
 # in the archive and is excluded from the comparison.
 plugin_content_matches_source() {
   local source="$1" target="$2" source_files target_files rel
-  [ -d "$target" ] || return 1
+  plugin_tree_is_safe "$source" || die "plugin archive contains an unsafe filesystem entry"
+  plugin_tree_is_safe "$target" || die "refusing unsafe filesystem entry in installer-owned plugin: $target"
   source_files="$(cd "$source" && find . -type f ! -path '*/__pycache__/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
   target_files="$(cd "$target" && find . -type f ! -path '*/__pycache__/*' ! -name '*.pyc' ! -name '.cozygateway-installer-owned' -print | LC_ALL=C sort)"
   [ "$source_files" = "$target_files" ] || return 1
@@ -772,6 +799,7 @@ install_plugin() {
   local profile="$1" home="$2" target stage source
   target="$home/plugins/cozygateway"
   case "$target" in "$HERMES_ROOT"/plugins/cozygateway|"$HERMES_ROOT"/profiles/*/plugins/cozygateway) ;; *) die "refusing plugin target outside the validated Hermes profile tree" ;; esac
+  assert_plugin_target_path "$home" "$target"
   if [ "$DRY_RUN" = 1 ]; then
     # Dry runs cannot safely extract the supplied archive into the profile, so
     # show the conservative lifecycle plan rather than claim a no-op.
@@ -782,6 +810,7 @@ install_plugin() {
   stage="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-plugin.XXXXXX")"; trap 'rm -rf "$stage"' RETURN
   tar -xzf "$PLUGIN_ARCHIVE" -C "$stage"; source="$stage/attach-plugin"
   [ -f "$source/plugin.yaml" ] && [ -f "$source/__init__.py" ] || die "plugin archive is incomplete"
+  plugin_tree_is_safe "$source" || die "plugin archive contains an unsafe filesystem entry"
   if [ -e "$target" ] && [ ! -f "$target/.cozygateway-installer-owned" ]; then
     die "$target already exists and is not owned by this installer"
   fi
