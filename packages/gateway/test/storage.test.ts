@@ -69,6 +69,15 @@ describe("durable gateway maintenance operations", () => {
     storage.close();
   });
 
+  it("rejects the same idempotency key with a different fingerprint", () => {
+    const storage = openStorage(":memory:");
+    storage.createGatewayMaintenanceOperation(input());
+    expect(() => storage.createGatewayMaintenanceOperation({
+      ...input(2, "request-1"), fingerprint: "update:different-target",
+    })).toThrow(expect.objectContaining({ code: "stale_version" }));
+    storage.close();
+  });
+
   it("refuses two active maintenance operations", () => {
     const storage = openStorage(":memory:");
     storage.createGatewayMaintenanceOperation(input());

@@ -961,6 +961,16 @@ const GATEWAY_MAINTENANCE_SELECT = `
     message, next_action AS nextAction
   FROM gateway_maintenance_operations`;
 
+export class GatewayMaintenanceOperationConflict extends Error {
+  readonly code: "stale_version" | "operation_in_progress";
+
+  constructor(code: GatewayMaintenanceOperationConflict["code"]) {
+    super(code);
+    this.name = "GatewayMaintenanceOperationConflict";
+    this.code = code;
+  }
+}
+
 export class Storage {
   readonly #db: DatabaseSync;
 
@@ -1153,11 +1163,6 @@ export class Storage {
     priorVersions: GatewayMaintenanceVersions;
     now: number;
   }): GatewayMaintenanceOperation {
-    const existing = this.gatewayMaintenanceOperationByKey(input.idempotencyKey);
-    if (existing !== undefined) {
-      const { fingerprint: _fingerprint, ...operation } = existing;
-      return operation;
-    }
     try {
       this.#db.prepare(
         `INSERT INTO gateway_maintenance_operations (
@@ -1177,10 +1182,13 @@ export class Storage {
     } catch (error) {
       const retried = this.gatewayMaintenanceOperationByKey(input.idempotencyKey);
       if (retried !== undefined) {
+        if (retried.fingerprint !== input.fingerprint)
+          throw new GatewayMaintenanceOperationConflict("stale_version");
         const { fingerprint: _fingerprint, ...operation } = retried;
         return operation;
       }
-      if (this.activeGatewayMaintenanceOperation() !== undefined) throw new Error("operation_in_progress");
+      if (this.activeGatewayMaintenanceOperation() !== undefined)
+        throw new GatewayMaintenanceOperationConflict("operation_in_progress");
       throw error;
     }
     return this.gatewayMaintenanceOperation(input.operationId)!;

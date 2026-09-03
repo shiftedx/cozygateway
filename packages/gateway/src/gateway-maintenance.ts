@@ -1,14 +1,34 @@
 import { randomUUID } from "node:crypto";
 import { connect } from "node:net";
 
-import type {
-  GatewayMaintenanceOperation,
-  GatewayMaintenanceReceipt,
-  GatewayMaintenanceStatus,
-  GatewayMaintenanceUpdate,
+import { Type } from "@sinclair/typebox";
+
+import {
+  GatewayMaintenanceUpdateSchema,
+  assertValid,
+  type GatewayMaintenanceOperation,
+  type GatewayMaintenanceReceipt,
+  type GatewayMaintenanceStatus,
+  type GatewayMaintenanceUpdate,
 } from "cozygateway-contract";
 
-import type { Storage } from "./storage.ts";
+import {
+  GatewayMaintenanceOperationConflict,
+  type Storage,
+} from "./storage.ts";
+
+const GatewayMaintenanceHostStatusSchema = Type.Object({
+  currentVersion: Type.String({ minLength: 1, maxLength: 120 }),
+  restartSupported: Type.Boolean(),
+  update: GatewayMaintenanceUpdateSchema,
+  cozyAgents: Type.Optional(Type.Object({
+    installed: Type.Literal(true),
+    version: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+    ready: Type.Boolean(),
+    failureCode: Type.Optional(Type.String({ pattern: "^[a-z0-9_]{1,64}$" })),
+    runnerId: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
+  }, { additionalProperties: false })),
+}, { additionalProperties: false });
 
 const SOCKET_TIMEOUT_MS = 1_500;
 
@@ -75,7 +95,7 @@ export class UnixSocketGatewayMaintenanceSupervisor implements GatewayMaintenanc
     const response = await this.request({ action: "status" });
     if (!response.ok || !("status" in response))
       throw failureForSupervisor(response.ok ? undefined : response.code);
-    return response.status;
+    return assertValid(GatewayMaintenanceHostStatusSchema, response.status);
   }
 
   async start(operationId: string): Promise<void> {
@@ -155,11 +175,14 @@ export class GatewayMaintenance {
       ? runtime.attach !== undefined && runtime.attach.configured > 0
         && runtime.attach.online === runtime.attach.configured && runtime.attach.deadLetters === 0
       : runtime.localRunnerAttached === true;
+    const cozyAgentsReady = this.#status.cozyAgents?.ready !== false;
     return {
       ...this.#status,
       currentVersion: this.currentVersion,
       health: {
-        state: active === undefined ? (attached ? "working" : "needs_attention") : "updating",
+        state: active === undefined
+          ? (attached && cozyAgentsReady ? "working" : "needs_attention")
+          : "updating",
         gateway: active === undefined
           ? { state: "working", version: this.currentVersion }
           : { state: "updating", version: this.currentVersion, operationId: active.operationId },
@@ -236,9 +259,10 @@ export class GatewayMaintenance {
     }
 
     let operation: GatewayMaintenanceOperation;
+    const operationId = `maintenance_${randomUUID().replaceAll("-", "")}`;
     try {
       operation = this.storage.createGatewayMaintenanceOperation({
-        operationId: `maintenance_${randomUUID().replaceAll("-", "")}`,
+        operationId,
         idempotencyKey: requestId,
         fingerprint,
         action,
@@ -247,10 +271,12 @@ export class GatewayMaintenance {
         now: this.now(),
       });
     } catch (error) {
-      if (error instanceof Error && error.message === "operation_in_progress")
-        throw new GatewayMaintenanceFailure("operation_in_progress", 409);
+      if (error instanceof GatewayMaintenanceOperationConflict)
+        throw new GatewayMaintenanceFailure(error.code, 409);
       throw error;
     }
+    if (operation.operationId !== operationId)
+      return { operationId: operation.operationId, acceptedAt: operation.createdAt };
     try {
       await this.supervisor.start(operation.operationId);
     } catch {

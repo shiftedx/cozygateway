@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +19,7 @@ import {
   type GatewayMaintenanceHostStatus,
   GatewayMaintenanceNotFound,
   type GatewayMaintenanceSupervisor,
+  UnixSocketGatewayMaintenanceSupervisor,
 } from "../src/gateway-maintenance.ts";
 import { createApp } from "../src/http.ts";
 import { gatewayInfoForConfig } from "../src/server.ts";
@@ -68,6 +70,32 @@ function appFor(supervisor = new Supervisor()) {
 }
 
 describe("gateway maintenance paired routes", () => {
+  it("rejects unknown and secret fields from supervisor status", async () => {
+    const socketDirectory = process.platform === "win32"
+      ? undefined
+      : mkdtempSync(join(tmpdir(), "cozygateway-maintenance-socket-"));
+    const socketPath = socketDirectory === undefined
+      ? `\\\\.\\pipe\\cozygateway-maintenance-${process.pid}`
+      : join(socketDirectory, "supervisor.sock");
+    const server = createServer((socket) => socket.once("data", () => socket.end(`${JSON.stringify({
+      ok: true,
+      status: {
+        currentVersion: "0.6.4",
+        restartSupported: true,
+        update: { state: "upToDate", token: "fixture-secret" },
+        argv: "fixture-secret",
+      },
+    })}\n`)));
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+    try {
+      await expect(new UnixSocketGatewayMaintenanceSupervisor(socketPath).status())
+        .rejects.toThrow();
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error === undefined ? resolve() : reject(error)));
+      if (socketDirectory !== undefined) rmSync(socketDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("advertises the capability only when the host supervisor was proven usable", () => {
     expect(gatewayInfoForConfig(CONFIG).capabilities?.["com.cozylabs.gateway-maintenance"]).toBeUndefined();
     expect(gatewayInfoForConfig(CONFIG, false, false, false, undefined, false, true)
@@ -179,6 +207,36 @@ describe("gateway maintenance paired routes", () => {
     expect(operationIds).toEqual([receipt.operationId]);
   });
 
+  it("does not start an operation another Gateway won while accepting the same request", async () => {
+    const storage = openStorage(":memory:");
+    const supervisor = new Supervisor();
+    const existing = storage.createGatewayMaintenanceOperation({
+      operationId: "maintenance_00000000000000000000000000000001",
+      idempotencyKey: "raced-request",
+      fingerprint: "restart",
+      action: "restart",
+      step: "gateway",
+      priorVersions: { gateway: "0.6.4" },
+      now: 99,
+    });
+    const lookup = storage.gatewayMaintenanceOperationByKey.bind(storage);
+    let firstLookup = true;
+    storage.gatewayMaintenanceOperationByKey = (idempotencyKey) => {
+      if (firstLookup) {
+        firstLookup = false;
+        return undefined;
+      }
+      return lookup(idempotencyKey);
+    };
+    const maintenance = new GatewayMaintenance(storage, supervisor, supervisor.statusValue, "0.6.4", () => 100);
+
+    await expect(maintenance.restart("raced-request")).resolves.toEqual({
+      operationId: existing.operationId,
+      acceptedAt: existing.createdAt,
+    });
+    expect(supervisor.starts).toEqual([]);
+  });
+
   it("finds a durable operation and reports a missing one", async () => {
     const storage = openStorage(":memory:");
     const supervisor = new Supervisor();
@@ -257,6 +315,25 @@ describe("gateway maintenance paired routes", () => {
         product: "hermes", state: "needs_attention", failureCode: "hermes_attach_not_ready",
         message: "Hermes attachment is not ready.", nextAction: "run_repair",
       },
+    });
+  });
+
+  it("needs attention when installed co-located CozyAgents is not ready", () => {
+    const storage = openStorage(":memory:");
+    const supervisor = new Supervisor();
+    supervisor.statusValue = {
+      ...supervisor.statusValue,
+      cozyAgents: { installed: true, ready: false, runnerId: "local-runner" },
+    };
+    const maintenance = new GatewayMaintenance(
+      storage, supervisor, supervisor.statusValue, "0.6.4", () => 100,
+      () => ({ harness: "hermes", attach: { configured: 1, online: 1, deadLetters: 0 } }),
+    );
+
+    expect(maintenance.status().health).toMatchObject({
+      state: "needs_attention",
+      harness: { product: "hermes", state: "attached" },
+      cozyAgents: { state: "needs_attention" },
     });
   });
 
