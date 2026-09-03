@@ -60,6 +60,11 @@ TOKENS=()
 TOKEN_ENVS=()
 SERVICE_PROFILES=()
 SERVICE_ACTIONS=()
+# A repaired install may contain many Hermes profiles, but a loaded profile only
+# needs a restart when this run replaced its attach plugin. Keep that fact per
+# profile so an already-attached sibling is never restarted just because a
+# different profile was interrupted mid-update.
+PLUGIN_CHANGED_PROFILES=()
 ENV_OWNER_KEY="COZYGATEWAY_INSTALLER_OWNER"
 ENV_OWNER_VALUE="cozylabs-v1"
 
@@ -737,19 +742,57 @@ gateway_state() {
   esac
 }
 
+record_plugin_change() { PLUGIN_CHANGED_PROFILES+=("$1"); }
+plugin_changed_for() {
+  local profile="$1" changed
+  for changed in "${PLUGIN_CHANGED_PROFILES[@]:-}"; do
+    [ "$changed" = "$profile" ] && return 0
+  done
+  return 1
+}
+# The release archive is already checksum-verified. Compare its extracted
+# plugin tree with the installer-owned copy before replacing it so a repair is
+# a true no-op for an already current profile. The marker is deliberately not
+# in the archive and is excluded from the comparison.
+plugin_content_matches_source() {
+  local source="$1" target="$2" source_files target_files rel
+  [ -d "$target" ] || return 1
+  source_files="$(cd "$source" && find . -type f ! -path '*/__pycache__/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
+  target_files="$(cd "$target" && find . -type f ! -path '*/__pycache__/*' ! -name '*.pyc' ! -name '.cozygateway-installer-owned' -print | LC_ALL=C sort)"
+  [ "$source_files" = "$target_files" ] || return 1
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    cmp -s "$source/$rel" "$target/$rel" || return 1
+  done <<EOF
+$source_files
+EOF
+}
+
 install_plugin() {
   local profile="$1" home="$2" target stage source
   target="$home/plugins/cozygateway"
   case "$target" in "$HERMES_ROOT"/plugins/cozygateway|"$HERMES_ROOT"/profiles/*/plugins/cozygateway) ;; *) die "refusing plugin target outside the validated Hermes profile tree" ;; esac
-  if [ "$DRY_RUN" = 1 ]; then say "DRY   install verified attach plugin into $target for Hermes profile $profile"; return; fi
+  if [ "$DRY_RUN" = 1 ]; then
+    # Dry runs cannot safely extract the supplied archive into the profile, so
+    # show the conservative lifecycle plan rather than claim a no-op.
+    record_plugin_change "$profile"
+    say "DRY   install verified attach plugin into $target for Hermes profile $profile"
+    return
+  fi
   stage="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-plugin.XXXXXX")"; trap 'rm -rf "$stage"' RETURN
   tar -xzf "$PLUGIN_ARCHIVE" -C "$stage"; source="$stage/attach-plugin"
   [ -f "$source/plugin.yaml" ] && [ -f "$source/__init__.py" ] || die "plugin archive is incomplete"
   if [ -e "$target" ] && [ ! -f "$target/.cozygateway-installer-owned" ]; then
     die "$target already exists and is not owned by this installer"
   fi
+  if [ -f "$target/.cozygateway-installer-owned" ] && plugin_content_matches_source "$source" "$target"; then
+    rm -rf "$stage"; trap - RETURN
+    say "OK    attach plugin already current for Hermes profile $profile"
+    return
+  fi
   mkdir -p "$home/plugins"; rm -rf "$target"; mv "$source" "$target"
   printf 'installed by cozygateway agent-install.sh\n' > "$target/.cozygateway-installer-owned"
+  record_plugin_change "$profile"
   rm -rf "$stage"; trap - RETURN
 }
 enable_plugin() {
@@ -897,9 +940,13 @@ ensure_hermes_gateways() {
     state="$(gateway_state "$profile")"; prior="$(prior_service_action "$profile")"
     case "$state" in
       running)
-        run "$HERMES_BIN" -p "$profile" gateway restart
+        if plugin_changed_for "$profile"; then
+          run "$HERMES_BIN" -p "$profile" gateway restart
+          say "OK    restarted Hermes gateway service for profile $profile"
+        else
+          say "OK    Hermes gateway service for profile $profile is already running with the current attach plugin"
+        fi
         action="${prior:-preexisting}"
-        say "OK    restarted Hermes gateway service for profile $profile"
         ;;
       stopped)
         run "$HERMES_BIN" -p "$profile" gateway start
