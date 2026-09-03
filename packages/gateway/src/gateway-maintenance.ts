@@ -102,7 +102,8 @@ export class UnixSocketGatewayMaintenanceSupervisor implements GatewayMaintenanc
 
   async start(operationId: string): Promise<void> {
     const response = await this.request({ action: "start", operationId });
-    if (!response.ok) throw failureForSupervisor(response.code);
+    if (!response.ok || "status" in response)
+      throw failureForSupervisor(response.ok ? undefined : response.code);
   }
 
   private request(message: SupervisorRequest): Promise<SupervisorResponse> {

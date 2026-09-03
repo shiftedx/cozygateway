@@ -116,6 +116,14 @@ describe("gateway maintenance paired routes", () => {
       expect(supervisor.start("maintenance_0123456789abcdef0123456789abcdef")).rejects.toThrow());
   });
 
+  it("rejects a supervisor status response as a start ACK", async () => {
+    await withSupervisorResponse({
+      ok: true,
+      status: { currentVersion: "0.6.4", restartSupported: true, update: { state: "upToDate" } },
+    }, async (supervisor) =>
+      expect(supervisor.start("maintenance_0123456789abcdef0123456789abcdef")).rejects.toThrow());
+  });
+
   it("advertises the capability only when the host supervisor was proven usable", () => {
     expect(gatewayInfoForConfig(CONFIG).capabilities?.["com.cozylabs.gateway-maintenance"]).toBeUndefined();
     expect(gatewayInfoForConfig(CONFIG, false, false, false, undefined, false, true)
