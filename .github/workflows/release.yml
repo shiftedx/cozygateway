@@ -50,6 +50,8 @@ jobs:
             dist-bundle/cozygateway-hermes-attach-plugin.tar.gz.sha256
             dist-bundle/cozygateway-installer.sh
             dist-bundle/cozygateway-installer.sh.sha256
+            dist-bundle/gateway-supervisor.cjs
+            dist-bundle/gateway-supervisor.cjs.sha256
             dist-bundle/install.ps1
             dist-bundle/install.ps1.sha256
             dist-bundle/install.sh

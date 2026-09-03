@@ -18,11 +18,14 @@ import { loadConfig } from "../src/config.ts";
 const ROOT = join(import.meta.dirname, "..", "..", "..");
 const WORKFLOW = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8").replaceAll("\r\n", "\n");
 const BUNDLER = readFileSync(join(ROOT, "scripts/build-bundle.mjs"), "utf8");
+const INSTALLER = readFileSync(join(ROOT, "scripts/agent-install.sh"), "utf8");
+const SUPERVISOR = join(ROOT, "scripts/gateway-supervisor.cjs");
 
 const REQUIRED = [
   "cozygateway.mjs",
   "cozygateway-hermes-attach-plugin.tar.gz",
   "cozygateway-installer.sh",
+  "gateway-supervisor.cjs",
   "install.ps1",
   "install.sh",
 ];
@@ -52,6 +55,20 @@ describe("what a release publishes", () => {
   it("builds both one-liner bootstraps, not just the Windows one", () => {
     expect(BUNDLER).toContain('"dist-bundle/install.ps1"');
     expect(BUNDLER).toContain('"dist-bundle/install.sh"');
+    expect(BUNDLER).toContain('"dist-bundle/gateway-supervisor.cjs"');
+  });
+
+  it("ships one gateway supervisor body for every desktop platform", () => {
+    expect(existsSync(SUPERVISOR)).toBe(true);
+    expect(INSTALLER).toContain("gateway-supervisor.cjs");
+    expect(INSTALLER).not.toContain("write_cozyagents_wrapper()");
+    expect(INSTALLER).not.toContain("exec \"$NODE_RESOLVED\" - ");
+  });
+
+  it("lets POSIX service managers execute and restart the supervisor", () => {
+    expect(INSTALLER).toContain("<string>$NODE_RESOLVED</string><string>$SUPERVISOR</string>");
+    expect(INSTALLER).toContain("printf 'ExecStart=%q %q ' \"$NODE_RESOLVED\" \"$SUPERVISOR\"");
+    expect(INSTALLER).not.toContain("ExecStart=/bin/bash $WRAPPER");
   });
 
   it("checksums whatever it built, if a bundle is present", () => {

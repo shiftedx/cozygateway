@@ -59,11 +59,12 @@ main() {
   fetch_verified cozygateway.mjs "$stage/cozygateway.mjs"
   fetch_verified cozygateway-hermes-attach-plugin.tar.gz "$stage/cozygateway-hermes-attach-plugin.tar.gz"
   fetch_verified cozygateway-installer.sh "$stage/agent-install.sh"
+  fetch_verified gateway-supervisor.cjs "$stage/gateway-supervisor.cjs"
   # Keep the release bootstrap that verified these assets. The installed command
   # uses it for repair so it never treats checkout files as update payloads.
   fetch_verified install.sh "$stage/cozygateway-bootstrap.sh"
   if [ -n "$dry_stage" ]; then rm -rf "$dry_stage"; stage=""; trap - EXIT; printf 'DRY   verified assets; would run installer from %s\n' "$HOME_DIR/bin/agent-install.sh"; return; fi
-  for asset in cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz agent-install.sh cozygateway-bootstrap.sh; do
+  for asset in cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz agent-install.sh gateway-supervisor.cjs cozygateway-bootstrap.sh; do
     mv "$stage/$asset" "$asset_dir/$asset"; mv "$stage/$asset.sha256" "$asset_dir/$asset.sha256"
   done
   rm -rf "$stage"

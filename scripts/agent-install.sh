@@ -188,6 +188,9 @@ DASHBOARD_OWNER_PS1="$LOCAL_DIR/dashboard-owner.ps1"
 DASHBOARD_ELEVATION_PS1="$LOCAL_DIR/dashboard-owner-elevate.ps1"
 STATE_FILE="$LOCAL_DIR/install-state"
 WRAPPER="$LOCAL_DIR/run-gateway.sh"
+SUPERVISOR="$LOCAL_DIR/gateway-supervisor.cjs"
+MAINTENANCE_WORKER="$GATEWAY_DIR/bin/gateway-maintenance-worker.cjs"
+MAINTENANCE_SOCKET="$LOCAL_DIR/gateway-maintenance.sock"
 CLI_WRAPPER="$GATEWAY_DIR/bin/cozygateway"
 CLI_WINDOWS="$GATEWAY_DIR/bin/cozygateway.cmd"
 POSIX_BOOTSTRAP="$GATEWAY_DIR/bin/cozygateway-bootstrap.sh"
@@ -884,6 +887,7 @@ write_cozyagents_state() {
   {
     printf 'harness=cozyagents\n'
     printf 'cozyagents_home=%s\n' "$COZYAGENTS_HOME_DIR"
+    printf 'supervisor=%s\n' "$SUPERVISOR"
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
 }
@@ -1006,6 +1010,7 @@ write_state() {
     # down the CozyGateway service before discovering it cannot reverse the
     # Hermes work it owns.
     printf 'hermes_bin=%s\n' "$HERMES_RESOLVED"
+    printf 'supervisor=%s\n' "$SUPERVISOR"
     for profile in "${SELECTED[@]}"; do printf 'service_%s=%s\n' "$profile" "$(service_action_for "$profile")"; done
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
@@ -1651,207 +1656,39 @@ try {
 POWERSHELL_ELEVATION
   chmod 600 "$DASHBOARD_ELEVATION_PS1"
 }
-# The CozyAgents supervisor is the Hermes one with the whole Dashboard half removed: there is no
-# control plane to start, wait for, or authenticate against, only the gateway and its config watch.
-write_cozyagents_wrapper() {
-  umask 077; cat > "$WRAPPER" <<WRAPPER
-#!/usr/bin/env bash
-set -euo pipefail
-exec "$NODE_RESOLVED" - "$GATEWAY_ENV" "$BUNDLE_PATH" "$CONFIG_JSON" <<'NODE'
-const { readFileSync, unwatchFile, watchFile } = require('node:fs');
-const { spawn } = require('node:child_process');
-const { parseEnv } = require('node:util');
-const [gatewayEnvPath, bundle, config] = process.argv.slice(2);
-const gatewayEnv = parseEnv(readFileSync(gatewayEnvPath, 'utf8'));
-let child;
-let restarting = false;
-let shuttingDown = false;
-let crashRestartTimer;
-let configBytes = readFileSync(config);
-const restartAfterCrash = () => {
-  if (shuttingDown || crashRestartTimer) return;
-  crashRestartTimer = setTimeout(() => {
-    crashRestartTimer = undefined;
-    if (!shuttingDown) spawnGateway();
-  }, 1000);
-};
-const spawnGateway = () => {
-  child = spawn(process.execPath, [bundle, 'serve', '--config', config], { stdio: 'inherit', env: { ...process.env, ...gatewayEnv } });
-  child.on('error', (error) => { console.error(error); restartAfterCrash(); });
-  child.on('exit', (code, signal) => {
-    if (shuttingDown) process.exit(code ?? (signal ? 1 : 0));
-    if (restarting) {
-      if (crashRestartTimer) { clearTimeout(crashRestartTimer); crashRestartTimer = undefined; }
-      restarting = false;
-      spawnGateway();
-      return;
-    }
-    console.error('CozyGateway exited unexpectedly (' + (code ?? signal ?? 'unknown') + '); restarting');
-    restartAfterCrash();
-  });
-};
-const restartGateway = () => {
-  if (shuttingDown || restarting) return;
-  if (crashRestartTimer) { clearTimeout(crashRestartTimer); crashRestartTimer = undefined; }
-  restarting = true;
-  if (child && child.exitCode === null) child.kill('SIGTERM');
-  else { restarting = false; spawnGateway(); }
-};
-watchFile(config, { interval: 500 }, (current, previous) => {
-  if (current.mtimeMs === previous.mtimeMs) return;
-  const next = readFileSync(config);
-  if (next.equals(configBytes)) return;
-  configBytes = next;
-  restartGateway();
-});
-for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
-  shuttingDown = true;
-  if (crashRestartTimer) clearTimeout(crashRestartTimer);
-  unwatchFile(config);
-  if (child && child.exitCode === null) child.kill(signal);
-  else process.exit(0);
-});
-spawnGateway();
-NODE
-WRAPPER
-  chmod 700 "$WRAPPER"
+install_supervisor() {
+  local source="${COZYGATEWAY_SUPERVISOR_SOURCE:-$(dirname "$BUNDLE_PATH")/gateway-supervisor.cjs}"
+  [ "$DRY_RUN" = 1 ] && { say "DRY   install 0700 gateway supervisor at $SUPERVISOR"; return; }
+  [ -f "$source" ] || die "verified gateway supervisor is unavailable: $source"
+  cp "$source" "$SUPERVISOR"
+  chmod 700 "$SUPERVISOR"
+}
+build_supervisor_args() {
+  local platform="$SERVICE_PLATFORM" gateway_env="$GATEWAY_ENV" bundle="$BUNDLE_PATH" config="$CONFIG_JSON"
+  local socket="$MAINTENANCE_SOCKET" worker="$MAINTENANCE_WORKER" database="$LOCAL_DIR/cozygateway.sqlite"
+  local dashboard_env="$DASHBOARD_ENV" hermes_root="${HERMES_ROOT:-}" hermes="${HERMES_RESOLVED:-}"
+  local launcher="${HERMES_ROOT:-}/bin/hermes.exe" owner_helper="$DASHBOARD_OWNER_PS1"
+  if is_windows; then
+    gateway_env="$(to_windows_path "$gateway_env")"; bundle="$(to_windows_path "$bundle")"; config="$(to_windows_path "$config")"
+    socket='\\.\pipe\cozygateway-maintenance'; worker="$(to_windows_path "$worker")"; database="$(to_windows_path "$database")"
+    dashboard_env="$(to_windows_path "$dashboard_env")"; hermes_root="$(to_windows_path "$hermes_root")"
+    hermes="$(to_windows_path "$hermes")"; launcher="$(to_windows_path "$launcher")"; owner_helper="$(to_windows_path "$owner_helper")"
+  fi
+  SUPERVISOR_ARGS=(--platform "$platform" --gateway-env "$gateway_env" --bundle "$bundle" --config "$config" --maintenance-socket "$socket" --maintenance-worker "$worker" --database "$database")
+  if [ "${HARNESS:-}" = hermes ]; then
+    SUPERVISOR_ARGS+=(--dashboard-env "$dashboard_env" --hermes-root "$hermes_root" --hermes "$hermes" --hermes-launcher "$launcher" --owner-helper "$owner_helper" --dashboard-port "$DASHBOARD_PORT")
+    if is_windows; then SUPERVISOR_ARGS+=(--windows-dashboard-profile); fi
+  fi
 }
 write_wrapper() {
-  local gateway_env_arg dashboard_env_arg hermes_root_arg hermes_arg launcher_arg owner_helper_arg bundle_arg config_arg windows_dashboard_profile=0
-  [ "$DRY_RUN" = 1 ] && { say "DRY   write 0700 gateway wrapper that reads $GATEWAY_ENV at runtime"; return; }
-  [ "${HARNESS:-}" = cozyagents ] && { write_cozyagents_wrapper; return; }
-  gateway_env_arg="$GATEWAY_ENV"; dashboard_env_arg="$DASHBOARD_ENV"; hermes_root_arg="$HERMES_ROOT"
-  hermes_arg="$HERMES_RESOLVED"; launcher_arg="$HERMES_ROOT/bin/hermes.exe"; owner_helper_arg="$DASHBOARD_OWNER_PS1"; bundle_arg="$BUNDLE_PATH"; config_arg="$CONFIG_JSON"
-  if is_windows; then
-    windows_dashboard_profile=1
-    gateway_env_arg="$(to_windows_path "$gateway_env_arg")"
-    dashboard_env_arg="$(to_windows_path "$dashboard_env_arg")"
-    hermes_root_arg="$(to_windows_path "$hermes_root_arg")"
-    hermes_arg="$(to_windows_path "$hermes_arg")"
-    launcher_arg="$(to_windows_path "$launcher_arg")"
-    owner_helper_arg="$(to_windows_path "$owner_helper_arg")"
-    bundle_arg="$(to_windows_path "$bundle_arg")"
-    config_arg="$(to_windows_path "$config_arg")"
-  fi
-  # shellcheck disable=SC2016,SC2086,SC2154
-  umask 077; cat > "$WRAPPER" <<WRAPPER
-#!/usr/bin/env bash
-set -euo pipefail
-exec "$NODE_RESOLVED" - "$gateway_env_arg" "$dashboard_env_arg" "$hermes_root_arg" "$hermes_arg" "$launcher_arg" "$owner_helper_arg" "$DASHBOARD_PORT" "$bundle_arg" "$config_arg" <<'NODE'
-const { readFileSync, unwatchFile, watchFile } = require('node:fs');
-const { spawn } = require('node:child_process');
-const { parseEnv } = require('node:util');
-const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
-async function stopOwnedDashboard(child, dashboardPort, hermesRoot, hermes, launcher, ownerHelper) {
-  if (process.platform === 'win32') {
-    if (child.exitCode === null && child.signalCode === null) {
-      const taskkill = (process.env.SystemRoot || process.env.WINDIR) + '\\System32\\taskkill.exe';
-      const killer = spawn(taskkill, ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
-      await new Promise((resolve) => { killer.once('error', resolve); killer.once('exit', resolve); });
-      if (child.exitCode === null && child.signalCode === null) child.kill();
-      await wait(100);
-    }
-    const cleanupPort = Number(dashboardPort);
-    if (!Number.isInteger(cleanupPort) || cleanupPort < 1 || cleanupPort > 65535) throw new Error('invalid Hermes Dashboard cleanup port');
-    const listenerCleanup = spawn('powershell.exe', [
-      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ownerHelper,
-      hermesRoot, hermes, launcher, String(cleanupPort),
-    ], { stdio: 'ignore', windowsHide: true });
-    await new Promise((resolve) => { listenerCleanup.once('error', resolve); listenerCleanup.once('exit', resolve); });
-    return;
-  }
-  try { process.kill(-child.pid, 'SIGTERM'); } catch (error) { if (error.code === 'ESRCH') return; throw error; }
-  await wait(1000);
-  try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-}
-async function main() {
-const [gatewayEnvPath, dashboardEnvPath, hermesRoot, hermes, launcher, ownerHelper, dashboardPort, bundle, config] = process.argv.slice(2);
-const gatewayEnv = parseEnv(readFileSync(gatewayEnvPath, 'utf8'));
-const dashboard = parseEnv(readFileSync(dashboardEnvPath, 'utf8'));
-const dashboardEnv = {
-  ...process.env,
-  HERMES_HOME: hermesRoot,
-  HERMES_DASHBOARD_SESSION_TOKEN: dashboard.DASHBOARD_SESSION_TOKEN,
-};
-const health = await fetch('http://127.0.0.1:' + dashboardPort + '/api/health', { signal: AbortSignal.timeout(2000) })
-  .then((response) => response.status === 200 || response.status === 401)
-  .catch(() => false);
-let dashboardChild;
-if (!health) {
-  const dashboardArgs = ['dashboard', ...($windows_dashboard_profile === 1 ? ['-p', 'default'] : []), '--host', '127.0.0.1', '--port', dashboardPort, '--no-open', '--skip-build'];
-  dashboardChild = spawn(hermes, dashboardArgs, { detached: true, stdio: 'ignore', env: dashboardEnv });
-  await new Promise((resolve, reject) => { dashboardChild.once('spawn', resolve); dashboardChild.once('error', reject); });
-}
-try {
-  let probe;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    probe = await fetch('http://127.0.0.1:' + dashboardPort + '/api/config', {
-      headers: { 'x-hermes-session-token': dashboard.DASHBOARD_SESSION_TOKEN },
-      signal: AbortSignal.timeout(2000),
-    }).catch(() => undefined);
-    if (probe?.status === 200) break;
-    if (probe?.status === 401 || probe?.status === 403) throw new Error('Hermes Dashboard rejected the configured local session token');
-    await wait(1000);
-  }
-  if (probe?.status !== 200) throw new Error('Hermes Dashboard did not become ready for authenticated local access');
-} catch (error) {
-  if (dashboardChild) await stopOwnedDashboard(dashboardChild, dashboardPort, hermesRoot, hermes, launcher, ownerHelper);
-  throw error;
-}
-if (dashboardChild) dashboardChild.unref();
-let child;
-let restarting = false;
-let shuttingDown = false;
-let crashRestartTimer;
-let configBytes = readFileSync(config);
-const restartAfterCrash = () => {
-  if (shuttingDown || crashRestartTimer) return;
-  crashRestartTimer = setTimeout(() => {
-    crashRestartTimer = undefined;
-    if (!shuttingDown) spawnGateway();
-  }, 1000);
-};
-const spawnGateway = () => {
-  child = spawn(process.execPath, [bundle, 'serve', '--config', config], { stdio: 'inherit', env: { ...process.env, ...gatewayEnv } });
-  child.on('error', (error) => { console.error(error); restartAfterCrash(); });
-  child.on('exit', (code, signal) => {
-    if (shuttingDown) process.exit(code ?? (signal ? 1 : 0));
-    if (restarting) {
-      if (crashRestartTimer) { clearTimeout(crashRestartTimer); crashRestartTimer = undefined; }
-      restarting = false;
-      spawnGateway();
-      return;
-    }
-    console.error('CozyGateway exited unexpectedly (' + (code ?? signal ?? 'unknown') + '); restarting');
-    restartAfterCrash();
-  });
-};
-const restartGateway = () => {
-  if (shuttingDown || restarting) return;
-  if (crashRestartTimer) { clearTimeout(crashRestartTimer); crashRestartTimer = undefined; }
-  restarting = true;
-  if (child && child.exitCode === null) child.kill('SIGTERM');
-  else { restarting = false; spawnGateway(); }
-};
-watchFile(config, { interval: 500 }, (current, previous) => {
-  if (current.mtimeMs === previous.mtimeMs) return;
-  const next = readFileSync(config);
-  if (next.equals(configBytes)) return;
-  configBytes = next;
-  restartGateway();
-});
-for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
-  shuttingDown = true;
-  if (crashRestartTimer) clearTimeout(crashRestartTimer);
-  unwatchFile(config);
-  if (child && child.exitCode === null) child.kill(signal);
-  else process.exit(0);
-});
-spawnGateway();
-}
-main();
-NODE
-WRAPPER
+  [ "$DRY_RUN" = 1 ] && { say "DRY   write 0700 gateway wrapper that executes $SUPERVISOR"; return; }
+  build_supervisor_args
+  umask 077
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\nexec '
+    printf '%q ' "$NODE_RESOLVED" "$SUPERVISOR" "${SUPERVISOR_ARGS[@]}"
+    printf '\n'
+  } > "$WRAPPER"
   chmod 700 "$WRAPPER"
 }
 vbs_quote() {
@@ -2114,16 +1951,24 @@ install_service() {
     fi
     return
   fi
+  install_supervisor
   if [ "$SERVICE_PLATFORM" = Windows ]; then
     install_windows_service
   elif [ "$SERVICE_PLATFORM" = Darwin ]; then
     write_wrapper
+    build_supervisor_args
     local plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" loaded=0; mkdir -p "$HOME/Library/LaunchAgents"
-    cat > "$plist" <<PLIST
+    {
+    cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict><key>Label</key><string>$SERVICE_LABEL</string><key>ProgramArguments</key><array><string>/bin/bash</string><string>$WRAPPER</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StandardOutPath</key><string>$GW_LOG</string><key>StandardErrorPath</key><string>$GW_LOG</string><key>ThrottleInterval</key><integer>10</integer></dict></plist>
+<plist version="1.0"><dict><key>Label</key><string>$SERVICE_LABEL</string><key>ProgramArguments</key><array><string>$NODE_RESOLVED</string><string>$SUPERVISOR</string>
 PLIST
+    for value in "${SUPERVISOR_ARGS[@]}"; do printf '<string>%s</string>\n' "$value"; done
+    cat <<PLIST
+</array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>StandardOutPath</key><string>$GW_LOG</string><key>StandardErrorPath</key><string>$GW_LOG</string><key>ThrottleInterval</key><integer>10</integer></dict></plist>
+PLIST
+    } > "$plist"
     launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true
     for _ in $(seq 1 10); do
       if launchctl bootstrap "gui/$(id -u)" "$plist"; then loaded=1; break; fi
@@ -2132,16 +1977,22 @@ PLIST
     [ "$loaded" = 1 ] || die "launchd did not accept the CozyGateway service after 10 attempts"
   else
     write_wrapper
+    build_supervisor_args
     local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"; mkdir -p "$unit_dir"
     have loginctl || die "Linux logout/reboot persistence needs loginctl; install systemd-login or run CozyGateway as a system service"
     if [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)" != yes ]; then
       loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || die "Linux logout/reboot persistence needs lingering; run: sudo loginctl enable-linger $(id -un)"
     fi
-    cat > "$unit_dir/$SERVICE_UNIT" <<UNIT
+    {
+    cat <<UNIT
 [Unit]
 Description=CozyGateway
 [Service]
-ExecStart=/bin/bash $WRAPPER
+UNIT
+    printf 'ExecStart=%q %q ' "$NODE_RESOLVED" "$SUPERVISOR"
+    printf '%q ' "${SUPERVISOR_ARGS[@]}"
+    cat <<UNIT
+
 Restart=always
 RestartSec=5
 StandardOutput=append:$GW_LOG
@@ -2149,6 +2000,7 @@ StandardError=append:$GW_LOG
 [Install]
 WantedBy=default.target
 UNIT
+    } > "$unit_dir/$SERVICE_UNIT"
     systemctl --user daemon-reload; systemctl --user enable --now "$SERVICE_UNIT"
   fi
 }

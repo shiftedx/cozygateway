@@ -831,9 +831,10 @@ function Install-WithCozyAgents {
     try {
         Get-VerifiedAsset 'cozygateway.mjs' (Join-Path $stage 'cozygateway.mjs') $Base
         Get-VerifiedAsset 'cozygateway-installer.sh' (Join-Path $stage 'agent-install.sh') $Base
+        Get-VerifiedAsset 'gateway-supervisor.cjs' (Join-Path $stage 'gateway-supervisor.cjs') $Base
         Get-VerifiedAsset 'install.ps1' (Join-Path $stage 'cozygateway-bootstrap.ps1') $Base
         New-Item -ItemType Directory -Force -Path $Bin | Out-Null
-        foreach ($asset in @('cozygateway.mjs', 'agent-install.sh', 'cozygateway-bootstrap.ps1')) {
+        foreach ($asset in @('cozygateway.mjs', 'agent-install.sh', 'gateway-supervisor.cjs', 'cozygateway-bootstrap.ps1')) {
             Promote-VerifiedAsset $asset $stage $Bin
         }
     } finally {
@@ -981,9 +982,10 @@ try {
     Get-VerifiedAsset 'cozygateway.mjs' (Join-Path $stage 'cozygateway.mjs') $base
     Get-VerifiedAsset 'cozygateway-hermes-attach-plugin.tar.gz' (Join-Path $stage 'cozygateway-hermes-attach-plugin.tar.gz') $base
     Get-VerifiedAsset 'cozygateway-installer.sh' (Join-Path $stage 'agent-install.sh') $base
+    Get-VerifiedAsset 'gateway-supervisor.cjs' (Join-Path $stage 'gateway-supervisor.cjs') $base
     Get-VerifiedAsset 'install.ps1' (Join-Path $stage 'cozygateway-bootstrap.ps1') $base
     New-Item -ItemType Directory -Force -Path $bin | Out-Null
-    foreach ($asset in @('cozygateway.mjs', 'cozygateway-hermes-attach-plugin.tar.gz', 'agent-install.sh', 'cozygateway-bootstrap.ps1')) {
+    foreach ($asset in @('cozygateway.mjs', 'cozygateway-hermes-attach-plugin.tar.gz', 'agent-install.sh', 'gateway-supervisor.cjs', 'cozygateway-bootstrap.ps1')) {
         Promote-VerifiedAsset $asset $stage $bin
     }
 } finally {

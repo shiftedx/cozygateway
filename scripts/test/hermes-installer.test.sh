@@ -220,11 +220,13 @@ mkdir -p "$tmp/release-assets"
 cp "$tmp/gateway.mjs" "$tmp/release-assets/cozygateway.mjs"
 cp "$tmp/plugin.tar.gz" "$tmp/release-assets/cozygateway-hermes-attach-plugin.tar.gz"
 cp "$repo_root/scripts/agent-install.sh" "$tmp/release-assets/cozygateway-installer.sh"
+cp "$repo_root/scripts/gateway-supervisor.cjs" "$tmp/release-assets/gateway-supervisor.cjs"
 cp "$repo_root/scripts/install.sh" "$tmp/release-assets/install.sh"
-for asset in cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz cozygateway-installer.sh install.sh; do
+for asset in cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz cozygateway-installer.sh gateway-supervisor.cjs install.sh; do
   if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/$asset" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/$asset" | awk '{print $1}')"; fi
   printf '%s  %s\n' "$asset_sha" "$asset" > "$tmp/release-assets/$asset.sha256"
 done
+cp "$repo_root/scripts/gateway-supervisor.cjs" "$tmp/gateway-supervisor.cjs"
 release_asset_base="file://$tmp/release-assets"
 case "$OSTYPE" in
   msys*|cygwin*)
