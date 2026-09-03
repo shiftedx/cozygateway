@@ -755,15 +755,14 @@ fi
 expect_contains "$missing_repair_metadata" 'repair metadata is unavailable. Reinstall with: curl -fsSL https://cozylabs.ai/install.sh | bash'
 mv "$tmp/gateway-live/local/install-state.saved" "$tmp/gateway-live/local/install-state"
 
-grep -Fq 'watchFile(config' "$tmp/gateway-live/local/run-gateway.sh"
-grep -Fq 'restartGateway' "$tmp/gateway-live/local/run-gateway.sh"
-grep -Fq 'restartAfterCrash' "$tmp/gateway-live/local/run-gateway.sh"
+cmp -s "$repo_root/scripts/gateway-supervisor.cjs" "$tmp/gateway-live/local/gateway-supervisor.cjs"
+grep -Fq -- '--platform Darwin' "$tmp/gateway-live/local/run-gateway.sh"
 remote_pair="$(COZYGATEWAY_TEST_REAL_NODE="$real_node" "$tmp/gateway-live/bin/cozygateway" pair --url https://gateway.example.com)"
 grep -q '"gatewayUrl":"https://gateway.example.com"' <<<"$remote_pair"
-grep -Fq 'parseEnv(readFileSync(gatewayEnvPath' "$tmp/gateway-live/local/run-gateway.sh"
-grep -Fq 'HERMES_DASHBOARD_SESSION_TOKEN' "$tmp/gateway-live/local/run-gateway.sh"
-grep -Fq "'x-hermes-session-token'" "$tmp/gateway-live/local/run-gateway.sh"
-if grep -Fq '/auth/password-login' "$tmp/gateway-live/local/run-gateway.sh"; then
+grep -Fq 'parseEnv(readFileSync(options.gatewayEnv' "$tmp/gateway-live/local/gateway-supervisor.cjs"
+grep -Fq 'HERMES_DASHBOARD_SESSION_TOKEN' "$tmp/gateway-live/local/gateway-supervisor.cjs"
+grep -Fq "'x-hermes-session-token'" "$tmp/gateway-live/local/gateway-supervisor.cjs"
+if grep -Fq '/auth/password-login' "$tmp/gateway-live/local/gateway-supervisor.cjs"; then
   echo 'loopback Dashboard wrapper must use Hermes session-token auth, not password auth' >&2
   exit 1
 fi
@@ -771,8 +770,8 @@ if grep -Fq '/auth/password-login' "$repo_root/scripts/agent-install.sh"; then
   echo 'installer source must not contain /auth/password-login' >&2
   exit 1
 fi
-grep -Fq 'spawn(process.execPath, [bundle' "$tmp/gateway-live/local/run-gateway.sh"
-sed -n "/<<'NODE'/,/^NODE$/p" "$tmp/gateway-live/local/run-gateway.sh" | sed '1d;$d' | "$real_node" --check -
+grep -Fq 'spawn(process.execPath, [options.bundle' "$tmp/gateway-live/local/gateway-supervisor.cjs"
+"$real_node" --check "$tmp/gateway-live/local/gateway-supervisor.cjs"
 if grep -Fq '. "' "$tmp/gateway-live/local/run-gateway.sh"; then
   echo 'gateway wrapper must not source credential files' >&2
   exit 1
@@ -784,7 +783,7 @@ fi
 # Dashboard, and Gateway cannot start until authenticated /api/config succeeds.
 # An atomic config replacement must then terminate the first gateway child and
 # launch a second child that reads the new listener port.
-sed -n "/<<'NODE'/,/^NODE$/p" "$tmp/gateway-live/local/run-gateway.sh" | sed '1d;$d' > "$tmp/supervisor.cjs"
+cp "$tmp/gateway-live/local/gateway-supervisor.cjs" "$tmp/supervisor.cjs"
 cat > "$tmp/reload-gateway.mjs" <<'RELOAD_GATEWAY'
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 if (!existsSync(process.env.COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER)) process.exit(2);
@@ -951,8 +950,9 @@ NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_RELOAD_LOG="$rel
   COZYGATEWAY_TEST_HERMES_STUB_MARKER="$hermes_stub_marker" COZYGATEWAY_TEST_HERMES_STUB_TRACE="$hermes_stub_trace" \
   COZYGATEWAY_TEST_EXPECTED_HERMES_HOME="$expected_hermes_home" \
   "$real_node" "$tmp/supervisor.cjs" \
-  "$tmp/gateway-live/local/gateway.env" "$tmp/gateway-live/local/dashboard.env" "$tmp/hermes" \
-  "$hermes_stub_arg" "$expected_launcher" "$owner_helper" "$mock_dashboard_port" "$tmp/reload-gateway.mjs" "$tmp/gateway-live/local/cozygateway.config.json" \
+  --platform Windows --gateway-env "$tmp/gateway-live/local/gateway.env" --bundle "$tmp/reload-gateway.mjs" --config "$tmp/gateway-live/local/cozygateway.config.json" \
+  --maintenance-socket unused --maintenance-worker unused --database unused --dashboard-env "$tmp/gateway-live/local/dashboard.env" --hermes-root "$tmp/hermes" \
+  --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$mock_dashboard_port" --windows-dashboard-profile \
   >"$tmp/supervisor.log" 2>&1 &
 supervisor_pid=$!
 for _ in $(seq 1 50); do [ -s "$tmp/reload.log" ] && break; sleep 0.1; done
@@ -1032,8 +1032,9 @@ CRASH_CHILD_PRELOAD
 crash_spawn_log="$tmp/crash-spawn.log"
 NODE_OPTIONS="--require=$tmp/crash-child-preload.cjs" COZYGATEWAY_TEST_CRASH_SPAWN_LOG="$crash_spawn_log" \
   "$real_node" "$tmp/supervisor.cjs" \
-  "$tmp/gateway-live/local/gateway.env" "$tmp/gateway-live/local/dashboard.env" "$tmp/hermes" \
-  "$hermes_stub_arg" "$expected_launcher" "$owner_helper" "$mock_dashboard_port" "$tmp/reload-gateway.mjs" "$tmp/gateway-live/local/cozygateway.config.json" \
+  --platform Windows --gateway-env "$tmp/gateway-live/local/gateway.env" --bundle "$tmp/reload-gateway.mjs" --config "$tmp/gateway-live/local/cozygateway.config.json" \
+  --maintenance-socket unused --maintenance-worker unused --database unused --dashboard-env "$tmp/gateway-live/local/dashboard.env" --hermes-root "$tmp/hermes" \
+  --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$mock_dashboard_port" --windows-dashboard-profile \
   >"$tmp/crash-supervisor.log" 2>&1 &
 crash_supervisor_pid=$!
 for _ in $(seq 1 20); do [ -f "$crash_spawn_log" ] && [ "$(wc -l < "$crash_spawn_log" | tr -d ' ')" -ge 1 ] && break; sleep 0.1; done
@@ -1085,8 +1086,9 @@ foreign_supervisor_status=0
   COZYGATEWAY_TEST_DASHBOARD_PORT="$foreign_dashboard_port" COZYGATEWAY_TEST_HERMES_STUB_MARKER="$hermes_stub_marker" \
   COZYGATEWAY_TEST_HERMES_STUB_TRACE="$hermes_stub_trace" COZYGATEWAY_TEST_EXPECTED_HERMES_HOME="$expected_hermes_home" \
   "$real_node" "$tmp/supervisor.cjs" \
-  "$tmp/gateway-live/local/gateway.env" "$tmp/gateway-live/local/dashboard.env" "$tmp/hermes" \
-  "$hermes_stub_arg" "$expected_launcher" "$owner_helper" "$foreign_dashboard_port" "$tmp/reload-gateway.mjs" "$tmp/gateway-live/local/cozygateway.config.json" \
+  --platform Windows --gateway-env "$tmp/gateway-live/local/gateway.env" --bundle "$tmp/reload-gateway.mjs" --config "$tmp/gateway-live/local/cozygateway.config.json" \
+  --maintenance-socket unused --maintenance-worker unused --database unused --dashboard-env "$tmp/gateway-live/local/dashboard.env" --hermes-root "$tmp/hermes" \
+  --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$foreign_dashboard_port" --windows-dashboard-profile \
   >"$tmp/foreign-supervisor.log" 2>&1) || foreign_supervisor_status=$?
 set -e
 test "$foreign_supervisor_status" -ne 0
@@ -1114,8 +1116,9 @@ failed_supervisor_status=0
   COZYGATEWAY_TEST_HERMES_STUB_TRACE="$hermes_stub_trace" COZYGATEWAY_TEST_EXPECTED_HERMES_HOME="$expected_hermes_home" \
   COZYGATEWAY_TEST_TASKKILL_LOG="$taskkill_log" \
   "$real_node" "$tmp/supervisor.cjs" \
-  "$tmp/gateway-live/local/gateway.env" "$tmp/gateway-live/local/dashboard.env" "$tmp/hermes" \
-  "$hermes_stub_arg" "$expected_launcher" "$owner_helper" "$failed_dashboard_port" "$tmp/reload-gateway.mjs" "$tmp/gateway-live/local/cozygateway.config.json" \
+  --platform Windows --gateway-env "$tmp/gateway-live/local/gateway.env" --bundle "$tmp/reload-gateway.mjs" --config "$tmp/gateway-live/local/cozygateway.config.json" \
+  --maintenance-socket unused --maintenance-worker unused --database unused --dashboard-env "$tmp/gateway-live/local/dashboard.env" --hermes-root "$tmp/hermes" \
+  --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$failed_dashboard_port" --windows-dashboard-profile \
   >"$tmp/failed-supervisor.log" 2>&1) || failed_supervisor_status=$?
 set -e
 test "$failed_supervisor_status" -ne 0
@@ -1316,7 +1319,7 @@ grep -Fq 'CozyGateway listens on 127.0.0.1:8787' <<<"$linux_output"
 grep -Fq '"host": "127.0.0.1"' "$tmp/gateway-linux-live/local/cozygateway.config.json"
 grep -q '^enable-linger ' "$tmp/system-commands"
 grep -q '^--user enable --now cozygateway.service$' "$tmp/system-commands"
-grep -Fq "ExecStart=/bin/bash $tmp/gateway-linux-live/local/run-gateway.sh" "$tmp/linux-xdg/systemd/user/cozygateway.service"
+grep -Fq "$tmp/gateway-linux-live/local/gateway-supervisor.cjs --platform Linux" "$tmp/linux-xdg/systemd/user/cozygateway.service"
 if [[ "$(uname -s)" = MINGW* ]]; then
   cmp -s "$tmp/linux-home/.local/bin/cozygateway" "$tmp/gateway-linux-live/bin/cozygateway"
 else
@@ -1390,13 +1393,20 @@ partial_windows_startup="$tmp/windows-appdata/Microsoft/Windows/Start Menu/Progr
 mkdir -p "$partial_windows_gateway/runtime/node" "$partial_windows_gateway/local" "$(dirname "$partial_windows_startup")"
 printf 'partial\n' > "$partial_windows_gateway/runtime/node/marker"
 partial_windows_wrapper_native="$("$tmp/bin/cygpath" -w "$partial_windows_gateway/local/run-gateway.sh")"
-partial_windows_vbs_native="$("$tmp/bin/cygpath" -w "$partial_windows_gateway/local/run-gateway.vbs")"
-printf 'command = "%s"\n' "$partial_windows_wrapper_native" > "$partial_windows_gateway/local/run-gateway.vbs"
+cat > "$partial_windows_gateway/local/run-gateway.vbs" <<PARTIAL_VBS
+Set shell = CreateObject("WScript.Shell")
+command = "$partial_windows_wrapper_native"
+For attempt = 0 To 3
+  code = shell.Run(command, 0, True)
+  If code = 0 Then Exit For
+  If attempt < 3 Then WScript.Sleep 60000
+Next
+PARTIAL_VBS
 cp "$partial_windows_gateway/local/run-gateway.vbs" "$partial_windows_startup"
-HOME="$tmp/windows-partial-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:/usr/bin:/bin" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-partial-commands" COZYGATEWAY_TEST_SCHTASKS_XML="$partial_windows_vbs_native" COZYGATEWAY_NODE=false COZYGATEWAY_HERMES_BIN=false COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$partial_windows_gateway" >/dev/null
+HOME="$tmp/windows-partial-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:/usr/bin:/bin" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-partial-commands" COZYGATEWAY_NODE=false COZYGATEWAY_HERMES_BIN=false COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$partial_windows_gateway" >/dev/null
 test ! -e "$partial_windows_gateway"
 test ! -e "$partial_windows_startup"
-grep -Fq '/Delete /F /TN CozyGateway' "$tmp/windows-partial-commands"
+! grep -Fq '/Delete /F /TN CozyGateway' "$tmp/windows-partial-commands"
 grep -Fq 'powershell ' "$tmp/windows-partial-commands"
 foreign_windows_gateway="$tmp/gateway-windows-foreign"
 foreign_windows_startup="$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
@@ -1555,8 +1565,8 @@ grep -Fq "using Node.js 24 at $tmp/gateway-windows-node/runtime/node/node.exe" <
 windows_native_hermes="$("$tmp/bin/cygpath" -w "$tmp/bin/hermes")"
 windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$windows_native_hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"
 grep -Fqx "hermes_bin=$tmp/bin/hermes" "$tmp/gateway-windows-live/local/install-state"
-grep -Fq "const dashboardArgs = ['dashboard', ...(1 === 1 ? ['-p', 'default'] : [])" "$tmp/gateway-windows-live/local/run-gateway.sh"
-grep -Fq "windowsDashboardProfile === '1' ? ['-p', 'default'] : []" "$repo_root/scripts/agent-install.sh"
+grep -Fq -- '--windows-dashboard-profile' "$tmp/gateway-windows-live/local/run-gateway.sh"
+grep -Fq "options.windowsDashboardProfile ? ['-p', 'default'] : []" "$repo_root/scripts/gateway-supervisor.cjs"
 
 # A fresh interactive install can opt into same-LAN access. Invalid input repeats
 # the one question; the affirmative answer persists the wildcard listener and
@@ -1568,8 +1578,9 @@ grep -Fq 'trusted private network' <<<"$windows_lan_output"
 grep -Fq 'Tailscale' <<<"$windows_lan_output"
 grep -Fq '"host": "0.0.0.0"' "$tmp/gateway-windows-lan/local/cozygateway.config.json"
 
-grep -Fq '/Create /F /SC ONLOGON /RL LIMITED /TN CozyGateway' "$tmp/windows-commands"
-grep -Fq 'wscript ' "$tmp/windows-commands"
+grep -Fq '/Create /F /TN CozyGateway /XML' "$tmp/windows-commands"
+grep -Fq '/Run /TN CozyGateway' "$tmp/windows-commands"
+! grep -Fq 'wscript ' "$tmp/windows-commands"
 grep -Fq 'fake-qr' <<<"$windows_output"
 test -f "$tmp/gateway-windows-live/bin/cozygateway.cmd"
 grep -Fq 'gateway.mjs' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
@@ -1587,7 +1598,8 @@ if grep -Fq -- '--config' "$tmp/gateway-windows-live/bin/cozygateway.cmd"; then
   echo 'Windows command shim must allow an explicit --config override' >&2
   exit 1
 fi
-grep -Fq 'shell.Run command, 0, False' "$tmp/gateway-windows-live/local/run-gateway.vbs"
+grep -Fq 'shell.Run(command, 0, True)' "$tmp/gateway-windows-live/local/run-gateway.vbs"
+grep -Fq '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>' "$tmp/gateway-windows-live/local/cozygateway-task.xml"
 grep -Fq 'command = """' "$tmp/gateway-windows-live/local/run-gateway.vbs"
 grep -Eq '^COZYGATEWAY_SPOOL_PATH=[A-Za-z]:\\' "$tmp/hermes/.env"
 file "$tmp/gateway-windows-live/local/run-gateway.vbs" | grep -Fq 'CRLF'

@@ -20,6 +20,7 @@ const WORKFLOW = readFileSync(join(ROOT, ".github/workflows/release.yml"), "utf8
 const BUNDLER = readFileSync(join(ROOT, "scripts/build-bundle.mjs"), "utf8");
 const INSTALLER = readFileSync(join(ROOT, "scripts/agent-install.sh"), "utf8");
 const SUPERVISOR = join(ROOT, "scripts/gateway-supervisor.cjs");
+const SUPERVISOR_BODY = readFileSync(SUPERVISOR, "utf8");
 
 const REQUIRED = [
   "cozygateway.mjs",
@@ -58,17 +59,54 @@ describe("what a release publishes", () => {
     expect(BUNDLER).toContain('"dist-bundle/gateway-supervisor.cjs"');
   });
 
-  it("ships one gateway supervisor body for every desktop platform", () => {
+  it("one supervisor starts Gateway in both harness modes", () => {
     expect(existsSync(SUPERVISOR)).toBe(true);
     expect(INSTALLER).toContain("gateway-supervisor.cjs");
     expect(INSTALLER).not.toContain("write_cozyagents_wrapper()");
     expect(INSTALLER).not.toContain("exec \"$NODE_RESOLVED\" - ");
   });
 
-  it("lets POSIX service managers execute and restart the supervisor", () => {
+  it("POSIX exits once and relies on the native service restart", () => {
     expect(INSTALLER).toContain("<string>$NODE_RESOLVED</string><string>$SUPERVISOR</string>");
     expect(INSTALLER).toContain("printf 'ExecStart=%q %q ' \"$NODE_RESOLVED\" \"$SUPERVISOR\"");
     expect(INSTALLER).not.toContain("ExecStart=/bin/bash $WRAPPER");
+  });
+
+  it("Windows bounds child restarts", () => {
+    expect(SUPERVISOR_BODY).toContain("crashTimes.length >= 3");
+    expect(SUPERVISOR_BODY).toContain("now - crashTimes[0] >= 300_000");
+  });
+
+  it("config change restarts without spending crash budget", () => {
+    expect(SUPERVISOR_BODY).toMatch(/if \(deliberateRestart\) \{[\s\S]*?return start\(\);[\s\S]*?\}\s*crashed\(\);/);
+  });
+
+  it("Hermes prelude cleans up only its owned Dashboard on failure", () => {
+    expect(SUPERVISOR_BODY).toContain("if (child) await stopOwnedDashboard(child, options)");
+  });
+
+  it("task action directly tracks the Node supervisor", () => {
+    expect(INSTALLER).toContain('schtasks.exe /Create /F /TN "$WINDOWS_TASK" /XML');
+    expect(INSTALLER).toContain('schtasks.exe /Run /TN "$WINDOWS_TASK"');
+  });
+
+  it("task has bounded restart policy", () => {
+    expect(INSTALLER).toContain("<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>");
+  });
+
+  it("successful registration never launches detaching VBScript", () => {
+    expect(INSTALLER).toContain("shell.Run(command, 0, True)");
+    expect(INSTALLER).not.toContain('task_command="wscript.exe');
+  });
+
+  it("Startup fallback waits and retries only three times", () => {
+    expect(INSTALLER).toContain("For attempt = 0 To 3");
+    expect(INSTALLER).toContain("If attempt < 3 Then WScript.Sleep 60000");
+  });
+
+  it("repair replaces only an owned task action", () => {
+    expect(INSTALLER).toContain("if [ -n \"$existing\" ] && ! windows_task_uses_current_supervisor; then");
+    expect(INSTALLER).toContain("Scheduled Task $WINDOWS_TASK is foreign; leaving it untouched");
   });
 
   it("checksums whatever it built, if a bundle is present", () => {

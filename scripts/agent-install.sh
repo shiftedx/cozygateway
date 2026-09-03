@@ -200,6 +200,7 @@ SERVICE_LABEL="ai.cozylabs.cozygateway"
 SERVICE_UNIT="cozygateway.service"
 WINDOWS_TASK="CozyGateway"
 WINDOWS_VBS="$LOCAL_DIR/run-gateway.vbs"
+WINDOWS_TASK_XML="$LOCAL_DIR/cozygateway-task.xml"
 INSTALL_ALREADY_CONFIGURED=0
 [ ! -f "$CONFIG_JSON" ] || INSTALL_ALREADY_CONFIGURED=1
 
@@ -888,6 +889,7 @@ write_cozyagents_state() {
     printf 'harness=cozyagents\n'
     printf 'cozyagents_home=%s\n' "$COZYAGENTS_HOME_DIR"
     printf 'supervisor=%s\n' "$SUPERVISOR"
+    if is_windows; then printf 'task_xml=%s\n' "$WINDOWS_TASK_XML"; fi
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
 }
@@ -1011,6 +1013,7 @@ write_state() {
     # Hermes work it owns.
     printf 'hermes_bin=%s\n' "$HERMES_RESOLVED"
     printf 'supervisor=%s\n' "$SUPERVISOR"
+    if is_windows; then printf 'task_xml=%s\n' "$WINDOWS_TASK_XML"; fi
     for profile in "${SELECTED[@]}"; do printf 'service_%s=%s\n' "$profile" "$(service_action_for "$profile")"; done
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
@@ -1703,27 +1706,17 @@ windows_startup_dir() {
   to_posix_path "$native\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
 }
 windows_startup_entry_uses_current_wrapper() {
-  local entry="$1" wrapper_native prefix separator suffix command rest bash_path wrapper_path line_count
+  local entry="$1" bash_posix bash_native wrapper_native command expected actual
   [ -f "$entry" ] || return 1
+  bash_posix="${COZYGATEWAY_GIT_BASH:-$(command -v bash)}"
+  bash_posix="$(to_posix_path "$bash_posix")"
+  [ -f "$bash_posix" ] || return 1
+  bash_native="$(to_windows_path "$bash_posix")"
   wrapper_native="$(to_windows_path "$WRAPPER")"
-  case "$wrapper_native" in *'"'*|*$'\r'*|*$'\n'*) return 1 ;; esac
-  line_count="$(tr -d '\r' < "$entry" | awk 'END { print NR }')"
-  [ "$line_count" = 3 ] || return 1
-  [ "$(sed -n '1p' "$entry" | tr -d '\r')" = 'Set shell = CreateObject("WScript.Shell")' ] || return 1
-  [ "$(sed -n '3p' "$entry" | tr -d '\r')" = 'shell.Run command, 0, False' ] || return 1
-  command="$(sed -n '2p' "$entry" | tr -d '\r')"
-  prefix='command = """'
-  separator='"" ""'
-  suffix='"""'
-  rest="${command#"$prefix"}"
-  [ "$rest" != "$command" ] || return 1
-  bash_path="${rest%%"$separator"*}"
-  rest="${rest#*"$separator"}"
-  [ "$rest" != "$bash_path" ] || return 1
-  wrapper_path="${rest%"$suffix"}"
-  [ "$wrapper_path" != "$rest" ] || return 1
-  [ "$rest" = "$wrapper_path$suffix" ] || return 1
-  [ -n "$bash_path" ] && [ "$wrapper_path" = "$wrapper_native" ]
+  command="$(vbs_quote "\"$bash_native\" \"$wrapper_native\"")"
+  expected="$(printf 'Set shell = CreateObject("WScript.Shell")\ncommand = %s\nFor attempt = 0 To 3\n  code = shell.Run(command, 0, True)\n  If code = 0 Then Exit For\n  If attempt < 3 Then WScript.Sleep 60000\nNext' "$command")"
+  actual="$(tr -d '\r' < "$entry")"
+  [ "$actual" = "$expected" ]
 }
 write_windows_launcher() {
   local bash_posix bash_native wrapper_native command
@@ -1737,39 +1730,36 @@ write_windows_launcher() {
   {
     printf 'Set shell = CreateObject("WScript.Shell")\r\n'
     printf 'command = %s\r\n' "$command"
-    printf 'shell.Run command, 0, False\r\n'
+    printf 'For attempt = 0 To 3\r\n'
+    printf '  code = shell.Run(command, 0, True)\r\n'
+    printf '  If code = 0 Then Exit For\r\n'
+    printf '  If attempt < 3 Then WScript.Sleep 60000\r\n'
+    printf 'Next\r\n'
   } > "$WINDOWS_VBS"
   chmod 600 "$WINDOWS_VBS" 2>/dev/null || true
 }
 load_windows_wrapper_identity() {
-  local line head values value index node
-  [ -r "$WRAPPER" ] || return 1
-  line="$(sed -n '3p' "$WRAPPER")"
-  head="${line#exec \"}"
-  [ "$head" != "$line" ] || return 1
-  node="${head%%\" - *}"
-  [ "$node" != "$head" ] || return 1
-  values="${head#*\" - }"
-  for index in $(seq 1 9); do
-    case "$values" in \"*) ;; *) return 1 ;; esac
-    values="${values#\"}"; value="${values%%\"*}"
-    [ "$value" != "$values" ] || return 1
-    values="${values#*\"}"
-    case "$index" in
-      1) WINDOWS_OWNED_GATEWAY_ENV="$(to_posix_path "$value")" ;;
-      2) WINDOWS_OWNED_DASHBOARD_ENV="$(to_posix_path "$value")" ;;
-      3) WINDOWS_OWNED_HERMES_ROOT="$(to_posix_path "$value")" ;;
-      4) WINDOWS_OWNED_HERMES_RESOLVED="$(to_posix_path "$value")" ;;
-      5) WINDOWS_OWNED_LAUNCHER="$(to_posix_path "$value")" ;;
-      6) WINDOWS_OWNED_DASHBOARD_OWNER_PS1="$(to_posix_path "$value")" ;;
-      7) WINDOWS_OWNED_DASHBOARD_PORT="$value" ;;
-      8) WINDOWS_OWNED_BUNDLE_PATH="$(to_posix_path "$value")" ;;
-      9) WINDOWS_OWNED_CONFIG_JSON="$(to_posix_path "$value")" ;;
-    esac
-    values="${values# }"
-  done
-  case "$values" in "<<'NODE'") ;; *) return 1 ;; esac
-  WINDOWS_OWNED_NODE_RESOLVED="$(to_posix_path "$node")"
+  local prefix line node supervisor gateway_env bundle config
+  [ -r "$WRAPPER" ] && [ -r "$SUPERVISOR" ] || return 1
+  [ "$(tr -d '\r' < "$WRAPPER" | awk 'END { print NR }')" = 3 ] || return 1
+  [ "$(sed -n '1p' "$WRAPPER" | tr -d '\r')" = '#!/usr/bin/env bash' ] || return 1
+  [ "$(sed -n '2p' "$WRAPPER" | tr -d '\r')" = 'set -euo pipefail' ] || return 1
+  printf -v node '%q' "$NODE_RESOLVED"; printf -v supervisor '%q' "$SUPERVISOR"
+  printf -v gateway_env '%q' "$(to_windows_path "$GATEWAY_ENV")"
+  printf -v bundle '%q' "$(to_windows_path "$BUNDLE_PATH")"; printf -v config '%q' "$(to_windows_path "$CONFIG_JSON")"
+  prefix="exec $node $supervisor --platform Windows --gateway-env $gateway_env --bundle $bundle --config $config "
+  line="$(sed -n '3p' "$WRAPPER" | tr -d '\r')"
+  [ "${line#"$prefix"}" != "$line" ] || return 1
+  WINDOWS_OWNED_NODE_RESOLVED="$NODE_RESOLVED"
+  WINDOWS_OWNED_GATEWAY_ENV="$GATEWAY_ENV"
+  WINDOWS_OWNED_DASHBOARD_ENV="$DASHBOARD_ENV"
+  WINDOWS_OWNED_HERMES_ROOT="${HERMES_ROOT:-}"
+  WINDOWS_OWNED_HERMES_RESOLVED="${HERMES_RESOLVED:-}"
+  WINDOWS_OWNED_LAUNCHER="${HERMES_ROOT:-}/bin/hermes.exe"
+  WINDOWS_OWNED_DASHBOARD_OWNER_PS1="$DASHBOARD_OWNER_PS1"
+  WINDOWS_OWNED_DASHBOARD_PORT="$DASHBOARD_PORT"
+  WINDOWS_OWNED_BUNDLE_PATH="$BUNDLE_PATH"
+  WINDOWS_OWNED_CONFIG_JSON="$CONFIG_JSON"
   WINDOWS_OWNED_IDENTITY=1
 }
 stop_owned_windows_gateway() {
@@ -1789,7 +1779,7 @@ stop_owned_windows_gateway() {
   launcher_native="$(to_windows_path "$WINDOWS_OWNED_LAUNCHER")"
   owner_helper_native="$(to_windows_path "$WINDOWS_OWNED_DASHBOARD_OWNER_PS1")"
   set +e
-  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_GATEWAY_ENV="$gateway_env_native" COZYGATEWAY_EXPECTED_DASHBOARD_ENV="$dashboard_env_native" COZYGATEWAY_EXPECTED_NODE="$node_native" COZYGATEWAY_EXPECTED_BUNDLE="$bundle_native" COZYGATEWAY_EXPECTED_HERMES_ROOT="$hermes_root_native" COZYGATEWAY_EXPECTED_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_OWNER_HELPER="$owner_helper_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$WINDOWS_OWNED_DASHBOARD_PORT" powershell.exe -NoProfile -NonInteractive -Command '
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_GATEWAY_ENV="$gateway_env_native" COZYGATEWAY_EXPECTED_DASHBOARD_ENV="$dashboard_env_native" COZYGATEWAY_EXPECTED_NODE="$node_native" COZYGATEWAY_EXPECTED_SUPERVISOR="$(to_windows_path "$SUPERVISOR")" COZYGATEWAY_EXPECTED_BUNDLE="$bundle_native" COZYGATEWAY_EXPECTED_HERMES_ROOT="$hermes_root_native" COZYGATEWAY_EXPECTED_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_OWNER_HELPER="$owner_helper_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$WINDOWS_OWNED_DASHBOARD_PORT" powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
     function Same-Path([string] $Candidate, [string] $Expected) {
       if ([string]::IsNullOrWhiteSpace($Candidate) -or [string]::IsNullOrWhiteSpace($Expected)) { return $false }
@@ -1804,8 +1794,17 @@ stop_owned_windows_gateway() {
     }
     function Is-ManagedGatewaySupervisor($Process) {
       $tokens = Command-Tokens ([string]$Process.CommandLine)
-      if ($tokens.Count -ne 11 -or -not (Same-Path $tokens[0] $env:COZYGATEWAY_EXPECTED_NODE) -or $tokens[1] -ne "-" -or -not (Same-Path $tokens[2] $env:COZYGATEWAY_EXPECTED_GATEWAY_ENV) -or -not (Same-Path $tokens[3] $env:COZYGATEWAY_EXPECTED_DASHBOARD_ENV) -or -not (Same-Path $tokens[4] $env:COZYGATEWAY_EXPECTED_HERMES_ROOT) -or -not (Same-Path $tokens[5] $env:COZYGATEWAY_EXPECTED_HERMES) -or -not (Same-Path $tokens[6] $env:COZYGATEWAY_EXPECTED_LAUNCHER) -or -not (Same-Path $tokens[7] $env:COZYGATEWAY_EXPECTED_OWNER_HELPER) -or $tokens[8] -ne $env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT -or -not (Same-Path $tokens[9] $env:COZYGATEWAY_EXPECTED_BUNDLE)) { return $false }
-      return Same-Path $tokens[10] $env:COZYGATEWAY_EXPECTED_CONFIG
+      if ($tokens.Count -lt 16 -or -not (Same-Path $tokens[0] $env:COZYGATEWAY_EXPECTED_NODE) -or -not (Same-Path $tokens[1] $env:COZYGATEWAY_EXPECTED_SUPERVISOR)) { return $false }
+      $arguments = @{}
+      for ($index = 2; $index -lt $tokens.Count; $index += 2) {
+        if ($tokens[$index] -eq "--windows-dashboard-profile") { $arguments[$tokens[$index]] = "true"; $index -= 1; continue }
+        if ($index + 1 -ge $tokens.Count) { return $false }
+        $arguments[$tokens[$index]] = $tokens[$index + 1]
+      }
+      return $arguments["--platform"] -eq "Windows" -and
+        (Same-Path $arguments["--gateway-env"] $env:COZYGATEWAY_EXPECTED_GATEWAY_ENV) -and
+        (Same-Path $arguments["--bundle"] $env:COZYGATEWAY_EXPECTED_BUNDLE) -and
+        (Same-Path $arguments["--config"] $env:COZYGATEWAY_EXPECTED_CONFIG)
     }
     function Managed-GatewayProcesses {
       $all = @(Get-CimInstance Win32_Process)
@@ -1880,30 +1879,67 @@ windows_gateway_ports_are_free() {
     [ "$release_code" -eq 0 ] || die "port $expected_port is owned by a process this installer cannot safely stop"
   done
 }
+windows_task_uses_current_supervisor() {
+  local xml recorded_command recorded_arguments vbs_native
+  xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
+  [ -z "$xml" ] && return 1
+  if [ -f "$WINDOWS_TASK_XML" ]; then
+    recorded_command="$(sed -n 's:.*\(<Command>[^<]*</Command>\).*:\1:p' "$WINDOWS_TASK_XML")"
+    recorded_arguments="$(sed -n 's:.*\(<Arguments>[^<]*</Arguments>\).*:\1:p' "$WINDOWS_TASK_XML")"
+    [ -n "$recorded_command" ] && [ -n "$recorded_arguments" ] &&
+      grep -Fq "$recorded_command" <<<"$xml" && grep -Fq "$recorded_arguments" <<<"$xml" && return 0
+  fi
+  vbs_native="$(to_windows_path "$WINDOWS_VBS")"
+  [ -f "$WINDOWS_VBS" ] && windows_startup_entry_uses_current_wrapper "$WINDOWS_VBS" && grep -Fq "$vbs_native" <<<"$xml"
+}
+windows_recorded_task_is_owned() {
+  windows_task_uses_current_supervisor
+}
+write_windows_task_xml() {
+  local node_native supervisor_native arguments='' value escaped
+  build_supervisor_args
+  node_native="$(to_windows_path "$NODE_RESOLVED")"; supervisor_native="$(to_windows_path "$SUPERVISOR")"
+  for value in "$supervisor_native" "${SUPERVISOR_ARGS[@]}"; do
+    case "$value" in *'"'*|*$'\r'*|*$'\n'*) die "refusing an unsafe Scheduled Task argument" ;; esac
+    arguments="${arguments}${arguments:+ }&quot;${value//&/&amp;}&quot;"
+  done
+  escaped="${node_native//&/&amp;}"
+  umask 077
+  cat > "$WINDOWS_TASK_XML" <<TASK_XML
+<?xml version="1.0" encoding="UTF-8"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Enabled>true</Enabled></Settings><Actions Context="Author"><Exec><Command>$escaped</Command><Arguments>$arguments</Arguments></Exec></Actions></Task>
+TASK_XML
+  chmod 600 "$WINDOWS_TASK_XML" 2>/dev/null || true
+}
 install_windows_service() {
-  local vbs_native task_command output code startup entry
+  local task_xml_native output code startup entry existing
   [ "$DRY_RUN" = 1 ] && { say "DRY   register current-user Scheduled Task $WINDOWS_TASK with Startup-folder fallback"; return; }
   if stop_owned_windows_gateway; then
     say "OK    stopped the previous CozyGateway process for an in-place update"
   fi
   write_wrapper
   write_windows_launcher
-  vbs_native="$(to_windows_path "$WINDOWS_VBS")"
-  task_command="wscript.exe \"$vbs_native\""
+  existing="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
+  if [ -n "$existing" ] && ! windows_task_uses_current_supervisor; then
+    die "Scheduled Task $WINDOWS_TASK is foreign; leaving it untouched"
+  fi
+  write_windows_task_xml
+  task_xml_native="$(to_windows_path "$WINDOWS_TASK_XML")"
   set +e
-  output="$(MSYS_NO_PATHCONV=1 schtasks.exe /Create /F /SC ONLOGON /RL LIMITED /TN "$WINDOWS_TASK" /TR "$task_command" 2>&1)"
+  output="$(MSYS_NO_PATHCONV=1 schtasks.exe /Create /F /TN "$WINDOWS_TASK" /XML "$task_xml_native" 2>&1)"
   code=$?
   set -e
   if [ "$code" -ne 0 ]; then
     startup="$(windows_startup_dir)"; entry="$startup/$WINDOWS_TASK.vbs"
     mkdir -p "$startup"; cp "$WINDOWS_VBS" "$entry"
     say "INFO  Scheduled Task unavailable ($output); installed current-user Startup fallback: $entry"
+    wscript.exe "$(to_windows_path "$WINDOWS_VBS")"
   else
     say "OK    registered current-user Scheduled Task $WINDOWS_TASK"
     startup="$(windows_startup_dir)"; entry="$startup/$WINDOWS_TASK.vbs"
     if [ -f "$entry" ] && { cmp -s "$entry" "$WINDOWS_VBS" || windows_startup_entry_uses_current_wrapper "$entry"; }; then rm -f "$entry"; fi
+    MSYS_NO_PATHCONV=1 schtasks.exe /Run /TN "$WINDOWS_TASK" >/dev/null || die "Scheduled Task $WINDOWS_TASK did not start"
   fi
-  wscript.exe "$vbs_native"
 }
 gateway_ready() {
   local code
@@ -2165,8 +2201,8 @@ uninstall_cozyagents() {
     if [ "$DRY_RUN" = 1 ]; then
       say "DRY   delete Scheduled Task $WINDOWS_TASK and Startup entry $startup_entry"
     else
-      MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
-      rm -f "$startup_entry"
+      windows_recorded_task_is_owned && MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
+      if [ -f "$startup_entry" ] && [ -f "$WINDOWS_VBS" ] && cmp -s "$startup_entry" "$WINDOWS_VBS"; then rm -f "$startup_entry"; fi
       stop_owned_windows_gateway 0 || true
       remove_windows_cli_path
     fi
@@ -2192,16 +2228,17 @@ uninstall() {
     say "WARN  CozyGateway install state is missing; removing recoverable current-user files only"
     if [ "$DRY_RUN" = 1 ]; then run rm -rf "$GATEWAY_DIR"; return; fi
     if [ "$SERVICE_PLATFORM" = Windows ]; then
-      local startup_entry wrapper_native vbs_native task_xml
+      local startup_entry task_xml owned=0
       startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
-      wrapper_native="$(to_windows_path "$WRAPPER")"; vbs_native="$(to_windows_path "$WINDOWS_VBS")"
-      if [ -f "$WINDOWS_VBS" ] && grep -Fq "$wrapper_native" "$WINDOWS_VBS"; then
-        task_xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
-        if grep -Fq "$vbs_native" <<<"$task_xml"; then MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
-        else say "WARN  CozyGateway Scheduled Task ownership could not be verified; leaving it untouched"; fi
-        if [ -f "$startup_entry" ] && cmp -s "$startup_entry" "$WINDOWS_VBS"; then rm -f "$startup_entry"
+      task_xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
+      if [ -n "$task_xml" ] && windows_recorded_task_is_owned; then
+        MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true; owned=1
+      elif [ -n "$task_xml" ]; then say "WARN  CozyGateway Scheduled Task ownership could not be verified; leaving it untouched"; fi
+      if [ -f "$WINDOWS_VBS" ] && windows_startup_entry_uses_current_wrapper "$WINDOWS_VBS"; then
+        if [ -f "$startup_entry" ] && cmp -s "$startup_entry" "$WINDOWS_VBS"; then rm -f "$startup_entry"; owned=1
         elif [ -f "$startup_entry" ]; then say "WARN  CozyGateway Startup entry ownership could not be verified; leaving it untouched"; fi
-        remove_windows_cli_path
+      fi
+      if [ "$owned" = 1 ]; then remove_windows_cli_path
       else say "WARN  CozyGateway Windows launcher ownership could not be verified; leaving task, Startup entry, and PATH untouched"; fi
     elif [ "$SERVICE_PLATFORM" = Darwin ]; then launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; remove_posix_cli
     elif [ "$SERVICE_PLATFORM" = Linux ]; then systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; remove_posix_cli
@@ -2234,8 +2271,8 @@ uninstall() {
     if [ "$DRY_RUN" = 1 ]; then
       say "DRY   delete Scheduled Task $WINDOWS_TASK and Startup entry $startup_entry"
     else
-      MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
-      rm -f "$startup_entry"
+      windows_recorded_task_is_owned && MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
+      if [ -f "$startup_entry" ] && [ -f "$WINDOWS_VBS" ] && cmp -s "$startup_entry" "$WINDOWS_VBS"; then rm -f "$startup_entry"; fi
       stop_owned_windows_gateway 0 || true
     fi
     stop_owned_windows_dashboard_for_uninstall

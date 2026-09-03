@@ -873,6 +873,8 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     Assert-True $cliWriterMatch.Success 'shared installer must define write_cli_wrapper'
     $wrapperWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_wrapper\(\) \{.*?^\}\r?\n(?=vbs_quote\(\))')
     Assert-True $wrapperWriterMatch.Success 'shared installer must define the gateway supervisor writer'
+    $supervisorArgumentsMatch = [regex]::Match($agentInstaller, '(?ms)^build_supervisor_args\(\) \{.*?^\}\r?\n(?=write_wrapper\(\))')
+    Assert-True $supervisorArgumentsMatch.Success 'shared installer must define the supervisor arguments'
     $wrapperIdentityMatch = [regex]::Match($agentInstaller, '(?ms)^load_windows_wrapper_identity\(\) \{.*?^\}\r?\n(?=stop_owned_windows_gateway\(\))')
     Assert-True $wrapperIdentityMatch.Success 'shared installer must define the persisted gateway wrapper identity loader'
     $gatewayStopFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^stop_owned_windows_gateway\(\) \{.*?^\}')
@@ -1040,6 +1042,7 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
     }
     $wrapperGenerator = Join-Path $temp 'generate-gateway-supervisor.sh'
     $generatedWrapper = Join-Path $supervisorLocal 'run-gateway.sh'
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'scripts\gateway-supervisor.cjs') -Destination (Join-Path $supervisorLocal 'gateway-supervisor.cjs')
     $wrapperGeneratorScript = @"
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1055,10 +1058,16 @@ DASHBOARD_PORT="`$9"
 NODE_RESOLVED="`${10}"
 BUNDLE_PATH="`${11}"
 CONFIG_JSON="`${12}"
+SUPERVISOR="`$LOCAL_DIR/gateway-supervisor.cjs"
+MAINTENANCE_WORKER="`$GATEWAY_DIR/bin/gateway-maintenance-worker.cjs"
+MAINTENANCE_SOCKET="`$LOCAL_DIR/gateway-maintenance.sock"
+SERVICE_PLATFORM=Windows
+HARNESS=hermes
 DRY_RUN=0
 say() { printf '%s\n' "`$*"; }
 is_windows() { return 0; }
 to_windows_path() { cygpath -w "`$1"; }
+$($supervisorArgumentsMatch.Value)
 $($wrapperWriterMatch.Value)
 write_wrapper
 "@
@@ -1102,6 +1111,7 @@ HERMES_RESOLVED="`$8"
 DASHBOARD_OWNER_PS1="`$9"
 DASHBOARD_PORT="`${10}"
 WRAPPER="`${11}"
+SUPERVISOR="`$(dirname "`$WRAPPER")/gateway-supervisor.cjs"
 PREVIOUS_PORT="`${12}"
 to_windows_path() { cygpath -w "`$1"; }
 to_posix_path() { cygpath -u "`$1"; }
@@ -1198,9 +1208,12 @@ HERMES_ROOT="`$5"
 HERMES_RESOLVED="`$6"
 DASHBOARD_OWNER_PS1="`$7"
 WRAPPER="`$8"
+SUPERVISOR="`$(dirname "`$WRAPPER")/gateway-supervisor.cjs"
 DASHBOARD_PORT="`$9"
 EXPECTED_NODE_RESOLVED="`${10}"
 EXPECTED_BUNDLE_PATH="`${11}"
+NODE_RESOLVED="`$EXPECTED_NODE_RESOLVED"
+BUNDLE_PATH="`$EXPECTED_BUNDLE_PATH"
 WINDOWS_OWNED_IDENTITY=0
 to_windows_path() { cygpath -w "`$1"; }
 to_posix_path() { cygpath -u "`$1"; }

@@ -32,7 +32,7 @@ function optionsFrom(argv) {
 }
 
 async function stopOwnedDashboard(child, options) {
-  if (options.platform === 'Windows') {
+  if (process.platform === 'win32') {
     if (child.exitCode === null && child.signalCode === null) {
       const taskkill = `${process.env.SystemRoot || process.env.WINDIR}\\System32\\taskkill.exe`;
       const killer = spawn(taskkill, ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
@@ -66,6 +66,7 @@ async function startDashboardIfNeeded(options) {
     .then((response) => response.status === 200 || response.status === 401)
     .catch(() => false);
   let child;
+  let restartTimer;
   if (!health) {
     const profile = options.windowsDashboardProfile ? ['-p', 'default'] : [];
     child = spawn(options.hermes, ['dashboard', ...profile, '--host', '127.0.0.1', '--port', options.dashboardPort, '--no-open', '--skip-build'], {
@@ -121,9 +122,13 @@ async function superviseGatewayOnWindows(options, gatewayEnv) {
   let configBytes = readFileSync(options.config);
   const finished = new Promise((resolve) => {
     const start = () => {
+      let finished = false;
       child = gatewayChild(options, gatewayEnv);
-      child.once('error', crashed);
+      const crashOnce = () => { if (!finished) { finished = true; crashed(); } };
+      child.once('error', crashOnce);
       child.once('exit', (code, signal) => {
+        if (finished) return;
+        finished = true;
         if (shuttingDown) return resolve(code ?? (signal ? 1 : 0));
         if (deliberateRestart) {
           deliberateRestart = false;
@@ -137,7 +142,7 @@ async function superviseGatewayOnWindows(options, gatewayEnv) {
       while (crashTimes[0] !== undefined && now - crashTimes[0] >= 300_000) crashTimes.shift();
       if (crashTimes.length >= 3) return resolve(1);
       crashTimes.push(now);
-      setTimeout(start, 1000);
+      restartTimer = setTimeout(() => { restartTimer = undefined; start(); }, 1000);
     };
     watchFile(options.config, { interval: 500 }, () => {
       const next = readFileSync(options.config);
@@ -145,11 +150,17 @@ async function superviseGatewayOnWindows(options, gatewayEnv) {
       configBytes = next;
       deliberateRestart = true;
       if (child?.exitCode === null) child.kill('SIGTERM');
-      else { deliberateRestart = false; start(); }
+      else {
+        deliberateRestart = false;
+        if (restartTimer) clearTimeout(restartTimer);
+        restartTimer = undefined;
+        start();
+      }
     });
     for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
       shuttingDown = true;
       unwatchFile(options.config);
+      if (restartTimer) clearTimeout(restartTimer);
       if (child?.exitCode === null) child.kill(signal);
       else resolve(0);
     });
