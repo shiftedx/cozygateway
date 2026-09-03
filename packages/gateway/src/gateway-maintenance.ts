@@ -144,7 +144,13 @@ export class GatewayMaintenance {
     void this.supervisor.status().then((status) => { this.#status = status; }).catch(() => {
       this.#status = { currentVersion: this.currentVersion, restartSupported: false, update: { state: "unavailable" } };
     });
-    const runtime = this.runtimeHealth();
+    let runtime: GatewayMaintenanceRuntimeHealth;
+    try {
+      runtime = this.runtimeHealth();
+    } catch {
+      runtime = { harness: this.#status.cozyAgents === undefined ? "hermes" : "cozyagents" };
+    }
+    const active = this.storage.activeGatewayMaintenanceOperation();
     const attached = runtime.harness === "hermes"
       ? runtime.attach !== undefined && runtime.attach.configured > 0
         && runtime.attach.online === runtime.attach.configured && runtime.attach.deadLetters === 0
@@ -153,8 +159,10 @@ export class GatewayMaintenance {
       ...this.#status,
       currentVersion: this.currentVersion,
       health: {
-        state: attached ? "working" : "needs_attention",
-        gateway: { state: "working", version: this.currentVersion },
+        state: active === undefined ? (attached ? "working" : "needs_attention") : "updating",
+        gateway: active === undefined
+          ? { state: "working", version: this.currentVersion }
+          : { state: "updating", version: this.currentVersion, operationId: active.operationId },
         harness: attached
           ? { product: runtime.harness, state: "attached" }
           : {
@@ -166,7 +174,9 @@ export class GatewayMaintenance {
             },
         ...(this.#status.cozyAgents === undefined ? {} : {
           cozyAgents: {
-            state: this.#status.cozyAgents.ready ? "working" as const : "needs_attention" as const,
+            state: active?.step === "agents"
+              ? "updating" as const
+              : this.#status.cozyAgents.ready ? "working" as const : "needs_attention" as const,
             ...(this.#status.cozyAgents.version === undefined ? {} : { version: this.#status.cozyAgents.version }),
             ...(this.#status.cozyAgents.ready ? {} : {
               failureCode: this.#status.cozyAgents.failureCode ?? "cozyagents_not_attached",
@@ -196,6 +206,10 @@ export class GatewayMaintenance {
     const operation = this.storage.gatewayMaintenanceOperation(operationId);
     if (operation === undefined) throw new GatewayMaintenanceNotFound();
     return operation;
+  }
+
+  coLocatedRunnerId(): string | undefined {
+    return this.#status.cozyAgents?.runnerId;
   }
 
   private async accept(

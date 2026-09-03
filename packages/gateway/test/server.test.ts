@@ -16,12 +16,30 @@ import {
 
 import { testHermes } from "./support/test-config.ts";
 import { startFakeHermesServer } from "./support/fake-hermes-server.ts";
-import { startGateway, type RunningGateway } from "../src/server.ts";
+import { maintenanceRuntimeHealth, startGateway, type RunningGateway } from "../src/server.ts";
 import { HERMES_GLOBAL_SKILLS_CAPABILITY_ID } from "../src/hermes-bridge/global-skills.ts";
 import { openStorage } from "../src/storage.ts";
 import { PHOTO_SWEEP_MS } from "../src/hermes-bridge/photos.ts";
 
 let gateway: RunningGateway;
+
+describe("gateway maintenance runtime health wiring", () => {
+  it("projects only the co-located CozyAgents runner", () => {
+    expect(maintenanceRuntimeHealth({
+      harness: "cozyagents",
+      coLocatedRunnerId: "local",
+      connectedRunners: ["local", "secondary"],
+    })).toEqual({ harness: "cozyagents", localRunnerAttached: true });
+  });
+
+  it("ignores an offline secondary runner", () => {
+    expect(maintenanceRuntimeHealth({
+      harness: "cozyagents",
+      coLocatedRunnerId: "local",
+      connectedRunners: ["secondary"],
+    })).toEqual({ harness: "cozyagents", localRunnerAttached: false });
+  });
+});
 
 beforeEach(async () => {
   process.env.TEST_HERMES_CONTROL_TOKEN = "control-secret";

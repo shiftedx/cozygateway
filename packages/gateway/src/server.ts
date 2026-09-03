@@ -31,7 +31,10 @@ import {
 
 import { hermesEndpoints, nativeBots, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
 import { fileGatewaySettings, type GatewaySettingsStore } from "./gateway-settings.ts";
-import { discoverGatewayMaintenance } from "./gateway-maintenance.ts";
+import {
+  discoverGatewayMaintenance,
+  type GatewayMaintenanceRuntimeHealth,
+} from "./gateway-maintenance.ts";
 import { cozyAppPhysicalId, openStorage, type Storage } from "./storage.ts";
 import {
   ATTACH_V1_CAPABILITIES,
@@ -268,6 +271,26 @@ export function gatewayInfoForConfig(
   };
 }
 
+export function maintenanceRuntimeHealth(input: {
+  harness: "hermes" | "cozyagents";
+  attach?: { configured: number; online: number };
+  deadLetters?: number;
+  coLocatedRunnerId?: string;
+  connectedRunners?: readonly string[];
+}): GatewayMaintenanceRuntimeHealth {
+  if (input.harness === "hermes") return {
+    harness: "hermes",
+    ...(input.attach === undefined ? {} : {
+      attach: { ...input.attach, deadLetters: input.deadLetters ?? 0 },
+    }),
+  };
+  return {
+    harness: "cozyagents",
+    localRunnerAttached: input.coLocatedRunnerId !== undefined
+      && input.connectedRunners?.includes(input.coLocatedRunnerId) === true,
+  };
+}
+
 export async function startGateway(
   config: GatewayConfig,
   options: StartGatewayOptions = {},
@@ -407,11 +430,14 @@ export async function startGateway(
   const harnessUpdates = new GatewayHarnessUpdates(
     updateResults.filter((adapter) => adapter !== undefined),
   );
+  let readMaintenanceRuntimeHealth = () => ({
+    harness: endpoints.length === 0 ? "cozyagents" as const : "hermes" as const,
+  });
   const maintenance = await discoverGatewayMaintenance(
     process.env,
     storage,
     GATEWAY_VERSION,
-    () => ({ harness: hermesEndpoints(config).length === 0 ? "cozyagents" : "hermes" }),
+    () => readMaintenanceRuntimeHealth(),
     () => Date.now(),
   );
   const gatewayInfo = gatewayInfoForConfig(
@@ -802,6 +828,21 @@ export async function startGateway(
     onReceipt: () => bridge.refreshSoon("runner receipt"),
     now: () => Date.now(),
   });
+  readMaintenanceRuntimeHealth = () => {
+    if (endpoints.length === 0) {
+      return maintenanceRuntimeHealth({
+        harness: "cozyagents",
+        coLocatedRunnerId: maintenance?.coLocatedRunnerId(),
+        connectedRunners: runnerLane.connectedRunners(),
+      });
+    }
+    const attach = attachV1Ingress.health();
+    return maintenanceRuntimeHealth({
+      harness: "hermes",
+      attach: { configured: attach.configured, online: attach.online },
+      deadLetters: storage.attachProjectionDeadLetters().length,
+    });
+  };
   runtimeBotService = new RuntimeBotService({
     storage,
     lane: runnerLane,
