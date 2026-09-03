@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { connect } from "node:net";
 
-import { Type } from "@sinclair/typebox";
+import { type Static, Type } from "@sinclair/typebox";
 
 import {
   GatewayMaintenanceUpdateSchema,
@@ -70,10 +70,12 @@ export interface GatewayMaintenanceSupervisor {
 }
 
 type SupervisorRequest = { action: "status" } | { action: "start"; operationId: string };
-type SupervisorResponse =
-  | { ok: true; status: GatewayMaintenanceHostStatus }
-  | { ok: true }
-  | { ok: false; code?: string };
+const SupervisorResponseSchema = Type.Union([
+  Type.Object({ ok: Type.Literal(true), status: GatewayMaintenanceHostStatusSchema }, { additionalProperties: false }),
+  Type.Object({ ok: Type.Literal(true) }, { additionalProperties: false }),
+  Type.Object({ ok: Type.Literal(false), code: Type.Optional(Type.String()) }, { additionalProperties: false }),
+]);
+type SupervisorResponse = Static<typeof SupervisorResponseSchema>;
 
 function failureForSupervisor(code: string | undefined): GatewayMaintenanceFailure {
   if (code === "insufficient_storage") return new GatewayMaintenanceFailure("insufficient_storage", 507);
@@ -95,7 +97,7 @@ export class UnixSocketGatewayMaintenanceSupervisor implements GatewayMaintenanc
     const response = await this.request({ action: "status" });
     if (!response.ok || !("status" in response))
       throw failureForSupervisor(response.ok ? undefined : response.code);
-    return assertValid(GatewayMaintenanceHostStatusSchema, response.status);
+    return response.status;
   }
 
   async start(operationId: string): Promise<void> {
@@ -120,9 +122,7 @@ export class UnixSocketGatewayMaintenanceSupervisor implements GatewayMaintenanc
         const newline = body.indexOf("\n");
         if (newline < 0) return;
         try {
-          const parsed = JSON.parse(body.slice(0, newline)) as SupervisorResponse;
-          if (typeof parsed !== "object" || parsed === null || typeof parsed.ok !== "boolean")
-            throw new Error("maintenance supervisor returned an invalid response");
+          const parsed = assertValid(SupervisorResponseSchema, JSON.parse(body.slice(0, newline)));
           finish(undefined, parsed);
         } catch (error) {
           finish(error instanceof Error ? error : new Error("maintenance supervisor returned invalid JSON"));
@@ -177,8 +177,9 @@ export class GatewayMaintenance {
       : runtime.localRunnerAttached === true;
     const cozyAgentsReady = this.#status.cozyAgents?.ready !== false;
     return {
-      ...this.#status,
       currentVersion: this.currentVersion,
+      restartSupported: this.#status.restartSupported,
+      update: this.#status.update,
       health: {
         state: active === undefined
           ? (attached && cozyAgentsReady ? "working" : "needs_attention")

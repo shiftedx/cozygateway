@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   GatewayMaintenanceOperationSchema,
+  GatewayMaintenanceStatusSchema,
   assertValid,
   type Message,
   type RichBlock,
@@ -69,15 +70,29 @@ function appFor(supervisor = new Supervisor()) {
   return { app, request, supervisor, storage, maintenance };
 }
 
+async function withSupervisorResponse(
+  response: unknown,
+  run: (supervisor: UnixSocketGatewayMaintenanceSupervisor) => Promise<void>,
+): Promise<void> {
+  const socketDirectory = process.platform === "win32"
+    ? undefined
+    : mkdtempSync(join(tmpdir(), "cozygateway-maintenance-socket-"));
+  const socketPath = socketDirectory === undefined
+    ? `\\\\.\\pipe\\cozygateway-maintenance-${process.pid}-${Math.random()}`
+    : join(socketDirectory, "supervisor.sock");
+  const server = createServer((socket) => socket.once("data", () => socket.end(`${JSON.stringify(response)}\n`)));
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  try {
+    await run(new UnixSocketGatewayMaintenanceSupervisor(socketPath));
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error === undefined ? resolve() : reject(error)));
+    if (socketDirectory !== undefined) rmSync(socketDirectory, { recursive: true, force: true });
+  }
+}
+
 describe("gateway maintenance paired routes", () => {
   it("rejects unknown and secret fields from supervisor status", async () => {
-    const socketDirectory = process.platform === "win32"
-      ? undefined
-      : mkdtempSync(join(tmpdir(), "cozygateway-maintenance-socket-"));
-    const socketPath = socketDirectory === undefined
-      ? `\\\\.\\pipe\\cozygateway-maintenance-${process.pid}`
-      : join(socketDirectory, "supervisor.sock");
-    const server = createServer((socket) => socket.once("data", () => socket.end(`${JSON.stringify({
+    await withSupervisorResponse({
       ok: true,
       status: {
         currentVersion: "0.6.4",
@@ -85,15 +100,20 @@ describe("gateway maintenance paired routes", () => {
         update: { state: "upToDate", token: "fixture-secret" },
         argv: "fixture-secret",
       },
-    })}\n`)));
-    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
-    try {
-      await expect(new UnixSocketGatewayMaintenanceSupervisor(socketPath).status())
-        .rejects.toThrow();
-    } finally {
-      await new Promise<void>((resolve, reject) => server.close((error) => error === undefined ? resolve() : reject(error)));
-      if (socketDirectory !== undefined) rmSync(socketDirectory, { recursive: true, force: true });
-    }
+    }, async (supervisor) => expect(supervisor.status()).rejects.toThrow());
+  });
+
+  it("rejects unknown top-level fields from a supervisor status envelope", async () => {
+    await withSupervisorResponse({
+      ok: true,
+      status: { currentVersion: "0.6.4", restartSupported: true, update: { state: "upToDate" } },
+      argv: "fixture-secret",
+    }, async (supervisor) => expect(supervisor.status()).rejects.toThrow());
+  });
+
+  it("rejects unknown top-level fields from a supervisor start ACK", async () => {
+    await withSupervisorResponse({ ok: true, argv: "fixture-secret" }, async (supervisor) =>
+      expect(supervisor.start("maintenance_0123456789abcdef0123456789abcdef")).rejects.toThrow());
   });
 
   it("advertises the capability only when the host supervisor was proven usable", () => {
@@ -355,6 +375,21 @@ describe("gateway maintenance paired routes", () => {
       cozyAgents: { state: "working", version: "0.3.1" },
     });
     expect(JSON.stringify(maintenance.status().health)).not.toContain("local-runner");
+  });
+
+  it("keeps internal CozyAgents host state out of the public status route", async () => {
+    const supervisor = new Supervisor();
+    supervisor.statusValue = {
+      ...supervisor.statusValue,
+      cozyAgents: { installed: true, version: "0.3.1", ready: true, runnerId: "local-runner" },
+    };
+    const { request } = appFor(supervisor);
+
+    const response = await request("/gateway/maintenance");
+    const status = await response.json();
+    expect(assertValid(GatewayMaintenanceStatusSchema, status)).toEqual(status);
+    expect(status).not.toHaveProperty("cozyAgents");
+    expect(JSON.stringify(status)).not.toContain("local-runner");
   });
 
   it("ignores an offline secondary runner", () => {
