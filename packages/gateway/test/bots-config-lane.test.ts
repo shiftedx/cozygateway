@@ -151,6 +151,29 @@ describe("attach-v1 config lane", () => {
     peer.ws.close();
   });
 
+  it("preserves a peer's additive row-local ignored details on profile writes", async () => {
+    const peer = await dial({
+      "profile.write": {
+        name: "sage",
+        outcome: "applied",
+        ok: true,
+        applied: { skills_enabled: true },
+        ignored: { skills_enabled: ["missing-skill"] },
+        requested: ["enabledSkills"],
+      },
+    });
+
+    await expect(config.configureProfile("sage", { enabledSkills: ["missing-skill"] })).resolves.toEqual({
+      outcome: "applied",
+      ok: true,
+      applied: { skills_enabled: true },
+      ignored: { skills_enabled: ["missing-skill"] },
+      requested: ["enabledSkills"],
+    });
+    expect(peer.requests[0]?.input).toEqual({ enabledSkills: ["missing-skill"] });
+    peer.ws.close();
+  });
+
   // Capability 57: this gateway does not interpret guardrailLevel, it relays it. A patch carrying
   // the field is forwarded to the peer byte-for-byte, and a peer's read carrying it comes straight
   // back, for each of the four names.

@@ -967,6 +967,7 @@ export function registerBotRoutes(
         outcome: result.outcome,
         ok: result.ok,
         applied: result.applied,
+        ...(result.ignored === undefined ? {} : { ignored: result.ignored }),
         requested: result.requested,
       });
     } catch (err) {

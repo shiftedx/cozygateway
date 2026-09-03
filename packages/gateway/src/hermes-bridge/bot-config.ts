@@ -218,6 +218,7 @@ export class AttachConfigSurface implements ConfigSurface {
       outcome: result.outcome,
       ok: result.ok,
       applied: result.applied,
+      ...(result.ignored === undefined ? {} : { ignored: result.ignored }),
       requested: result.requested as ProfileConfigureResult["requested"],
     };
   }

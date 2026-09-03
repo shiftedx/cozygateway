@@ -13,6 +13,7 @@ import type { AttachV1EventFrame } from "../src/adapters/attach/protocol-v1.ts";
 import { BackendUnavailable, UnsupportedForRuntime } from "../src/errors.ts";
 import { BotNameTaken } from "../src/hermes-bridge/crud.ts";
 import { registerBotRoutes } from "../src/hermes-bridge/routes.ts";
+import type { ConfigSurface } from "../src/hermes-bridge/bot-config.ts";
 import { ATTACH_MEDIA_TTL_MS } from "../src/hermes-bridge/photos.ts";
 import { openStorage } from "../src/storage.ts";
 
@@ -2308,6 +2309,53 @@ describe("native runtime bots", () => {
       runtime: "cozyagents",
       feature: "botProfile",
     });
+
+    plane.close();
+    storage.close();
+  });
+
+  it("returns row-local ignored profile details from a runtime bot's peer", async () => {
+    const storage = openStorage(":memory:");
+    const configureProfile = vi.fn(async () => ({
+      outcome: "applied" as const,
+      ok: true,
+      applied: { skills_enabled: true },
+      ignored: { skills_enabled: ["missing-skill"] },
+      requested: ["enabledSkills" as const],
+    }));
+    const plane = new NativeBotDataPlane({
+      control: { configureProfile: vi.fn() } as unknown as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      botConfig: { configureProfile } as unknown as ConfigSurface,
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+    const app = new Hono<{ Variables: { deviceId: string } }>();
+    const requireDevice: MiddlewareHandler<{ Variables: { deviceId: string } }> = async (c, next) => {
+      c.set("deviceId", "device-1");
+      await next();
+    };
+    registerBotRoutes(app, requireDevice, plane.surface());
+
+    const response = await app.request("/bots/sage/profile", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabledSkills: ["missing-skill"] }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      name: "sage",
+      outcome: "applied",
+      ok: true,
+      applied: { skills_enabled: true },
+      ignored: { skills_enabled: ["missing-skill"] },
+      requested: ["enabledSkills"],
+    });
+    expect(configureProfile).toHaveBeenCalledWith("sage", { enabledSkills: ["missing-skill"] });
 
     plane.close();
     storage.close();

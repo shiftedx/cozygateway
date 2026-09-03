@@ -3,6 +3,7 @@ import type {
   BotProfile,
   BotProfilePatch,
   BotProfileApplied,
+  BotProfileIgnored,
   BotProfileRuntimeInert,
 } from "cozygateway-contract";
 
@@ -81,8 +82,11 @@ export const RUNTIME_INERT_SECTIONS: BotProfileRuntimeInert = ["toolsets", "mcpS
 
 export interface ProfileConfigureResult {
   outcome: ConfigureOutcome;
-  /** Hermes' own `applied` map, VERBATIM (its keys, its booleans). Empty on `unsupported`. */
+  /** The backend's own `applied` map, VERBATIM (its keys, its booleans). Empty on `unsupported`. */
   applied: BotProfileApplied;
+  /** Runtime-owned, row-local details for requested names it stored but cannot currently honour.
+   *  Absent on Hermes and on a clean runtime write; section keys are relayed verbatim. */
+  ignored?: BotProfileIgnored;
   /** True only when every section the request asked for came back true. False on `unsupported`,
    *  because a gateway that cannot report is a gateway that cannot be believed. */
   ok: boolean;

@@ -1135,16 +1135,28 @@ export type BotProfilePatch = Static<typeof BotProfilePatchSchema>;
 export const BotProfileAppliedSchema = Type.Record(Type.String(), Type.Boolean());
 export type BotProfileApplied = Static<typeof BotProfileAppliedSchema>;
 
+/** Names a runtime accepted into profile storage but could not honour. Keys use the same backend
+ *  section vocabulary as `applied`; values are the individual requested names, so a client can
+ *  keep successful rows settled while offering refusal/retry UI only for the ignored rows. */
+export const BotProfileIgnoredSchema = Type.Record(
+  Type.String(),
+  Type.Array(NameItem, { maxItems: 500 }),
+);
+export type BotProfileIgnored = Static<typeof BotProfileIgnoredSchema>;
+
 /** `PATCH /bots/:name/profile` response. `outcome: "unsupported"` means the gateway answered with
  *  no `applied` map at all, which is an older backend that does not report per-section results: the
  *  write may well have landed, but nothing can confirm it, so `ok` is false and `applied` is empty.
  *  `requested` names the body fields this call carried, so a client can pair a section with the
- *  `applied` key that answers for it. */
+ *  `applied` key that answers for it. `ignored` is additive and omitted on a clean write. It names
+ *  individual values a runtime stored but cannot currently honour, including capability 59's
+ *  `skills_enabled`, without turning an otherwise successful multi-row write into one failure. */
 export const BotProfileConfigureResponseSchema = Type.Object({
   name: Type.String(),
   outcome: Type.Union([Type.Literal("applied"), Type.Literal("unsupported")]),
   ok: Type.Boolean(),
   applied: BotProfileAppliedSchema,
+  ignored: Type.Optional(BotProfileIgnoredSchema),
   requested: Type.Array(Type.String()),
 });
 export type BotProfileConfigureResponse = Static<typeof BotProfileConfigureResponseSchema>;

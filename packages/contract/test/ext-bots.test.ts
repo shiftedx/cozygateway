@@ -42,6 +42,7 @@ import {
   BotModelProviderOAuthSessionSchema,
   BotModelProviderSetupCatalogSchema,
   BotNewSessionResponseSchema,
+  BotProfileConfigureResponseSchema,
   BotProfilePatchSchema,
   BotProfileSchema,
   BotSkillSchema,
@@ -345,6 +346,25 @@ describe("focus request", () => {
 });
 
 describe("profile patch", () => {
+  it("accepts additive row-local ignored details on a configure response", () => {
+    const base = {
+      name: "sage",
+      outcome: "applied",
+      ok: true,
+      applied: { skills_enabled: true },
+      requested: ["enabledSkills"],
+    };
+    expect(check(BotProfileConfigureResponseSchema, base)).toBe(true);
+    expect(check(BotProfileConfigureResponseSchema, {
+      ...base,
+      ignored: { skills_enabled: ["missing-skill"], toolsets: ["missing-toolset"] },
+    })).toBe(true);
+    expect(check(BotProfileConfigureResponseSchema, {
+      ...base,
+      ignored: { skills_enabled: "missing-skill" },
+    })).toBe(false);
+  });
+
   it("takes enabledSkills on the patch, with the same name rule disabledSkills has", () => {
     expect(check(BotProfilePatchSchema, { enabledSkills: ["spike"] })).toBe(true);
     expect(check(BotProfilePatchSchema, { enabledSkills: [] })).toBe(true);
