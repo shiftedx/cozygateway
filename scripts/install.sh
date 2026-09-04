@@ -40,6 +40,7 @@ valid_inventory_name() {
 }
 acquire_bootstrap_lock() {
   local owner
+  [ ! -L "$bootstrap_lock" ] && [ ! -L "$bootstrap_lock/pid" ] || die "refusing redirected bootstrap lock"
   if ! mkdir "$bootstrap_lock" 2>/dev/null; then
     owner="$(cat "$bootstrap_lock/pid" 2>/dev/null || true)"
     case "$owner" in *[!0-9]*|'') ;; *) kill -0 "$owner" 2>/dev/null && die "another CozyGateway bootstrap is running; wait for it to finish and rerun" ;; esac
@@ -63,18 +64,49 @@ prepare_owned_dir() {
 }
 recover_bootstrap_transaction() {
   local asset_dir="$1"; shift
-  local journal="$HOME_DIR/.bootstrap-transaction" backup="$HOME_DIR/.bootstrap-previous" state name inventory
-  [ ! -L "$journal" ] || die "refusing symlinked bootstrap transaction marker"
+  local journal="$HOME_DIR/.bootstrap-transaction" backup="$HOME_DIR/.bootstrap-previous"
+  local state entry name inventory seen='' count=0
+  [ ! -L "$journal" ] && [ ! -L "$journal.next" ] || die "refusing symlinked bootstrap transaction marker"
   [ ! -L "$backup" ] || die "refusing symlinked bootstrap rollback directory"
-  [ -f "$journal" ] || { [ ! -e "$backup" ] || { rmdir "$backup" 2>/dev/null || die "bootstrap rollback directory exists without a transaction marker; preserve it and rerun"; }; return; }
+  if [ ! -e "$journal" ]; then
+    [ ! -e "$backup" ] || rmdir "$backup" 2>/dev/null || die "bootstrap snapshots exist without a marker; preserve them and rerun"
+    return
+  fi
+  [ -f "$journal" ] || die "bootstrap transaction marker is not a file"
   state="$(cat "$journal")"
-  if [ "$state" = 'commit=installer-succeeded' ] || [ "$state" = 'restored=previous-release' ]; then [ ! -e "$backup" ] || rm -rf "$backup" || die "could not finish bootstrap cleanup; journal preserved"; rm -f "$journal" || die "could not clear completed bootstrap marker"; return; fi
-  if [ "$state" = 'prepare=replace-release-assets' ]; then rm -rf "$backup" || die "could not clear incomplete bootstrap snapshot"; rm -f "$journal"; return; fi
-  [ "$state" = 'intent=replace-release-assets' ] || die "bootstrap transaction marker is invalid; preserve it and rerun"
-  inventory="$backup/inventory"; [ -f "$inventory" ] || die "bootstrap transaction inventory is missing; preserve it and rerun"
+  case "$state" in
+    commit=installer-succeeded|restored=previous-release|prepare=replace-release-assets)
+      [ ! -e "$backup" ] || rm -rf "$backup" || die "could not finish bootstrap cleanup; journal preserved"
+      rm -f "$journal" || die "could not clear completed bootstrap marker"
+      return ;;
+    intent=replace-release-assets) ;;
+    *) die "bootstrap transaction marker is invalid; preserve it and rerun" ;;
+  esac
+  inventory="$backup/inventory"
+  [ -f "$inventory" ] && [ ! -L "$inventory" ] || die "bootstrap transaction inventory is missing or redirected"
+  # Validate the complete snapshot before changing any installed file. A truncated
+  # inventory must never turn a partial restore into an apparently successful one.
+  while IFS= read -r entry || [ -n "$entry" ]; do
+    case "$entry" in present:*|absent:*) name="${entry#*:}" ;; *) die "bootstrap transaction inventory is invalid" ;; esac
+    valid_inventory_name "$name" || die "bootstrap transaction inventory is invalid"
+    case "|$seen" in *"|$name|"*) die "bootstrap transaction inventory has duplicate assets" ;; esac
+    seen="$seen$name|"
+    count=$((count + 1))
+    [ ! -L "$asset_dir/$name" ] && [ ! -L "$asset_dir/$name.recover.$$" ] || die "refusing redirected installed bootstrap asset"
+    if [ "${entry%%:*}" = present ]; then
+      [ -f "$backup/$name" ] && [ ! -L "$backup/$name" ] || die "bootstrap snapshot is incomplete or redirected"
+    fi
+  done < "$inventory"
+  [ "$count" -eq "$((${#BOOTSTRAP_ASSETS[@]} * 2))" ] || die "bootstrap transaction inventory is incomplete"
   printf 'INFO  recovering an interrupted CozyGateway bootstrap before fetching a new release\n' >&2
-  while IFS= read -r name; do
-    case "$name" in present:*) name="${name#present:}"; valid_inventory_name "$name" || die "bootstrap transaction inventory is invalid"; cp "$backup/$name" "$asset_dir/$name.recover.$$" || die "could not restore $name"; mv -f "$asset_dir/$name.recover.$$" "$asset_dir/$name" || die "could not activate restored $name" ;; absent:*) name="${name#absent:}"; valid_inventory_name "$name" || die "bootstrap transaction inventory is invalid"; rm -f "$asset_dir/$name" ;; *) die "bootstrap transaction inventory is invalid" ;; esac
+  while IFS= read -r entry || [ -n "$entry" ]; do
+    name="${entry#*:}"
+    if [ "${entry%%:*}" = present ]; then
+      cp "$backup/$name" "$asset_dir/$name.recover.$$" || die "could not restore $name"
+      mv -f "$asset_dir/$name.recover.$$" "$asset_dir/$name" || die "could not activate restored $name"
+    else
+      rm -f "$asset_dir/$name" || die "could not remove incomplete bootstrap asset"
+    fi
   done < "$inventory"
   if [ -f "$asset_dir/agent-install.sh" ]; then
     restore_previous_installer "$asset_dir" "$@" || die "previous assets were restored but its service restart failed; recovery journal is preserved"
@@ -87,9 +119,11 @@ recover_bootstrap_transaction() {
 begin_bootstrap_transaction() {
   local asset_dir="$1" journal="$HOME_DIR/.bootstrap-transaction" backup="$HOME_DIR/.bootstrap-previous" name
   [ ! -e "$journal" ] && [ ! -e "$backup" ] || die "bootstrap recovery state already exists; rerun to recover it"
+  [ ! -L "$journal" ] && [ ! -L "$journal.next" ] && [ ! -L "$backup" ] || die "refusing redirected bootstrap transaction paths"
   mkdir "$backup" || die "could not create bootstrap rollback directory"
   printf 'prepare=replace-release-assets\n' > "$journal" || { rmdir "$backup" 2>/dev/null || true; die "could not record bootstrap preparation"; }
   for asset in "${BOOTSTRAP_ASSETS[@]}"; do for name in "$asset" "$asset.sha256"; do
+    [ ! -L "$asset_dir/$name" ] || die "refusing symlinked installed bootstrap asset"
     if [ -e "$asset_dir/$name" ]; then printf 'present:%s\n' "$name" >> "$backup/inventory"; cp "$asset_dir/$name" "$backup/$name" || die "could not snapshot $name"; else printf 'absent:%s\n' "$name" >> "$backup/inventory"; fi
   done; done
   printf 'intent=replace-release-assets\n' > "$journal.next" && mv -f "$journal.next" "$journal" || die "could not activate bootstrap transaction"
