@@ -2630,7 +2630,7 @@ export class NativeBotDataPlane {
         this.#log(
           `reaping silent turn ${turnId} for ${bot}: no events for ${silentFor}ms`,
         );
-        this.#finish(bot, chat.sessionId, turnId, { phase: "timeout", status: "timed_out" });
+        this.#timeoutTurn(bot, chat.sessionId, turnId);
       }
     }
     // A turn can also leave through /new, which discards it without a terminal. Anything no

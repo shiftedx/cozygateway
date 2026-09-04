@@ -968,6 +968,72 @@ describe("attach-v1 native Bot Mode plane", () => {
     }
   });
 
+  it("interrupts an acknowledged turn before reaping it for progress silence", async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = openStorage(":memory:");
+      let now = 0;
+      let command: { sequence: number; commandId: string } | undefined;
+      const interrupt = vi.fn(() => true);
+      const plane = new NativeBotDataPlane({
+        control: {} as BotsSurface,
+        storage,
+        ingress: {
+          isAttached: () => true,
+          sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+            const queued = storage.enqueueAttachCommand(bot, "turn", { kind: "turn", ...input } as never, now);
+            command = { sequence: queued.sequence, commandId: queued.commandId };
+            return true;
+          },
+          sendNativeInterrupt: interrupt,
+        } as unknown as AttachV1Ingress,
+        nativeBots: ["sage"],
+        chatSuggestion: "",
+        broadcast: () => undefined,
+        now: () => now,
+        staleTurnSweepMs: 10,
+        staleTurnInterruptGraceMs: 0,
+        staleTurnCeilingMs: 50,
+      });
+      const sent = await plane.surface().sendChatMessage("sage", "stuck before provider");
+      const turnId = storage.nativeBotChat("sage", now).activeTurnId!;
+      storage.ackAttachCommand("sage", command!.sequence, command!.commandId, now);
+
+      now = 40;
+      expect(plane.handle("sage", {
+        kind: "event", sequence: 1, eventId: "progress", event: {
+          kind: "draft", threadId: sent.sessionId, turnId, blocks: [{ type: "paragraph", text: "working" }],
+        },
+      })).toBe(true);
+      now = 89;
+      await vi.advanceTimersByTimeAsync(10);
+      expect(interrupt).not.toHaveBeenCalled();
+
+      now = 90;
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(interrupt).toHaveBeenCalledExactlyOnceWith("sage", { threadId: sent.sessionId, turnId });
+      expect(storage.nativeBotLastTerminal("sage", sent.sessionId)).toEqual({ status: "timed_out" });
+      await vi.advanceTimersByTimeAsync(50);
+      expect(interrupt).toHaveBeenCalledTimes(1);
+
+      expect(plane.handle("sage", {
+        kind: "event", sequence: 1, eventId: "late-final", event: {
+          kind: "commit", threadId: sent.sessionId, turnId,
+          messageId: "late-final", blocks: [{ type: "paragraph", text: "finished after timeout" }],
+        },
+      })).toBe(true);
+      expect((await plane.surface().chatHistory("sage")).messages).toContainEqual(
+        expect.objectContaining({ id: "late-final", text: "finished after timeout" }),
+      );
+      expect(storage.nativeBotLastTerminal("sage", sent.sessionId)).toEqual({ status: "completed" });
+      plane.close();
+      storage.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("projects an acknowledged turn's final answer even when it arrives after the gateway timeout", async () => {
     vi.useFakeTimers();
     try {
