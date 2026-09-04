@@ -1852,7 +1852,7 @@ write_windows_launcher() {
   mv -f "$staged" "$WINDOWS_VBS"
 }
 load_windows_wrapper_identity() {
-  local line expected='exec ' value quoted
+  local line expected='exec ' legacy_expected='exec ' value quoted skip_value=0 dashboard_state=''
   [ -r "$WRAPPER" ] && [ -r "$SUPERVISOR" ] || return 1
   [ "$(tr -d '\r' < "$WRAPPER" | awk 'END { print NR }')" = 3 ] || return 1
   [ "$(sed -n '1p' "$WRAPPER" | tr -d '\r')" = '#!/usr/bin/env bash' ] || return 1
@@ -1861,9 +1861,15 @@ load_windows_wrapper_identity() {
   for value in "$NODE_RESOLVED" "$SUPERVISOR" "${SUPERVISOR_ARGS[@]}"; do
     printf -v quoted '%q' "$value"
     expected="$expected$quoted "
+    if [ "$skip_value" = 1 ]; then skip_value=0; continue; fi
+    if [ "$value" = --dashboard-port-state ]; then skip_value=1; continue; fi
+    legacy_expected="$legacy_expected$quoted "
   done
   line="$(sed -n '3p' "$WRAPPER" | tr -d '\r')"
-  [ "$line" = "$expected" ] || return 1
+  if [ "$line" = "$expected" ]; then dashboard_state="$DASHBOARD_PORT_STATE"
+  elif [ "$line" != "$legacy_expected" ]; then return 1
+  fi
+  WINDOWS_OWNED_DASHBOARD_PORT_STATE="$dashboard_state"
   WINDOWS_OWNED_NODE_RESOLVED="$NODE_RESOLVED"
   WINDOWS_OWNED_GATEWAY_ENV="$GATEWAY_ENV"
   WINDOWS_OWNED_DASHBOARD_ENV=
@@ -1922,7 +1928,7 @@ preflight_windows_service_ownership() {
   NODE_RESOLVED="$desired_node"; BUNDLE_PATH="$desired_bundle"; DASHBOARD_PORT="$desired_dashboard_port"
 }
 stop_owned_windows_gateway() {
-  local config_native gateway_env_native dashboard_env_native node_native bundle_native hermes_root_native hermes_native launcher_native owner_helper_native worker_native database_native code release_code attempt expected_port check_target_port="${1:-1}"
+  local config_native gateway_env_native dashboard_env_native node_native bundle_native hermes_root_native hermes_native launcher_native owner_helper_native dashboard_state_native worker_native database_native code release_code attempt expected_port check_target_port="${1:-1}"
   if [ "${WINDOWS_OWNED_IDENTITY:-0}" != 1 ] && ! load_windows_wrapper_identity; then
     [ "$check_target_port" = 0 ] && return 1
     windows_gateway_ports_are_free
@@ -1930,7 +1936,7 @@ stop_owned_windows_gateway() {
   fi
   config_native="$(to_windows_path "$WINDOWS_OWNED_CONFIG_JSON")"
   gateway_env_native="$(to_windows_path "$WINDOWS_OWNED_GATEWAY_ENV")"
-  dashboard_env_native=; hermes_root_native=; hermes_native=; launcher_native=; owner_helper_native=
+  dashboard_env_native=; hermes_root_native=; hermes_native=; launcher_native=; owner_helper_native=; dashboard_state_native=
   node_native="$(to_windows_path "$WINDOWS_OWNED_NODE_RESOLVED")"
   bundle_native="$(to_windows_path "$WINDOWS_OWNED_BUNDLE_PATH")"
   if [ -n "$WINDOWS_OWNED_DASHBOARD_ENV" ]; then
@@ -1940,11 +1946,12 @@ stop_owned_windows_gateway() {
     hermes_native="$(to_windows_path "$WINDOWS_OWNED_HERMES_RESOLVED")"
     launcher_native="$(to_windows_path "$WINDOWS_OWNED_LAUNCHER")"
     owner_helper_native="$(to_windows_path "$WINDOWS_OWNED_DASHBOARD_OWNER_PS1")"
+    [ -z "${WINDOWS_OWNED_DASHBOARD_PORT_STATE:-}" ] || dashboard_state_native="$(to_windows_path "$WINDOWS_OWNED_DASHBOARD_PORT_STATE")"
   fi
   worker_native="$(to_windows_path "$MAINTENANCE_WORKER")"
   database_native="$(to_windows_path "$LOCAL_DIR/cozygateway.sqlite")"
   set +e
-  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_GATEWAY_ENV="$gateway_env_native" COZYGATEWAY_EXPECTED_DASHBOARD_ENV="$dashboard_env_native" COZYGATEWAY_EXPECTED_NODE="$node_native" COZYGATEWAY_EXPECTED_SUPERVISOR="$(to_windows_path "$SUPERVISOR")" COZYGATEWAY_EXPECTED_BUNDLE="$bundle_native" COZYGATEWAY_EXPECTED_WORKER="$worker_native" COZYGATEWAY_EXPECTED_DATABASE="$database_native" COZYGATEWAY_EXPECTED_HERMES_ROOT="$hermes_root_native" COZYGATEWAY_EXPECTED_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_OWNER_HELPER="$owner_helper_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$WINDOWS_OWNED_DASHBOARD_PORT" powershell.exe -NoProfile -NonInteractive -Command '
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_GATEWAY_ENV="$gateway_env_native" COZYGATEWAY_EXPECTED_DASHBOARD_ENV="$dashboard_env_native" COZYGATEWAY_EXPECTED_NODE="$node_native" COZYGATEWAY_EXPECTED_SUPERVISOR="$(to_windows_path "$SUPERVISOR")" COZYGATEWAY_EXPECTED_BUNDLE="$bundle_native" COZYGATEWAY_EXPECTED_WORKER="$worker_native" COZYGATEWAY_EXPECTED_DATABASE="$database_native" COZYGATEWAY_EXPECTED_HERMES_ROOT="$hermes_root_native" COZYGATEWAY_EXPECTED_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_OWNER_HELPER="$owner_helper_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$WINDOWS_OWNED_DASHBOARD_PORT" COZYGATEWAY_EXPECTED_DASHBOARD_PORT_STATE="$dashboard_state_native" powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
     function Same-Path([string] $Candidate, [string] $Expected) {
       if ([string]::IsNullOrWhiteSpace($Candidate) -or [string]::IsNullOrWhiteSpace($Expected)) { return $false }
@@ -1967,11 +1974,14 @@ stop_owned_windows_gateway() {
       if (-not [string]::IsNullOrWhiteSpace($env:COZYGATEWAY_EXPECTED_DASHBOARD_ENV)) {
         $expected += @("--dashboard-env", $env:COZYGATEWAY_EXPECTED_DASHBOARD_ENV, "--hermes-root", $env:COZYGATEWAY_EXPECTED_HERMES_ROOT,
           "--hermes", $env:COZYGATEWAY_EXPECTED_HERMES, "--hermes-launcher", $env:COZYGATEWAY_EXPECTED_LAUNCHER,
-          "--owner-helper", $env:COZYGATEWAY_EXPECTED_OWNER_HELPER, "--dashboard-port", $env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT,
-          "--windows-dashboard-profile")
+          "--owner-helper", $env:COZYGATEWAY_EXPECTED_OWNER_HELPER, "--dashboard-port", $env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT)
+        if (-not [string]::IsNullOrWhiteSpace($env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT_STATE)) {
+          $expected += @("--dashboard-port-state", $env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT_STATE)
+        }
+        $expected += "--windows-dashboard-profile"
       }
       if ($tokens.Count -ne $expected.Count) { return $false }
-      $pathIndexes = @(0, 1, 5, 7, 9, 13, 15, 17, 19, 21, 23, 25)
+      $pathIndexes = @(0, 1, 5, 7, 9, 13, 15, 17, 19, 21, 23, 25, 29)
       for ($index = 0; $index -lt $expected.Count; $index += 1) {
         if ($pathIndexes -contains $index) { if (-not (Same-Path $tokens[$index] $expected[$index])) { return $false } }
         elseif ($tokens[$index] -cne $expected[$index]) { return $false }
