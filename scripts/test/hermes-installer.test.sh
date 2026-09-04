@@ -32,6 +32,17 @@ expect_contains() {
     return 1
   fi
 }
+tree_sha256() {
+  local root="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    find "$root" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    find "$root" -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}'
+  else
+    echo 'sha256 tool required (sha256sum or shasum)' >&2
+    return 1
+  fi
+}
 make_directory_symlink() {
   local target="$1" link="$2"
   case "$(uname -s)" in
@@ -1677,7 +1688,7 @@ windows_node_version=v24.99.0
 windows_node_directory="node-$windows_node_version-win-x64"
 windows_node_archive="$windows_node_directory.zip"
 cp -R "$tmp/hermes" "$tmp/hermes-legacy"
-shared_hermes_digest_before="$(find "$tmp/hermes" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)"
+shared_hermes_digest_before="$(tree_sha256 "$tmp/hermes")"
 mkdir -p "$tmp/windows-node-dist/$windows_node_version"
 printf 'fixture Windows Node archive\n' > "$tmp/windows-node-dist/$windows_node_version/$windows_node_archive"
 if command -v shasum >/dev/null 2>&1; then windows_node_sha="$(shasum -a 256 "$tmp/windows-node-dist/$windows_node_version/$windows_node_archive" | awk '{print $1}')"; else windows_node_sha="$(sha256sum "$tmp/windows-node-dist/$windows_node_version/$windows_node_archive" | awk '{print $1}')"; fi
@@ -1714,7 +1725,7 @@ HOME="$tmp/windows-node-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-
 grep -Fq '/Delete /F /TN CozyGateway' "$tmp/windows-node-commands"
 ! grep -Eq '^default:gateway:(stop|uninstall)$' "$tmp/windows-node-hermes-commands"
 test ! -e "$tmp/gateway-windows-node"
-test "$(find "$tmp/hermes" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)" = "$shared_hermes_digest_before"
+test "$(tree_sha256 "$tmp/hermes")" = "$shared_hermes_digest_before"
 
 windows_native_hermes="$("$tmp/bin/cygpath" -w "$tmp/bin/hermes")"
 windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$windows_native_hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"

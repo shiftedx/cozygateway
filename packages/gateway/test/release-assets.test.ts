@@ -79,7 +79,7 @@ describe("what a release publishes", () => {
   });
 
   it("derives missing-state Windows task ownership from the canonical Gateway bundle", () => {
-    expect(INSTALLER).toContain('bundle="$(to_windows_path "$GATEWAY_DIR/bin/cozygateway.mjs")"');
+    expect(INSTALLER).toContain('[ "$bundle" = "$(to_windows_path "$GATEWAY_DIR/bin/cozygateway.mjs")" ]');
   });
 
   it("config change restarts without spending crash budget", () => {
