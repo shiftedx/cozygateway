@@ -22,6 +22,7 @@ ENV COZYGATEWAY_PORT=8787
 ENV COZYGATEWAY_DB_PATH=/data/cozygateway.db
 WORKDIR /app
 COPY --from=build /app /app
+COPY LICENSE /app/LICENSE
 RUN mkdir -p /data && chown -R node:node /data /app
 VOLUME ["/data"]
 EXPOSE 8787

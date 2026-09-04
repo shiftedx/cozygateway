@@ -16,6 +16,7 @@ FROM node:24-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d52
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=build /app /app
+COPY LICENSE /app/LICENSE
 RUN mkdir -p /data && chown -R node:node /data /app
 VOLUME ["/data"]
 EXPOSE 8788

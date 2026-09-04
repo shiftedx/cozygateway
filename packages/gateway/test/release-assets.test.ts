@@ -1,4 +1,6 @@
-import { readFileSync, existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { readFileSync, existsSync, mkdtempSync, writeFileSync, mkdirSync, symlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect } from "vitest";
@@ -114,10 +116,29 @@ describe("what a release publishes", () => {
     expect(INSTALLER).toContain("Scheduled Task $WINDOWS_TASK is foreign; leaving it untouched");
   });
 
-  it("cleans ignored bundle residue before producing release assets", () => {
-    // This test intentionally never inspects ROOT/dist-bundle: that ignored directory may be a
-    // stale local artifact. The bundler owns an empty output directory on every invocation.
-    expect(BUNDLER).toContain('rmSync("dist-bundle", { recursive: true, force: true })');
-    expect(BUNDLER).toContain('mkdirSync("dist-bundle", { recursive: true })');
-  });
+  it("builds a complete checksummed release despite partial ignored artifacts", () => {
+    const stage = mkdtempSync(join(tmpdir(), "gateway-release-fixture-"));
+    try {
+      for (const directory of ["packages", "scripts", "integrations", "node_modules"]) {
+        symlinkSync(join(ROOT, directory), join(stage, directory), "junction");
+      }
+      writeFileSync(join(stage, "LICENSE"), readFileSync(join(ROOT, "LICENSE")));
+      mkdirSync(join(stage, "dist-bundle"));
+      writeFileSync(join(stage, "dist-bundle", "install.sh"), "partial stale artifact");
+      writeFileSync(join(stage, "dist-bundle", "stale-secret.txt"), "discard this obsolete artifact");
+      const built = spawnSync(process.execPath, [join(ROOT, "scripts/build-bundle.mjs")], { cwd: stage, encoding: "utf8", timeout: 60_000 });
+      expect(built.status, built.stderr).toBe(0);
+      expect(existsSync(join(stage, "dist-bundle", "stale-secret.txt"))).toBe(false);
+      for (const asset of REQUIRED) {
+        const bytes = readFileSync(join(stage, "dist-bundle", asset));
+        expect(readFileSync(join(stage, "dist-bundle", `${asset}.sha256`), "utf8"))
+          .toBe(`${createHash("sha256").update(bytes).digest("hex")}  ${asset}\n`);
+      }
+      const notices = readFileSync(join(stage, "dist-bundle", "THIRD_PARTY_NOTICES.txt"), "utf8");
+      expect(notices).toContain("MIT License");
+      expect(readFileSync(join(stage, "dist-bundle", "cozygateway.mjs"), "utf8")).toContain(notices);
+    } finally {
+      rmSync(stage, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
