@@ -2030,10 +2030,10 @@ windows_recorded_task_is_owned() {
   windows_task_uses_current_supervisor
 }
 windows_task_is_directly_owned_by_gateway_home() {
-  local xml command arguments node_native supervisor_native rest token flag value index
-  local gateway_env bundle config worker database dashboard_env owner_helper hermes_root hermes launcher dashboard_port
+  local xml command arguments node_native supervisor_native rest token flag value index seen_flags='|'
+  local platform= gateway_env= bundle= config= maintenance_socket= worker= database= dashboard_env= owner_helper=
+  local hermes_root= hermes= launcher= dashboard_port= windows_dashboard_profile=
   local -a tokens
-  local -A seen
   xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
   [ -n "$xml" ] || return 1
   windows_task_has_single_exec_action "$xml" || return 1
@@ -2047,7 +2047,7 @@ windows_task_is_directly_owned_by_gateway_home() {
     case "$rest" in '&quot;'*) rest="${rest#'&quot;'}" ;; *) return 1 ;; esac
     token="${rest%%'&quot;'*}"; [ "$token" != "$rest" ] || return 1
     rest="${rest#*'&quot;'}"
-    token="${token//&lt;/<}"; token="${token//&gt;/>}"; token="${token//&amp;/\&}"
+    token="$(xml_unescape "$token")"
     tokens+=("$token")
     [ -z "$rest" ] || { case "$rest" in ' '*) rest="${rest# }" ;; *) return 1 ;; esac; }
   done
@@ -2055,35 +2055,43 @@ windows_task_is_directly_owned_by_gateway_home() {
   for ((index=1; index<${#tokens[@]}; index+=1)); do
     flag="${tokens[index]}"
     if [ "$flag" = --windows-dashboard-profile ]; then
-      [ -z "${seen[$flag]+x}" ] || return 1
-      seen[$flag]=true
+      case "$seen_flags" in *'|--windows-dashboard-profile|'*) return 1 ;; esac
+      seen_flags="${seen_flags}--windows-dashboard-profile|"
+      windows_dashboard_profile=true
       continue
     fi
     [ $((index + 1)) -lt ${#tokens[@]} ] || return 1
     value="${tokens[index+1]}"; index=$((index + 1))
     case "$flag" in
-      --platform|--gateway-env|--bundle|--config|--maintenance-socket|--maintenance-worker|--database|--dashboard-env|--hermes-root|--hermes|--hermes-launcher|--owner-helper|--dashboard-port) ;;
+      --platform) platform="$value" ;;
+      --gateway-env) gateway_env="$value" ;;
+      --bundle) bundle="$value" ;;
+      --config) config="$value" ;;
+      --maintenance-socket) maintenance_socket="$value" ;;
+      --maintenance-worker) worker="$value" ;;
+      --database) database="$value" ;;
+      --dashboard-env) dashboard_env="$value" ;;
+      --hermes-root) hermes_root="$value" ;;
+      --hermes) hermes="$value" ;;
+      --hermes-launcher) launcher="$value" ;;
+      --owner-helper) owner_helper="$value" ;;
+      --dashboard-port) dashboard_port="$value" ;;
       *) return 1 ;;
     esac
-    [ -z "${seen[$flag]+x}" ] || return 1
-    seen[$flag]="$value"
+    case "$seen_flags" in *"|$flag|"*) return 1 ;; esac
+    seen_flags="${seen_flags}${flag}|"
   done
-  gateway_env="$(to_windows_path "$GATEWAY_ENV")"; bundle="$(to_windows_path "$GATEWAY_DIR/bin/cozygateway.mjs")"
-  config="$(to_windows_path "$CONFIG_JSON")"; worker="$(to_windows_path "$MAINTENANCE_WORKER")"
-  database="$(to_windows_path "$LOCAL_DIR/cozygateway.sqlite")"
-  [ "${seen[--platform]:-}" = Windows ] && [ "${seen[--gateway-env]:-}" = "$gateway_env" ] &&
-    [ "${seen[--bundle]:-}" = "$bundle" ] && [ "${seen[--config]:-}" = "$config" ] &&
-    [ "${seen[--maintenance-socket]:-}" = '\\.\pipe\cozygateway-maintenance' ] &&
-    [ "${seen[--maintenance-worker]:-}" = "$worker" ] && [ "${seen[--database]:-}" = "$database" ] || return 1
-  dashboard_env="${seen[--dashboard-env]:-}"; owner_helper="${seen[--owner-helper]:-}"
-  hermes_root="${seen[--hermes-root]:-}"; hermes="${seen[--hermes]:-}"; launcher="${seen[--hermes-launcher]:-}"; dashboard_port="${seen[--dashboard-port]:-}"
+  [ "$platform" = Windows ] && [ "$gateway_env" = "$(to_windows_path "$GATEWAY_ENV")" ] &&
+    [ "$bundle" = "$(to_windows_path "$GATEWAY_DIR/bin/cozygateway.mjs")" ] && [ "$config" = "$(to_windows_path "$CONFIG_JSON")" ] &&
+    [ "$maintenance_socket" = '\\.\pipe\cozygateway-maintenance' ] &&
+    [ "$worker" = "$(to_windows_path "$MAINTENANCE_WORKER")" ] && [ "$database" = "$(to_windows_path "$LOCAL_DIR/cozygateway.sqlite")" ] || return 1
   if [ -n "$dashboard_env$owner_helper$hermes_root$hermes$launcher$dashboard_port" ]; then
     [ "$dashboard_env" = "$(to_windows_path "$DASHBOARD_ENV")" ] &&
       [ "$owner_helper" = "$(to_windows_path "$DASHBOARD_OWNER_PS1")" ] && [[ "$hermes_root" =~ ^[A-Za-z]:\\ ]] &&
       [[ "$hermes" =~ ^[A-Za-z]:\\ ]] && [ "$launcher" = "$hermes_root\\bin\\hermes.exe" ] &&
-      [ "${seen[--windows-dashboard-profile]:-}" = true ] &&
+      [ "$windows_dashboard_profile" = true ] &&
       [[ "$dashboard_port" =~ ^[0-9]+$ ]] && [ "$dashboard_port" -ge 1 ] && [ "$dashboard_port" -le 65535 ] || return 1
-  elif [ -n "${seen[--windows-dashboard-profile]:-}" ]; then
+  elif [ -n "$windows_dashboard_profile" ]; then
     return 1
   fi
   return 0
@@ -2094,9 +2102,7 @@ xml_escape() {
   printf '%s' "$value"
 }
 xml_unescape() {
-  local value="$1"
-  value="${value//&lt;/<}"; value="${value//&gt;/>}"; value="${value//&amp;/\&}"
-  printf '%s' "$value"
+  printf '%s' "$1" | sed 's/&lt;/</g; s/&gt;/>/g; s/&amp;/\&/g'
 }
 write_windows_task_xml() {
   local node_native supervisor_native arguments='' value escaped user_sid task_start staged="$WINDOWS_TASK_XML.tmp.$$" utf8="$WINDOWS_TASK_XML.tmp.$$.utf8"
