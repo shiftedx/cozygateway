@@ -12,8 +12,8 @@
 
 ## Global Constraints
 
-- Repo: `/Users/kmcdowell/Documents/repos/cozygateway` (branch off `main`; one PR per task group as stated in each task; never push to `main` directly; merge with `gh pr merge <N> -R shiftedx/cozygateway --squash`).
-- Website repo: `/Users/kmcdowell/Documents/repos/CozyLabs-Website` (Task 8 only).
+- Repo: `<repository-root>` (branch off `main`; one PR per task group as stated in each task; never push to `main` directly; merge with `gh pr merge <N> -R shiftedx/cozygateway --squash`).
+- Website repository: `<website-repository-root>` (Task 8 only).
 - Node floor is **24** everywhere (engines field, installer checks). The dev machine's default `node` is v22 — use a Node 24 (`brew` or nvm) for any step that must RUN gateway code; document which node you used.
 - `scripts/agent-install.sh` is battle-tested. Extend it; do not restructure working phases. Every existing flag and the Docker path must behave byte-for-byte identically when the new flags are absent.
 - All shell code must pass `shellcheck` with no new errors (warnings existing on main are acceptable; do not add new ones). If shellcheck is not installed: `brew install shellcheck`.

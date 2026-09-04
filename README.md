@@ -91,6 +91,9 @@ sign their own app with their own Apple team.
 
 - Shipped: contract v1 (frozen), conformance suite, attach-v1 data plane, hosted relay plus encrypted push origination and APNs delivery (`contract/push-v0.md`), TLS for the phone link (gateway-native, or a shipped Caddy sidecar example; `docs/tls.md`).
 
+Docker publishes the gateway on `127.0.0.1:8787` by default. Use the documented LAN overlay only
+for a trusted private network, or use the Caddy or native TLS Compose overlays for off-host access.
+
 ## Repo layout
 
 - `contract/`: the human-readable, versioned wire contract spec.

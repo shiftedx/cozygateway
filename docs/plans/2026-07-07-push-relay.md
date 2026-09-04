@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Node >= 24; on this machine prefix every node/pnpm command with `PATH=/opt/homebrew/opt/node@26/bin:$PATH`.
-- Every shell command starts with `cd /Users/kmcdowell/Documents/repos/cozygateway && ...` (the shell cwd resets between calls).
+- Every shell command starts with `cd <repository-root> && ...` (the shell cwd resets between calls).
 - Pure ESM, `.ts`-extension relative imports, `erasableSyntaxOnly` (no enums, no namespaces, no parameter properties), strictest tsconfig.
 - Never fabricate test data with `as` casts. Allowed narrowing: `as const`, parsed `unknown` after a schema/`Value.Check` pass, post-`instanceof`, and the established `.all() as unknown as Row[]` sqlite row pattern.
 - No em-dashes anywhere in this repo's copy. Public copy never names the private codebase or any specific agent harness product. Do not promise unbuilt features (APNs is "planned", never "supported").
@@ -130,7 +130,7 @@ Modify:
 
 Then link the workspace:
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm install`
+Run: `cd <repository-root> && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm install`
 Expected: succeeds; `packages/relay` appears in the workspace.
 
 - [ ] **Step 2: Write the failing test**
@@ -227,7 +227,7 @@ describe("relay storage", () => {
 
 - [ ] **Step 3: Run the test to verify it fails**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/storage.test.ts`
+Run: `cd <repository-root>/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/storage.test.ts`
 Expected: FAIL (cannot resolve `../src/schemas.ts` / `../src/storage.ts`).
 
 - [ ] **Step 4: Implement schemas and storage**
@@ -355,13 +355,13 @@ export function openRelayStorage(dbPath: string): RelayStorage {
 
 - [ ] **Step 5: Run the test to verify it passes**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/storage.test.ts`
+Run: `cd <repository-root>/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/storage.test.ts`
 Expected: PASS (all tests).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/kmcdowell/Documents/repos/cozygateway && git add packages/relay pnpm-lock.yaml && git commit -m "feat(relay): package scaffold, request schemas, sqlite storage"
+cd <repository-root> && git add packages/relay pnpm-lock.yaml && git commit -m "feat(relay): package scaffold, request schemas, sqlite storage"
 ```
 
 ---
@@ -421,7 +421,7 @@ describe("webhook transport", () => {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/transports.test.ts`
+Run: `cd <repository-root>/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/transports.test.ts`
 Expected: FAIL (cannot resolve `../src/transports.ts`).
 
 - [ ] **Step 3: Implement transports**
@@ -456,7 +456,7 @@ export function webhookTransport(fetchImpl: typeof fetch = fetch): Transport {
 
 - [ ] **Step 4: Run the transports test to verify it passes**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/transports.test.ts`
+Run: `cd <repository-root>/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/transports.test.ts`
 Expected: PASS.
 
 - [ ] **Step 5: Write the failing routes test**
@@ -639,7 +639,7 @@ describe("envelope faults", () => {
 
 - [ ] **Step 6: Run it to verify it fails**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/routes.test.ts`
+Run: `cd <repository-root>/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/routes.test.ts`
 Expected: FAIL (cannot resolve `../src/http.ts`).
 
 - [ ] **Step 7: Implement the HTTP app**
@@ -765,13 +765,13 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
 
 - [ ] **Step 8: Run both tests to verify they pass**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run`
+Run: `cd <repository-root>/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run`
 Expected: PASS (storage, transports, routes).
 
 - [ ] **Step 9: Commit**
 
 ```bash
-cd /Users/kmcdowell/Documents/repos/cozygateway && git add packages/relay && git commit -m "feat(relay): webhook transport and register/notify/delete routes with daily cap"
+cd <repository-root> && git add packages/relay && git commit -m "feat(relay): webhook transport and register/notify/delete routes with daily cap"
 ```
 
 ---
@@ -824,7 +824,7 @@ describe("startRelay", () => {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/server.test.ts`
+Run: `cd <repository-root>/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/server.test.ts`
 Expected: FAIL (cannot resolve `../src/server.ts`).
 
 - [ ] **Step 3: Implement server, CLI, and index**
@@ -1003,7 +1003,7 @@ describe("parseCliConfig", () => {
 
 - [ ] **Step 5: Run the package tests to verify everything passes**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run`
+Run: `cd <repository-root>/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run`
 Expected: PASS (all files).
 
 - [ ] **Step 6: Write the contract doc**
@@ -1122,13 +1122,13 @@ counts. Nothing else is stored.
 
 - [ ] **Step 8: Run the full relay package check**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm build && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm typecheck && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm test`
+Run: `cd <repository-root>/packages/relay && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm build && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm typecheck && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm test`
 Expected: build clean, typecheck clean, all tests PASS.
 
 - [ ] **Step 9: Commit**
 
 ```bash
-cd /Users/kmcdowell/Documents/repos/cozygateway && git add packages/relay contract/push-v0.md && git commit -m "feat(relay): server assembly, cli, push-v0 contract doc"
+cd <repository-root> && git add packages/relay contract/push-v0.md && git commit -m "feat(relay): server assembly, cli, push-v0 contract doc"
 ```
 
 ---
@@ -1214,7 +1214,7 @@ describe("push crypto", () => {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/push-crypto.test.ts`
+Run: `cd <repository-root>/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/push-crypto.test.ts`
 Expected: FAIL (cannot resolve `../src/push-crypto.ts`).
 
 - [ ] **Step 3: Implement push-crypto**
@@ -1254,7 +1254,7 @@ export function encryptPushPayload(pushKey: string, payload: PushPayload, nonce:
 
 - [ ] **Step 4: Run the crypto test to verify it passes**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/push-crypto.test.ts`
+Run: `cd <repository-root>/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/push-crypto.test.ts`
 Expected: PASS. If the vector assertion fails, the implementation is wrong (the vector
 was verified by round-trip when the spec was written); fix the code, never the vector.
 
@@ -1286,7 +1286,7 @@ it("lists and deletes push registrations", () => {
 If the existing file constructs storage differently (for example a fresh `openStorage(":memory:")`
 per test), follow the file's local convention; the assertions above are the requirement.
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/storage.test.ts`
+Run: `cd <repository-root>/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/storage.test.ts`
 Expected: FAIL (`pushRegistrations is not a function`).
 
 - [ ] **Step 6: Implement the storage additions**
@@ -1321,13 +1321,13 @@ deletePushRegistration(deviceId: string): void {
 
 - [ ] **Step 7: Run the gateway tests**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/storage.test.ts test/push-crypto.test.ts`
+Run: `cd <repository-root>/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/storage.test.ts test/push-crypto.test.ts`
 Expected: PASS.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /Users/kmcdowell/Documents/repos/cozygateway && git add packages/gateway/src/push-crypto.ts packages/gateway/src/storage.ts packages/gateway/test/push-crypto.test.ts packages/gateway/test/storage.test.ts && git commit -m "feat(gateway): push payload crypto (hkdf + aes-256-gcm) and registration read api"
+cd <repository-root> && git add packages/gateway/src/push-crypto.ts packages/gateway/src/storage.ts packages/gateway/test/push-crypto.test.ts packages/gateway/test/storage.test.ts && git commit -m "feat(gateway): push payload crypto (hkdf + aes-256-gcm) and registration read api"
 ```
 
 ---
@@ -1483,7 +1483,7 @@ describe("RelayNotifier", () => {
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/push-notifier.test.ts`
+Run: `cd <repository-root>/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/push-notifier.test.ts`
 Expected: FAIL (cannot resolve `../src/push-notifier.ts`).
 
 - [ ] **Step 3: Implement the notifier**
@@ -1562,7 +1562,7 @@ export class RelayNotifier implements Notifier {
 
 - [ ] **Step 4: Run the notifier test to verify it passes**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/push-notifier.test.ts`
+Run: `cd <repository-root>/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/push-notifier.test.ts`
 Expected: PASS.
 
 - [ ] **Step 5: Wire it into the server**
@@ -1588,14 +1588,14 @@ const runner = new TurnRunner({
 
 - [ ] **Step 6: Run the full gateway suite**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run`
+Run: `cd <repository-root>/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run`
 Expected: PASS (every existing test still green; server tests exercise the new wiring
 with zero registrations, which is a no-op).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/kmcdowell/Documents/repos/cozygateway && git add packages/gateway/src/push-notifier.ts packages/gateway/src/server.ts packages/gateway/test/push-notifier.test.ts && git commit -m "feat(gateway): RelayNotifier replaces nullNotifier for push origination"
+cd <repository-root> && git add packages/gateway/src/push-notifier.ts packages/gateway/src/server.ts packages/gateway/test/push-notifier.test.ts && git commit -m "feat(gateway): RelayNotifier replaces nullNotifier for push origination"
 ```
 
 ---
@@ -1621,7 +1621,7 @@ In `packages/gateway/package.json`, add:
 }
 ```
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm install && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm build`
+Run: `cd <repository-root> && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm install && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm build`
 Expected: install links the workspace package; build produces `packages/relay/dist` (the
 gateway test imports resolve `cozygateway-relay` via its dist exports).
 
@@ -1805,7 +1805,7 @@ that handshake portion; the assertions stand.
 
 - [ ] **Step 3: Run it to verify it fails**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/push-e2e.test.ts`
+Run: `cd <repository-root>/packages/gateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm vitest run test/push-e2e.test.ts`
 Expected: the first test FAILS before the implementation is complete ONLY if Tasks 4-5
 are unmerged; on a branch where Tasks 1-5 are done this should PASS on the first run.
 If it fails, debug the seam it names (this is the integration gate, not new code).
@@ -1828,7 +1828,7 @@ Honest-copy rule applies: no promised features beyond "planned", no harness name
 
 - [ ] **Step 5: Run the FULL workspace gate**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm check`
+Run: `cd <repository-root> && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm check`
 Expected: build 4/4 packages, typecheck 4/4, tests all green including conformance
 21/21 and the new relay + push suites.
 
@@ -1837,8 +1837,8 @@ Expected: build 4/4 packages, typecheck 4/4, tests all green including conforman
 Run:
 
 ```bash
-cd /Users/kmcdowell/Documents/repos/cozygateway && grep -rn $'—' packages/relay contract/push-v0.md packages/gateway/src/push-crypto.ts packages/gateway/src/push-notifier.ts docs/plans/2026-07-07-push-relay.md README.md | grep -v Binary || echo "no em-dashes"
-cd /Users/kmcdowell/Documents/repos/cozygateway && grep -rni "hermes\|cozylabs\|claude" packages/relay contract/push-v0.md packages/gateway/src/push-crypto.ts packages/gateway/src/push-notifier.ts README.md || echo "copy clean"
+cd <repository-root> && grep -rn $'—' packages/relay contract/push-v0.md packages/gateway/src/push-crypto.ts packages/gateway/src/push-notifier.ts docs/plans/2026-07-07-push-relay.md README.md | grep -v Binary || echo "no em-dashes"
+cd <repository-root> && grep -rni "hermes\|cozylabs\|claude" packages/relay contract/push-v0.md packages/gateway/src/push-crypto.ts packages/gateway/src/push-notifier.ts README.md || echo "copy clean"
 ```
 
 Expected: `no em-dashes` and `copy clean`.
@@ -1846,7 +1846,7 @@ Expected: `no em-dashes` and `copy clean`.
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/kmcdowell/Documents/repos/cozygateway && git add packages/gateway/package.json packages/gateway/test/push-e2e.test.ts README.md pnpm-lock.yaml && git commit -m "test(gateway): push e2e through a real relay; README status for the push relay"
+cd <repository-root> && git add packages/gateway/package.json packages/gateway/test/push-e2e.test.ts README.md pnpm-lock.yaml && git commit -m "test(gateway): push e2e through a real relay; README status for the push relay"
 ```
 
 ---

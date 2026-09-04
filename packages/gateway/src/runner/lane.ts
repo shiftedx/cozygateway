@@ -3,6 +3,11 @@ import type { Duplex } from "node:stream";
 
 import { check } from "cozygateway-contract";
 import { WebSocket, WebSocketServer } from "ws";
+import {
+  PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES,
+  PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS,
+  PendingWebsocketLimiter,
+} from "../websocket-limits.ts";
 
 import { resolveAttachBearer } from "../adapters/attach/token-auth.ts";
 import type { RunnerOperationRow, Storage } from "../storage.ts";
@@ -41,6 +46,8 @@ export interface RunnerLaneOptions {
   /** Diagnostics sink. Every line here carries ids, stages and counts only: no token, no env
    *  value, no host path (ADR 0002). */
   log?: (line: string) => void;
+  /** Test seam; production keeps a bounded pool until runner-v1 hello completes. */
+  maxPendingConnections?: number;
 }
 
 interface RunnerConnection {
@@ -78,6 +85,7 @@ export class RunnerLane {
   readonly #log: (line: string) => void;
   readonly #wss: WebSocketServer;
   readonly #connections = new Map<string, RunnerConnection>();
+  readonly #pendingConnections: PendingWebsocketLimiter;
   #heartbeat: ReturnType<typeof setInterval> | undefined;
   #closed = false;
 
@@ -91,12 +99,21 @@ export class RunnerLane {
     this.#heartbeatTimeoutMs = opts.heartbeatTimeoutMs ?? RUNNER_V1_HEARTBEAT_TIMEOUT_MS;
     this.#onReceipt = opts.onReceipt;
     this.#log = opts.log ?? ((line) => void process.stderr.write(`[runner] ${line}\n`));
-    this.#wss = new WebSocketServer({ noServer: true });
-    this.#wss.on("connection", (socket, req) => this.#onConnection(socket, req));
+    this.#pendingConnections = new PendingWebsocketLimiter(opts.maxPendingConnections ?? PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS);
+    this.#wss = new WebSocketServer({ noServer: true, maxPayload: PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES });
+    this.#wss.on("error", () => {});
+    this.#wss.on("connection", (socket: WebSocket, req: IncomingMessage, releasePending: () => void) => this.#onConnection(socket, req, releasePending));
   }
 
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
-    this.#wss.handleUpgrade(req, socket, head, (ws) => this.#wss.emit("connection", ws, req));
+    const releasePending = this.#pendingConnections.reserve(socket);
+    if (releasePending === undefined) return;
+    try {
+      this.#wss.handleUpgrade(req, socket, head, (ws) => this.#wss.emit("connection", ws, req, releasePending));
+    } catch {
+      releasePending();
+      socket.destroy();
+    }
   }
 
   /** Whether ANY runner has completed its hello. A create is still accepted when this is false. */
@@ -212,8 +229,12 @@ export class RunnerLane {
     this.#log(`sent ${operation.kind} ${operation.operationId} for bot ${operation.bot}`);
   }
 
-  #onConnection(socket: WebSocket, req: IncomingMessage): void {
-    socket.on("error", () => socket.terminate());
+  #onConnection(socket: WebSocket, req: IncomingMessage, releasePending?: () => void): void {
+    socket.once("close", () => releasePending?.());
+    socket.on("error", () => {
+      releasePending?.();
+      socket.terminate();
+    });
     if (this.#closed) {
       socket.close(1001, "gateway shutting down");
       return;
@@ -288,6 +309,7 @@ export class RunnerLane {
           return;
         }
         clearTimeout(helloTimer);
+        releasePending?.();
         // A second hello for the SAME runner supersedes the first rather than racing it: two
         // reconcilers against one host is the failure mode the single-writer rule exists to
         // prevent. A hello for a DIFFERENT runner is a different machine and gets its own socket,
@@ -344,6 +366,7 @@ export class RunnerLane {
 
     socket.on("close", () => {
       clearTimeout(helloTimer);
+      releasePending?.();
       if (this.#connections.get(connection.key)?.socket === socket) {
         this.#connections.delete(connection.key);
         this.#log(`runner ${connection.key} detached`);

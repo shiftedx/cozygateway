@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Node >= 24; on this machine prefix every node/pnpm command with `PATH=/opt/homebrew/opt/node@26/bin:$PATH`.
-- Every shell command starts with `cd /Users/kmcdowell/Documents/repos/cozygateway && ...` (the shell cwd resets between calls).
+- Every shell command starts with `cd <repository-root> && ...` (the shell cwd resets between calls).
 - Pure ESM, `.ts`-extension relative imports, `erasableSyntaxOnly` (no enums, no namespaces, no parameter properties), strictest tsconfig.
 - Never fabricate test data with `as` casts. Allowed narrowing: `as const`, parsed `unknown`, post-`instanceof`.
 - No em-dashes anywhere in this repo's copy. Public copy never names the private codebase or any specific agent harness product; say "agent harness". Do not promise unbuilt features.
@@ -182,7 +182,7 @@ describe("blocksToText", () => {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-protocol.test.ts`
+Run: `cd <repository-root> && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-protocol.test.ts`
 Expected: FAIL (cannot resolve `../src/adapters/attach/protocol.ts`).
 
 - [ ] **Step 3: Implement the schemas**
@@ -301,7 +301,7 @@ export function blocksToText(blocks: RichBlock[]): string {
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-protocol.test.ts`
+Run: `cd <repository-root> && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-protocol.test.ts`
 Expected: PASS (all tests green).
 
 - [ ] **Step 5: Write the protocol spec**
@@ -415,13 +415,13 @@ reports the same state on `GET /agents`.
 
 - [ ] **Step 6: Run the repo gate**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm check`
+Run: `cd <repository-root> && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm check`
 Expected: build, typecheck, and all tests green (102 existing + the new file's tests).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/kmcdowell/Documents/repos/cozygateway && git add contract/attach-v0.md packages/gateway/src/adapters/attach/protocol.ts packages/gateway/src/adapters/attach/blocks-to-text.ts packages/gateway/test/attach-protocol.test.ts && git commit -m "feat: attach protocol v0 schemas, block rendering, and spec"
+cd <repository-root> && git add contract/attach-v0.md packages/gateway/src/adapters/attach/protocol.ts packages/gateway/src/adapters/attach/blocks-to-text.ts packages/gateway/test/attach-protocol.test.ts && git commit -m "feat: attach protocol v0 schemas, block rendering, and spec"
 ```
 
 ---
@@ -602,7 +602,7 @@ describe("AttachIngress", () => {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-ingress.test.ts`
+Run: `cd <repository-root> && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-ingress.test.ts`
 Expected: FAIL (cannot resolve `../src/adapters/attach/ingress.ts`).
 
 - [ ] **Step 3: Implement the ingress**
@@ -740,13 +740,13 @@ export class AttachIngress {
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-ingress.test.ts`
+Run: `cd <repository-root> && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-ingress.test.ts`
 Expected: PASS, pristine exit (no lingering handles).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/kmcdowell/Documents/repos/cozygateway && git add packages/gateway/src/adapters/attach/ingress.ts packages/gateway/test/attach-ingress.test.ts && git commit -m "feat: attach ingress with bearer auth, newest-wins connections, presence"
+cd <repository-root> && git add packages/gateway/src/adapters/attach/ingress.ts packages/gateway/test/attach-ingress.test.ts && git commit -m "feat: attach ingress with bearer auth, newest-wins connections, presence"
 ```
 
 ---
@@ -1070,7 +1070,7 @@ describe("AttachRouter", () => {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-adapter.test.ts`
+Run: `cd <repository-root> && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-adapter.test.ts`
 Expected: FAIL (cannot resolve `../src/adapters/attach/adapter.ts`).
 
 - [ ] **Step 3: Implement the adapter**
@@ -1281,13 +1281,13 @@ export class AttachRouter {
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-adapter.test.ts`
+Run: `cd <repository-root> && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-adapter.test.ts`
 Expected: PASS, pristine exit.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/kmcdowell/Documents/repos/cozygateway && git add packages/gateway/src/adapters/attach/adapter.ts packages/gateway/test/attach-adapter.test.ts && git commit -m "feat: attach backend adapter with turn orchestration and fail-fast semantics"
+cd <repository-root> && git add packages/gateway/src/adapters/attach/adapter.ts packages/gateway/test/attach-adapter.test.ts && git commit -m "feat: attach backend adapter with turn orchestration and fail-fast semantics"
 ```
 
 ---
@@ -1549,7 +1549,7 @@ describe("buildAdapters attach branch", () => {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-e2e.test.ts`
+Run: `cd <repository-root> && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-e2e.test.ts`
 Expected: FAIL (`buildAdapters` throws `unknown backend "attach"` during startGateway).
 
 - [ ] **Step 3: Wire the registry**
@@ -1720,7 +1720,7 @@ export async function startGateway(config: GatewayConfig): Promise<RunningGatewa
 
 - [ ] **Step 5: Run the test to verify it passes**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-e2e.test.ts`
+Run: `cd <repository-root> && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm --filter cozygateway exec vitest run test/attach-e2e.test.ts`
 Expected: PASS, pristine exit.
 
 - [ ] **Step 6: Update the README**
@@ -1741,13 +1741,13 @@ At the end of the `## Repo layout` list, add:
 
 - [ ] **Step 7: Run the full gate (conformance must stay 21/21)**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm check`
+Run: `cd <repository-root> && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm check`
 Expected: build, typecheck, every package's tests green, conformance suite 21/21 against the mock backend.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /Users/kmcdowell/Documents/repos/cozygateway && git add packages/gateway/src/adapters/registry.ts packages/gateway/src/server.ts packages/gateway/test/attach-e2e.test.ts README.md && git commit -m "feat: wire the attach backend through registry and server, end to end"
+cd <repository-root> && git add packages/gateway/src/adapters/registry.ts packages/gateway/src/server.ts packages/gateway/test/attach-e2e.test.ts README.md && git commit -m "feat: wire the attach backend through registry and server, end to end"
 ```
 
 ---
@@ -1768,7 +1768,7 @@ verification gate over that code, not a transcription task.
 
 - [ ] **Step 1: Compile gate**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && python3 -m py_compile integrations/attach-plugin/cozygateway/*.py && echo OK`
+Run: `cd <repository-root> && python3 -m py_compile integrations/attach-plugin/cozygateway/*.py && echo OK`
 Expected: `OK`, no output before it. Remove any `__pycache__` directories afterwards (`find integrations/attach-plugin -name __pycache__ -type d -exec rm -rf {} +`); they must never be committed.
 
 - [ ] **Step 2: Copy-hygiene gate**
@@ -1781,13 +1781,13 @@ Read `attach_client.py` and confirm, against the spec: frames are `{"threadId", 
 
 - [ ] **Step 4: Verify the full repo gate still passes**
 
-Run: `cd /Users/kmcdowell/Documents/repos/cozygateway && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm check`
+Run: `cd <repository-root> && PATH=/opt/homebrew/opt/node@26/bin:$PATH pnpm check`
 Expected: green (the plugin adds no Node surface; this confirms nothing else regressed).
 
 - [ ] **Step 5: Commit (only if Steps 1 to 4 required fixes; otherwise report clean)**
 
 ```bash
-cd /Users/kmcdowell/Documents/repos/cozygateway && git add integrations/attach-plugin && git commit -m "chore: attach plugin hygiene fixes"
+cd <repository-root> && git add integrations/attach-plugin && git commit -m "chore: attach plugin hygiene fixes"
 ```
 
 Known follow-ups recorded for the final review (do NOT act on them in this task):

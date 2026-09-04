@@ -70,19 +70,8 @@ describe("attach-v1 ingress", () => {
   let memoryResults: AttachV1MemoryResult[];
   let logs: string[];
 
-  beforeEach(async () => {
-    storage = openStorage(":memory:");
-    accepted = [];
-    presence = [];
-    clock = 0;
-    projectionSucceeds = true;
-    traces = [];
-    mobileRequests = [];
-    mobileCancels = [];
-    acceptsTarget = true;
-    memoryResults = [];
-    logs = [];
-    ingress = new AttachV1Ingress({
+  function makeIngress(maxPendingConnections?: number): AttachV1Ingress {
+    return new AttachV1Ingress({
       tokens: new Map([
         ["secret", "sage"],
         ["soak-1", "soak-1"], ["soak-2", "soak-2"], ["soak-3", "soak-3"],
@@ -102,7 +91,23 @@ describe("attach-v1 ingress", () => {
       projectionMaxAttempts: 3,
       trace: (line) => traces.push(line),
       log: (line) => logs.push(line),
+      ...(maxPendingConnections === undefined ? {} : { maxPendingConnections }),
     });
+  }
+
+  beforeEach(async () => {
+    storage = openStorage(":memory:");
+    accepted = [];
+    presence = [];
+    clock = 0;
+    projectionSucceeds = true;
+    traces = [];
+    mobileRequests = [];
+    mobileCancels = [];
+    acceptsTarget = true;
+    memoryResults = [];
+    logs = [];
+    ingress = makeIngress();
     server = createServer();
     server.on("upgrade", (req, socket, head) => ingress.handleUpgrade(req, socket, head));
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -138,6 +143,35 @@ describe("attach-v1 ingress", () => {
     await until(() => frames.some((frame) => frame.kind === "hello_ack"));
     return { ws, frames };
   }
+
+  async function rejectedUpgrade(token = "secret"): Promise<number> {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, { headers: { authorization: `Bearer ${token}` } });
+    return await new Promise<number>((resolve, reject) => {
+      ws.once("unexpected-response", (_request, response) => {
+        response.resume();
+        resolve(response.statusCode ?? 0);
+      });
+      ws.once("error", reject);
+    });
+  }
+
+  it("releases invalid bearers and rejects a full attach pool before a 101 response", async () => {
+    ingress.close();
+    ingress = makeIngress(1);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const invalid = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, { headers: { authorization: `Bearer invalid-${attempt}` } });
+      await once(invalid, "open");
+      const [code] = (await once(invalid, "close")) as [number];
+      expect(code).toBe(1008);
+    }
+    const held = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, { headers: { authorization: "Bearer secret" } });
+    await once(held, "open");
+    await expect(rejectedUpgrade()).resolves.toBe(503);
+    held.close();
+    await once(held, "close");
+    const valid = await dial();
+    valid.ws.close();
+  });
 
   it("keeps the command catalog across a drop and lets a new authenticated hello clear it", async () => {
     const commands = [

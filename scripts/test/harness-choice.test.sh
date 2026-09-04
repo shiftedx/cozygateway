@@ -111,6 +111,7 @@ cozy_env=(
   COZYGATEWAY_SUPERVISOR_SOURCE="$repo_root/scripts/gateway-supervisor.cjs"
   COZYGATEWAY_SERVICE_PLATFORM=Darwin
   COZYAGENTS_INSTALL_URL="$tmp/agents.sh"
+  COZYAGENTS_INSTALL_SHA256="$(shasum -a 256 "$tmp/agents.sh" | awk '{print $1}')"
 )
 
 # ---------------------------------------------------------------------------
@@ -180,13 +181,16 @@ printf '{"stub":true}\n' > "$live_home/.pi/agent/auth.json"
 printf 'openai-codex\ngpt-5.6-luna\ny\n' > "$tmp/model-answers"
 printf 'yes\n' > "$tmp/lan-yes"
 : > "$tmp/agents.log"
-live_output="$(HOME="$live_home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" \
+if ! live_output="$(HOME="$live_home" PATH="$tmp/bin:$PATH" env "${cozy_env[@]}" \
   COZYGATEWAY_HERMES_BIN="$tmp/absent-hermes" HERMES_HOME="$tmp/absent-hermes-home" \
   COZYAGENTS_HOME="$live_home/.cozyagents" COZYAGENTS_TEST_LOG="$tmp/agents.log" \
   COZYGATEWAY_TEST_MODEL_PROMPT_INPUT="$tmp/model-answers" \
   COZYGATEWAY_TEST_LAN_PROMPT_INPUT="$tmp/lan-yes" \
   COZYGATEWAY_TEST_PAIRING_LAN_ADDRESS=192.0.2.10 \
-  bash "$installer" --bundle "$tmp/gateway.mjs" --gateway-dir "$tmp/gw-live" 2>&1)"
+  bash "$installer" --bundle "$tmp/gateway.mjs" --gateway-dir "$tmp/gw-live" 2>&1)"; then
+  printf '%s\n' "$live_output" >&2
+  exit 1
+fi
 
 # The questions, in the approved order: harness, model, network, then the QR.
 expect_contains "$live_output" 'Which provider should new bots use?'
@@ -404,6 +408,7 @@ windows_env=(
   COZYGATEWAY_TEST_REAL_NODE="$real_node"
   COZYGATEWAY_SERVICE_PLATFORM=Windows
   COZYAGENTS_INSTALL_URL="$tmp/agents.sh"
+  COZYAGENTS_INSTALL_SHA256="$(shasum -a 256 "$tmp/agents.sh" | awk '{print $1}')"
   APPDATA="$tmp/win-appdata"
 )
 

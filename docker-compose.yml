@@ -17,7 +17,9 @@ services:
     env_file:
       - "${COZYGATEWAY_SECRETS_FILE:?set COZYGATEWAY_SECRETS_FILE to a Hermes secrets env file}"
     ports:
-      - "8787:8787"
+      # The reference deployment is local by default. Add docker-compose.lan.yml only after
+      # choosing a trusted LAN or TLS posture; it is the deliberate opt-in to all host interfaces.
+      - "127.0.0.1:8787:8787"
     volumes:
       - gateway-data:/data
       - "${COZYGATEWAY_CONFIG_DIR:?set COZYGATEWAY_CONFIG_DIR to the writable config directory}:/config:rw"

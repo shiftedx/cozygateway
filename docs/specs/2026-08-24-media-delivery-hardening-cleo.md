@@ -55,7 +55,7 @@ Everything else should be adapter/platform responsibility:
 
 Active adapter:
 
-`/Users/kmcdowell/.hermes/profiles/cleo/plugins/cozygateway/cozygateway/adapter.py`
+`~/.hermes/profiles/cleo/plugins/cozygateway/cozygateway/adapter.py`
 
 Important current code areas:
 
@@ -73,8 +73,8 @@ This is a better design than simply falling through to generic platform methods.
 
 Primary logs:
 
-- `/Users/kmcdowell/.hermes/profiles/cleo/logs/agent.log`
-- `/Users/kmcdowell/.hermes/profiles/cleo/logs/errors.log`
+- `~/.hermes/profiles/cleo/logs/agent.log`
+- `~/.hermes/profiles/cleo/logs/errors.log`
 
 Observed failures include:
 

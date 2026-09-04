@@ -9,20 +9,31 @@
     "url": "git+https://github.com/shiftedx/cozygateway.git",
     "directory": "packages/gateway"
   },
-  "engines": { "node": ">=24" },
-  "bin": { "cozygateway": "dist/cli.js" },
-  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
-  "files": ["dist"],
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "cozygateway": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "build": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "@hono/node-server": "^1.13.0",
+    "@hono/node-server": "^1.19.17",
     "@sinclair/typebox": "^0.34.0",
     "cozygateway-contract": "workspace:*",
-    "hono": "^4.6.0",
+    "hono": "^4.13.7",
     "ws": "^8.18.0"
   },
   "devDependencies": {

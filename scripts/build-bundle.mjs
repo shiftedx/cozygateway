@@ -4,6 +4,7 @@
 // Output: dist-bundle/cozygateway.mjs + .sha256 (the exact names
 // scripts/install.sh downloads from a GitHub Release).
 import { build } from "esbuild";
+import { thirdPartyNotices } from "./third-party-notices.mjs";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
@@ -14,6 +15,9 @@ if (!existsSync(entry)) {
   console.error(`build-bundle: ${entry} not found; run 'pnpm build' first`);
   process.exit(1);
 }
+// A release build must not inherit an ignored bundle from a developer's working tree. In
+// particular, release-assets tests and CI both need a fresh set of checksums for only this build.
+rmSync("dist-bundle", { recursive: true, force: true });
 mkdirSync("dist-bundle", { recursive: true });
 
 // cli.js only invokes runCli() when process.argv[1] ends with "cli.js"/"cli.ts" (see its
@@ -34,7 +38,8 @@ runCli(process.argv.slice(2)).then(
 );
 `,
 );
-await build({
+const result = await build({
+  metafile: true,
   entryPoints: [wrapperEntry],
   bundle: true,
   platform: "node",
@@ -50,6 +55,9 @@ await build({
   },
 });
 rmSync(wrapperEntry, { force: true });
+const notices = thirdPartyNotices([result.metafile]);
+writeFileSync("dist-bundle/THIRD_PARTY_NOTICES.txt", notices);
+writeFileSync("dist-bundle/cozygateway.mjs", `${readFileSync("dist-bundle/cozygateway.mjs", "utf8")}\n/*\n${notices.replaceAll("*/", "* /")}*/\n`);
 const body = readFileSync("dist-bundle/cozygateway.mjs");
 const sha = createHash("sha256").update(body).digest("hex");
 writeFileSync("dist-bundle/cozygateway.mjs.sha256", `${sha}  cozygateway.mjs\n`);

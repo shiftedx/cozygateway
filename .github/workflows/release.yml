@@ -4,13 +4,17 @@ on:
     tags: ["v*"]
 permissions:
   contents: write
+  attestations: write
+  id-token: write
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with: { node-version: 24, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
@@ -21,6 +25,10 @@ jobs:
           test "$version" = "$(node -p "require('./packages/gateway/package.json').version")"
           test "$version" = "$(sed -n 's/^version: //p' integrations/attach-plugin/plugin.yaml)"
       - run: pnpm bundle
+      - name: attest release artifacts
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661
+        with:
+          subject-path: dist-bundle/*
       - name: smoke the bundle
         run: |
           cat > /tmp/smoke.json <<'EOF'
@@ -35,15 +43,18 @@ jobs:
           EOF
           SMOKE_HERMES_TOKEN=smoke SMOKE_ATTACH_TOKEN=smoke node dist-bundle/cozygateway.mjs serve --config /tmp/smoke.json &
           ok=
-          for i in $(seq 1 15); do
+          attempt=1
+          while [ "$attempt" -le 15 ]; do
             curl -fsS http://127.0.0.1:18787/health | grep -q '"contract":"v1"' && ok=1 && break
             sleep 1
+            attempt=$((attempt + 1))
           done
           kill %1
           [ "${ok:-}" = 1 ]
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           files: |
+            dist-bundle/THIRD_PARTY_NOTICES.txt
             dist-bundle/cozygateway.mjs
             dist-bundle/cozygateway.mjs.sha256
             dist-bundle/cozygateway-hermes-attach-plugin.tar.gz
