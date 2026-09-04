@@ -397,6 +397,33 @@ describe("attach-v1 ingress", () => {
     ws.close();
   });
 
+  it("holds a verified session deletion in the durable outbox while an older peer reconnects", async () => {
+    const verified = await dial(undefined, ["draft", "session_deletion"]);
+    expect(ingress.canSendSessionDeletion("sage")).toBe(true);
+    verified.ws.close();
+    await once(verified.ws, "close");
+    expect(ingress.canSendSessionDeletion("sage")).toBe(true);
+    const stale = storage.nativeBotChat("sage", 1).sessionId;
+    storage.resetNativeBotChat("sage", 2);
+    expect(storage.deleteNativeBotSession({ bot: "sage", sessionId: stale, deletedAt: 3, enqueue: true }).outcome).toBe("deleted");
+
+    const old = await dial(undefined, ["draft"]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(old.frames.some((frame) => frame.kind === "command")).toBe(false);
+    expect(storage.pendingAttachCommands("sage", 0, 10)[0]).toMatchObject({ command: { kind: "session_deleted" } });
+    old.ws.close();
+    await once(old.ws, "close");
+
+    const current = await dial(undefined, ["draft", "session_deletion"]);
+    await until(() => current.frames.some((frame) => frame.kind === "command"));
+    const deletion = current.frames.find((frame) => frame.kind === "command");
+    expect(deletion).toMatchObject({ command: { kind: "session_deleted" } });
+    if (deletion?.kind !== "command") throw new Error("session deletion command missing");
+    current.ws.send(JSON.stringify({ kind: "ack", channel: "command", sequence: deletion.sequence, id: deletion.commandId }));
+    await until(() => storage.pendingAttachCommands("sage", 0, 10).length === 0);
+    current.ws.close();
+  });
+
   it("durably ACKs events, deduplicates ACK loss, reports sequence gaps, and ignores a late draft", async () => {
     const { ws, frames } = await dial();
     const commit = { kind: "event", sequence: 1, eventId: "e1", event: { kind: "commit", threadId: "t", turnId: "u", messageId: "m", blocks: [{ type: "paragraph", text: "done" }] } };

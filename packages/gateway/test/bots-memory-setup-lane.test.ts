@@ -162,6 +162,17 @@ describe("capability-42 memory setup for a runtime bot", () => {
     peer.ws.close();
   });
 
+  it("keeps a capability-59 peer's memory create byte-compatible", async () => {
+    const peer = await dial(["memory_management"]);
+    const response = await authed("/bots/sage/memory/sources/files/items", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ content: "legacy" }),
+    });
+    expect(response.status).toBe(201);
+    expect(peer.requests.at(-1)).toMatchObject({ operation: "create", input: { sourceId: "files", content: "legacy" } });
+    expect(peer.requests.at(-1)?.input).not.toHaveProperty("owner");
+    peer.ws.close();
+  });
+
   // The switches are a fact about the peer, not about how much it has remembered. A bot with one
   // available source still has three settings to offer, so the answer cannot be inferred from an
   // empty listing.

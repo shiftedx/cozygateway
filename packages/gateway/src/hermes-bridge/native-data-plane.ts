@@ -1363,10 +1363,15 @@ export class NativeBotDataPlane {
   async #deleteSession(name: string, sessionId: string): Promise<BotSessionDeletion> {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    // A deletion is only committed with its receiver tombstone. The negotiated capability is
+    // durable across an attach outage, but an unverified or older runtime must not lose a
+    // conversation it cannot be told to forget.
+    if (!this.#ingress.canSendSessionDeletion(bot))
+      throw new BackendUnavailable("cannot delete a conversation until the attached runtime has negotiated capability 60");
     const now = this.#now();
     const deleted = this.#storage.deleteNativeBotSession({
       bot, sessionId, deletedAt: now,
-      enqueue: this.#ingress.canSendSessionDeletion(bot),
+      enqueue: true,
     });
     if (deleted.outcome === "not_found") throw new BotSessionNotFound(sessionId);
     if (deleted.outcome === "foreign") throw new BotSessionConflict(sessionId, "another bot");

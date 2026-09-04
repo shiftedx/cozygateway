@@ -23,6 +23,65 @@ describe("attach-v1 durable transport storage", () => {
     storage.close();
   });
 
+  it("replays a deletion after an attach outage and restart until its one ACK", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "attach-delete-replay-")), "gateway.sqlite");
+    let storage = openStorage(path);
+    storage.setAttachSessionDeletionCapability("sage", true, 1);
+    const stale = storage.nativeBotChat("sage", 1).sessionId;
+    storage.resetNativeBotChat("sage", 2);
+    expect(storage.deleteNativeBotSession({ bot: "sage", sessionId: stale, deletedAt: 3, enqueue: true }).outcome).toBe("deleted");
+    const queued = storage.pendingAttachCommands("sage", 0, 10);
+    expect(queued).toHaveLength(1);
+    storage.close();
+
+    storage = openStorage(path);
+    expect(storage.hasAttachSessionDeletionCapability("sage")).toBe(true);
+    expect(storage.pendingAttachCommands("sage", 0, 10)).toEqual(queued);
+    expect(storage.ackAttachCommand("sage", queued[0]!.sequence, queued[0]!.commandId, 4)).toBe(true);
+    storage.close();
+
+    storage = openStorage(path);
+    expect(storage.pendingAttachCommands("sage", 0, 10)).toEqual([]);
+    expect(storage.deleteNativeBotSession({ bot: "sage", sessionId: stale, deletedAt: 5, enqueue: true })).toEqual({ outcome: "not_found" });
+    storage.close();
+  });
+
+  it("erases deleted-session media and transport payloads while retaining only safe cursor state", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "attach-delete-privacy-")), "gateway.sqlite");
+    let storage = openStorage(path);
+    const stale = storage.nativeBotChat("sage", 1).sessionId;
+    const bytes = Uint8Array.from([1, 2, 3]);
+    storage.saveAttachMedia("sage", {
+      mediaId: "private-media", mimeType: "image/png", byteCount: bytes.byteLength,
+      sha256: createHash("sha256").update(bytes).digest("hex"), filename: "private.png", family: "image",
+    }, bytes, 1);
+    storage.appendNativeBotMessage({
+      bot: "sage", sessionId: stale, messageId: "private-message", role: "assistant", text: "private", at: 2,
+      attachments: [{ type: "attachment", fileId: "private-media", name: "private.png", mimeType: "image/png", size: bytes.byteLength, mediaKind: "image" }],
+    });
+    storage.enqueueAttachCommand("sage", "private-turn", { kind: "turn", threadId: stale, turnId: "private-turn", messageId: "private-message", text: "private" }, 2);
+    expect(storage.acceptAttachEvent("sage", {
+      kind: "event", sequence: 1, eventId: "private-event",
+      event: { kind: "commit", threadId: stale, turnId: "private-turn", messageId: "private-message", blocks: [{ type: "paragraph", text: "private" }], mediaIds: ["private-media"] },
+    }, 2).status).toBe("accepted");
+    storage.resetNativeBotChat("sage", 3);
+    expect(storage.deleteNativeBotSession({ bot: "sage", sessionId: stale, deletedAt: 4, enqueue: true }).outcome).toBe("deleted");
+    expect(storage.attachMediaInfo("sage", "private-media", 5)).toBeUndefined();
+    expect(storage.attachMediaSlice("sage", "private-media", 0, 8, 5)).toBeUndefined();
+    expect(storage.unappliedAttachEvents("sage")).toEqual([]);
+    const replay = storage.pendingAttachCommands("sage", 0, 10);
+    expect(replay[0]).toMatchObject({ commandId: "private-turn", command: { kind: "discard", originalKind: "turn" } });
+    expect(JSON.stringify(replay)).not.toContain(stale);
+    storage.close();
+
+    storage = openStorage(path);
+    expect(storage.attachMediaInfo("sage", "private-media", 5)).toBeUndefined();
+    expect(storage.attachMediaSlice("sage", "private-media", 0, 8, 5)).toBeUndefined();
+    expect(storage.unappliedAttachEvents("sage")).toEqual([]);
+    expect(JSON.stringify(storage.pendingAttachCommands("sage", 0, 10))).not.toContain(stale);
+    storage.close();
+  });
+
   it("reconciles only an issued contiguous plugin resume cursor", () => {
     const storage = openStorage(":memory:");
     storage.enqueueAttachCommand("sage", "c1", { kind: "interrupt", threadId: "t", turnId: "u" }, 1);

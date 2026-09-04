@@ -153,7 +153,14 @@ export class AttachMemorySurface implements MemorySurface {
   async setup(name: string, input: BotMemorySetupRequest): Promise<BotMemoryOverviewResponse> { return this.#withSetup(name, await this.#request(name, "setup", input) as BotMemoryOverviewResponse); }
   async items(name: string, input: MemoryInput): Promise<BotMemoryItemsResponse> { return this.#withSetup(name, await this.#request(name, "items", input) as BotMemoryItemsResponse); }
   async item(name: string, sourceId: string, itemId: string): Promise<BotMemoryItem> { return await this.#request(name, "item", { sourceId, itemId }) as BotMemoryItem; }
-  async create(name: string, sourceId: string, input: MemoryInput): Promise<BotMemoryWriteResponse> { return await this.#request(name, "create", { ...input, sourceId }) as BotMemoryWriteResponse; }
+  async create(name: string, sourceId: string, input: MemoryInput): Promise<BotMemoryWriteResponse> {
+    // Capability 59 peers understand the original request byte-for-byte. The Gateway's person
+    // origin is authoritative only once the peer positively negotiated capability 60 ownership.
+    const caps = this.#endpoint.negotiatedCapabilities?.call(this.#endpoint, name);
+    const ownership = caps?.has("memory_ownership") === true;
+    const { owner: _owner, ...legacy } = input as MemoryInput & { owner?: "person" | "bot" };
+    return await this.#request(name, "create", ownership ? { ...input, sourceId } : { ...legacy, sourceId }) as BotMemoryWriteResponse;
+  }
   async update(name: string, sourceId: string, itemId: string, input: MemoryInput): Promise<BotMemoryWriteResponse> { return await this.#request(name, "update", { ...input, sourceId, itemId }) as BotMemoryWriteResponse; }
   async remove(name: string, sourceId: string, itemId: string, input: MemoryInput): Promise<BotMemoryDeleteResponse> { return await this.#request(name, "delete", { ...input, sourceId, itemId }) as BotMemoryDeleteResponse; }
   async graph(name: string, input: MemoryInput): Promise<BotMemoryGraphResponse> { return await this.#request(name, "graph", input) as BotMemoryGraphResponse; }

@@ -331,6 +331,8 @@ CREATE TABLE IF NOT EXISTS attach_streams (
   plugin_event_ack_cursor INTEGER,
   plugin_last_ack_progress_at INTEGER,
   plugin_command_inbox_depth INTEGER,
+  -- Capability 60: last positively negotiated receiver support survives an outage/restart.
+  session_deletion_capability INTEGER,
   updated_at INTEGER NOT NULL
 ) STRICT;
 CREATE TABLE IF NOT EXISTS attach_command_outbox (
@@ -2143,11 +2145,14 @@ export class Storage {
       commandId: row.commandId,
       command: row.cancelledAt === null
         ? JSON.parse(row.commandJson) as AttachV1Command
-        : {
+        : (() => {
+            const stored = JSON.parse(row.commandJson) as AttachV1Command;
+            return stored.kind === "discard" ? stored : {
             kind: "discard" as const,
-            originalKind: (JSON.parse(row.commandJson) as AttachV1Command).kind as Exclude<AttachV1Command["kind"], "discard">,
+            originalKind: stored.kind as Exclude<AttachV1Command["kind"], "discard">,
             reason: row.cancelReason ?? "capability no longer negotiated",
-          },
+          };
+          })(),
     }));
   }
 
@@ -2205,6 +2210,19 @@ export class Storage {
       )
       .get(agentId, sequence) as { reason: string; cancelledAt: number } | undefined;
     return row;
+  }
+
+  setAttachSessionDeletionCapability(agentId: string, supported: boolean, now: number): void {
+    this.#db.prepare(
+      `INSERT INTO attach_streams (agent_id, next_command_sequence, last_event_sequence, session_deletion_capability, updated_at)
+       VALUES (?, 1, 0, ?, ?)
+       ON CONFLICT(agent_id) DO UPDATE SET session_deletion_capability = excluded.session_deletion_capability, updated_at = excluded.updated_at`,
+    ).run(agentId, supported ? 1 : 0, now);
+  }
+
+  hasAttachSessionDeletionCapability(agentId: string): boolean {
+    return (this.#db.prepare("SELECT session_deletion_capability AS supported FROM attach_streams WHERE agent_id = ?")
+      .get(agentId) as { supported: number | null } | undefined)?.supported === 1;
   }
 
   ackAttachCommand(agentId: string, sequence: number, commandId: string, ackedAt: number): boolean {
@@ -3212,6 +3230,46 @@ export class Storage {
       this.#db.prepare(`DELETE FROM bot_turn_media_deliveries WHERE bot = ? AND message_id IN
         (SELECT message_id FROM bot_native_messages WHERE bot = ? AND session_id = ?)`)
         .run(input.bot, input.bot, input.sessionId);
+      // Preserve sequence/dedupe state but erase direct-session transport payloads. Cancelled
+      // commands replay only as the ordinary payload-free discard command.
+      const commandRows = this.#db.prepare(
+        `SELECT sequence, command_json AS commandJson FROM attach_command_outbox
+         WHERE agent_id = ? AND json_extract(command_json, '$.threadId') = ?`,
+      ).all(input.bot, input.sessionId) as Array<{ sequence: number; commandJson: string }>;
+      for (const row of commandRows) {
+        const original = JSON.parse(row.commandJson) as AttachV1Command;
+        this.#db.prepare(
+          `UPDATE attach_command_outbox SET command_json = ?, cancelled_at = COALESCE(cancelled_at, ?),
+           cancel_reason = COALESCE(cancel_reason, 'session deleted') WHERE agent_id = ? AND sequence = ?`,
+        ).run(JSON.stringify({ kind: "discard", originalKind: original.kind, reason: "session deleted" }), input.deletedAt, input.bot, row.sequence);
+      }
+      const eventRows = this.#db.prepare(
+        `SELECT sequence, event_id AS eventId FROM attach_event_inbox
+         WHERE agent_id = ? AND json_extract(frame_json, '$.event.threadId') = ?`,
+      ).all(input.bot, input.sessionId) as Array<{ sequence: number; eventId: string }>;
+      for (const row of eventRows) {
+        this.#db.prepare(
+          `UPDATE attach_event_inbox SET frame_json = ?, disposition = 'discarded', applied_at = COALESCE(applied_at, ?),
+           projection_error = COALESCE(projection_error, 'session deleted'), dead_lettered_at = COALESCE(dead_lettered_at, ?)
+           WHERE agent_id = ? AND sequence = ?`,
+        ).run(JSON.stringify({ kind: "event", sequence: row.sequence, eventId: row.eventId, event: { kind: "presence", state: "absent" } }), input.deletedAt, input.deletedAt, input.bot, row.sequence);
+      }
+      this.#db.prepare("DELETE FROM attach_scheduled_deliveries WHERE agent_id = ? AND thread_id = ?")
+        .run(input.bot, input.sessionId);
+      this.#db.prepare(
+        `DELETE FROM attach_media WHERE agent_id = ? AND media_id IN (
+           SELECT json_extract(attachment.value, '$.fileId') FROM bot_native_messages AS message,
+             json_each(message.attachments_json) AS attachment
+           WHERE message.bot = ? AND message.session_id = ?
+         ) AND NOT EXISTS (
+           SELECT 1 FROM bot_native_messages AS message, json_each(message.attachments_json) AS attachment
+           WHERE message.bot = ? AND message.session_id <> ?
+             AND json_extract(attachment.value, '$.fileId') = attach_media.media_id
+         ) AND NOT EXISTS (
+           SELECT 1 FROM attach_event_inbox AS inbox, json_each(inbox.frame_json, '$.event.mediaIds') AS media
+           WHERE inbox.agent_id = ? AND media.value = attach_media.media_id
+         )`,
+      ).run(input.bot, input.bot, input.sessionId, input.bot, input.sessionId, input.bot);
       for (const table of ["bot_native_messages", "bot_chat_tool_steps", "bot_chat_delegations", "bot_mobile_receipts", "bot_native_interactions", "bot_native_turn_terminals", "bot_desktop_resume_bindings"]) {
         this.#db.prepare(`DELETE FROM ${table} WHERE bot = ? AND session_id = ?`).run(input.bot, input.sessionId);
       }
@@ -4297,6 +4355,12 @@ export function openStorage(dbPath: string): Storage {
       .map((column) => column.name),
   );
   if (!setupCodeColumns.has("kind")) db.exec("ALTER TABLE setup_codes ADD COLUMN kind TEXT");
+  const attachStreamColumns = new Set(
+    (db.prepare("PRAGMA table_info(attach_streams)").all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!attachStreamColumns.has("session_deletion_capability"))
+    db.exec("ALTER TABLE attach_streams ADD COLUMN session_deletion_capability INTEGER");
   // Capability 55. An existing database's `runners` predates the person-set display name; adding
   // it nullable is the whole migration. Nothing is backfilled: every existing row reopens with no
   // display name, which is exactly "nobody has renamed this yet" -- the honest state. Idempotent,

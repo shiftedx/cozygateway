@@ -243,6 +243,11 @@ export class AttachV1Ingress implements TurnEndpoint {
         connection.sendCursor = connection.commandCursor;
         const offered = new Set(frame.capabilities);
         connection.capabilities = new Set(this.#allowed(agentId).filter((capability) => offered.has(capability)));
+        this.#storage.setAttachSessionDeletionCapability(
+          agentId,
+          connection.capabilities.has("session_deletion"),
+          receivedAt,
+        );
         if ("telemetry" in frame && frame.telemetry !== undefined)
           connection.telemetry = this.#recordTelemetry(agentId, frame.telemetry, receivedAt);
         if (frame.commands !== undefined) {
@@ -412,6 +417,10 @@ export class AttachV1Ingress implements TurnEndpoint {
       let frame = queued;
       const missing = commandCapabilities(frame.command).find((capability) => !connection.capabilities.has(capability));
       if (missing !== undefined) {
+        // Unlike ordinary optional commands, a committed deletion must stay durable until its
+        // capable receiver ACKs it. A temporarily older reconnect gets no unknown frame and must
+        // not turn the privacy tombstone into a semantic no-op for a later capable reconnect.
+        if (frame.command.kind === "session_deleted") break;
         const cancelled = this.#storage.discardAttachCommandAndReopenNativeInteraction(
           agentId,
           frame.sequence,
@@ -541,10 +550,8 @@ export class AttachV1Ingress implements TurnEndpoint {
    * ordered replay loop after that transaction succeeds. A disconnected or older peer receives
    * no unknown command. */
   canSendSessionDeletion(agentId: string): boolean {
-    const connection = this.#current.get(agentId);
-    return connection?.hello === true
-      && this.#allowed(agentId).includes("session_deletion")
-      && connection.capabilities.has("session_deletion");
+    return this.#allowed(agentId).includes("session_deletion")
+      && this.#storage.hasAttachSessionDeletionCapability(agentId);
   }
 
   flushQueuedCommands(agentId: string): void {

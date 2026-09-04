@@ -1,6 +1,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Hono, type MiddlewareHandler } from "hono";
 import { describe, expect, it, vi } from "vitest";
 
 import type { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
@@ -11,9 +12,14 @@ import {
   type BotsSurface,
 } from "../src/hermes-bridge/bridge.ts";
 import { NativeBotDataPlane } from "../src/hermes-bridge/native-data-plane.ts";
+import { registerBotRoutes } from "../src/hermes-bridge/routes.ts";
 import { openStorage } from "../src/storage.ts";
 
-function nativePlane(bots = ["sage", "luna"], storage = openStorage(":memory:")) {
+function nativePlane(
+  bots = ["sage", "luna"],
+  storage = openStorage(":memory:"),
+  sessionDeletion = true,
+) {
   const frames: unknown[] = [];
   const commands: Array<{ bot: string; threadId: string }> = [];
   const desktopResumeCommands: Array<{
@@ -43,7 +49,7 @@ function nativePlane(bots = ["sage", "luna"], storage = openStorage(":memory:"))
       desktopResumeCommands.push({ bot, ...input });
       return true;
     },
-    canSendSessionDeletion: () => false,
+    canSendSessionDeletion: () => sessionDeletion,
     flushQueuedCommands: () => undefined,
   } as unknown as AttachV1Ingress;
   let now = 1_000;
@@ -222,6 +228,52 @@ describe("attach-v1 native Bot Mode sessions", () => {
     expect((await h.surface.sessions("sage", 10)).sessions.map((row) => row.id)).toEqual([current]);
     expect(h.storage.nativeBotMessages("sage", first)).toEqual([]);
     await expect(h.surface.deleteSession("sage", current)).rejects.toThrow("active conversation");
+    h.plane.close();
+    h.storage.close();
+  });
+
+  it("fails a direct-session deletion closed until the attached runtime has negotiated capability 60", async () => {
+    const h = nativePlane(["sage"], openStorage(":memory:"), false);
+    const stale = (await h.surface.canonicalChat("sage")).sessionId;
+    h.storage.resetNativeBotChat("sage", 2);
+
+    await expect(h.surface.deleteSession("sage", stale)).rejects.toThrow("capability 60");
+    expect(h.storage.nativeBotHasSession("sage", stale)).toBe(true);
+    expect(h.storage.pendingAttachCommands("sage", 0, 10)).toEqual([]);
+    h.plane.close();
+    h.storage.close();
+  });
+
+  it("accepts authenticated DELETE only for an owned inactive native direct conversation", async () => {
+    const h = nativePlane(["sage"]);
+    const stale = (await h.surface.canonicalChat("sage")).sessionId;
+    h.storage.resetNativeBotChat("sage", 2);
+    const app = new Hono<{ Variables: { deviceId: string } }>();
+    const requireDevice: MiddlewareHandler<{ Variables: { deviceId: string } }> = async (c, next) => {
+      c.set("deviceId", "device-1");
+      await next();
+    };
+    registerBotRoutes(app, requireDevice, h.surface);
+
+    expect((await app.request(`/bots/sage/sessions/${stale}`, { method: "DELETE" })).status).toBe(204);
+    expect(h.storage.nativeBotHasSession("sage", stale)).toBe(false);
+    h.plane.close();
+    h.storage.close();
+  });
+
+  it("reports authenticated native DELETE ownership and active-session refusals truthfully", async () => {
+    const h = nativePlane(["sage", "luna"]);
+    const current = (await h.surface.canonicalChat("sage")).sessionId;
+    const foreign = (await h.surface.canonicalChat("luna")).sessionId;
+    const app = new Hono<{ Variables: { deviceId: string } }>();
+    const requireDevice: MiddlewareHandler<{ Variables: { deviceId: string } }> = async (c, next) => {
+      c.set("deviceId", "device-1");
+      await next();
+    };
+    registerBotRoutes(app, requireDevice, h.surface);
+
+    expect((await app.request(`/bots/sage/sessions/${foreign}`, { method: "DELETE" })).status).toBe(409);
+    expect((await app.request(`/bots/sage/sessions/${current}`, { method: "DELETE" })).status).toBe(503);
     h.plane.close();
     h.storage.close();
   });
