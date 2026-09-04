@@ -51,7 +51,7 @@ recover_bootstrap_transaction() {
   local journal="$HOME_DIR/.bootstrap-transaction" backup="$HOME_DIR/.bootstrap-previous" state name inventory
   [ -f "$journal" ] || { [ ! -e "$backup" ] || { rmdir "$backup" 2>/dev/null || die "bootstrap rollback directory exists without a transaction marker; preserve it and rerun"; }; return; }
   state="$(cat "$journal")"
-  if [ "$state" = 'commit=installer-succeeded' ]; then rm -rf "$backup" 2>/dev/null || true; rm -f "$journal" || die "could not clear completed bootstrap transaction marker"; return; fi
+  if [ "$state" = 'commit=installer-succeeded' ] || [ "$state" = 'restored=previous-release' ]; then [ ! -e "$backup" ] || rm -rf "$backup" || die "could not finish bootstrap cleanup; journal preserved"; rm -f "$journal" || die "could not clear completed bootstrap marker"; return; fi
   if [ "$state" = 'prepare=replace-release-assets' ]; then rm -rf "$backup" || die "could not clear incomplete bootstrap snapshot"; rm -f "$journal"; return; fi
   [ "$state" = 'intent=replace-release-assets' ] || die "bootstrap transaction marker is invalid; preserve it and rerun"
   inventory="$backup/inventory"; [ -f "$inventory" ] || die "bootstrap transaction inventory is missing; preserve it and rerun"
@@ -63,6 +63,7 @@ recover_bootstrap_transaction() {
     restore_previous_installer "$asset_dir" "$@" || die "previous assets were restored but its service restart failed; recovery journal is preserved"
     printf 'OK    restarted the previous CozyGateway service after the failed update\n' >&2
   fi
+  printf 'restored=previous-release\n' > "$journal.next" && mv -f "$journal.next" "$journal" || die "could not record recovered bootstrap state"
   rm -rf "$backup" || die "could not finish bootstrap recovery; journal preserved"
   rm -f "$journal" || die "could not clear recovered bootstrap journal"
 }
@@ -104,10 +105,6 @@ main() {
   [ "$(id -u)" != 0 ] || die "CozyGateway installs per user under \$HOME and never needs sudo; rerun as yourself."
   command -v curl >/dev/null 2>&1 || die "curl is required"
   canonical_home_dir
-  if [ -z "$ASSET_BASE" ]; then
-    if [ -z "$TAG" ]; then TAG="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"; [ -n "$TAG" ] || die "could not resolve latest release"; fi
-    ASSET_BASE="https://github.com/$REPO/releases/download/$TAG"
-  fi
   if [ "${COZYGATEWAY_INSTALL_DRYRUN:-}" = 1 ]; then
     dry_stage="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-bootstrap.XXXXXX")"; stage="$dry_stage"
   else
@@ -119,6 +116,10 @@ main() {
     stage="$(mktemp -d "$HOME_DIR/.bootstrap.XXXXXX")"
   fi
   trap '[ -z "$stage" ] || rm -rf "$stage"; release_bootstrap_lock' EXIT HUP INT TERM
+  if [ -z "$ASSET_BASE" ]; then
+    if [ -z "$TAG" ]; then TAG="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"; [ -n "$TAG" ] || die "could not resolve latest release"; fi
+    ASSET_BASE="https://github.com/$REPO/releases/download/$TAG"
+  fi
   fetch_verified cozygateway.mjs "$stage/cozygateway.mjs"
   fetch_verified cozygateway-hermes-attach-plugin.tar.gz "$stage/cozygateway-hermes-attach-plugin.tar.gz"
   fetch_verified cozygateway-installer.sh "$stage/agent-install.sh"
