@@ -113,7 +113,7 @@ begin_bootstrap_transaction "$asset_dir"
 # These names are the minimum runnable contract; explicit checks prevent a
 # future whitelist edit from silently reducing snapshot coverage.
 for required in \
-  local/install-state local/cozygateway.config.json local/gateway.env \
+  local/install-state local/cozygateway.config.json local/gateway.env local/profiles.json local/bootstrap-source \
   local/dashboard.env local/dashboard-port local/run-gateway.sh \
   local/gateway-supervisor.cjs bin/cozygateway; do
   expect_runtime_snapshot "$required"
