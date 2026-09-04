@@ -49,7 +49,7 @@ valid_runtime_file_id() {
   for item in "${BOOTSTRAP_RUNTIME_FILES[@]}"; do [ "$candidate" = "$item" ] && return 0; done
   return 1
 }
-bootstrap_path_mode() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
+bootstrap_path_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
 bootstrap_safe_path_and_parents() {
   local path="$1" parent
   [ ! -L "$path" ] || return 1
@@ -157,7 +157,8 @@ recover_bootstrap_transaction() {
         name="${entry#*:}"; valid_inventory_name "$name" || die "bootstrap transaction inventory is invalid"
         case "|$seen" in *"|asset:$name|"*) die "bootstrap transaction inventory has duplicate assets" ;; esac
         seen="$seen""asset:$name|"; count=$((count + 1))
-        [ ! -L "$asset_dir/$name" ] && [ ! -L "$asset_dir/$name.recover.$$" ] || die "refusing redirected installed bootstrap asset"
+        bootstrap_safe_path_and_parents "$asset_dir/$name" && bootstrap_safe_path_and_parents "$asset_dir/$name.recover.$$" || die "refusing redirected installed bootstrap asset"
+        bootstrap_safe_path_and_parents "$backup/$name" || die "refusing redirected bootstrap snapshot asset"
         if [ "${entry%%:*}" = present ]; then [ -f "$backup/$name" ] && [ ! -L "$backup/$name" ] || die "bootstrap snapshot is incomplete or redirected"; fi ;;
       state:present:*|state:absent:*)
         [ "$version" = 2 ] || die "bootstrap transaction inventory is invalid"
@@ -167,6 +168,7 @@ recover_bootstrap_transaction() {
         case "|$seen" in *"|state:$item|"*) die "bootstrap transaction inventory has duplicate runtime state" ;; esac
         seen="$seen""state:$item|"
         if [ "$item" = local/install-state ] && [ "$state" = present ]; then prior_runtime_state=1; fi
+        bootstrap_safe_path_and_parents "$(bootstrap_runtime_path "$item")" && bootstrap_safe_path_and_parents "$(bootstrap_runtime_path "$item").recover.$$" && bootstrap_safe_path_and_parents "$backup/runtime/$item" || die "refusing redirected bootstrap runtime path"
         if [ "$state" = present ]; then [ -f "$backup/runtime/$item" ] && [ ! -L "$backup/runtime/$item" ] || die "bootstrap runtime snapshot is incomplete or redirected"; fi ;;
       service:present:*|service:absent:*)
         [ "$version" = 2 ] || die "bootstrap transaction inventory is invalid"
@@ -185,11 +187,12 @@ recover_bootstrap_transaction() {
     # Validate the service while the current wrapper is still present. After
     # restoring an older wrapper, a valid newer unit can no longer be compared
     # to it, but a foreign unit must still block recovery before any mutation.
-    if [ "$prior_runtime_state" = 0 ] && [ "$service_state" = absent ]; then
+    service_path="$(bootstrap_service_registration_path)"
+    bootstrap_safe_path_and_parents "$service_path" && bootstrap_safe_path_and_parents "$service_path.recover.$$" && bootstrap_safe_path_and_parents "$backup/service-registration" || die "refusing redirected bootstrap service path"
+    if [ ! -e "$service_path" ]; then
       skip_service_restart=1
     else
-      service_path="$(bootstrap_service_registration_path)"
-      [ ! -e "$service_path" ] || current_service_present=1
+      current_service_present=1
       bootstrap_service_is_owned_or_absent "$service_path" || die "bootstrap service registration is foreign; recovery journal is preserved"
     fi
   fi
@@ -212,7 +215,7 @@ recover_bootstrap_transaction() {
     restart_existing_owned_service || die "previous assets were restored but its service restart failed; recovery journal is preserved"
     printf 'OK    restarted the previous CozyGateway service after the failed update\n' >&2
   else
-    printf 'OK    restarted the previous CozyGateway service after the failed update (no prior service was registered)\n' >&2
+    printf 'OK    restored previous CozyGateway assets; no prior service was registered\n' >&2
   fi
   printf 'restored=previous-release\n' > "$journal.next" && mv -f "$journal.next" "$journal" || die "could not record recovered bootstrap state"
   rm -rf "$backup" || die "could not finish bootstrap recovery; journal preserved"

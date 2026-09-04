@@ -191,4 +191,40 @@ expect_file "$journal"
 expect_absent "$manager_log"
 expect_contents "$foreign_unit" $'[Service]\nExecStart=/usr/bin/foreign'
 
+# A failed update from an installed Gateway may create a new owned service even
+# when the previous install had none. Recovery unregisters it rather than
+# leaving a login service for bytes it just removed.
+reset_fixture
+write_asset_pair "$asset_dir" prior
+mkdir -p "$HOME_DIR/local"
+printf 'harness=hermes\n' > "$HOME_DIR/local/install-state"
+begin_bootstrap_transaction "$asset_dir"
+write_asset_pair "$asset_dir" fresh
+mkdir -p "$XDG_CONFIG_HOME/systemd/user"
+printf '#!/usr/bin/env bash\nset -euo pipefail\nexec /usr/bin/node %q\n' "$asset_dir/gateway-supervisor.cjs" > "$HOME_DIR/local/run-gateway.sh"
+printf '[Service]\nExecStart=/usr/bin/node %s\n' "$asset_dir/gateway-supervisor.cjs" > "$XDG_CONFIG_HOME/systemd/user/cozygateway.service"
+: > "$manager_log"
+PATH="$fake_bin:$PATH" COZYGATEWAY_TEST_SERVICE_LOG="$manager_log" recover_bootstrap_transaction "$asset_dir"
+expect_absent "$XDG_CONFIG_HOME/systemd/user/cozygateway.service"
+grep -Fqx -- '--user disable --now cozygateway.service' "$manager_log" || fail 'new owned service was not unregistered'
+grep -Fqx -- '--user daemon-reload' "$manager_log" || fail 'manager was not reloaded after unregistering service'
+
+# Runtime destinations and snapshot parents are all validated before the first
+# asset write. A redirected local tree or backup cannot yield a mixed release.
+for redirect in destination snapshot; do
+  reset_fixture
+  write_asset_pair "$asset_dir" prior
+  mkdir -p "$HOME_DIR/local"
+  printf 'harness=hermes\n' > "$HOME_DIR/local/install-state"
+  begin_bootstrap_transaction "$asset_dir"
+  write_asset_pair "$asset_dir" fresh
+  if [ "$redirect" = destination ]; then
+    mv "$HOME_DIR/local" "$tmp/local-real"; ln -s "$tmp/local-real" "$HOME_DIR/local"
+  else
+    mv "$backup_dir/runtime/local" "$tmp/runtime-real"; ln -s "$tmp/runtime-real" "$backup_dir/runtime/local"
+  fi
+  if (PATH="$fake_bin:$PATH" COZYGATEWAY_TEST_SERVICE_LOG="$manager_log" recover_bootstrap_transaction "$asset_dir"); then fail "$redirect redirect unexpectedly recovered"; fi
+  expect_contents "$asset_dir/cozygateway.mjs" 'fresh:cozygateway.mjs'
+done
+
 printf 'bootstrap transaction tests passed\n'
