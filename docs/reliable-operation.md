@@ -33,3 +33,15 @@ The control Dashboard is local to the computer. It is separate from the address 
 Include the product version, operating system, status/error code and the step that failed. Do not include pairing codes, tokens, complete environment files or conversation contents. See [support](../SUPPORT.md).
 
 Release testing must distinguish a local process restart from a full machine reboot, and macOS qualification from Windows or Linux qualification. An untested platform or recovery path remains unverified.
+
+## Existing Hermes deployments
+
+If this computer already has Hermes profiles managed by another Gateway, use the checksummed bootstrap with runtime-only mode:
+
+```sh
+curl -fsSL https://cozylabs.ai/install.sh | bash -s -- --runtime-only
+```
+
+Runtime-only repair replaces the Gateway-owned supervisor and registered service, then refreshes its command. It keeps the saved profile map, including profiles that are currently absent, and does not change Hermes profile environment files, plugins, harness services, tokens, or remote Gateway bindings. Its successful state is retained, so later `cozygateway repair` and `cozygateway update` keep using runtime-only mode. Removing a runtime-only installation removes only Gateway-owned files and registration; it preserves Hermes profiles, plugins, services, and environment. It verifies the Gateway health endpoint; it does not certify that every bot is connected.
+
+Use the ordinary installer for a Gateway-managed Hermes setup. Before it writes Gateway state, it rejects selected profiles that already point at another Gateway, including a profile carrying an old installer marker. A normal Hermes installation can update external Hermes plugin and environment state, which cannot be rolled back atomically with a later Gateway readiness failure. Runtime-only repair avoids that external change when Hermes is independently managed.

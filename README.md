@@ -1,123 +1,106 @@
-# cozygateway
+# CozyGateway
 
-Chat with your self-hosted AI agent from your phone, without handing your data to anyone.
+**Chat with a self-hosted AI agent from your phone while keeping the conversation on your own machine.**
 
-cozygateway is a single self-hosted Node process you run next to your agent. It speaks a small published wire contract to chat clients and uses its `attach` data plane to let an agent harness dial in over a small WebSocket protocol and answer turns live.
+CozyGateway is a Node.js gateway that runs beside your agent. It implements the published [wire contract](contract/v1.md) for chat clients and connects agent harnesses through the [attach-v1](contract/attach-v1.md) WebSocket data plane. Pair a device with a short-lived code, then talk directly to your gateway—without creating an account for the gateway itself.
 
-## Install
+[Quick start](#quickstart) · [Documentation](#documentation) · [Releases](https://github.com/shiftedx/cozygateway/releases) · [Contributing](CONTRIBUTING.md)
 
-There are two ways in. Pick the one that fits your machine.
+[CozyChat](https://github.com/shiftedx/cozychat) is the Apple client. [CozyAgents](https://github.com/shiftedx/cozyagents) runs agents on your computers. CozyGateway owns pairing, conversation state, and routing between them.
 
-### Simple (recommended): one line, runs as a service
+## What it provides
 
-Windows PowerShell (Hermes is installed automatically if needed, then you
-choose or confirm its model and provider):
+- **Direct, revocable device pairing.** A QR code or setup code creates a device token; no gateway account is required.
+- **Live agent chat.** Typed rich-content replies stream over WebSocket, with multiple named threads and durable per-thread ordering.
+- **Local state.** Conversation history is stored in SQLite on the gateway host.
+- **Private notifications.** Push payloads leave the host as end-to-end encrypted ciphertext. The default relay receives an opaque push ID, ciphertext, notification metadata, and transient source IP for rate limiting—not message contents or device identity. See [the push contract](contract/push-v0.md).
+- **A documented integration boundary.** The frozen v1 contract, TypeBox schemas, and black-box conformance suite support independent clients and implementations.
 
-```powershell
-irm https://cozylabs.ai/install.ps1 | iex
-```
+## Quickstart
 
-macOS/Linux:
+The release bootstrap downloads one matched, checksum-verified release and installs a per-user service. It provisions a private Node.js 24 runtime when needed and can set up the Hermes integration used by the standard install path.
+
+### macOS and Linux
 
 ```sh
 curl -fsSL https://cozylabs.ai/install.sh | bash
 ```
 
-Open a new terminal afterward and type `cozygateway` on every supported host.
-
-No Docker or source checkout is required. The installer provisions missing Node 24 and Hermes,
-then asks you to confirm a working model/provider. The
-bootstrap verifies versioned release checksums for the gateway bundle, complete Hermes attach-plugin
-archive, and installer payload. It discovers Hermes profile homes through the Hermes CLI, installs
-one attach identity per selected profile, and supervises one shared gateway service. The default
-scope is `all`; updates preserve the recorded selection. An installation with `all` also provisions newly discovered profiles. Existing Hermes
-profile gateway services stay Hermes-owned. Fresh interactive installs ask once whether CozyChat
-may connect over the local network; No (the default) keeps loopback (`127.0.0.1:8787`), while Yes
-binds all local interfaces and puts the detected LAN address in the pairing QR. The
-installer never configures Tailscale, Cloudflare, DNS, firewalls, or tunnels. See
-[service installation](docs/install-service.md), [connectivity](docs/connectivity.md), and
-[keeping your Gateway available](docs/reliable-operation.md).
-
-Windows installs under `%LOCALAPPDATA%\cozygateway`, registers a current-user
-`CozyGateway` Scheduled Task with a Startup-folder fallback, and normally stays
-non-elevated. One scoped administrator prompt can appear only when an existing
-higher-integrity Hermes Dashboard cannot be classified safely without elevated
-process metadata. The final screen contains a QR and plain-text setup code.
-Open a new PowerShell or Terminal window and type `cozygateway` for a small menu
-that shows status, prints a fresh pairing QR, or changes the bind address and
-port. `cozygateway status` names the safe next step when attention is needed;
-`cozygateway repair` (or `update`) downloads the latest matched, checksummed
-release and reconciles the install. Existing installs retain their saved
-listener; `--bind-host` remains the non-interactive override.
-The setup URLs serve the published release. Local builds do not change those
-URLs until the matching release assets and website pins are published.
-
-Uninstall on macOS/Linux:
+Open a new terminal and run:
 
 ```sh
-bash ~/.cozygateway/bin/agent-install.sh --uninstall --gateway-dir ~/.cozygateway
+cozygateway
 ```
 
-This removes CozyGateway-owned service state, plugin copies, spools, and installer-written env keys;
-Hermes profiles and Hermes services remain. It also removes the installer-owned
-command entry from the user PATH.
+The command shows gateway status and lets you create a fresh pairing code. Scan the QR code, or enter the code in the chat client.
 
-### Existing Hermes install
+### Windows PowerShell
 
-The installer targets Hermes profiles already on this machine. For a narrower
-selection, pass `--profiles default,ops` to the one-paste command. The command
-uses the installed Hermes CLI as the source of truth for profile homes and does
-not clone a repository or create a Docker deployment.
+```powershell
+irm https://cozylabs.ai/install.ps1 | iex
+```
 
-## How push works
+Open a new PowerShell or Terminal window, then run `cozygateway` to check the installation or make a pairing code.
 
-Self-hosted gateways use `https://push.cozylabs.ai` by default so the store app works
-without APNs setup. The gateway encrypts every notification end to end before sending it.
-The hosted relay sees only an opaque push ID, ciphertext, optional category and collapse
-ID, and the source IP transiently for rate limiting. It never sees message content or
-device identity. Override `COZYGATEWAY_PUSH_RELAY_URL` to use another relay.
+The Windows installer is published and has automated coverage, but full Windows end-to-end qualification is still in progress. Use it with that limitation in mind; report results through [GitHub Issues](https://github.com/shiftedx/cozygateway/issues).
 
-A relay you host with your own APNs key cannot push to the store app because APNs keys
-are scoped to the publisher team. The `local-push` Compose profile is for developers who
-sign their own app with their own Apple team.
+For installation details, profile selection, service registration, and prerequisites, see [Install as a service](docs/install-service.md).
 
-## What it does
+## Network and deployment choices
 
-- Pairing: scan a QR code, get a revocable device token. No accounts.
-- Threads: multiple renameable DM threads per agent, each bound to its own backend session.
-- Streaming: agent replies stream live as typed rich content blocks over one WebSocket.
-- History: SQLite-backed message history with strict per-thread ordering and gap replay.
-- Push: end-to-end encrypted notifications through the accountless CozyLabs relay by default.
+Fresh installs listen on `127.0.0.1:8787` by default. The installer asks whether to make the gateway reachable on a trusted local network; choosing no preserves the loopback-only listener. It does not configure DNS, firewalls, Tailscale, Cloudflare, or a tunnel.
 
-## Status
+For remote access, keep the gateway on loopback and use a TLS endpoint you operate. The [connectivity guide](docs/connectivity.md) covers Tailscale Serve and a named Cloudflare Tunnel; [TLS and remote access](docs/tls.md) covers gateway TLS and proxy requirements. The `--public-url` installer option records the exact HTTPS origin advertised in pairing codes.
 
-- Shipped: contract v1 (frozen), conformance suite, attach-v1 data plane, hosted relay plus encrypted push origination and APNs delivery (`contract/push-v0.md`), TLS for the phone link (gateway-native, or a shipped Caddy sidecar example; `docs/tls.md`).
+For an existing Hermes deployment or an operator-managed host, use the [runtime-only recovery path](docs/reliable-operation.md#existing-hermes-deployments). Docker is an advanced deployment path for a pre-existing Hermes configuration; start with [Docker self-hosting](docs/self-host-docker.md).
 
-Docker publishes the gateway on `127.0.0.1:8787` by default. Use the documented LAN overlay only
-for a trusted private network, or use the Caddy or native TLS Compose overlays for off-host access.
+## Operate and recover
 
-## Repo layout
-
-- `contract/`: the human-readable, versioned wire contract spec.
-- `packages/contract`: TypeBox schemas and TypeScript types for the contract (publishable as `cozygateway-contract`).
-- `packages/gateway`: the gateway process, implementing contract v1.
-- `packages/relay`: the push relay service (opaque push ids in, ciphertext through).
-- `packages/conformance`: contract conformance suite that runs against any gateway implementation, validated against the reference gateway.
-- `integrations/attach-plugin`: the reference Python platform plugin for the durable attach-v1 data plane; see `contract/attach-v1.md` and `docs/attach-v1-operations.md`.
-
-## Privacy model
-
-Your messages live in SQLite on your box. The gateway must read plaintext to drive your agent, and it never sends message content outside your box. TLS for the phone link ships two ways, gateway-native or a Caddy sidecar example, and the app pins the certificate on first use; see `docs/tls.md`. Plain HTTP remains the default, for boxes that already terminate TLS in front. Push leaves the box only as end-to-end encrypted ciphertext.
-
-## Development
-
-Requires Node 24+ and pnpm 10.
+Keep the gateway host powered, awake, and connected when you want to reach your agent. The installer creates a user-level background service: launchd on macOS, a systemd user service on Linux, and a current-user Scheduled Task with a Startup-folder fallback on Windows.
 
 ```sh
-pnpm install
-pnpm check   # typecheck + test + build
+cozygateway status
+cozygateway repair   # `cozygateway update` is an alias
 ```
 
-## License
+`status` reports the next safe action when the service needs attention. `repair` downloads and verifies one matched release while retaining the recorded listener, public origin, and selected profiles. If the command itself is unavailable, run the relevant installation command again. Do not remove the gateway directory or reset pairing as a first recovery step: that can discard the state recovery preserves. Read [reliable operation and recovery](docs/reliable-operation.md) before a host migration or deployment repair.
 
-MIT
+## Documentation
+
+| Need | Start here |
+| --- | --- |
+| Install, update, remove, or inspect the service | [Service installation](docs/install-service.md) |
+| LAN, Tailscale, Cloudflare Tunnel, or public HTTPS | [Connectivity](docs/connectivity.md) and [TLS](docs/tls.md) |
+| Docker deployment | [Self-host with Docker](docs/self-host-docker.md) |
+| Hermes/attach operations | [Attach-v1 operations](docs/attach-v1-operations.md) |
+| Gateway runtime configuration and commands | [Gateway package README](packages/gateway/README.md) |
+| Client and gateway protocol | [Contract v1](contract/v1.md) and [conformance suite](packages/conformance/README.md) |
+| Support | [Support guide](SUPPORT.md) · [GitHub Issues](https://github.com/shiftedx/cozygateway/issues) |
+
+## Develop
+
+Development requires Node.js 24+ and pnpm 10.
+
+```sh
+pnpm install --frozen-lockfile
+pnpm check
+```
+
+`pnpm check` builds, type-checks, and tests every workspace package. The repository contains the gateway, contract package, relay, conformance suite, and reference attach plugin:
+
+| Path | Purpose |
+| --- | --- |
+| [`contract/`](contract/) | Versioned wire and extension specifications |
+| [`packages/gateway/`](packages/gateway/) | Reference gateway service |
+| [`packages/contract/`](packages/contract/) | TypeBox schemas and TypeScript contract types |
+| [`packages/conformance/`](packages/conformance/) | Black-box contract conformance suite |
+| [`packages/relay/`](packages/relay/) | Encrypted push relay |
+| [`integrations/attach-plugin/`](integrations/attach-plugin/) | Reference attach-v1 plugin |
+
+## Contributing, security, and license
+
+For substantial changes, open an issue before writing the implementation. Keep pull requests focused, add meaningful behavior coverage, and run `pnpm check` with Node 24 before requesting review. Contract changes require an explicit migration and conformance coverage. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Please report vulnerabilities privately through GitHub's security advisory flow; do not include tokens, pairing codes, keys, or conversation contents. See [SECURITY.md](SECURITY.md).
+
+CozyGateway is licensed under the [MIT License](LICENSE).
