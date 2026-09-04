@@ -1513,7 +1513,11 @@ stop_owned_windows_gateway 0
         # near-match still fails in the earlier port-change assertion.
         $legacyWrapper = Join-Path $supervisorLocal 'run-gateway-legacy.sh'
         $legacyText = Get-Content -LiteralPath $generatedWrapper -Raw
-        $legacyText = $legacyText -replace (' --dashboard-port-state ' + [regex]::Escape($dashboardPortStatePosix)), ''
+        # printf %q escapes Windows backslashes and spaces in the generated
+        # wrapper, so remove one complete shell token rather than a POSIX path.
+        $stateArgument = ' --dashboard-port-state (?:\\.|[^\\\s])+'
+        Assert-True ([regex]::Matches($legacyText, $stateArgument).Count -eq 1) 'legacy fixture must find exactly one encoded state argument'
+        $legacyText = $legacyText -replace $stateArgument, ''
         Assert-True (-not ($legacyText -match '--dashboard-port-state')) 'legacy fixture must omit dashboard-port-state exactly'
         Write-Utf8NoBom $legacyWrapper $legacyText
         $uninstallSupervisor = Start-Process -FilePath $bashPath -ArgumentList ('"' + $legacyWrapper + '"') -PassThru
