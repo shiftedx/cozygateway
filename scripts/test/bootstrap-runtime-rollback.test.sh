@@ -25,6 +25,9 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 expect_absent() { [ ! -e "$1" ] && [ ! -L "$1" ] || fail "expected absence: $1"; }
 expect_contents() { [ "$(cat "$1")" = "$2" ] || fail "unexpected contents in $1"; }
 expect_mode() { [ "$(bootstrap_path_mode "$1")" = "$2" ] || fail "unexpected mode on $1"; }
+expect_runtime_snapshot() {
+  awk -F: -v id="$1" '$1 == "state" && $3 == id { found=1 } END { exit !found }' "$backup_dir/inventory" || fail "missing runtime snapshot for $1"
+}
 
 fake_bin="$tmp/fake-bin"
 manager_log="$tmp/systemctl.log"
@@ -87,6 +90,17 @@ printf 'old:local/gateway-supervisor.cjs\n' > "$HOME_DIR/local/gateway-superviso
 chmod 700 "$HOME_DIR/local/gateway-supervisor.cjs"
 write_owned_wrapper
 
+# A historical installer is part of the baseline snapshot. It intentionally fails
+# if recovery replays it, including with the --no-qr flag supplied below.
+old_installer_log="$tmp/old-installer.log"
+export COZYGATEWAY_TEST_OLD_INSTALLER_LOG="$old_installer_log"
+cat > "$asset_dir/agent-install.sh" <<'OLD_INSTALLER'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "${COZYGATEWAY_TEST_OLD_INSTALLER_LOG:?}"
+exit 91
+OLD_INSTALLER
+chmod 700 "$asset_dir/agent-install.sh"
+
 # These are deliberately outside the transaction contract: the live database,
 # logs, Hermes bindings, and CozyAgents state must never be restored or removed.
 mkdir -p "$HOME_DIR/local" "$tmp/hermes/profile" "$tmp/agents"
@@ -96,6 +110,14 @@ printf 'hermes-before\n' > "$tmp/hermes/profile/.env"
 printf 'agents-before\n' > "$tmp/agents/install.json"
 
 begin_bootstrap_transaction "$asset_dir"
+# These names are the minimum runnable contract; explicit checks prevent a
+# future whitelist edit from silently reducing snapshot coverage.
+for required in \
+  local/install-state local/cozygateway.config.json local/gateway.env \
+  local/dashboard.env local/dashboard-port local/run-gateway.sh \
+  local/gateway-supervisor.cjs bin/cozygateway; do
+  expect_runtime_snapshot "$required"
+done
 write_assets fresh
 # Replace present runtime files and create every previously absent one.
 for item in "${BOOTSTRAP_RUNTIME_FILES[@]}"; do
@@ -116,17 +138,7 @@ printf 'sqlite-after\n' > "$HOME_DIR/local/cozygateway.sqlite"
 printf 'log-after\n' > "$HOME_DIR/local/cozygateway.log"
 printf 'hermes-after\n' > "$tmp/hermes/profile/.env"
 printf 'agents-after\n' > "$tmp/agents/install.json"
-# A historical installer must not be executed by recovery.
-cat > "$asset_dir/agent-install.sh" <<'OLD_INSTALLER'
-#!/usr/bin/env bash
-printf 'replayed\n' > "${COZYGATEWAY_TEST_OLD_INSTALLER_LOG:?}"
-exit 91
-OLD_INSTALLER
-chmod 700 "$asset_dir/agent-install.sh"
-old_installer_log="$tmp/old-installer.log"
-export COZYGATEWAY_TEST_OLD_INSTALLER_LOG="$old_installer_log"
-
-recover_bootstrap_transaction "$asset_dir"
+recover_bootstrap_transaction "$asset_dir" --no-qr
 expect_absent "$old_installer_log"
 expect_contents "$asset_dir/cozygateway.mjs" 'old:cozygateway.mjs'
 expect_contents "$HOME_DIR/local/run-gateway.sh" "$(printf '#!/usr/bin/env bash\nset -euo pipefail\nexec /usr/bin/node %s' "$asset_dir/gateway-supervisor.cjs")"
@@ -153,6 +165,29 @@ expect_contents "$tmp/hermes/profile/.env" 'hermes-after'
 expect_contents "$tmp/agents/install.json" 'agents-after'
 expect_absent "$journal"
 expect_absent "$backup_dir"
+
+# An install that previously had no Gateway registration may create one before
+# a late failure. Recovery must remove that owned registration and reload the
+# manager; it must not leave a login service for bytes it just rolled back.
+reset_fixture
+rm -f "$service_unit"
+printf 'harness=hermes\n' > "$HOME_DIR/local/install-state"
+begin_bootstrap_transaction "$asset_dir"
+write_assets fresh
+cat > "$HOME_DIR/local/run-gateway.sh" <<EOF_NEW_ABSENT_WRAPPER
+#!/usr/bin/env bash
+set -euo pipefail
+exec /usr/bin/new-node $asset_dir/gateway-supervisor.cjs
+EOF_NEW_ABSENT_WRAPPER
+chmod 700 "$HOME_DIR/local/run-gateway.sh"
+printf '[Service]\nExecStart=/usr/bin/new-node %s\n' "$asset_dir/gateway-supervisor.cjs" > "$service_unit"
+chmod 600 "$service_unit"
+: > "$manager_log"
+recover_bootstrap_transaction "$asset_dir"
+expect_absent "$service_unit"
+grep -Fqx -- '--user disable --now cozygateway.service' "$manager_log" || fail 'recovery did not unregister a newly-created owned service'
+grep -Fqx -- '--user daemon-reload' "$manager_log" || fail 'recovery did not reload after unregistering the service'
+if grep -Fq -- 'enable' "$manager_log"; then fail 'recovery must not enable a service absent before the update'; fi
 
 # Existing binary-only journals predate version=2. They recover only their
 # recorded assets and leave newer local runtime state untouched.
