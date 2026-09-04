@@ -14,6 +14,7 @@ import {
   PairRequestSchema,
   BotCreateRequestSchema,
   BotRuntimeProjectionSchema,
+  BotRuntimeRecoveryResponseSchema,
   BotCreateResponseSchema,
   BotDeleteResponseSchema,
   BOTS_CAPABILITY_ID,
@@ -857,7 +858,7 @@ describe("capability advertisement", () => {
     // Capability 59 adds optional skill provenance and installation fields, optional toolset
     // availability fields, and an optional additive `enabledSkills` patch list. The gateway relays
     // runtime rows and writes unchanged while keeping Hermes reads and writes on their old shape.
-    expect(BOTS_CAPABILITY_VERSION).toBe(60);
+    expect(BOTS_CAPABILITY_VERSION).toBe(61);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {
@@ -896,6 +897,17 @@ describe("capability advertisement", () => {
         attachToken: "secret",
       }),
     ).toBe(false);
+    expect(
+      check(BotRuntimeRecoveryResponseSchema, {
+        operationId: "op_1234",
+        runtime: {
+          stage: "waiting_for_runner",
+          specGeneration: 1,
+          observedGeneration: null,
+          lastRunnerContactAt: null,
+        },
+      }),
+    ).toBe(true);
   });
 
   it("carries capability-54 runner placement on the create, the row, and the projection", () => {

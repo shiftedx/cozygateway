@@ -98,6 +98,7 @@ async function setup(
       hasRuntime: (id) => service?.hasRuntime(id) === true,
       create: (input, row) => service!.create(input, row),
       delete: (name, deleteOpts) => service!.delete(name, deleteOpts),
+      recover: (name) => service!.recover(name),
       projection: (name) => service!.projection(name),
     },
   });
@@ -472,6 +473,88 @@ describe("the runner lane", () => {
       stage: "needs_attention",
       code: "image_unavailable",
     });
+  });
+
+  it("recovers a terminal runtime once by replaying its durable create spec", async () => {
+    let allowSpecRead = true;
+    const h = await harness({
+      spec: () => {
+        if (!allowSpecRead) throw new Error("recovery must not reread gateway defaults");
+        return {
+          image: "ghcr.io/example/cozyagents@sha256:abc",
+          resources: { cpus: 2, memoryMb: 2048 },
+          model: { id: "original", provider: "local", contextWindow: 131_072 },
+        };
+      },
+    });
+    await createRuntimeBot(h);
+    const runner = await fakeRunner(h);
+    await until(() => commands(runner.frames).length === 1);
+    const original = commands(runner.frames)[0]!.payload as unknown as {
+      operationId: string;
+      attachToken: string;
+      [key: string]: unknown;
+    };
+    await receipt(runner.ws, h, original.operationId, "needs_attention", {
+      code: "restart_budget_exhausted",
+    });
+    const originalRow = h.storage.runnerOperation(original.operationId)!;
+    const token = h.storage.runtimeBot("sage")!.token;
+    allowSpecRead = false;
+
+    const [first, replay] = await Promise.all([
+      h.request("/bots/sage/runtime/recover", { method: "POST" }),
+      h.request("/bots/sage/runtime/recover", { method: "POST" }),
+    ]);
+    const accepted = [first, replay].find((response) => response.status === 202);
+    const refused = [first, replay].find((response) => response.status === 409);
+    expect(accepted).toBeDefined();
+    expect(refused).toBeDefined();
+    expect(await refused!.json()).toMatchObject({ error: { code: "conflict" } });
+    const recovered = (await accepted!.json()) as {
+      operationId: string;
+      runtime: BotRuntimeProjection;
+    };
+    expect(recovered.operationId).not.toBe(original.operationId);
+    expect(recovered.runtime).toMatchObject({ stage: "waiting_for_runner", specGeneration: 1 });
+
+    await until(() => commands(runner.frames).length === 2);
+    const replayed = commands(runner.frames)[1]!.payload as unknown as {
+      operationId: string;
+      attachToken: string;
+      [key: string]: unknown;
+    };
+    const replayedRow = h.storage.runnerOperation(recovered.operationId)!;
+    // The operation id and injected attach token are deliberately fresh/live transport fields.
+    // Every durable create field, including the original model ceiling, is replayed exactly.
+    expect(replayedRow).toMatchObject({
+      bot: "sage",
+      kind: "create_runtime",
+      specGeneration: originalRow.specGeneration,
+      payload: originalRow.payload,
+      runnerId: originalRow.runnerId,
+    });
+    expect(replayed).toMatchObject({
+      ...original,
+      operationId: recovered.operationId,
+      attachToken: token,
+    });
+    expect(h.storage.runtimeBot("sage")!.token).toBe(token);
+  });
+
+  it("refuses recovery unless the current operation is terminal needs_attention", async () => {
+    const h = await harness();
+    await createRuntimeBot(h);
+    const runner = await fakeRunner(h);
+    await until(() => commands(runner.frames).length === 1);
+    const operationId = (commands(runner.frames)[0]!.payload as { operationId: string }).operationId;
+
+    expect((await h.request("/bots/sage/runtime/recover", { method: "POST" })).status).toBe(409);
+    await receipt(runner.ws, h, operationId, "stopped");
+    expect((await h.request("/bots/sage/runtime/recover", { method: "POST" })).status).toBe(409);
+    expect((await h.request("/bots/missing/runtime/recover", { method: "POST" })).status).toBe(404);
+    expect((await h.request("/bots/sage", { method: "DELETE" })).status).toBe(200);
+    expect((await h.request("/bots/sage/runtime/recover", { method: "POST" })).status).toBe(404);
   });
 
   it("ignores a receipt for an operation it never issued", async () => {

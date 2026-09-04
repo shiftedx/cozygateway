@@ -736,6 +736,11 @@ export async function startGateway(
         // bot whose turn never settled, and a hole here makes that bot undeletable.
         return runtimeBotService.delete(name, deleteOptions);
       },
+      recover: (name) => {
+        if (runtimeBotService === undefined)
+          throw new Error("the runtime bot service is not assembled yet");
+        return runtimeBotService.recover(name);
+      },
       projection: (name) => {
         if (runtimeBotService === undefined)
           throw new Error("the runtime bot service is not assembled yet");

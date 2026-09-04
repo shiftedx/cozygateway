@@ -7,6 +7,7 @@ import type {
   BotCreateResponse,
   BotDeleteResponse,
   BotRuntimeProjection,
+  BotRuntimeRecoveryResponse,
   BotRuntimeStage,
 } from "cozygateway-contract";
 
@@ -277,6 +278,16 @@ export interface RuntimeBotServiceOptions {
   log?: (line: string) => void;
 }
 
+/** A recovery request that cannot safely name one exact failed runtime operation. It deliberately
+ * carries no runner diagnostic or stored payload: the client only needs to know that it cannot
+ * retry this bot's current state. */
+export class RuntimeBotRecoveryUnavailable extends Error {
+  constructor(bot: string) {
+    super(`runtime recovery is unavailable for bot "${bot}" in its current state`);
+    this.name = "RuntimeBotRecoveryUnavailable";
+  }
+}
+
 /** Capability 49. Creating, deleting, and projecting a Bot this gateway owns outright.
  *
  * The gateway is the lifecycle authority (ADR 0002): it writes the durable row, mints the attach
@@ -440,6 +451,40 @@ export class RuntimeBotService {
         `GET /bots/${canon}/runtime keeps answering until the runner receipts the delete, so the cleanup is watchable`,
       ],
     };
+  }
+
+  /** Reissues one terminal failed create with a new operation id. Recovery is intentionally not a
+   * re-create: identity, credential, runner assignment, generation, and the durable payload all
+   * remain the original operation's. A current `needs_attention` is the only truthful retry point;
+   * provisioning, ready and stopped states must be resolved by their own lifecycle action. */
+  recover(name: string): BotRuntimeRecoveryResponse {
+    const canon = normalizeProfileName(name);
+    const bot = this.#storage.runtimeBot(canon);
+    if (bot === undefined) throw new BotNotFound(canon);
+    const previous = this.#storage.latestRunnerOperationForBot(canon);
+    if (
+      previous === undefined ||
+      previous.kind !== "create_runtime" ||
+      previous.stage !== "needs_attention" ||
+      previous.runnerId !== bot.runnerId ||
+      (bot.runnerId !== null && this.#runnerName(bot.runnerId) === undefined)
+    ) {
+      throw new RuntimeBotRecoveryUnavailable(canon);
+    }
+    const operationId = `op_${randomUUID()}`;
+    const recovered = this.#storage.recoverFailedRuntimeCreate({
+      operationId,
+      sourceOperationId: previous.operationId,
+      bot: canon,
+      at: this.#now(),
+    });
+    // The storage statement also fences concurrent/replayed requests. Do not turn a changed state
+    // into a second recovery command merely because the first requester has not received its 202.
+    if (recovered === undefined) throw new RuntimeBotRecoveryUnavailable(canon);
+    this.#log(`recovered runtime bot ${canon}, operation ${operationId}`);
+    this.#lane?.dispatchPending();
+    this.#rosterChanged(`runtime bot ${canon} recovery requested`);
+    return { operationId, runtime: this.projection(canon) };
   }
 
   /** Where an operation for a bot that names `runnerId` should actually be addressed. A runner this

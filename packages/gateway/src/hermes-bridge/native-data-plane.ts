@@ -7,6 +7,7 @@ import type {
   BotCreateResponse,
   BotDeleteResponse,
   BotRuntimeProjection,
+  BotRuntimeRecoveryResponse,
   BotApprovalPendingFrame,
   BotApprovalResolutionRequestedFrame,
   BotApprovalResolvedFrame,
@@ -81,6 +82,7 @@ export interface RuntimeBotLifecycle {
   hasRuntime(id: string): boolean;
   create(input: BotCreateRequest, row: (id: string) => BotSummary): BotCreateResponse;
   delete(name: string, opts: { force?: boolean }): BotDeleteResponse;
+  recover(name: string): BotRuntimeRecoveryResponse;
   projection(name: string): BotRuntimeProjection;
 }
 
@@ -411,6 +413,7 @@ export class NativeBotDataPlane {
         return this.#runtimeLifecycle.delete(bot, opts ?? {});
       },
       botRuntime: (name) => this.#botRuntime(name),
+      recoverBotRuntime: (name) => this.#recoverBotRuntime(name),
       readiness: (name) => this.#readiness(name),
       commands: (name) => this.#commands(name),
       pendingApprovals: () => this.#pendingApprovals(),
@@ -597,6 +600,20 @@ export class NativeBotDataPlane {
     if (this.#runtimeLifecycle?.hasRuntime(bot) !== true)
       throw new UnsupportedForRuntime(bot, "botRuntime", "cozyagents");
     return this.#runtimeLifecycle.projection(bot);
+  }
+
+  /** Capability 61's exact-bot retry. A config-declared runtime has no operation row this
+   * gateway owns, and a deleted gateway-owned bot must let the service return its ordinary 404;
+   * only a live gateway-owned row may reach the recovery mutation. */
+  #recoverBotRuntime(name: string): BotRuntimeRecoveryResponse {
+    const bot = normalize(name);
+    if (this.#runtimeLifecycle === undefined)
+      throw new UnsupportedForRuntime(bot, "recoverBotRuntime", "cozyagents");
+    if (this.#runtimeLifecycle.owns(bot) || this.#runtimeLifecycle.hasRuntime(bot))
+      return this.#runtimeLifecycle.recover(bot);
+    if (this.#runtimeBots.has(bot))
+      throw new UnsupportedForRuntime(bot, "recoverBotRuntime", "cozyagents");
+    throw new BotNotFound(bot);
   }
 
   /** Capability 50's history surface, with the ONE rule those routes owe a client wrapped around

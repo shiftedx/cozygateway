@@ -32,7 +32,12 @@ import type { RunRoutineSurface } from "./native-data-plane.ts";
 import type { BotMemoryKind } from "cozygateway-contract";
 
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
-import { NoRunnerPaired, RunnerChoiceRequired, RunnerUnknown } from "../runner/runtime-bots.ts";
+import {
+  NoRunnerPaired,
+  RunnerChoiceRequired,
+  RunnerUnknown,
+  RuntimeBotRecoveryUnavailable,
+} from "../runner/runtime-bots.ts";
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
 import { ModelConfigInvalid } from "./model-config.ts";
 import { ProviderSetupInvalid } from "./provider-setup.ts";
@@ -663,6 +668,24 @@ export function registerBotRoutes(
     try {
       return c.json(chat.botRuntime(resolved.name));
     } catch (error) {
+      return failure(c, error);
+    }
+  });
+
+  // Capability 61. A retry is an operator action, not a best-effort resend: the runtime service
+  // accepts it only for the exact current terminal create operation, then sends the fresh durable
+  // operation through the ordinary runner lane. No body means an accidental client replay cannot
+  // redirect the bot, change its spec, or replace its credential.
+  app.post("/bots/:name/runtime/recover", requireDevice, (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    if (typeof chat.recoverBotRuntime !== "function")
+      return c.json(errorBody("not_found", "this gateway serves no runtime recovery"), 404);
+    try {
+      return c.json(chat.recoverBotRuntime(resolved.name), 202);
+    } catch (error) {
+      if (error instanceof RuntimeBotRecoveryUnavailable)
+        return c.json(extensionErrorBody("conflict", error.message), 409);
       return failure(c, error);
     }
   });

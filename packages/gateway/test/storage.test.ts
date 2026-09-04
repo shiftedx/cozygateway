@@ -489,6 +489,51 @@ describe("capability 54 runner placement migration", () => {
   });
 });
 
+describe("runtime operation recovery", () => {
+  it("clones the durable create payload bytes and admits only its current terminal failure", () => {
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-runtime-recovery-"));
+    const path = join(directory, "gateway.sqlite");
+    const storage = openStorage(path);
+    storage.insertRuntimeBot({
+      id: "sage", name: "Sage", avatar: null, token: "token-sage", runtime: "cozyagents",
+      specGeneration: 1, createdAt: 1, runnerId: "runner-1",
+    });
+    storage.enqueueRunnerOperation({
+      operationId: "op_source", bot: "sage", kind: "create_runtime", specGeneration: 1,
+      payload: {}, at: 1, runnerId: "runner-1",
+    });
+    storage.close();
+
+    // The stored payload intentionally has whitespace that JSON.stringify would erase. Recovery
+    // must carry that exact source value forward, not reconstruct a contemporary gateway default.
+    const sourcePayload = '{ "model" : { "id" : "original" }, "resources" : { "cpus" : 2 } }';
+    const raw = new DatabaseSync(path);
+    raw.prepare("UPDATE runner_operations SET payload_json = ?, stage = 'needs_attention' WHERE operation_id = 'op_source'")
+      .run(sourcePayload);
+    raw.close();
+
+    const reopened = openStorage(path);
+    const recovered = reopened.recoverFailedRuntimeCreate({
+      operationId: "op_recovered", sourceOperationId: "op_source", bot: "sage", at: 2,
+    });
+    expect(recovered).toMatchObject({
+      operationId: "op_recovered", specGeneration: 1, runnerId: "runner-1",
+      payload: { model: { id: "original" }, resources: { cpus: 2 } },
+    });
+    expect(reopened.recoverFailedRuntimeCreate({
+      operationId: "op_duplicate", sourceOperationId: "op_source", bot: "sage", at: 3,
+    })).toBeUndefined();
+    reopened.close();
+
+    const verified = new DatabaseSync(path, { readOnly: true });
+    const copied = verified.prepare("SELECT payload_json FROM runner_operations WHERE operation_id = 'op_recovered'")
+      .get() as { payload_json: string };
+    expect(copied.payload_json).toBe(sourcePayload);
+    verified.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+});
+
 describe("capability 55 runner display-name migration", () => {
   it("adds the display_name column to a pre-55 runners table, reads existing rows unrenamed, and reopens cleanly", () => {
     const directory = mkdtempSync(join(tmpdir(), "cozygateway-runner-display-name-migration-"));

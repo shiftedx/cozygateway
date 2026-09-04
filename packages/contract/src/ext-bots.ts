@@ -229,6 +229,15 @@ export const BotRuntimeProjectionSchema = Type.Object({
 }, { additionalProperties: false });
 export type BotRuntimeProjection = Static<typeof BotRuntimeProjectionSchema>;
 
+/** Capability 61: `POST /bots/:name/runtime/recover`. The only mutable fact is the fresh
+ * operation id; `runtime` is the immediately-readable projection of that accepted operation.
+ * No credential, runner payload, or diagnostic text crosses this operator surface. */
+export const BotRuntimeRecoveryResponseSchema = Type.Object({
+  operationId: Type.String({ minLength: 4, maxLength: 128 }),
+  runtime: BotRuntimeProjectionSchema,
+}, { additionalProperties: false });
+export type BotRuntimeRecoveryResponse = Static<typeof BotRuntimeRecoveryResponseSchema>;
+
 /** Gateway-owned attach-v1 Bot Mode sessions are conversations. */
 export const BotSessionKindSchema = Type.Literal("conversation");
 export type BotSessionKind = Static<typeof BotSessionKindSchema>;
@@ -2541,4 +2550,12 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  *
  * Additive: all read fields and the patch field are optional. Peers and clients below 59 retain
  * their prior shape, and clients gate catalogue-only rows and the enable write on `>= 59`. */
-export const BOTS_CAPABILITY_VERSION = 60;
+/** Capability 61: EXACT RUNTIME RECOVERY. `POST /bots/:name/runtime/recover` accepts one fresh
+ * `create_runtime` operation only when the gateway-owned bot's current operation is terminal
+ * `needs_attention`. It returns `202 {operationId, runtime}` and replays the stored operation
+ * payload, generation, runner assignment, and attach identity; only `operationId` changes.
+ * Replaying the POST is bounded: once accepted, the new waiting operation is current and the next
+ * request is `409 conflict` until a runner returns terminal `needs_attention` again. A deleted,
+ * stopped, provisioning, ready, wrong-runner, or config-declared runtime is never a recovery
+ * target. Clients that offer the action gate it on `>= 61`. */
+export const BOTS_CAPABILITY_VERSION = 61;

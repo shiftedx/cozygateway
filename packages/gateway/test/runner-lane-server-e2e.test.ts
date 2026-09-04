@@ -155,4 +155,42 @@ describe("capability 49 through the assembled gateway", () => {
     const ready = (await (await l.authed("/bots/sage/runtime")).json()) as BotRuntimeProjection;
     expect(ready).toMatchObject({ stage: "ready", specGeneration: 1, observedGeneration: 1 });
   });
+
+  it("accepts one authenticated exact recovery through the assembled control plane", async () => {
+    const l = await live();
+    await createSage(l);
+    const ws = new WebSocket(`${l.gateway.url.replace("http", "ws")}/runner/v1`, {
+      headers: { authorization: `Bearer ${RUNNER_TOKEN}` },
+    });
+    sockets.push(ws);
+    const frames: Array<{ kind: string; command?: string; payload?: { botId: string; operationId: string; attachToken: string } }> = [];
+    ws.on("message", (data) => frames.push(JSON.parse(String(data)) as (typeof frames)[number]));
+    await once(ws, "open");
+    ws.send(JSON.stringify({ kind: "hello", version: 1, runnerId: "e2e", backends: ["process"] }));
+    await until(() => frames.some((frame) => frame.command === "create_runtime"));
+    const first = frames.find((frame) => frame.command === "create_runtime")!.payload!;
+    ws.send(JSON.stringify({
+      kind: "receipt",
+      operationId: first.operationId,
+      botId: "sage",
+      specGeneration: 1,
+      stage: "needs_attention",
+      code: "restart_budget_exhausted",
+      at: Date.now(),
+    }));
+    await until(() => l.gateway.storage.runnerOperation(first.operationId)?.stage === "needs_attention");
+
+    const recovered = await l.authed("/bots/sage/runtime/recover", { method: "POST" });
+    expect(recovered.status).toBe(202);
+    const body = (await recovered.json()) as { operationId: string; runtime: BotRuntimeProjection };
+    expect(body).toMatchObject({ runtime: { stage: "waiting_for_runner", specGeneration: 1 } });
+    await until(() => frames.filter((frame) => frame.command === "create_runtime").length === 2);
+    const second = frames.filter((frame) => frame.command === "create_runtime")[1]!.payload!;
+    expect(second).toMatchObject({
+      botId: "sage",
+      operationId: body.operationId,
+      attachToken: first.attachToken,
+    });
+    expect(second.operationId).not.toBe(first.operationId);
+  });
 });

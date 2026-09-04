@@ -4202,6 +4202,42 @@ export class Storage {
     )[0];
   }
 
+  /** Reopens exactly the current terminal create operation for a gateway-owned runtime bot.
+   *
+   * The INSERT reads `payload_json` directly from the prior row rather than round-tripping its
+   * parsed object through a caller. That keeps the original durable spec byte-for-byte intact and
+   * makes `operationId` the only new command identity. The `latest` predicate is the idempotency
+   * fence: once one caller inserts its fresh row, a replay (or a concurrent caller) affects zero
+   * rows because the source is no longer this bot's current operation. */
+  recoverFailedRuntimeCreate(input: {
+    operationId: string;
+    sourceOperationId: string;
+    bot: string;
+    at: number;
+  }): RunnerOperationRow | undefined {
+    const result = this.#db
+      .prepare(
+        `INSERT INTO runner_operations
+           (operation_id, bot, kind, spec_generation, payload_json, stage, created_at, updated_at, runner_id)
+         SELECT ?, bot, kind, spec_generation, payload_json, 'waiting_for_runner', ?, ?, runner_id
+         FROM runner_operations
+         WHERE operation_id = ? AND bot = ? AND kind = 'create_runtime' AND stage = 'needs_attention'
+           AND operation_id = (
+             SELECT operation_id FROM runner_operations
+             WHERE bot = ? ORDER BY created_at DESC, rowid DESC LIMIT 1
+           )`,
+      )
+      .run(
+        input.operationId,
+        input.at,
+        input.at,
+        input.sourceOperationId,
+        input.bot,
+        input.bot,
+      );
+    return result.changes === 1 ? this.runnerOperation(input.operationId) : undefined;
+  }
+
   markRunnerOperationSent(operationId: string, at: number): void {
     this.#db
       .prepare("UPDATE runner_operations SET sent_at = ?, updated_at = ? WHERE operation_id = ?")

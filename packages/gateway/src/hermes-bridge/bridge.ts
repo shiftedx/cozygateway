@@ -24,6 +24,7 @@ import type {
   BotProfilePatch,
   BotReadiness,
   BotRuntimeProjection,
+  BotRuntimeRecoveryResponse,
   BotRoutine,
   BotRoutineCreateRequest,
   BotRoutinePatch,
@@ -280,6 +281,10 @@ export interface BotsSurface extends BotControlSurface {
    * gateway with no runner lane has no runtime to project and the route is then not registered at
    * all, which is the honest answer rather than a stage invented from nothing. */
   botRuntime?(name: string): BotRuntimeProjection;
+  /** Capability 61: accept one exact retry for the current terminal runtime operation. Optional
+   * for the same assembly reason as `botRuntime`: a gateway without lifecycle ownership cannot
+   * honestly expose a recovery control. */
+  recoverBotRuntime?(name: string): BotRuntimeRecoveryResponse;
   commands(name: string): readonly BotSlashCommand[];
   /** Capability 27: current durable approvals only; terminal records stay private to lifecycle
    * settlement and never appear in the user's decision inbox. */

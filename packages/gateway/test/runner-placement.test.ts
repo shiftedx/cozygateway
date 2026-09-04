@@ -106,6 +106,7 @@ async function harness(opts: { legacyToken?: string; placement?: boolean } = {})
       hasRuntime: (id) => service?.hasRuntime(id) === true,
       create: (input, row) => service!.create(input, row),
       delete: (name, deleteOpts) => service!.delete(name, deleteOpts),
+      recover: (name) => service!.recover(name),
       projection: (name) => service!.projection(name),
     },
   });
@@ -431,6 +432,31 @@ describe("a revoked computer", () => {
     const runner = await connect(h, survivor.token, survivor.runner.id);
     await until(() => commands(runner).length === 1);
     expect(commands(runner)[0]).toMatchObject({ command: "delete_runtime", payload: { botId: "sage" } });
+  });
+
+  it("refuses recovery when the exact runner assignment is no longer safe", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "gone" });
+    const runner = await connect(h, paired.token, paired.runner.id);
+    expect((await create(h, { name: "sage" })).status).toBe(201);
+    await until(() => commands(runner).length === 1);
+    const operationId = commands(runner)[0]!.payload.operationId;
+    runner.ws.send(JSON.stringify({
+      kind: "receipt",
+      operationId,
+      botId: "sage",
+      specGeneration: 1,
+      stage: "needs_attention",
+      code: "restart_budget_exhausted",
+      at: NOW + 1,
+    }));
+    await until(() => h.storage.runnerOperation(operationId)?.stage === "needs_attention");
+    h.roster.remove(paired.runner.id);
+
+    const refused = await h.request("/bots/sage/runtime/recover", { method: "POST" });
+    expect(refused.status).toBe(409);
+    expect((await refused.json())).toMatchObject({ error: { code: "conflict" } });
+    expect(h.storage.latestRunnerOperationForBot("sage")?.operationId).toBe(operationId);
   });
 });
 
