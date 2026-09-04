@@ -6,7 +6,7 @@ function Write-Info { param([string] $Message) }
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $Installer), [ref] $tokens, [ref] $errors)
 if ($errors.Count) { throw ($errors | Out-String) }
-$needed = @('Assert-BootstrapPath', 'Recover-BootstrapTransaction', 'Finish-BootstrapRecovery', 'Start-BootstrapTransaction', 'Commit-BootstrapTransaction')
+$needed = @('Assert-BootstrapPath', 'Recover-BootstrapTransaction', 'Finish-BootstrapRecovery', 'Start-BootstrapTransaction', 'Commit-BootstrapTransaction', 'Get-GatewayTaskExec', 'Test-OwnedGatewayTask')
 foreach ($name in $needed) {
   $fn = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true) | Select-Object -First 1
   Assert-True ($null -ne $fn) "installer must define $name"
@@ -16,6 +16,15 @@ $script:BootstrapLockPath = $null
 $root = Join-Path ([IO.Path]::GetTempPath()) ('cozygateway-transaction-' + [guid]::NewGuid().ToString('N'))
 try {
   $bin = Join-Path $root bin; New-Item -ItemType Directory -Force -Path $bin | Out-Null
+  $node = [IO.Path]::GetFullPath((Join-Path $root 'runtime\node\node.exe'))
+  $supervisor = [IO.Path]::GetFullPath((Join-Path $root 'local\gateway-supervisor.cjs'))
+  $bundle = [IO.Path]::GetFullPath((Join-Path $root 'bin\cozygateway.mjs'))
+  $gatewayEnv = Join-Path $root 'local\gateway.env'; $config = Join-Path $root 'local\cozygateway.config.json'; $worker = Join-Path $root 'local\maintenance-worker.cjs'; $database = Join-Path $root 'local\cozygateway.sqlite'
+  $taskArgs = @($supervisor, '--platform', 'Windows', '--gateway-env', $gatewayEnv, '--bundle', $bundle, '--config', $config, '--maintenance-socket', '\\.\pipe\cozygateway-maintenance', '--maintenance-worker', $worker, '--database', $database) | ForEach-Object { '"' + $_ + '"' }
+  $taskXml = '<Task><Actions><Exec><Command>' + $node + '</Command><Arguments>' + ($taskArgs -join ' ') + '</Arguments></Exec></Actions></Task>'
+  Assert-True (Test-OwnedGatewayTask $root $taskXml) 'a single exact Gateway task must be accepted for recovery'
+  $foreignTaskXml = $taskXml.Replace($bundle, (Join-Path $root 'foreign.mjs'))
+  Assert-True (-not (Test-OwnedGatewayTask $root $foreignTaskXml)) 'a task whose bundle escapes the Gateway home must be refused'
   $assets = @('cozygateway.mjs')
   [IO.File]::WriteAllText((Join-Path $bin 'cozygateway.mjs'), 'old')
   [IO.File]::WriteAllText((Join-Path $bin 'cozygateway.mjs.sha256'), 'old-sha')
