@@ -103,8 +103,8 @@ function Promote-VerifiedAsset {
 }
 
 function Acquire-BootstrapLock {
-    param([string] $Home)
-    $script:BootstrapLockPath = Join-Path $Home '.bootstrap-lock'
+    param([string] $InstallRoot)
+    $script:BootstrapLockPath = Join-Path $InstallRoot '.bootstrap-lock'
     try {
         New-Item -ItemType Directory -Path $script:BootstrapLockPath -ErrorAction Stop | Out-Null
     } catch {
@@ -131,11 +131,11 @@ function Release-BootstrapLock {
 }
 
 function Recover-BootstrapTransaction {
-    param([string] $Home, [string] $Bin, [string[]] $Assets)
-    $journal = Join-Path $Home '.bootstrap-transaction'; $backup = Join-Path $Home '.bootstrap-previous'
+    param([string] $InstallRoot, [string] $Bin, [string[]] $Assets)
+    $journal = Join-Path $InstallRoot '.bootstrap-transaction'; $backup = Join-Path $InstallRoot '.bootstrap-previous'
     if (-not (Test-Path -LiteralPath $journal -PathType Leaf)) { if (Test-Path -LiteralPath $backup) { if (@(Get-ChildItem -LiteralPath $backup -Force).Count -ne 0) { Fail 'bootstrap rollback directory exists without a transaction marker; preserve it and rerun the verified installer' }; Remove-Item -LiteralPath $backup -Force }; return }
     $state = (Get-Content -LiteralPath $journal -Raw).Trim()
-    if ($state -eq 'commit=installer-succeeded') { if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }; Remove-Item -LiteralPath $journal -Force; return }
+    if ($state -eq 'commit=installer-succeeded' -or $state -eq 'restored=previous-release') { if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }; Remove-Item -LiteralPath $journal -Force; return }
     if ($state -eq 'prepare=replace-release-assets') { Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $journal -Force; return }
     if ($state -ne 'intent=replace-release-assets') { Fail 'bootstrap transaction marker is invalid; preserve it and rerun the verified installer' }
     $inventory = Join-Path $backup 'inventory'; if (-not (Test-Path -LiteralPath $inventory -PathType Leaf)) { Fail 'bootstrap transaction inventory is missing; preserve it and rerun the verified installer' }
@@ -147,19 +147,27 @@ function Recover-BootstrapTransaction {
     }
     return $true
 }
-function Finish-BootstrapRecovery { param([string] $Home) Remove-Item -LiteralPath (Join-Path $Home '.bootstrap-previous') -Recurse -Force -ErrorAction Stop; Remove-Item -LiteralPath (Join-Path $Home '.bootstrap-transaction') -Force -ErrorAction Stop }
+function Finish-BootstrapRecovery {
+    param([string] $InstallRoot)
+    $journal = Join-Path $InstallRoot '.bootstrap-transaction'
+    $next = "$journal.next"
+    Set-Content -LiteralPath $next -Value 'restored=previous-release' -NoNewline -Encoding ascii -ErrorAction Stop
+    Move-Item -LiteralPath $next -Destination $journal -Force -ErrorAction Stop
+    Remove-Item -LiteralPath (Join-Path $InstallRoot '.bootstrap-previous') -Recurse -Force -ErrorAction Stop
+    Remove-Item -LiteralPath $journal -Force -ErrorAction Stop
+}
 function Start-BootstrapTransaction {
-    param([string] $Home, [string] $Bin, [string[]] $Assets)
-    $journal=Join-Path $Home '.bootstrap-transaction'; $backup=Join-Path $Home '.bootstrap-previous'
+    param([string] $InstallRoot, [string] $Bin, [string[]] $Assets)
+    $journal=Join-Path $InstallRoot '.bootstrap-transaction'; $backup=Join-Path $InstallRoot '.bootstrap-previous'
     if ((Test-Path -LiteralPath $journal) -or (Test-Path -LiteralPath $backup)) { Fail 'bootstrap recovery state already exists; rerun this installer to recover it' }
     New-Item -ItemType Directory -Path $backup -ErrorAction Stop | Out-Null; Set-Content -LiteralPath $journal -Value 'prepare=replace-release-assets' -NoNewline -Encoding ascii
     foreach ($asset in $Assets) { foreach ($name in @($asset,"$asset.sha256")) { $live=Join-Path $Bin $name; if (Test-Path -LiteralPath $live -PathType Leaf) { Add-Content -LiteralPath (Join-Path $backup 'inventory') -Value "present:$name" -Encoding ascii; Copy-Item -LiteralPath $live -Destination (Join-Path $backup $name) -Force } else { Add-Content -LiteralPath (Join-Path $backup 'inventory') -Value "absent:$name" -Encoding ascii } } }
     $next="$journal.next"; Set-Content -LiteralPath $next -Value 'intent=replace-release-assets' -NoNewline -Encoding ascii; Move-Item -LiteralPath $next -Destination $journal -Force
 }
 function Commit-BootstrapTransaction {
-    param([string] $Home)
-    $journal = Join-Path $Home '.bootstrap-transaction'
-    $backup = Join-Path $Home '.bootstrap-previous'
+    param([string] $InstallRoot)
+    $journal = Join-Path $InstallRoot '.bootstrap-transaction'
+    $backup = Join-Path $InstallRoot '.bootstrap-previous'
     $staged = "$journal.commit.$PID"
     Set-Content -LiteralPath $staged -Value 'commit=installer-succeeded' -NoNewline -Encoding ascii -ErrorAction Stop
     Move-Item -LiteralPath $staged -Destination $journal -Force -ErrorAction Stop
@@ -168,8 +176,8 @@ function Commit-BootstrapTransaction {
 }
 
 function Save-ExplicitBootstrapSource {
-    param([string] $Home, [string] $Base)
-    $source = Join-Path $Home 'local\bootstrap-source'
+    param([string] $InstallRoot, [string] $Base)
+    $source = Join-Path $InstallRoot 'local\bootstrap-source'
     if ([string]::IsNullOrWhiteSpace($Base)) { Remove-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue; return }
     if ($Base -notmatch '^file:///.+') { return }
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $source) | Out-Null
@@ -179,26 +187,26 @@ function Save-ExplicitBootstrapSource {
 }
 
 function Invoke-TransactionalRelease {
-    param([string] $Home, [string] $Bin, [string] $Stage, [string[]] $Assets, [scriptblock] $Install, [scriptblock] $Restore)
-    Start-BootstrapTransaction $Home $Bin $Assets
+    param([string] $InstallRoot, [string] $Bin, [string] $Stage, [string[]] $Assets, [scriptblock] $Install, [scriptblock] $Restore)
+    Start-BootstrapTransaction $InstallRoot $Bin $Assets
     try {
         foreach ($asset in $Assets) {
             Promote-VerifiedAsset $asset $Stage $Bin
             if ($env:COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION -eq $asset) { Stop-Process -Id $PID -Force }
         }
         & $Install
-        Commit-BootstrapTransaction $Home
+        Commit-BootstrapTransaction $InstallRoot
     } catch {
         $failure = $_
-        $journal = Join-Path $Home '.bootstrap-transaction'
+        $journal = Join-Path $InstallRoot '.bootstrap-transaction'
         $committed = (Test-Path -LiteralPath $journal -PathType Leaf) -and ((Get-Content -LiteralPath $journal -Raw).Trim() -eq 'commit=installer-succeeded')
         if (-not $committed) {
             $restored = $false
             try {
-                $recovered = Recover-BootstrapTransaction $Home $Bin $Assets
+                $recovered = Recover-BootstrapTransaction $InstallRoot $Bin $Assets
                 $restored = $true
                 & $Restore
-                if ($recovered) { Finish-BootstrapRecovery $Home }
+                if ($recovered) { Finish-BootstrapRecovery $InstallRoot }
                 Write-Ok 'restarted the previous CozyGateway service after the failed update'
             } catch {
                 if ($restored) { Write-Warning 'previous release assets were restored, but its service restart failed; rerun CozyGateway repair after resolving that error' }
