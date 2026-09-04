@@ -31,7 +31,7 @@ require('node:child_process').spawn = () => {
 `);
 
   await expect(execFileAsync(process.execPath, [
-    resolve("scripts/gateway-supervisor.cjs"),
+    resolve("../..", "scripts/gateway-supervisor.cjs"),
     "--platform", "Windows",
     "--gateway-env", gatewayEnv,
     "--bundle", join(directory, "bundle.mjs"),
