@@ -4194,10 +4194,12 @@ export class Storage {
     )[0];
   }
 
-  /** The operation whose stage a bot's runtime projection reports: the newest one accepted. */
+  /** The operation whose stage a bot's runtime projection reports: the most recently accepted
+   * row. `rowid` is the durable acceptance order; wall-clock values are display/audit facts and
+   * may move backwards after a host clock correction. */
   latestRunnerOperationForBot(bot: string): RunnerOperationRow | undefined {
     return this.#runnerOperations(
-      "SELECT * FROM runner_operations WHERE bot = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      "SELECT * FROM runner_operations WHERE bot = ? ORDER BY rowid DESC LIMIT 1",
       bot,
     )[0];
   }
@@ -4224,7 +4226,7 @@ export class Storage {
          WHERE operation_id = ? AND bot = ? AND kind = 'create_runtime' AND stage = 'needs_attention'
            AND operation_id = (
              SELECT operation_id FROM runner_operations
-             WHERE bot = ? ORDER BY created_at DESC, rowid DESC LIMIT 1
+             WHERE bot = ? ORDER BY rowid DESC LIMIT 1
            )`,
       )
       .run(

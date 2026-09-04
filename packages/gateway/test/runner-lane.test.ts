@@ -501,22 +501,21 @@ describe("the runner lane", () => {
     const originalRow = h.storage.runnerOperation(original.operationId)!;
     const token = h.storage.runtimeBot("sage")!.token;
     allowSpecRead = false;
+    // Wall clocks can move backwards after NTP/VM correction. The accepted retry is newer because
+    // it was inserted later, even though its recorded time is deliberately older than the source.
+    h.advance(-10_000);
 
-    const [first, replay] = await Promise.all([
-      h.request("/bots/sage/runtime/recover", { method: "POST" }),
-      h.request("/bots/sage/runtime/recover", { method: "POST" }),
-    ]);
-    const accepted = [first, replay].find((response) => response.status === 202);
-    const refused = [first, replay].find((response) => response.status === 409);
-    expect(accepted).toBeDefined();
-    expect(refused).toBeDefined();
-    expect(await refused!.json()).toMatchObject({ error: { code: "conflict" } });
-    const recovered = (await accepted!.json()) as {
+    const accepted = await h.request("/bots/sage/runtime/recover", { method: "POST" });
+    expect(accepted.status).toBe(202);
+    const recovered = (await accepted.json()) as {
       operationId: string;
       runtime: BotRuntimeProjection;
     };
     expect(recovered.operationId).not.toBe(original.operationId);
     expect(recovered.runtime).toMatchObject({ stage: "waiting_for_runner", specGeneration: 1 });
+    const refused = await h.request("/bots/sage/runtime/recover", { method: "POST" });
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toMatchObject({ error: { code: "conflict" } });
 
     await until(() => commands(runner.frames).length === 2);
     const replayed = commands(runner.frames)[1]!.payload as unknown as {
@@ -525,6 +524,8 @@ describe("the runner lane", () => {
       [key: string]: unknown;
     };
     const replayedRow = h.storage.runnerOperation(recovered.operationId)!;
+    expect(replayedRow.createdAt).toBeLessThan(originalRow.createdAt);
+    expect(h.storage.latestRunnerOperationForBot("sage")?.operationId).toBe(recovered.operationId);
     // The operation id and injected attach token are deliberately fresh/live transport fields.
     // Every durable create field, including the original model ceiling, is replayed exactly.
     expect(replayedRow).toMatchObject({
