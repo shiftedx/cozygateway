@@ -281,6 +281,7 @@ printf '%s  cozygateway-installer.sh\n' "$asset_sha" > "$tmp/release-assets/cozy
 COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff" bash "$repo_root/scripts/install.sh"
 test -x "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh"
 test -f "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh.sha256"
+test "$(cat "$tmp/bootstrap-live-home/local/bootstrap-source")" = "$release_asset_base"
 grep -Fq -- '--gateway-dir' "$tmp/bootstrap-handoff"
 test -z "$(find "$tmp/bootstrap-live-home" -maxdepth 1 -name '.bootstrap.*' -print -quit)"
 case "$(uname -s)" in
@@ -330,6 +331,54 @@ else
   test "$before_bootstrap_sha" = "$(sha256sum "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"
 fi
 test ! -e "$tmp/bootstrap-handoff-late"
+cp "$repo_root/scripts/install.sh" "$tmp/release-assets/install.sh"
+if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/install.sh" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/install.sh" | awk '{print $1}')"; fi
+printf '%s  install.sh\n' "$asset_sha" > "$tmp/release-assets/install.sh.sha256"
+
+# Promotion is a journaled transaction. A hard kill after the first replacement
+# leaves a durable snapshot; the next one-line run restores it before fetching,
+# then installs one coherent new release rather than a mixed asset set.
+cp "$tmp/bootstrap-live-home/bin/cozygateway.mjs" "$tmp/bootstrap-before-kill.mjs"
+printf 'new verified bundle after interrupted bootstrap\n' > "$tmp/release-assets/cozygateway.mjs"
+if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/cozygateway.mjs" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/cozygateway.mjs" | awk '{print $1}')"; fi
+printf '%s  cozygateway.mjs\n' "$asset_sha" > "$tmp/release-assets/cozygateway.mjs.sha256"
+set +e
+COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-killed" COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION=cozygateway.mjs bash "$repo_root/scripts/install.sh" >"$tmp/bootstrap-killed.log" 2>&1
+bootstrap_killed_status=$?
+set -e
+test "$bootstrap_killed_status" -ne 0
+test -f "$tmp/bootstrap-live-home/.bootstrap-transaction"
+cmp -s "$tmp/bootstrap-before-kill.mjs" "$tmp/bootstrap-live-home/.bootstrap-previous/cozygateway.mjs"
+set +e
+bootstrap_recovered_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-recovered" bash "$repo_root/scripts/install.sh" 2>&1)"
+bootstrap_recovered_status=$?
+set -e
+if [ "$bootstrap_recovered_status" -ne 0 ]; then printf '%s\n' "$bootstrap_recovered_output" >&2; exit 1; fi
+expect_contains "$bootstrap_recovered_output" 'recovering an interrupted CozyGateway bootstrap'
+cmp -s "$tmp/release-assets/cozygateway.mjs" "$tmp/bootstrap-live-home/bin/cozygateway.mjs"
+test ! -e "$tmp/bootstrap-live-home/.bootstrap-transaction"
+test ! -e "$tmp/bootstrap-live-home/.bootstrap-previous"
+
+# A child installer failure returns the complete prior payload instead of
+# leaving a freshly downloaded bootstrap that no matching service can run.
+cp "$tmp/bootstrap-live-home/bin/cozygateway.mjs" "$tmp/bootstrap-before-child-failure.mjs"
+cat > "$tmp/release-assets/cozygateway-installer.sh" <<'BOOTSTRAP_FAILURE'
+#!/usr/bin/env bash
+exit 23
+BOOTSTRAP_FAILURE
+chmod 700 "$tmp/release-assets/cozygateway-installer.sh"
+if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/cozygateway-installer.sh" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/cozygateway-installer.sh" | awk '{print $1}')"; fi
+printf '%s  cozygateway-installer.sh\n' "$asset_sha" > "$tmp/release-assets/cozygateway-installer.sh.sha256"
+if child_failure_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-rolled-back" bash "$repo_root/scripts/install.sh" 2>&1)"; then
+  echo 'failed child installer must roll back the release assets' >&2
+  exit 1
+fi
+expect_contains "$child_failure_output" 'installer failed; restored the previous CozyGateway release'
+expect_contains "$child_failure_output" 'restarted the previous CozyGateway service after the failed update'
+cmp -s "$tmp/bootstrap-before-child-failure.mjs" "$tmp/bootstrap-live-home/bin/cozygateway.mjs"
+grep -Fq -- '--gateway-dir' "$tmp/bootstrap-handoff-rolled-back"
+test ! -e "$tmp/bootstrap-live-home/.bootstrap-transaction"
+test ! -e "$tmp/bootstrap-live-home/.bootstrap-previous"
 
 # An ordinary rerun retains its recorded scope; an explicit `--profiles all`
 # remains the deliberate way to widen it.
@@ -771,10 +820,14 @@ fi
 expect_contains "$missing_repair_output" 'curl -fsSL https://cozylabs.ai/install.sh | bash'
 
 # The installed command routes both spellings through the persisted, checksummed
-# bootstrap and keeps the installer's default dynamic all-profile scope.
+# bootstrap and keeps the installer's default dynamic all-profile scope. A successful
+# explicit file release is retained for repair so an unpublished local build cannot
+# silently downgrade to the current public release.
+mkdir -p "$tmp/gateway-live/local"
+printf 'file://%s\n' "$tmp/verified-local-release" > "$tmp/gateway-live/local/bootstrap-source"
 cat > "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" <<'REPAIR_BOOTSTRAP'
 #!/usr/bin/env bash
-printf '%s\n' "$COZYGATEWAY_HOME:$*" >> "${COZYGATEWAY_TEST_REPAIR_LOG:?}"
+printf '%s\n' "$COZYGATEWAY_HOME:$COZYGATEWAY_INSTALL_ASSET_BASE:$*" >> "${COZYGATEWAY_TEST_REPAIR_LOG:?}"
 REPAIR_BOOTSTRAP
 chmod 700 "$tmp/gateway-live/bin/cozygateway-bootstrap.sh"
 if command -v shasum >/dev/null 2>&1; then repair_sha="$(shasum -a 256 "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; else repair_sha="$(sha256sum "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; fi
@@ -789,7 +842,7 @@ if [ "$repair_count" != 2 ]; then
   cat "$tmp/repair.log" >&2
   exit 1
 fi
-grep -Fq "$tmp/gateway-live:--profiles $expected_profiles" "$tmp/repair.log"
+grep -Fq "$tmp/gateway-live:file://$tmp/verified-local-release:--profiles $expected_profiles" "$tmp/repair.log"
 printf '# tampered\n' >> "$tmp/gateway-live/bin/cozygateway-bootstrap.sh"
 if checksum_repair_output="$(COZYGATEWAY_TEST_REPAIR_LOG="$tmp/repair.log" "$tmp/gateway-live/bin/cozygateway" repair 2>&1)"; then
   echo 'a tampered repair bootstrap must fail checksum validation' >&2
@@ -799,7 +852,7 @@ expect_contains "$checksum_repair_output" 'repair bootstrap checksum mismatch'
 test "$(wc -l < "$tmp/repair.log" | tr -d ' ')" = 2
 cat > "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" <<'REPAIR_BOOTSTRAP'
 #!/usr/bin/env bash
-printf '%s\n' "$COZYGATEWAY_HOME:$*" >> "${COZYGATEWAY_TEST_REPAIR_LOG:?}"
+printf '%s\n' "$COZYGATEWAY_HOME:$COZYGATEWAY_INSTALL_ASSET_BASE:$*" >> "${COZYGATEWAY_TEST_REPAIR_LOG:?}"
 REPAIR_BOOTSTRAP
 chmod 700 "$tmp/gateway-live/bin/cozygateway-bootstrap.sh"
 if command -v shasum >/dev/null 2>&1; then repair_sha="$(shasum -a 256 "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; else repair_sha="$(sha256sum "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; fi

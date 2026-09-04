@@ -1103,16 +1103,22 @@ if [ "\${1:-}" = repair ] || [ "\${1:-}" = update ]; then
   bootstrap=$(printf %q "$POSIX_BOOTSTRAP")
   checksum="\$bootstrap.sha256"
   state=$(printf %q "$STATE_FILE")
+  source_file=$(printf %q "$LOCAL_DIR/bootstrap-source")
   reinstall='curl -fsSL https://cozylabs.ai/install.sh | bash'
   [ -f "\$bootstrap" ] && [ -f "\$checksum" ] || { printf 'FAIL  repair bootstrap is unavailable. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
   [ -r "\$state" ] || { printf 'FAIL  repair metadata is unavailable. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
   expected="\$(awk '{print \$1}' "\$checksum")"
   if command -v shasum >/dev/null 2>&1; then actual="\$(shasum -a 256 "\$bootstrap" | awk '{print \$1}')"; elif command -v sha256sum >/dev/null 2>&1; then actual="\$(sha256sum "\$bootstrap" | awk '{print \$1}')"; else printf 'FAIL  repair needs shasum or sha256sum. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; fi
   [ -n "\$expected" ] && [ "\$expected" = "\$actual" ] || { printf 'FAIL  repair bootstrap checksum mismatch. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
+  asset_base=""
+  if [ -f "\$source_file" ]; then
+    asset_base="\$(cat "\$source_file")"
+    case "\$asset_base" in file:///*) ;; *) printf 'FAIL  recorded repair source is invalid. Reinstall with: %s\n' "\$reinstall" >&2; exit 1 ;; esac
+  fi
   harness="\$(sed -n 's/^harness=//p' "\$state" | tail -1)"
   if [ "\$harness" = cozyagents ]; then
     printf 'INFO  repair refreshes verified runtime assets, then restarts CozyGateway\n'
-    exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") bash "\$bootstrap" --harness cozyagents
+    exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") COZYGATEWAY_INSTALL_ASSET_BASE="\$asset_base" bash "\$bootstrap" --harness cozyagents
   fi
   profiles="\$(sed -n 's/^profiles=//p' "\$state" | tail -1)"
   profile_scope="\$(sed -n 's/^profile_scope=//p' "\$state" | tail -1)"
@@ -1122,7 +1128,7 @@ if [ "\${1:-}" = repair ] || [ "\${1:-}" = update ]; then
     [[ "\$profiles" =~ ^(default|[A-Za-z0-9][A-Za-z0-9._-]{0,63})(,(default|[A-Za-z0-9][A-Za-z0-9._-]{0,63}))*\$ ]] || { printf 'FAIL  repair metadata is unavailable. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
   fi
   printf 'INFO  repair refreshes verified runtime and plugin assets, then restarts CozyGateway and Hermes attachment\n'
-  exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") bash "\$bootstrap" --profiles "\$profiles"
+  exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") COZYGATEWAY_INSTALL_ASSET_BASE="\$asset_base" bash "\$bootstrap" --profiles "\$profiles"
 fi
 cd $(printf %q "$LOCAL_DIR")
 exec $(printf %q "$NODE_RESOLVED") $(printf %q "$BUNDLE_PATH") "\$@"
