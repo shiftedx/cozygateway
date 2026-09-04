@@ -263,7 +263,9 @@ try {
         Set-Content -LiteralPath (Join-Path $backup 'inventory') -Value @('version=2', 'present:../outside') -Encoding ascii
     }
     Assert-RecoveryRefusesBeforeAssetMutation 'incomplete' {
-        Get-Content -LiteralPath (Join-Path $backup 'inventory') | Where-Object { $_ -notmatch '^state:' } | Set-Content -LiteralPath (Join-Path $backup 'inventory') -Encoding ascii
+        $inventoryPath = Join-Path $backup 'inventory'
+        $incompleteInventory = @(Get-Content -LiteralPath $inventoryPath | Where-Object { $_ -notmatch '^state:' })
+        Set-Content -LiteralPath $inventoryPath -Value $incompleteInventory -Encoding ascii
     }
     Assert-RecoveryRefusesBeforeAssetMutation 'duplicate' {
         $inventoryPath = Join-Path $backup 'inventory'
