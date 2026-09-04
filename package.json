@@ -12,7 +12,7 @@
     "test": "pnpm -r test",
     "build": "pnpm -r build",
     "bundle": "node scripts/build-bundle.mjs",
-    "test:installer": "bash scripts/test/bootstrap-transaction.test.sh && bash scripts/test/attach-health-diagnosis.test.sh && bash scripts/test/hermes-installer.test.sh && bash scripts/test/harness-choice.test.sh && bash scripts/test/bot-provisioner-installer.test.sh && bash scripts/test/plugin-rollout.test.sh",
+    "test:installer": "bash scripts/test/bootstrap-transaction.test.sh && bash scripts/test/bootstrap-runtime-rollback.test.sh && bash scripts/test/attach-health-diagnosis.test.sh && bash scripts/test/hermes-installer.test.sh && bash scripts/test/harness-choice.test.sh && bash scripts/test/bot-provisioner-installer.test.sh && bash scripts/test/plugin-rollout.test.sh",
     "test:installer:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap.test.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-agents-bootstrap.test.ps1",
     "check": "pnpm build && pnpm typecheck && pnpm test"
   },

@@ -24,6 +24,7 @@ BIND_HOST="${COZYGATEWAY_BIND_HOST:-127.0.0.1}"
 PORT="${COZYGATEWAY_PORT:-8787}"
 PUBLIC_URL=""
 PREVIOUS_PORT=""
+PREVIOUS_BIND_HOST=""
 DASHBOARD_PORT="${COZYGATEWAY_DASHBOARD_PORT:-9119}"
 DASHBOARD_PORT_EXPLICIT=0
 if [ "${COZYGATEWAY_DASHBOARD_PORT+x}" = x ]; then DASHBOARD_PORT_EXPLICIT=1; fi
@@ -41,6 +42,7 @@ WINDOWS_OWNED_CONFIG_JSON=""
 DRY_RUN=0
 UNINSTALL=0
 STATUS=0
+RUNTIME_ONLY=0
 # Which harness runs the bots. Empty until choose_harness scans the machine or --harness answers
 # for it. COZYAGENTS_CHOSEN stays 0 unless a person or a recorded install actually said CozyAgents,
 # because that is the only answer allowed to take a Hermes bridge out of an existing config.
@@ -100,6 +102,7 @@ usage: agent-install.sh --bundle PATH --plugin-archive PATH [options]
   --dry-run               show discovered work without changing anything
   --service-platform OS   override service platform (Darwin, Linux, Windows)
   --status                report persistence and live gateway health
+  --runtime-only          update only CozyGateway-owned runtime, service, and CLI
   --uninstall             remove only CozyGateway-owned service, plugins, env keys and state
 
 The gateway and attach plugin both stay on this machine. This installer never
@@ -126,6 +129,7 @@ while [ "$#" -gt 0 ]; do
     --dry-run) DRY_RUN=1 ;;
     --service-platform) need_value "$@"; SERVICE_PLATFORM="$2"; shift ;;
     --status) STATUS=1 ;;
+    --runtime-only) RUNTIME_ONLY=1 ;;
     --uninstall) UNINSTALL=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown flag: $1" ;;
@@ -226,6 +230,7 @@ NODE
   saved_host="${saved%%$'\t'*}"; remainder="${saved#*$'\t'}"
   saved_port="${remainder%%$'\t'*}"; saved_public="${remainder#*$'\t'}"
   PREVIOUS_PORT="$saved_port"
+  PREVIOUS_BIND_HOST="$saved_host"
   [ "$BIND_HOST_EXPLICIT" = 1 ] || [ -z "$saved_host" ] || BIND_HOST="$saved_host"
   [ "$PORT_EXPLICIT" = 1 ] || [ -z "$saved_port" ] || PORT="$saved_port"
   if [ "$CLEAR_PUBLIC_URL" = 1 ]; then
@@ -768,12 +773,35 @@ env_write() {
   [[ "$value" =~ ^[A-Za-z0-9_-]+$ ]] || die "installer-owned credentials must use the safe generated alphabet"
   printf '%s=%s\n' "$key" "$value" >> "$file"
 }
+previous_gateway_origin() {
+  local host="$PREVIOUS_BIND_HOST" port="$PREVIOUS_PORT"
+  [ -n "$host" ] && [ -n "$port" ] || return 1
+  case "$host" in 0.0.0.0) host=127.0.0.1 ;; ::) host='[::1]' ;; *:*) host="[$host]" ;; esac
+  printf 'http://%s:%s' "$host" "$port"
+}
+preflight_profile_env_ownership() {
+  local profile file owner url key
+  for profile in "${SELECTED[@]}"; do
+    file="$(profile_home "$profile")/.env"
+    owner="$(env_get "$file" "$ENV_OWNER_KEY")"
+    url="$(env_get "$file" COZYGATEWAY_URL)"
+    if [ "$owner" = "$ENV_OWNER_VALUE" ]; then
+      if [ -z "$url" ] || [ "$url" = "$(gateway_origin)" ] || [ "$url" = "$(previous_gateway_origin || true)" ]; then
+        continue
+      fi
+      die "$file targets another Gateway; use --runtime-only to preserve it"
+    fi
+    for key in COZYGATEWAY_URL COZYGATEWAY_TOKEN COZYGATEWAY_SPOOL_PATH COZYGATEWAY_HOME_CHANNEL; do
+      [ -z "$(env_get "$file" "$key")" ] || die "$file has an existing Gateway configuration; use --runtime-only to preserve it"
+    done
+  done
+}
 claim_profile_env() {
   local file="$1" owner
   owner="$(env_get "$file" "$ENV_OWNER_KEY")"
   [ "$owner" = "$ENV_OWNER_VALUE" ] && return
   if [ -f "$file" ] && grep -Eq '^(COZYGATEWAY_URL|COZYGATEWAY_TOKEN|COZYGATEWAY_SPOOL_PATH|COZYGATEWAY_HOME_CHANNEL)=' "$file"; then
-    die "$file already has CozyGateway keys not owned by this installer; remove or rename them before installing"
+    die "$file already has CozyGateway keys not owned by this installer; use --runtime-only to preserve it"
   fi
   env_put "$file" "$ENV_OWNER_KEY" "$ENV_OWNER_VALUE"
 }
@@ -983,8 +1011,9 @@ write_gateway_env() {
   local p token env_name profile_env spool_path seen_token seen_name
   prepare_dashboard_credential
   [ "$DRY_RUN" = 1 ] && { say "DRY   write gateway token environment at $GATEWAY_ENV (values redacted)"; return; }
-  umask 077; : > "$GATEWAY_ENV"
-  env_write "$GATEWAY_ENV" COZYGATEWAY_HERMES_TOKEN "$DASHBOARD_SESSION_TOKEN"
+  local staged="$GATEWAY_ENV.tmp.$$"
+  umask 077; : > "$staged"
+  env_write "$staged" COZYGATEWAY_HERMES_TOKEN "$DASHBOARD_SESSION_TOKEN"
   for p in "${SELECTED[@]}"; do
     profile_env="$(profile_home "$p")/.env"; claim_profile_env "$profile_env"; token="$(env_get "$profile_env" COZYGATEWAY_TOKEN)"; safe_secret "$token" || token="$(new_token)"; env_name="$(token_env_name "$p")"
     for seen_token in "${TOKENS[@]:-}"; do [ "$token" != "$seen_token" ] || die "Hermes profiles must have distinct CozyGateway attach tokens"; done
@@ -994,8 +1023,10 @@ write_gateway_env() {
     spool_path="$(profile_home "$p")/plugin-data/cozygateway/attach-v1.sqlite"
     is_windows && spool_path="$(to_windows_path "$spool_path")"
     env_put "$profile_env" COZYGATEWAY_SPOOL_PATH "$spool_path"; env_put "$profile_env" COZYGATEWAY_HOME_CHANNEL thread
-    env_write "$GATEWAY_ENV" "$env_name" "$token"
+    env_write "$staged" "$env_name" "$token"
   done
+  chmod 600 "$staged"
+  mv -f "$staged" "$GATEWAY_ENV"
   chmod 600 "$GATEWAY_ENV"
 }
 service_action_for() {
@@ -1114,6 +1145,11 @@ if [ "\${1:-}" = repair ] || [ "\${1:-}" = update ]; then
   if [ -f "\$source_file" ]; then
     asset_base="\$(cat "\$source_file")"
     case "\$asset_base" in file:///*) ;; *) printf 'FAIL  recorded repair source is invalid. Reinstall with: %s\n' "\$reinstall" >&2; exit 1 ;; esac
+  fi
+  repair_mode="\$(sed -n 's/^repair_mode=//p' "\$state" | tail -1)"
+  if [ "\$repair_mode" = runtime-only ]; then
+    printf 'INFO  repair refreshes only the recorded CozyGateway runtime\n'
+    exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") COZYGATEWAY_INSTALL_ASSET_BASE="\$asset_base" bash "\$bootstrap" --runtime-only
   fi
   harness="\$(sed -n 's/^harness=//p' "\$state" | tail -1)"
   if [ "\$harness" = cozyagents ]; then
@@ -2377,7 +2413,7 @@ WantedBy=default.target
 UNIT
     } > "$staged"
     chmod 600 "$staged"; mv -f "$staged" "$unit"
-    systemctl --user daemon-reload; systemctl --user enable --now "$SERVICE_UNIT"
+    systemctl --user daemon-reload; systemctl --user enable --now "$SERVICE_UNIT"; systemctl --user restart "$SERVICE_UNIT"
   fi
 }
 dashboard_ready() {
@@ -2590,6 +2626,45 @@ uninstall() {
     return
   fi
   # install-state contains only profile names, paths, and lifecycle state; no secrets.
+  if [ "$(sed -n 's/^repair_mode=//p' "$STATE_FILE" | tail -1)" = runtime-only ]; then
+    resolve_platform
+    if [ "$SERVICE_PLATFORM" = Windows ]; then
+      local startup_entry task_xml
+      startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
+      task_xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
+      [ -z "$task_xml" ] || windows_recorded_task_is_owned || die "CozyGateway Scheduled Task ownership could not be verified; preserving independently managed Hermes state"
+      [ ! -f "$startup_entry" ] || windows_startup_entry_is_owned "$startup_entry" || die "CozyGateway Startup entry ownership could not be verified; preserving independently managed Hermes state"
+      if [ "$DRY_RUN" = 1 ]; then
+        say "DRY   stop the owned CozyGateway process, delete Scheduled Task $WINDOWS_TASK and Startup entry $startup_entry"
+      else
+        if stop_owned_windows_gateway 0; then :; else say "INFO  no owned CozyGateway process was running"; fi
+        [ -z "$task_xml" ] || MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || die "could not remove owned CozyGateway Scheduled Task"
+        [ ! -f "$startup_entry" ] || rm -f "$startup_entry" || die "could not remove owned CozyGateway Startup entry"
+        remove_windows_cli_path
+      fi
+    elif [ "$SERVICE_PLATFORM" = Darwin ]; then
+      local plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
+      posix_service_is_owned_or_absent "$plist" || die "CozyGateway launchd ownership could not be verified; preserving independently managed Hermes state"
+      if [ "$DRY_RUN" = 1 ]; then
+        say "DRY   stop and remove owned launchd service $SERVICE_LABEL and the cozygateway command"
+      else
+        remove_owned_posix_service "$plist" || die "could not remove owned CozyGateway launchd service"
+        remove_posix_cli || die "could not remove the CozyGateway command"
+      fi
+    else
+      local unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"
+      posix_service_is_owned_or_absent "$unit" || die "CozyGateway systemd ownership could not be verified; preserving independently managed Hermes state"
+      if [ "$DRY_RUN" = 1 ]; then
+        say "DRY   stop and remove owned systemd service $SERVICE_UNIT and the cozygateway command"
+      else
+        remove_owned_posix_service "$unit" || die "could not remove owned CozyGateway systemd service"
+        remove_posix_cli || die "could not remove the CozyGateway command"
+      fi
+    fi
+    run rm -rf "$GATEWAY_DIR"
+    say "OK    removed CozyGateway runtime-only state; Hermes profiles, plugins, services, and environment were preserved"
+    return
+  fi
   if [ "$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)" = cozyagents ]; then uninstall_cozyagents; return; fi
   root="$(sed -n 's/^hermes_root=//p' "$STATE_FILE" | tail -1)"
   hermes_bin="$(sed -n 's/^hermes_bin=//p' "$STATE_FILE" | tail -1)"
@@ -2790,10 +2865,67 @@ install_with_cozyagents() {
   announce_listener
   pairing_and_finish
 }
+runtime_state_value() {
+  sed -n "s/^$1=//p" "$STATE_FILE" | tail -1
+}
+hydrate_runtime_only_harness() {
+  HARNESS="$(runtime_state_value harness)"
+  if [ -z "$HARNESS" ] && [ -n "$(runtime_state_value hermes_root)$(runtime_state_value hermes_bin)" ]; then HARNESS=hermes; fi
+  case "$HARNESS" in
+    hermes)
+      HERMES_ROOT="$(runtime_state_value hermes_root)"
+      HERMES_RESOLVED="$(runtime_state_value hermes_bin)"
+      [ -d "$HERMES_ROOT" ] && [ -x "$HERMES_RESOLVED" ] || die "--runtime-only needs the recorded Hermes runtime; reinstall normally to repair Hermes integration"
+      HERMES_BIN="$HERMES_RESOLVED"
+      DASHBOARD_SESSION_TOKEN="$(env_get "$DASHBOARD_ENV" DASHBOARD_SESSION_TOKEN)"
+      safe_secret "$DASHBOARD_SESSION_TOKEN" || die "--runtime-only needs the existing Dashboard credential"
+      write_dashboard_port_state
+      write_dashboard_owner_helper
+      if is_windows; then write_dashboard_elevation_helper; fi
+      ;;
+    cozyagents) ;;
+    *) die "--runtime-only cannot classify the existing harness; reinstall normally" ;;
+  esac
+}
+write_runtime_only_state() {
+  local staged="$STATE_FILE.runtime.$$"
+  [ "$DRY_RUN" = 1 ] && return
+  [ -f "$STATE_FILE" ] || die "runtime-only repair needs existing installer state"
+  umask 077
+  grep -v -E '^(repair_mode|harness|dashboard_port|node_resolved|bundle_path|supervisor)=' "$STATE_FILE" > "$staged" || true
+  printf 'harness=%s\n' "$HARNESS" >> "$staged"
+  printf 'dashboard_port=%s\n' "$DASHBOARD_PORT" >> "$staged"
+  printf 'node_resolved=%s\n' "$NODE_RESOLVED" >> "$staged"
+  printf 'bundle_path=%s\n' "$BUNDLE_PATH" >> "$staged"
+  printf 'supervisor=%s\n' "$SUPERVISOR" >> "$staged"
+  printf 'repair_mode=runtime-only\n' >> "$staged"
+  chmod 600 "$staged"
+  mv -f "$staged" "$STATE_FILE"
+}
+runtime_only_repair() {
+  [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--runtime-only needs a verified release bundle"
+  [ -f "$STATE_FILE" ] && [ -f "$CONFIG_JSON" ] && [ -f "$GATEWAY_ENV" ] || die "--runtime-only needs an existing CozyGateway installation"
+  hydrate_runtime_only_harness
+  install_service
+  wait_gateway_ready
+  write_runtime_only_state
+  write_cli_wrapper
+  is_windows || install_posix_cli
+  say "OK    updated CozyGateway runtime and supervisor without changing Hermes profiles, plugins, services, or tokens"
+}
 main() {
   local prerequisite_missing=0 profile action
   if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
   preflight_service_manager
+  if [ "$RUNTIME_ONLY" = 1 ]; then
+    NODE_RESOLVED="$(resolve_node)" || die "--runtime-only needs the existing Node.js 24 runtime; reinstall normally to provision it"
+    say "OK    using existing Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
+    hydrate_listener_settings
+    hydrate_dashboard_port
+    validate_listener_settings
+    runtime_only_repair
+    return
+  fi
   if NODE_RESOLVED="$(resolve_node)"; then say "OK    using Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
   elif [ "$DRY_RUN" = 1 ]; then say "DRY   install the current Node.js 24 release under $GATEWAY_DIR/runtime/node from checksum-verified nodejs.org assets"; prerequisite_missing=1
   else install_node_runtime
@@ -2832,6 +2964,7 @@ main() {
   HERMES_BIN="$HERMES_RESOLVED"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; hydrate_profile_scope; discover_profiles
   say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"
   is_windows && preflight_windows_service_ownership
+  preflight_profile_env_ownership
   for profile in "${SELECTED[@]}"; do action="$(prior_service_action "$profile")"; record_service_action "$profile" "${action:-unknown}"; done
   write_state; write_gateway_env
   # Stage every profile before enabling any of them. Hermes can materialize inherited global
