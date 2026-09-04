@@ -165,7 +165,7 @@ public static class $className {
 function New-FakeBash {
     param([string] $Path, [string] $EventLog)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
-    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho bash-hermes:%COZYGATEWAY_HERMES_BIN%>>`"$EventLog`"`necho bash-powershell:%COZYGATEWAY_POWERSHELL%>>`"$EventLog`"`nif not `"%COZYGATEWAY_TEST_SECRET_PATH%`"==`"`" (`n  for %%I in (`"%COZYGATEWAY_TEST_SECRET_PATH%`") do if not exist `"%%~dpI`" mkdir `"%%~dpI`"`n  >`"%COZYGATEWAY_TEST_SECRET_PATH%`" echo DASHBOARD_SESSION_TOKEN=test-token`n)`nif `"%COZYGATEWAY_TEST_BASH_FAIL%`"==`"1`" exit /b 23`nexit /b 0`n"
+    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho bash-hermes:%COZYGATEWAY_HERMES_BIN%>>`"$EventLog`"`necho bash-powershell:%COZYGATEWAY_POWERSHELL%>>`"$EventLog`"`nif not `"%COZYGATEWAY_TEST_SECRET_PATH%`"==`"`" (`n  for %%I in (`"%COZYGATEWAY_TEST_SECRET_PATH%`") do if not exist `"%%~dpI`" mkdir `"%%~dpI`"`n  >`"%COZYGATEWAY_TEST_SECRET_PATH%`" echo DASHBOARD_SESSION_TOKEN=test-token`n)`nif not `"%COZYGATEWAY_TEST_BASH_FAIL_ONCE%`"==`"`" if not exist `"%COZYGATEWAY_TEST_BASH_FAIL_ONCE%`" (`n  type nul >`"%COZYGATEWAY_TEST_BASH_FAIL_ONCE%`"`n  exit /b 23`n)`nif `"%COZYGATEWAY_TEST_BASH_FAIL%`"==`"1`" exit /b 23`nexit /b 0`n"
 }
 
 function Invoke-Bootstrap {
@@ -720,6 +720,54 @@ try {
     Assert-True (-not ((Get-Content -LiteralPath $eventLog -Raw -ErrorAction SilentlyContinue) -match '(?m)^bash:')) 'late checksum failure must not invoke the installer payload'
     Assert-True (@(Get-ChildItem -LiteralPath (Join-Path $temp 'Cozy Gateway') -Filter '.bootstrap-*' -Force).Count -eq 0) 'failed bootstrap must remove its staging directory'
     Write-Utf8NoBom (Join-Path $fixtures 'install.ps1') $originalInstallPs1
+
+    # The public Windows entrypoint journals every release asset. A real hard
+    # stop after the first promotion leaves a snapshot that the next launch
+    # restores before fetching, then promotes as one coherent release.
+    $transactionHome = Join-Path $temp 'transaction recovery gateway'
+    $transactionBefore = [IO.File]::ReadAllBytes((Join-Path $temp 'Cozy Gateway\bin\cozygateway.mjs'))
+    Write-Utf8NoBom (Join-Path $fixtures 'cozygateway.mjs') "console.log('transaction replacement');`n"
+    $transactionHash = (Get-FileHash -LiteralPath (Join-Path $fixtures 'cozygateway.mjs') -Algorithm SHA256).Hash.ToLowerInvariant()
+    Write-Utf8NoBom (Join-Path $fixtures 'cozygateway.mjs.sha256') "$transactionHash  cozygateway.mjs`n"
+    $fileFixtureBase = ([Uri](Resolve-Path -LiteralPath $fixtures).Path).AbsoluteUri
+    New-Item -ItemType Directory -Force -Path $transactionHome | Out-Null
+    Copy-Item -Path (Join-Path $temp 'Cozy Gateway\*') -Destination $transactionHome -Recurse
+    $transactionKilled = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fileFixtureBase
+        'COZYGATEWAY_HOME' = $transactionHome
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION' = 'cozygateway.mjs'
+    }
+    Assert-True ($transactionKilled.ExitCode -ne 0) 'hard-stop fixture must terminate the bootstrap'
+    Assert-True (Test-Path -LiteralPath (Join-Path $transactionHome '.bootstrap-transaction')) 'hard stop must preserve the Windows bootstrap journal'
+    Assert-True ([Linq.Enumerable]::SequenceEqual($transactionBefore, [IO.File]::ReadAllBytes((Join-Path $transactionHome '.bootstrap-previous\cozygateway.mjs')))) 'journal snapshot must retain the prior bundle'
+    $transactionRecovered = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fileFixtureBase
+        'COZYGATEWAY_HOME' = $transactionHome
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+    }
+    Assert-True ($transactionRecovered.ExitCode -eq 0 -and $transactionRecovered.Output -match 'recovering an interrupted CozyGateway bootstrap') "interrupted Windows bootstrap must recover: $($transactionRecovered.Output)"
+    Assert-True ([Linq.Enumerable]::SequenceEqual([IO.File]::ReadAllBytes((Join-Path $fixtures 'cozygateway.mjs')), [IO.File]::ReadAllBytes((Join-Path $transactionHome 'bin\cozygateway.mjs')))) 'recovered Windows bootstrap must install the complete replacement'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $transactionHome '.bootstrap-transaction')) -and -not (Test-Path -LiteralPath (Join-Path $transactionHome '.bootstrap-previous'))) 'recovered Windows bootstrap must clear journal and snapshot'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $transactionHome 'local\bootstrap-source') -Raw).Trim() -eq $fileFixtureBase) 'explicit local Windows release source must be retained for repair'
+
+    $childFailureBefore = [IO.File]::ReadAllBytes((Join-Path $transactionHome 'bin\cozygateway.mjs'))
+    $childFailureMarker = Join-Path $temp 'child-install-failed-once.txt'
+    $childFailure = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fileFixtureBase
+        'COZYGATEWAY_HOME' = $transactionHome
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_TEST_BASH_FAIL_ONCE' = $childFailureMarker
+    }
+    Assert-True ($childFailure.ExitCode -ne 0 -and $childFailure.Output -match 'restarted the previous CozyGateway service after the failed update') "failed child installer must restore its prior service: $($childFailure.Output)"
+    Assert-True ([Linq.Enumerable]::SequenceEqual($childFailureBefore, [IO.File]::ReadAllBytes((Join-Path $transactionHome 'bin\cozygateway.mjs')))) 'failed child installer must restore the prior Windows bundle'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $transactionHome '.bootstrap-transaction')) -and -not (Test-Path -LiteralPath (Join-Path $transactionHome '.bootstrap-previous'))) 'failed child installer must clear recovered Windows transaction state'
 
     $restoreWrapper = Join-Path $temp 'verify-hermes-env-restore.ps1'
     Write-Utf8NoBom $restoreWrapper @"

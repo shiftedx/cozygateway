@@ -76,7 +76,11 @@ function Copy-OrDownload {
 
 function Get-VerifiedAsset {
     param([string] $Name, [string] $Destination, [string] $BaseUri)
-    $source = if (Test-Path -LiteralPath $BaseUri) { Join-Path $BaseUri $Name } else { "$($BaseUri.TrimEnd('/'))/$Name" }
+    $localBase = $BaseUri
+    if ($BaseUri -match '^file://') {
+        try { $localBase = ([Uri]$BaseUri).LocalPath } catch { Fail "invalid local release source: $BaseUri" }
+    }
+    $source = if (Test-Path -LiteralPath $localBase) { Join-Path $localBase $Name } else { "$($BaseUri.TrimEnd('/'))/$Name" }
     $newPath = "$Destination.new"
     $shaPath = "$Destination.sha256"
     Remove-Item -LiteralPath $newPath -Force -ErrorAction SilentlyContinue
@@ -96,6 +100,140 @@ function Promote-VerifiedAsset {
     param([string] $Name, [string] $Stage, [string] $Destination)
     Move-Item -LiteralPath (Join-Path $Stage $Name) -Destination (Join-Path $Destination $Name) -Force
     Move-Item -LiteralPath (Join-Path $Stage "$Name.sha256") -Destination (Join-Path $Destination "$Name.sha256") -Force
+}
+
+function Acquire-BootstrapLock {
+    param([string] $Home)
+    $script:BootstrapLockPath = Join-Path $Home '.bootstrap-lock'
+    try {
+        New-Item -ItemType Directory -Path $script:BootstrapLockPath -ErrorAction Stop | Out-Null
+    } catch {
+        $pidPath = Join-Path $script:BootstrapLockPath 'pid'
+        $owner = if (Test-Path -LiteralPath $pidPath -PathType Leaf) { (Get-Content -LiteralPath $pidPath -Raw).Trim() } else { '' }
+        $live = $false
+        $ownerId = 0
+        if ([int]::TryParse($owner, [ref]$ownerId)) { $live = $null -ne (Get-Process -Id $ownerId -ErrorAction SilentlyContinue) }
+        if ($live) { Fail 'another CozyGateway bootstrap is running; wait for it to finish and rerun' }
+        if (-not (Test-Path -LiteralPath $script:BootstrapLockPath -PathType Container) -or @((Get-ChildItem -LiteralPath $script:BootstrapLockPath -Force)).Count -gt 1) {
+            Fail 'another CozyGateway bootstrap is running; wait for it to finish and rerun'
+        }
+        Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $script:BootstrapLockPath -Force -ErrorAction Stop
+        New-Item -ItemType Directory -Path $script:BootstrapLockPath -ErrorAction Stop | Out-Null
+    }
+    Set-Content -LiteralPath (Join-Path $script:BootstrapLockPath 'pid') -Value $PID -NoNewline -Encoding ascii
+}
+
+function Release-BootstrapLock {
+    if ([string]::IsNullOrWhiteSpace($script:BootstrapLockPath)) { return }
+    Remove-Item -LiteralPath (Join-Path $script:BootstrapLockPath 'pid') -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $script:BootstrapLockPath -Force -ErrorAction SilentlyContinue
+}
+
+function Recover-BootstrapTransaction {
+    param([string] $Home, [string] $Bin, [string[]] $Assets)
+    $journal = Join-Path $Home '.bootstrap-transaction'
+    $backup = Join-Path $Home '.bootstrap-previous'
+    if (-not (Test-Path -LiteralPath $journal -PathType Leaf)) {
+        if (-not (Test-Path -LiteralPath $backup)) { return }
+        if (-not (Test-Path -LiteralPath $backup -PathType Container) -or @((Get-ChildItem -LiteralPath $backup -Force)).Count -ne 0) {
+            Fail "bootstrap rollback directory exists without a transaction marker; preserve it and rerun the verified installer"
+        }
+        Remove-Item -LiteralPath $backup -Force -ErrorAction Stop
+        return
+    }
+    if (-not (Test-Path -LiteralPath $backup -PathType Container)) { Fail "bootstrap transaction recovery needs $backup; preserve these files and rerun the verified installer" }
+    $state = (Get-Content -LiteralPath $journal -Raw).Trim()
+    if ($state -eq 'commit=installer-succeeded') {
+        Write-Info 'completing a previously successful CozyGateway bootstrap cleanup'
+        Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction Stop
+        Remove-Item -LiteralPath $journal -Force -ErrorAction Stop
+        return
+    }
+    if ($state -ne 'intent=replace-release-assets') { Fail "bootstrap transaction marker is invalid; preserve $journal and rerun the verified installer" }
+    Write-Info 'recovering an interrupted CozyGateway bootstrap before fetching a new release'
+    foreach ($asset in $Assets) {
+        foreach ($name in @($asset, "$asset.sha256")) {
+            $old = Join-Path $backup $name
+            if (Test-Path -LiteralPath $old -PathType Leaf) {
+                Remove-Item -LiteralPath (Join-Path $Bin $name) -Force -ErrorAction SilentlyContinue
+                Move-Item -LiteralPath $old -Destination (Join-Path $Bin $name) -Force -ErrorAction Stop
+            }
+        }
+    }
+    Remove-Item -LiteralPath $backup -Force -ErrorAction Stop
+    Remove-Item -LiteralPath $journal -Force -ErrorAction Stop
+}
+
+function Start-BootstrapTransaction {
+    param([string] $Home, [string] $Bin, [string[]] $Assets)
+    $journal = Join-Path $Home '.bootstrap-transaction'
+    $backup = Join-Path $Home '.bootstrap-previous'
+    if ((Test-Path -LiteralPath $journal) -or (Test-Path -LiteralPath $backup)) { Fail 'bootstrap recovery state already exists; rerun this installer to recover it' }
+    New-Item -ItemType Directory -Path $backup -ErrorAction Stop | Out-Null
+    try { Set-Content -LiteralPath $journal -Value 'intent=replace-release-assets' -NoNewline -Encoding ascii -ErrorAction Stop }
+    catch { Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue; throw }
+    foreach ($asset in $Assets) {
+        foreach ($name in @($asset, "$asset.sha256")) {
+            $live = Join-Path $Bin $name
+            if (Test-Path -LiteralPath $live -PathType Leaf) {
+                try { Move-Item -LiteralPath $live -Destination (Join-Path $backup $name) -Force -ErrorAction Stop }
+                catch { Recover-BootstrapTransaction $Home $Bin $Assets; throw }
+            }
+        }
+    }
+}
+
+function Commit-BootstrapTransaction {
+    param([string] $Home)
+    $journal = Join-Path $Home '.bootstrap-transaction'
+    $backup = Join-Path $Home '.bootstrap-previous'
+    $staged = "$journal.commit.$PID"
+    Set-Content -LiteralPath $staged -Value 'commit=installer-succeeded' -NoNewline -Encoding ascii -ErrorAction Stop
+    Move-Item -LiteralPath $staged -Destination $journal -Force -ErrorAction Stop
+    Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction Stop
+    Remove-Item -LiteralPath $journal -Force -ErrorAction Stop
+}
+
+function Save-ExplicitBootstrapSource {
+    param([string] $Home, [string] $Base)
+    $source = Join-Path $Home 'local\bootstrap-source'
+    if ([string]::IsNullOrWhiteSpace($Base)) { Remove-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue; return }
+    if ($Base -notmatch '^file:///.+') { return }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $source) | Out-Null
+    $staged = "$source.tmp.$PID"
+    Set-Content -LiteralPath $staged -Value $Base -NoNewline -Encoding utf8 -ErrorAction Stop
+    Move-Item -LiteralPath $staged -Destination $source -Force -ErrorAction Stop
+}
+
+function Invoke-TransactionalRelease {
+    param([string] $Home, [string] $Bin, [string] $Stage, [string[]] $Assets, [scriptblock] $Install, [scriptblock] $Restore)
+    Start-BootstrapTransaction $Home $Bin $Assets
+    try {
+        foreach ($asset in $Assets) {
+            Promote-VerifiedAsset $asset $Stage $Bin
+            if ($env:COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION -eq $asset) { Stop-Process -Id $PID -Force }
+        }
+        & $Install
+        Commit-BootstrapTransaction $Home
+    } catch {
+        $failure = $_
+        $journal = Join-Path $Home '.bootstrap-transaction'
+        $committed = (Test-Path -LiteralPath $journal -PathType Leaf) -and ((Get-Content -LiteralPath $journal -Raw).Trim() -eq 'commit=installer-succeeded')
+        if (-not $committed) {
+            $restored = $false
+            try {
+                Recover-BootstrapTransaction $Home $Bin $Assets
+                $restored = $true
+                & $Restore
+                Write-Ok 'restarted the previous CozyGateway service after the failed update'
+            } catch {
+                if ($restored) { Write-Warning 'previous release assets were restored, but its service restart failed; rerun CozyGateway repair after resolving that error' }
+                else { Write-Warning 'the previous release could not be fully restored; its recovery journal was preserved for retry' }
+            }
+        }
+        throw $failure
+    }
 }
 
 function Get-PersistedRepairProfiles {
@@ -839,28 +977,34 @@ function Install-WithCozyAgents {
     $listener = Select-Listener $AlreadyConfigured $ForwardedArguments
 
     Protect-CozyGatewayHome $script:InstallHome
-    $stage = Join-Path $script:InstallHome ('.bootstrap-' + [guid]::NewGuid().ToString('N'))
-    $null = New-Item -ItemType Directory -Force -Path $stage
+    $assets = @('cozygateway.mjs', 'agent-install.sh', 'gateway-supervisor.cjs', 'cozygateway-bootstrap.ps1')
+    Acquire-BootstrapLock $script:InstallHome
+    $stage = $null
     $script:BundlePath = Join-Path $Bin 'cozygateway.mjs'
     try {
+        Recover-BootstrapTransaction $script:InstallHome $Bin $assets
+        $stage = Join-Path $script:InstallHome ('.bootstrap-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Force -Path $stage
         Get-VerifiedAsset 'cozygateway.mjs' (Join-Path $stage 'cozygateway.mjs') $Base
         Get-VerifiedAsset 'cozygateway-installer.sh' (Join-Path $stage 'agent-install.sh') $Base
         Get-VerifiedAsset 'gateway-supervisor.cjs' (Join-Path $stage 'gateway-supervisor.cjs') $Base
         Get-VerifiedAsset 'install.ps1' (Join-Path $stage 'cozygateway-bootstrap.ps1') $Base
         New-Item -ItemType Directory -Force -Path $Bin | Out-Null
-        foreach ($asset in @('cozygateway.mjs', 'agent-install.sh', 'gateway-supervisor.cjs', 'cozygateway-bootstrap.ps1')) {
-            Promote-VerifiedAsset $asset $stage $Bin
+        Invoke-TransactionalRelease $script:InstallHome $Bin $stage $assets {
+            Invoke-CozyGatewayInstaller $bash $InstallerPath '' $ForwardedArguments 'cozyagents' $listener
+            Save-ExplicitBootstrapSource $script:InstallHome $explicitAssetBase
+            Set-CozyGatewayCommandPath $Bin $true
+            Install-CozyAgentsHarness $agentsHome $InstallerSource $script:CozyAgentsInstallerSha256
+            Write-RunnerModelEnv (Join-Path $agentsHome 'runner.env') $model
+            Join-RunnerToGateway $agentsHome $CliPath $ConfigPath
+            Complete-Pairing $CliPath $AlreadyConfigured $NoQr
+        } {
+            Invoke-CozyGatewayInstaller $bash $InstallerPath '' $ForwardedArguments 'cozyagents' $listener
         }
     } finally {
-        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        if ($stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+        Release-BootstrapLock
     }
-
-    Invoke-CozyGatewayInstaller $bash $InstallerPath '' $ForwardedArguments 'cozyagents' $listener
-    Set-CozyGatewayCommandPath $Bin $true
-    Install-CozyAgentsHarness $agentsHome $InstallerSource $script:CozyAgentsInstallerSha256
-    Write-RunnerModelEnv (Join-Path $agentsHome 'runner.env') $model
-    Join-RunnerToGateway $agentsHome $CliPath $ConfigPath
-    Complete-Pairing $CliPath $AlreadyConfigured $NoQr
 }
 
 # A CozyAgents uninstall takes back exactly what this bootstrap put there: the gateway through the
@@ -906,6 +1050,8 @@ $bootstrapPath = Join-Path $bin 'cozygateway-bootstrap.ps1'
 $cliPath = Join-Path $bin 'cozygateway.cmd'
 $statePath = Join-Path $script:InstallHome 'local\install-state'
 $configPath = Join-Path $script:InstallHome 'local\cozygateway.config.json'
+$sourcePath = Join-Path $script:InstallHome 'local\bootstrap-source'
+$explicitAssetBase = $env:COZYGATEWAY_INSTALL_ASSET_BASE
 $isUninstall = $InstallerArguments -contains '--uninstall'
 $isDryRun = $env:COZYGATEWAY_INSTALL_DRYRUN -eq '1' -or $InstallerArguments -contains '--dry-run'
 $isNoQr = $InstallerArguments -contains '--no-qr'
@@ -921,6 +1067,12 @@ if ($Repair) {
     $actual = (Get-FileHash -LiteralPath $bootstrapPath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ([string]::IsNullOrWhiteSpace($expected) -or $expected -ne $actual) {
         Fail 'repair bootstrap checksum mismatch. Reinstall with: irm https://cozylabs.ai/install.ps1 | iex'
+    }
+    if (Test-Path -LiteralPath $sourcePath -PathType Leaf) {
+        $recordedSource = (Get-Content -LiteralPath $sourcePath -Raw).Trim()
+        if ($recordedSource -notmatch '^file:///.+') { Fail 'recorded repair source is invalid. Reinstall with: irm https://cozylabs.ai/install.ps1 | iex' }
+        $env:COZYGATEWAY_INSTALL_ASSET_BASE = $recordedSource
+        $explicitAssetBase = $recordedSource
     }
     if ((Get-RecordedHarness $statePath) -eq 'cozyagents') {
         $Harness = 'cozyagents'
@@ -989,22 +1141,29 @@ Confirm-HermesModel $hermes
 $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH
 
 Protect-CozyGatewayHome $script:InstallHome
-$stage = Join-Path $script:InstallHome ('.bootstrap-' + [guid]::NewGuid().ToString('N'))
-$null = New-Item -ItemType Directory -Force -Path $stage
+$assets = @('cozygateway.mjs', 'cozygateway-hermes-attach-plugin.tar.gz', 'agent-install.sh', 'gateway-supervisor.cjs', 'cozygateway-bootstrap.ps1')
+Acquire-BootstrapLock $script:InstallHome
+$stage = $null
 $script:BundlePath = Join-Path $bin 'cozygateway.mjs'
 $script:PluginPath = Join-Path $bin 'cozygateway-hermes-attach-plugin.tar.gz'
 try {
+    Recover-BootstrapTransaction $script:InstallHome $bin $assets
+    $stage = Join-Path $script:InstallHome ('.bootstrap-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Force -Path $stage
     Get-VerifiedAsset 'cozygateway.mjs' (Join-Path $stage 'cozygateway.mjs') $base
     Get-VerifiedAsset 'cozygateway-hermes-attach-plugin.tar.gz' (Join-Path $stage 'cozygateway-hermes-attach-plugin.tar.gz') $base
     Get-VerifiedAsset 'cozygateway-installer.sh' (Join-Path $stage 'agent-install.sh') $base
     Get-VerifiedAsset 'gateway-supervisor.cjs' (Join-Path $stage 'gateway-supervisor.cjs') $base
     Get-VerifiedAsset 'install.ps1' (Join-Path $stage 'cozygateway-bootstrap.ps1') $base
     New-Item -ItemType Directory -Force -Path $bin | Out-Null
-    foreach ($asset in @('cozygateway.mjs', 'cozygateway-hermes-attach-plugin.tar.gz', 'agent-install.sh', 'gateway-supervisor.cjs', 'cozygateway-bootstrap.ps1')) {
-        Promote-VerifiedAsset $asset $stage $bin
+    Invoke-TransactionalRelease $script:InstallHome $bin $stage $assets {
+        Invoke-CozyGatewayInstaller $bash $installerPath $hermes $InstallerArguments
+        Save-ExplicitBootstrapSource $script:InstallHome $explicitAssetBase
+        Set-CozyGatewayCommandPath $bin $true
+    } {
+        Invoke-CozyGatewayInstaller $bash $installerPath $hermes $InstallerArguments
     }
 } finally {
-    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    if ($stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    Release-BootstrapLock
 }
-Invoke-CozyGatewayInstaller $bash $installerPath $hermes $InstallerArguments
-if ($env:COZYGATEWAY_INSTALL_DRYRUN -ne '1') { Set-CozyGatewayCommandPath $bin $true }
