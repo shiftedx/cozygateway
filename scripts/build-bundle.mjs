@@ -77,6 +77,8 @@ if (archive.status !== 0) {
 // verifies it before executing it, rather than trusting a mutable raw branch.
 const installer = "dist-bundle/cozygateway-installer.sh";
 writeFileSync(installer, readFileSync("scripts/agent-install.sh"), { mode: 0o700 });
+const supervisor = "dist-bundle/gateway-supervisor.cjs";
+writeFileSync(supervisor, readFileSync("scripts/gateway-supervisor.cjs"), { mode: 0o700 });
 const windowsBootstrap = "dist-bundle/install.ps1";
 writeFileSync(windowsBootstrap, readFileSync("scripts/install.ps1"));
 // The POSIX bootstrap ships as a release asset for the same reason the Windows one does: what a
@@ -84,7 +86,7 @@ writeFileSync(windowsBootstrap, readFileSync("scripts/install.ps1"));
 // branch says this minute. Serving it from a release is what lets the checksum mean anything.
 const posixBootstrap = "dist-bundle/install.sh";
 writeFileSync(posixBootstrap, readFileSync("scripts/install.sh"), { mode: 0o700 });
-for (const asset of [pluginArchive, installer, windowsBootstrap, posixBootstrap]) {
+for (const asset of [pluginArchive, installer, supervisor, windowsBootstrap, posixBootstrap]) {
   const assetSha = createHash("sha256").update(readFileSync(asset)).digest("hex");
   writeFileSync(`${asset}.sha256`, `${assetSha}  ${asset.split("/").at(-1)}\n`);
 }

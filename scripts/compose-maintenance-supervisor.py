@@ -235,7 +235,8 @@ def handle(connection: socket.socket) -> None:
         if not isinstance(operation_id, str) or OPERATION_ID.fullmatch(operation_id) is None:
             send(connection, {"ok": False, "code": "invalid_request"})
             return
-        if request == {"action": "restart", "operationId": operation_id}:
+        requested_action = request.get("action")
+        if requested_action in ("restart", "start") and request == {"action": requested_action, "operationId": operation_id}:
             recorded = existing_operation(operation_id, "restart")
             if recorded == "conflict":
                 send(connection, {"ok": False, "code": "invalid_request"})
@@ -255,7 +256,7 @@ def handle(connection: socket.socket) -> None:
             send(connection, {"ok": True})
             threading.Thread(target=delayed, args=(operation_id, restart), daemon=True).start()
             return
-        if request.get("action") == "restart":
+        if requested_action in ("restart", "start"):
             # In particular, do not accept a caller-provided container/image/command field.
             send(connection, {"ok": False, "code": "invalid_request"})
             return

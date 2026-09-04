@@ -224,7 +224,8 @@ foreach ($shape in @('DirectLauncher', 'PythonLauncher', 'Module', 'UnderRootScr
     }
 }
 
-$windowsProfileLaunches = [regex]::Matches($installer, "\['dashboard', \.\.\.\([^\r\n]+\? \['-p', 'default'\] : \[\]\)")
+$supervisor = Get-Content -LiteralPath (Join-Path $repoRoot 'scripts\gateway-supervisor.cjs') -Raw
+$windowsProfileLaunches = [regex]::Matches(($installer + $supervisor), "\? \['-p', 'default'\] : \[\]")
 Assert-Equal 'both Windows Dashboard spawn sites carry explicit default-profile proof' 2 $windowsProfileLaunches.Count
 Assert-Equal 'Windows stale-token stop carries explicit default-profile proof' $true ($installer -match 'dashboard -p default --stop')
 

@@ -44,7 +44,7 @@ import { Value } from "@sinclair/typebox/value";
 
 import type { GatewayConfig } from "./config.ts";
 import { GatewaySettingsPersistenceError } from "./gateway-settings.ts";
-import { GatewayMaintenance, GatewayMaintenanceFailure } from "./gateway-maintenance.ts";
+import { GatewayMaintenance, GatewayMaintenanceFailure, GatewayMaintenanceNotFound } from "./gateway-maintenance.ts";
 import type { Storage, ThreadRow } from "./storage.ts";
 import { SETUP_CODE_TTL_MS, hashToken, mintDeviceToken, newSetupCode } from "./auth.ts";
 import { listenerOrigin } from "./configure.ts";
@@ -528,6 +528,19 @@ export function createApp(deps: AppDeps): Hono<Env> {
 
   if (deps.maintenance !== undefined) {
     app.get("/gateway/maintenance", requireDevice, (c) => c.json(deps.maintenance!.status()));
+    app.get("/gateway/maintenance/operations/:operationId", requireDevice, (c) => {
+      try {
+        return c.json(deps.maintenance!.operation(c.req.param("operationId")));
+      } catch (error) {
+        if (error instanceof GatewayMaintenanceNotFound) return c.json({
+          error: {
+            code: "operation_not_found",
+            message: "Gateway maintenance operation was not found.",
+          },
+        }, 404);
+        throw error;
+      }
+    });
     app.post("/gateway/maintenance/restart", requireDevice, async (c) => {
       try {
         const input = assertValid(GatewayMaintenanceRestartRequestSchema, await readBody(c));
