@@ -1454,14 +1454,15 @@ describe("paired runners (capability 52)", () => {
     // Paired but not yet dialed in: the row exists and says so honestly.
     expect(check(RunnerSelfSchema, { ...self, platform: null, lastSeenAt: null, attached: false })).toBe(true);
     expect(Object.keys(RunnerSelfSchema.properties).sort()).toEqual([
-      "agentVersion", "attached", "default", "id", "lastSeenAt", "name", "platform", "renamed",
+      "agentVersion", "attached", "default", "id", "lastSeenAt", "name", "online", "platform", "renamed",
     ]);
     expect(check(RunnerSelfSchema, { ...self, agentVersion: "0.2.0" })).toBe(true);
     // It is a runner's view of itself, not the roster row: no token, and no other machine's facts.
     for (const leak of ["token", "runnerToken", "tokenHash", "backends"])
       expect(RunnerSelfSchema.properties).not.toHaveProperty(leak);
     expect(check(RunnerSelfSchema, { ...self, token: "secret" })).toBe(false);
-    expect(check(RunnerSelfSchema, { ...self, online: true })).toBe(false);
+    expect(check(RunnerSelfSchema, { ...self, online: true })).toBe(true);
+    expect(check(RunnerSelfSchema, { ...self, online: "true" })).toBe(false);
     expect(check(RunnerSelfSchema, { ...self, renamed: undefined })).toBe(false);
   });
 

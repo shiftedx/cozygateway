@@ -1922,6 +1922,8 @@ export const RunnerSelfSchema = Type.Object({
   default: Type.Boolean(),
   lastSeenAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
   attached: Type.Boolean(),
+  /** Compatibility alias for released Agents updaters. When supplied, equals `attached`. */
+  online: Type.Optional(Type.Boolean()),
   /** Present only when this runner's currently attached, authenticated hello supplied a version. */
   agentVersion: Type.Optional(Type.String({ minLength: 1, maxLength: 40 })),
   /** Capability 55. True exactly when a person has set a display name, matching `Runner.renamed`. */

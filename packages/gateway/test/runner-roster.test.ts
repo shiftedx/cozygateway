@@ -610,10 +610,10 @@ describe("GET /runners/self", () => {
     });
     expect(response.status).toBe(200);
     const body = (await response.json()) as Record<string, unknown>;
-    // Exactly the seven fields the installer reads: no token, no backends, no other runner.
+    // Installer fields and the legacy online alias: no token, no backends, no other runner.
     // `renamed` is capability 55's addition to this same row.
     expect(Object.keys(body).sort()).toEqual([
-      "attached", "default", "id", "lastSeenAt", "name", "platform", "renamed",
+      "attached", "default", "id", "lastSeenAt", "name", "online", "platform", "renamed",
     ]);
     expect(body).toEqual({
       id: paired.runner.id,
@@ -622,6 +622,7 @@ describe("GET /runners/self", () => {
       default: true,
       lastSeenAt: NOW + 3_000,
       attached: false,
+      online: false,
       renamed: false,
     });
   });
@@ -652,9 +653,9 @@ describe("GET /runners/self", () => {
         await h.app.request("/runners/self", { headers: { authorization: `Bearer ${paired.token}` } })
       ).json()) as { attached: boolean };
     // Paired, service not yet dialed in: the row exists and the answer says so honestly.
-    expect((await self()).attached).toBe(false);
+    expect(await self()).toMatchObject({ attached: false, online: false });
     h.online.add(paired.runner.id);
-    expect((await self()).attached).toBe(true);
+    expect(await self()).toMatchObject({ attached: true, online: true });
   });
 
   it("reports a version only from the current attached hello, never an offline roster observation", async () => {

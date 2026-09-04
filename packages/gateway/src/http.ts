@@ -1065,6 +1065,9 @@ export function createApp(deps: AppDeps): Hono<Env> {
         // What the INSTALLER polls: the row exists (it just paired) long before the service it
         // registered has dialed in, so "am I attached" is a different question from "do I exist".
         attached,
+        // Released Agents updaters read `online`; keep it equal to live attachment so they can
+        // verify the first upgrade to an Agents release that reads `attached` instead.
+        online: attached,
         // An update verifier may accept this only alongside `attached`: it is read from the live
         // authenticated hello, never the durable roster observation left by an old connection.
         ...(deps.runnerPresence?.agentVersion(row.id) === undefined
