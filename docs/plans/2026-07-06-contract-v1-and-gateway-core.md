@@ -18,7 +18,7 @@
 - No em-dashes in any public-facing copy (README, contract spec, package descriptions, error messages).
 - Every commit message and code comment states constraints, not narration.
 - Test command inside a package: `pnpm test` (vitest run). Full gate from repo root: `pnpm check`.
-- Git: work on the slice branch the executor names for your task. Do not create or switch to any other branch. Do not push. Absolute paths only inside `/Users/kmcdowell/Documents/repos/cozygateway`.
+- Git: work on the slice branch the executor names for your task. Do not create or switch to any other branch. Do not push. Absolute paths only inside `<repository-root>`.
 
 ## Contract quick reference (names every task must match)
 
