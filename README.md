@@ -25,16 +25,18 @@ curl -fsSL https://cozylabs.ai/install.sh | bash
 
 Open a new terminal afterward and type `cozygateway` on every supported host.
 
-No Docker, git, or build tools. It requires an existing Hermes installation and Node 24+. The
+No Docker or source checkout is required. The installer provisions missing Node 24 and Hermes,
+then asks you to confirm a working model/provider. The
 bootstrap verifies versioned release checksums for the gateway bundle, complete Hermes attach-plugin
 archive, and installer payload. It discovers Hermes profile homes through the Hermes CLI, installs
 one attach identity per selected profile, and supervises one shared gateway service. The default
-scope remains `all`, so update and repair runs also provision newly discovered profiles. Existing Hermes
+scope is `all`; updates preserve the recorded selection. An installation with `all` also provisions newly discovered profiles. Existing Hermes
 profile gateway services stay Hermes-owned. Fresh interactive installs ask once whether CozyChat
 may connect over the local network; No (the default) keeps loopback (`127.0.0.1:8787`), while Yes
 binds all local interfaces and puts the detected LAN address in the pairing QR. The
 installer never configures Tailscale, Cloudflare, DNS, firewalls, or tunnels. See
-`docs/install-service.md` and `docs/connectivity.md`.
+[service installation](docs/install-service.md), [connectivity](docs/connectivity.md), and
+[keeping your Gateway available](docs/reliable-operation.md).
 
 Windows installs under `%LOCALAPPDATA%\cozygateway`, registers a current-user
 `CozyGateway` Scheduled Task with a Startup-folder fallback, and normally stays
@@ -47,8 +49,8 @@ port. `cozygateway status` names the safe next step when attention is needed;
 `cozygateway repair` (or `update`) downloads the latest matched, checksummed
 release and reconciles the install. Existing installs retain their saved
 listener; `--bind-host` remains the non-interactive override.
-Publishing the short PowerShell URL is tracked separately; before that website
-change, use the `install.ps1` asset from a versioned GitHub release.
+The setup URLs serve the published release. Local builds do not change those
+URLs until the matching release assets and website pins are published.
 
 Uninstall on macOS/Linux:
 
