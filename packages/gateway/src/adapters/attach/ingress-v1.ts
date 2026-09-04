@@ -48,6 +48,10 @@ import {
 } from "./protocol-v1.ts";
 import { resolveAttachBearer } from "./token-auth.ts";
 import { emitTrace, traceId, type TraceLog } from "../../trace.ts";
+import {
+  PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES,
+  PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS,
+} from "../../websocket-limits.ts";
 
 export const ATTACH_V1_MAX_IN_FLIGHT_EVENTS = 64;
 export const ATTACH_V1_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
@@ -133,6 +137,8 @@ export class AttachV1Ingress implements TurnEndpoint {
   readonly #projectionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   readonly #trace: TraceLog | undefined;
   readonly #log: (line: string) => void;
+  readonly #maxPendingConnections: number;
+  #pendingConnections = 0;
   #lastHeartbeatAt: number | null = null;
 
   constructor(deps: {
@@ -149,6 +155,8 @@ export class AttachV1Ingress implements TurnEndpoint {
     /** Operator-visible channel for refusals. Tracing is optional and often off; a peer that is
      *  being refused must still say so somewhere an operator reads by default. */
     log?: (line: string) => void;
+    /** Test seam; production keeps a bounded pool until attach-v1 hello completes. */
+    maxPendingConnections?: number;
   }) {
     this.#tokens = deps.tokens;
     this.#storage = deps.storage;
@@ -161,7 +169,8 @@ export class AttachV1Ingress implements TurnEndpoint {
     this.#projectionMaxAttempts = deps.projectionMaxAttempts ?? 8;
     this.#trace = deps.trace;
     this.#log = deps.log ?? ((line) => console.warn(line));
-    this.#wss = new WebSocketServer({ noServer: true });
+    this.#maxPendingConnections = deps.maxPendingConnections ?? PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS;
+    this.#wss = new WebSocketServer({ noServer: true, maxPayload: PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES });
     this.#wss.on("error", () => {});
     this.#wss.on("connection", (socket, req) => this.#onConnection(socket, req));
     this.#heartbeat = setInterval(() => this.#tick(), this.#heartbeatIntervalMs);
@@ -178,6 +187,17 @@ export class AttachV1Ingress implements TurnEndpoint {
 
   #onConnection(socket: WebSocket, req: IncomingMessage): void {
     socket.on("error", () => socket.terminate());
+    if (this.#pendingConnections >= this.#maxPendingConnections) {
+      socket.close(1013, "too many pending connections");
+      return;
+    }
+    this.#pendingConnections += 1;
+    let pending = true;
+    const releasePending = (): void => {
+      if (!pending) return;
+      pending = false;
+      this.#pendingConnections -= 1;
+    };
     const agentId = this.#agentFor(req);
     if (agentId === undefined) {
       socket.close(1008, "unauthorized");
@@ -237,6 +257,7 @@ export class AttachV1Ingress implements TurnEndpoint {
           return;
         }
         connection.hello = true;
+        releasePending();
         this.#negotiated.add(agentId);
         connection.instanceId = frame.instanceId;
         connection.commandCursor = this.#storage.attachCommandCursor(agentId);
@@ -391,6 +412,7 @@ export class AttachV1Ingress implements TurnEndpoint {
 
     socket.on("close", (code) => {
       clearTimeout(helloTimer);
+      releasePending();
       if (this.#current.get(agentId) === connection) {
         this.#current.delete(agentId);
         this.#presence(agentId, "absent");

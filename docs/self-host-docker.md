@@ -105,7 +105,15 @@ docker compose exec gateway node dist/cli.js pair \
 
 The `--url` value is the exact origin CozyChat receives. Omit it only for a local/LAN setup where
 the loopback default is intentionally correct. The gateway itself is the only service published by
-the default Compose file; its SQLite state is in `gateway-data`.
+the default Compose file, and it is published on `127.0.0.1:8787` only; its SQLite state is in
+`gateway-data`. To deliberately expose plaintext on a trusted LAN, compose the LAN overlay:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d
+```
+
+Do not use that overlay for an internet-facing deployment. Use one of the TLS overlays below and
+pair using its HTTPS origin instead.
 
 The Hermes attach plugin for every configured profile points at the gateway's reachable origin and
 uses that profile's `tokenEnv` value. The profile list drives both regular conversations and Bot
@@ -140,7 +148,8 @@ docker compose -f docker-compose.yml -f docker-compose.tls-native.yml up -d
 
 The Caddy overlay publishes only Caddy on `80`/`443`; the gateway remains private on the Compose
 network. The native overlay mounts a PEM certificate and key set by `COZY_TLS_CERT_HOST_PATH` and
-`COZY_TLS_KEY_HOST_PATH`. See [`docs/tls.md`](tls.md) for certificate expectations and CozyChat's
+`COZY_TLS_KEY_HOST_PATH`; combine it with `docker-compose.lan.yml` when the TLS listener needs to
+be reachable off-host. See [`docs/tls.md`](tls.md) for certificate expectations and CozyChat's
 trust-on-first-use behavior.
 
 ## Push relay

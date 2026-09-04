@@ -267,6 +267,7 @@ describe("reference deployment", () => {
     expect(compose).toContain("/config:rw");
     expect(compose).not.toContain("cozygateway.config.json:ro");
     expect(compose).toContain("COZYGATEWAY_SECRETS_FILE");
+    expect(compose).toContain('"127.0.0.1:8787:8787"');
     expect(compose).not.toContain("COZYGATEWAY_ATTACH_TOKEN");
     expect(compose).not.toContain("agents:");
   });

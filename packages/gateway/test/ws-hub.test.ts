@@ -8,6 +8,7 @@ import type { ServerFrame } from "cozygateway-contract";
 import { openStorage, type Storage } from "../src/storage.ts";
 import { WsHub } from "../src/ws-hub.ts";
 import { mintDeviceToken } from "../src/auth.ts";
+import { PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES } from "../src/websocket-limits.ts";
 
 let hub: WsHub;
 let storage: Storage;
@@ -72,6 +73,49 @@ async function until(predicate: () => boolean, ms = 2_000): Promise<void> {
 }
 
 describe("auth", () => {
+  it("bounds pending handshakes, then frees a slot once a client authenticates", async () => {
+    hub.close();
+    hub = new WsHub({
+      storage,
+      gatewayInfo: { name: "g", version: "0.1.0", contract: "v1" },
+      now: () => 1_000,
+      authTimeoutMs: 2_000,
+      heartbeatMs: 25,
+      maxPendingConnections: 1,
+    });
+    const pending = connect();
+    await once(pending, "open");
+    const refused = connect();
+    await once(refused, "open");
+    const [refusedCode] = (await once(refused, "close")) as [number];
+    expect(refusedCode).toBe(1013);
+
+    const pendingFrames = frames(pending);
+    pending.send(JSON.stringify({ type: "auth", token }));
+    await until(() => pendingFrames.some((frame) => frame.type === "ready"));
+
+    const next = connect();
+    const nextFrames = frames(next);
+    await once(next, "open");
+    next.send(JSON.stringify({ type: "auth", token }));
+    await until(() => nextFrames.some((frame) => frame.type === "ready"));
+    const pendingClosed = once(pending, "close");
+    const nextClosed = once(next, "close");
+    pending.close();
+    next.close();
+    await Promise.all([pendingClosed, nextClosed]);
+    await until(() => !hub.isDeviceConnected("d1"));
+  });
+
+  it("rejects a frame over the public WebSocket payload ceiling", async () => {
+    const ws = connect();
+    ws.on("error", () => {});
+    await once(ws, "open");
+    ws.send("x".repeat(PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES + 1));
+    const [code] = (await once(ws, "close")) as [number];
+    expect(code).toBe(1009);
+  });
+
   it("traces connection lifecycle without raw device IDs or tokens", async () => {
     const ws = connect();
     const seen = frames(ws);
@@ -82,14 +126,20 @@ describe("auth", () => {
     await until(() => seen.some((frame) => frame.type === "synced"));
     ws.close();
     await once(ws, "close");
-    await until(() => traces.some((line) => JSON.parse(line).event === "app_ws_close"));
+    await until(() => {
+      const open = traces.findIndex((line) => JSON.parse(line).event === "app_ws_open");
+      return open >= 0 && traces.slice(open).some((line) => JSON.parse(line).event === "app_ws_close");
+    });
 
     const records = traces.map((line) => JSON.parse(line) as Record<string, unknown>);
-    expect(records.map((record) => record.event)).toEqual(["app_ws_open", "app_ws_auth", "app_ws_sync", "app_ws_close"]);
-    expect(records.at(-1)?.code).toBe(1005);
+    // A previous socket can finish its server-side close on the next tick; keep this assertion
+    // about this connection's ordered lifecycle rather than that unrelated teardown timing.
+    const lifecycle = records.slice(records.findIndex((record) => record.event === "app_ws_open"));
+    expect(lifecycle.map((record) => record.event)).toEqual(["app_ws_open", "app_ws_auth", "app_ws_sync", "app_ws_close"]);
+    expect(lifecycle.at(-1)?.code).toBe(1005);
     expect(traces.join("\n")).not.toContain(token);
     expect(traces.join("\n")).not.toContain('"d1"');
-    expect(String(records[1]?.device)).toMatch(/^[0-9a-f]{16}$/);
+    expect(String(lifecycle[1]?.device)).toMatch(/^[0-9a-f]{16}$/);
   });
 
   it("ready on a good token", async () => {
