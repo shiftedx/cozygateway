@@ -32,6 +32,18 @@ expect_contains() {
     return 1
   fi
 }
+make_directory_symlink() {
+  local target="$1" link="$2"
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      COZYGATEWAY_TEST_LINK_NATIVE="$(cygpath -w "$link")" \
+        COZYGATEWAY_TEST_TARGET_NATIVE="$(cygpath -w "$target")" \
+        powershell.exe -NoProfile -NonInteractive -Command \
+          'New-Item -ItemType Junction -Path $env:COZYGATEWAY_TEST_LINK_NATIVE -Target $env:COZYGATEWAY_TEST_TARGET_NATIVE | Out-Null'
+      ;;
+    *) ln -s "$target" "$link" ;;
+  esac
+}
 mkdir -p "$tmp/hermes/profiles/ops" "$tmp/hermes/profiles/active" "$tmp/bin"
 printf '{}\n' > "$tmp/hermes/config.yaml"
 printf '{}\n' > "$tmp/hermes/profiles/ops/config.yaml"
@@ -474,6 +486,19 @@ fi
 cmp -s "$tmp/darwin-plist-foreign" "$darwin_plist"
 cp "$tmp/darwin-plist-owned" "$darwin_plist"
 
+# Valid POSIX install paths containing XML metacharacters remain exact argv in
+# launchd and are recognized as owned on a subsequent repair.
+escaped_home="$tmp/darwin&home"
+escaped_gateway="$tmp/gateway-escaped-launchd"
+escaped_bundle="$tmp/gateway&bundle.mjs"
+mkdir -p "$escaped_home"
+cp "$tmp/gateway.mjs" "$escaped_bundle"
+for pass in first repair; do
+  HOME="$escaped_home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/escaped-launchd-$pass-commands" COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --profiles default --bundle "$escaped_bundle" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$escaped_gateway" >/dev/null
+done
+escaped_plist="$escaped_home/Library/LaunchAgents/ai.cozylabs.cozygateway.plist"
+grep -Fq 'gateway&amp;bundle.mjs' "$escaped_plist"
+
 # A fresh Hermes install can spend more than 30 seconds importing and warming
 # the Dashboard on a small Linux host. Model that boundary without making this
 # test slow: the endpoint becomes ready only after the initial probe plus 31
@@ -520,7 +545,7 @@ fi
 # enumerated only regular files, reported it current, and left Hermes loading
 # files reachable outside the selected profile.
 mkdir -p "$tmp/plugin-outside"
-ln -s "$tmp/plugin-outside" "$tmp/hermes/profiles/active/plugins/cozygateway/unexpected-link"
+make_directory_symlink "$tmp/plugin-outside" "$tmp/hermes/profiles/active/plugins/cozygateway/unexpected-link"
 if MATCHED_WITH_EXTRA_SYMLINK_OUTPUT="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/matched-with-extra-symlink-commands" COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"; then
   printf 'MATCHED_WITH_EXTRA_SYMLINK must fail closed:\n%s\n' "$MATCHED_WITH_EXTRA_SYMLINK_OUTPUT" >&2
   exit 1
@@ -531,7 +556,7 @@ rm "$tmp/hermes/profiles/active/plugins/cozygateway/unexpected-link"
 # A plugin root itself cannot be an installer-owned symlink, even when the
 # symlink destination has the marker and matching files.
 mv "$tmp/hermes/profiles/active/plugins/cozygateway" "$tmp/escaped-active-plugin"
-ln -s "$tmp/escaped-active-plugin" "$tmp/hermes/profiles/active/plugins/cozygateway"
+make_directory_symlink "$tmp/escaped-active-plugin" "$tmp/hermes/profiles/active/plugins/cozygateway"
 if symlinked_plugin_root_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/symlinked-plugin-root-commands" COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"; then
   printf 'symlinked plugin root must fail closed:\n%s\n' "$symlinked_plugin_root_output" >&2
   exit 1
@@ -543,7 +568,7 @@ mv "$tmp/escaped-active-plugin" "$tmp/hermes/profiles/active/plugins/cozygateway
 # The containing plugins directory is an ancestor escape, not an alternate
 # profile home. It must get the same fail-closed treatment as a symlink root.
 mv "$tmp/hermes/profiles/ops/plugins" "$tmp/escaped-ops-plugins"
-ln -s "$tmp/escaped-ops-plugins" "$tmp/hermes/profiles/ops/plugins"
+make_directory_symlink "$tmp/escaped-ops-plugins" "$tmp/hermes/profiles/ops/plugins"
 if symlinked_plugin_ancestor_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/symlinked-plugin-ancestor-commands" COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"; then
   printf 'symlinked plugin ancestor must fail closed:\n%s\n' "$symlinked_plugin_ancestor_output" >&2
   exit 1
@@ -1067,14 +1092,15 @@ wait "$crash_supervisor_pid" 2>/dev/null || true
 # Windows supervision permits exactly three restarts in one five-minute
 # window, then returns failure to Task Scheduler instead of looping forever.
 rm -f "$crash_spawn_log"
-set +e
-NODE_OPTIONS="--require=$tmp/crash-child-preload.cjs" COZYGATEWAY_TEST_CRASH_SPAWN_LOG="$crash_spawn_log" \
+if NODE_OPTIONS="--require=$tmp/crash-child-preload.cjs" COZYGATEWAY_TEST_CRASH_SPAWN_LOG="$crash_spawn_log" \
   "$real_node" "$tmp/supervisor.cjs" \
   --platform Windows --gateway-env "$tmp/gateway-live/local/gateway.env" --bundle "$tmp/reload-gateway.mjs" --config "$tmp/gateway-live/local/cozygateway.config.json" \
   --maintenance-socket unused --maintenance-worker unused --database unused \
-  >"$tmp/bounded-crash-supervisor.log" 2>&1
-bounded_crash_status=$?
-set -e
+  >"$tmp/bounded-crash-supervisor.log" 2>&1; then
+  bounded_crash_status=0
+else
+  bounded_crash_status=$?
+fi
 test "$bounded_crash_status" -ne 0
 test "$(wc -l < "$crash_spawn_log" | tr -d ' ')" = 4
 stop_test_pid "$mock_dashboard_pid"
@@ -1215,7 +1241,9 @@ ops_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/profiles/ops/.env")"
 install_count_before="$(grep -c '^default:gateway:install$' "$tmp/commands")"
 restart_count_before="$(grep -c ':gateway:restart$' "$tmp/commands" || true)"
 printf '\n' > "$tmp/pair-default-no"
-rerun_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_PAIR_PROMPT_INPUT="$tmp/pair-default-no" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"
+if ! rerun_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_PAIR_PROMPT_INPUT="$tmp/pair-default-no" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"; then
+  printf 'configured update rerun failed:\n%s\n' "$rerun_output" >&2; exit 1
+fi
 # Updates ask before minting pairing material and Enter takes the safe default: no new code.
 grep -Fq 'Create a new CozyChat pairing code? [y/N]' <<<"$rerun_output"
 if grep -Fq 'fake-qr' <<<"$rerun_output" || grep -Fq '"setupCode":"TEST-CODE"' <<<"$rerun_output"; then
@@ -1422,15 +1450,29 @@ exit 0
 POWERSHELL
 chmod 700 "$tmp/windows-bin/schtasks.exe" "$tmp/windows-bin/wscript.exe" "$tmp/windows-bin/powershell.exe"
 
-# Missing state may still recover an exact direct supervisor task when both
-# executable and supervisor are under the canonical Gateway home.
+# Missing state must not infer ownership from an incomplete direct supervisor
+# action, even when both executables are under the canonical Gateway home.
 direct_windows_gateway="$tmp/gateway-windows-direct-partial"
 mkdir -p "$direct_windows_gateway/runtime/node" "$direct_windows_gateway/local"
+printf 'preserve\n' > "$direct_windows_gateway/local/marker"
 direct_node_native="$($tmp/bin/cygpath -w "$direct_windows_gateway/runtime/node/node.exe")"
 direct_supervisor_native="$($tmp/bin/cygpath -w "$direct_windows_gateway/local/gateway-supervisor.cjs")"
 direct_task_xml="<Exec><Command>$direct_node_native</Command><Arguments>&quot;$direct_supervisor_native&quot; &quot;--platform&quot; &quot;Windows&quot; &quot;--gateway-env&quot; &quot;missing&quot;</Arguments></Exec>"
-HOME="$tmp/windows-direct-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:/usr/bin:/bin" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-direct-commands" COZYGATEWAY_TEST_SCHTASKS_XML="$direct_task_xml" COZYGATEWAY_NODE=false COZYGATEWAY_HERMES_BIN=false COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$direct_windows_gateway" >/dev/null
-grep -Fq '/Delete /F /TN CozyGateway' "$tmp/windows-direct-commands"
+if HOME="$tmp/windows-direct-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:/usr/bin:/bin" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-direct-commands" COZYGATEWAY_TEST_SCHTASKS_XML="$direct_task_xml" COZYGATEWAY_NODE=false COZYGATEWAY_HERMES_BIN=false COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$direct_windows_gateway" >/dev/null 2>&1; then
+  echo 'expected incomplete missing-state task action to fail closed' >&2; exit 1
+fi
+! grep -Fq '/Delete /F /TN CozyGateway' "$tmp/windows-direct-commands"
+test -f "$direct_windows_gateway/local/marker"
+
+# The complete exact direct action remains recoverable without install-state.
+direct_gateway_env="$($tmp/bin/cygpath -w "$direct_windows_gateway/local/gateway.env")"
+direct_bundle="$($tmp/bin/cygpath -w "$direct_windows_gateway/bin/cozygateway.mjs")"
+direct_config="$($tmp/bin/cygpath -w "$direct_windows_gateway/local/cozygateway.config.json")"
+direct_worker="$($tmp/bin/cygpath -w "$direct_windows_gateway/bin/gateway-maintenance-worker.cjs")"
+direct_database="$($tmp/bin/cygpath -w "$direct_windows_gateway/local/cozygateway.sqlite")"
+direct_task_xml="<Exec><Command>$direct_node_native</Command><Arguments>&quot;$direct_supervisor_native&quot; &quot;--platform&quot; &quot;Windows&quot; &quot;--gateway-env&quot; &quot;$direct_gateway_env&quot; &quot;--bundle&quot; &quot;$direct_bundle&quot; &quot;--config&quot; &quot;$direct_config&quot; &quot;--maintenance-socket&quot; &quot;\\\\.\pipe\cozygateway-maintenance&quot; &quot;--maintenance-worker&quot; &quot;$direct_worker&quot; &quot;--database&quot; &quot;$direct_database&quot;</Arguments></Exec>"
+HOME="$tmp/windows-direct-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:/usr/bin:/bin" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-direct-owned-commands" COZYGATEWAY_TEST_SCHTASKS_XML="$direct_task_xml" COZYGATEWAY_NODE=false COZYGATEWAY_HERMES_BIN=false COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$direct_windows_gateway" >/dev/null
+grep -Fq '/Delete /F /TN CozyGateway' "$tmp/windows-direct-owned-commands"
 test ! -e "$direct_windows_gateway"
 
 # Missing install-state is still a Windows cleanup path: remove only the
@@ -1461,8 +1503,10 @@ foreign_windows_startup="$tmp/windows-appdata/Microsoft/Windows/Start Menu/Progr
 mkdir -p "$foreign_windows_gateway/local" "$(dirname "$foreign_windows_startup")"
 printf 'foreign launcher\n' > "$foreign_windows_gateway/local/run-gateway.vbs"
 printf 'foreign startup\n' > "$foreign_windows_startup"
-HOME="$tmp/windows-foreign-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:/usr/bin:/bin" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-foreign-commands" COZYGATEWAY_TEST_SCHTASKS_XML='foreign-task' COZYGATEWAY_NODE=false COZYGATEWAY_HERMES_BIN=false COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$foreign_windows_gateway" >/dev/null
-test ! -e "$foreign_windows_gateway"
+if HOME="$tmp/windows-foreign-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:/usr/bin:/bin" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-foreign-commands" COZYGATEWAY_TEST_SCHTASKS_XML='<Exec><Command>foreign.exe</Command><Arguments>foreign</Arguments></Exec>' COZYGATEWAY_NODE=false COZYGATEWAY_HERMES_BIN=false COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$foreign_windows_gateway" >/dev/null 2>&1; then
+  echo 'expected foreign missing-state registrations to preserve the Gateway directory' >&2; exit 1
+fi
+test -e "$foreign_windows_gateway"
 test -e "$foreign_windows_startup"
 [ ! -f "$tmp/windows-foreign-commands" ] || ! grep -Fq '/Delete /F /TN CozyGateway' "$tmp/windows-foreign-commands"
 

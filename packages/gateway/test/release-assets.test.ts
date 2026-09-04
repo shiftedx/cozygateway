@@ -67,14 +67,19 @@ describe("what a release publishes", () => {
   });
 
   it("POSIX exits once and relies on the native service restart", () => {
-    expect(INSTALLER).toContain("<string>$NODE_RESOLVED</string><string>$SUPERVISOR</string>");
+    const serviceWriter = INSTALLER.slice(INSTALLER.indexOf("install_service() {"), INSTALLER.indexOf("dashboard_ready() {"));
+    expect(INSTALLER).toContain('<string>$(xml_escape "$NODE_RESOLVED")</string><string>$(xml_escape "$SUPERVISOR")</string>');
     expect(INSTALLER).toContain("printf 'ExecStart=%q %q ' \"$NODE_RESOLVED\" \"$SUPERVISOR\"");
-    expect(INSTALLER).not.toContain("ExecStart=/bin/bash $WRAPPER");
+    expect(serviceWriter).not.toContain("ExecStart=/bin/bash $WRAPPER");
   });
 
   it("Windows bounds child restarts", () => {
     expect(SUPERVISOR_BODY).toContain("crashTimes.length >= 3");
     expect(SUPERVISOR_BODY).toContain("now - crashTimes[0] >= 300_000");
+  });
+
+  it("derives missing-state Windows task ownership from the canonical Gateway bundle", () => {
+    expect(INSTALLER).toContain('bundle="$(to_windows_path "$GATEWAY_DIR/bin/cozygateway.mjs")"');
   });
 
   it("config change restarts without spending crash budget", () => {
