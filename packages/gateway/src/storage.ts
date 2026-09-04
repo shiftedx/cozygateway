@@ -3243,16 +3243,35 @@ export class Storage {
            cancel_reason = COALESCE(cancel_reason, 'session deleted') WHERE agent_id = ? AND sequence = ?`,
         ).run(JSON.stringify({ kind: "discard", originalKind: original.kind, reason: "session deleted" }), input.deletedAt, input.bot, row.sequence);
       }
-      const eventRows = this.#db.prepare(
+      // Canonical-home scheduled events deliberately carry no threadId. Their admission-time
+      // delivery binding is the canonical session association, so collect it before removing
+      // that mapping or redacting the inbox payload.
+      const scheduledRows = this.#db.prepare(
+        `SELECT inbox.sequence, inbox.event_id AS eventId, inbox.frame_json AS frameJson
+         FROM attach_scheduled_deliveries AS delivery
+         JOIN attach_event_inbox AS inbox
+           ON inbox.agent_id = delivery.agent_id AND inbox.event_id = delivery.event_id
+         WHERE delivery.agent_id = ? AND delivery.thread_id = ?`,
+      ).all(input.bot, input.sessionId) as Array<{ sequence: number; eventId: string; frameJson: string }>;
+      const scheduledMediaIds = new Set<string>();
+      for (const row of scheduledRows) {
+        const frame = JSON.parse(row.frameJson) as AttachV1EventFrame;
+        if (frame.event.kind === "scheduled") for (const mediaId of frame.event.mediaIds ?? []) scheduledMediaIds.add(mediaId);
+      }
+      const directEventRows = this.#db.prepare(
         `SELECT sequence, event_id AS eventId FROM attach_event_inbox
          WHERE agent_id = ? AND json_extract(frame_json, '$.event.threadId') = ?`,
       ).all(input.bot, input.sessionId) as Array<{ sequence: number; eventId: string }>;
-      for (const row of eventRows) {
+      const eventRows = new Map<number, { eventId: string }>([
+        ...directEventRows.map((row) => [row.sequence, { eventId: row.eventId }] as const),
+        ...scheduledRows.map((row) => [row.sequence, { eventId: row.eventId }] as const),
+      ]);
+      for (const [sequence, row] of eventRows) {
         this.#db.prepare(
           `UPDATE attach_event_inbox SET frame_json = ?, disposition = 'discarded', applied_at = COALESCE(applied_at, ?),
            projection_error = COALESCE(projection_error, 'session deleted'), dead_lettered_at = COALESCE(dead_lettered_at, ?)
            WHERE agent_id = ? AND sequence = ?`,
-        ).run(JSON.stringify({ kind: "event", sequence: row.sequence, eventId: row.eventId, event: { kind: "presence", state: "absent" } }), input.deletedAt, input.deletedAt, input.bot, row.sequence);
+        ).run(JSON.stringify({ kind: "event", sequence, eventId: row.eventId, event: { kind: "presence", state: "absent" } }), input.deletedAt, input.deletedAt, input.bot, sequence);
       }
       this.#db.prepare("DELETE FROM attach_scheduled_deliveries WHERE agent_id = ? AND thread_id = ?")
         .run(input.bot, input.sessionId);
@@ -3270,6 +3289,18 @@ export class Storage {
            WHERE inbox.agent_id = ? AND media.value = attach_media.media_id
          )`,
       ).run(input.bot, input.bot, input.sessionId, input.bot, input.sessionId, input.bot);
+      const deleteUnreferencedMedia = this.#db.prepare(
+        `DELETE FROM attach_media WHERE agent_id = ? AND media_id = ? AND NOT EXISTS (
+           SELECT 1 FROM bot_native_messages AS message, json_each(message.attachments_json) AS attachment
+           WHERE message.bot = ? AND message.session_id <> ?
+             AND json_extract(attachment.value, '$.fileId') = attach_media.media_id
+         ) AND NOT EXISTS (
+           SELECT 1 FROM attach_event_inbox AS inbox, json_each(inbox.frame_json, '$.event.mediaIds') AS media
+           WHERE inbox.agent_id = ? AND media.value = attach_media.media_id
+         )`,
+      );
+      for (const mediaId of scheduledMediaIds)
+        deleteUnreferencedMedia.run(input.bot, mediaId, input.bot, input.sessionId, input.bot);
       for (const table of ["bot_native_messages", "bot_chat_tool_steps", "bot_chat_delegations", "bot_mobile_receipts", "bot_native_interactions", "bot_native_turn_terminals", "bot_desktop_resume_bindings"]) {
         this.#db.prepare(`DELETE FROM ${table} WHERE bot = ? AND session_id = ?`).run(input.bot, input.sessionId);
       }

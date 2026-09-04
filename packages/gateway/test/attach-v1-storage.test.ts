@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 
 import { openStorage } from "../src/storage.ts";
@@ -80,6 +81,54 @@ describe("attach-v1 durable transport storage", () => {
     expect(storage.unappliedAttachEvents("sage")).toEqual([]);
     expect(JSON.stringify(storage.pendingAttachCommands("sage", 0, 10))).not.toContain(stale);
     storage.close();
+  });
+
+  it("redacts canonical-home scheduled payloads by their durable session binding and retains shared media", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "attach-delete-scheduled-privacy-")), "gateway.sqlite");
+    const storage = openStorage(path);
+    const stale = storage.nativeBotChat("sage", 1).sessionId;
+    const privateBytes = Uint8Array.from([1, 2, 3]);
+    const sharedBytes = Uint8Array.from([4, 5, 6]);
+    for (const [mediaId, bytes] of [["scheduled-private-media", privateBytes], ["scheduled-shared-media", sharedBytes]] as const) {
+      storage.saveAttachMedia("sage", {
+        mediaId, mimeType: "image/png", byteCount: bytes.byteLength,
+        sha256: createHash("sha256").update(bytes).digest("hex"), filename: `${mediaId}.png`, family: "image",
+      }, bytes, 1);
+    }
+    expect(storage.acceptAttachEvent("sage", {
+      kind: "event", sequence: 1, eventId: "canonical-home-secret",
+      event: {
+        kind: "scheduled", target: { kind: "canonical_home" }, deliveryId: "secret-daily", messageId: "secret-message",
+        blocks: [{ type: "paragraph", text: "scheduled private payload" }], mediaIds: ["scheduled-private-media", "scheduled-shared-media"],
+      },
+    }, 2).status).toBe("accepted");
+    const current = storage.resetNativeBotChat("sage", 3);
+    storage.appendNativeBotMessage({
+      bot: "sage", sessionId: current, messageId: "shared-message", role: "assistant", text: "keep shared", at: 3,
+      attachments: [{ type: "attachment", fileId: "scheduled-shared-media", name: "shared.png", mimeType: "image/png", size: sharedBytes.byteLength, mediaKind: "image" }],
+    });
+    expect(storage.deleteNativeBotSession({ bot: "sage", sessionId: stale, deletedAt: 4, enqueue: true }).outcome).toBe("deleted");
+    expect(storage.attachScheduledDeliveryReceipt("sage", "secret-daily")).toBeUndefined();
+    expect(storage.attachMediaInfo("sage", "scheduled-private-media", 5)).toBeUndefined();
+    expect(storage.attachMediaSlice("sage", "scheduled-private-media", 0, 8, 5)).toBeUndefined();
+    expect(storage.attachMediaInfo("sage", "scheduled-shared-media", 5)).toBeDefined();
+    storage.close();
+
+    const raw = new DatabaseSync(path, { readOnly: true });
+    const row = raw.prepare("SELECT frame_json AS frameJson FROM attach_event_inbox WHERE agent_id = ? AND event_id = ?")
+      .get("sage", "canonical-home-secret") as { frameJson: string } | undefined;
+    raw.close();
+    expect(JSON.parse(row?.frameJson ?? "null")).toEqual({
+      kind: "event", sequence: 1, eventId: "canonical-home-secret", event: { kind: "presence", state: "absent" },
+    });
+    expect(row?.frameJson).not.toContain("scheduled private payload");
+    expect(row?.frameJson).not.toContain("scheduled-private-media");
+    expect(row?.frameJson).not.toContain("scheduled-shared-media");
+    expect(row?.frameJson).not.toContain("canonical_home");
+    const reopened = openStorage(path);
+    expect(reopened.attachMediaInfo("sage", "scheduled-private-media", 5)).toBeUndefined();
+    expect(reopened.attachMediaInfo("sage", "scheduled-shared-media", 5)).toBeDefined();
+    reopened.close();
   });
 
   it("reconciles only an issued contiguous plugin resume cursor", () => {
