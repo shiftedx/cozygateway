@@ -227,7 +227,7 @@ foreach ($shape in @('DirectLauncher', 'PythonLauncher', 'Module', 'UnderRootScr
 $supervisor = Get-Content -LiteralPath (Join-Path $repoRoot 'scripts\gateway-supervisor.cjs') -Raw
 $windowsProfileLaunches = [regex]::Matches(($installer + $supervisor), "\? \['-p', 'default'\] : \[\]")
 Assert-Equal 'both Windows Dashboard spawn sites carry explicit default-profile proof' 2 $windowsProfileLaunches.Count
-Assert-Equal 'Windows stale-token stop carries explicit default-profile proof' $true ($installer -match 'dashboard -p default --stop')
+Assert-Equal 'installer never stops an existing Dashboard to replace its credentials' $false ($installer -match 'dashboard -p default --stop')
 
 $scriptProcess = New-TestProcess 300 0 $uvPython ('"{0}" "{1}" dashboard -p default --port=9119' -f $uvPython, $mainScript)
 Assert-Owner 'orphaned in-root main.py' 'Owned' $scriptProcess @{ 300 = $scriptProcess }

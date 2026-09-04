@@ -41,6 +41,7 @@ interface Harness {
   roster: RunnerRoster;
   online: Set<string>;
   contact: Map<string, number>;
+  liveVersions: Map<string, string>;
   revoked: string[];
   authed: (path: string, init?: RequestInit) => Promise<Response>;
   runners: () => Promise<Runner[]>;
@@ -59,6 +60,7 @@ async function harness(opts: { legacy?: boolean } = {}): Promise<Harness> {
   const roster = new RunnerRoster({ storage, now });
   const online = new Set<string>();
   const contact = new Map<string, number>();
+  const liveVersions = new Map<string, string>();
   const revoked: string[] = [];
   const app = createApp({
     storage,
@@ -68,6 +70,7 @@ async function harness(opts: { legacy?: boolean } = {}): Promise<Harness> {
     runnerPresence: {
       online: (id) => online.has(id),
       lastContactAt: (id) => contact.get(id) ?? null,
+      agentVersion: (id) => (online.has(id) ? liveVersions.get(id) : undefined),
     },
     ...(opts.legacy === true ? { legacyRunnerConfigured: true } : {}),
     onRunnerRevoked: (id) => revoked.push(id),
@@ -100,6 +103,7 @@ async function harness(opts: { legacy?: boolean } = {}): Promise<Harness> {
     roster,
     online,
     contact,
+    liveVersions,
     revoked,
     authed,
     runners: async () => ((await (await authed("/runners")).json()) as { runners: Runner[] }).runners,
@@ -606,10 +610,10 @@ describe("GET /runners/self", () => {
     });
     expect(response.status).toBe(200);
     const body = (await response.json()) as Record<string, unknown>;
-    // Exactly the seven fields the installer reads: no token, no backends, no other runner.
+    // Installer fields and the legacy online alias: no token, no backends, no other runner.
     // `renamed` is capability 55's addition to this same row.
     expect(Object.keys(body).sort()).toEqual([
-      "attached", "default", "id", "lastSeenAt", "name", "platform", "renamed",
+      "attached", "default", "id", "lastSeenAt", "name", "online", "platform", "renamed",
     ]);
     expect(body).toEqual({
       id: paired.runner.id,
@@ -618,6 +622,7 @@ describe("GET /runners/self", () => {
       default: true,
       lastSeenAt: NOW + 3_000,
       attached: false,
+      online: false,
       renamed: false,
     });
   });
@@ -648,9 +653,28 @@ describe("GET /runners/self", () => {
         await h.app.request("/runners/self", { headers: { authorization: `Bearer ${paired.token}` } })
       ).json()) as { attached: boolean };
     // Paired, service not yet dialed in: the row exists and the answer says so honestly.
-    expect((await self()).attached).toBe(false);
+    expect(await self()).toMatchObject({ attached: false, online: false });
     h.online.add(paired.runner.id);
-    expect((await self()).attached).toBe(true);
+    expect(await self()).toMatchObject({ attached: true, online: true });
+  });
+
+  it("reports a version only from the current attached hello, never an offline roster observation", async () => {
+    const h = await harness();
+    const paired = h.roster.pair({ name: "box" });
+    // This is deliberately durable but stale: it cannot prove a newly installed process started.
+    h.roster.observe(paired.runner.id, { version: "0.1.0" });
+    const read = async () =>
+      (await (await h.app.request("/runners/self", {
+        headers: { authorization: `Bearer ${paired.token}` },
+      })).json()) as { attached: boolean; agentVersion?: string };
+    expect(await read()).toEqual(expect.objectContaining({ attached: false }));
+    expect((await read()).agentVersion).toBeUndefined();
+    h.online.add(paired.runner.id);
+    h.liveVersions.set(paired.runner.id, "0.2.0");
+    expect(await read()).toEqual(expect.objectContaining({ attached: true, agentVersion: "0.2.0" }));
+    h.online.delete(paired.runner.id);
+    // Retaining the live map entry makes this an explicit no-stale-version assertion.
+    expect((await read()).agentVersion).toBeUndefined();
   });
 
   it("refuses a device token, an unknown token, and a revoked one", async () => {

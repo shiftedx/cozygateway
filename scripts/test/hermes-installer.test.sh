@@ -17,7 +17,7 @@ stop_test_pid() {
     *) kill "$pid" 2>/dev/null || true ;;
   esac
 }
-trap 'stop_test_pid "${supervisor_pid:-}"; stop_test_pid "${mock_dashboard_pid:-}"; stop_test_pid "${failed_dashboard_pid:-}"; stop_test_pid "${foreign_dashboard_pid:-}"; rm -rf "$tmp"' EXIT
+trap 'stop_test_pid "${supervisor_pid:-}"; stop_test_pid "${foreign_supervisor_pid:-}"; stop_test_pid "${mock_dashboard_pid:-}"; stop_test_pid "${failed_dashboard_pid:-}"; stop_test_pid "${foreign_dashboard_pid:-}"; rm -rf "$tmp"' EXIT
 # Under `set -e` a bare assertion dies with no output at all, so a failure on a machine you cannot
 # reach reads as "it stopped somewhere". Name the line and the command that failed.
 trap 'status=$?; [ "$status" -eq 0 ] || printf "FAIL  line %s exited %s: %s\n" "$LINENO" "$status" "$BASH_COMMAND" >&2' ERR
@@ -41,6 +41,12 @@ tree_sha256() {
   else
     echo 'sha256 tool required (sha256sum or shasum)' >&2
     return 1
+  fi
+}
+file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  else echo 'sha256 tool required (sha256sum or shasum)' >&2; return 1
   fi
 }
 make_directory_symlink() {
@@ -259,13 +265,15 @@ for asset in cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz cozygateway
 done
 cp "$repo_root/scripts/gateway-supervisor.cjs" "$tmp/gateway-supervisor.cjs"
 release_asset_base="file://$tmp/release-assets"
+bootstrap_user_home="$tmp/bootstrap-user-home"
+mkdir -p "$bootstrap_user_home"
 case "$OSTYPE" in
   msys*|cygwin*)
     release_assets_windows="$(cygpath -w "$tmp/release-assets")"
     release_asset_base="file:///${release_assets_windows//\\//}"
     ;;
 esac
-bootstrap_dry_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-dry-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_INSTALL_DRYRUN=1 bash "$repo_root/scripts/install.sh")"
+bootstrap_dry_output="$(HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-dry-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_INSTALL_DRYRUN=1 bash "$repo_root/scripts/install.sh")"
 grep -Fq 'DRY   verified assets' <<<"$bootstrap_dry_output"
 test ! -e "$tmp/bootstrap-dry-home"
 
@@ -278,9 +286,10 @@ BOOTSTRAP_HANDOFF
 chmod 700 "$tmp/release-assets/cozygateway-installer.sh"
 if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/cozygateway-installer.sh" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/cozygateway-installer.sh" | awk '{print $1}')"; fi
 printf '%s  cozygateway-installer.sh\n' "$asset_sha" > "$tmp/release-assets/cozygateway-installer.sh.sha256"
-COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff" bash "$repo_root/scripts/install.sh"
+HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff" bash "$repo_root/scripts/install.sh"
 test -x "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh"
 test -f "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh.sha256"
+test "$(cat "$tmp/bootstrap-live-home/local/bootstrap-source")" = "$release_asset_base"
 grep -Fq -- '--gateway-dir' "$tmp/bootstrap-handoff"
 test -z "$(find "$tmp/bootstrap-live-home" -maxdepth 1 -name '.bootstrap.*' -print -quit)"
 case "$(uname -s)" in
@@ -288,7 +297,7 @@ case "$(uname -s)" in
   *)
     mkdir -p "$tmp/bootstrap-unsafe-home" "$tmp/bootstrap-unsafe-target"
     ln -s "$tmp/bootstrap-unsafe-target" "$tmp/bootstrap-unsafe-home/bin"
-    if unsafe_bootstrap_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-unsafe-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" bash "$repo_root/scripts/install.sh" 2>&1)"; then
+    if unsafe_bootstrap_output="$(HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-unsafe-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" bash "$repo_root/scripts/install.sh" 2>&1)"; then
       echo 'symlinked bootstrap bin must be rejected' >&2
       exit 1
     fi
@@ -310,7 +319,7 @@ else
   before_bootstrap_sha="$(sha256sum "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"
 fi
 printf 'tampered bootstrap\n' > "$tmp/release-assets/install.sh"
-if late_bootstrap_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-late" bash "$repo_root/scripts/install.sh" 2>&1)"; then
+if late_bootstrap_output="$(HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-late" bash "$repo_root/scripts/install.sh" 2>&1)"; then
   echo 'late bootstrap checksum failure must fail before promotion' >&2
   exit 1
 fi
@@ -330,6 +339,54 @@ else
   test "$before_bootstrap_sha" = "$(sha256sum "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"
 fi
 test ! -e "$tmp/bootstrap-handoff-late"
+cp "$repo_root/scripts/install.sh" "$tmp/release-assets/install.sh"
+if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/install.sh" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/install.sh" | awk '{print $1}')"; fi
+printf '%s  install.sh\n' "$asset_sha" > "$tmp/release-assets/install.sh.sha256"
+
+# Promotion is a journaled transaction. A hard kill after the first replacement
+# leaves a durable snapshot; the next one-line run restores it before fetching,
+# then installs one coherent new release rather than a mixed asset set.
+cp "$tmp/bootstrap-live-home/bin/cozygateway.mjs" "$tmp/bootstrap-before-kill.mjs"
+printf 'new verified bundle after interrupted bootstrap\n' > "$tmp/release-assets/cozygateway.mjs"
+if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/cozygateway.mjs" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/cozygateway.mjs" | awk '{print $1}')"; fi
+printf '%s  cozygateway.mjs\n' "$asset_sha" > "$tmp/release-assets/cozygateway.mjs.sha256"
+set +e
+HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-killed" COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION=cozygateway.mjs bash "$repo_root/scripts/install.sh" >"$tmp/bootstrap-killed.log" 2>&1
+bootstrap_killed_status=$?
+set -e
+test "$bootstrap_killed_status" -ne 0
+test -f "$tmp/bootstrap-live-home/.bootstrap-transaction"
+cmp -s "$tmp/bootstrap-before-kill.mjs" "$tmp/bootstrap-live-home/.bootstrap-previous/cozygateway.mjs"
+set +e
+bootstrap_recovered_output="$(HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-recovered" bash "$repo_root/scripts/install.sh" 2>&1)"
+bootstrap_recovered_status=$?
+set -e
+if [ "$bootstrap_recovered_status" -ne 0 ]; then printf '%s\n' "$bootstrap_recovered_output" >&2; exit 1; fi
+expect_contains "$bootstrap_recovered_output" 'recovering an interrupted CozyGateway bootstrap'
+cmp -s "$tmp/release-assets/cozygateway.mjs" "$tmp/bootstrap-live-home/bin/cozygateway.mjs"
+test ! -e "$tmp/bootstrap-live-home/.bootstrap-transaction"
+test ! -e "$tmp/bootstrap-live-home/.bootstrap-previous"
+
+# A child installer failure returns the complete prior payload instead of
+# leaving a freshly downloaded bootstrap that no matching service can run.
+cp "$tmp/bootstrap-live-home/bin/cozygateway.mjs" "$tmp/bootstrap-before-child-failure.mjs"
+cat > "$tmp/release-assets/cozygateway-installer.sh" <<'BOOTSTRAP_FAILURE'
+#!/usr/bin/env bash
+exit 23
+BOOTSTRAP_FAILURE
+chmod 700 "$tmp/release-assets/cozygateway-installer.sh"
+if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/cozygateway-installer.sh" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/cozygateway-installer.sh" | awk '{print $1}')"; fi
+printf '%s  cozygateway-installer.sh\n' "$asset_sha" > "$tmp/release-assets/cozygateway-installer.sh.sha256"
+if child_failure_output="$(HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-rolled-back" bash "$repo_root/scripts/install.sh" 2>&1)"; then
+  echo 'failed child installer must roll back the release assets' >&2
+  exit 1
+fi
+expect_contains "$child_failure_output" 'installer failed; restored the previous CozyGateway release'
+expect_contains "$child_failure_output" 'restored previous CozyGateway assets; no prior service was registered'
+cmp -s "$tmp/bootstrap-before-child-failure.mjs" "$tmp/bootstrap-live-home/bin/cozygateway.mjs"
+test ! -e "$tmp/bootstrap-handoff-rolled-back"
+test ! -e "$tmp/bootstrap-live-home/.bootstrap-transaction"
+test ! -e "$tmp/bootstrap-live-home/.bootstrap-previous"
 
 # An ordinary rerun retains its recorded scope; an explicit `--profiles all`
 # remains the deliberate way to widen it.
@@ -410,6 +467,12 @@ cat > "$tmp/service-bin/launchctl" <<'LAUNCHCTL'
 if [ "${1:-}" = bootstrap ] && [ -n "${COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER:-}" ] && [ ! -f "$COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER" ]; then
   : > "$COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER"
   exit 5
+fi
+if [ -n "${COZYGATEWAY_TEST_LAUNCHCTL_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$COZYGATEWAY_TEST_LAUNCHCTL_LOG"
+fi
+if { [ "${1:-}" = kickstart ] || [ "${1:-}" = bootstrap ]; } && [ -n "${COZYGATEWAY_TEST_LAUNCHCTL_KICKSTART_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$COZYGATEWAY_TEST_LAUNCHCTL_KICKSTART_LOG"
 fi
 exit 0
 LAUNCHCTL
@@ -691,10 +754,159 @@ grep -Fq '"host": "0.0.0.0"' "$tmp/gateway-live/local/cozygateway.config.json"
 grep -Fq 'COZYGATEWAY_URL=http://127.0.0.1:8787' "$tmp/hermes/.env"
 grep -Fq 'http://127.0.0.1:8787/health' "$tmp/curl.log"
 
+# A machine can host Hermes profiles that belong to another Gateway. Runtime-only
+# repair must update the owned runtime without adopting those profiles, replacing
+# their tokens, or rewriting their plugin/service state. The registered service
+# is deliberately the old two-argument /bin/bash wrapper accepted by prior
+# releases; current repair must still recognize and restart it.
+runtime_gateway="$tmp/gateway-runtime-only"
+runtime_home="$tmp/runtime-only-home"
+runtime_profiles="$tmp/runtime-only-hermes"
+cp -R "$tmp/gateway-live" "$runtime_gateway"
+mkdir -p "$runtime_home/Library/LaunchAgents" "$runtime_profiles/profiles/ops/plugins"
+cat > "$runtime_gateway/local/run-gateway.sh" <<'LEGACY_WRAPPER'
+#!/usr/bin/env bash
+# Legacy installer wrapper retained by a runtime-only repair.
+exec "$@"
+LEGACY_WRAPPER
+chmod 700 "$runtime_gateway/local/run-gateway.sh"
+sed -i.bak -E '/^(harness|node_resolved|supervisor)=/d' "$runtime_gateway/local/install-state" && rm -f "$runtime_gateway/local/install-state.bak"
+cat > "$runtime_home/Library/LaunchAgents/ai.cozylabs.cozygateway.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>ProgramArguments</key><array><string>/bin/bash</string><string>$runtime_gateway/local/run-gateway.sh</string></array></dict></plist>
+PLIST
+"$real_node" - "$runtime_gateway/local/cozygateway.config.json" <<'NODE'
+const { readFileSync, writeFileSync } = require('node:fs');
+const path = process.argv[2];
+const config = JSON.parse(readFileSync(path, 'utf8'));
+config.host = '127.0.0.1';
+config.port = 9000;
+config.hermesEndpoints = [{ id: 'default', url: 'ws://127.0.0.1:19120/api/ws', authMode: 'token', tokenEnv: 'COZYGATEWAY_HERMES_TOKEN', profile: 'default', profiles: ['default', 'ops'] }];
+writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
+NODE
+cat > "$runtime_profiles/.env" <<'REMOTE_PROFILE'
+COZYGATEWAY_INSTALLER_OWNER=cozylabs-v1
+COZYGATEWAY_URL=https://warm.cozylabs.ai
+COZYGATEWAY_TOKEN=remote-token-must-not-change
+REMOTE_PROFILE
+printf 'remote plugin sentinel\n' > "$runtime_profiles/profiles/ops/plugins/keep.txt"
+runtime_gateway_before="$(tree_sha256 "$runtime_gateway/local")"
+runtime_config_before="$(file_sha256 "$runtime_gateway/local/cozygateway.config.json")"
+runtime_env_before="$(file_sha256 "$runtime_gateway/local/gateway.env")"
+runtime_profiles_before="$(tree_sha256 "$runtime_profiles")"
+if ! runtime_output="$(env -u COZYGATEWAY_NODE HOME="$runtime_home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_CURL_LOG="$tmp/runtime-only-curl.log" COZYGATEWAY_TEST_LAUNCHCTL_KICKSTART_LOG="$tmp/runtime-only-kickstart.log" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --runtime-only --bundle "$tmp/gateway.mjs" --gateway-dir "$runtime_gateway" 2>&1)"; then
+  printf 'runtime-only repair failed:\n%s\n' "$runtime_output" >&2
+  exit 1
+fi
+grep -Fq 'updated CozyGateway runtime and supervisor without changing Hermes profiles' <<<"$runtime_output"
+grep -Fq 'http://127.0.0.1:9000/health' "$tmp/runtime-only-curl.log"
+grep -Fq "bootstrap gui/$(id -u)" "$tmp/runtime-only-kickstart.log"
+grep -Fqx 'harness=hermes' "$runtime_gateway/local/install-state"
+grep -Fqx 'repair_mode=runtime-only' "$runtime_gateway/local/install-state"
+grep -Fq "$runtime_gateway/runtime/node/bin/node" "$runtime_gateway/bin/cozygateway"
+grep -Fqx 'set -euo pipefail' <(sed -n '2p' "$runtime_gateway/local/run-gateway.sh")
+grep -Fq "$runtime_gateway/local/gateway-supervisor.cjs" "$runtime_gateway/local/run-gateway.sh"
+cmp -s "$tmp/gateway-supervisor.cjs" "$runtime_gateway/local/gateway-supervisor.cjs"
+test "$runtime_gateway_before" != "$(tree_sha256 "$runtime_gateway/local")"
+test "$runtime_config_before" = "$(file_sha256 "$runtime_gateway/local/cozygateway.config.json")"
+test "$runtime_env_before" = "$(file_sha256 "$runtime_gateway/local/gateway.env")"
+test "$runtime_profiles_before" = "$(tree_sha256 "$runtime_profiles")"
+# Dry-run removal validates the owned registration but must not boot it out,
+# remove the CLI, or remove the Gateway home.
+runtime_dry_before="$(tree_sha256 "$runtime_gateway")"
+rm -f "$tmp/runtime-only-dry-launchctl.log"
+runtime_dry_output="$(HOME="$runtime_home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LAUNCHCTL_LOG="$tmp/runtime-only-dry-launchctl.log" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --uninstall --gateway-dir "$runtime_gateway" 2>&1)"
+expect_contains "$runtime_dry_output" 'DRY   stop and remove owned launchd service'
+test "$runtime_dry_before" = "$(tree_sha256 "$runtime_gateway")"
+test ! -s "$tmp/runtime-only-dry-launchctl.log"
+test "$runtime_profiles_before" = "$(tree_sha256 "$runtime_profiles")"
+# The generated CLI keeps that narrow mode on every later repair.
+cat > "$runtime_gateway/bin/cozygateway-bootstrap.sh" <<'RUNTIME_REPAIR_BOOTSTRAP'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${COZYGATEWAY_TEST_RUNTIME_REPAIR_LOG:?}"
+RUNTIME_REPAIR_BOOTSTRAP
+chmod 700 "$runtime_gateway/bin/cozygateway-bootstrap.sh"
+if command -v shasum >/dev/null 2>&1; then runtime_repair_sha="$(shasum -a 256 "$runtime_gateway/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; else runtime_repair_sha="$(sha256sum "$runtime_gateway/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; fi
+printf '%s  install.sh\n' "$runtime_repair_sha" > "$runtime_gateway/bin/cozygateway-bootstrap.sh.sha256"
+printf 'file://%s\n' "$tmp/runtime-release" > "$runtime_gateway/local/bootstrap-source"
+COZYGATEWAY_TEST_RUNTIME_REPAIR_LOG="$tmp/runtime-only-repair.log" "$runtime_gateway/bin/cozygateway" repair >/dev/null
+grep -Fqx -- '--runtime-only' "$tmp/runtime-only-repair.log"
+
+# Readiness is the commit point: a failed runtime-only restart preserves the
+# prior state and never claims future repairs are narrow.
+runtime_failed="$tmp/gateway-runtime-only-failed"
+cp -R "$runtime_gateway" "$runtime_failed"
+sed -i.bak 's/"port": 9000/"port": 8999/' "$runtime_failed/local/cozygateway.config.json" && rm -f "$runtime_failed/local/cozygateway.config.json.bak"
+cat > "$runtime_failed/local/run-gateway.sh" <<'FAILED_LEGACY_WRAPPER'
+#!/usr/bin/env bash
+# Legacy wrapper retained when readiness fails.
+exit 0
+FAILED_LEGACY_WRAPPER
+chmod 700 "$runtime_failed/local/run-gateway.sh"
+cat > "$runtime_home/Library/LaunchAgents/ai.cozylabs.cozygateway.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>ProgramArguments</key><array><string>/bin/bash</string><string>$runtime_failed/local/run-gateway.sh</string></array></dict></plist>
+PLIST
+runtime_failed_state_before="$(file_sha256 "$runtime_failed/local/install-state")"
+runtime_failed_config_before="$(file_sha256 "$runtime_failed/local/cozygateway.config.json")"
+runtime_failed_env_before="$(file_sha256 "$runtime_failed/local/gateway.env")"
+if runtime_failed_output="$(env -u COZYGATEWAY_NODE HOME="$runtime_home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --runtime-only --bundle "$tmp/gateway.mjs" --gateway-dir "$runtime_failed" 2>&1)"; then
+  echo 'a runtime-only repair with an unhealthy saved listener must fail' >&2
+  exit 1
+fi
+expect_contains "$runtime_failed_output" 'CozyGateway did not become healthy on http://127.0.0.1:8999'
+test "$runtime_failed_state_before" = "$(file_sha256 "$runtime_failed/local/install-state")"
+test "$runtime_failed_config_before" = "$(file_sha256 "$runtime_failed/local/cozygateway.config.json")"
+test "$runtime_failed_env_before" = "$(file_sha256 "$runtime_failed/local/gateway.env")"
+
+# Runtime-only uninstall takes back only the Gateway registration and files. It
+# must leave independently managed remote Hermes bindings and plugin state intact.
+runtime_uninstall_output="$(HOME="$runtime_home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$runtime_failed" 2>&1)"
+expect_contains "$runtime_uninstall_output" 'Hermes profiles, plugins, services, and environment were preserved'
+test ! -e "$runtime_failed"
+test "$runtime_profiles_before" = "$(tree_sha256 "$runtime_profiles")"
+
+# Linux uses the registered service unit, not the launchd-style label, when it
+# restarts a legacy owned wrapper. This catches a repair that would otherwise
+# report success without touching the user's real systemd service.
+linux_gateway="$tmp/gateway-runtime-only-linux"
+linux_home="$tmp/runtime-only-linux-home"
+linux_config="$tmp/runtime-only-linux-config"
+mkdir -p "$linux_config/systemd/user" "$tmp/linux-runtime-bin"
+cp -R "$runtime_gateway" "$linux_gateway"
+sed -i.bak "s|$runtime_gateway|$linux_gateway|g" "$linux_gateway/local/install-state" "$linux_gateway/bin/cozygateway" && rm -f "$linux_gateway/local/install-state.bak" "$linux_gateway/bin/cozygateway.bak"
+cat > "$linux_config/systemd/user/cozygateway.service" <<UNIT
+[Service]
+ExecStart=/bin/bash $linux_gateway/local/run-gateway.sh
+UNIT
+cat > "$tmp/linux-runtime-bin/systemctl" <<'SYSTEMCTL'
+#!/usr/bin/env bash
+if [ "${1:-}" = --user ] && [ "${2:-}" = show-environment ]; then exit 0; fi
+printf '%s\n' "$*" >> "${COZYGATEWAY_TEST_SYSTEMCTL_LOG:?}"
+SYSTEMCTL
+cat > "$tmp/linux-runtime-bin/loginctl" <<'LOGINCTL'
+#!/usr/bin/env bash
+exit 0
+LOGINCTL
+chmod 700 "$tmp/linux-runtime-bin/systemctl" "$tmp/linux-runtime-bin/loginctl"
+env -u COZYGATEWAY_NODE HOME="$linux_home" XDG_CONFIG_HOME="$linux_config" PATH="$tmp/linux-runtime-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_SYSTEMCTL_LOG="$tmp/runtime-only-systemctl.log" COZYGATEWAY_SERVICE_PLATFORM=Linux bash "$repo_root/scripts/agent-install.sh" --runtime-only --bundle "$tmp/gateway.mjs" --gateway-dir "$linux_gateway" >/dev/null
+grep -Fqx -- '--user restart cozygateway.service' "$tmp/runtime-only-systemctl.log"
+
 # On util-linux hosts, exercise the public one-paste shape with installer stdin
 # occupied by a pipe while a separate controlling terminal supplies the LAN
 # answer. A regression to `read` from fd 0 skips this prompt and stays loopback.
 if script --version 2>&1 | grep -qi util-linux; then
+  # The accepted LAN case writes its selected URL to Hermes profile files. Keep
+  # the explicit-listener case independent so its preflight tests the prompt
+  # path rather than rejecting that deliberately different URL as foreign.
+  pty_explicit_hermes="$tmp/pty-explicit-hermes"
+  cp -R "$tmp/hermes" "$pty_explicit_hermes"
+  # Seed this independent fixture with the explicit listener it is about to
+  # retain; otherwise its inherited loopback:8787 binding is rightly foreign.
+  while IFS= read -r pty_profile_env; do
+    sed 's|^COZYGATEWAY_URL=.*|COZYGATEWAY_URL=http://127.0.0.1:9000|' "$pty_profile_env" > "$pty_profile_env.next"
+    mv "$pty_profile_env.next" "$pty_profile_env"
+  done < <(find "$pty_explicit_hermes" -name .env -type f)
   pty_output="$({ sleep 1; printf 'yes\n'; } | script -qec "printf 'bootstrap-stdin\\n' | env HOME='$tmp/pty-home' PATH='$tmp/service-bin:$tmp/bin:$PATH' COZYGATEWAY_TEST_PAIRING_LAN_ADDRESS=192.0.2.11 COZYGATEWAY_TEST_HERMES_ROOT='$tmp/hermes' COZYGATEWAY_TEST_COMMAND_LOG='$tmp/pty-hermes-commands' COZYGATEWAY_TEST_REAL_NODE='$real_node' COZYGATEWAY_HERMES_BIN='$tmp/bin/hermes' COZYGATEWAY_NODE='$fake_node' COZYGATEWAY_SERVICE_PLATFORM=Darwin bash '$repo_root/scripts/agent-install.sh' --bundle '$tmp/gateway.mjs' --plugin-archive '$tmp/plugin.tar.gz' --gateway-dir '$tmp/gateway-pty'" /dev/null)"
   grep -Fq 'Allow CozyChat to access this Gateway over your local network? [y/N]' <<<"$pty_output"
   grep -Fq '"gatewayUrl":"http://192.0.2.11:8787"' <<<"$pty_output"
@@ -710,7 +922,7 @@ if script --version 2>&1 | grep -qi util-linux; then
   # It raced the install: slower machines wrote before `script` exited and passed,
   # CI runners finished in under a second and failed every time. `script` still
   # allocates the pty, which is the only thing this case needs from it.
-  pty_explicit_output="$(script -qec "env HOME='$tmp/pty-explicit-home' PATH='$tmp/service-bin:$tmp/bin:$PATH' COZYGATEWAY_TEST_HERMES_ROOT='$tmp/hermes' COZYGATEWAY_TEST_COMMAND_LOG='$tmp/pty-explicit-hermes-commands' COZYGATEWAY_TEST_REAL_NODE='$real_node' COZYGATEWAY_HERMES_BIN='$tmp/bin/hermes' COZYGATEWAY_NODE='$fake_node' COZYGATEWAY_SERVICE_PLATFORM=Darwin bash '$repo_root/scripts/agent-install.sh' --bind-host 127.0.0.1 --port 9000 --bundle '$tmp/gateway.mjs' --plugin-archive '$tmp/plugin.tar.gz' --gateway-dir '$tmp/gateway-pty-explicit'" /dev/null </dev/null)"
+  pty_explicit_output="$(script -qec "env HOME='$tmp/pty-explicit-home' PATH='$tmp/service-bin:$tmp/bin:$PATH' COZYGATEWAY_TEST_HERMES_ROOT='$pty_explicit_hermes' COZYGATEWAY_TEST_COMMAND_LOG='$tmp/pty-explicit-hermes-commands' COZYGATEWAY_TEST_REAL_NODE='$real_node' COZYGATEWAY_HERMES_BIN='$tmp/bin/hermes' COZYGATEWAY_NODE='$fake_node' COZYGATEWAY_SERVICE_PLATFORM=Darwin bash '$repo_root/scripts/agent-install.sh' --bind-host 127.0.0.1 --port 9000 --bundle '$tmp/gateway.mjs' --plugin-archive '$tmp/plugin.tar.gz' --gateway-dir '$tmp/gateway-pty-explicit'" /dev/null </dev/null)"
   grep -Fq 'CozyGateway listens on 127.0.0.1:9000' <<<"$pty_explicit_output"
   if grep -Fq 'Allow CozyChat to access this Gateway' <<<"$pty_explicit_output"; then
     echo 'an explicit bind host must skip the LAN prompt' >&2
@@ -771,10 +983,14 @@ fi
 expect_contains "$missing_repair_output" 'curl -fsSL https://cozylabs.ai/install.sh | bash'
 
 # The installed command routes both spellings through the persisted, checksummed
-# bootstrap and keeps the installer's default dynamic all-profile scope.
+# bootstrap and keeps the installer's default dynamic all-profile scope. A successful
+# explicit file release is retained for repair so an unpublished local build cannot
+# silently downgrade to the current public release.
+mkdir -p "$tmp/gateway-live/local"
+printf 'file://%s\n' "$tmp/verified-local-release" > "$tmp/gateway-live/local/bootstrap-source"
 cat > "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" <<'REPAIR_BOOTSTRAP'
 #!/usr/bin/env bash
-printf '%s\n' "$COZYGATEWAY_HOME:$*" >> "${COZYGATEWAY_TEST_REPAIR_LOG:?}"
+printf '%s\n' "$COZYGATEWAY_HOME:$COZYGATEWAY_INSTALL_ASSET_BASE:$*" >> "${COZYGATEWAY_TEST_REPAIR_LOG:?}"
 REPAIR_BOOTSTRAP
 chmod 700 "$tmp/gateway-live/bin/cozygateway-bootstrap.sh"
 if command -v shasum >/dev/null 2>&1; then repair_sha="$(shasum -a 256 "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; else repair_sha="$(sha256sum "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; fi
@@ -789,7 +1005,7 @@ if [ "$repair_count" != 2 ]; then
   cat "$tmp/repair.log" >&2
   exit 1
 fi
-grep -Fq "$tmp/gateway-live:--profiles $expected_profiles" "$tmp/repair.log"
+grep -Fq "$tmp/gateway-live:file://$tmp/verified-local-release:--profiles $expected_profiles" "$tmp/repair.log"
 printf '# tampered\n' >> "$tmp/gateway-live/bin/cozygateway-bootstrap.sh"
 if checksum_repair_output="$(COZYGATEWAY_TEST_REPAIR_LOG="$tmp/repair.log" "$tmp/gateway-live/bin/cozygateway" repair 2>&1)"; then
   echo 'a tampered repair bootstrap must fail checksum validation' >&2
@@ -799,7 +1015,7 @@ expect_contains "$checksum_repair_output" 'repair bootstrap checksum mismatch'
 test "$(wc -l < "$tmp/repair.log" | tr -d ' ')" = 2
 cat > "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" <<'REPAIR_BOOTSTRAP'
 #!/usr/bin/env bash
-printf '%s\n' "$COZYGATEWAY_HOME:$*" >> "${COZYGATEWAY_TEST_REPAIR_LOG:?}"
+printf '%s\n' "$COZYGATEWAY_HOME:$COZYGATEWAY_INSTALL_ASSET_BASE:$*" >> "${COZYGATEWAY_TEST_REPAIR_LOG:?}"
 REPAIR_BOOTSTRAP
 chmod 700 "$tmp/gateway-live/bin/cozygateway-bootstrap.sh"
 if command -v shasum >/dev/null 2>&1; then repair_sha="$(shasum -a 256 "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; else repair_sha="$(sha256sum "$tmp/gateway-live/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; fi
@@ -921,9 +1137,10 @@ if (hermesArgs[0] === 'dashboard') {
   const windowsLauncher = process.platform === 'win32';
   // gateway-live is intentionally generated with service platform Darwin,
   // even when this fixture itself runs on Windows.
-  const expectedLauncherArgs = ['dashboard', '-p', 'default', '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
+  const port = hermesArgs[hermesArgs.indexOf('--port') + 1];
+  const expectedLauncherArgs = ['dashboard', '-p', 'default', '--host', '127.0.0.1', '--port', port, '--no-open', '--skip-build'];
   const descendantProfileArgs = ['-p', 'default'];
-  const descendantArgs = [process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT, 'dashboard', ...descendantProfileArgs, '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
+  const descendantArgs = [process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT, 'dashboard', ...descendantProfileArgs, '--host', '127.0.0.1', '--port', port, '--no-open', '--skip-build'];
   const expectedToken = parseEnv(readFileSync(process.env.COZYGATEWAY_TEST_DASHBOARD_ENV, 'utf8')).DASHBOARD_SESSION_TOKEN;
   const homeMatches = resolve(process.env.HERMES_HOME) === resolve(process.env.COZYGATEWAY_TEST_EXPECTED_HERMES_HOME);
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_TRACE, JSON.stringify({
@@ -949,6 +1166,14 @@ if (hermesArgs[0] === 'dashboard') {
 HERMES_STUB
 dashboard_auth_marker="$tmp/mock-dashboard-authenticated"
 mock_dashboard_port="$("$real_node" -e "const server=require('node:net').createServer();server.listen(0,'127.0.0.1',()=>{process.stdout.write(String(server.address().port));server.close()})")"
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" "$mock_dashboard_port" <<'NODE'
+const { readFileSync, writeFileSync } = require('node:fs');
+const [path, port] = process.argv.slice(2);
+const config = JSON.parse(readFileSync(path, 'utf8'));
+config.hermesEndpoints[0].url = `ws://127.0.0.1:${port}/api/ws`;
+writeFileSync(path, JSON.stringify(config));
+NODE
+rm -f "$tmp/gateway-live/local/dashboard-port"
 mkdir -p "$tmp/Hermes Bin"
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) hermes_stub="$tmp/Hermes Bin/hermes-stub.exe" ;; *) hermes_stub="$tmp/Hermes Bin/hermes-stub" ;; esac
 case "$(uname -s)" in
@@ -1135,9 +1360,9 @@ sed -n '1p' "$tmp/reload.log" | grep -Eq '^[0-9]+:8787$'
 sed -n '2p' "$tmp/reload.log" | grep -Eq '^[0-9]+:8998$'
 test "$(cut -d: -f1 "$tmp/reload.log" | sed -n '1p')" != "$(cut -d: -f1 "$tmp/reload.log" | sed -n '2p')"
 
-# A foreign process can bind the target port after the supervisor's initial
-# health decision but before authenticated readiness. Failed readiness must not
-# turn the dedicated port into authority to kill that non-Hermes listener.
+# A foreign OAuth or token-gated Dashboard is not CozyGateway-owned. The
+# supervisor must preserve it, choose a durable loopback fallback for its own
+# authenticated Dashboard, and repoint only its private control endpoint.
 foreign_dashboard_port="$("$real_node" -e "const server=require('node:net').createServer();server.listen(0,'127.0.0.1',()=>{process.stdout.write(String(server.address().port));server.close()})")"
 rm -f "$tmp/foreign-dashboard.pid" "$tmp/foreign-reload.log" "$tmp/mock-dashboard.pid"
 COZYGATEWAY_TEST_DASHBOARD_READY_DELAY_MS=3000 COZYGATEWAY_TEST_DASHBOARD_REJECT=1 HERMES_DASHBOARD_SESSION_TOKEN=foreign \
@@ -1147,9 +1372,14 @@ foreign_dashboard_pid=$!
 for _ in $(seq 1 50); do [ -s "$tmp/foreign-dashboard.pid" ] && break; sleep 0.1; done
 test -s "$tmp/foreign-dashboard.pid"
 foreign_dashboard_pid="$(cat "$tmp/foreign-dashboard.pid")"
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" "$foreign_dashboard_port" <<'NODE'
+const { readFileSync, writeFileSync } = require('node:fs');
+const [path, port] = process.argv.slice(2);
+const config = JSON.parse(readFileSync(path, 'utf8'));
+config.hermesEndpoints[0].url = `ws://127.0.0.1:${port}/api/ws`;
+writeFileSync(path, JSON.stringify(config));
+NODE
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) foreign_reload_log="$(cygpath -w "$tmp/foreign-reload.log")" ;; *) foreign_reload_log="$tmp/foreign-reload.log" ;; esac
-set +e
-foreign_supervisor_status=0
 (trap - ERR; NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_RELOAD_LOG="$foreign_reload_log" \
   COZYGATEWAY_TEST_DASHBOARD_RUNTIME="$dashboard_runtime" \
   COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER="$dashboard_auth_marker_env" COZYGATEWAY_TEST_DASHBOARD_ENV="$dashboard_env" \
@@ -1159,15 +1389,47 @@ foreign_supervisor_status=0
   "$real_node" "$tmp/supervisor.cjs" \
   --platform Windows --gateway-env "$tmp/gateway-live/local/gateway.env" --bundle "$tmp/reload-gateway.mjs" --config "$tmp/gateway-live/local/cozygateway.config.json" \
   --maintenance-socket unused --maintenance-worker unused --database unused --dashboard-env "$tmp/gateway-live/local/dashboard.env" --hermes-root "$tmp/hermes" \
-  --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$foreign_dashboard_port" --windows-dashboard-profile \
-  >"$tmp/foreign-supervisor.log" 2>&1) || foreign_supervisor_status=$?
-set -e
-test "$foreign_supervisor_status" -ne 0
-test ! -e "$tmp/foreign-reload.log"
-if ! "$real_node" -e 'try { process.kill(Number(process.argv[1]), 0); process.exit(0) } catch { process.exit(1) }' "$foreign_dashboard_pid"; then
-  echo 'failed readiness killed a non-owned loopback listener' >&2
+  --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$foreign_dashboard_port" --dashboard-port-state "$tmp/gateway-live/local/dashboard-port" --windows-dashboard-profile \
+  >"$tmp/foreign-supervisor.log" 2>&1) &
+foreign_supervisor_pid=$!
+for _ in $(seq 1 80); do [ -s "$tmp/foreign-reload.log" ] && break; sleep 0.1; done
+if [ ! -s "$tmp/foreign-reload.log" ]; then
+  cat "$tmp/foreign-supervisor.log" >&2
+  [ ! -f "$tmp/hermes-stub-trace" ] || cat "$tmp/hermes-stub-trace" >&2
   exit 1
 fi
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" "$tmp/gateway-live/local/dashboard-port" "$foreign_dashboard_port" <<'NODE'
+const { readFileSync } = require('node:fs');
+const [configPath, statePath, foreignPort] = process.argv.slice(2);
+const config = JSON.parse(readFileSync(configPath, 'utf8'));
+const port = Number(readFileSync(statePath, 'utf8').trim());
+if (!Number.isInteger(port) || port <= Number(foreignPort) || config.hermesEndpoints[0].url !== `ws://127.0.0.1:${port}/api/ws`) process.exit(1);
+NODE
+if ! "$real_node" -e 'try { process.kill(Number(process.argv[1]), 0); process.exit(0) } catch { process.exit(1) }' "$foreign_dashboard_pid"; then
+  echo 'fallback startup killed a non-owned loopback listener' >&2
+  exit 1
+fi
+mock_dashboard_pid="$(cat "$tmp/mock-dashboard.pid")"
+kill "$foreign_supervisor_pid" 2>/dev/null || true
+wait "$foreign_supervisor_pid" 2>/dev/null || true
+foreign_supervisor_pid=
+# A process loss between the endpoint rename and state rename leaves an old state value behind.
+# On restart the config remains authoritative and repairs that cache before launching Gateway.
+printf '%s\n' "$foreign_dashboard_port" > "$tmp/gateway-live/local/dashboard-port"
+if ! NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_RELOAD_LOG="$foreign_reload_log" \
+  COZYGATEWAY_TEST_DASHBOARD_RUNTIME="$dashboard_runtime" \
+  COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER="$dashboard_auth_marker_env" COZYGATEWAY_TEST_DASHBOARD_ENV="$dashboard_env" \
+  COZYGATEWAY_TEST_DASHBOARD_SCRIPT="$dashboard_script" COZYGATEWAY_TEST_DASHBOARD_PID_FILE="$dashboard_pid_file" \
+  COZYGATEWAY_TEST_HERMES_STUB_MARKER="$hermes_stub_marker" COZYGATEWAY_TEST_HERMES_STUB_TRACE="$hermes_stub_trace" COZYGATEWAY_TEST_EXPECTED_HERMES_HOME="$expected_hermes_home" \
+  "$real_node" "$tmp/supervisor.cjs" \
+  --platform Darwin --gateway-env "$tmp/gateway-live/local/gateway.env" --bundle "$tmp/reload-gateway.mjs" --config "$tmp/gateway-live/local/cozygateway.config.json" \
+  --maintenance-socket unused --maintenance-worker unused --database unused --dashboard-env "$tmp/gateway-live/local/dashboard.env" --hermes-root "$tmp/hermes" \
+  --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$foreign_dashboard_port" --dashboard-port-state "$tmp/gateway-live/local/dashboard-port" \
+  >"$tmp/foreign-restart-supervisor.log" 2>&1; then
+  cat "$tmp/foreign-restart-supervisor.log" >&2
+  exit 1
+fi
+grep -Fxq "$("$real_node" -e "const c=JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8')); process.stdout.write(c.hermesEndpoints[0].url.match(/:(\\d+)\\/api\\/ws$/)[1])" "$tmp/gateway-live/local/cozygateway.config.json")" "$tmp/gateway-live/local/dashboard-port"
 stop_test_pid "$foreign_dashboard_pid"
 foreign_dashboard_pid=
 
@@ -1176,6 +1438,16 @@ foreign_dashboard_pid=
 # supervisor exits; the successful cold start above remains detached.
 failed_dashboard_port="$("$real_node" -e "const server=require('node:net').createServer();server.listen(0,'127.0.0.1',()=>{process.stdout.write(String(server.address().port));server.close()})")"
 rm -f "$tmp/mock-dashboard.pid" "$tmp/supervisor-taskkill.log"
+failed_dashboard_state="$tmp/gateway-live/local/failed-dashboard-port"
+printf '%s\n' "$failed_dashboard_port" > "$failed_dashboard_state"
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" "$failed_dashboard_port" <<'NODE'
+const { readFileSync, writeFileSync } = require('node:fs');
+const [path, port] = process.argv.slice(2);
+const config = JSON.parse(readFileSync(path, 'utf8'));
+config.hermesEndpoints[0].url = `ws://127.0.0.1:${port}/api/ws`;
+writeFileSync(path, JSON.stringify(config));
+NODE
+cp "$tmp/gateway-live/local/cozygateway.config.json" "$tmp/failed-dashboard-config-before"
 set +e
 failed_supervisor_status=0
 (trap - ERR; NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_DASHBOARD_READY_DELAY_MS=1000 \
@@ -1189,10 +1461,12 @@ failed_supervisor_status=0
   "$real_node" "$tmp/supervisor.cjs" \
   --platform Windows --gateway-env "$tmp/gateway-live/local/gateway.env" --bundle "$tmp/reload-gateway.mjs" --config "$tmp/gateway-live/local/cozygateway.config.json" \
   --maintenance-socket unused --maintenance-worker unused --database unused --dashboard-env "$tmp/gateway-live/local/dashboard.env" --hermes-root "$tmp/hermes" \
-  --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$failed_dashboard_port" --windows-dashboard-profile \
+  --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$failed_dashboard_port" --dashboard-port-state "$failed_dashboard_state" --windows-dashboard-profile \
   >"$tmp/failed-supervisor.log" 2>&1) || failed_supervisor_status=$?
 set -e
 test "$failed_supervisor_status" -ne 0
+cmp -s "$tmp/failed-dashboard-config-before" "$tmp/gateway-live/local/cozygateway.config.json"
+grep -Fxq "$failed_dashboard_port" "$failed_dashboard_state"
 if [ ! -s "$tmp/mock-dashboard.pid" ]; then
   echo 'failed-readiness Hermes fixture did not start' >&2
   cat "$tmp/failed-supervisor.log" >&2
@@ -1230,6 +1504,7 @@ config.host = '127.0.0.1';
 config.port = 8999;
 writeFileSync(path, JSON.stringify(config));
 NODE
+sed -i.bak 's|COZYGATEWAY_URL=http://127.0.0.1:8787|COZYGATEWAY_URL=http://127.0.0.1:8999|' "$tmp/hermes/.env" "$tmp/hermes/profiles/ops/.env" "$tmp/hermes/profiles/active/.env" && rm -f "$tmp/hermes/.env.bak" "$tmp/hermes/profiles/ops/.env.bak" "$tmp/hermes/profiles/active/.env.bak"
 preserved_listener_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
 grep -Fq 'CozyGateway listens on 127.0.0.1:8999' <<<"$preserved_listener_output"
 overridden_listener_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bind-host 0.0.0.0 --port 9000 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
@@ -1244,6 +1519,7 @@ config.host = '0.0.0.0';
 config.port = 8787;
 writeFileSync(path, JSON.stringify(config));
 NODE
+sed -i.bak 's|COZYGATEWAY_URL=http://127.0.0.1:8999|COZYGATEWAY_URL=http://127.0.0.1:8787|' "$tmp/hermes/.env" "$tmp/hermes/profiles/ops/.env" "$tmp/hermes/profiles/active/.env" && rm -f "$tmp/hermes/.env.bak" "$tmp/hermes/profiles/ops/.env.bak" "$tmp/hermes/profiles/active/.env.bak"
 
 # A rerun sees all services running, preserves the installer-owned lifecycle
 # records and attach tokens, and never tries to install a second Hermes service.
@@ -1834,6 +2110,10 @@ rm -f "$tmp/windows-gateway-ready"
 windows_stop_count="$(grep -c '^powershell ' "$tmp/windows-commands")"
 HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --port 9000 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live" >/dev/null
 test "$(grep -c '^powershell ' "$tmp/windows-commands")" -gt "$windows_stop_count"
+# The following fresh fallback installation uses the fixture's default 8787
+# listener. Restore the shared Hermes profile bindings after the explicit-port
+# migration above so it is not mistaken for a different Gateway instance.
+sed -i.bak 's|COZYGATEWAY_URL=http://127.0.0.1:9000|COZYGATEWAY_URL=http://127.0.0.1:8787|' "$tmp/hermes/.env" "$tmp/hermes/profiles/ops/.env" "$tmp/hermes/profiles/active/.env" && rm -f "$tmp/hermes/.env.bak" "$tmp/hermes/profiles/ops/.env.bak" "$tmp/hermes/profiles/active/.env.bak"
 
 HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-fallback-gateway-ready" COZYGATEWAY_TEST_SCHTASKS_FAIL_CREATE=1 COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
 test -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
@@ -1869,9 +2149,9 @@ fi
 cmp -s "$tmp/foreign-windows-startup.vbs" "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
 rm -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
 
-# Hermes Dashboard 0.20.x can report a successful `dashboard --stop` on Windows
-# while its Python child still owns the port. The fallback is allowed to stop
-# only that validated Hermes Dashboard listener, then installation continues.
+# A token-gated Dashboard on the conventional port may belong to another local
+# Hermes installation. Installation preserves it, registers the Gateway-owned
+# supervisor, and lets that supervisor select a private loopback fallback.
 : > "$tmp/windows-dashboard-wrong"
 dashboard_stop_home_log="$tmp/windows-dashboard-stop-home.log"
 dashboard_relaunch_home_log="$tmp/windows-dashboard-relaunch-home.log"
@@ -1884,21 +2164,15 @@ if [ "$dashboard_fallback_status" -ne 0 ]; then
   cat "$tmp/windows-dashboard-commands" >&2
 fi
 test "$dashboard_fallback_status" -eq 0
-grep -Fxq "$expected_windows_hermes_home" "$dashboard_stop_home_log"
-grep -Fxq "$expected_windows_hermes_home" "$dashboard_relaunch_home_log"
-grep -Fq 'dashboard-owner.ps1' "$tmp/windows-dashboard-commands"
-grep -Fq "$expected_windows_hermes_home" "$tmp/windows-dashboard-commands"
-grep -Fq 'COZYGATEWAY_DASHBOARD_OWNER_BEGIN' "$repo_root/scripts/agent-install.sh"
-test ! -e "$tmp/windows-dashboard-wrong"
-if grep -Fq 'Dashboard stayed listening after stop' <<<"$dashboard_fallback_output"; then
-  echo 'Windows Dashboard fallback did not release the validated listener' >&2
-  exit 1
-fi
+grep -Fq 'preserving it and letting the CozyGateway supervisor provision a private loopback Dashboard' <<<"$dashboard_fallback_output"
+test ! -e "$dashboard_stop_home_log"
+test ! -e "$dashboard_relaunch_home_log"
+! grep -Fq 'dashboard-owner.ps1' "$tmp/windows-dashboard-commands"
 
 # Windows uninstall must stop a Dashboard started by the managed wrapper before
 # removing the strict owner helper, while preserving the persisted install port.
 grep -Fxq 'dashboard_port=19119' "$tmp/gateway-windows-dashboard/local/install-state"
-dashboard_owner_calls_before_uninstall="$(grep -Fc 'dashboard-owner.ps1' "$tmp/windows-dashboard-commands")"
+dashboard_owner_calls_before_uninstall="$(grep -Fc 'dashboard-owner.ps1' "$tmp/windows-dashboard-commands" || true)"
 owner_stop_marker="$tmp/windows-dashboard-uninstall-owner-stopped"
 HOME="$tmp/windows-dashboard-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-dashboard-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-dashboard-commands" COZYGATEWAY_TEST_DASHBOARD_MODULE_OWNER=1 COZYGATEWAY_TEST_EXPECT_DASHBOARD_OWNER_PORT=19119 COZYGATEWAY_TEST_OWNER_STOP_MARKER="$owner_stop_marker" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-dashboard" >/dev/null
 test "$(grep -Fc 'dashboard-owner.ps1' "$tmp/windows-dashboard-commands")" -gt "$dashboard_owner_calls_before_uninstall"
@@ -1963,16 +2237,11 @@ test "$(wc -l < "$tmp/curl.log")" = "$curl_count_before_uninstall"
 test "$(grep -Fc 'dashboard-owner.ps1' "$tmp/windows-fallback-commands")" -gt "$fallback_owner_calls_before_uninstall"
 test ! -e "$tmp/gateway-windows-fallback"
 
-# A listener alone is not sufficient: an existing Dashboard that rejects the
-# credential must be stopped/restarted or fail loudly, never silently accepted.
-if wrong_output="$(HOME="$tmp/wrong-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_DASHBOARD_TOKEN_CODE=401 COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-wrong" 2>&1)"; then
-  echo 'expected wrong Dashboard credential to fail' >&2
-  exit 1
-fi
-expect_contains "$wrong_output" 'Dashboard stayed listening after stop'
-test ! -e "$tmp/wrong-home/.local/bin/cozygateway"
-[ ! -f "$tmp/wrong-home/.profile" ] || ! grep -Fq '# CozyGateway CLI' "$tmp/wrong-home/.profile"
-[ ! -f "$tmp/wrong-home/.zprofile" ] || ! grep -Fq '# CozyGateway CLI' "$tmp/wrong-home/.zprofile"
+# A listener alone is not authority to restart it: an OAuth or token-gated
+# Dashboard is preserved and the registered supervisor owns a private fallback.
+wrong_output="$(HOME="$tmp/wrong-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_DASHBOARD_TOKEN_CODE=401 COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-wrong" 2>&1)"
+expect_contains "$wrong_output" 'preserving it and letting the CozyGateway supervisor provision a private loopback Dashboard'
+test -x "$tmp/wrong-home/.local/bin/cozygateway"
 
 if bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir / >/dev/null 2>&1; then
   echo 'expected unsafe gateway directory to be rejected' >&2
@@ -1982,6 +2251,53 @@ if COZYGATEWAY_HOME=/ COZYGATEWAY_INSTALL_DRYRUN=1 bash "$repo_root/scripts/inst
   echo 'expected unsafe bootstrap home to be rejected before downloading assets' >&2
   exit 1
 fi
+
+# Normal Hermes setup refuses every existing profile that points at another
+# Gateway before it writes the local state or gateway environment. Node's dotenv
+# parser handles whitespace and `export`, so a formatted foreign binding cannot
+# bypass this preflight.
+preflight_hermes="$tmp/hermes-preflight"
+preflight_gateway="$tmp/gateway-preflight"
+cp -R "$tmp/hermes" "$preflight_hermes"
+mkdir -p "$preflight_gateway/local"
+printf 'profiles=default\nprofile_scope=default\npre-existing-state=preserved\n' > "$preflight_gateway/local/install-state"
+printf 'pre-existing-gateway-env\n' > "$preflight_gateway/local/gateway.env"
+cat > "$preflight_hermes/.env" <<'FOREIGN_PROFILE_ENV'
+COZYGATEWAY_INSTALLER_OWNER=cozylabs-v1
+export COZYGATEWAY_URL = https://warm.cozylabs.ai
+COZYGATEWAY_TOKEN=remote-token-must-not-change
+FOREIGN_PROFILE_ENV
+preflight_state_before="$(file_sha256 "$preflight_gateway/local/install-state")"
+preflight_env_before="$(file_sha256 "$preflight_gateway/local/gateway.env")"
+if preflight_output="$(HOME="$tmp/preflight-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$preflight_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/preflight-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$preflight_gateway" 2>&1)"; then
+  echo 'a profile with this installer marker but a foreign Gateway URL must fail closed' >&2
+  exit 1
+fi
+expect_contains "$preflight_output" 'targets another Gateway; use --runtime-only to preserve it'
+test "$preflight_state_before" = "$(file_sha256 "$preflight_gateway/local/install-state")"
+test "$preflight_env_before" = "$(file_sha256 "$preflight_gateway/local/gateway.env")"
+
+# Gateway environment promotion is atomic too. A later duplicate-token failure
+# must leave the prior complete file available rather than truncating it.
+atomic_hermes="$tmp/hermes-atomic-env"
+atomic_gateway="$tmp/gateway-atomic-env"
+cp -R "$tmp/hermes" "$atomic_hermes"
+mkdir -p "$atomic_gateway/local"
+printf 'old-gateway-env-must-survive\n' > "$atomic_gateway/local/gateway.env"
+for profile_env in "$atomic_hermes/.env" "$atomic_hermes/profiles/ops/.env"; do
+  cat > "$profile_env" <<'OWNED_PROFILE_ENV'
+COZYGATEWAY_INSTALLER_OWNER=cozylabs-v1
+COZYGATEWAY_URL=http://127.0.0.1:8787
+COZYGATEWAY_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+OWNED_PROFILE_ENV
+done
+atomic_env_before="$(file_sha256 "$atomic_gateway/local/gateway.env")"
+if atomic_env_output="$(HOME="$tmp/atomic-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$atomic_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/atomic-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --profiles default,ops --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$atomic_gateway" 2>&1)"; then
+  echo 'duplicate existing attach tokens must fail before gateway.env promotion' >&2
+  exit 1
+fi
+expect_contains "$atomic_env_output" 'Hermes profiles must have distinct CozyGateway attach tokens'
+test "$atomic_env_before" = "$(file_sha256 "$atomic_gateway/local/gateway.env")"
 
 # A bootstrap interrupted before install-state exists is still removable with
 # no Node, Hermes, or config. The dedicated directory is the recovery boundary.

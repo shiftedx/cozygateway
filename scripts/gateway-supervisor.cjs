@@ -2,7 +2,8 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
-const { readFileSync, unwatchFile, watchFile } = require('node:fs');
+const { readFileSync, writeFileSync, renameSync, unwatchFile, watchFile } = require('node:fs');
+const { createServer } = require('node:net');
 const { parseEnv } = require('node:util');
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -54,6 +55,76 @@ async function stopOwnedDashboard(child, options) {
   try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
 }
 
+function configuredDashboardPort(options) {
+  try {
+    const config = JSON.parse(readFileSync(options.config, 'utf8'));
+    const local = (Array.isArray(config.hermesEndpoints) ? config.hermesEndpoints : [])
+      .map((endpoint) => /^ws:\/\/127\.0\.0\.1:(\d+)\/api\/ws$/.exec(endpoint?.url ?? "")?.[1])
+      .filter((port) => port !== undefined);
+    if (local.length === 1) {
+      const port = Number(local[0]);
+      if (Number.isInteger(port) && port >= 1 && port <= 65535) return port;
+    }
+  } catch {}
+  return Number(options.dashboardPort);
+}
+
+function reconcileDashboardPortState(options, port) {
+  if (!options.dashboardPortState) return;
+  try {
+    if (Number(readFileSync(options.dashboardPortState, 'utf8').trim()) === port) return;
+  } catch {}
+  const staged = `${options.dashboardPortState}.tmp.${process.pid}`;
+  writeFileSync(staged, `${port}\n`, { mode: 0o600 });
+  renameSync(staged, options.dashboardPortState);
+}
+
+async function dashboardStatus(port, token) {
+  return await fetch(`http://127.0.0.1:${port}/api/config`, {
+    headers: { 'x-hermes-session-token': token }, signal: AbortSignal.timeout(2000),
+  }).then((response) => response.status).catch(() => undefined);
+}
+
+async function portIsAvailable(port) {
+  return await new Promise((resolve) => {
+    const server = createServer();
+    server.once('error', () => resolve(false));
+    server.listen(port, '127.0.0.1', () => server.close(() => resolve(true)));
+  });
+}
+
+function persistDashboardEndpoint(options, currentPort, port) {
+  const originalConfig = readFileSync(options.config, 'utf8');
+  const config = JSON.parse(originalConfig);
+  const endpoints = Array.isArray(config.hermesEndpoints) ? config.hermesEndpoints : [];
+  const current = `ws://127.0.0.1:${currentPort}/api/ws`;
+  const matches = endpoints.filter((endpoint) => endpoint?.url === current);
+  if (matches.length !== 1) throw new Error('CozyGateway could not safely update its private Hermes Dashboard endpoint');
+  matches[0].url = `ws://127.0.0.1:${port}/api/ws`;
+  if (matches[0].baseUrl === `http://127.0.0.1:${currentPort}`) matches[0].baseUrl = `http://127.0.0.1:${port}`;
+  const stagedConfig = `${options.config}.dashboard-port.${process.pid}`;
+  writeFileSync(stagedConfig, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  const stagedState = options.dashboardPortState && `${options.dashboardPortState}.tmp.${process.pid}`;
+  if (stagedState) writeFileSync(stagedState, `${port}\n`, { mode: 0o600 });
+  let configPromoted = false;
+  try {
+    renameSync(stagedConfig, options.config);
+    configPromoted = true;
+    if (stagedState) renameSync(stagedState, options.dashboardPortState);
+  } catch (error) {
+    if (configPromoted) {
+      const rollback = `${options.config}.dashboard-port.rollback.${process.pid}`;
+      try {
+        writeFileSync(rollback, originalConfig, { mode: 0o600 });
+        renameSync(rollback, options.config);
+      } catch (rollbackError) {
+        throw new Error(`CozyGateway could not persist its private Dashboard endpoint or restore the prior configuration: ${rollbackError.message}`);
+      }
+    }
+    throw error;
+  }
+}
+
 async function startDashboardIfNeeded(options) {
   if (!options.dashboardEnv) return;
   const dashboard = parseEnv(readFileSync(options.dashboardEnv, 'utf8'));
@@ -62,34 +133,60 @@ async function startDashboardIfNeeded(options) {
     HERMES_HOME: options.hermesRoot,
     HERMES_DASHBOARD_SESSION_TOKEN: dashboard.DASHBOARD_SESSION_TOKEN,
   };
-  const health = await fetch(`http://127.0.0.1:${options.dashboardPort}/api/health`, { signal: AbortSignal.timeout(2000) })
-    .then((response) => response.status === 200 || response.status === 401)
-    .catch(() => false);
-  let child;
-  if (!health) {
+  const start = async (port) => {
     const profile = options.windowsDashboardProfile ? ['-p', 'default'] : [];
-    child = spawn(options.hermes, ['dashboard', ...profile, '--host', '127.0.0.1', '--port', options.dashboardPort, '--no-open', '--skip-build'], {
+    const child = spawn(options.hermes, ['dashboard', ...profile, '--host', '127.0.0.1', '--port', String(port), '--no-open', '--skip-build'], {
       detached: true, stdio: 'ignore', env: environment,
     });
     await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
-  }
-  try {
-    let response;
+    return child;
+  };
+  const verify = async (port) => {
     for (let attempt = 0; attempt < 30; attempt += 1) {
-      response = await fetch(`http://127.0.0.1:${options.dashboardPort}/api/config`, {
-        headers: { 'x-hermes-session-token': dashboard.DASHBOARD_SESSION_TOKEN },
-        signal: AbortSignal.timeout(2000),
-      }).catch(() => undefined);
-      if (response?.status === 200) break;
-      if (response?.status === 401 || response?.status === 403) throw new Error('Hermes Dashboard rejected the configured local session token');
+      const status = await dashboardStatus(port, dashboard.DASHBOARD_SESSION_TOKEN);
+      if (status === 200) return;
+      if (status === 401 || status === 403) throw new Error('Hermes Dashboard rejected the configured local session token');
       await wait(1000);
     }
-    if (response?.status !== 200) throw new Error('Hermes Dashboard did not become ready for authenticated local access');
-  } catch (error) {
-    if (child) await stopOwnedDashboard(child, options);
-    throw error;
+    throw new Error('Hermes Dashboard did not become ready for authenticated local access');
+  };
+  // The endpoint the Gateway reads is the durable authority. The state file is a convenience for
+  // installer reruns, so an interruption after the config rename cannot make a later supervisor
+  // dial an old port or overwrite a newer endpoint.
+  const preferred = configuredDashboardPort(options);
+  const existing = await dashboardStatus(preferred, dashboard.DASHBOARD_SESSION_TOKEN);
+  if (existing === 200) {
+    reconcileDashboardPortState(options, preferred);
+    return;
   }
-  child?.unref();
+  let child;
+  if (existing !== 401 && existing !== 403) {
+    child = await start(preferred);
+    try {
+      await verify(preferred);
+      reconcileDashboardPortState(options, preferred);
+      child.unref();
+      return;
+    } catch (error) {
+      await stopOwnedDashboard(child, { ...options, dashboardPort: preferred });
+      if (error.message !== 'Hermes Dashboard rejected the configured local session token') throw error;
+    }
+  }
+  for (let port = preferred + 1; port <= Math.min(preferred + 64, 65535); port += 1) {
+    if (!await portIsAvailable(port)) continue;
+    child = await start(port);
+    try {
+      await verify(port);
+      persistDashboardEndpoint(options, preferred, port);
+      child.unref();
+      console.error(`CozyGateway preserved an incompatible Dashboard on port ${preferred} and started its private control Dashboard on loopback port ${port}.`);
+      return;
+    } catch (error) {
+      await stopOwnedDashboard(child, { ...options, dashboardPort: port });
+      throw error;
+    }
+  }
+  throw new Error(`CozyGateway found an incompatible Dashboard on port ${preferred} and no private loopback fallback port is available`);
 }
 
 function gatewayChild(options, gatewayEnv) {

@@ -142,7 +142,9 @@ export interface RunnerDeleteRuntimePayload {
 export const RUNNER_CLIENT_FRAME_KINDS: ReadonlySet<string> = new Set(["hello", "heartbeat", "receipt"]);
 
 export type RunnerServerFrame =
-  | { kind: "hello_ack"; version: number; heartbeatIntervalMs: number }
+  // The runner parses hello acknowledgements as an exact four-field wire frame. The gateway does
+  // not implement any optional runner commands yet, so it acknowledges an explicit empty set.
+  | { kind: "hello_ack"; version: number; capabilities: readonly []; heartbeatIntervalMs: number }
   | { kind: "heartbeat"; sentAt: number }
   | { kind: "command"; command: "create_runtime"; payload: RunnerCreateRuntimePayload }
   | { kind: "command"; command: "delete_runtime"; payload: RunnerDeleteRuntimePayload };

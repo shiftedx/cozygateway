@@ -165,7 +165,7 @@ public static class $className {
 function New-FakeBash {
     param([string] $Path, [string] $EventLog)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
-    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho bash-hermes:%COZYGATEWAY_HERMES_BIN%>>`"$EventLog`"`necho bash-powershell:%COZYGATEWAY_POWERSHELL%>>`"$EventLog`"`nif not `"%COZYGATEWAY_TEST_SECRET_PATH%`"==`"`" (`n  for %%I in (`"%COZYGATEWAY_TEST_SECRET_PATH%`") do if not exist `"%%~dpI`" mkdir `"%%~dpI`"`n  >`"%COZYGATEWAY_TEST_SECRET_PATH%`" echo DASHBOARD_SESSION_TOKEN=test-token`n)`nif `"%COZYGATEWAY_TEST_BASH_FAIL%`"==`"1`" exit /b 23`nexit /b 0`n"
+    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho bash-hermes:%COZYGATEWAY_HERMES_BIN%>>`"$EventLog`"`necho bash-powershell:%COZYGATEWAY_POWERSHELL%>>`"$EventLog`"`nif not `"%COZYGATEWAY_TEST_SECRET_PATH%`"==`"`" (`n  for %%I in (`"%COZYGATEWAY_TEST_SECRET_PATH%`") do if not exist `"%%~dpI`" mkdir `"%%~dpI`"`n  >`"%COZYGATEWAY_TEST_SECRET_PATH%`" echo DASHBOARD_SESSION_TOKEN=test-token`n)`nif not `"%COZYGATEWAY_TEST_BASH_FAIL_ONCE%`"==`"`" if not exist `"%COZYGATEWAY_TEST_BASH_FAIL_ONCE%`" (`n  type nul >`"%COZYGATEWAY_TEST_BASH_FAIL_ONCE%`"`n  exit /b 23`n)`nif `"%COZYGATEWAY_TEST_BASH_FAIL%`"==`"1`" exit /b 23`nexit /b 0`n"
 }
 
 function Invoke-Bootstrap {
@@ -721,6 +721,54 @@ try {
     Assert-True (@(Get-ChildItem -LiteralPath (Join-Path $temp 'Cozy Gateway') -Filter '.bootstrap-*' -Force).Count -eq 0) 'failed bootstrap must remove its staging directory'
     Write-Utf8NoBom (Join-Path $fixtures 'install.ps1') $originalInstallPs1
 
+    # The public Windows entrypoint journals every release asset. A real hard
+    # stop after the first promotion leaves a snapshot that the next launch
+    # restores before fetching, then promotes as one coherent release.
+    $transactionHome = Join-Path $temp 'transaction recovery gateway'
+    $transactionBefore = [IO.File]::ReadAllBytes((Join-Path $temp 'Cozy Gateway\bin\cozygateway.mjs'))
+    Write-Utf8NoBom (Join-Path $fixtures 'cozygateway.mjs') "console.log('transaction replacement');`n"
+    $transactionHash = (Get-FileHash -LiteralPath (Join-Path $fixtures 'cozygateway.mjs') -Algorithm SHA256).Hash.ToLowerInvariant()
+    Write-Utf8NoBom (Join-Path $fixtures 'cozygateway.mjs.sha256') "$transactionHash  cozygateway.mjs`n"
+    $fileFixtureBase = ([Uri](Resolve-Path -LiteralPath $fixtures).Path).AbsoluteUri
+    New-Item -ItemType Directory -Force -Path $transactionHome | Out-Null
+    Copy-Item -Path (Join-Path $temp 'Cozy Gateway\*') -Destination $transactionHome -Recurse
+    $transactionKilled = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fileFixtureBase
+        'COZYGATEWAY_HOME' = $transactionHome
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION' = 'cozygateway.mjs'
+    }
+    Assert-True ($transactionKilled.ExitCode -ne 0) 'hard-stop fixture must terminate the bootstrap'
+    Assert-True (Test-Path -LiteralPath (Join-Path $transactionHome '.bootstrap-transaction')) 'hard stop must preserve the Windows bootstrap journal'
+    Assert-True ([Linq.Enumerable]::SequenceEqual($transactionBefore, [IO.File]::ReadAllBytes((Join-Path $transactionHome '.bootstrap-previous\cozygateway.mjs')))) 'journal snapshot must retain the prior bundle'
+    $transactionRecovered = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fileFixtureBase
+        'COZYGATEWAY_HOME' = $transactionHome
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+    }
+    Assert-True ($transactionRecovered.ExitCode -eq 0 -and $transactionRecovered.Output -match 'recovering an interrupted CozyGateway bootstrap') "interrupted Windows bootstrap must recover: $($transactionRecovered.Output)"
+    Assert-True ([Linq.Enumerable]::SequenceEqual([IO.File]::ReadAllBytes((Join-Path $fixtures 'cozygateway.mjs')), [IO.File]::ReadAllBytes((Join-Path $transactionHome 'bin\cozygateway.mjs')))) 'recovered Windows bootstrap must install the complete replacement'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $transactionHome '.bootstrap-transaction')) -and -not (Test-Path -LiteralPath (Join-Path $transactionHome '.bootstrap-previous'))) 'recovered Windows bootstrap must clear journal and snapshot'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $transactionHome 'local\bootstrap-source') -Raw).Trim() -eq $fileFixtureBase) 'explicit local Windows release source must be retained for repair'
+
+    $childFailureBefore = [IO.File]::ReadAllBytes((Join-Path $transactionHome 'bin\cozygateway.mjs'))
+    $childFailureMarker = Join-Path $temp 'child-install-failed-once.txt'
+    $childFailure = Invoke-Bootstrap $installer @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fileFixtureBase
+        'COZYGATEWAY_HOME' = $transactionHome
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+        'COZYGATEWAY_TEST_BASH_FAIL_ONCE' = $childFailureMarker
+    }
+    Assert-True ($childFailure.ExitCode -ne 0 -and $childFailure.Output -match 'restarted the previous CozyGateway service after the failed update') "failed child installer must restore its prior service: $($childFailure.Output)"
+    Assert-True ([Linq.Enumerable]::SequenceEqual($childFailureBefore, [IO.File]::ReadAllBytes((Join-Path $transactionHome 'bin\cozygateway.mjs')))) 'failed child installer must restore the prior Windows bundle'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $transactionHome '.bootstrap-transaction')) -and -not (Test-Path -LiteralPath (Join-Path $transactionHome '.bootstrap-previous'))) 'failed child installer must clear recovered Windows transaction state'
+
     $restoreWrapper = Join-Path $temp 'verify-hermes-env-restore.ps1'
     Write-Utf8NoBom $restoreWrapper @"
 `$env:COZYGATEWAY_HERMES_BIN = 'preexisting-hermes-value'
@@ -1144,6 +1192,9 @@ process.on('SIGINT', stop);
     $hermesPosix = & $toPosix (Join-Path $supervisorRoot 'hermes\bin\hermes-agent.exe')
     $launcherPosix = & $toPosix (Join-Path $supervisorRoot 'hermes\bin\hermes.exe')
     $ownerHelperPosix = & $toPosix (Join-Path $supervisorLocal 'dashboard-owner.ps1')
+    $dashboardPortState = Join-Path $supervisorLocal 'dashboard-port'
+    $dashboardPortStatePosix = & $toPosix $dashboardPortState
+    $dashboardPortStateNative = (& cygpath.exe -w $dashboardPortStatePosix).Trim()
     $dashboardReservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
     $dashboardReservation.Start()
     $supervisorDashboardPort = ([Net.IPEndPoint]$dashboardReservation.LocalEndpoint).Port
@@ -1212,6 +1263,7 @@ DASHBOARD_PORT="`$9"
 NODE_RESOLVED="`${10}"
 BUNDLE_PATH="`${11}"
 CONFIG_JSON="`${12}"
+DASHBOARD_PORT_STATE="`${14}"
 SUPERVISOR="`$LOCAL_DIR/gateway-supervisor.cjs"
 MAINTENANCE_WORKER="`$GATEWAY_DIR/bin/gateway-maintenance-worker.cjs"
 MAINTENANCE_SOCKET="`$LOCAL_DIR/gateway-maintenance.sock"
@@ -1224,11 +1276,14 @@ to_windows_path() { cygpath -w "`$1"; }
 $($supervisorArgumentsMatch.Value)
 $($wrapperWriterMatch.Value)
 write_wrapper
+build_supervisor_args
+printf '%s\n' "`${SUPERVISOR_ARGS[@]}"
 "@
     $wrapperGeneratorScript = $wrapperGeneratorScript.Replace('HARNESS=hermes', 'HARNESS="${13}"')
     Write-Utf8NoBom $wrapperGenerator $wrapperGeneratorScript
-    $wrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $generatedWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix hermes 2>&1 | Out-String)
+    $wrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $generatedWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix hermes $dashboardPortStatePosix 2>&1 | Out-String)
     Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $generatedWrapper)) "production writer must generate the supervisor: $wrapperOutput"
+    Assert-True ($wrapperOutput.Replace("`r`n", "`n").Contains("--dashboard-port-state`n$dashboardPortStateNative")) "Windows supervisor arguments must pass dashboard port state as a native path: $wrapperOutput"
     $wrapperArgument = '"' + $generatedWrapper + '"'
     $supervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
     $staleSupervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
@@ -1274,6 +1329,7 @@ MAINTENANCE_WORKER="`$GATEWAY_DIR/bin/gateway-maintenance-worker.cjs"
 MAINTENANCE_SOCKET="`$LOCAL_DIR/gateway-maintenance.sock"
 SERVICE_PLATFORM=Windows
 HARNESS="`${13}"
+DASHBOARD_PORT_STATE="`${14}"
 PREVIOUS_PORT="`${12}"
 is_windows() { return 0; }
 to_windows_path() { cygpath -w "`$1"; }
@@ -1290,7 +1346,7 @@ stop_owned_windows_gateway
         $savedErrorActionPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
-            $stopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $generatedWrapper $supervisorPort hermes 2>&1 | Out-String)
+            $stopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $generatedWrapper $supervisorPort hermes $dashboardPortStatePosix 2>&1 | Out-String)
             $stopExitCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $savedErrorActionPreference
@@ -1312,7 +1368,7 @@ stop_owned_windows_gateway
         Assert-True $reacquired 'a dashboard-port and gateway-port update must stop the persisted owned supervisor so it cannot reclaim the old gateway port'
 
         $cozyWrapper = Join-Path $supervisorLocal 'run-gateway-cozyagents.sh'
-        $cozyWrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $cozyWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix cozyagents 2>&1 | Out-String)
+        $cozyWrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $cozyWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix cozyagents $dashboardPortStatePosix 2>&1 | Out-String)
         Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $cozyWrapper)) "production writer must generate the CozyAgents supervisor wrapper: $cozyWrapperOutput"
         Assert-True (-not ((Get-Content -LiteralPath $cozyWrapper -Raw) -match '--dashboard-env')) 'CozyAgents supervisor wrapper must omit the complete Hermes argument group'
         $cozySupervisor = Start-Process -FilePath $bashPath -ArgumentList ('"' + $cozyWrapper + '"') -PassThru
@@ -1330,7 +1386,7 @@ stop_owned_windows_gateway
             }
         }
         Assert-True $cozyListening 'CozyAgents supervisor fixture must start its managed gateway child'
-        $cozyStopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $cozyWrapper $supervisorPort cozyagents 2>&1 | Out-String)
+        $cozyStopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $cozyWrapper $supervisorPort cozyagents $dashboardPortStatePosix 2>&1 | Out-String)
         Assert-True ($LASTEXITCODE -eq 0) "owned CozyAgents gateway stop helper failed: $cozyStopOutput"
         Start-Sleep -Milliseconds 1500
         $cozyReacquired = $false
@@ -1371,7 +1427,7 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
         $savedErrorActionPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
-            $foreignOldPortOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $generatedWrapper $supervisorPort hermes 2>&1 | Out-String)
+            $foreignOldPortOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $generatedWrapper $supervisorPort hermes $dashboardPortStatePosix 2>&1 | Out-String)
             $foreignOldPortExitCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $savedErrorActionPreference
@@ -1416,6 +1472,7 @@ MAINTENANCE_SOCKET="`$LOCAL_DIR/gateway-maintenance.sock"
 SERVICE_PLATFORM=Windows
 HARNESS=hermes
 DASHBOARD_PORT="`$9"
+DASHBOARD_PORT_STATE="`${12}"
 EXPECTED_NODE_RESOLVED="`${10}"
 EXPECTED_BUNDLE_PATH="`${11}"
 NODE_RESOLVED="`$EXPECTED_NODE_RESOLVED"
@@ -1436,7 +1493,7 @@ $($gatewayPortCheckFunctionMatch.Value)
 stop_owned_windows_gateway 0
 "@
         Write-Utf8NoBom $uninstallStopHarness $uninstallStopScript
-        $uninstallOutput = (& $bashPath $uninstallStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $generatedWrapper $supervisorDashboardPort $nodePosix $bundlePosix 2>&1 | Out-String)
+        $uninstallOutput = (& $bashPath $uninstallStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $generatedWrapper $supervisorDashboardPort $nodePosix $bundlePosix $dashboardPortStatePosix 2>&1 | Out-String)
         Assert-True ($LASTEXITCODE -eq 0) "uninstall-owned gateway stop helper failed: $uninstallOutput"
         Start-Sleep -Milliseconds 1500
         $uninstallReacquired = $false
@@ -1450,6 +1507,37 @@ stop_owned_windows_gateway 0
             if ($uninstallReacquired) { $uninstallReplacement.Stop() }
         }
         Assert-True $uninstallReacquired 'uninstall must stop a running generated supervisor even before Node and bundle are resolved'
+
+        # Gateways installed before dashboard-port-state existed retain the exact
+        # prior wrapper identity. It remains owned and stoppable, while a foreign
+        # near-match still fails in the earlier port-change assertion.
+        $legacyWrapper = Join-Path $supervisorLocal 'run-gateway-legacy.sh'
+        $legacyText = Get-Content -LiteralPath $generatedWrapper -Raw
+        # printf %q escapes Windows backslashes and spaces in the generated
+        # wrapper, so remove one complete shell token rather than a POSIX path.
+        $stateArgument = ' --dashboard-port-state (?:\\.|[^\\\s])+'
+        Assert-True ([regex]::Matches($legacyText, $stateArgument).Count -eq 1) 'legacy fixture must find exactly one encoded state argument'
+        $legacyText = $legacyText -replace $stateArgument, ''
+        Assert-True (-not ($legacyText -match '--dashboard-port-state')) 'legacy fixture must omit dashboard-port-state exactly'
+        Write-Utf8NoBom $legacyWrapper $legacyText
+        $uninstallSupervisor = Start-Process -FilePath $bashPath -ArgumentList ('"' + $legacyWrapper + '"') -PassThru
+        $legacyListening = $false
+        for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
+            $probe = [Net.Sockets.TcpClient]::new()
+            try { $probe.Connect('127.0.0.1', $supervisorPort); $legacyListening = $true; break }
+            catch { Start-Sleep -Milliseconds 100 }
+            finally { $probe.Dispose() }
+        }
+        Assert-True $legacyListening 'legacy owned supervisor fixture must start its managed child'
+        $legacyStopOutput = (& $bashPath $uninstallStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $legacyWrapper $supervisorDashboardPort $nodePosix $bundlePosix $dashboardPortStatePosix 2>&1 | Out-String)
+        Assert-True ($LASTEXITCODE -eq 0) "legacy owned gateway stop helper failed: $legacyStopOutput"
+        Start-Sleep -Milliseconds 1500
+        $legacyReacquired = $false
+        $legacyReplacement = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $supervisorPort)
+        try { $legacyReplacement.Start(); $legacyReacquired = $true }
+        catch { $legacyReacquired = $false }
+        finally { if ($legacyReacquired) { $legacyReplacement.Stop() } }
+        Assert-True $legacyReacquired 'legacy owned wrapper without dashboard-port-state must remain stoppable'
     } finally {
         Stop-FixtureProcessTree $supervisor
         Stop-FixtureProcessTree $staleSupervisor

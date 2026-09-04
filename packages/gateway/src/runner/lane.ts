@@ -61,6 +61,10 @@ interface RunnerConnection {
   rowId: string | undefined;
   runnerId: string;
   backends: readonly string[];
+  /** Version supplied by this authenticated socket's current hello. It deliberately never falls
+   *  back to the roster's durable observation: an offline row cannot prove which binary is now
+   *  running. */
+  agentVersion: string | undefined;
   lastSeenAt: number;
 }
 
@@ -124,6 +128,12 @@ export class RunnerLane {
   /** Every runner holding a live, hello-completed socket, by lane key. */
   connectedRunners(): readonly string[] {
     return this.#attached().map((connection) => connection.key);
+  }
+
+  /** The version this runner proved on its current authenticated hello, if it is attached now. */
+  agentVersion(runnerId: string): string | undefined {
+    const connection = this.#connections.get(runnerId);
+    return connection?.hello === true ? connection.agentVersion : undefined;
   }
 
   /** When a runner last said anything at all: the most recent of any of them, or of one named
@@ -259,6 +269,7 @@ export class RunnerLane {
       rowId: row?.id,
       runnerId: "",
       backends: [],
+      agentVersion: undefined,
       lastSeenAt: this.#now(),
     };
     const helloTimer = setTimeout(() => {
@@ -320,6 +331,7 @@ export class RunnerLane {
         connection.hello = true;
         connection.runnerId = frame.runnerId;
         connection.backends = frame.backends;
+        connection.agentVersion = frame.agentVersion;
         this.#connections.set(connection.key, connection);
         if (connection.rowId !== undefined) {
           this.#roster?.observe(connection.rowId, {
@@ -338,6 +350,7 @@ export class RunnerLane {
           JSON.stringify({
             kind: "hello_ack",
             version: RUNNER_V1_VERSION,
+            capabilities: [],
             heartbeatIntervalMs: this.#heartbeatIntervalMs,
           } satisfies RunnerServerFrame),
         );

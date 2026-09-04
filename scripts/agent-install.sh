@@ -24,7 +24,10 @@ BIND_HOST="${COZYGATEWAY_BIND_HOST:-127.0.0.1}"
 PORT="${COZYGATEWAY_PORT:-8787}"
 PUBLIC_URL=""
 PREVIOUS_PORT=""
+PREVIOUS_BIND_HOST=""
 DASHBOARD_PORT="${COZYGATEWAY_DASHBOARD_PORT:-9119}"
+DASHBOARD_PORT_EXPLICIT=0
+if [ "${COZYGATEWAY_DASHBOARD_PORT+x}" = x ]; then DASHBOARD_PORT_EXPLICIT=1; fi
 WINDOWS_OWNED_IDENTITY=0
 WINDOWS_OWNED_NODE_RESOLVED=""
 WINDOWS_OWNED_GATEWAY_ENV=""
@@ -39,6 +42,7 @@ WINDOWS_OWNED_CONFIG_JSON=""
 DRY_RUN=0
 UNINSTALL=0
 STATUS=0
+RUNTIME_ONLY=0
 # Which harness runs the bots. Empty until choose_harness scans the machine or --harness answers
 # for it. COZYAGENTS_CHOSEN stays 0 unless a person or a recorded install actually said CozyAgents,
 # because that is the only answer allowed to take a Hermes bridge out of an existing config.
@@ -98,6 +102,7 @@ usage: agent-install.sh --bundle PATH --plugin-archive PATH [options]
   --dry-run               show discovered work without changing anything
   --service-platform OS   override service platform (Darwin, Linux, Windows)
   --status                report persistence and live gateway health
+  --runtime-only          update only CozyGateway-owned runtime, service, and CLI
   --uninstall             remove only CozyGateway-owned service, plugins, env keys and state
 
 The gateway and attach plugin both stay on this machine. This installer never
@@ -120,10 +125,11 @@ while [ "$#" -gt 0 ]; do
     --port) need_value "$@"; PORT="$2"; PORT_EXPLICIT=1; shift ;;
     --public-url) need_value "$@"; PUBLIC_URL="$2"; PUBLIC_URL_EXPLICIT=1; shift ;;
     --clear-public-url) CLEAR_PUBLIC_URL=1 ;;
-    --dashboard-port) need_value "$@"; DASHBOARD_PORT="$2"; shift ;;
+    --dashboard-port) need_value "$@"; DASHBOARD_PORT="$2"; DASHBOARD_PORT_EXPLICIT=1; shift ;;
     --dry-run) DRY_RUN=1 ;;
     --service-platform) need_value "$@"; SERVICE_PLATFORM="$2"; shift ;;
     --status) STATUS=1 ;;
+    --runtime-only) RUNTIME_ONLY=1 ;;
     --uninstall) UNINSTALL=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown flag: $1" ;;
@@ -193,6 +199,7 @@ GATEWAY_ENV="$LOCAL_DIR/gateway.env"
 DASHBOARD_ENV="$LOCAL_DIR/dashboard.env"
 DASHBOARD_OWNER_PS1="$LOCAL_DIR/dashboard-owner.ps1"
 DASHBOARD_ELEVATION_PS1="$LOCAL_DIR/dashboard-owner-elevate.ps1"
+DASHBOARD_PORT_STATE="$LOCAL_DIR/dashboard-port"
 STATE_FILE="$LOCAL_DIR/install-state"
 WRAPPER="$LOCAL_DIR/run-gateway.sh"
 SUPERVISOR="$LOCAL_DIR/gateway-supervisor.cjs"
@@ -223,6 +230,7 @@ NODE
   saved_host="${saved%%$'\t'*}"; remainder="${saved#*$'\t'}"
   saved_port="${remainder%%$'\t'*}"; saved_public="${remainder#*$'\t'}"
   PREVIOUS_PORT="$saved_port"
+  PREVIOUS_BIND_HOST="$saved_host"
   [ "$BIND_HOST_EXPLICIT" = 1 ] || [ -z "$saved_host" ] || BIND_HOST="$saved_host"
   [ "$PORT_EXPLICIT" = 1 ] || [ -z "$saved_port" ] || PORT="$saved_port"
   if [ "$CLEAR_PUBLIC_URL" = 1 ]; then
@@ -233,6 +241,29 @@ NODE
   # Opting into a public origin is a posture, not a label. Unless the operator explicitly supplied
   # another bind (which validation below will reject), move an existing LAN install back to loopback.
   [ "$PUBLIC_URL_EXPLICIT" = 0 ] || [ "$BIND_HOST_EXPLICIT" = 1 ] || BIND_HOST=127.0.0.1
+}
+hydrate_dashboard_port() {
+  local saved configured
+  [ "$DASHBOARD_PORT_EXPLICIT" = 1 ] && return 0
+  if [ -f "$CONFIG_JSON" ]; then
+    configured="$("$NODE_RESOLVED" - "$CONFIG_JSON" <<'NODE'
+const { readFileSync } = require('node:fs');
+const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const ports = (Array.isArray(config.hermesEndpoints) ? config.hermesEndpoints : [])
+  .map((endpoint) => /^ws:\/\/127\.0\.0\.1:(\d+)\/api\/ws$/.exec(endpoint?.url ?? '')?.[1])
+  .filter((port) => port !== undefined);
+if (ports.length === 1) process.stdout.write(ports[0]);
+NODE
+)" || die "could not read the existing private Dashboard endpoint from $CONFIG_JSON"
+    case "$configured" in ''|*[!0-9]*) ;; *)
+      [ "$configured" -ge 1 ] && [ "$configured" -le 65535 ] && { DASHBOARD_PORT="$configured"; return 0; }
+    esac
+  fi
+  [ -f "$DASHBOARD_PORT_STATE" ] || return 0
+  saved="$(tr -d '[:space:]' < "$DASHBOARD_PORT_STATE")"
+  case "$saved" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$saved" -ge 1 ] && [ "$saved" -le 65535 ] || return 0
+  DASHBOARD_PORT="$saved"
 }
 choose_fresh_listener() {
   local input answer
@@ -742,12 +773,35 @@ env_write() {
   [[ "$value" =~ ^[A-Za-z0-9_-]+$ ]] || die "installer-owned credentials must use the safe generated alphabet"
   printf '%s=%s\n' "$key" "$value" >> "$file"
 }
+previous_gateway_origin() {
+  local host="$PREVIOUS_BIND_HOST" port="$PREVIOUS_PORT"
+  [ -n "$host" ] && [ -n "$port" ] || return 1
+  case "$host" in 0.0.0.0) host=127.0.0.1 ;; ::) host='[::1]' ;; *:*) host="[$host]" ;; esac
+  printf 'http://%s:%s' "$host" "$port"
+}
+preflight_profile_env_ownership() {
+  local profile file owner url key
+  for profile in "${SELECTED[@]}"; do
+    file="$(profile_home "$profile")/.env"
+    owner="$(env_get "$file" "$ENV_OWNER_KEY")"
+    url="$(env_get "$file" COZYGATEWAY_URL)"
+    if [ "$owner" = "$ENV_OWNER_VALUE" ]; then
+      if [ -z "$url" ] || [ "$url" = "$(gateway_origin)" ] || [ "$url" = "$(previous_gateway_origin || true)" ]; then
+        continue
+      fi
+      die "$file targets another Gateway; use --runtime-only to preserve it"
+    fi
+    for key in COZYGATEWAY_URL COZYGATEWAY_TOKEN COZYGATEWAY_SPOOL_PATH COZYGATEWAY_HOME_CHANNEL; do
+      [ -z "$(env_get "$file" "$key")" ] || die "$file has an existing Gateway configuration; use --runtime-only to preserve it"
+    done
+  done
+}
 claim_profile_env() {
   local file="$1" owner
   owner="$(env_get "$file" "$ENV_OWNER_KEY")"
   [ "$owner" = "$ENV_OWNER_VALUE" ] && return
   if [ -f "$file" ] && grep -Eq '^(COZYGATEWAY_URL|COZYGATEWAY_TOKEN|COZYGATEWAY_SPOOL_PATH|COZYGATEWAY_HOME_CHANNEL)=' "$file"; then
-    die "$file already has CozyGateway keys not owned by this installer; remove or rename them before installing"
+    die "$file already has CozyGateway keys not owned by this installer; use --runtime-only to preserve it"
   fi
   env_put "$file" "$ENV_OWNER_KEY" "$ENV_OWNER_VALUE"
 }
@@ -957,8 +1011,9 @@ write_gateway_env() {
   local p token env_name profile_env spool_path seen_token seen_name
   prepare_dashboard_credential
   [ "$DRY_RUN" = 1 ] && { say "DRY   write gateway token environment at $GATEWAY_ENV (values redacted)"; return; }
-  umask 077; : > "$GATEWAY_ENV"
-  env_write "$GATEWAY_ENV" COZYGATEWAY_HERMES_TOKEN "$DASHBOARD_SESSION_TOKEN"
+  local staged="$GATEWAY_ENV.tmp.$$"
+  umask 077; : > "$staged"
+  env_write "$staged" COZYGATEWAY_HERMES_TOKEN "$DASHBOARD_SESSION_TOKEN"
   for p in "${SELECTED[@]}"; do
     profile_env="$(profile_home "$p")/.env"; claim_profile_env "$profile_env"; token="$(env_get "$profile_env" COZYGATEWAY_TOKEN)"; safe_secret "$token" || token="$(new_token)"; env_name="$(token_env_name "$p")"
     for seen_token in "${TOKENS[@]:-}"; do [ "$token" != "$seen_token" ] || die "Hermes profiles must have distinct CozyGateway attach tokens"; done
@@ -968,8 +1023,10 @@ write_gateway_env() {
     spool_path="$(profile_home "$p")/plugin-data/cozygateway/attach-v1.sqlite"
     is_windows && spool_path="$(to_windows_path "$spool_path")"
     env_put "$profile_env" COZYGATEWAY_SPOOL_PATH "$spool_path"; env_put "$profile_env" COZYGATEWAY_HOME_CHANNEL thread
-    env_write "$GATEWAY_ENV" "$env_name" "$token"
+    env_write "$staged" "$env_name" "$token"
   done
+  chmod 600 "$staged"
+  mv -f "$staged" "$GATEWAY_ENV"
   chmod 600 "$GATEWAY_ENV"
 }
 service_action_for() {
@@ -1045,6 +1102,13 @@ write_state() {
   command -v sync >/dev/null 2>&1 && sync -f "$staged" 2>/dev/null || true
   mv -f "$staged" "$STATE_FILE" || { rm -f "$staged"; return 1; }
 }
+write_dashboard_port_state() {
+  [ "$DRY_RUN" = 1 ] && return
+  umask 077
+  printf '%s\n' "$DASHBOARD_PORT" > "$DASHBOARD_PORT_STATE.tmp.$$"
+  chmod 600 "$DASHBOARD_PORT_STATE.tmp.$$"
+  mv -f "$DASHBOARD_PORT_STATE.tmp.$$" "$DASHBOARD_PORT_STATE"
+}
 resolve_platform() { normalize_service_platform; }
 preflight_service_manager() {
   resolve_platform
@@ -1070,16 +1134,27 @@ if [ "\${1:-}" = repair ] || [ "\${1:-}" = update ]; then
   bootstrap=$(printf %q "$POSIX_BOOTSTRAP")
   checksum="\$bootstrap.sha256"
   state=$(printf %q "$STATE_FILE")
+  source_file=$(printf %q "$LOCAL_DIR/bootstrap-source")
   reinstall='curl -fsSL https://cozylabs.ai/install.sh | bash'
   [ -f "\$bootstrap" ] && [ -f "\$checksum" ] || { printf 'FAIL  repair bootstrap is unavailable. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
   [ -r "\$state" ] || { printf 'FAIL  repair metadata is unavailable. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
   expected="\$(awk '{print \$1}' "\$checksum")"
   if command -v shasum >/dev/null 2>&1; then actual="\$(shasum -a 256 "\$bootstrap" | awk '{print \$1}')"; elif command -v sha256sum >/dev/null 2>&1; then actual="\$(sha256sum "\$bootstrap" | awk '{print \$1}')"; else printf 'FAIL  repair needs shasum or sha256sum. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; fi
   [ -n "\$expected" ] && [ "\$expected" = "\$actual" ] || { printf 'FAIL  repair bootstrap checksum mismatch. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
+  asset_base=""
+  if [ -f "\$source_file" ]; then
+    asset_base="\$(cat "\$source_file")"
+    case "\$asset_base" in file:///*) ;; *) printf 'FAIL  recorded repair source is invalid. Reinstall with: %s\n' "\$reinstall" >&2; exit 1 ;; esac
+  fi
+  repair_mode="\$(sed -n 's/^repair_mode=//p' "\$state" | tail -1)"
+  if [ "\$repair_mode" = runtime-only ]; then
+    printf 'INFO  repair refreshes only the recorded CozyGateway runtime\n'
+    exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") COZYGATEWAY_INSTALL_ASSET_BASE="\$asset_base" bash "\$bootstrap" --runtime-only
+  fi
   harness="\$(sed -n 's/^harness=//p' "\$state" | tail -1)"
   if [ "\$harness" = cozyagents ]; then
     printf 'INFO  repair refreshes verified runtime assets, then restarts CozyGateway\n'
-    exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") bash "\$bootstrap" --harness cozyagents
+    exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") COZYGATEWAY_INSTALL_ASSET_BASE="\$asset_base" bash "\$bootstrap" --harness cozyagents
   fi
   profiles="\$(sed -n 's/^profiles=//p' "\$state" | tail -1)"
   profile_scope="\$(sed -n 's/^profile_scope=//p' "\$state" | tail -1)"
@@ -1089,7 +1164,7 @@ if [ "\${1:-}" = repair ] || [ "\${1:-}" = update ]; then
     [[ "\$profiles" =~ ^(default|[A-Za-z0-9][A-Za-z0-9._-]{0,63})(,(default|[A-Za-z0-9][A-Za-z0-9._-]{0,63}))*\$ ]] || { printf 'FAIL  repair metadata is unavailable. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
   fi
   printf 'INFO  repair refreshes verified runtime and plugin assets, then restarts CozyGateway and Hermes attachment\n'
-  exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") bash "\$bootstrap" --profiles "\$profiles"
+  exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") COZYGATEWAY_INSTALL_ASSET_BASE="\$asset_base" bash "\$bootstrap" --profiles "\$profiles"
 fi
 cd $(printf %q "$LOCAL_DIR")
 exec $(printf %q "$NODE_RESOLVED") $(printf %q "$BUNDLE_PATH") "\$@"
@@ -1702,22 +1777,23 @@ atomic_copy() {
 build_supervisor_args() {
   local platform="$SERVICE_PLATFORM" gateway_env="$GATEWAY_ENV" bundle="$BUNDLE_PATH" config="$CONFIG_JSON"
   local socket="$MAINTENANCE_SOCKET" worker="$MAINTENANCE_WORKER" database="$LOCAL_DIR/cozygateway.sqlite"
-  local dashboard_env= hermes_root= hermes= launcher= owner_helper=
+  local dashboard_env= hermes_root= hermes= launcher= owner_helper= dashboard_port_state=
   if [ "${HARNESS:-}" = hermes ]; then
     dashboard_env="$DASHBOARD_ENV"; hermes_root="${HERMES_ROOT:-}"; hermes="${HERMES_RESOLVED:-}"
     launcher="${HERMES_ROOT:-}/bin/hermes.exe"; owner_helper="$DASHBOARD_OWNER_PS1"
+    dashboard_port_state="$DASHBOARD_PORT_STATE"
   fi
   if is_windows; then
     gateway_env="$(to_windows_path "$gateway_env")"; bundle="$(to_windows_path "$bundle")"; config="$(to_windows_path "$config")"
     socket='\\.\pipe\cozygateway-maintenance'; worker="$(to_windows_path "$worker")"; database="$(to_windows_path "$database")"
     if [ "${HARNESS:-}" = hermes ]; then
       dashboard_env="$(to_windows_path "$dashboard_env")"; hermes_root="$(to_windows_path "$hermes_root")"
-      hermes="$(to_windows_path "$hermes")"; launcher="$(to_windows_path "$launcher")"; owner_helper="$(to_windows_path "$owner_helper")"
+      hermes="$(to_windows_path "$hermes")"; launcher="$(to_windows_path "$launcher")"; owner_helper="$(to_windows_path "$owner_helper")"; dashboard_port_state="$(to_windows_path "$dashboard_port_state")"
     fi
   fi
   SUPERVISOR_ARGS=(--platform "$platform" --gateway-env "$gateway_env" --bundle "$bundle" --config "$config" --maintenance-socket "$socket" --maintenance-worker "$worker" --database "$database")
   if [ "${HARNESS:-}" = hermes ]; then
-    SUPERVISOR_ARGS+=(--dashboard-env "$dashboard_env" --hermes-root "$hermes_root" --hermes "$hermes" --hermes-launcher "$launcher" --owner-helper "$owner_helper" --dashboard-port "$DASHBOARD_PORT")
+    SUPERVISOR_ARGS+=(--dashboard-env "$dashboard_env" --hermes-root "$hermes_root" --hermes "$hermes" --hermes-launcher "$launcher" --owner-helper "$owner_helper" --dashboard-port "$DASHBOARD_PORT" --dashboard-port-state "$dashboard_port_state")
     if is_windows; then SUPERVISOR_ARGS+=(--windows-dashboard-profile); fi
   fi
 }
@@ -1812,7 +1888,7 @@ write_windows_launcher() {
   mv -f "$staged" "$WINDOWS_VBS"
 }
 load_windows_wrapper_identity() {
-  local line expected='exec ' value quoted
+  local line expected='exec ' legacy_expected='exec ' value quoted skip_value=0 dashboard_state=''
   [ -r "$WRAPPER" ] && [ -r "$SUPERVISOR" ] || return 1
   [ "$(tr -d '\r' < "$WRAPPER" | awk 'END { print NR }')" = 3 ] || return 1
   [ "$(sed -n '1p' "$WRAPPER" | tr -d '\r')" = '#!/usr/bin/env bash' ] || return 1
@@ -1821,9 +1897,15 @@ load_windows_wrapper_identity() {
   for value in "$NODE_RESOLVED" "$SUPERVISOR" "${SUPERVISOR_ARGS[@]}"; do
     printf -v quoted '%q' "$value"
     expected="$expected$quoted "
+    if [ "$skip_value" = 1 ]; then skip_value=0; continue; fi
+    if [ "$value" = --dashboard-port-state ]; then skip_value=1; continue; fi
+    legacy_expected="$legacy_expected$quoted "
   done
   line="$(sed -n '3p' "$WRAPPER" | tr -d '\r')"
-  [ "$line" = "$expected" ] || return 1
+  if [ "$line" = "$expected" ]; then dashboard_state="$DASHBOARD_PORT_STATE"
+  elif [ "$line" != "$legacy_expected" ]; then return 1
+  fi
+  WINDOWS_OWNED_DASHBOARD_PORT_STATE="$dashboard_state"
   WINDOWS_OWNED_NODE_RESOLVED="$NODE_RESOLVED"
   WINDOWS_OWNED_GATEWAY_ENV="$GATEWAY_ENV"
   WINDOWS_OWNED_DASHBOARD_ENV=
@@ -1882,7 +1964,7 @@ preflight_windows_service_ownership() {
   NODE_RESOLVED="$desired_node"; BUNDLE_PATH="$desired_bundle"; DASHBOARD_PORT="$desired_dashboard_port"
 }
 stop_owned_windows_gateway() {
-  local config_native gateway_env_native dashboard_env_native node_native bundle_native hermes_root_native hermes_native launcher_native owner_helper_native worker_native database_native code release_code attempt expected_port check_target_port="${1:-1}"
+  local config_native gateway_env_native dashboard_env_native node_native bundle_native hermes_root_native hermes_native launcher_native owner_helper_native dashboard_state_native worker_native database_native code release_code attempt expected_port check_target_port="${1:-1}"
   if [ "${WINDOWS_OWNED_IDENTITY:-0}" != 1 ] && ! load_windows_wrapper_identity; then
     [ "$check_target_port" = 0 ] && return 1
     windows_gateway_ports_are_free
@@ -1890,7 +1972,7 @@ stop_owned_windows_gateway() {
   fi
   config_native="$(to_windows_path "$WINDOWS_OWNED_CONFIG_JSON")"
   gateway_env_native="$(to_windows_path "$WINDOWS_OWNED_GATEWAY_ENV")"
-  dashboard_env_native=; hermes_root_native=; hermes_native=; launcher_native=; owner_helper_native=
+  dashboard_env_native=; hermes_root_native=; hermes_native=; launcher_native=; owner_helper_native=; dashboard_state_native=
   node_native="$(to_windows_path "$WINDOWS_OWNED_NODE_RESOLVED")"
   bundle_native="$(to_windows_path "$WINDOWS_OWNED_BUNDLE_PATH")"
   if [ -n "$WINDOWS_OWNED_DASHBOARD_ENV" ]; then
@@ -1900,11 +1982,12 @@ stop_owned_windows_gateway() {
     hermes_native="$(to_windows_path "$WINDOWS_OWNED_HERMES_RESOLVED")"
     launcher_native="$(to_windows_path "$WINDOWS_OWNED_LAUNCHER")"
     owner_helper_native="$(to_windows_path "$WINDOWS_OWNED_DASHBOARD_OWNER_PS1")"
+    [ -z "${WINDOWS_OWNED_DASHBOARD_PORT_STATE:-}" ] || dashboard_state_native="$(to_windows_path "$WINDOWS_OWNED_DASHBOARD_PORT_STATE")"
   fi
   worker_native="$(to_windows_path "$MAINTENANCE_WORKER")"
   database_native="$(to_windows_path "$LOCAL_DIR/cozygateway.sqlite")"
   set +e
-  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_GATEWAY_ENV="$gateway_env_native" COZYGATEWAY_EXPECTED_DASHBOARD_ENV="$dashboard_env_native" COZYGATEWAY_EXPECTED_NODE="$node_native" COZYGATEWAY_EXPECTED_SUPERVISOR="$(to_windows_path "$SUPERVISOR")" COZYGATEWAY_EXPECTED_BUNDLE="$bundle_native" COZYGATEWAY_EXPECTED_WORKER="$worker_native" COZYGATEWAY_EXPECTED_DATABASE="$database_native" COZYGATEWAY_EXPECTED_HERMES_ROOT="$hermes_root_native" COZYGATEWAY_EXPECTED_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_OWNER_HELPER="$owner_helper_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$WINDOWS_OWNED_DASHBOARD_PORT" powershell.exe -NoProfile -NonInteractive -Command '
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_GATEWAY_ENV="$gateway_env_native" COZYGATEWAY_EXPECTED_DASHBOARD_ENV="$dashboard_env_native" COZYGATEWAY_EXPECTED_NODE="$node_native" COZYGATEWAY_EXPECTED_SUPERVISOR="$(to_windows_path "$SUPERVISOR")" COZYGATEWAY_EXPECTED_BUNDLE="$bundle_native" COZYGATEWAY_EXPECTED_WORKER="$worker_native" COZYGATEWAY_EXPECTED_DATABASE="$database_native" COZYGATEWAY_EXPECTED_HERMES_ROOT="$hermes_root_native" COZYGATEWAY_EXPECTED_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_OWNER_HELPER="$owner_helper_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$WINDOWS_OWNED_DASHBOARD_PORT" COZYGATEWAY_EXPECTED_DASHBOARD_PORT_STATE="$dashboard_state_native" powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
     function Same-Path([string] $Candidate, [string] $Expected) {
       if ([string]::IsNullOrWhiteSpace($Candidate) -or [string]::IsNullOrWhiteSpace($Expected)) { return $false }
@@ -1927,11 +2010,14 @@ stop_owned_windows_gateway() {
       if (-not [string]::IsNullOrWhiteSpace($env:COZYGATEWAY_EXPECTED_DASHBOARD_ENV)) {
         $expected += @("--dashboard-env", $env:COZYGATEWAY_EXPECTED_DASHBOARD_ENV, "--hermes-root", $env:COZYGATEWAY_EXPECTED_HERMES_ROOT,
           "--hermes", $env:COZYGATEWAY_EXPECTED_HERMES, "--hermes-launcher", $env:COZYGATEWAY_EXPECTED_LAUNCHER,
-          "--owner-helper", $env:COZYGATEWAY_EXPECTED_OWNER_HELPER, "--dashboard-port", $env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT,
-          "--windows-dashboard-profile")
+          "--owner-helper", $env:COZYGATEWAY_EXPECTED_OWNER_HELPER, "--dashboard-port", $env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT)
+        if (-not [string]::IsNullOrWhiteSpace($env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT_STATE)) {
+          $expected += @("--dashboard-port-state", $env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT_STATE)
+        }
+        $expected += "--windows-dashboard-profile"
       }
       if ($tokens.Count -ne $expected.Count) { return $false }
-      $pathIndexes = @(0, 1, 5, 7, 9, 13, 15, 17, 19, 21, 23, 25)
+      $pathIndexes = @(0, 1, 5, 7, 9, 13, 15, 17, 19, 21, 23, 25, 29)
       for ($index = 0; $index -lt $expected.Count; $index += 1) {
         if ($pathIndexes -contains $index) { if (-not (Same-Path $tokens[$index] $expected[$index])) { return $false } }
         elseif ($tokens[$index] -cne $expected[$index]) { return $false }
@@ -2327,7 +2413,7 @@ WantedBy=default.target
 UNIT
     } > "$staged"
     chmod 600 "$staged"; mv -f "$staged" "$unit"
-    systemctl --user daemon-reload; systemctl --user enable --now "$SERVICE_UNIT"
+    systemctl --user daemon-reload; systemctl --user enable --now "$SERVICE_UNIT"; systemctl --user restart "$SERVICE_UNIT"
   fi
 }
 dashboard_ready() {
@@ -2445,18 +2531,8 @@ start_dashboard() {
   [ "$DRY_RUN" = 1 ] && { say "DRY   start/reuse Hermes Dashboard at 127.0.0.1:$DASHBOARD_PORT as the control/read plane"; return; }
   if dashboard_ready; then
     dashboard_credentials_work && return
-    say "INFO  existing Hermes Dashboard rejected the configured local session token; restarting it with the installer-owned token"
-    if is_windows; then
-      HERMES_HOME="$hermes_root_arg" "$HERMES_RESOLVED" dashboard -p default --stop >/dev/null 2>&1 || die "could not stop the Dashboard that rejected the local credential"
-    else
-      HERMES_HOME="$hermes_root_arg" "$HERMES_RESOLVED" dashboard --stop >/dev/null 2>&1 || die "could not stop the Dashboard that rejected the local credential"
-    fi
-    for _ in $(seq 1 5); do dashboard_ready || break; sleep 1; done
-    if dashboard_ready && is_windows; then
-      stop_stubborn_windows_dashboard
-      for _ in $(seq 1 10); do dashboard_ready || break; sleep 1; done
-    fi
-    dashboard_ready && die "Dashboard stayed listening after stop; refusing to launch with an unverified credential"
+    say "WARN  existing Hermes Dashboard rejected the configured local session token; preserving it and letting the CozyGateway supervisor provision a private loopback Dashboard"
+    return
   fi
   launch_dashboard
   for _ in $(seq 1 90); do dashboard_ready && break; sleep 1; done
@@ -2550,6 +2626,45 @@ uninstall() {
     return
   fi
   # install-state contains only profile names, paths, and lifecycle state; no secrets.
+  if [ "$(sed -n 's/^repair_mode=//p' "$STATE_FILE" | tail -1)" = runtime-only ]; then
+    resolve_platform
+    if [ "$SERVICE_PLATFORM" = Windows ]; then
+      local startup_entry task_xml
+      startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
+      task_xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
+      [ -z "$task_xml" ] || windows_recorded_task_is_owned || die "CozyGateway Scheduled Task ownership could not be verified; preserving independently managed Hermes state"
+      [ ! -f "$startup_entry" ] || windows_startup_entry_is_owned "$startup_entry" || die "CozyGateway Startup entry ownership could not be verified; preserving independently managed Hermes state"
+      if [ "$DRY_RUN" = 1 ]; then
+        say "DRY   stop the owned CozyGateway process, delete Scheduled Task $WINDOWS_TASK and Startup entry $startup_entry"
+      else
+        if stop_owned_windows_gateway 0; then :; else say "INFO  no owned CozyGateway process was running"; fi
+        [ -z "$task_xml" ] || MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || die "could not remove owned CozyGateway Scheduled Task"
+        [ ! -f "$startup_entry" ] || rm -f "$startup_entry" || die "could not remove owned CozyGateway Startup entry"
+        remove_windows_cli_path
+      fi
+    elif [ "$SERVICE_PLATFORM" = Darwin ]; then
+      local plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
+      posix_service_is_owned_or_absent "$plist" || die "CozyGateway launchd ownership could not be verified; preserving independently managed Hermes state"
+      if [ "$DRY_RUN" = 1 ]; then
+        say "DRY   stop and remove owned launchd service $SERVICE_LABEL and the cozygateway command"
+      else
+        remove_owned_posix_service "$plist" || die "could not remove owned CozyGateway launchd service"
+        remove_posix_cli || die "could not remove the CozyGateway command"
+      fi
+    else
+      local unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"
+      posix_service_is_owned_or_absent "$unit" || die "CozyGateway systemd ownership could not be verified; preserving independently managed Hermes state"
+      if [ "$DRY_RUN" = 1 ]; then
+        say "DRY   stop and remove owned systemd service $SERVICE_UNIT and the cozygateway command"
+      else
+        remove_owned_posix_service "$unit" || die "could not remove owned CozyGateway systemd service"
+        remove_posix_cli || die "could not remove the CozyGateway command"
+      fi
+    fi
+    run rm -rf "$GATEWAY_DIR"
+    say "OK    removed CozyGateway runtime-only state; Hermes profiles, plugins, services, and environment were preserved"
+    return
+  fi
   if [ "$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)" = cozyagents ]; then uninstall_cozyagents; return; fi
   root="$(sed -n 's/^hermes_root=//p' "$STATE_FILE" | tail -1)"
   hermes_bin="$(sed -n 's/^hermes_bin=//p' "$STATE_FILE" | tail -1)"
@@ -2750,15 +2865,72 @@ install_with_cozyagents() {
   announce_listener
   pairing_and_finish
 }
+runtime_state_value() {
+  sed -n "s/^$1=//p" "$STATE_FILE" | tail -1
+}
+hydrate_runtime_only_harness() {
+  HARNESS="$(runtime_state_value harness)"
+  if [ -z "$HARNESS" ] && [ -n "$(runtime_state_value hermes_root)$(runtime_state_value hermes_bin)" ]; then HARNESS=hermes; fi
+  case "$HARNESS" in
+    hermes)
+      HERMES_ROOT="$(runtime_state_value hermes_root)"
+      HERMES_RESOLVED="$(runtime_state_value hermes_bin)"
+      [ -d "$HERMES_ROOT" ] && [ -x "$HERMES_RESOLVED" ] || die "--runtime-only needs the recorded Hermes runtime; reinstall normally to repair Hermes integration"
+      HERMES_BIN="$HERMES_RESOLVED"
+      DASHBOARD_SESSION_TOKEN="$(env_get "$DASHBOARD_ENV" DASHBOARD_SESSION_TOKEN)"
+      safe_secret "$DASHBOARD_SESSION_TOKEN" || die "--runtime-only needs the existing Dashboard credential"
+      write_dashboard_port_state
+      write_dashboard_owner_helper
+      if is_windows; then write_dashboard_elevation_helper; fi
+      ;;
+    cozyagents) ;;
+    *) die "--runtime-only cannot classify the existing harness; reinstall normally" ;;
+  esac
+}
+write_runtime_only_state() {
+  local staged="$STATE_FILE.runtime.$$"
+  [ "$DRY_RUN" = 1 ] && return
+  [ -f "$STATE_FILE" ] || die "runtime-only repair needs existing installer state"
+  umask 077
+  grep -v -E '^(repair_mode|harness|dashboard_port|node_resolved|bundle_path|supervisor)=' "$STATE_FILE" > "$staged" || true
+  printf 'harness=%s\n' "$HARNESS" >> "$staged"
+  printf 'dashboard_port=%s\n' "$DASHBOARD_PORT" >> "$staged"
+  printf 'node_resolved=%s\n' "$NODE_RESOLVED" >> "$staged"
+  printf 'bundle_path=%s\n' "$BUNDLE_PATH" >> "$staged"
+  printf 'supervisor=%s\n' "$SUPERVISOR" >> "$staged"
+  printf 'repair_mode=runtime-only\n' >> "$staged"
+  chmod 600 "$staged"
+  mv -f "$staged" "$STATE_FILE"
+}
+runtime_only_repair() {
+  [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--runtime-only needs a verified release bundle"
+  [ -f "$STATE_FILE" ] && [ -f "$CONFIG_JSON" ] && [ -f "$GATEWAY_ENV" ] || die "--runtime-only needs an existing CozyGateway installation"
+  hydrate_runtime_only_harness
+  install_service
+  wait_gateway_ready
+  write_runtime_only_state
+  write_cli_wrapper
+  is_windows || install_posix_cli
+  say "OK    updated CozyGateway runtime and supervisor without changing Hermes profiles, plugins, services, or tokens"
+}
 main() {
   local prerequisite_missing=0 profile action
   if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
   preflight_service_manager
+  if [ "$RUNTIME_ONLY" = 1 ]; then
+    NODE_RESOLVED="$(resolve_node)" || die "--runtime-only needs the existing Node.js 24 runtime; reinstall normally to provision it"
+    say "OK    using existing Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
+    hydrate_listener_settings
+    hydrate_dashboard_port
+    validate_listener_settings
+    runtime_only_repair
+    return
+  fi
   if NODE_RESOLVED="$(resolve_node)"; then say "OK    using Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
   elif [ "$DRY_RUN" = 1 ]; then say "DRY   install the current Node.js 24 release under $GATEWAY_DIR/runtime/node from checksum-verified nodejs.org assets"; prerequisite_missing=1
   else install_node_runtime
   fi
-  [ "$prerequisite_missing" = 1 ] || hydrate_listener_settings
+  [ "$prerequisite_missing" = 1 ] || { hydrate_listener_settings; hydrate_dashboard_port; }
   if [ "$STATUS" = 1 ]; then validate_listener_settings; status_install; return; fi
   [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--bundle must name the verified release bundle"
   # Step 1 of the approved order: the harness, before anything is installed.
@@ -2792,6 +2964,7 @@ main() {
   HERMES_BIN="$HERMES_RESOLVED"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; hydrate_profile_scope; discover_profiles
   say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"
   is_windows && preflight_windows_service_ownership
+  preflight_profile_env_ownership
   for profile in "${SELECTED[@]}"; do action="$(prior_service_action "$profile")"; record_service_action "$profile" "${action:-unknown}"; done
   write_state; write_gateway_env
   # Stage every profile before enabling any of them. Hermes can materialize inherited global
@@ -2799,7 +2972,7 @@ main() {
   # would create an unowned legacy copy and make the next profile fail closed.
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
   for profile in "${SELECTED[@]}"; do enable_plugin "$profile"; done
-  write_gateway_config; write_cli_wrapper; write_dashboard_owner_helper; is_windows && write_dashboard_elevation_helper; start_dashboard; install_service; wait_gateway_ready
+  write_dashboard_port_state; write_gateway_config; write_cli_wrapper; write_dashboard_owner_helper; is_windows && write_dashboard_elevation_helper; start_dashboard; install_service; wait_gateway_ready
   ensure_hermes_gateways; write_state; wait_attach_ready
   is_windows || install_posix_cli
   announce_listener

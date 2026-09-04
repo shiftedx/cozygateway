@@ -39,8 +39,8 @@ Authorization: Bearer <COZYRUNNER_TOKEN>
   appears in `GET /runners` as one row with id `legacy`, which cannot be renamed or deleted from the
   app; unsetting the variable is how it goes away.
 - A wrong or missing token closes the socket `1008`. The same credential also opens `GET
-  /runners/self`, which answers that one runner's row plus `attached`, and nothing else on this
-  gateway.
+  /runners/self`, which answers that one runner's row plus `attached` and, only when its current
+  authenticated hello supplied it, `agentVersion`; it opens nothing else on this gateway.
 - The path is always registered from 52, because a runner pairs at runtime and a lane built only for
   an operator-placed variable would leave a freshly paired runner with nowhere to dial. A gateway
   with no runner at all still accepts and stores runtime operations; they simply wait.

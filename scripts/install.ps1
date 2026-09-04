@@ -74,9 +74,22 @@ function Copy-OrDownload {
     }
 }
 
+function Resolve-BootstrapReleaseBase {
+    param([string] $Base)
+    if (-not [string]::IsNullOrWhiteSpace($Base)) { return $Base }
+    $repository = if ($env:COZYGATEWAY_INSTALL_REPO) { $env:COZYGATEWAY_INSTALL_REPO } else { 'shiftedx/cozygateway' }
+    $releaseTag = $env:COZYGATEWAY_INSTALL_TAG
+    if ([string]::IsNullOrWhiteSpace($releaseTag)) { $releaseTag = Get-LatestTag $repository }
+    return "https://github.com/$repository/releases/download/$releaseTag"
+}
+
 function Get-VerifiedAsset {
     param([string] $Name, [string] $Destination, [string] $BaseUri)
-    $source = if (Test-Path -LiteralPath $BaseUri) { Join-Path $BaseUri $Name } else { "$($BaseUri.TrimEnd('/'))/$Name" }
+    $localBase = $BaseUri
+    if ($BaseUri -match '^file://') {
+        try { $localBase = ([Uri]$BaseUri).LocalPath } catch { Fail "invalid local release source: $BaseUri" }
+    }
+    $source = if (Test-Path -LiteralPath $localBase) { Join-Path $localBase $Name } else { "$($BaseUri.TrimEnd('/'))/$Name" }
     $newPath = "$Destination.new"
     $shaPath = "$Destination.sha256"
     Remove-Item -LiteralPath $newPath -Force -ErrorAction SilentlyContinue
@@ -98,6 +111,714 @@ function Promote-VerifiedAsset {
     Move-Item -LiteralPath (Join-Path $Stage "$Name.sha256") -Destination (Join-Path $Destination "$Name.sha256") -Force
 }
 
+function Acquire-BootstrapLock {
+    param([string] $InstallRoot)
+    $script:BootstrapLockPath = Join-Path $InstallRoot '.bootstrap-lock'
+    Assert-BootstrapPath $script:BootstrapLockPath
+    Assert-BootstrapPath (Join-Path $script:BootstrapLockPath 'pid')
+    try {
+        New-Item -ItemType Directory -Path $script:BootstrapLockPath -ErrorAction Stop | Out-Null
+    } catch {
+        $pidPath = Join-Path $script:BootstrapLockPath 'pid'
+        $owner = if (Test-Path -LiteralPath $pidPath -PathType Leaf) { (Get-Content -LiteralPath $pidPath -Raw).Trim() } else { '' }
+        $live = $false
+        $ownerId = 0
+        if ([int]::TryParse($owner, [ref]$ownerId)) { $live = $null -ne (Get-Process -Id $ownerId -ErrorAction SilentlyContinue) }
+        if ($live) { Fail 'another CozyGateway bootstrap is running; wait for it to finish and rerun' }
+        if (-not (Test-Path -LiteralPath $script:BootstrapLockPath -PathType Container) -or @((Get-ChildItem -LiteralPath $script:BootstrapLockPath -Force)).Count -gt 1) {
+            Fail 'another CozyGateway bootstrap is running; wait for it to finish and rerun'
+        }
+        Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $script:BootstrapLockPath -Force -ErrorAction Stop
+        New-Item -ItemType Directory -Path $script:BootstrapLockPath -ErrorAction Stop | Out-Null
+    }
+    Set-Content -LiteralPath (Join-Path $script:BootstrapLockPath 'pid') -Value $PID -NoNewline -Encoding ascii
+}
+
+function Release-BootstrapLock {
+    if ([string]::IsNullOrWhiteSpace($script:BootstrapLockPath)) { return }
+    Remove-Item -LiteralPath (Join-Path $script:BootstrapLockPath 'pid') -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $script:BootstrapLockPath -Force -ErrorAction SilentlyContinue
+}
+
+function Assert-BootstrapPath {
+    param([string] $Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Fail "refusing redirected bootstrap path: $Path"
+    }
+}
+
+function Test-BootstrapWindows {
+    return [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+}
+
+# These are the small, durable Gateway runtime contract. They deliberately omit
+# databases, logs, sockets, Hermes profiles, and CozyAgents state: a bootstrap
+# rollback must restore the Gateway launcher without trying to rewind user data.
+function Get-BootstrapRuntimeFiles {
+    return @(
+        'local/install-state',
+        'local/profiles.json',
+        'local/cozygateway.config.json',
+        'local/gateway.env',
+        'local/gateway-supervisor.cjs',
+        'local/run-gateway.sh',
+        'local/dashboard.env',
+        'local/dashboard-port',
+        'local/dashboard-owner.ps1',
+        'local/dashboard-owner-elevate.ps1',
+        'local/run-gateway.vbs',
+        'local/cozygateway-task.xml',
+        'local/bootstrap-source',
+        'bin/cozygateway',
+        'bin/cozygateway.cmd'
+    )
+}
+
+function Test-BootstrapRuntimeFileId {
+    param([string] $Id)
+    return (Get-BootstrapRuntimeFiles) -ccontains $Id
+}
+
+function Assert-BootstrapPathAndParents {
+    param([string] $Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { Fail 'bootstrap path is empty' }
+    $current = [IO.Path]::GetFullPath($Path)
+    while ($true) {
+        Assert-BootstrapPath $current
+        $parent = [IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrWhiteSpace($parent) -or [string]::Equals($parent, $current, [StringComparison]::OrdinalIgnoreCase)) { return }
+        $current = $parent
+    }
+}
+
+function Assert-BootstrapRegularFile {
+    param([string] $Path, [string] $Label, [switch] $MustExist)
+    Assert-BootstrapPathAndParents $Path
+    if (Test-Path -LiteralPath $Path) {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { Fail "bootstrap $Label is not a regular file" }
+        return
+    }
+    if ($MustExist) { Fail "bootstrap $Label is missing" }
+}
+
+function Assert-BootstrapTreeSafe {
+    param([string] $Path)
+    Assert-BootstrapPathAndParents $Path
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { Fail 'bootstrap snapshot is not a directory' }
+    foreach ($child in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)) {
+        Assert-BootstrapPath $child.FullName
+        if ($child.PSIsContainer) { Assert-BootstrapTreeSafe $child.FullName }
+    }
+}
+
+function Assert-BootstrapAssetName {
+    param([string] $Name)
+    if ([string]::IsNullOrWhiteSpace($Name) -or $Name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+        Fail 'bootstrap asset name is invalid'
+    }
+}
+
+function Get-BootstrapAclToken {
+    param([string] $Path, [string] $Label)
+    if (-not (Test-BootstrapWindows)) { return '-' }
+    try {
+        $sddl = (Get-Acl -LiteralPath $Path -ErrorAction Stop).Sddl
+        if ([string]::IsNullOrWhiteSpace($sddl)) { Fail "could not read bootstrap ACL: $Label" }
+        return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($sddl))
+    } catch {
+        Fail "could not read bootstrap ACL: $Label"
+    }
+}
+
+function Test-BootstrapAclToken {
+    param([string] $Token)
+    if (-not (Test-BootstrapWindows)) { return $Token -eq '-' }
+    if ([string]::IsNullOrWhiteSpace($Token) -or $Token -eq '-') { return $false }
+    try {
+        $sddl = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Token))
+        if ([string]::IsNullOrWhiteSpace($sddl)) { return $false }
+        $descriptor = New-Object -TypeName 'System.Security.AccessControl.RawSecurityDescriptor' -ArgumentList $sddl
+        return $null -ne $descriptor
+    } catch {
+        return $false
+    }
+}
+
+function Restore-BootstrapAcl {
+    param([string] $Path, [string] $Token, [string] $Label)
+    if (-not (Test-BootstrapWindows)) { return }
+    if (-not (Test-BootstrapAclToken $Token)) { Fail "bootstrap ACL snapshot is invalid: $Label" }
+    try {
+        $sddl = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Token))
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $acl.SetSecurityDescriptorSddlForm($sddl)
+        Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+    } catch {
+        Fail "could not restore bootstrap ACL: $Label"
+    }
+}
+
+function Get-BootstrapTemporaryPath {
+    param([string] $Path)
+    return "$Path.recover.$PID"
+}
+
+function Assert-BootstrapRestoreDestination {
+    param([string] $Path, [string] $Label)
+    Assert-BootstrapRegularFile $Path $Label
+    $temporary = Get-BootstrapTemporaryPath $Path
+    Assert-BootstrapPathAndParents $temporary
+    if (Test-Path -LiteralPath $temporary) { Fail "bootstrap restore staging file already exists: $Label" }
+}
+
+function Copy-BootstrapSnapshotFile {
+    param([string] $Source, [string] $Destination, [string] $Label)
+    Assert-BootstrapRegularFile $Source "snapshot source $Label" -MustExist
+    Assert-BootstrapRegularFile $Destination "snapshot destination $Label"
+    $parent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Destination))
+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null }
+    Assert-BootstrapPathAndParents $Destination
+    $temporary = "$Destination.snapshot.$PID"
+    Assert-BootstrapPathAndParents $temporary
+    if (Test-Path -LiteralPath $temporary) { Fail "bootstrap snapshot staging file already exists: $Label" }
+    try {
+        Copy-Item -LiteralPath $Source -Destination $temporary -Force -ErrorAction Stop
+        if (-not (Test-Path -LiteralPath $temporary -PathType Leaf)) { Fail "could not snapshot bootstrap $Label" }
+        Move-Item -LiteralPath $temporary -Destination $Destination -Force -ErrorAction Stop
+    } finally {
+        if (Test-Path -LiteralPath $temporary) {
+            Assert-BootstrapPath $temporary
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Restore-BootstrapFile {
+    param([string] $Path, [string] $Source, [string] $State, [string] $AclToken, [string] $Label)
+    Assert-BootstrapRestoreDestination $Path $Label
+    if ($State -eq 'absent') {
+        if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop }
+        return
+    }
+    if ($State -ne 'present') { Fail "bootstrap restore state is invalid: $Label" }
+    Assert-BootstrapRegularFile $Source "snapshot $Label" -MustExist
+    if ($AclToken -ne '-' -and -not (Test-BootstrapAclToken $AclToken)) { Fail "bootstrap ACL snapshot is invalid: $Label" }
+    $parent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))
+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null }
+    Assert-BootstrapRestoreDestination $Path $Label
+    $temporary = Get-BootstrapTemporaryPath $Path
+    try {
+        Copy-Item -LiteralPath $Source -Destination $temporary -Force -ErrorAction Stop
+        if ($AclToken -ne '-') { Restore-BootstrapAcl $temporary $AclToken $Label }
+        Move-Item -LiteralPath $temporary -Destination $Path -Force -ErrorAction Stop
+    } finally {
+        if (Test-Path -LiteralPath $temporary) {
+            Assert-BootstrapPath $temporary
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Set-BootstrapTransactionState {
+    param([string] $InstallRoot, [string] $State)
+    if ($State -notin @('prepare=replace-release-assets', 'intent=replace-release-assets', 'commit=installer-succeeded', 'restored=previous-release')) {
+        Fail 'bootstrap transaction state is invalid'
+    }
+    $journal = Join-Path $InstallRoot '.bootstrap-transaction'
+    $next = "$journal.next"
+    Assert-BootstrapPathAndParents $journal
+    Assert-BootstrapPathAndParents $next
+    if (Test-Path -LiteralPath $next) { Fail 'bootstrap transaction staging marker already exists' }
+    try {
+        Set-Content -LiteralPath $next -Value $State -NoNewline -Encoding ascii -ErrorAction Stop
+        Move-Item -LiteralPath $next -Destination $journal -Force -ErrorAction Stop
+    } finally {
+        if (Test-Path -LiteralPath $next) {
+            Assert-BootstrapPath $next
+            Remove-Item -LiteralPath $next -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-GatewayTaskExec {
+    param([string] $TaskXml)
+    try { [xml] $document = $TaskXml } catch { return $null }
+    $execs = @($document.SelectNodes('//*[local-name()="Actions"]/*[local-name()="Exec"]'))
+    if ($execs.Count -ne 1) { return $null }
+    $actions = @($document.SelectNodes('//*[local-name()="Actions"]/*'))
+    if ($actions.Count -ne 1) { return $null }
+    $command = [string]$execs[0].Command
+    $arguments = [string]$execs[0].Arguments
+    if ([string]::IsNullOrWhiteSpace($command) -or [string]::IsNullOrWhiteSpace($arguments)) { return $null }
+    return [pscustomobject]@{ Command = $command; Arguments = $arguments }
+}
+
+function Test-BootstrapPathEquals {
+    param([string] $Left, [string] $Right)
+    return [string]::Equals($Left, $Right, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-OwnedGatewayStartupEntry {
+    param([string] $InstallRoot, [string] $EntryPath)
+    $item = Get-Item -LiteralPath $EntryPath -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item -or $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+    try { $content = [IO.File]::ReadAllText($EntryPath) } catch { return $false }
+    $content = ($content -replace "`r", '').TrimEnd([char[]]"`n")
+    $lines = @($content -split "`n")
+    $wrapper = [IO.Path]::GetFullPath((Join-Path $InstallRoot 'local\run-gateway.sh'))
+    if ($lines.Count -eq 7 -and $lines[0] -eq 'Set shell = CreateObject("WScript.Shell")' -and
+        $lines[2] -eq 'For attempt = 0 To 3' -and $lines[3] -eq '  code = shell.Run(command, 0, True)' -and
+        $lines[4] -eq '  If code = 0 Then Exit For' -and $lines[5] -eq '  If attempt < 3 Then WScript.Sleep 60000' -and $lines[6] -eq 'Next') {
+        $match = [regex]::Match($lines[1], '^command = """(?<bash>[^"]+)"" ""(?<wrapper>[^"]+)"""$')
+        return $match.Success -and -not [string]::IsNullOrWhiteSpace($match.Groups['bash'].Value) -and (Test-BootstrapPathEquals $match.Groups['wrapper'].Value $wrapper)
+    }
+    if ($lines.Count -eq 3 -and $lines[0] -eq 'Set shell = CreateObject("WScript.Shell")' -and $lines[2] -eq 'shell.Run command, 0, False') {
+        $match = [regex]::Match($lines[1], '^command = """(?<bash>[^"]+)"" ""(?<wrapper>[^"]+)"""$')
+        return $match.Success -and -not [string]::IsNullOrWhiteSpace($match.Groups['bash'].Value) -and (Test-BootstrapPathEquals $match.Groups['wrapper'].Value $wrapper)
+    }
+    if ($lines.Count -eq 7 -and $lines[0] -eq 'Set shell = CreateObject("WScript.Shell")' -and
+        $lines[2] -eq 'For attempt = 0 To 3' -and $lines[3] -eq '  code = shell.Run(command, 0, True)' -and
+        $lines[4] -eq '  If code = 0 Then Exit For' -and $lines[5] -eq '  If attempt < 3 Then WScript.Sleep 60000' -and $lines[6] -eq 'Next') {
+        $match = [regex]::Match($lines[1], '^command = "(?<wrapper>[^"]+)"$')
+        return $match.Success -and (Test-BootstrapPathEquals $match.Groups['wrapper'].Value $wrapper)
+    }
+    return $false
+}
+
+function Test-OwnedGatewayTask {
+    param([string] $InstallRoot, [string] $TaskXml, [string] $LauncherPath = (Join-Path $InstallRoot 'local\run-gateway.vbs'))
+    $exec = Get-GatewayTaskExec $TaskXml
+    if ($null -eq $exec) { return $false }
+    $matches = [regex]::Matches($exec.Arguments, '"([^"]*)"')
+    if ($matches.Count -eq 0 -or (($matches | ForEach-Object { $_.Value }) -join ' ') -ne $exec.Arguments.Trim()) { return $false }
+    $values = @($matches | ForEach-Object { $_.Groups[1].Value })
+    if ([string]::Equals($exec.Command, 'wscript.exe', [StringComparison]::OrdinalIgnoreCase)) {
+        return $values.Count -eq 1 -and (Test-BootstrapPathEquals $values[0] ([IO.Path]::GetFullPath($LauncherPath))) -and (Test-OwnedGatewayStartupEntry $InstallRoot $LauncherPath)
+    }
+    $node = [IO.Path]::GetFullPath((Join-Path $InstallRoot 'runtime\node\node.exe'))
+    $supervisor = [IO.Path]::GetFullPath((Join-Path $InstallRoot 'local\gateway-supervisor.cjs'))
+    if (-not (Test-BootstrapPathEquals $exec.Command $node) -or $values.Count -lt 1 -or -not (Test-BootstrapPathEquals $values[0] $supervisor)) { return $false }
+    $required = @{
+        '--platform' = 'Windows'
+        '--gateway-env' = (Join-Path $InstallRoot 'local\gateway.env')
+        '--bundle' = (Join-Path $InstallRoot 'bin\cozygateway.mjs')
+        '--config' = (Join-Path $InstallRoot 'local\cozygateway.config.json')
+        '--maintenance-socket' = '\\.\pipe\cozygateway-maintenance'
+        '--database' = (Join-Path $InstallRoot 'local\cozygateway.sqlite')
+    }
+    $known = @($required.Keys + @('--maintenance-worker', '--dashboard-env', '--hermes-root', '--hermes', '--hermes-launcher', '--owner-helper', '--dashboard-port', '--dashboard-port-state'))
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $provided = @{}
+    for ($index = 1; $index -lt $values.Count; $index += 1) {
+        $flag = $values[$index]
+        if ($flag -eq '--windows-dashboard-profile') {
+            if (-not $seen.Add($flag)) { return $false }
+            $provided[$flag] = 'true'
+            continue
+        }
+        if ($known -cnotcontains $flag -or $index + 1 -ge $values.Count -or -not $seen.Add($flag)) { return $false }
+        $index += 1
+        $provided[$flag] = $values[$index]
+    }
+    foreach ($flag in $required.Keys) {
+        if (-not $provided.ContainsKey($flag) -or -not (Test-BootstrapPathEquals $provided[$flag] $required[$flag])) { return $false }
+    }
+    if (-not $provided.ContainsKey('--maintenance-worker')) { return $false }
+    $workers = @((Join-Path $InstallRoot 'local\maintenance-worker.cjs'), (Join-Path $InstallRoot 'bin\gateway-maintenance-worker.cjs'))
+    if ($workers -cnotcontains $provided['--maintenance-worker']) { return $false }
+    $dashboardFlags = @('--dashboard-env', '--hermes-root', '--hermes', '--hermes-launcher', '--owner-helper', '--dashboard-port', '--dashboard-port-state', '--windows-dashboard-profile')
+    $hasDashboard = @($dashboardFlags | Where-Object { $provided.ContainsKey($_) }).Count -gt 0
+    if (-not $hasDashboard) { return $true }
+    foreach ($flag in @('--dashboard-env', '--hermes-root', '--hermes', '--hermes-launcher', '--owner-helper', '--dashboard-port', '--windows-dashboard-profile')) {
+        if (-not $provided.ContainsKey($flag)) { return $false }
+    }
+    if (-not (Test-BootstrapPathEquals $provided['--dashboard-env'] (Join-Path $InstallRoot 'local\dashboard.env')) -or
+        -not (Test-BootstrapPathEquals $provided['--owner-helper'] (Join-Path $InstallRoot 'local\dashboard-owner.ps1')) -or
+        $provided['--hermes-root'] -notmatch '^[A-Za-z]:\\' -or $provided['--hermes'] -notmatch '^[A-Za-z]:\\' -or
+        -not (Test-BootstrapPathEquals $provided['--hermes-launcher'] ($provided['--hermes-root'].TrimEnd('\') + '\bin\hermes.exe'))) { return $false }
+    $port = 0
+    return [int]::TryParse($provided['--dashboard-port'], [ref] $port) -and $port -ge 1 -and $port -le 65535 -and
+        (-not $provided.ContainsKey('--dashboard-port-state') -or (Test-BootstrapPathEquals $provided['--dashboard-port-state'] (Join-Path $InstallRoot 'local\dashboard-port')))
+}
+
+function Get-GatewayScheduledTaskXml {
+    try {
+        $taskXml = (& schtasks.exe /Query /TN CozyGateway /XML 2>$null | Out-String)
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($taskXml)) { return $taskXml }
+    } catch { }
+    return $null
+}
+
+function Register-GatewayScheduledTask {
+    param([string] $TaskXmlPath)
+    try {
+        & schtasks.exe /Create /F /TN CozyGateway /XML $TaskXmlPath | Out-Null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function Remove-GatewayScheduledTask {
+    try {
+        & schtasks.exe /Delete /F /TN CozyGateway | Out-Null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function Start-GatewayScheduledTask {
+    try {
+        & schtasks.exe /Run /TN CozyGateway | Out-Null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function Get-GatewayStartupEntryPath {
+    $appData = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
+    if ([string]::IsNullOrWhiteSpace($appData)) { $appData = $env:APPDATA }
+    if ([string]::IsNullOrWhiteSpace($appData)) { Fail 'Windows Startup folder is unavailable' }
+    return Join-Path $appData 'Microsoft\Windows\Start Menu\Programs\Startup\CozyGateway.vbs'
+}
+
+function Start-GatewayStartupEntry {
+    param([string] $EntryPath)
+    try {
+        & wscript.exe $EntryPath | Out-Null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function Get-GatewayRegistrationForRecovery {
+    param([string] $InstallRoot)
+    $taskXml = Get-GatewayScheduledTaskXml
+    if (-not [string]::IsNullOrWhiteSpace($taskXml) -and -not (Test-OwnedGatewayTask $InstallRoot $taskXml)) {
+        Fail 'existing Gateway Scheduled Task is not owned by this installer'
+    }
+    $startup = Get-GatewayStartupEntryPath
+    Assert-BootstrapRegularFile $startup 'Gateway Startup entry'
+    $startupPresent = Test-Path -LiteralPath $startup
+    if ($startupPresent -and -not (Test-OwnedGatewayStartupEntry $InstallRoot $startup)) {
+        Fail 'existing Gateway Startup entry is not owned by this installer'
+    }
+    return [pscustomobject]@{ TaskXml = $taskXml; StartupPath = $startup; StartupPresent = $startupPresent }
+}
+
+function Restore-GatewayRegistration {
+    param(
+        [string] $InstallRoot,
+        [string] $TaskState,
+        [string] $TaskSnapshot,
+        [string] $StartupState,
+        [string] $StartupSnapshot,
+        [string] $StartupAcl
+    )
+    $current = Get-GatewayRegistrationForRecovery $InstallRoot
+    if ($TaskState -eq 'present') {
+        Assert-BootstrapRegularFile $TaskSnapshot 'Gateway Scheduled Task snapshot' -MustExist
+        $taskXml = Get-Content -LiteralPath $TaskSnapshot -Raw -ErrorAction Stop
+        if (-not (Test-OwnedGatewayTask $InstallRoot $taskXml)) { Fail 'Gateway Scheduled Task snapshot is invalid' }
+        if (-not (Register-GatewayScheduledTask $TaskSnapshot)) { Fail 'could not restore the previous Gateway Scheduled Task' }
+    } elseif ($TaskState -eq 'absent') {
+        if (-not [string]::IsNullOrWhiteSpace($current.TaskXml) -and -not (Remove-GatewayScheduledTask)) { Fail 'could not remove the failed Gateway Scheduled Task' }
+    } else {
+        Fail 'Gateway Scheduled Task snapshot state is invalid'
+    }
+    if ($StartupState -eq 'present') {
+        Assert-BootstrapRegularFile $StartupSnapshot 'Gateway Startup snapshot' -MustExist
+        if (-not (Test-OwnedGatewayStartupEntry $InstallRoot $StartupSnapshot)) { Fail 'Gateway Startup snapshot is invalid' }
+        Restore-BootstrapFile $current.StartupPath $StartupSnapshot 'present' $StartupAcl 'Gateway Startup entry'
+    } elseif ($StartupState -eq 'absent') {
+        if ($current.StartupPresent) {
+            Assert-BootstrapRegularFile $current.StartupPath 'Gateway Startup entry'
+            if (-not (Test-OwnedGatewayStartupEntry $InstallRoot $current.StartupPath)) { Fail 'failed Gateway Startup entry is not owned by this installer' }
+            Remove-Item -LiteralPath $current.StartupPath -Force -ErrorAction Stop
+        }
+    } else {
+        Fail 'Gateway Startup snapshot state is invalid'
+    }
+}
+
+function Restart-OwnedGatewayService {
+    param([string] $InstallRoot)
+    $registration = Get-GatewayRegistrationForRecovery $InstallRoot
+    if (-not [string]::IsNullOrWhiteSpace($registration.TaskXml)) {
+        if (-not (Start-GatewayScheduledTask)) { Fail 'owned Gateway Scheduled Task did not start' }
+        return
+    }
+    if ($registration.StartupPresent -and -not (Start-GatewayStartupEntry $registration.StartupPath)) {
+        Fail 'owned Gateway Startup entry did not start'
+    }
+}
+
+function Start-BootstrapTransaction {
+    param([string] $InstallRoot, [string] $Bin, [string[]] $Assets)
+    $journal = Join-Path $InstallRoot '.bootstrap-transaction'
+    $backup = Join-Path $InstallRoot '.bootstrap-previous'
+    $inventory = Join-Path $backup 'inventory'
+    Assert-BootstrapPathAndParents $InstallRoot
+    foreach ($path in @($journal, $backup, "$journal.next", $Bin, $inventory)) { Assert-BootstrapPathAndParents $path }
+    if ((Test-Path -LiteralPath $journal) -or (Test-Path -LiteralPath $backup)) { Fail 'bootstrap recovery state already exists; rerun this installer to recover it' }
+    $assetNames = New-Object 'System.Collections.Generic.List[string]'
+    $assetSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($asset in $Assets) {
+        Assert-BootstrapAssetName $asset
+        foreach ($name in @($asset, "$asset.sha256")) {
+            if (-not $assetSeen.Add($name)) { Fail 'bootstrap assets are duplicated' }
+            $assetNames.Add($name)
+            Assert-BootstrapRegularFile (Join-Path $Bin $name) "installed bootstrap asset $name"
+        }
+    }
+    foreach ($id in Get-BootstrapRuntimeFiles) {
+        Assert-BootstrapRegularFile (Join-Path $InstallRoot $id) "runtime state $id"
+    }
+    # Query and validate both registration mechanisms before the installer can
+    # replace any bytes. A task and a Startup fallback can briefly coexist after
+    # an interrupted update, so snapshot both exact prior states.
+    $registration = Get-GatewayRegistrationForRecovery $InstallRoot
+    New-Item -ItemType Directory -Path (Join-Path $backup 'runtime') -Force -ErrorAction Stop | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $backup 'registration') -Force -ErrorAction Stop | Out-Null
+    Set-BootstrapTransactionState $InstallRoot 'prepare=replace-release-assets'
+    Set-Content -LiteralPath $inventory -Value 'version=2' -Encoding ascii -ErrorAction Stop
+    foreach ($name in $assetNames) {
+        $live = Join-Path $Bin $name
+        if (Test-Path -LiteralPath $live) {
+            Copy-BootstrapSnapshotFile $live (Join-Path $backup $name) "asset $name"
+            Add-Content -LiteralPath $inventory -Value "present:$name" -Encoding ascii -ErrorAction Stop
+        } else {
+            Add-Content -LiteralPath $inventory -Value "absent:$name" -Encoding ascii -ErrorAction Stop
+        }
+    }
+    foreach ($id in Get-BootstrapRuntimeFiles) {
+        $live = Join-Path $InstallRoot $id
+        if (Test-Path -LiteralPath $live) {
+            $acl = Get-BootstrapAclToken $live "runtime state $id"
+            Copy-BootstrapSnapshotFile $live (Join-Path (Join-Path $backup 'runtime') $id) "runtime state $id"
+            Add-Content -LiteralPath $inventory -Value "state:present:${id}:$acl" -Encoding ascii -ErrorAction Stop
+        } else {
+            Add-Content -LiteralPath $inventory -Value "state:absent:${id}:-" -Encoding ascii -ErrorAction Stop
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($registration.TaskXml)) {
+        $taskSnapshot = Join-Path (Join-Path $backup 'registration') 'task.xml'
+        $taskTemporary = "$taskSnapshot.snapshot.$PID"
+        Assert-BootstrapPathAndParents $taskTemporary
+        if (Test-Path -LiteralPath $taskTemporary) { Fail 'Gateway Scheduled Task snapshot staging file already exists' }
+        try {
+            [IO.File]::WriteAllText($taskTemporary, $registration.TaskXml, [Text.Encoding]::Unicode)
+            Move-Item -LiteralPath $taskTemporary -Destination $taskSnapshot -Force -ErrorAction Stop
+        } finally {
+            if (Test-Path -LiteralPath $taskTemporary) { Remove-Item -LiteralPath $taskTemporary -Force -ErrorAction SilentlyContinue }
+        }
+        Add-Content -LiteralPath $inventory -Value 'registration:task:present' -Encoding ascii -ErrorAction Stop
+    } else {
+        Add-Content -LiteralPath $inventory -Value 'registration:task:absent' -Encoding ascii -ErrorAction Stop
+    }
+    if ($registration.StartupPresent) {
+        $startupSnapshot = Join-Path (Join-Path $backup 'registration') 'startup.vbs'
+        $acl = Get-BootstrapAclToken $registration.StartupPath 'Gateway Startup entry'
+        Copy-BootstrapSnapshotFile $registration.StartupPath $startupSnapshot 'Gateway Startup entry'
+        Add-Content -LiteralPath $inventory -Value "registration:startup:present:$acl" -Encoding ascii -ErrorAction Stop
+    } else {
+        Add-Content -LiteralPath $inventory -Value 'registration:startup:absent:-' -Encoding ascii -ErrorAction Stop
+    }
+    Set-BootstrapTransactionState $InstallRoot 'intent=replace-release-assets'
+}
+
+function Recover-BootstrapTransaction {
+    param([string] $InstallRoot, [string] $Bin, [string[]] $Assets)
+    $journal = Join-Path $InstallRoot '.bootstrap-transaction'
+    $backup = Join-Path $InstallRoot '.bootstrap-previous'
+    Assert-BootstrapPathAndParents $InstallRoot
+    Assert-BootstrapPathAndParents $journal
+    Assert-BootstrapPathAndParents $backup
+    Assert-BootstrapPathAndParents $Bin
+    if (Test-Path -LiteralPath $backup) { Assert-BootstrapTreeSafe $backup }
+    if (-not (Test-Path -LiteralPath $journal)) {
+        if (Test-Path -LiteralPath $backup) {
+            if (@(Get-ChildItem -LiteralPath $backup -Force).Count -ne 0) { Fail 'bootstrap snapshots exist without a transaction marker; preserve them and rerun the verified installer' }
+            Remove-Item -LiteralPath $backup -Force -ErrorAction Stop
+        }
+        return
+    }
+    Assert-BootstrapRegularFile $journal 'transaction marker' -MustExist
+    $state = (Get-Content -LiteralPath $journal -Raw).Trim()
+    if ($state -in @('commit=installer-succeeded', 'restored=previous-release', 'prepare=replace-release-assets')) {
+        if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction Stop }
+        Remove-Item -LiteralPath $journal -Force -ErrorAction Stop
+        return
+    }
+    if ($state -ne 'intent=replace-release-assets') { Fail 'bootstrap transaction marker is invalid; preserve it and rerun the verified installer' }
+    $inventory = Join-Path $backup 'inventory'
+    Assert-BootstrapRegularFile $inventory 'transaction inventory' -MustExist
+    $entries = @(Get-Content -LiteralPath $inventory)
+    $version = 1
+    if ($entries.Count -gt 0 -and $entries[0] -eq 'version=2') { $version = 2 }
+    $expected = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($asset in $Assets) {
+        Assert-BootstrapAssetName $asset
+        $expected.Add($asset)
+        $expected.Add("$asset.sha256")
+    }
+    $assetSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $runtimeSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $registrations = @{}
+    $assetRecords = @()
+    $runtimeRecords = @()
+    foreach ($entry in $entries) {
+        if ($entry -eq 'version=2') {
+            if ($version -ne 2 -or $entry -ne $entries[0]) { Fail 'bootstrap transaction inventory is invalid' }
+            continue
+        }
+        if ($entry -match '^(present|absent):(.+)$') {
+            $presence = $Matches[1]
+            $name = $Matches[2]
+            if ($expected -cnotcontains $name -or -not $assetSeen.Add($name)) { Fail 'bootstrap transaction inventory is invalid' }
+            $live = Join-Path $Bin $name
+            Assert-BootstrapRestoreDestination $live "asset $name"
+            $snapshot = Join-Path $backup $name
+            if ($presence -eq 'present') { Assert-BootstrapRegularFile $snapshot "asset snapshot $name" -MustExist }
+            $assetRecords += [pscustomobject]@{ State = $presence; Name = $name; Live = $live; Snapshot = $snapshot }
+            continue
+        }
+        if ($entry -match '^state:(present|absent):([^:]+):([^:]+)$') {
+            if ($version -ne 2) { Fail 'bootstrap transaction inventory is invalid' }
+            $presence = $Matches[1]
+            $id = $Matches[2]
+            $acl = $Matches[3]
+            if (-not (Test-BootstrapRuntimeFileId $id) -or -not $runtimeSeen.Add($id) -or (($presence -eq 'present') -and -not (Test-BootstrapAclToken $acl)) -or (($presence -eq 'absent') -and $acl -ne '-')) { Fail 'bootstrap transaction inventory is invalid' }
+            $live = Join-Path $InstallRoot $id
+            Assert-BootstrapRestoreDestination $live "runtime state $id"
+            $snapshot = Join-Path (Join-Path $backup 'runtime') $id
+            if ($presence -eq 'present') { Assert-BootstrapRegularFile $snapshot "runtime snapshot $id" -MustExist }
+            $runtimeRecords += [pscustomobject]@{ State = $presence; Id = $id; Live = $live; Snapshot = $snapshot; Acl = $acl }
+            continue
+        }
+        if ($entry -match '^registration:task:(present|absent)$') {
+            if ($version -ne 2 -or $registrations.ContainsKey('task')) { Fail 'bootstrap transaction inventory is invalid' }
+            $presence = $Matches[1]
+            $snapshot = Join-Path (Join-Path $backup 'registration') 'task.xml'
+            if ($presence -eq 'present') {
+                Assert-BootstrapRegularFile $snapshot 'Gateway Scheduled Task snapshot' -MustExist
+                $taskLauncher = Join-Path (Join-Path (Join-Path $backup 'runtime') 'local') 'run-gateway.vbs'
+                $taskXml = Get-Content -LiteralPath $snapshot -Raw -ErrorAction Stop
+                if (-not (Test-OwnedGatewayTask $InstallRoot $taskXml $taskLauncher)) { Fail 'Gateway Scheduled Task snapshot is invalid' }
+            }
+            $registrations['task'] = [pscustomobject]@{ State = $presence; Snapshot = $snapshot }
+            continue
+        }
+        if ($entry -match '^registration:startup:(present|absent):([^:]+)$') {
+            if ($version -ne 2 -or $registrations.ContainsKey('startup')) { Fail 'bootstrap transaction inventory is invalid' }
+            $presence = $Matches[1]
+            $acl = $Matches[2]
+            if (($presence -eq 'present' -and -not (Test-BootstrapAclToken $acl)) -or ($presence -eq 'absent' -and $acl -ne '-')) { Fail 'bootstrap transaction inventory is invalid' }
+            $snapshot = Join-Path (Join-Path $backup 'registration') 'startup.vbs'
+            if ($presence -eq 'present') {
+                Assert-BootstrapRegularFile $snapshot 'Gateway Startup snapshot' -MustExist
+                if (-not (Test-OwnedGatewayStartupEntry $InstallRoot $snapshot)) { Fail 'Gateway Startup snapshot is invalid' }
+            }
+            $registrations['startup'] = [pscustomobject]@{ State = $presence; Snapshot = $snapshot; Acl = $acl }
+            continue
+        }
+        Fail 'bootstrap transaction inventory is invalid'
+    }
+    if ($assetSeen.Count -ne $expected.Count) { Fail 'bootstrap transaction inventory is incomplete' }
+    if ($version -eq 2) {
+        foreach ($id in Get-BootstrapRuntimeFiles) { if (-not $runtimeSeen.Contains($id)) { Fail 'bootstrap transaction inventory is incomplete' } }
+        if (-not $registrations.ContainsKey('task') -or -not $registrations.ContainsKey('startup')) { Fail 'bootstrap transaction inventory is incomplete' }
+        # This check happens before the first asset copy or removal. It protects
+        # a same-name foreign registration even when the snapshot says that no
+        # registration existed before this failed first install.
+        $null = Get-GatewayRegistrationForRecovery $InstallRoot
+    }
+    Write-Info 'recovering an interrupted CozyGateway bootstrap before fetching a new release'
+    foreach ($record in $assetRecords) { Restore-BootstrapFile $record.Live $record.Snapshot $record.State '-' "asset $($record.Name)" }
+    if ($version -eq 2) {
+        foreach ($record in $runtimeRecords) { Restore-BootstrapFile $record.Live $record.Snapshot $record.State $record.Acl "runtime state $($record.Id)" }
+        Restore-GatewayRegistration $InstallRoot $registrations['task'].State $registrations['task'].Snapshot $registrations['startup'].State $registrations['startup'].Snapshot $registrations['startup'].Acl
+    }
+    return $true
+}
+
+function Finish-BootstrapRecovery {
+    param([string] $InstallRoot)
+    $journal = Join-Path $InstallRoot '.bootstrap-transaction'
+    $backup = Join-Path $InstallRoot '.bootstrap-previous'
+    Assert-BootstrapPathAndParents $journal
+    Assert-BootstrapTreeSafe $backup
+    Set-BootstrapTransactionState $InstallRoot 'restored=previous-release'
+    Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction Stop
+    Remove-Item -LiteralPath $journal -Force -ErrorAction Stop
+}
+
+function Commit-BootstrapTransaction {
+    param([string] $InstallRoot)
+    $journal = Join-Path $InstallRoot '.bootstrap-transaction'
+    $backup = Join-Path $InstallRoot '.bootstrap-previous'
+    Assert-BootstrapPathAndParents $journal
+    Assert-BootstrapTreeSafe $backup
+    Set-BootstrapTransactionState $InstallRoot 'commit=installer-succeeded'
+    Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction Stop
+    Remove-Item -LiteralPath $journal -Force -ErrorAction Stop
+}
+
+function Save-ExplicitBootstrapSource {
+    param([string] $InstallRoot, [string] $Base)
+    $source = Join-Path $InstallRoot 'local\bootstrap-source'
+    if ([string]::IsNullOrWhiteSpace($Base)) { Remove-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue; return }
+    if ($Base -notmatch '^file:///.+') { return }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $source) | Out-Null
+    $staged = "$source.tmp.$PID"
+    Set-Content -LiteralPath $staged -Value $Base -NoNewline -Encoding utf8 -ErrorAction Stop
+    Move-Item -LiteralPath $staged -Destination $source -Force -ErrorAction Stop
+}
+
+function Invoke-TransactionalRelease {
+    param([string] $InstallRoot, [string] $Bin, [string] $Stage, [string[]] $Assets, [scriptblock] $Install, [scriptblock] $Restore)
+    Start-BootstrapTransaction $InstallRoot $Bin $Assets
+    try {
+        foreach ($asset in $Assets) {
+            Promote-VerifiedAsset $asset $Stage $Bin
+            if ($env:COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION -eq $asset) { Stop-Process -Id $PID -Force }
+        }
+        & $Install
+        Commit-BootstrapTransaction $InstallRoot
+    } catch {
+        $failure = $_
+        $journal = Join-Path $InstallRoot '.bootstrap-transaction'
+        $committed = (Test-Path -LiteralPath $journal -PathType Leaf) -and ((Get-Content -LiteralPath $journal -Raw).Trim() -eq 'commit=installer-succeeded')
+        if (-not $committed) {
+            $restored = $false
+            try {
+                $recovered = Recover-BootstrapTransaction $InstallRoot $Bin $Assets
+                $restored = $true
+                & $Restore
+                if ($recovered) { Finish-BootstrapRecovery $InstallRoot }
+                Write-Ok 'restarted the previous CozyGateway service after the failed update'
+            } catch {
+                if ($restored) { Write-Warning 'previous release assets were restored, but its service restart failed; rerun CozyGateway repair after resolving that error' }
+                else { Write-Warning 'the previous release could not be fully restored; its recovery journal was preserved for retry' }
+            }
+        }
+        throw $failure
+    }
+}
+
+function Get-PersistedRepairMode {
+    param([string] $StatePath)
+    if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) { return $null }
+    $line = (Get-Content -LiteralPath $StatePath | Where-Object { $_ -like 'repair_mode=*' } | Select-Object -Last 1)
+    if ($line -eq 'repair_mode=runtime-only') { return 'runtime-only' }
+    return $null
+}
 function Get-PersistedRepairProfiles {
     param([string] $StatePath)
     if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
@@ -839,28 +1560,39 @@ function Install-WithCozyAgents {
     $listener = Select-Listener $AlreadyConfigured $ForwardedArguments
 
     Protect-CozyGatewayHome $script:InstallHome
-    $stage = Join-Path $script:InstallHome ('.bootstrap-' + [guid]::NewGuid().ToString('N'))
-    $null = New-Item -ItemType Directory -Force -Path $stage
+    $assets = @('cozygateway.mjs', 'agent-install.sh', 'gateway-supervisor.cjs', 'cozygateway-bootstrap.ps1')
+    Acquire-BootstrapLock $script:InstallHome
+    $stage = $null
     $script:BundlePath = Join-Path $Bin 'cozygateway.mjs'
     try {
+        $recovered = Recover-BootstrapTransaction $script:InstallHome $Bin $assets
+        if ($recovered) {
+            Restart-OwnedGatewayService $script:InstallHome
+            Finish-BootstrapRecovery $script:InstallHome
+        }
+        $Base = Resolve-BootstrapReleaseBase $Base
+        $stage = Join-Path $script:InstallHome ('.bootstrap-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Force -Path $stage
         Get-VerifiedAsset 'cozygateway.mjs' (Join-Path $stage 'cozygateway.mjs') $Base
         Get-VerifiedAsset 'cozygateway-installer.sh' (Join-Path $stage 'agent-install.sh') $Base
         Get-VerifiedAsset 'gateway-supervisor.cjs' (Join-Path $stage 'gateway-supervisor.cjs') $Base
         Get-VerifiedAsset 'install.ps1' (Join-Path $stage 'cozygateway-bootstrap.ps1') $Base
         New-Item -ItemType Directory -Force -Path $Bin | Out-Null
-        foreach ($asset in @('cozygateway.mjs', 'agent-install.sh', 'gateway-supervisor.cjs', 'cozygateway-bootstrap.ps1')) {
-            Promote-VerifiedAsset $asset $stage $Bin
+        Invoke-TransactionalRelease $script:InstallHome $Bin $stage $assets {
+            Invoke-CozyGatewayInstaller $bash $InstallerPath '' $ForwardedArguments 'cozyagents' $listener
+            Save-ExplicitBootstrapSource $script:InstallHome $explicitAssetBase
+            Set-CozyGatewayCommandPath $Bin $true
+            Install-CozyAgentsHarness $agentsHome $InstallerSource $script:CozyAgentsInstallerSha256
+            Write-RunnerModelEnv (Join-Path $agentsHome 'runner.env') $model
+            Join-RunnerToGateway $agentsHome $CliPath $ConfigPath
+            Complete-Pairing $CliPath $AlreadyConfigured $NoQr
+        } {
+            Restart-OwnedGatewayService $script:InstallHome
         }
     } finally {
-        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        if ($stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+        Release-BootstrapLock
     }
-
-    Invoke-CozyGatewayInstaller $bash $InstallerPath '' $ForwardedArguments 'cozyagents' $listener
-    Set-CozyGatewayCommandPath $Bin $true
-    Install-CozyAgentsHarness $agentsHome $InstallerSource $script:CozyAgentsInstallerSha256
-    Write-RunnerModelEnv (Join-Path $agentsHome 'runner.env') $model
-    Join-RunnerToGateway $agentsHome $CliPath $ConfigPath
-    Complete-Pairing $CliPath $AlreadyConfigured $NoQr
 }
 
 # A CozyAgents uninstall takes back exactly what this bootstrap put there: the gateway through the
@@ -906,6 +1638,8 @@ $bootstrapPath = Join-Path $bin 'cozygateway-bootstrap.ps1'
 $cliPath = Join-Path $bin 'cozygateway.cmd'
 $statePath = Join-Path $script:InstallHome 'local\install-state'
 $configPath = Join-Path $script:InstallHome 'local\cozygateway.config.json'
+$sourcePath = Join-Path $script:InstallHome 'local\bootstrap-source'
+$explicitAssetBase = $env:COZYGATEWAY_INSTALL_ASSET_BASE
 $isUninstall = $InstallerArguments -contains '--uninstall'
 $isDryRun = $env:COZYGATEWAY_INSTALL_DRYRUN -eq '1' -or $InstallerArguments -contains '--dry-run'
 $isNoQr = $InstallerArguments -contains '--no-qr'
@@ -922,8 +1656,20 @@ if ($Repair) {
     if ([string]::IsNullOrWhiteSpace($expected) -or $expected -ne $actual) {
         Fail 'repair bootstrap checksum mismatch. Reinstall with: irm https://cozylabs.ai/install.ps1 | iex'
     }
+    if (Test-Path -LiteralPath $sourcePath -PathType Leaf) {
+        $recordedSource = (Get-Content -LiteralPath $sourcePath -Raw).Trim()
+        if ($recordedSource -notmatch '^file:///.+') { Fail 'recorded repair source is invalid. Reinstall with: irm https://cozylabs.ai/install.ps1 | iex' }
+        $env:COZYGATEWAY_INSTALL_ASSET_BASE = $recordedSource
+        $explicitAssetBase = $recordedSource
+    }
+    $repairMode = Get-PersistedRepairMode $statePath
+    if ($repairMode -eq 'runtime-only' -and $InstallerArguments -notcontains '--runtime-only') {
+        $InstallerArguments = @('--runtime-only') + @($InstallerArguments)
+    }
     if ((Get-RecordedHarness $statePath) -eq 'cozyagents') {
         $Harness = 'cozyagents'
+        Write-Info 'repair refreshes verified runtime assets, then restarts CozyGateway'
+    } elseif ($repairMode -eq 'runtime-only') {
         Write-Info 'repair refreshes verified runtime assets, then restarts CozyGateway'
     } else {
         $InstallerArguments = @('--profiles', (Get-PersistedRepairProfiles $statePath)) + @($InstallerArguments)
@@ -971,13 +1717,7 @@ if ($isDryRun) {
     return
 }
 
-$repo = if ($env:COZYGATEWAY_INSTALL_REPO) { $env:COZYGATEWAY_INSTALL_REPO } else { 'shiftedx/cozygateway' }
-$tag = $env:COZYGATEWAY_INSTALL_TAG
 $base = $env:COZYGATEWAY_INSTALL_ASSET_BASE
-if ([string]::IsNullOrWhiteSpace($base)) {
-    if ([string]::IsNullOrWhiteSpace($tag)) { $tag = Get-LatestTag $repo }
-    $base = "https://github.com/$repo/releases/download/$tag"
-}
 
 if ($harness -eq 'cozyagents') {
     Install-WithCozyAgents $bin $installerPath $configPath $cliPath $base ([bool]$alreadyConfigured) ([bool]$isNoQr) $InstallerArguments $cozyAgentsInstaller
@@ -989,22 +1729,34 @@ Confirm-HermesModel $hermes
 $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH
 
 Protect-CozyGatewayHome $script:InstallHome
-$stage = Join-Path $script:InstallHome ('.bootstrap-' + [guid]::NewGuid().ToString('N'))
-$null = New-Item -ItemType Directory -Force -Path $stage
+$assets = @('cozygateway.mjs', 'cozygateway-hermes-attach-plugin.tar.gz', 'agent-install.sh', 'gateway-supervisor.cjs', 'cozygateway-bootstrap.ps1')
+Acquire-BootstrapLock $script:InstallHome
+$stage = $null
 $script:BundlePath = Join-Path $bin 'cozygateway.mjs'
 $script:PluginPath = Join-Path $bin 'cozygateway-hermes-attach-plugin.tar.gz'
 try {
+    $recovered = Recover-BootstrapTransaction $script:InstallHome $bin $assets
+    if ($recovered) {
+        Restart-OwnedGatewayService $script:InstallHome
+        Finish-BootstrapRecovery $script:InstallHome
+    }
+    $base = Resolve-BootstrapReleaseBase $base
+    $stage = Join-Path $script:InstallHome ('.bootstrap-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Force -Path $stage
     Get-VerifiedAsset 'cozygateway.mjs' (Join-Path $stage 'cozygateway.mjs') $base
     Get-VerifiedAsset 'cozygateway-hermes-attach-plugin.tar.gz' (Join-Path $stage 'cozygateway-hermes-attach-plugin.tar.gz') $base
     Get-VerifiedAsset 'cozygateway-installer.sh' (Join-Path $stage 'agent-install.sh') $base
     Get-VerifiedAsset 'gateway-supervisor.cjs' (Join-Path $stage 'gateway-supervisor.cjs') $base
     Get-VerifiedAsset 'install.ps1' (Join-Path $stage 'cozygateway-bootstrap.ps1') $base
     New-Item -ItemType Directory -Force -Path $bin | Out-Null
-    foreach ($asset in @('cozygateway.mjs', 'cozygateway-hermes-attach-plugin.tar.gz', 'agent-install.sh', 'gateway-supervisor.cjs', 'cozygateway-bootstrap.ps1')) {
-        Promote-VerifiedAsset $asset $stage $bin
+    Invoke-TransactionalRelease $script:InstallHome $bin $stage $assets {
+        Invoke-CozyGatewayInstaller $bash $installerPath $hermes $InstallerArguments
+        Save-ExplicitBootstrapSource $script:InstallHome $explicitAssetBase
+        Set-CozyGatewayCommandPath $bin $true
+    } {
+        Restart-OwnedGatewayService $script:InstallHome
     }
 } finally {
-    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    if ($stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    Release-BootstrapLock
 }
-Invoke-CozyGatewayInstaller $bash $installerPath $hermes $InstallerArguments
-if ($env:COZYGATEWAY_INSTALL_DRYRUN -ne '1') { Set-CozyGatewayCommandPath $bin $true }

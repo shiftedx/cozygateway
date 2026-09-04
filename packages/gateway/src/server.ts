@@ -97,7 +97,7 @@ import {
   HERMES_GLOBAL_SKILLS_CAPABILITY_VERSION,
 } from "./hermes-bridge/global-skills.ts";
 
-export const GATEWAY_VERSION = "0.7.3";
+export const GATEWAY_VERSION = "0.7.4";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
@@ -976,6 +976,7 @@ export async function startGateway(
     runnerPresence: {
       online: (runnerId) => runnerLane.connectedRunners().includes(runnerId),
       lastContactAt: (runnerId) => runnerLane.lastContactAt(runnerId),
+      agentVersion: (runnerId) => runnerLane.agentVersion(runnerId),
     },
     legacyRunnerConfigured,
     // The LISTENING port, not the configured one: a host that asked for port 0 (every test, and a
