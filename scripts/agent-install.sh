@@ -1735,22 +1735,23 @@ atomic_copy() {
 build_supervisor_args() {
   local platform="$SERVICE_PLATFORM" gateway_env="$GATEWAY_ENV" bundle="$BUNDLE_PATH" config="$CONFIG_JSON"
   local socket="$MAINTENANCE_SOCKET" worker="$MAINTENANCE_WORKER" database="$LOCAL_DIR/cozygateway.sqlite"
-  local dashboard_env= hermes_root= hermes= launcher= owner_helper=
+  local dashboard_env= hermes_root= hermes= launcher= owner_helper= dashboard_port_state=
   if [ "${HARNESS:-}" = hermes ]; then
     dashboard_env="$DASHBOARD_ENV"; hermes_root="${HERMES_ROOT:-}"; hermes="${HERMES_RESOLVED:-}"
     launcher="${HERMES_ROOT:-}/bin/hermes.exe"; owner_helper="$DASHBOARD_OWNER_PS1"
+    dashboard_port_state="$DASHBOARD_PORT_STATE"
   fi
   if is_windows; then
     gateway_env="$(to_windows_path "$gateway_env")"; bundle="$(to_windows_path "$bundle")"; config="$(to_windows_path "$config")"
     socket='\\.\pipe\cozygateway-maintenance'; worker="$(to_windows_path "$worker")"; database="$(to_windows_path "$database")"
     if [ "${HARNESS:-}" = hermes ]; then
       dashboard_env="$(to_windows_path "$dashboard_env")"; hermes_root="$(to_windows_path "$hermes_root")"
-      hermes="$(to_windows_path "$hermes")"; launcher="$(to_windows_path "$launcher")"; owner_helper="$(to_windows_path "$owner_helper")"
+      hermes="$(to_windows_path "$hermes")"; launcher="$(to_windows_path "$launcher")"; owner_helper="$(to_windows_path "$owner_helper")"; dashboard_port_state="$(to_windows_path "$dashboard_port_state")"
     fi
   fi
   SUPERVISOR_ARGS=(--platform "$platform" --gateway-env "$gateway_env" --bundle "$bundle" --config "$config" --maintenance-socket "$socket" --maintenance-worker "$worker" --database "$database")
   if [ "${HARNESS:-}" = hermes ]; then
-    SUPERVISOR_ARGS+=(--dashboard-env "$dashboard_env" --hermes-root "$hermes_root" --hermes "$hermes" --hermes-launcher "$launcher" --owner-helper "$owner_helper" --dashboard-port "$DASHBOARD_PORT" --dashboard-port-state "$DASHBOARD_PORT_STATE")
+    SUPERVISOR_ARGS+=(--dashboard-env "$dashboard_env" --hermes-root "$hermes_root" --hermes "$hermes" --hermes-launcher "$launcher" --owner-helper "$owner_helper" --dashboard-port "$DASHBOARD_PORT" --dashboard-port-state "$dashboard_port_state")
     if is_windows; then SUPERVISOR_ARGS+=(--windows-dashboard-profile); fi
   fi
 }
