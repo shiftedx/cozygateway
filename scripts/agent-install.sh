@@ -1001,8 +1001,9 @@ write_gateway_env() {
   local p token env_name profile_env spool_path seen_token seen_name
   prepare_dashboard_credential
   [ "$DRY_RUN" = 1 ] && { say "DRY   write gateway token environment at $GATEWAY_ENV (values redacted)"; return; }
-  umask 077; : > "$GATEWAY_ENV"
-  env_write "$GATEWAY_ENV" COZYGATEWAY_HERMES_TOKEN "$DASHBOARD_SESSION_TOKEN"
+  local staged="$GATEWAY_ENV.tmp.$$"
+  umask 077; : > "$staged"
+  env_write "$staged" COZYGATEWAY_HERMES_TOKEN "$DASHBOARD_SESSION_TOKEN"
   for p in "${SELECTED[@]}"; do
     profile_env="$(profile_home "$p")/.env"; claim_profile_env "$profile_env"; token="$(env_get "$profile_env" COZYGATEWAY_TOKEN)"; safe_secret "$token" || token="$(new_token)"; env_name="$(token_env_name "$p")"
     for seen_token in "${TOKENS[@]:-}"; do [ "$token" != "$seen_token" ] || die "Hermes profiles must have distinct CozyGateway attach tokens"; done
@@ -1012,8 +1013,10 @@ write_gateway_env() {
     spool_path="$(profile_home "$p")/plugin-data/cozygateway/attach-v1.sqlite"
     is_windows && spool_path="$(to_windows_path "$spool_path")"
     env_put "$profile_env" COZYGATEWAY_SPOOL_PATH "$spool_path"; env_put "$profile_env" COZYGATEWAY_HOME_CHANNEL thread
-    env_write "$GATEWAY_ENV" "$env_name" "$token"
+    env_write "$staged" "$env_name" "$token"
   done
+  chmod 600 "$staged"
+  mv -f "$staged" "$GATEWAY_ENV"
   chmod 600 "$GATEWAY_ENV"
 }
 service_action_for() {
@@ -2834,11 +2837,11 @@ restart_existing_service() {
   elif [ "$SERVICE_PLATFORM" = Linux ]; then
     unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"
     systemd_service_is_owned "$unit" || die "existing Gateway service is not owned by this installer"
-    run systemctl --user restart "$SERVICE_LABEL.service"
+    run systemctl --user restart "$SERVICE_UNIT"
   else
     preflight_windows_service_ownership
     stop_owned_windows_gateway 0 || die "existing Gateway service is not owned by this installer"
-    task_xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN \"$WINDOWS_TASK\" /XML 2>/dev/null || true)"
+    task_xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
     [ -z "$task_xml" ] || { MSYS_NO_PATHCONV=1 schtasks.exe /Run /TN "$WINDOWS_TASK" >/dev/null || die "owned Gateway Scheduled Task did not start"; }
     [ -n "$task_xml" ] || { [ -f "$WINDOWS_VBS" ] && wscript.exe "$(to_windows_path "$WINDOWS_VBS")" || die "owned Gateway launcher is unavailable"; }
   fi
@@ -2856,7 +2859,15 @@ main() {
   local prerequisite_missing=0 profile action
   if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
   preflight_service_manager
-  [ "$RUNTIME_ONLY" = 0 ] || { runtime_only_repair; return; }
+  if [ "$RUNTIME_ONLY" = 1 ]; then
+    NODE_RESOLVED="$(resolve_node)" || die "--runtime-only needs the existing Node.js 24 runtime; reinstall normally to provision it"
+    say "OK    using existing Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
+    hydrate_listener_settings
+    hydrate_dashboard_port
+    validate_listener_settings
+    runtime_only_repair
+    return
+  fi
   if NODE_RESOLVED="$(resolve_node)"; then say "OK    using Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
   elif [ "$DRY_RUN" = 1 ]; then say "DRY   install the current Node.js 24 release under $GATEWAY_DIR/runtime/node from checksum-verified nodejs.org assets"; prerequisite_missing=1
   else install_node_runtime
