@@ -35,6 +35,8 @@ const RuntimeSpecCommon = {
       id: Type.String({ minLength: 1, maxLength: 200 }),
       provider: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
       endpoint: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+      contextWindow: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
+      maxTokens: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
     }, { additionalProperties: false }),
   ),
   resources: Type.Optional(
@@ -86,9 +88,22 @@ export function runtimeSpecDefaults(env: Record<string, string | undefined>): Ru
       throw new ContractViolation(`${name} must be a number`, `/${name}`);
     return parsed;
   };
+  const positiveInteger = (name: string): number | undefined => {
+    const value = env[name]?.trim();
+    if (value === undefined) return undefined;
+    if (value.length === 0) return undefined;
+    if (!/^[1-9][0-9]*$/.test(value))
+      throw new ContractViolation(`${name} must be a positive integer`, `/${name}`);
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed) || parsed < 1)
+      throw new ContractViolation(`${name} must be a positive integer`, `/${name}`);
+    return parsed;
+  };
   const modelId = text("COZYGATEWAY_RUNNER_MODEL_ID");
   const provider = text("COZYGATEWAY_RUNNER_MODEL_PROVIDER");
   const endpoint = text("COZYGATEWAY_RUNNER_MODEL_ENDPOINT");
+  const contextWindow = positiveInteger("COZYGATEWAY_RUNNER_MODEL_CONTEXT_WINDOW");
+  const maxTokens = positiveInteger("COZYGATEWAY_RUNNER_MODEL_MAX_TOKENS");
   const cpus = numeric("COZYGATEWAY_RUNNER_CPUS");
   const memoryMb = numeric("COZYGATEWAY_RUNNER_MEMORY_MB");
   const pids = numeric("COZYGATEWAY_RUNNER_PIDS");
@@ -125,7 +140,15 @@ export function runtimeSpecDefaults(env: Record<string, string | undefined>): Ru
     ...(entrypoint === undefined ? {} : { entrypoint }),
     ...(modelId === undefined
       ? {}
-      : { model: { id: modelId, ...(provider === undefined ? {} : { provider }), ...(endpoint === undefined ? {} : { endpoint }) } }),
+      : {
+          model: {
+            id: modelId,
+            ...(provider === undefined ? {} : { provider }),
+            ...(endpoint === undefined ? {} : { endpoint }),
+            ...(contextWindow === undefined ? {} : { contextWindow }),
+            ...(maxTokens === undefined ? {} : { maxTokens }),
+          },
+        }),
     ...(Object.keys(resources).length === 0 ? {} : { resources }),
   };
   return assertValid(RuntimeSpecSchema, spec) as RuntimeSpecDefaults;

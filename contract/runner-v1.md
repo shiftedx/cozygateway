@@ -165,7 +165,7 @@ socket: a runner that cannot answer is a runner that cannot be handed a mutation
     "specGeneration": 1,
     "attachToken": "<secret>",
     "image": "ghcr.io/.../cozyagents@sha256:...",
-    "model": { "provider": "anthropic", "id": "..." },
+    "model": { "provider": "anthropic", "id": "...", "contextWindow": 131072, "maxTokens": 8192 },
     "resources": { "cpus": 2, "memoryMb": 2048, "pids": 512 }
   }
 }
@@ -186,17 +186,28 @@ Payload fields:
 | `attachToken` | string | The container's attach credential. Secret. |
 | `image` | string | Docker backend: the image reference, digest-pinned by the operator. |
 | `entrypoint` | string[] | Process backend: ARGV, not a shell string. The runner spawns it directly, so quoting rules never enter into it. |
-| `model` | `{id, provider?, endpoint?}` | Optional. |
+| `model` | `{id, provider?, endpoint?, contextWindow?, maxTokens?}` | Optional. `contextWindow` and `maxTokens`, when present, are canonical positive safe decimal integers. |
 | `resources` | `{cpus?: number, memoryMb?: integer, pids?: integer}` | Optional. `cpus` is fractional CPUs, `memoryMb` is mebibytes, `pids` is the process-count ceiling. |
 
 At most one of `image` and `entrypoint` is present: an image for the Docker backend, an entrypoint
 argv for the process backend. `image`, `entrypoint`, `model` and `resources` are all present only
 when the operator configured them (`COZYGATEWAY_RUNNER_IMAGE`,
-`COZYGATEWAY_RUNNER_ENTRYPOINT_JSON`, `COZYGATEWAY_RUNNER_MODEL_*`, `COZYGATEWAY_RUNNER_CPUS` /
+`COZYGATEWAY_RUNNER_ENTRYPOINT_JSON`, `COZYGATEWAY_RUNNER_MODEL_*` (including the optional
+`COZYGATEWAY_RUNNER_MODEL_CONTEXT_WINDOW` and `COZYGATEWAY_RUNNER_MODEL_MAX_TOKENS`), `COZYGATEWAY_RUNNER_CPUS` /
 `_MEMORY_MB` / `_PIDS`). **A missing `model` means the runner uses its own default**, exactly as a
 missing `image` or `resources` means its own compose defaults: the gateway never invents an image
 tag, a model id, or a ceiling it cannot verify. A malformed operator value is refused on the
 create that would have used it (`400`, naming the variable) rather than dropped in silence.
+
+#### #37 cross-repo release gate
+
+Gateway and Runner only provision these two optional values. Do not merge or release #37 as
+end-to-end support until the accepted CozyAgents P0 consumer parses
+`COZYAGENTS_MODEL_CONTEXT_WINDOW` and `COZYAGENTS_MODEL_MAX_TOKENS` and passes both limits to
+Pi's local provider configuration. On the integration checkout, run the Gateway runner-lane and
+CozyAgents runner-backend tests, then the P0 consumer test that proves a provisioned context
+window reaches Pi. Until that consumer is integrated, this contract is provisioning-only and its
+end-to-end result is pending.
 
 `attachToken` is the credential the container needs to attach back to this gateway. It exists on
 this frame and nowhere else: it is never written into an operations row, a receipt, a log line, or

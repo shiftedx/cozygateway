@@ -120,7 +120,13 @@ export interface RunnerCreateRuntimePayload {
   /** Argv, not a shell string: the process backend spawns it directly, so quoting rules never
    *  enter into it. */
   entrypoint?: string[];
-  model?: { provider?: string; endpoint?: string; id: string };
+  model?: {
+    provider?: string;
+    endpoint?: string;
+    id: string;
+    contextWindow?: number;
+    maxTokens?: number;
+  };
   resources?: { cpus?: number; memoryMb?: number; pids?: number };
 }
 

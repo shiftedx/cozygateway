@@ -337,6 +337,38 @@ describe("the runtime spec an operator configures", () => {
     });
   });
 
+  it("carries configured positive model limits and omits absent limits", () => {
+    expect(runtimeSpecDefaults({
+      COZYGATEWAY_RUNNER_MODEL_ID: "m",
+      COZYGATEWAY_RUNNER_MODEL_PROVIDER: "p",
+      COZYGATEWAY_RUNNER_MODEL_CONTEXT_WINDOW: "131072",
+      COZYGATEWAY_RUNNER_MODEL_MAX_TOKENS: "8192",
+    })).toEqual({
+      model: { id: "m", provider: "p", contextWindow: 131072, maxTokens: 8192 },
+    });
+
+    expect(JSON.stringify(runtimeSpecDefaults({
+      COZYGATEWAY_RUNNER_MODEL_ID: "m",
+      COZYGATEWAY_RUNNER_MODEL_PROVIDER: "p",
+    }))).toBe('{"model":{"id":"m","provider":"p"}}');
+  });
+
+  it("rejects invalid model limits by configuration name", () => {
+    const invalid = ["0", "-1", "01", "1.0", "1e3", "+1000", "NaN", "Infinity", "9007199254740992"];
+    for (const name of [
+      "COZYGATEWAY_RUNNER_MODEL_CONTEXT_WINDOW",
+      "COZYGATEWAY_RUNNER_MODEL_MAX_TOKENS",
+    ]) {
+      for (const value of invalid) {
+        expect(() => runtimeSpecDefaults({
+          COZYGATEWAY_RUNNER_MODEL_ID: "m",
+          COZYGATEWAY_RUNNER_MODEL_PROVIDER: "p",
+          [name]: value,
+        })).toThrow(name);
+      }
+    }
+  });
+
   it("lets a storage row win over a config line with the same id", () => {
     const merged = mergeRuntimeBots(
       [
@@ -405,6 +437,27 @@ describe("the runner lane", () => {
       observedGeneration: 1,
       lastRunnerContactAt: NOW + 1,
     });
+  });
+
+  it("projects configured model limits into the runner command", async () => {
+    const h = await harness({
+      spec: () => runtimeSpecDefaults({
+        COZYGATEWAY_RUNNER_MODEL_ID: "m",
+        COZYGATEWAY_RUNNER_MODEL_PROVIDER: "p",
+        COZYGATEWAY_RUNNER_MODEL_CONTEXT_WINDOW: "131072",
+        COZYGATEWAY_RUNNER_MODEL_MAX_TOKENS: "8192",
+      }),
+    });
+    await createRuntimeBot(h);
+    const runner = await fakeRunner(h);
+
+    await until(() => commands(runner.frames).length > 0);
+    expect(commands(runner.frames)[0]).toMatchObject({
+      command: "create_runtime",
+      payload: { model: { id: "m", provider: "p", contextWindow: 131072, maxTokens: 8192 } },
+    });
+    expect(h.logs.join("\n")).not.toContain("131072");
+    expect(h.logs.join("\n")).not.toContain("8192");
   });
 
   it("projects a needs_attention receipt with its safe code", async () => {
