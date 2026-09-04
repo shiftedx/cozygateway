@@ -47,72 +47,38 @@ prepare_owned_dir() {
   chmod 700 "$path" || die "could not secure installer directory: $path"
 }
 recover_bootstrap_transaction() {
-  local asset_dir="$1" journal="$HOME_DIR/.bootstrap-transaction" backup="$HOME_DIR/.bootstrap-previous" asset state
-  [ ! -e "$journal" ] || [ -f "$journal" ] || die "bootstrap transaction marker is not a regular file"
-  if [ ! -f "$journal" ]; then
-    [ ! -e "$backup" ] && return 0
-    [ -d "$backup" ] || die "bootstrap rollback directory is not a directory: $backup"
-    rmdir "$backup" 2>/dev/null || die "bootstrap rollback directory exists without a transaction marker; preserve it and rerun the verified installer"
-    return 0
-  fi
-  [ -d "$backup" ] || die "bootstrap transaction recovery needs $backup; preserve these files and rerun the verified installer"
+  local asset_dir="$1"; shift
+  local journal="$HOME_DIR/.bootstrap-transaction" backup="$HOME_DIR/.bootstrap-previous" state name inventory
+  [ -f "$journal" ] || { [ ! -e "$backup" ] || { rmdir "$backup" 2>/dev/null || die "bootstrap rollback directory exists without a transaction marker; preserve it and rerun"; }; return; }
   state="$(cat "$journal")"
-  if [ "$state" = 'commit=installer-succeeded' ]; then
-    printf 'INFO  completing a previously successful CozyGateway bootstrap cleanup\n' >&2
-    rm -rf "$backup" || die "could not finish successful bootstrap cleanup; preserved $journal for retry"
-    rm -f "$journal" || die "could not clear completed bootstrap transaction marker"
-    return 0
-  fi
-  [ "$state" = 'intent=replace-release-assets' ] || die "bootstrap transaction marker is invalid; preserve $journal and rerun the verified installer"
+  if [ "$state" = 'commit=installer-succeeded' ]; then rm -rf "$backup" 2>/dev/null || true; rm -f "$journal" || die "could not clear completed bootstrap transaction marker"; return; fi
+  if [ "$state" = 'prepare=replace-release-assets' ]; then rm -rf "$backup" || die "could not clear incomplete bootstrap snapshot"; rm -f "$journal"; return; fi
+  [ "$state" = 'intent=replace-release-assets' ] || die "bootstrap transaction marker is invalid; preserve it and rerun"
+  inventory="$backup/inventory"; [ -f "$inventory" ] || die "bootstrap transaction inventory is missing; preserve it and rerun"
   printf 'INFO  recovering an interrupted CozyGateway bootstrap before fetching a new release\n' >&2
-  # Snapshotting completes before any promotion. During a hard stop in that
-  # snapshot phase, only files already moved into the backup are replaced;
-  # untouched live files remain their original release instead of being erased.
-  for asset in "${BOOTSTRAP_ASSETS[@]}"; do
-    if [ -e "$backup/$asset" ]; then
-      rm -f "$asset_dir/$asset"
-      mv "$backup/$asset" "$asset_dir/$asset" || die "could not restore $asset after interrupted bootstrap"
-    fi
-    if [ -e "$backup/$asset.sha256" ]; then
-      rm -f "$asset_dir/$asset.sha256"
-      mv "$backup/$asset.sha256" "$asset_dir/$asset.sha256" || die "could not restore $asset checksum after interrupted bootstrap"
-    fi
-  done
-  rmdir "$backup" 2>/dev/null || die "could not finish interrupted bootstrap recovery; preserved $journal for retry"
-  rm -f "$journal" || die "could not clear recovered bootstrap transaction marker"
+  while IFS= read -r name; do
+    case "$name" in present:*) name="${name#present:}"; cp "$backup/$name" "$asset_dir/$name.recover.$$" || die "could not restore $name"; mv -f "$asset_dir/$name.recover.$$" "$asset_dir/$name" || die "could not activate restored $name" ;; absent:*) rm -f "$asset_dir/${name#absent:}" ;; *) die "bootstrap transaction inventory is invalid" ;; esac
+  done < "$inventory"
+  if [ -f "$asset_dir/agent-install.sh" ]; then
+    restore_previous_installer "$asset_dir" "$@" || die "previous assets were restored but its service restart failed; recovery journal is preserved"
+    printf 'OK    restarted the previous CozyGateway service after the failed update\n' >&2
+  fi
+  rm -rf "$backup" || die "could not finish bootstrap recovery; journal preserved"
+  rm -f "$journal" || die "could not clear recovered bootstrap journal"
 }
 begin_bootstrap_transaction() {
-  local asset_dir="$1" journal="$HOME_DIR/.bootstrap-transaction" backup="$HOME_DIR/.bootstrap-previous" asset
-  [ ! -e "$journal" ] && [ ! -e "$backup" ] || die "bootstrap recovery state already exists; rerun this installer to recover it"
+  local asset_dir="$1" journal="$HOME_DIR/.bootstrap-transaction" backup="$HOME_DIR/.bootstrap-previous" name
+  [ ! -e "$journal" ] && [ ! -e "$backup" ] || die "bootstrap recovery state already exists; rerun to recover it"
   mkdir "$backup" || die "could not create bootstrap rollback directory"
-  printf 'intent=replace-release-assets\n' > "$journal" || { rmdir "$backup" 2>/dev/null || true; die "could not record bootstrap transaction intent"; }
-  chmod 600 "$journal"
-  for asset in "${BOOTSTRAP_ASSETS[@]}"; do
-    [ ! -e "$asset_dir/$asset" ] || mv "$asset_dir/$asset" "$backup/$asset" || { rollback_bootstrap_transaction "$asset_dir"; die "could not snapshot $asset before bootstrap promotion"; }
-    [ ! -e "$asset_dir/$asset.sha256" ] || mv "$asset_dir/$asset.sha256" "$backup/$asset.sha256" || { rollback_bootstrap_transaction "$asset_dir"; die "could not snapshot $asset checksum before bootstrap promotion"; }
-  done
+  printf 'prepare=replace-release-assets\n' > "$journal" || { rmdir "$backup" 2>/dev/null || true; die "could not record bootstrap preparation"; }
+  for asset in "${BOOTSTRAP_ASSETS[@]}"; do for name in "$asset" "$asset.sha256"; do
+    if [ -e "$asset_dir/$name" ]; then printf 'present:%s\n' "$name" >> "$backup/inventory"; cp "$asset_dir/$name" "$backup/$name" || die "could not snapshot $name"; else printf 'absent:%s\n' "$name" >> "$backup/inventory"; fi
+  done; done
+  printf 'intent=replace-release-assets\n' > "$journal.next" && mv -f "$journal.next" "$journal" || die "could not activate bootstrap transaction"
 }
-rollback_bootstrap_transaction() {
-  local asset_dir="$1"
-  recover_bootstrap_transaction "$asset_dir"
-}
-restore_previous_installer() {
-  local asset_dir="$1"
-  if bash "$asset_dir/agent-install.sh" --gateway-dir "$HOME_DIR" --bundle "$asset_dir/cozygateway.mjs" --plugin-archive "$asset_dir/cozygateway-hermes-attach-plugin.tar.gz" "$@"; then
-    printf 'OK    restarted the previous CozyGateway service after the failed update\n' >&2
-  else
-    printf 'WARN  previous release assets were restored, but its service restart failed; rerun CozyGateway repair after resolving that error\n' >&2
-  fi
-}
-commit_bootstrap_transaction() {
-  local journal="$HOME_DIR/.bootstrap-transaction" backup="$HOME_DIR/.bootstrap-previous" staged="$HOME_DIR/.bootstrap-transaction.commit.$$"
-  umask 077
-  printf 'commit=installer-succeeded\n' > "$staged" || die "could not record bootstrap commit"
-  chmod 600 "$staged"
-  mv "$staged" "$journal" || die "could not record bootstrap commit"
-  rm -rf "$backup" || die "could not remove bootstrap rollback directory after successful install"
-  rm -f "$journal" || die "could not clear bootstrap transaction marker after successful install"
-}
+restore_previous_installer() { local asset_dir="$1"; shift; bash "$asset_dir/agent-install.sh" --gateway-dir "$HOME_DIR" --bundle "$asset_dir/cozygateway.mjs" --plugin-archive "$asset_dir/cozygateway-hermes-attach-plugin.tar.gz" "$@"; }
+rollback_bootstrap_transaction() { local asset_dir="$1"; shift; recover_bootstrap_transaction "$asset_dir" "$@"; }
+commit_bootstrap_transaction() { local journal="$HOME_DIR/.bootstrap-transaction" backup="$HOME_DIR/.bootstrap-previous"; printf 'commit=installer-succeeded\n' > "$journal.next" && mv -f "$journal.next" "$journal" || die "could not record bootstrap commit"; rm -rf "$backup" || die "could not remove bootstrap rollback directory"; rm -f "$journal" || die "could not clear bootstrap transaction marker"; }
 record_explicit_bootstrap_source() {
   local source_file="$HOME_DIR/local/bootstrap-source" staged
   [ -n "$EXPLICIT_ASSET_BASE" ] || { rm -f "$source_file"; return; }
@@ -149,7 +115,7 @@ main() {
     bootstrap_lock="$HOME_DIR/.bootstrap-lock"
     acquire_bootstrap_lock
     trap 'release_bootstrap_lock' EXIT HUP INT TERM
-    recover_bootstrap_transaction "$asset_dir"
+    recover_bootstrap_transaction "$asset_dir" "$@"
     stage="$(mktemp -d "$HOME_DIR/.bootstrap.XXXXXX")"
   fi
   trap '[ -z "$stage" ] || rm -rf "$stage"; release_bootstrap_lock' EXIT HUP INT TERM
@@ -163,8 +129,8 @@ main() {
   if [ -n "$dry_stage" ]; then rm -rf "$dry_stage"; stage=""; trap - EXIT HUP INT TERM; printf 'DRY   verified assets; would run installer from %s\n' "$HOME_DIR/bin/agent-install.sh"; return; fi
   begin_bootstrap_transaction "$asset_dir"
   for asset in "${BOOTSTRAP_ASSETS[@]}"; do
-    mv "$stage/$asset" "$asset_dir/$asset" || { rollback_bootstrap_transaction "$asset_dir"; die "could not promote $asset; restored the previous release"; }
-    mv "$stage/$asset.sha256" "$asset_dir/$asset.sha256" || { rollback_bootstrap_transaction "$asset_dir"; die "could not promote $asset checksum; restored the previous release"; }
+    mv "$stage/$asset" "$asset_dir/$asset" || { rollback_bootstrap_transaction "$asset_dir" "$@"; die "could not promote $asset; restored the previous release"; }
+    mv "$stage/$asset.sha256" "$asset_dir/$asset.sha256" || { rollback_bootstrap_transaction "$asset_dir" "$@"; die "could not promote $asset checksum; restored the previous release"; }
     if [ "${COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION:-}" = "$asset" ]; then
       kill -KILL "$$"
     fi
@@ -180,8 +146,7 @@ main() {
   else
     installer_status=$?
   fi
-  rollback_bootstrap_transaction "$asset_dir" || die "installer failed and the previous release could not be restored; the recovery journal is preserved at $HOME_DIR/.bootstrap-transaction"
-  restore_previous_installer "$asset_dir" "$@"
+  rollback_bootstrap_transaction "$asset_dir" "$@" || die "installer failed and the previous release could not be restored; the recovery journal is preserved at $HOME_DIR/.bootstrap-transaction"
   die "installer failed; restored the previous CozyGateway release (exit $installer_status)"
 }
 main "$@"
