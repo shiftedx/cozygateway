@@ -1338,7 +1338,7 @@ stop_owned_windows_gateway
             }
         }
         Assert-True $cozyListening 'CozyAgents supervisor fixture must start its managed gateway child'
-        $cozyStopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $cozyWrapper $supervisorPort cozyagents 2>&1 | Out-String)
+        $cozyStopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $cozyWrapper $supervisorPort cozyagents $dashboardPortStatePosix 2>&1 | Out-String)
         Assert-True ($LASTEXITCODE -eq 0) "owned CozyAgents gateway stop helper failed: $cozyStopOutput"
         Start-Sleep -Milliseconds 1500
         $cozyReacquired = $false
@@ -1379,7 +1379,7 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
         $savedErrorActionPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
-            $foreignOldPortOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $generatedWrapper $supervisorPort hermes 2>&1 | Out-String)
+            $foreignOldPortOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $generatedWrapper $supervisorPort hermes $dashboardPortStatePosix 2>&1 | Out-String)
             $foreignOldPortExitCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $savedErrorActionPreference
