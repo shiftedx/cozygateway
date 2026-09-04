@@ -1,0 +1,23 @@
+name: Bug report
+description: Report a reproducible CozyGateway defect
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: Include CozyGateway version, OS, and Node version. Redact tokens and pairing codes.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true

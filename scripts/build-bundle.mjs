@@ -14,6 +14,9 @@ if (!existsSync(entry)) {
   console.error(`build-bundle: ${entry} not found; run 'pnpm build' first`);
   process.exit(1);
 }
+// A release build must not inherit an ignored bundle from a developer's working tree. In
+// particular, release-assets tests and CI both need a fresh set of checksums for only this build.
+rmSync("dist-bundle", { recursive: true, force: true });
 mkdirSync("dist-bundle", { recursive: true });
 
 // cli.js only invokes runCli() when process.argv[1] ends with "cli.js"/"cli.ts" (see its

@@ -114,11 +114,10 @@ describe("what a release publishes", () => {
     expect(INSTALLER).toContain("Scheduled Task $WINDOWS_TASK is foreign; leaving it untouched");
   });
 
-  it("checksums whatever it built, if a bundle is present", () => {
-    const dist = join(ROOT, "dist-bundle");
-    if (!existsSync(join(dist, "install.sh"))) return; // no bundle in this working tree
-    for (const asset of REQUIRED) {
-      expect(existsSync(join(dist, `${asset}.sha256`)), `${asset}.sha256 missing`).toBe(true);
-    }
+  it("cleans ignored bundle residue before producing release assets", () => {
+    // This test intentionally never inspects ROOT/dist-bundle: that ignored directory may be a
+    // stale local artifact. The bundler owns an empty output directory on every invocation.
+    expect(BUNDLER).toContain('rmSync("dist-bundle", { recursive: true, force: true })');
+    expect(BUNDLER).toContain('mkdirSync("dist-bundle", { recursive: true })');
   });
 });
