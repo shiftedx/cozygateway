@@ -22,7 +22,22 @@ canonical_home_dir() {
 sha256_of() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'; elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else die "sha256 tool required (shasum or sha256sum)"; fi; }
 BOOTSTRAP_ASSETS=(cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz agent-install.sh gateway-supervisor.cjs cozygateway-bootstrap.sh)
 bootstrap_lock=""
-release_bootstrap_lock() { [ -z "$bootstrap_lock" ] || { rm -f "$bootstrap_lock/pid"; rmdir "$bootstrap_lock" 2>/dev/null || true; }; }
+release_bootstrap_lock() {
+  [ -z "$bootstrap_lock" ] && return
+  rm -f "$bootstrap_lock/pid"
+  rmdir "$bootstrap_lock" 2>/dev/null || true
+}
+handle_bootstrap_signal() {
+  release_bootstrap_lock
+  exit 128
+}
+valid_inventory_name() {
+  local candidate="$1" asset
+  for asset in "${BOOTSTRAP_ASSETS[@]}"; do
+    [ "$candidate" = "$asset" ] || [ "$candidate" = "$asset.sha256" ] && return 0
+  done
+  return 1
+}
 acquire_bootstrap_lock() {
   local owner
   if ! mkdir "$bootstrap_lock" 2>/dev/null; then
@@ -49,6 +64,8 @@ prepare_owned_dir() {
 recover_bootstrap_transaction() {
   local asset_dir="$1"; shift
   local journal="$HOME_DIR/.bootstrap-transaction" backup="$HOME_DIR/.bootstrap-previous" state name inventory
+  [ ! -L "$journal" ] || die "refusing symlinked bootstrap transaction marker"
+  [ ! -L "$backup" ] || die "refusing symlinked bootstrap rollback directory"
   [ -f "$journal" ] || { [ ! -e "$backup" ] || { rmdir "$backup" 2>/dev/null || die "bootstrap rollback directory exists without a transaction marker; preserve it and rerun"; }; return; }
   state="$(cat "$journal")"
   if [ "$state" = 'commit=installer-succeeded' ] || [ "$state" = 'restored=previous-release' ]; then [ ! -e "$backup" ] || rm -rf "$backup" || die "could not finish bootstrap cleanup; journal preserved"; rm -f "$journal" || die "could not clear completed bootstrap marker"; return; fi
@@ -57,7 +74,7 @@ recover_bootstrap_transaction() {
   inventory="$backup/inventory"; [ -f "$inventory" ] || die "bootstrap transaction inventory is missing; preserve it and rerun"
   printf 'INFO  recovering an interrupted CozyGateway bootstrap before fetching a new release\n' >&2
   while IFS= read -r name; do
-    case "$name" in present:*) name="${name#present:}"; cp "$backup/$name" "$asset_dir/$name.recover.$$" || die "could not restore $name"; mv -f "$asset_dir/$name.recover.$$" "$asset_dir/$name" || die "could not activate restored $name" ;; absent:*) rm -f "$asset_dir/${name#absent:}" ;; *) die "bootstrap transaction inventory is invalid" ;; esac
+    case "$name" in present:*) name="${name#present:}"; valid_inventory_name "$name" || die "bootstrap transaction inventory is invalid"; cp "$backup/$name" "$asset_dir/$name.recover.$$" || die "could not restore $name"; mv -f "$asset_dir/$name.recover.$$" "$asset_dir/$name" || die "could not activate restored $name" ;; absent:*) name="${name#absent:}"; valid_inventory_name "$name" || die "bootstrap transaction inventory is invalid"; rm -f "$asset_dir/$name" ;; *) die "bootstrap transaction inventory is invalid" ;; esac
   done < "$inventory"
   if [ -f "$asset_dir/agent-install.sh" ]; then
     restore_previous_installer "$asset_dir" "$@" || die "previous assets were restored but its service restart failed; recovery journal is preserved"
@@ -111,11 +128,13 @@ main() {
     prepare_owned_dir "$HOME_DIR"; prepare_owned_dir "$asset_dir"
     bootstrap_lock="$HOME_DIR/.bootstrap-lock"
     acquire_bootstrap_lock
-    trap 'release_bootstrap_lock' EXIT HUP INT TERM
+    trap 'release_bootstrap_lock' EXIT
+    trap 'handle_bootstrap_signal' HUP INT TERM
     recover_bootstrap_transaction "$asset_dir" "$@"
     stage="$(mktemp -d "$HOME_DIR/.bootstrap.XXXXXX")"
   fi
-  trap '[ -z "$stage" ] || rm -rf "$stage"; release_bootstrap_lock' EXIT HUP INT TERM
+  trap '[ -z "$stage" ] || rm -rf "$stage"; release_bootstrap_lock' EXIT
+  trap 'handle_bootstrap_signal' HUP INT TERM
   if [ -z "$ASSET_BASE" ]; then
     if [ -z "$TAG" ]; then TAG="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"; [ -n "$TAG" ] || die "could not resolve latest release"; fi
     ASSET_BASE="https://github.com/$REPO/releases/download/$TAG"
