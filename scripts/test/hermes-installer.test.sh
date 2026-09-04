@@ -43,6 +43,12 @@ tree_sha256() {
     return 1
   fi
 }
+file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  else echo 'sha256 tool required (sha256sum or shasum)' >&2; return 1
+  fi
+}
 make_directory_symlink() {
   local target="$1" link="$2"
   case "$(uname -s)" in
@@ -376,7 +382,7 @@ fi
 expect_contains "$child_failure_output" 'installer failed; restored the previous CozyGateway release'
 expect_contains "$child_failure_output" 'restarted the previous CozyGateway service after the failed update'
 cmp -s "$tmp/bootstrap-before-child-failure.mjs" "$tmp/bootstrap-live-home/bin/cozygateway.mjs"
-grep -Fq -- '--gateway-dir' "$tmp/bootstrap-handoff-rolled-back"
+test ! -e "$tmp/bootstrap-handoff-rolled-back"
 test ! -e "$tmp/bootstrap-live-home/.bootstrap-transaction"
 test ! -e "$tmp/bootstrap-live-home/.bootstrap-previous"
 
@@ -459,6 +465,9 @@ cat > "$tmp/service-bin/launchctl" <<'LAUNCHCTL'
 if [ "${1:-}" = bootstrap ] && [ -n "${COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER:-}" ] && [ ! -f "$COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER" ]; then
   : > "$COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER"
   exit 5
+fi
+if [ "${1:-}" = kickstart ] && [ -n "${COZYGATEWAY_TEST_LAUNCHCTL_KICKSTART_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$COZYGATEWAY_TEST_LAUNCHCTL_KICKSTART_LOG"
 fi
 exit 0
 LAUNCHCTL
@@ -739,6 +748,112 @@ grep -Fq '"tokenEnv": "COZYGATEWAY_HERMES_TOKEN"' "$tmp/gateway-live/local/cozyg
 grep -Fq '"host": "0.0.0.0"' "$tmp/gateway-live/local/cozygateway.config.json"
 grep -Fq 'COZYGATEWAY_URL=http://127.0.0.1:8787' "$tmp/hermes/.env"
 grep -Fq 'http://127.0.0.1:8787/health' "$tmp/curl.log"
+
+# A machine can host Hermes profiles that belong to another Gateway. Runtime-only
+# repair must update the owned runtime without adopting those profiles, replacing
+# their tokens, or rewriting their plugin/service state. The registered service
+# is deliberately the old two-argument /bin/bash wrapper accepted by prior
+# releases; current repair must still recognize and restart it.
+runtime_gateway="$tmp/gateway-runtime-only"
+runtime_home="$tmp/runtime-only-home"
+runtime_profiles="$tmp/runtime-only-hermes"
+cp -R "$tmp/gateway-live" "$runtime_gateway"
+mkdir -p "$runtime_home/Library/LaunchAgents" "$runtime_profiles/profiles/ops/plugins"
+cat > "$runtime_gateway/local/run-gateway.sh" <<'LEGACY_WRAPPER'
+#!/usr/bin/env bash
+# Legacy installer wrapper retained by a runtime-only repair.
+exec "$@"
+LEGACY_WRAPPER
+chmod 700 "$runtime_gateway/local/run-gateway.sh"
+cat > "$runtime_home/Library/LaunchAgents/ai.cozylabs.cozygateway.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>ProgramArguments</key><array><string>/bin/bash</string><string>$runtime_gateway/local/run-gateway.sh</string></array></dict></plist>
+PLIST
+"$real_node" - "$runtime_gateway/local/cozygateway.config.json" <<'NODE'
+const { readFileSync, writeFileSync } = require('node:fs');
+const path = process.argv[2];
+const config = JSON.parse(readFileSync(path, 'utf8'));
+config.host = '127.0.0.1';
+config.port = 9000;
+config.hermesEndpoints = [{ id: 'default', url: 'ws://127.0.0.1:19120/api/ws', authMode: 'token', tokenEnv: 'COZYGATEWAY_HERMES_TOKEN', profile: 'default', profiles: ['default', 'ops'] }];
+writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
+NODE
+cat > "$runtime_profiles/.env" <<'REMOTE_PROFILE'
+COZYGATEWAY_INSTALLER_OWNER=cozylabs-v1
+COZYGATEWAY_URL=https://warm.cozylabs.ai
+COZYGATEWAY_TOKEN=remote-token-must-not-change
+REMOTE_PROFILE
+printf 'remote plugin sentinel\n' > "$runtime_profiles/profiles/ops/plugins/keep.txt"
+runtime_gateway_before="$(tree_sha256 "$runtime_gateway/local")"
+runtime_config_before="$(file_sha256 "$runtime_gateway/local/cozygateway.config.json")"
+runtime_env_before="$(file_sha256 "$runtime_gateway/local/gateway.env")"
+runtime_profiles_before="$(tree_sha256 "$runtime_profiles")"
+runtime_output="$(env -u COZYGATEWAY_NODE HOME="$runtime_home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_CURL_LOG="$tmp/runtime-only-curl.log" COZYGATEWAY_TEST_LAUNCHCTL_KICKSTART_LOG="$tmp/runtime-only-kickstart.log" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --runtime-only --bundle "$tmp/gateway.mjs" --gateway-dir "$runtime_gateway" 2>&1)"
+grep -Fq 'updated CozyGateway runtime without changing Hermes profiles' <<<"$runtime_output"
+grep -Fq 'http://127.0.0.1:9000/health' "$tmp/runtime-only-curl.log"
+grep -Fq "kickstart -k gui/$(id -u)/ai.cozylabs.cozygateway" "$tmp/runtime-only-kickstart.log"
+grep -Fqx 'repair_mode=runtime-only' "$runtime_gateway/local/install-state"
+grep -Fq "$runtime_gateway/runtime/node/bin/node" "$runtime_gateway/bin/cozygateway"
+test "$runtime_gateway_before" != "$(tree_sha256 "$runtime_gateway/local")"
+test "$runtime_config_before" = "$(file_sha256 "$runtime_gateway/local/cozygateway.config.json")"
+test "$runtime_env_before" = "$(file_sha256 "$runtime_gateway/local/gateway.env")"
+test "$runtime_profiles_before" = "$(tree_sha256 "$runtime_profiles")"
+# The generated CLI keeps that narrow mode on every later repair.
+cat > "$runtime_gateway/bin/cozygateway-bootstrap.sh" <<'RUNTIME_REPAIR_BOOTSTRAP'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${COZYGATEWAY_TEST_RUNTIME_REPAIR_LOG:?}"
+RUNTIME_REPAIR_BOOTSTRAP
+chmod 700 "$runtime_gateway/bin/cozygateway-bootstrap.sh"
+if command -v shasum >/dev/null 2>&1; then runtime_repair_sha="$(shasum -a 256 "$runtime_gateway/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; else runtime_repair_sha="$(sha256sum "$runtime_gateway/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"; fi
+printf '%s  install.sh\n' "$runtime_repair_sha" > "$runtime_gateway/bin/cozygateway-bootstrap.sh.sha256"
+printf 'file://%s\n' "$tmp/runtime-release" > "$runtime_gateway/local/bootstrap-source"
+COZYGATEWAY_TEST_RUNTIME_REPAIR_LOG="$tmp/runtime-only-repair.log" "$runtime_gateway/bin/cozygateway" repair >/dev/null
+grep -Fqx -- '--runtime-only' "$tmp/runtime-only-repair.log"
+
+# Readiness is the commit point: a failed runtime-only restart preserves the
+# prior state and never claims future repairs are narrow.
+runtime_failed="$tmp/gateway-runtime-only-failed"
+cp -R "$runtime_gateway" "$runtime_failed"
+sed -i.bak 's/"port": 9000/"port": 8999/' "$runtime_failed/local/cozygateway.config.json" && rm -f "$runtime_failed/local/cozygateway.config.json.bak"
+sed -i.bak "s|$runtime_gateway|$runtime_failed|g" "$runtime_home/Library/LaunchAgents/ai.cozylabs.cozygateway.plist" && rm -f "$runtime_home/Library/LaunchAgents/ai.cozylabs.cozygateway.plist.bak"
+sed -i.bak '/^repair_mode=runtime-only$/d' "$runtime_failed/local/install-state" && rm -f "$runtime_failed/local/install-state.bak"
+runtime_failed_state_before="$(file_sha256 "$runtime_failed/local/install-state")"
+runtime_failed_config_before="$(file_sha256 "$runtime_failed/local/cozygateway.config.json")"
+runtime_failed_env_before="$(file_sha256 "$runtime_failed/local/gateway.env")"
+if runtime_failed_output="$(env -u COZYGATEWAY_NODE HOME="$runtime_home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --runtime-only --bundle "$tmp/gateway.mjs" --gateway-dir "$runtime_failed" 2>&1)"; then
+  echo 'a runtime-only repair with an unhealthy saved listener must fail' >&2
+  exit 1
+fi
+expect_contains "$runtime_failed_output" 'CozyGateway did not become healthy on http://127.0.0.1:8999'
+test "$runtime_failed_state_before" = "$(file_sha256 "$runtime_failed/local/install-state")"
+test "$runtime_failed_config_before" = "$(file_sha256 "$runtime_failed/local/cozygateway.config.json")"
+test "$runtime_failed_env_before" = "$(file_sha256 "$runtime_failed/local/gateway.env")"
+
+# Linux uses the registered service unit, not the launchd-style label, when it
+# restarts a legacy owned wrapper. This catches a repair that would otherwise
+# report success without touching the user's real systemd service.
+linux_gateway="$tmp/gateway-runtime-only-linux"
+linux_home="$tmp/runtime-only-linux-home"
+linux_config="$tmp/runtime-only-linux-config"
+mkdir -p "$linux_config/systemd/user" "$tmp/linux-runtime-bin"
+cp -R "$runtime_gateway" "$linux_gateway"
+sed -i.bak "s|$runtime_gateway|$linux_gateway|g" "$linux_gateway/local/install-state" "$linux_gateway/bin/cozygateway" && rm -f "$linux_gateway/local/install-state.bak" "$linux_gateway/bin/cozygateway.bak"
+cat > "$linux_config/systemd/user/cozygateway.service" <<UNIT
+[Service]
+ExecStart=/bin/bash $linux_gateway/local/run-gateway.sh
+UNIT
+cat > "$tmp/linux-runtime-bin/systemctl" <<'SYSTEMCTL'
+#!/usr/bin/env bash
+if [ "${1:-}" = --user ] && [ "${2:-}" = show-environment ]; then exit 0; fi
+printf '%s\n' "$*" >> "${COZYGATEWAY_TEST_SYSTEMCTL_LOG:?}"
+SYSTEMCTL
+cat > "$tmp/linux-runtime-bin/loginctl" <<'LOGINCTL'
+#!/usr/bin/env bash
+exit 0
+LOGINCTL
+chmod 700 "$tmp/linux-runtime-bin/systemctl" "$tmp/linux-runtime-bin/loginctl"
+env -u COZYGATEWAY_NODE HOME="$linux_home" XDG_CONFIG_HOME="$linux_config" PATH="$tmp/linux-runtime-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_SYSTEMCTL_LOG="$tmp/runtime-only-systemctl.log" COZYGATEWAY_SERVICE_PLATFORM=Linux bash "$repo_root/scripts/agent-install.sh" --runtime-only --bundle "$tmp/gateway.mjs" --gateway-dir "$linux_gateway" >/dev/null
+grep -Fqx -- '--user restart cozygateway.service' "$tmp/runtime-only-systemctl.log"
 
 # On util-linux hosts, exercise the public one-paste shape with installer stdin
 # occupied by a pipe while a separate controlling terminal supplies the LAN
@@ -2082,6 +2197,53 @@ if COZYGATEWAY_HOME=/ COZYGATEWAY_INSTALL_DRYRUN=1 bash "$repo_root/scripts/inst
   echo 'expected unsafe bootstrap home to be rejected before downloading assets' >&2
   exit 1
 fi
+
+# Normal Hermes setup refuses every existing profile that points at another
+# Gateway before it writes the local state or gateway environment. Node's dotenv
+# parser handles whitespace and `export`, so a formatted foreign binding cannot
+# bypass this preflight.
+preflight_hermes="$tmp/hermes-preflight"
+preflight_gateway="$tmp/gateway-preflight"
+cp -R "$tmp/hermes" "$preflight_hermes"
+mkdir -p "$preflight_gateway/local"
+printf 'pre-existing-state\n' > "$preflight_gateway/local/install-state"
+printf 'pre-existing-gateway-env\n' > "$preflight_gateway/local/gateway.env"
+cat > "$preflight_hermes/.env" <<'FOREIGN_PROFILE_ENV'
+COZYGATEWAY_INSTALLER_OWNER=cozylabs-v1
+export COZYGATEWAY_URL = https://warm.cozylabs.ai
+COZYGATEWAY_TOKEN=remote-token-must-not-change
+FOREIGN_PROFILE_ENV
+preflight_state_before="$(file_sha256 "$preflight_gateway/local/install-state")"
+preflight_env_before="$(file_sha256 "$preflight_gateway/local/gateway.env")"
+if preflight_output="$(HOME="$tmp/preflight-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$preflight_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/preflight-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$preflight_gateway" 2>&1)"; then
+  echo 'a profile with this installer marker but a foreign Gateway URL must fail closed' >&2
+  exit 1
+fi
+expect_contains "$preflight_output" 'targets another Gateway; use --runtime-only to preserve it'
+test "$preflight_state_before" = "$(file_sha256 "$preflight_gateway/local/install-state")"
+test "$preflight_env_before" = "$(file_sha256 "$preflight_gateway/local/gateway.env")"
+
+# Gateway environment promotion is atomic too. A later duplicate-token failure
+# must leave the prior complete file available rather than truncating it.
+atomic_hermes="$tmp/hermes-atomic-env"
+atomic_gateway="$tmp/gateway-atomic-env"
+cp -R "$tmp/hermes" "$atomic_hermes"
+mkdir -p "$atomic_gateway/local"
+printf 'old-gateway-env-must-survive\n' > "$atomic_gateway/local/gateway.env"
+for profile_env in "$atomic_hermes/.env" "$atomic_hermes/profiles/ops/.env"; do
+  cat > "$profile_env" <<'OWNED_PROFILE_ENV'
+COZYGATEWAY_INSTALLER_OWNER=cozylabs-v1
+COZYGATEWAY_URL=http://127.0.0.1:8787
+COZYGATEWAY_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+OWNED_PROFILE_ENV
+done
+atomic_env_before="$(file_sha256 "$atomic_gateway/local/gateway.env")"
+if atomic_env_output="$(HOME="$tmp/atomic-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$atomic_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/atomic-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --profiles default,ops --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$atomic_gateway" 2>&1)"; then
+  echo 'duplicate existing attach tokens must fail before gateway.env promotion' >&2
+  exit 1
+fi
+expect_contains "$atomic_env_output" 'Hermes profiles must have distinct CozyGateway attach tokens'
+test "$atomic_env_before" = "$(file_sha256 "$atomic_gateway/local/gateway.env")"
 
 # A bootstrap interrupted before install-state exists is still removable with
 # no Node, Hermes, or config. The dedicated directory is the recovery boundary.
