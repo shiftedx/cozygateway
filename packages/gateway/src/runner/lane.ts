@@ -6,6 +6,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import {
   PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES,
   PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS,
+  PendingWebsocketLimiter,
 } from "../websocket-limits.ts";
 
 import { resolveAttachBearer } from "../adapters/attach/token-auth.ts";
@@ -84,8 +85,7 @@ export class RunnerLane {
   readonly #log: (line: string) => void;
   readonly #wss: WebSocketServer;
   readonly #connections = new Map<string, RunnerConnection>();
-  readonly #maxPendingConnections: number;
-  #pendingConnections = 0;
+  readonly #pendingConnections: PendingWebsocketLimiter;
   #heartbeat: ReturnType<typeof setInterval> | undefined;
   #closed = false;
 
@@ -99,14 +99,21 @@ export class RunnerLane {
     this.#heartbeatTimeoutMs = opts.heartbeatTimeoutMs ?? RUNNER_V1_HEARTBEAT_TIMEOUT_MS;
     this.#onReceipt = opts.onReceipt;
     this.#log = opts.log ?? ((line) => void process.stderr.write(`[runner] ${line}\n`));
-    this.#maxPendingConnections = opts.maxPendingConnections ?? PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS;
+    this.#pendingConnections = new PendingWebsocketLimiter(opts.maxPendingConnections ?? PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS);
     this.#wss = new WebSocketServer({ noServer: true, maxPayload: PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES });
     this.#wss.on("error", () => {});
-    this.#wss.on("connection", (socket, req) => this.#onConnection(socket, req));
+    this.#wss.on("connection", (socket: WebSocket, req: IncomingMessage, releasePending: () => void) => this.#onConnection(socket, req, releasePending));
   }
 
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
-    this.#wss.handleUpgrade(req, socket, head, (ws) => this.#wss.emit("connection", ws, req));
+    const releasePending = this.#pendingConnections.reserve(socket);
+    if (releasePending === undefined) return;
+    try {
+      this.#wss.handleUpgrade(req, socket, head, (ws) => this.#wss.emit("connection", ws, req, releasePending));
+    } catch {
+      releasePending();
+      socket.destroy();
+    }
   }
 
   /** Whether ANY runner has completed its hello. A create is still accepted when this is false. */
@@ -222,23 +229,16 @@ export class RunnerLane {
     this.#log(`sent ${operation.kind} ${operation.operationId} for bot ${operation.bot}`);
   }
 
-  #onConnection(socket: WebSocket, req: IncomingMessage): void {
-    socket.on("error", () => socket.terminate());
+  #onConnection(socket: WebSocket, req: IncomingMessage, releasePending?: () => void): void {
+    socket.once("close", () => releasePending?.());
+    socket.on("error", () => {
+      releasePending?.();
+      socket.terminate();
+    });
     if (this.#closed) {
       socket.close(1001, "gateway shutting down");
       return;
     }
-    if (this.#pendingConnections >= this.#maxPendingConnections) {
-      socket.close(1013, "too many pending connections");
-      return;
-    }
-    this.#pendingConnections += 1;
-    let pending = true;
-    const releasePending = (): void => {
-      if (!pending) return;
-      pending = false;
-      this.#pendingConnections -= 1;
-    };
     // The paired runners first, then the legacy shared credential. Both resolve the bearer without
     // ever comparing it byte by byte against a real one: the roster hashes it and looks the hash
     // up, and the legacy path goes through the same constant-time scan every other credential on
@@ -309,7 +309,7 @@ export class RunnerLane {
           return;
         }
         clearTimeout(helloTimer);
-        releasePending();
+        releasePending?.();
         // A second hello for the SAME runner supersedes the first rather than racing it: two
         // reconcilers against one host is the failure mode the single-writer rule exists to
         // prevent. A hello for a DIFFERENT runner is a different machine and gets its own socket,
@@ -366,7 +366,7 @@ export class RunnerLane {
 
     socket.on("close", () => {
       clearTimeout(helloTimer);
-      releasePending();
+      releasePending?.();
       if (this.#connections.get(connection.key)?.socket === socket) {
         this.#connections.delete(connection.key);
         this.#log(`runner ${connection.key} detached`);

@@ -25,6 +25,7 @@ import { emitTrace, traceId, type TraceLog } from "./trace.ts";
 import {
   PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES,
   PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS,
+  PendingWebsocketLimiter,
 } from "./websocket-limits.ts";
 
 interface Client {
@@ -57,8 +58,7 @@ export class WsHub {
   readonly #onMobileResult: ((deviceId: string, frame: MobileNodeResultFrame) => void) | undefined;
   readonly #onDeviceDisconnect: ((deviceId: string) => void) | undefined;
   readonly #onMobileAvailable: ((deviceId: string) => void) | undefined;
-  readonly #maxPendingConnections: number;
-  #pendingConnections = 0;
+  readonly #pendingConnections: PendingWebsocketLimiter;
 
   constructor(deps: {
     storage: Storage;
@@ -81,14 +81,14 @@ export class WsHub {
     this.#onMobileResult = deps.onMobileResult;
     this.#onDeviceDisconnect = deps.onDeviceDisconnect;
     this.#onMobileAvailable = deps.onMobileAvailable;
-    this.#maxPendingConnections = deps.maxPendingConnections ?? PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS;
+    this.#pendingConnections = new PendingWebsocketLimiter(deps.maxPendingConnections ?? PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS);
     const heartbeatMs = deps.heartbeatMs ?? HEARTBEAT_MS;
     // noServer: true means this WebSocketServer never attaches its own 'upgrade' listener; the
     // caller routes matching requests to handleUpgrade() below. See upgrade-dispatcher.ts.
     this.#wss = new WebSocketServer({ noServer: true, maxPayload: PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES });
     // Swallow server-level errors: an unhandled 'error' event would crash the process.
     this.#wss.on("error", () => {});
-    this.#wss.on("connection", (socket) => this.#onConnection(socket));
+    this.#wss.on("connection", (socket: WebSocket, req: IncomingMessage, releasePending: () => void) => this.#onConnection(socket, req, releasePending));
     this.#heartbeatTimer = setInterval(() => this.#heartbeat(), heartbeatMs);
     this.#heartbeatTimer.unref?.();
   }
@@ -96,30 +96,30 @@ export class WsHub {
   /** Completes a WebSocket handshake for an upgrade request already routed to this hub by
    *  pathname. */
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
-    this.#wss.handleUpgrade(req, socket, head, (ws) => this.#wss.emit("connection", ws, req));
+    const releasePending = this.#pendingConnections.reserve(socket);
+    if (releasePending === undefined) return;
+    try {
+      this.#wss.handleUpgrade(req, socket, head, (ws) => this.#wss.emit("connection", ws, req, releasePending));
+    } catch {
+      releasePending();
+      socket.destroy();
+    }
   }
 
   #send(socket: WebSocket, frame: ServerFrame): void {
     if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(frame));
   }
 
-  #onConnection(socket: WebSocket): void {
+  #onConnection(socket: WebSocket, _req?: IncomingMessage, releasePending?: () => void): void {
     let client: Client | undefined;
-    if (this.#pendingConnections >= this.#maxPendingConnections) {
-      socket.close(1013, "too many pending connections");
-      return;
-    }
-    this.#pendingConnections += 1;
-    let pending = true;
-    const releasePending = (): void => {
-      if (!pending) return;
-      pending = false;
-      this.#pendingConnections -= 1;
-    };
+    // The raw socket reservation is already listening, but release here as well so a WebSocket
+    // error or close that races authentication cannot keep its slot until TCP teardown.
+    socket.once("close", () => releasePending?.());
     const connection = traceId(randomUUID());
     emitTrace(this.#trace, "app_ws_open", { connection });
     // A ws socket with no 'error' listener crashes the process on the first socket error.
     socket.on("error", () => {
+      releasePending?.();
       try {
         socket.close(1008, "socket error");
       } catch {
@@ -175,7 +175,7 @@ export class WsHub {
           return;
         }
         clearTimeout(authTimer);
-        releasePending();
+        releasePending?.();
         this.#storage.touchDevice(device.id, this.#now());
         client = { socket, deviceId: device.id, heartbeatAlive: true, mobileCommands: new Set(), mobileForeground: false };
         emitTrace(this.#trace, "app_ws_auth", { connection, device: traceId(device.id) });
@@ -234,7 +234,7 @@ export class WsHub {
 
     socket.on("close", (code) => {
       clearTimeout(authTimer);
-      releasePending();
+      releasePending?.();
       if (client !== undefined) {
         this.#clients.delete(client);
         this.#releaseDevice(client.deviceId);

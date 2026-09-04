@@ -58,6 +58,17 @@ function connect(): WebSocket {
   return new WebSocket(`ws://127.0.0.1:${port}/ws`);
 }
 
+async function rejectedUpgrade(): Promise<number> {
+  const ws = connect();
+  return await new Promise<number>((resolve, reject) => {
+    ws.once("unexpected-response", (_request, response) => {
+      response.resume();
+      resolve(response.statusCode ?? 0);
+    });
+    ws.once("error", reject);
+  });
+}
+
 function frames(ws: WebSocket): ServerFrame[] {
   const seen: ServerFrame[] = [];
   ws.on("message", (data) => seen.push(JSON.parse(String(data)) as ServerFrame));
@@ -85,10 +96,7 @@ describe("auth", () => {
     });
     const pending = connect();
     await once(pending, "open");
-    const refused = connect();
-    await once(refused, "open");
-    const [refusedCode] = (await once(refused, "close")) as [number];
-    expect(refusedCode).toBe(1013);
+    await expect(rejectedUpgrade()).resolves.toBe(503);
 
     const pendingFrames = frames(pending);
     pending.send(JSON.stringify({ type: "auth", token }));
@@ -105,6 +113,32 @@ describe("auth", () => {
     next.close();
     await Promise.all([pendingClosed, nextClosed]);
     await until(() => !hub.isDeviceConnected("d1"));
+  });
+
+  it("releases every invalid authentication attempt before admitting a valid client", async () => {
+    hub.close();
+    hub = new WsHub({
+      storage,
+      gatewayInfo: { name: "g", version: "0.1.0", contract: "v1" },
+      now: () => 1_000,
+      authTimeoutMs: 2_000,
+      heartbeatMs: 25,
+      maxPendingConnections: 1,
+    });
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const invalid = connect();
+      await once(invalid, "open");
+      invalid.send(JSON.stringify({ type: "auth", token: `invalid-${attempt}` }));
+      const [code] = (await once(invalid, "close")) as [number];
+      expect(code).toBe(1008);
+    }
+
+    const valid = connect();
+    const seen = frames(valid);
+    await once(valid, "open");
+    valid.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seen.some((frame) => frame.type === "ready"));
+    valid.close();
   });
 
   it("rejects a frame over the public WebSocket payload ceiling", async () => {

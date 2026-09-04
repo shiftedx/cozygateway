@@ -51,6 +51,7 @@ import { emitTrace, traceId, type TraceLog } from "../../trace.ts";
 import {
   PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES,
   PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS,
+  PendingWebsocketLimiter,
 } from "../../websocket-limits.ts";
 
 export const ATTACH_V1_MAX_IN_FLIGHT_EVENTS = 64;
@@ -137,8 +138,7 @@ export class AttachV1Ingress implements TurnEndpoint {
   readonly #projectionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   readonly #trace: TraceLog | undefined;
   readonly #log: (line: string) => void;
-  readonly #maxPendingConnections: number;
-  #pendingConnections = 0;
+  readonly #pendingConnections: PendingWebsocketLimiter;
   #lastHeartbeatAt: number | null = null;
 
   constructor(deps: {
@@ -169,35 +169,35 @@ export class AttachV1Ingress implements TurnEndpoint {
     this.#projectionMaxAttempts = deps.projectionMaxAttempts ?? 8;
     this.#trace = deps.trace;
     this.#log = deps.log ?? ((line) => console.warn(line));
-    this.#maxPendingConnections = deps.maxPendingConnections ?? PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS;
+    this.#pendingConnections = new PendingWebsocketLimiter(deps.maxPendingConnections ?? PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS);
     this.#wss = new WebSocketServer({ noServer: true, maxPayload: PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES });
     this.#wss.on("error", () => {});
-    this.#wss.on("connection", (socket, req) => this.#onConnection(socket, req));
+    this.#wss.on("connection", (socket: WebSocket, req: IncomingMessage, releasePending: () => void) => this.#onConnection(socket, req, releasePending));
     this.#heartbeat = setInterval(() => this.#tick(), this.#heartbeatIntervalMs);
     this.#heartbeat.unref();
   }
 
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
-    this.#wss.handleUpgrade(req, socket, head, (ws) => this.#wss.emit("connection", ws, req));
+    const releasePending = this.#pendingConnections.reserve(socket);
+    if (releasePending === undefined) return;
+    try {
+      this.#wss.handleUpgrade(req, socket, head, (ws) => this.#wss.emit("connection", ws, req, releasePending));
+    } catch {
+      releasePending();
+      socket.destroy();
+    }
   }
 
   #agentFor(req: IncomingMessage): string | undefined {
     return resolveAttachBearer(this.#tokens, req.headers.authorization);
   }
 
-  #onConnection(socket: WebSocket, req: IncomingMessage): void {
-    socket.on("error", () => socket.terminate());
-    if (this.#pendingConnections >= this.#maxPendingConnections) {
-      socket.close(1013, "too many pending connections");
-      return;
-    }
-    this.#pendingConnections += 1;
-    let pending = true;
-    const releasePending = (): void => {
-      if (!pending) return;
-      pending = false;
-      this.#pendingConnections -= 1;
-    };
+  #onConnection(socket: WebSocket, req: IncomingMessage, releasePending?: () => void): void {
+    socket.once("close", () => releasePending?.());
+    socket.on("error", () => {
+      releasePending?.();
+      socket.terminate();
+    });
     const agentId = this.#agentFor(req);
     if (agentId === undefined) {
       socket.close(1008, "unauthorized");
@@ -257,7 +257,7 @@ export class AttachV1Ingress implements TurnEndpoint {
           return;
         }
         connection.hello = true;
-        releasePending();
+        releasePending?.();
         this.#negotiated.add(agentId);
         connection.instanceId = frame.instanceId;
         connection.commandCursor = this.#storage.attachCommandCursor(agentId);
@@ -412,7 +412,7 @@ export class AttachV1Ingress implements TurnEndpoint {
 
     socket.on("close", (code) => {
       clearTimeout(helloTimer);
-      releasePending();
+      releasePending?.();
       if (this.#current.get(agentId) === connection) {
         this.#current.delete(agentId);
         this.#presence(agentId, "absent");

@@ -57,6 +57,7 @@ async function setup(
     spec?: () => RuntimeSpecDefaults;
     heartbeatIntervalMs?: number;
     heartbeatTimeoutMs?: number;
+    maxPendingConnections?: number;
   } = {},
 ): Promise<Harness> {
   const storage = openStorage(":memory:");
@@ -77,6 +78,7 @@ async function setup(
     log: (line) => logs.push(line),
     ...(opts.heartbeatIntervalMs === undefined ? {} : { heartbeatIntervalMs: opts.heartbeatIntervalMs }),
     ...(opts.heartbeatTimeoutMs === undefined ? {} : { heartbeatTimeoutMs: opts.heartbeatTimeoutMs }),
+    ...(opts.maxPendingConnections === undefined ? {} : { maxPendingConnections: opts.maxPendingConnections }),
   });
   const control = {
     roster: () => ({ bots: [], updatedAt: NOW, stale: false }),
@@ -212,6 +214,19 @@ async function fakeRunner(
   return { ws, frames };
 }
 
+async function rejectedRunnerUpgrade(h: Harness): Promise<number> {
+  const ws = new WebSocket(`ws://127.0.0.1:${h.port}/runner/v1`, {
+    headers: { authorization: `Bearer ${RUNNER_TOKEN}` },
+  });
+  return await new Promise<number>((resolve, reject) => {
+    ws.once("unexpected-response", (_request, response) => {
+      response.resume();
+      resolve(response.statusCode ?? 0);
+    });
+    ws.once("error", reject);
+  });
+}
+
 async function until(predicate: () => boolean, timeoutMs = 4_000): Promise<void> {
   const start = Date.now();
   while (!predicate()) {
@@ -246,6 +261,29 @@ async function receipt(
 }
 
 describe("runtime bot creation without a runner", () => {
+  it("releases invalid bearers and rejects a full runner pool before a 101 response", async () => {
+    const h = await harness({ maxPendingConnections: 1 });
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const invalid = new WebSocket(`ws://127.0.0.1:${h.port}/runner/v1`, {
+        headers: { authorization: `Bearer invalid-${attempt}` },
+      });
+      sockets.push(invalid);
+      await once(invalid, "open");
+      const [code] = (await once(invalid, "close")) as [number];
+      expect(code).toBe(1008);
+    }
+    const held = new WebSocket(`ws://127.0.0.1:${h.port}/runner/v1`, {
+      headers: { authorization: `Bearer ${RUNNER_TOKEN}` },
+    });
+    sockets.push(held);
+    await once(held, "open");
+    await expect(rejectedRunnerUpgrade(h)).resolves.toBe(503);
+    held.close();
+    await once(held, "close");
+    const valid = await fakeRunner(h);
+    valid.ws.close();
+  });
+
   it("answers 201 with the runtime row and leaves the operation waiting for a runner", async () => {
     const h = await harness();
     const created = await createRuntimeBot(h);
