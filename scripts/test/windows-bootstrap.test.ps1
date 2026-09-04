@@ -877,6 +877,14 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     Assert-True $supervisorArgumentsMatch.Success 'shared installer must define the supervisor arguments'
     $wrapperIdentityMatch = [regex]::Match($agentInstaller, '(?ms)^load_windows_wrapper_identity\(\) \{.*?^\}\r?\n(?=stop_owned_windows_gateway\(\))')
     Assert-True $wrapperIdentityMatch.Success 'shared installer must define the persisted gateway wrapper identity loader'
+    $cozyStateWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_cozyagents_state\(\) \{.*?^\}')
+    Assert-True $cozyStateWriterMatch.Success 'shared installer must define the CozyAgents state writer'
+    $hermesStateWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_state\(\) \{.*?^\}')
+    Assert-True $hermesStateWriterMatch.Success 'shared installer must define the Hermes state writer'
+    $cozyInstallMatch = [regex]::Match($agentInstaller, '(?ms)^install_with_cozyagents\(\) \{.*?^\}')
+    Assert-True $cozyInstallMatch.Success 'shared installer must define the CozyAgents install branch'
+    $windowsTaskWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_windows_task_xml\(\) \{.*?^\}\r?\n(?=install_windows_service\(\))')
+    Assert-True $windowsTaskWriterMatch.Success 'shared installer must define the Windows task XML writer'
     $gatewayStopFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^stop_owned_windows_gateway\(\) \{.*?^\}')
     Assert-True $gatewayStopFunctionMatch.Success 'shared installer must define the Windows gateway stop helper'
     $gatewayPortCheckFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^windows_gateway_ports_are_free\(\) \{.*?^\}')
@@ -945,6 +953,152 @@ write_cli_wrapper
     Add-Content -LiteralPath $repairBootstrap -Value '# tampered'
     $tamperedRepair = (& cmd.exe /c $repairCmd repair 2>&1 | Out-String)
     Assert-True ($LASTEXITCODE -ne 0 -and $tamperedRepair -match 'repair bootstrap checksum mismatch' -and @((Get-Content -LiteralPath $repairMarker)).Count -eq 2) 'generated repair shim must reject a tampered bootstrap before execution'
+
+    # A foreign Windows registration must stop the CozyAgents branch before it
+    # can replace any live state or configuration.
+    $cozyPreflightHarness = Join-Path $temp 'cozyagents-preflight-order.sh'
+    $cozyMutationMarker = Join-Path $temp 'cozyagents-preflight-mutation.txt'
+    $cozyPreflightScript = @"
+#!/usr/bin/env bash
+set -euo pipefail
+marker="`$1"
+windows_harness_owner() { return 0; }
+is_windows() { return 0; }
+say() { :; }
+confirm_cozyagents_model() { :; }
+choose_fresh_listener() { :; }
+validate_listener_settings() { :; }
+preflight_windows_service_ownership() { exit 71; }
+write_cozyagents_state() { printf 'state\n' >> "`$marker"; }
+write_cozyagents_gateway_env() { printf 'env\n' >> "`$marker"; }
+write_cozyagents_gateway_config() { printf 'config\n' >> "`$marker"; }
+write_cli_wrapper() { printf 'cli\n' >> "`$marker"; }
+install_service() { printf 'service\n' >> "`$marker"; }
+wait_gateway_ready() { :; }
+install_posix_cli() { :; }
+announce_listener() { :; }
+install_cozyagents_harness() { :; }
+pairing_and_finish() { :; }
+DRY_RUN=1
+LOCAL_DIR=/unused
+$($cozyInstallMatch.Value)
+install_with_cozyagents 0
+"@
+    Write-Utf8NoBom $cozyPreflightHarness $cozyPreflightScript
+    $cozyPreflightOutput = (& $bashPath $cozyPreflightHarness $cozyMutationMarker 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -eq 71) "foreign CozyAgents registration preflight must abort the branch: $cozyPreflightOutput"
+    Assert-True (-not (Test-Path -LiteralPath $cozyMutationMarker)) 'foreign CozyAgents registration preflight must preserve state, environment, config, CLI, and service files'
+
+    # A failed final rename simulates interruption at the state commit boundary.
+    # The authoritative old identity must remain intact and no stage may survive.
+    $atomicStateHarness = Join-Path $temp 'cozyagents-atomic-state.sh'
+    $atomicStatePath = Join-Path $temp 'atomic-state\install-state'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $atomicStatePath) | Out-Null
+    Write-Utf8NoBom $atomicStatePath "old-authoritative-state`n"
+    $atomicStateScript = @"
+#!/usr/bin/env bash
+set -euo pipefail
+STATE_FILE="`$1"
+DRY_RUN=0
+COZYAGENTS_HOME_DIR=/fixture/cozyagents
+NODE_RESOLVED=/fixture/node
+BUNDLE_PATH=/fixture/bundle
+SUPERVISOR=/fixture/supervisor
+WINDOWS_TASK_XML=/fixture/task.xml
+is_windows() { return 0; }
+mv() { return 73; }
+$($cozyStateWriterMatch.Value)
+write_cozyagents_state
+"@
+    Write-Utf8NoBom $atomicStateHarness $atomicStateScript
+    $atomicStateOutput = (& $bashPath $atomicStateHarness $atomicStatePath 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -ne 0) "state commit failure must propagate: $atomicStateOutput"
+    Assert-True ((Get-Content -LiteralPath $atomicStatePath -Raw) -eq "old-authoritative-state`n") 'failed state commit must preserve the complete old identity'
+    Assert-True (@(Get-ChildItem -LiteralPath (Split-Path -Parent $atomicStatePath) -Filter 'install-state.tmp.*').Count -eq 0) 'failed state commit must remove its staged state file'
+
+    Write-Utf8NoBom $atomicStatePath "old-hermes-authoritative-state`n"
+    $atomicHermesStateScript = @"
+#!/usr/bin/env bash
+set -euo pipefail
+STATE_FILE="`$1"
+DRY_RUN=0
+SELECTED=(default)
+PROFILE_SPEC=default
+HERMES_ROOT=/fixture/hermes
+DASHBOARD_PORT=9119
+HERMES_RESOLVED=/fixture/hermes/bin/hermes
+NODE_RESOLVED=/fixture/node
+BUNDLE_PATH=/fixture/bundle
+SUPERVISOR=/fixture/supervisor
+WINDOWS_TASK_XML=/fixture/task.xml
+is_windows() { return 0; }
+service_action_for() { printf 'installed'; }
+mv() { return 73; }
+$($hermesStateWriterMatch.Value)
+write_state
+"@
+    Write-Utf8NoBom $atomicStateHarness $atomicHermesStateScript
+    $atomicHermesStateOutput = (& $bashPath $atomicStateHarness $atomicStatePath 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -ne 0) "Hermes state commit failure must propagate: $atomicHermesStateOutput"
+    Assert-True ((Get-Content -LiteralPath $atomicStatePath -Raw) -eq "old-hermes-authoritative-state`n") 'failed Hermes state commit must preserve the complete old identity'
+    Assert-True (@(Get-ChildItem -LiteralPath (Split-Path -Parent $atomicStatePath) -Filter 'install-state.tmp.*').Count -eq 0) 'failed Hermes state commit must remove its staged state file'
+
+    $taskWriterHarness = Join-Path $temp 'windows-task-writer.sh'
+    $focusedTaskXml = Join-Path $temp 'focused-cozygateway-task.xml'
+    $taskWriterScript = @"
+#!/usr/bin/env bash
+set -euo pipefail
+WINDOWS_TASK_XML="`$1"
+GATEWAY_DIR=/fixture/gateway
+LOCAL_DIR=/fixture/gateway/local
+NODE_RESOLVED="`$2"
+BUNDLE_PATH=/fixture/gateway/bin/cozygateway.mjs
+SUPERVISOR=/fixture/gateway/local/gateway-supervisor.cjs
+GATEWAY_ENV=/fixture/gateway/local/gateway.env
+CONFIG_JSON=/fixture/gateway/local/cozygateway.config.json
+MAINTENANCE_SOCKET=/fixture/gateway/local/gateway-maintenance.sock
+MAINTENANCE_WORKER=/fixture/gateway/bin/gateway-maintenance-worker.cjs
+DASHBOARD_ENV=/unused
+DASHBOARD_OWNER_PS1=/unused
+DASHBOARD_PORT=9119
+SERVICE_PLATFORM=Windows
+HARNESS=cozyagents
+is_windows() { return 0; }
+to_windows_path() { cygpath -w "`$1"; }
+die() { printf 'FAIL  %s\n' "`$*" >&2; exit 1; }
+$($supervisorArgumentsMatch.Value)
+$($windowsTaskWriterMatch.Value)
+write_windows_task_xml
+"@
+    Write-Utf8NoBom $taskWriterHarness $taskWriterScript
+    $nativeTaskNodePosix = (& cygpath.exe -u (Join-Path $env:SystemRoot 'System32\cmd.exe')).Trim()
+    $taskWriterOutput = (& $bashPath $taskWriterHarness $focusedTaskXml $nativeTaskNodePosix 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -eq 0) "production Windows task writer failed: $taskWriterOutput"
+    $focusedTask = Get-Content -LiteralPath $focusedTaskXml -Raw
+    $focusedSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    Assert-True ($focusedTask.Contains("<LogonTrigger><Enabled>true</Enabled><UserId>$focusedSid</UserId></LogonTrigger>")) 'Windows task logon trigger must be scoped to the exact current user SID in schema order'
+    Assert-True ($focusedTask.Contains('<TimeTrigger><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><StartBoundary>')) 'Windows task must include an indefinite one-minute heartbeat trigger'
+    Assert-True ($focusedTask.Contains("<Principal id=`"Author`"><UserId>$focusedSid</UserId><LogonType>InteractiveToken</LogonType>")) 'Windows task principal must use the same exact current user SID'
+    Assert-True ($focusedTask.Contains('<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>')) 'Windows task must remain available on laptop battery power'
+    if ($env:COZYGATEWAY_TEST_NATIVE_TASK_XML -eq '1') {
+        $nativeTaskName = 'CozyGateway-Installer-Test-' + [guid]::NewGuid().ToString('N')
+        $nativeTaskCreated = $false
+        try {
+            $nativeErrorPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $nativeCreate = (& (Join-Path $env:SystemRoot 'System32\schtasks.exe') /Create /F /TN $nativeTaskName /XML $focusedTaskXml 2>&1 | Out-String)
+            } finally {
+                $ErrorActionPreference = $nativeErrorPreference
+            }
+            Assert-True ($LASTEXITCODE -eq 0) "current-user Windows must accept the exact generated task XML without elevation: $nativeCreate`n$focusedTask"
+            $nativeTaskCreated = $true
+            $nativeQuery = (& (Join-Path $env:SystemRoot 'System32\schtasks.exe') /Query /TN $nativeTaskName /XML 2>&1 | Out-String)
+            Assert-True ($LASTEXITCODE -eq 0 -and $nativeQuery.Contains("<UserId>$focusedSid</UserId>")) "registered task must retain the current-user identity: $nativeQuery"
+        } finally {
+            if ($nativeTaskCreated) { & (Join-Path $env:SystemRoot 'System32\schtasks.exe') /Delete /F /TN $nativeTaskName 2>$null | Out-Null }
+        }
+    }
 
     # The managed process is a Node supervisor, not the `serve` child. Killing
     # only the child appears to free the port, then the supervisor restarts it
@@ -1071,8 +1225,9 @@ $($supervisorArgumentsMatch.Value)
 $($wrapperWriterMatch.Value)
 write_wrapper
 "@
+    $wrapperGeneratorScript = $wrapperGeneratorScript.Replace('HARNESS=hermes', 'HARNESS="${13}"')
     Write-Utf8NoBom $wrapperGenerator $wrapperGeneratorScript
-    $wrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $generatedWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix 2>&1 | Out-String)
+    $wrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $generatedWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix hermes 2>&1 | Out-String)
     Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $generatedWrapper)) "production writer must generate the supervisor: $wrapperOutput"
     $wrapperArgument = '"' + $generatedWrapper + '"'
     $supervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
@@ -1080,6 +1235,7 @@ write_wrapper
     $foreignArguments = '"{0}" serve --config "{1}" --foreign' -f $supervisorBundle, $supervisorConfig
     $foreignChild = Start-Process -FilePath $nodeExecutable -ArgumentList $foreignArguments -PassThru
     $uninstallSupervisor = $null
+    $cozySupervisor = $null
     $foreignOldPortListener = $null
     try {
         $listening = $false
@@ -1112,11 +1268,19 @@ DASHBOARD_OWNER_PS1="`$9"
 DASHBOARD_PORT="`${10}"
 WRAPPER="`${11}"
 SUPERVISOR="`$(dirname "`$WRAPPER")/gateway-supervisor.cjs"
+LOCAL_DIR="`$(dirname "`$WRAPPER")"
+GATEWAY_DIR="`$(dirname "`$LOCAL_DIR")"
+MAINTENANCE_WORKER="`$GATEWAY_DIR/bin/gateway-maintenance-worker.cjs"
+MAINTENANCE_SOCKET="`$LOCAL_DIR/gateway-maintenance.sock"
+SERVICE_PLATFORM=Windows
+HARNESS="`${13}"
 PREVIOUS_PORT="`${12}"
+is_windows() { return 0; }
 to_windows_path() { cygpath -w "`$1"; }
 to_posix_path() { cygpath -u "`$1"; }
 gateway_ready() { return 1; }
 die() { printf 'FAIL  %s\n' "`$*" >&2; exit 1; }
+$($supervisorArgumentsMatch.Value)
 $($wrapperIdentityMatch.Value)
 $($gatewayStopFunctionMatch.Value)
 $($gatewayPortCheckFunctionMatch.Value)
@@ -1126,7 +1290,7 @@ stop_owned_windows_gateway
         $savedErrorActionPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
-            $stopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $nextDashboardPort $generatedWrapper $supervisorPort 2>&1 | Out-String)
+            $stopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $generatedWrapper $supervisorPort hermes 2>&1 | Out-String)
             $stopExitCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $savedErrorActionPreference
@@ -1146,6 +1310,42 @@ stop_owned_windows_gateway
             if ($reacquired) { $replacement.Stop() }
         }
         Assert-True $reacquired 'a dashboard-port and gateway-port update must stop the persisted owned supervisor so it cannot reclaim the old gateway port'
+
+        $cozyWrapper = Join-Path $supervisorLocal 'run-gateway-cozyagents.sh'
+        $cozyWrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $cozyWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix cozyagents 2>&1 | Out-String)
+        Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $cozyWrapper)) "production writer must generate the CozyAgents supervisor wrapper: $cozyWrapperOutput"
+        Assert-True (-not ((Get-Content -LiteralPath $cozyWrapper -Raw) -match '--dashboard-env')) 'CozyAgents supervisor wrapper must omit the complete Hermes argument group'
+        $cozySupervisor = Start-Process -FilePath $bashPath -ArgumentList ('"' + $cozyWrapper + '"') -PassThru
+        $cozyListening = $false
+        for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
+            $probe = [Net.Sockets.TcpClient]::new()
+            try {
+                $probe.Connect('127.0.0.1', $supervisorPort)
+                $cozyListening = $true
+                break
+            } catch {
+                Start-Sleep -Milliseconds 100
+            } finally {
+                $probe.Dispose()
+            }
+        }
+        Assert-True $cozyListening 'CozyAgents supervisor fixture must start its managed gateway child'
+        $cozyStopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $cozyWrapper $supervisorPort cozyagents 2>&1 | Out-String)
+        Assert-True ($LASTEXITCODE -eq 0) "owned CozyAgents gateway stop helper failed: $cozyStopOutput"
+        Start-Sleep -Milliseconds 1500
+        $cozyReacquired = $false
+        $cozyReplacement = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $supervisorPort)
+        try {
+            $cozyReplacement.Start()
+            $cozyReacquired = $true
+        } catch {
+            $cozyReacquired = $false
+        } finally {
+            if ($cozyReacquired) { $cozyReplacement.Stop() }
+        }
+        Assert-True $cozyReacquired 'CozyAgents cleanup must match and stop its supervisor without a Hermes argument group'
+        Stop-FixtureProcessTree $cozySupervisor
+        $cozySupervisor = $null
         $foreignListenerSource = Join-Path $supervisorRoot 'foreign-old-port-listener.mjs'
         Write-Utf8NoBom $foreignListenerSource @'
 import net from 'node:net';
@@ -1171,7 +1371,7 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
         $savedErrorActionPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
-            $foreignOldPortOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $nextDashboardPort $generatedWrapper $supervisorPort 2>&1 | Out-String)
+            $foreignOldPortOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $generatedWrapper $supervisorPort hermes 2>&1 | Out-String)
             $foreignOldPortExitCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $savedErrorActionPreference
@@ -1209,16 +1409,24 @@ HERMES_RESOLVED="`$6"
 DASHBOARD_OWNER_PS1="`$7"
 WRAPPER="`$8"
 SUPERVISOR="`$(dirname "`$WRAPPER")/gateway-supervisor.cjs"
+LOCAL_DIR="`$(dirname "`$WRAPPER")"
+GATEWAY_DIR="`$(dirname "`$LOCAL_DIR")"
+MAINTENANCE_WORKER="`$GATEWAY_DIR/bin/gateway-maintenance-worker.cjs"
+MAINTENANCE_SOCKET="`$LOCAL_DIR/gateway-maintenance.sock"
+SERVICE_PLATFORM=Windows
+HARNESS=hermes
 DASHBOARD_PORT="`$9"
 EXPECTED_NODE_RESOLVED="`${10}"
 EXPECTED_BUNDLE_PATH="`${11}"
 NODE_RESOLVED="`$EXPECTED_NODE_RESOLVED"
 BUNDLE_PATH="`$EXPECTED_BUNDLE_PATH"
 WINDOWS_OWNED_IDENTITY=0
+is_windows() { return 0; }
 to_windows_path() { cygpath -w "`$1"; }
 to_posix_path() { cygpath -u "`$1"; }
 gateway_ready() { return 1; }
 die() { printf 'FAIL  %s\n' "`$*" >&2; exit 1; }
+$($supervisorArgumentsMatch.Value)
 $($wrapperIdentityMatch.Value)
 load_windows_wrapper_identity || die "generated wrapper identity could not be read"
 [ "`$WINDOWS_OWNED_NODE_RESOLVED" = "`$EXPECTED_NODE_RESOLVED" ] || die "generated wrapper resolved an unexpected Node path"
@@ -1246,6 +1454,7 @@ stop_owned_windows_gateway 0
         Stop-FixtureProcessTree $supervisor
         Stop-FixtureProcessTree $staleSupervisor
         Stop-FixtureProcessTree $uninstallSupervisor
+        Stop-FixtureProcessTree $cozySupervisor
         Stop-FixtureProcessTree $foreignChild
         Stop-FixtureProcessTree $foreignOldPortListener
         Stop-FixtureProcessTree $dashboard

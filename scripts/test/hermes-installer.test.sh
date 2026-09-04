@@ -45,6 +45,14 @@ make_directory_symlink() {
   esac
 }
 mkdir -p "$tmp/hermes/profiles/ops" "$tmp/hermes/profiles/active" "$tmp/bin"
+# Installer retry loops exercise deterministic synchronous fakes here. Avoid
+# spending real seconds between probes; timing-specific cases prepend their own
+# sleep fixture below.
+cat > "$tmp/bin/sleep" <<'SLEEP'
+#!/usr/bin/env bash
+exit 0
+SLEEP
+chmod 700 "$tmp/bin/sleep"
 printf '{}\n' > "$tmp/hermes/config.yaml"
 printf '{}\n' > "$tmp/hermes/profiles/ops/config.yaml"
 printf '{}\n' > "$tmp/hermes/profiles/active/config.yaml"
@@ -1403,6 +1411,10 @@ if [ "$1" = /Query ] && [ -n "${COZYGATEWAY_TEST_SCHTASKS_XML:-}" ]; then
   printf '<Task><Actions>%s</Actions></Task>\n' "$COZYGATEWAY_TEST_SCHTASKS_XML"
   exit 0
 fi
+if [ "$1" = /Run ]; then
+  [ -z "${COZYGATEWAY_TEST_GATEWAY_MARKER:-}" ] || : > "$COZYGATEWAY_TEST_GATEWAY_MARKER"
+  exit 0
+fi
 if [ "${COZYGATEWAY_TEST_SCHTASKS_FAIL_CREATE:-}" = 1 ] && [ "$1" = /Create ]; then
   printf 'ERROR: Access is denied.\n' >&2
   exit 1
@@ -1418,6 +1430,8 @@ WSCRIPT
 cat > "$tmp/windows-bin/powershell.exe" <<'POWERSHELL'
 #!/usr/bin/env bash
 printf 'powershell %s\n' "$*" >> "${COZYGATEWAY_TEST_WINDOWS_LOG:?}"
+if [[ "$*" == *WindowsIdentity* ]]; then printf 'S-1-5-21-111-222-333-1001\n'; exit 0; fi
+if [[ "$*" == *Get-Date* ]]; then printf '2026-01-01T00:00:00\n'; exit 0; fi
 if [ -n "${COZYGATEWAY_NODE_EXPAND_DESTINATION:-}" ]; then
   destination="$(cygpath -u "$COZYGATEWAY_NODE_EXPAND_DESTINATION")"
   mkdir -p "$destination/${COZYGATEWAY_TEST_NODE_DIRECTORY:?}"
@@ -1509,6 +1523,24 @@ fi
 test -e "$foreign_windows_gateway"
 test -e "$foreign_windows_startup"
 [ ! -f "$tmp/windows-foreign-commands" ] || ! grep -Fq '/Delete /F /TN CozyGateway' "$tmp/windows-foreign-commands"
+
+# Recorded install state does not authorize deleting a foreign current-user
+# registration. Preserve the whole Gateway home until ownership is resolved.
+stateful_foreign_gateway="$tmp/gateway-windows-stateful-foreign"
+mkdir -p "$stateful_foreign_gateway/local"
+cat > "$stateful_foreign_gateway/local/install-state" <<STATEFUL_FOREIGN
+profiles=default
+hermes_root=$tmp/hermes
+hermes_bin=$tmp/bin/hermes
+service_default=unknown
+dashboard_port=9119
+STATEFUL_FOREIGN
+if HOME="$tmp/windows-stateful-foreign-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:/usr/bin:/bin" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-stateful-foreign-commands" COZYGATEWAY_TEST_SCHTASKS_XML='<Exec><Command>foreign.exe</Command><Arguments>foreign</Arguments></Exec>' COZYGATEWAY_NODE=false COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$stateful_foreign_gateway" >/dev/null 2>&1; then
+  echo 'expected stateful foreign Windows task to preserve Gateway state' >&2; exit 1
+fi
+test -f "$stateful_foreign_gateway/local/install-state"
+! grep -Fq '/Delete /F /TN CozyGateway' "$tmp/windows-stateful-foreign-commands"
+rm -f "$foreign_windows_startup"
 
 # Windows cannot unlink SQLite files held by a pre-existing Hermes gateway.
 # After the installer-owned plugin is disabled, uninstall restarts exactly that
@@ -1644,15 +1676,45 @@ test -e "$locked_install_state"
 windows_node_version=v24.99.0
 windows_node_directory="node-$windows_node_version-win-x64"
 windows_node_archive="$windows_node_directory.zip"
+cp -R "$tmp/hermes" "$tmp/hermes-legacy"
+shared_hermes_digest_before="$(find "$tmp/hermes" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)"
 mkdir -p "$tmp/windows-node-dist/$windows_node_version"
 printf 'fixture Windows Node archive\n' > "$tmp/windows-node-dist/$windows_node_version/$windows_node_archive"
 if command -v shasum >/dev/null 2>&1; then windows_node_sha="$(shasum -a 256 "$tmp/windows-node-dist/$windows_node_version/$windows_node_archive" | awk '{print $1}')"; else windows_node_sha="$(sha256sum "$tmp/windows-node-dist/$windows_node_version/$windows_node_archive" | awk '{print $1}')"; fi
 printf '%s  %s\n' "$windows_node_sha" "$windows_node_archive" > "$tmp/windows-node-dist/$windows_node_version/SHASUMS256.txt"
-windows_node_output="$(HOME="$tmp/windows-node-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" PROCESSOR_ARCHITECTURE=AMD64 COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-node-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-node-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-node-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_NODE_FIXTURE="$fake_node" COZYGATEWAY_TEST_NODE_DIRECTORY="$windows_node_directory" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_NODE_VERSION="$windows_node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/windows-node-dist" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-node")"
+mkdir -p "$tmp/gateway-windows-node/bin"
+cp "$tmp/gateway.mjs" "$tmp/gateway-windows-node/bin/cozygateway.mjs"
+cp "$tmp/gateway-supervisor.cjs" "$tmp/gateway-windows-node/bin/gateway-supervisor.cjs"
+windows_node_output="$(HOME="$tmp/windows-node-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" PROCESSOR_ARCHITECTURE=AMD64 COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes-legacy" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-node-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-node-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-node-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_NODE_FIXTURE="$fake_node" COZYGATEWAY_TEST_NODE_DIRECTORY="$windows_node_directory" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_NODE_VERSION="$windows_node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/windows-node-dist" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway-windows-node/bin/cozygateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-node")"
 test -x "$tmp/gateway-windows-node/runtime/node/node.exe"
 grep -Fq 'installed checksum-verified Node.js' <<<"$windows_node_output"
 grep -Fq '[IO.Compression.ZipFile]::ExtractToDirectory' "$tmp/windows-node-commands"
+grep -Fq '/Run /TN CozyGateway' "$tmp/windows-node-commands"
+! grep -Fq 'wscript ' "$tmp/windows-node-commands"
 grep -Fq "using Node.js 24 at $tmp/gateway-windows-node/runtime/node/node.exe" <<<"$(HOME="$tmp/windows-node-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-node-commands" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --status --gateway-dir "$tmp/gateway-windows-node")"
+
+# A pre-identity state file remains removable only through the complete legacy
+# task -> VBS -> exact canonical private-Node wrapper chain.
+grep -v '^\(node_resolved\|bundle_path\)=' "$tmp/gateway-windows-node/local/install-state" |
+  sed -e 's/^profiles=.*/profiles=default/' -e 's/^service_default=.*/service_default=preexisting/' \
+    -e '/^service_\(active\|ops\)=/d' > "$tmp/windows-node-legacy-state"
+mv "$tmp/windows-node-legacy-state" "$tmp/gateway-windows-node/local/install-state"
+legacy_vbs_native="$("$tmp/bin/cygpath" -w "$tmp/gateway-windows-node/local/run-gateway.vbs")"
+legacy_task_action="<Exec><Command>wscript.exe</Command><Arguments>&quot;$legacy_vbs_native&quot;</Arguments></Exec>"
+cp "$tmp/gateway-windows-node/local/run-gateway.sh" "$tmp/windows-node-legacy-wrapper.good"
+sed '3s/$/ --foreign/' "$tmp/windows-node-legacy-wrapper.good" > "$tmp/gateway-windows-node/local/run-gateway.sh"
+legacy_deletes_before="$(grep -Fc '/Delete /F /TN CozyGateway' "$tmp/windows-node-commands" || true)"
+if HOME="$tmp/windows-node-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes-legacy" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-node-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-node-commands" COZYGATEWAY_TEST_SCHTASKS_XML="$legacy_task_action" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-node" >/dev/null 2>&1; then
+  echo 'expected altered legacy wrapper chain to preserve state' >&2; exit 1
+fi
+test -f "$tmp/gateway-windows-node/local/install-state"
+test "$(grep -Fc '/Delete /F /TN CozyGateway' "$tmp/windows-node-commands" || true)" = "$legacy_deletes_before"
+cp "$tmp/windows-node-legacy-wrapper.good" "$tmp/gateway-windows-node/local/run-gateway.sh"
+HOME="$tmp/windows-node-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes-legacy" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-node-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-node-commands" COZYGATEWAY_TEST_SCHTASKS_XML="$legacy_task_action" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-node" >/dev/null
+grep -Fq '/Delete /F /TN CozyGateway' "$tmp/windows-node-commands"
+! grep -Eq '^default:gateway:(stop|uninstall)$' "$tmp/windows-node-hermes-commands"
+test ! -e "$tmp/gateway-windows-node"
+test "$(find "$tmp/hermes" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)" = "$shared_hermes_digest_before"
 
 windows_native_hermes="$("$tmp/bin/cygpath" -w "$tmp/bin/hermes")"
 windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$windows_native_hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"
@@ -1681,7 +1743,8 @@ grep -Fq 'repair bootstrap is unavailable. Reinstall with: irm https://cozylabs.
 grep -Fq 'repair does not accept extra arguments' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
 grep -Fq 'Get-FileHash -LiteralPath $p -Algorithm SHA256' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
 grep -Fq 'set "COZYGATEWAY_HOME=' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
-grep -Fq '"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+trusted_windows_powershell="${SYSTEMROOT:-C:\Windows}\System32\WindowsPowerShell\v1.0\powershell.exe"
+grep -Fq "\"$trusted_windows_powershell\" -NoProfile" "$tmp/gateway-windows-live/bin/cozygateway.cmd"
 if grep -Eq '^powershell\.exe ' "$tmp/gateway-windows-live/bin/cozygateway.cmd"; then
   echo 'Windows repair shim must not resolve PowerShell from the caller working directory or PATH' >&2
   exit 1
@@ -1691,17 +1754,32 @@ if grep -Fq -- '--config' "$tmp/gateway-windows-live/bin/cozygateway.cmd"; then
   exit 1
 fi
 grep -Fq 'shell.Run(command, 0, True)' "$tmp/gateway-windows-live/local/run-gateway.vbs"
-grep -Fq '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>' "$tmp/gateway-windows-live/local/cozygateway-task.xml"
+windows_task_xml="$(iconv -f UTF-16LE -t UTF-8 "$tmp/gateway-windows-live/local/cozygateway-task.xml")"
+grep -Fq '<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>' <<<"$windows_task_xml"
+grep -Fq '<LogonTrigger><Enabled>true</Enabled><UserId>S-1-5-21-111-222-333-1001</UserId></LogonTrigger>' <<<"$windows_task_xml"
+grep -Fq '<TimeTrigger><Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><StartBoundary>2026-01-01T00:00:00</StartBoundary><Enabled>true</Enabled></TimeTrigger>' <<<"$windows_task_xml"
+grep -Fq '<Principal id="Author"><UserId>S-1-5-21-111-222-333-1001</UserId><LogonType>InteractiveToken</LogonType>' <<<"$windows_task_xml"
+grep -Fq '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>' <<<"$windows_task_xml"
+grep -Fq 'Security.Principal.WindowsIdentity' "$tmp/windows-commands"
 grep -Fq 'command = """' "$tmp/gateway-windows-live/local/run-gateway.vbs"
 grep -Eq '^COZYGATEWAY_SPOOL_PATH=[A-Za-z]:\\' "$tmp/hermes/.env"
 file "$tmp/gateway-windows-live/local/run-gateway.vbs" | grep -Fq 'CRLF'
 # An XML collision must contain exactly one matching Exec action. Expected
 # Command/Arguments hidden beside a second action cannot confer ownership.
-task_action="$(sed -n 's:.*<Actions Context="Author">\(.*\)</Actions>.*:\1:p' "$tmp/gateway-windows-live/local/cozygateway-task.xml")"
+task_action="$(sed -n 's:.*<Actions Context="Author">\(.*\)</Actions>.*:\1:p' <<<"$windows_task_xml")"
+cp "$tmp/gateway-windows-live/local/gateway-supervisor.cjs" "$tmp/windows-collision-supervisor-before"
+cp "$tmp/gateway-windows-live/local/run-gateway.sh" "$tmp/windows-collision-wrapper-before"
 if task_collision_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-collision-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_SCHTASKS_XML="$task_action<Exec><Command>foreign.exe</Command><Arguments>--side-effect</Arguments></Exec>" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$windows_native_hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live" 2>&1)"; then
   echo 'expected multi-action Windows task collision to fail closed' >&2; exit 1
 fi
 grep -Fq 'Scheduled Task CozyGateway is foreign' <<<"$task_collision_output"
+cmp -s "$tmp/windows-collision-supervisor-before" "$tmp/gateway-windows-live/local/gateway-supervisor.cjs"
+cmp -s "$tmp/windows-collision-wrapper-before" "$tmp/gateway-windows-live/local/run-gateway.sh"
+if HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-comhandler-collision-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_SCHTASKS_XML="$task_action<ComHandler><ClassId>{00000000-0000-0000-0000-000000000000}</ClassId></ComHandler>" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$windows_native_hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live" >/dev/null 2>&1; then
+  echo 'expected non-Exec Windows task collision to fail closed' >&2; exit 1
+fi
+cmp -s "$tmp/windows-collision-supervisor-before" "$tmp/gateway-windows-live/local/gateway-supervisor.cjs"
+cmp -s "$tmp/windows-collision-wrapper-before" "$tmp/gateway-windows-live/local/run-gateway.sh"
 # A native Windows Hermes child must receive a native HERMES_HOME. Git Bash's
 # /c/... form points native Hermes at the wrong root and makes credential login
 # fail after launch.
@@ -1766,8 +1844,14 @@ command = """C:\\Program Files\\Git\\bin\\bash.exe"" ""C:\\Users\\fixture\\forei
 shell.Run command, 0, False
 FOREIGN_WINDOWS_STARTUP
 cp "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs" "$tmp/foreign-windows-startup.vbs"
-HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-fallback-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
+cp "$tmp/gateway-windows-fallback/local/gateway-supervisor.cjs" "$tmp/windows-startup-collision-supervisor-before"
+cp "$tmp/gateway-windows-fallback/local/run-gateway.sh" "$tmp/windows-startup-collision-wrapper-before"
+if HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-fallback-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null 2>&1; then
+  echo 'expected foreign Startup collision to fail before repair mutation' >&2; exit 1
+fi
 cmp -s "$tmp/foreign-windows-startup.vbs" "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
+cmp -s "$tmp/windows-startup-collision-supervisor-before" "$tmp/gateway-windows-fallback/local/gateway-supervisor.cjs"
+cmp -s "$tmp/windows-startup-collision-wrapper-before" "$tmp/gateway-windows-fallback/local/run-gateway.sh"
 if HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-fallback-gateway-ready" COZYGATEWAY_TEST_SCHTASKS_FAIL_CREATE=1 COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null 2>&1; then
   echo 'expected foreign Startup fallback collision to fail closed' >&2; exit 1
 fi
