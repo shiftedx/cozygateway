@@ -1456,6 +1456,7 @@ config.host = '127.0.0.1';
 config.port = 8999;
 writeFileSync(path, JSON.stringify(config));
 NODE
+sed -i.bak 's|COZYGATEWAY_URL=http://127.0.0.1:8787|COZYGATEWAY_URL=http://127.0.0.1:8999|' "$tmp/hermes/.env" "$tmp/hermes/profiles/ops/.env" "$tmp/hermes/profiles/active/.env" && rm -f "$tmp/hermes/.env.bak" "$tmp/hermes/profiles/ops/.env.bak" "$tmp/hermes/profiles/active/.env.bak"
 preserved_listener_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
 grep -Fq 'CozyGateway listens on 127.0.0.1:8999' <<<"$preserved_listener_output"
 overridden_listener_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bind-host 0.0.0.0 --port 9000 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
@@ -1470,6 +1471,7 @@ config.host = '0.0.0.0';
 config.port = 8787;
 writeFileSync(path, JSON.stringify(config));
 NODE
+sed -i.bak 's|COZYGATEWAY_URL=http://127.0.0.1:8999|COZYGATEWAY_URL=http://127.0.0.1:8787|' "$tmp/hermes/.env" "$tmp/hermes/profiles/ops/.env" "$tmp/hermes/profiles/active/.env" && rm -f "$tmp/hermes/.env.bak" "$tmp/hermes/profiles/ops/.env.bak" "$tmp/hermes/profiles/active/.env.bak"
 
 # A rerun sees all services running, preserves the installer-owned lifecycle
 # records and attach tokens, and never tries to install a second Hermes service.

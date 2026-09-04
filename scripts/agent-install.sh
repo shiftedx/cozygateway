@@ -24,6 +24,7 @@ BIND_HOST="${COZYGATEWAY_BIND_HOST:-127.0.0.1}"
 PORT="${COZYGATEWAY_PORT:-8787}"
 PUBLIC_URL=""
 PREVIOUS_PORT=""
+PREVIOUS_BIND_HOST=""
 DASHBOARD_PORT="${COZYGATEWAY_DASHBOARD_PORT:-9119}"
 DASHBOARD_PORT_EXPLICIT=0
 if [ "${COZYGATEWAY_DASHBOARD_PORT+x}" = x ]; then DASHBOARD_PORT_EXPLICIT=1; fi
@@ -229,6 +230,7 @@ NODE
   saved_host="${saved%%$'\t'*}"; remainder="${saved#*$'\t'}"
   saved_port="${remainder%%$'\t'*}"; saved_public="${remainder#*$'\t'}"
   PREVIOUS_PORT="$saved_port"
+  PREVIOUS_BIND_HOST="$saved_host"
   [ "$BIND_HOST_EXPLICIT" = 1 ] || [ -z "$saved_host" ] || BIND_HOST="$saved_host"
   [ "$PORT_EXPLICIT" = 1 ] || [ -z "$saved_port" ] || PORT="$saved_port"
   if [ "$CLEAR_PUBLIC_URL" = 1 ]; then
@@ -771,6 +773,12 @@ env_write() {
   [[ "$value" =~ ^[A-Za-z0-9_-]+$ ]] || die "installer-owned credentials must use the safe generated alphabet"
   printf '%s=%s\n' "$key" "$value" >> "$file"
 }
+previous_gateway_origin() {
+  local host="$PREVIOUS_BIND_HOST" port="$PREVIOUS_PORT"
+  [ -n "$host" ] && [ -n "$port" ] || return 1
+  case "$host" in 0.0.0.0) host=127.0.0.1 ;; ::) host='[::1]' ;; *:*) host="[$host]" ;; esac
+  printf 'http://%s:%s' "$host" "$port"
+}
 preflight_profile_env_ownership() {
   local profile file owner url key
   for profile in "${SELECTED[@]}"; do
@@ -778,8 +786,10 @@ preflight_profile_env_ownership() {
     owner="$(env_get "$file" "$ENV_OWNER_KEY")"
     url="$(env_get "$file" COZYGATEWAY_URL)"
     if [ "$owner" = "$ENV_OWNER_VALUE" ]; then
-      [ -z "$url" ] || [ "$url" = "$(gateway_origin)" ] || die "$file targets another Gateway; use --runtime-only to preserve it"
-      continue
+      if [ -z "$url" ] || [ "$url" = "$(gateway_origin)" ] || [ "$url" = "$(previous_gateway_origin || true)" ]; then
+        continue
+      fi
+      die "$file targets another Gateway; use --runtime-only to preserve it"
     fi
     for key in COZYGATEWAY_URL COZYGATEWAY_TOKEN COZYGATEWAY_SPOOL_PATH COZYGATEWAY_HOME_CHANNEL; do
       [ -z "$(env_get "$file" "$key")" ] || die "$file has an existing Gateway configuration; use --runtime-only to preserve it"
