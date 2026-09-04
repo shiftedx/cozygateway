@@ -835,7 +835,6 @@ cat > "$runtime_home/Library/LaunchAgents/ai.cozylabs.cozygateway.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict><key>ProgramArguments</key><array><string>/bin/bash</string><string>$runtime_failed/local/run-gateway.sh</string></array></dict></plist>
 PLIST
-sed -i.bak '/^repair_mode=runtime-only$/d' "$runtime_failed/local/install-state" && rm -f "$runtime_failed/local/install-state.bak"
 runtime_failed_state_before="$(file_sha256 "$runtime_failed/local/install-state")"
 runtime_failed_config_before="$(file_sha256 "$runtime_failed/local/cozygateway.config.json")"
 runtime_failed_env_before="$(file_sha256 "$runtime_failed/local/gateway.env")"
@@ -847,6 +846,13 @@ expect_contains "$runtime_failed_output" 'CozyGateway did not become healthy on 
 test "$runtime_failed_state_before" = "$(file_sha256 "$runtime_failed/local/install-state")"
 test "$runtime_failed_config_before" = "$(file_sha256 "$runtime_failed/local/cozygateway.config.json")"
 test "$runtime_failed_env_before" = "$(file_sha256 "$runtime_failed/local/gateway.env")"
+
+# Runtime-only uninstall takes back only the Gateway registration and files. It
+# must leave independently managed remote Hermes bindings and plugin state intact.
+runtime_uninstall_output="$(HOME="$runtime_home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$runtime_failed" 2>&1)"
+expect_contains "$runtime_uninstall_output" 'Hermes profiles, plugins, services, and environment were preserved'
+test ! -e "$runtime_failed"
+test "$runtime_profiles_before" = "$(tree_sha256 "$runtime_profiles")"
 
 # Linux uses the registered service unit, not the launchd-style label, when it
 # restarts a legacy owned wrapper. This catches a repair that would otherwise
