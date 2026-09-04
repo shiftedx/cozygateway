@@ -2862,7 +2862,7 @@ hydrate_runtime_only_harness() {
       safe_secret "$DASHBOARD_SESSION_TOKEN" || die "--runtime-only needs the existing Dashboard credential"
       write_dashboard_port_state
       write_dashboard_owner_helper
-      is_windows && write_dashboard_elevation_helper || true
+      if is_windows; then write_dashboard_elevation_helper; fi
       ;;
     cozyagents) ;;
     *) die "--runtime-only cannot classify the existing harness; reinstall normally" ;;
