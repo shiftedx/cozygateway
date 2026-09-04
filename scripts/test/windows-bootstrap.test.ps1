@@ -1144,6 +1144,9 @@ process.on('SIGINT', stop);
     $hermesPosix = & $toPosix (Join-Path $supervisorRoot 'hermes\bin\hermes-agent.exe')
     $launcherPosix = & $toPosix (Join-Path $supervisorRoot 'hermes\bin\hermes.exe')
     $ownerHelperPosix = & $toPosix (Join-Path $supervisorLocal 'dashboard-owner.ps1')
+    $dashboardPortState = Join-Path $supervisorLocal 'dashboard-port'
+    $dashboardPortStatePosix = & $toPosix $dashboardPortState
+    $dashboardPortStateNative = (& cygpath.exe -w $dashboardPortStatePosix).Trim()
     $dashboardReservation = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
     $dashboardReservation.Start()
     $supervisorDashboardPort = ([Net.IPEndPoint]$dashboardReservation.LocalEndpoint).Port
@@ -1212,6 +1215,7 @@ DASHBOARD_PORT="`$9"
 NODE_RESOLVED="`${10}"
 BUNDLE_PATH="`${11}"
 CONFIG_JSON="`${12}"
+DASHBOARD_PORT_STATE="`${14}"
 SUPERVISOR="`$LOCAL_DIR/gateway-supervisor.cjs"
 MAINTENANCE_WORKER="`$GATEWAY_DIR/bin/gateway-maintenance-worker.cjs"
 MAINTENANCE_SOCKET="`$LOCAL_DIR/gateway-maintenance.sock"
@@ -1224,11 +1228,14 @@ to_windows_path() { cygpath -w "`$1"; }
 $($supervisorArgumentsMatch.Value)
 $($wrapperWriterMatch.Value)
 write_wrapper
+build_supervisor_args
+printf '%s\n' "`${SUPERVISOR_ARGS[@]}"
 "@
     $wrapperGeneratorScript = $wrapperGeneratorScript.Replace('HARNESS=hermes', 'HARNESS="${13}"')
     Write-Utf8NoBom $wrapperGenerator $wrapperGeneratorScript
-    $wrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $generatedWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix hermes 2>&1 | Out-String)
+    $wrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $generatedWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix hermes $dashboardPortStatePosix 2>&1 | Out-String)
     Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $generatedWrapper)) "production writer must generate the supervisor: $wrapperOutput"
+    Assert-True ($wrapperOutput.Contains("--dashboard-port-state`n$dashboardPortStateNative")) "Windows supervisor arguments must pass dashboard port state as a native path: $wrapperOutput"
     $wrapperArgument = '"' + $generatedWrapper + '"'
     $supervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
     $staleSupervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
@@ -1274,6 +1281,7 @@ MAINTENANCE_WORKER="`$GATEWAY_DIR/bin/gateway-maintenance-worker.cjs"
 MAINTENANCE_SOCKET="`$LOCAL_DIR/gateway-maintenance.sock"
 SERVICE_PLATFORM=Windows
 HARNESS="`${13}"
+DASHBOARD_PORT_STATE="`${14}"
 PREVIOUS_PORT="`${12}"
 is_windows() { return 0; }
 to_windows_path() { cygpath -w "`$1"; }
@@ -1290,7 +1298,7 @@ stop_owned_windows_gateway
         $savedErrorActionPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = 'Continue'
-            $stopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $generatedWrapper $supervisorPort hermes 2>&1 | Out-String)
+            $stopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $generatedWrapper $supervisorPort hermes $dashboardPortStatePosix 2>&1 | Out-String)
             $stopExitCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $savedErrorActionPreference
@@ -1312,7 +1320,7 @@ stop_owned_windows_gateway
         Assert-True $reacquired 'a dashboard-port and gateway-port update must stop the persisted owned supervisor so it cannot reclaim the old gateway port'
 
         $cozyWrapper = Join-Path $supervisorLocal 'run-gateway-cozyagents.sh'
-        $cozyWrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $cozyWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix cozyagents 2>&1 | Out-String)
+        $cozyWrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $cozyWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix cozyagents $dashboardPortStatePosix 2>&1 | Out-String)
         Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $cozyWrapper)) "production writer must generate the CozyAgents supervisor wrapper: $cozyWrapperOutput"
         Assert-True (-not ((Get-Content -LiteralPath $cozyWrapper -Raw) -match '--dashboard-env')) 'CozyAgents supervisor wrapper must omit the complete Hermes argument group'
         $cozySupervisor = Start-Process -FilePath $bashPath -ArgumentList ('"' + $cozyWrapper + '"') -PassThru
@@ -1416,6 +1424,7 @@ MAINTENANCE_SOCKET="`$LOCAL_DIR/gateway-maintenance.sock"
 SERVICE_PLATFORM=Windows
 HARNESS=hermes
 DASHBOARD_PORT="`$9"
+DASHBOARD_PORT_STATE="`${12}"
 EXPECTED_NODE_RESOLVED="`${10}"
 EXPECTED_BUNDLE_PATH="`${11}"
 NODE_RESOLVED="`$EXPECTED_NODE_RESOLVED"
@@ -1436,7 +1445,7 @@ $($gatewayPortCheckFunctionMatch.Value)
 stop_owned_windows_gateway 0
 "@
         Write-Utf8NoBom $uninstallStopHarness $uninstallStopScript
-        $uninstallOutput = (& $bashPath $uninstallStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $generatedWrapper $supervisorDashboardPort $nodePosix $bundlePosix 2>&1 | Out-String)
+        $uninstallOutput = (& $bashPath $uninstallStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $generatedWrapper $supervisorDashboardPort $nodePosix $bundlePosix $dashboardPortStatePosix 2>&1 | Out-String)
         Assert-True ($LASTEXITCODE -eq 0) "uninstall-owned gateway stop helper failed: $uninstallOutput"
         Start-Sleep -Milliseconds 1500
         $uninstallReacquired = $false
