@@ -2413,7 +2413,7 @@ WantedBy=default.target
 UNIT
     } > "$staged"
     chmod 600 "$staged"; mv -f "$staged" "$unit"
-    systemctl --user daemon-reload; systemctl --user enable --now "$SERVICE_UNIT"
+    systemctl --user daemon-reload; systemctl --user enable --now "$SERVICE_UNIT"; systemctl --user restart "$SERVICE_UNIT"
   fi
 }
 dashboard_ready() {
@@ -2626,6 +2626,26 @@ uninstall() {
     return
   fi
   # install-state contains only profile names, paths, and lifecycle state; no secrets.
+  if [ "$(sed -n 's/^repair_mode=//p' "$STATE_FILE" | tail -1)" = runtime-only ]; then
+    resolve_platform
+    if [ "$SERVICE_PLATFORM" = Windows ]; then
+      local startup_entry task_xml
+      startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
+      task_xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
+      [ -z "$task_xml" ] || windows_recorded_task_is_owned || die "CozyGateway Scheduled Task ownership could not be verified; preserving independently managed Hermes state"
+      [ ! -f "$startup_entry" ] || windows_startup_entry_is_owned "$startup_entry" || die "CozyGateway Startup entry ownership could not be verified; preserving independently managed Hermes state"
+      [ -z "$task_xml" ] || MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
+      [ ! -f "$startup_entry" ] || rm -f "$startup_entry"
+      [ "$DRY_RUN" = 1 ] || remove_windows_cli_path
+    elif [ "$SERVICE_PLATFORM" = Darwin ]; then
+      remove_owned_posix_service "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" && remove_posix_cli || true
+    else
+      remove_owned_posix_service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT" && remove_posix_cli || true
+    fi
+    run rm -rf "$GATEWAY_DIR"
+    say "OK    removed CozyGateway runtime-only state; Hermes profiles, plugins, services, and environment were preserved"
+    return
+  fi
   if [ "$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)" = cozyagents ]; then uninstall_cozyagents; return; fi
   root="$(sed -n 's/^hermes_root=//p' "$STATE_FILE" | tail -1)"
   hermes_bin="$(sed -n 's/^hermes_bin=//p' "$STATE_FILE" | tail -1)"
@@ -2826,44 +2846,53 @@ install_with_cozyagents() {
   announce_listener
   pairing_and_finish
 }
+runtime_state_value() {
+  sed -n "s/^$1=//p" "$STATE_FILE" | tail -1
+}
+hydrate_runtime_only_harness() {
+  HARNESS="$(runtime_state_value harness)"
+  if [ -z "$HARNESS" ] && [ -n "$(runtime_state_value hermes_root)$(runtime_state_value hermes_bin)" ]; then HARNESS=hermes; fi
+  case "$HARNESS" in
+    hermes)
+      HERMES_ROOT="$(runtime_state_value hermes_root)"
+      HERMES_RESOLVED="$(runtime_state_value hermes_bin)"
+      [ -d "$HERMES_ROOT" ] && [ -x "$HERMES_RESOLVED" ] || die "--runtime-only needs the recorded Hermes runtime; reinstall normally to repair Hermes integration"
+      HERMES_BIN="$HERMES_RESOLVED"
+      DASHBOARD_SESSION_TOKEN="$(env_get "$DASHBOARD_ENV" DASHBOARD_SESSION_TOKEN)"
+      safe_secret "$DASHBOARD_SESSION_TOKEN" || die "--runtime-only needs the existing Dashboard credential"
+      write_dashboard_port_state
+      write_dashboard_owner_helper
+      is_windows && write_dashboard_elevation_helper || true
+      ;;
+    cozyagents) ;;
+    *) die "--runtime-only cannot classify the existing harness; reinstall normally" ;;
+  esac
+}
 write_runtime_only_state() {
   local staged="$STATE_FILE.runtime.$$"
   [ "$DRY_RUN" = 1 ] && return
   [ -f "$STATE_FILE" ] || die "runtime-only repair needs existing installer state"
   umask 077
-  grep -v '^repair_mode=' "$STATE_FILE" > "$staged" || true
+  grep -v -E '^(repair_mode|harness|dashboard_port|node_resolved|bundle_path|supervisor)=' "$STATE_FILE" > "$staged" || true
+  printf 'harness=%s\n' "$HARNESS" >> "$staged"
+  printf 'dashboard_port=%s\n' "$DASHBOARD_PORT" >> "$staged"
+  printf 'node_resolved=%s\n' "$NODE_RESOLVED" >> "$staged"
+  printf 'bundle_path=%s\n' "$BUNDLE_PATH" >> "$staged"
+  printf 'supervisor=%s\n' "$SUPERVISOR" >> "$staged"
   printf 'repair_mode=runtime-only\n' >> "$staged"
   chmod 600 "$staged"
   mv -f "$staged" "$STATE_FILE"
 }
-restart_existing_service() {
-  local plist unit task_xml
-  [ -f "$STATE_FILE" ] && [ -f "$CONFIG_JSON" ] && [ -f "$GATEWAY_ENV" ] || die "restart-existing-service needs an existing CozyGateway installation"
-  resolve_platform
-  if [ "$SERVICE_PLATFORM" = Darwin ]; then
-    plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
-    launchd_service_is_owned "$plist" || die "existing Gateway service is not owned by this installer"
-    run launchctl kickstart -k "gui/$(id -u)/$SERVICE_LABEL"
-  elif [ "$SERVICE_PLATFORM" = Linux ]; then
-    unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"
-    systemd_service_is_owned "$unit" || die "existing Gateway service is not owned by this installer"
-    run systemctl --user restart "$SERVICE_UNIT"
-  else
-    preflight_windows_service_ownership
-    stop_owned_windows_gateway 0 || die "existing Gateway service is not owned by this installer"
-    task_xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
-    [ -z "$task_xml" ] || { MSYS_NO_PATHCONV=1 schtasks.exe /Run /TN "$WINDOWS_TASK" >/dev/null || die "owned Gateway Scheduled Task did not start"; }
-    [ -n "$task_xml" ] || { [ -f "$WINDOWS_VBS" ] && wscript.exe "$(to_windows_path "$WINDOWS_VBS")" || die "owned Gateway launcher is unavailable"; }
-  fi
-  wait_gateway_ready
-}
 runtime_only_repair() {
   [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--runtime-only needs a verified release bundle"
-  restart_existing_service
+  [ -f "$STATE_FILE" ] && [ -f "$CONFIG_JSON" ] && [ -f "$GATEWAY_ENV" ] || die "--runtime-only needs an existing CozyGateway installation"
+  hydrate_runtime_only_harness
+  install_service
+  wait_gateway_ready
   write_runtime_only_state
   write_cli_wrapper
   is_windows || install_posix_cli
-  say "OK    updated CozyGateway runtime without changing Hermes profiles, plugins, services, or tokens"
+  say "OK    updated CozyGateway runtime and supervisor without changing Hermes profiles, plugins, services, or tokens"
 }
 main() {
   local prerequisite_missing=0 profile action

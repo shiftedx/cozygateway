@@ -265,13 +265,15 @@ for asset in cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz cozygateway
 done
 cp "$repo_root/scripts/gateway-supervisor.cjs" "$tmp/gateway-supervisor.cjs"
 release_asset_base="file://$tmp/release-assets"
+bootstrap_user_home="$tmp/bootstrap-user-home"
+mkdir -p "$bootstrap_user_home"
 case "$OSTYPE" in
   msys*|cygwin*)
     release_assets_windows="$(cygpath -w "$tmp/release-assets")"
     release_asset_base="file:///${release_assets_windows//\\//}"
     ;;
 esac
-bootstrap_dry_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-dry-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_INSTALL_DRYRUN=1 bash "$repo_root/scripts/install.sh")"
+bootstrap_dry_output="$(HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-dry-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_INSTALL_DRYRUN=1 bash "$repo_root/scripts/install.sh")"
 grep -Fq 'DRY   verified assets' <<<"$bootstrap_dry_output"
 test ! -e "$tmp/bootstrap-dry-home"
 
@@ -284,7 +286,7 @@ BOOTSTRAP_HANDOFF
 chmod 700 "$tmp/release-assets/cozygateway-installer.sh"
 if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/cozygateway-installer.sh" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/cozygateway-installer.sh" | awk '{print $1}')"; fi
 printf '%s  cozygateway-installer.sh\n' "$asset_sha" > "$tmp/release-assets/cozygateway-installer.sh.sha256"
-COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff" bash "$repo_root/scripts/install.sh"
+HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff" bash "$repo_root/scripts/install.sh"
 test -x "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh"
 test -f "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh.sha256"
 test "$(cat "$tmp/bootstrap-live-home/local/bootstrap-source")" = "$release_asset_base"
@@ -295,7 +297,7 @@ case "$(uname -s)" in
   *)
     mkdir -p "$tmp/bootstrap-unsafe-home" "$tmp/bootstrap-unsafe-target"
     ln -s "$tmp/bootstrap-unsafe-target" "$tmp/bootstrap-unsafe-home/bin"
-    if unsafe_bootstrap_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-unsafe-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" bash "$repo_root/scripts/install.sh" 2>&1)"; then
+    if unsafe_bootstrap_output="$(HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-unsafe-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" bash "$repo_root/scripts/install.sh" 2>&1)"; then
       echo 'symlinked bootstrap bin must be rejected' >&2
       exit 1
     fi
@@ -317,7 +319,7 @@ else
   before_bootstrap_sha="$(sha256sum "$tmp/bootstrap-live-home/bin/cozygateway-bootstrap.sh" | awk '{print $1}')"
 fi
 printf 'tampered bootstrap\n' > "$tmp/release-assets/install.sh"
-if late_bootstrap_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-late" bash "$repo_root/scripts/install.sh" 2>&1)"; then
+if late_bootstrap_output="$(HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-late" bash "$repo_root/scripts/install.sh" 2>&1)"; then
   echo 'late bootstrap checksum failure must fail before promotion' >&2
   exit 1
 fi
@@ -349,14 +351,14 @@ printf 'new verified bundle after interrupted bootstrap\n' > "$tmp/release-asset
 if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/cozygateway.mjs" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/cozygateway.mjs" | awk '{print $1}')"; fi
 printf '%s  cozygateway.mjs\n' "$asset_sha" > "$tmp/release-assets/cozygateway.mjs.sha256"
 set +e
-COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-killed" COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION=cozygateway.mjs bash "$repo_root/scripts/install.sh" >"$tmp/bootstrap-killed.log" 2>&1
+HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-killed" COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION=cozygateway.mjs bash "$repo_root/scripts/install.sh" >"$tmp/bootstrap-killed.log" 2>&1
 bootstrap_killed_status=$?
 set -e
 test "$bootstrap_killed_status" -ne 0
 test -f "$tmp/bootstrap-live-home/.bootstrap-transaction"
 cmp -s "$tmp/bootstrap-before-kill.mjs" "$tmp/bootstrap-live-home/.bootstrap-previous/cozygateway.mjs"
 set +e
-bootstrap_recovered_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-recovered" bash "$repo_root/scripts/install.sh" 2>&1)"
+bootstrap_recovered_output="$(HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-recovered" bash "$repo_root/scripts/install.sh" 2>&1)"
 bootstrap_recovered_status=$?
 set -e
 if [ "$bootstrap_recovered_status" -ne 0 ]; then printf '%s\n' "$bootstrap_recovered_output" >&2; exit 1; fi
@@ -375,12 +377,12 @@ BOOTSTRAP_FAILURE
 chmod 700 "$tmp/release-assets/cozygateway-installer.sh"
 if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/cozygateway-installer.sh" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/cozygateway-installer.sh" | awk '{print $1}')"; fi
 printf '%s  cozygateway-installer.sh\n' "$asset_sha" > "$tmp/release-assets/cozygateway-installer.sh.sha256"
-if child_failure_output="$(COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-rolled-back" bash "$repo_root/scripts/install.sh" 2>&1)"; then
+if child_failure_output="$(HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-rolled-back" bash "$repo_root/scripts/install.sh" 2>&1)"; then
   echo 'failed child installer must roll back the release assets' >&2
   exit 1
 fi
 expect_contains "$child_failure_output" 'installer failed; restored the previous CozyGateway release'
-expect_contains "$child_failure_output" 'restarted the previous CozyGateway service after the failed update'
+expect_contains "$child_failure_output" 'restored previous CozyGateway assets; no prior service was registered'
 cmp -s "$tmp/bootstrap-before-child-failure.mjs" "$tmp/bootstrap-live-home/bin/cozygateway.mjs"
 test ! -e "$tmp/bootstrap-handoff-rolled-back"
 test ! -e "$tmp/bootstrap-live-home/.bootstrap-transaction"
@@ -466,7 +468,7 @@ if [ "${1:-}" = bootstrap ] && [ -n "${COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER:-
   : > "$COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER"
   exit 5
 fi
-if [ "${1:-}" = kickstart ] && [ -n "${COZYGATEWAY_TEST_LAUNCHCTL_KICKSTART_LOG:-}" ]; then
+if { [ "${1:-}" = kickstart ] || [ "${1:-}" = bootstrap ]; } && [ -n "${COZYGATEWAY_TEST_LAUNCHCTL_KICKSTART_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$COZYGATEWAY_TEST_LAUNCHCTL_KICKSTART_LOG"
 fi
 exit 0
@@ -765,6 +767,7 @@ cat > "$runtime_gateway/local/run-gateway.sh" <<'LEGACY_WRAPPER'
 exec "$@"
 LEGACY_WRAPPER
 chmod 700 "$runtime_gateway/local/run-gateway.sh"
+sed -i.bak -E '/^(harness|node_resolved|supervisor)=/d' "$runtime_gateway/local/install-state" && rm -f "$runtime_gateway/local/install-state.bak"
 cat > "$runtime_home/Library/LaunchAgents/ai.cozylabs.cozygateway.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict><key>ProgramArguments</key><array><string>/bin/bash</string><string>$runtime_gateway/local/run-gateway.sh</string></array></dict></plist>
@@ -788,12 +791,19 @@ runtime_gateway_before="$(tree_sha256 "$runtime_gateway/local")"
 runtime_config_before="$(file_sha256 "$runtime_gateway/local/cozygateway.config.json")"
 runtime_env_before="$(file_sha256 "$runtime_gateway/local/gateway.env")"
 runtime_profiles_before="$(tree_sha256 "$runtime_profiles")"
-runtime_output="$(env -u COZYGATEWAY_NODE HOME="$runtime_home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_CURL_LOG="$tmp/runtime-only-curl.log" COZYGATEWAY_TEST_LAUNCHCTL_KICKSTART_LOG="$tmp/runtime-only-kickstart.log" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --runtime-only --bundle "$tmp/gateway.mjs" --gateway-dir "$runtime_gateway" 2>&1)"
-grep -Fq 'updated CozyGateway runtime without changing Hermes profiles' <<<"$runtime_output"
+if ! runtime_output="$(env -u COZYGATEWAY_NODE HOME="$runtime_home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_CURL_LOG="$tmp/runtime-only-curl.log" COZYGATEWAY_TEST_LAUNCHCTL_KICKSTART_LOG="$tmp/runtime-only-kickstart.log" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --runtime-only --bundle "$tmp/gateway.mjs" --gateway-dir "$runtime_gateway" 2>&1)"; then
+  printf 'runtime-only repair failed:\n%s\n' "$runtime_output" >&2
+  exit 1
+fi
+grep -Fq 'updated CozyGateway runtime and supervisor without changing Hermes profiles' <<<"$runtime_output"
 grep -Fq 'http://127.0.0.1:9000/health' "$tmp/runtime-only-curl.log"
-grep -Fq "kickstart -k gui/$(id -u)/ai.cozylabs.cozygateway" "$tmp/runtime-only-kickstart.log"
+grep -Fq "bootstrap gui/$(id -u)" "$tmp/runtime-only-kickstart.log"
+grep -Fqx 'harness=hermes' "$runtime_gateway/local/install-state"
 grep -Fqx 'repair_mode=runtime-only' "$runtime_gateway/local/install-state"
 grep -Fq "$runtime_gateway/runtime/node/bin/node" "$runtime_gateway/bin/cozygateway"
+grep -Fqx 'set -euo pipefail' <(sed -n '2p' "$runtime_gateway/local/run-gateway.sh")
+grep -Fq "$runtime_gateway/local/gateway-supervisor.cjs" "$runtime_gateway/local/run-gateway.sh"
+cmp -s "$tmp/gateway-supervisor.cjs" "$runtime_gateway/local/gateway-supervisor.cjs"
 test "$runtime_gateway_before" != "$(tree_sha256 "$runtime_gateway/local")"
 test "$runtime_config_before" = "$(file_sha256 "$runtime_gateway/local/cozygateway.config.json")"
 test "$runtime_env_before" = "$(file_sha256 "$runtime_gateway/local/gateway.env")"
@@ -815,7 +825,16 @@ grep -Fqx -- '--runtime-only' "$tmp/runtime-only-repair.log"
 runtime_failed="$tmp/gateway-runtime-only-failed"
 cp -R "$runtime_gateway" "$runtime_failed"
 sed -i.bak 's/"port": 9000/"port": 8999/' "$runtime_failed/local/cozygateway.config.json" && rm -f "$runtime_failed/local/cozygateway.config.json.bak"
-sed -i.bak "s|$runtime_gateway|$runtime_failed|g" "$runtime_home/Library/LaunchAgents/ai.cozylabs.cozygateway.plist" && rm -f "$runtime_home/Library/LaunchAgents/ai.cozylabs.cozygateway.plist.bak"
+cat > "$runtime_failed/local/run-gateway.sh" <<'FAILED_LEGACY_WRAPPER'
+#!/usr/bin/env bash
+# Legacy wrapper retained when readiness fails.
+exit 0
+FAILED_LEGACY_WRAPPER
+chmod 700 "$runtime_failed/local/run-gateway.sh"
+cat > "$runtime_home/Library/LaunchAgents/ai.cozylabs.cozygateway.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>ProgramArguments</key><array><string>/bin/bash</string><string>$runtime_failed/local/run-gateway.sh</string></array></dict></plist>
+PLIST
 sed -i.bak '/^repair_mode=runtime-only$/d' "$runtime_failed/local/install-state" && rm -f "$runtime_failed/local/install-state.bak"
 runtime_failed_state_before="$(file_sha256 "$runtime_failed/local/install-state")"
 runtime_failed_config_before="$(file_sha256 "$runtime_failed/local/cozygateway.config.json")"
@@ -2062,6 +2081,10 @@ rm -f "$tmp/windows-gateway-ready"
 windows_stop_count="$(grep -c '^powershell ' "$tmp/windows-commands")"
 HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --port 9000 --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live" >/dev/null
 test "$(grep -c '^powershell ' "$tmp/windows-commands")" -gt "$windows_stop_count"
+# The following fresh fallback installation uses the fixture's default 8787
+# listener. Restore the shared Hermes profile bindings after the explicit-port
+# migration above so it is not mistaken for a different Gateway instance.
+sed -i.bak 's|COZYGATEWAY_URL=http://127.0.0.1:9000|COZYGATEWAY_URL=http://127.0.0.1:8787|' "$tmp/hermes/.env" "$tmp/hermes/profiles/ops/.env" "$tmp/hermes/profiles/active/.env" && rm -f "$tmp/hermes/.env.bak" "$tmp/hermes/profiles/ops/.env.bak" "$tmp/hermes/profiles/active/.env.bak"
 
 HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-fallback-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-fallback-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-fallback-gateway-ready" COZYGATEWAY_TEST_SCHTASKS_FAIL_CREATE=1 COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-fallback" >/dev/null
 test -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
@@ -2208,7 +2231,7 @@ preflight_hermes="$tmp/hermes-preflight"
 preflight_gateway="$tmp/gateway-preflight"
 cp -R "$tmp/hermes" "$preflight_hermes"
 mkdir -p "$preflight_gateway/local"
-printf 'pre-existing-state\n' > "$preflight_gateway/local/install-state"
+printf 'profiles=default\nprofile_scope=default\npre-existing-state=preserved\n' > "$preflight_gateway/local/install-state"
 printf 'pre-existing-gateway-env\n' > "$preflight_gateway/local/gateway.env"
 cat > "$preflight_hermes/.env" <<'FOREIGN_PROFILE_ENV'
 COZYGATEWAY_INSTALLER_OWNER=cozylabs-v1
