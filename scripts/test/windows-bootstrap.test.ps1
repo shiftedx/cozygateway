@@ -1235,7 +1235,7 @@ printf '%s\n' "`${SUPERVISOR_ARGS[@]}"
     Write-Utf8NoBom $wrapperGenerator $wrapperGeneratorScript
     $wrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $generatedWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix hermes $dashboardPortStatePosix 2>&1 | Out-String)
     Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $generatedWrapper)) "production writer must generate the supervisor: $wrapperOutput"
-    Assert-True ($wrapperOutput.Contains("--dashboard-port-state`n$dashboardPortStateNative")) "Windows supervisor arguments must pass dashboard port state as a native path: $wrapperOutput"
+    Assert-True ($wrapperOutput.Replace("`r`n", "`n").Contains("--dashboard-port-state`n$dashboardPortStateNative")) "Windows supervisor arguments must pass dashboard port state as a native path: $wrapperOutput"
     $wrapperArgument = '"' + $generatedWrapper + '"'
     $supervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
     $staleSupervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
