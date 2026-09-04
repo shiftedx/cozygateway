@@ -2634,13 +2634,32 @@ uninstall() {
       task_xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
       [ -z "$task_xml" ] || windows_recorded_task_is_owned || die "CozyGateway Scheduled Task ownership could not be verified; preserving independently managed Hermes state"
       [ ! -f "$startup_entry" ] || windows_startup_entry_is_owned "$startup_entry" || die "CozyGateway Startup entry ownership could not be verified; preserving independently managed Hermes state"
-      [ -z "$task_xml" ] || MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
-      [ ! -f "$startup_entry" ] || rm -f "$startup_entry"
-      [ "$DRY_RUN" = 1 ] || remove_windows_cli_path
+      if [ "$DRY_RUN" = 1 ]; then
+        say "DRY   stop the owned CozyGateway process, delete Scheduled Task $WINDOWS_TASK and Startup entry $startup_entry"
+      else
+        if stop_owned_windows_gateway 0; then :; else say "INFO  no owned CozyGateway process was running"; fi
+        [ -z "$task_xml" ] || MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || die "could not remove owned CozyGateway Scheduled Task"
+        [ ! -f "$startup_entry" ] || rm -f "$startup_entry" || die "could not remove owned CozyGateway Startup entry"
+        remove_windows_cli_path
+      fi
     elif [ "$SERVICE_PLATFORM" = Darwin ]; then
-      remove_owned_posix_service "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" && remove_posix_cli || true
+      local plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
+      posix_service_is_owned_or_absent "$plist" || die "CozyGateway launchd ownership could not be verified; preserving independently managed Hermes state"
+      if [ "$DRY_RUN" = 1 ]; then
+        say "DRY   stop and remove owned launchd service $SERVICE_LABEL and the cozygateway command"
+      else
+        remove_owned_posix_service "$plist" || die "could not remove owned CozyGateway launchd service"
+        remove_posix_cli || die "could not remove the CozyGateway command"
+      fi
     else
-      remove_owned_posix_service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT" && remove_posix_cli || true
+      local unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"
+      posix_service_is_owned_or_absent "$unit" || die "CozyGateway systemd ownership could not be verified; preserving independently managed Hermes state"
+      if [ "$DRY_RUN" = 1 ]; then
+        say "DRY   stop and remove owned systemd service $SERVICE_UNIT and the cozygateway command"
+      else
+        remove_owned_posix_service "$unit" || die "could not remove owned CozyGateway systemd service"
+        remove_posix_cli || die "could not remove the CozyGateway command"
+      fi
     fi
     run rm -rf "$GATEWAY_DIR"
     say "OK    removed CozyGateway runtime-only state; Hermes profiles, plugins, services, and environment were preserved"

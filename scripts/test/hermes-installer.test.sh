@@ -468,6 +468,9 @@ if [ "${1:-}" = bootstrap ] && [ -n "${COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER:-
   : > "$COZYGATEWAY_TEST_LAUNCHCTL_RETRY_MARKER"
   exit 5
 fi
+if [ -n "${COZYGATEWAY_TEST_LAUNCHCTL_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$COZYGATEWAY_TEST_LAUNCHCTL_LOG"
+fi
 if { [ "${1:-}" = kickstart ] || [ "${1:-}" = bootstrap ]; } && [ -n "${COZYGATEWAY_TEST_LAUNCHCTL_KICKSTART_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$COZYGATEWAY_TEST_LAUNCHCTL_KICKSTART_LOG"
 fi
@@ -807,6 +810,15 @@ cmp -s "$tmp/gateway-supervisor.cjs" "$runtime_gateway/local/gateway-supervisor.
 test "$runtime_gateway_before" != "$(tree_sha256 "$runtime_gateway/local")"
 test "$runtime_config_before" = "$(file_sha256 "$runtime_gateway/local/cozygateway.config.json")"
 test "$runtime_env_before" = "$(file_sha256 "$runtime_gateway/local/gateway.env")"
+test "$runtime_profiles_before" = "$(tree_sha256 "$runtime_profiles")"
+# Dry-run removal validates the owned registration but must not boot it out,
+# remove the CLI, or remove the Gateway home.
+runtime_dry_before="$(tree_sha256 "$runtime_gateway")"
+rm -f "$tmp/runtime-only-dry-launchctl.log"
+runtime_dry_output="$(HOME="$runtime_home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_LAUNCHCTL_LOG="$tmp/runtime-only-dry-launchctl.log" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --uninstall --gateway-dir "$runtime_gateway" 2>&1)"
+expect_contains "$runtime_dry_output" 'DRY   stop and remove owned launchd service'
+test "$runtime_dry_before" = "$(tree_sha256 "$runtime_gateway")"
+test ! -s "$tmp/runtime-only-dry-launchctl.log"
 test "$runtime_profiles_before" = "$(tree_sha256 "$runtime_profiles")"
 # The generated CLI keeps that narrow mode on every later repair.
 cat > "$runtime_gateway/bin/cozygateway-bootstrap.sh" <<'RUNTIME_REPAIR_BOOTSTRAP'
