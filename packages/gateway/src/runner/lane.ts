@@ -338,6 +338,7 @@ export class RunnerLane {
           JSON.stringify({
             kind: "hello_ack",
             version: RUNNER_V1_VERSION,
+            capabilities: [],
             heartbeatIntervalMs: this.#heartbeatIntervalMs,
           } satisfies RunnerServerFrame),
         );
