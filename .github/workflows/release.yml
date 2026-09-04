@@ -26,7 +26,7 @@ jobs:
           test "$version" = "$(sed -n 's/^version: //p' integrations/attach-plugin/plugin.yaml)"
       - run: pnpm bundle
       - name: attest release artifacts
-        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
           subject-path: dist-bundle/*
       - name: smoke the bundle
