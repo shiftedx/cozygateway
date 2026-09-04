@@ -41,6 +41,7 @@ WINDOWS_OWNED_CONFIG_JSON=""
 DRY_RUN=0
 UNINSTALL=0
 STATUS=0
+RUNTIME_ONLY=0
 # Which harness runs the bots. Empty until choose_harness scans the machine or --harness answers
 # for it. COZYAGENTS_CHOSEN stays 0 unless a person or a recorded install actually said CozyAgents,
 # because that is the only answer allowed to take a Hermes bridge out of an existing config.
@@ -100,6 +101,7 @@ usage: agent-install.sh --bundle PATH --plugin-archive PATH [options]
   --dry-run               show discovered work without changing anything
   --service-platform OS   override service platform (Darwin, Linux, Windows)
   --status                report persistence and live gateway health
+  --runtime-only          update only CozyGateway-owned runtime, service, and CLI
   --uninstall             remove only CozyGateway-owned service, plugins, env keys and state
 
 The gateway and attach plugin both stay on this machine. This installer never
@@ -126,6 +128,7 @@ while [ "$#" -gt 0 ]; do
     --dry-run) DRY_RUN=1 ;;
     --service-platform) need_value "$@"; SERVICE_PLATFORM="$2"; shift ;;
     --status) STATUS=1 ;;
+    --runtime-only) RUNTIME_ONLY=1 ;;
     --uninstall) UNINSTALL=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown flag: $1" ;;
@@ -768,12 +771,27 @@ env_write() {
   [[ "$value" =~ ^[A-Za-z0-9_-]+$ ]] || die "installer-owned credentials must use the safe generated alphabet"
   printf '%s=%s\n' "$key" "$value" >> "$file"
 }
+preflight_profile_env_ownership() {
+  local profile file owner url key
+  for profile in "${SELECTED[@]}"; do
+    file="$(profile_home "$profile")/.env"
+    owner="$(env_get "$file" "$ENV_OWNER_KEY")"
+    url="$(env_get "$file" COZYGATEWAY_URL)"
+    if [ "$owner" = "$ENV_OWNER_VALUE" ]; then
+      [ -z "$url" ] || [ "$url" = "$(gateway_origin)" ] || die "$file targets another Gateway; use --runtime-only to preserve it"
+      continue
+    fi
+    for key in COZYGATEWAY_URL COZYGATEWAY_TOKEN COZYGATEWAY_SPOOL_PATH COZYGATEWAY_HOME_CHANNEL; do
+      [ -z "$(env_get "$file" "$key")" ] || die "$file has an existing Gateway configuration; use --runtime-only to preserve it"
+    done
+  done
+}
 claim_profile_env() {
   local file="$1" owner
   owner="$(env_get "$file" "$ENV_OWNER_KEY")"
   [ "$owner" = "$ENV_OWNER_VALUE" ] && return
   if [ -f "$file" ] && grep -Eq '^(COZYGATEWAY_URL|COZYGATEWAY_TOKEN|COZYGATEWAY_SPOOL_PATH|COZYGATEWAY_HOME_CHANNEL)=' "$file"; then
-    die "$file already has CozyGateway keys not owned by this installer; remove or rename them before installing"
+    die "$file already has CozyGateway keys not owned by this installer; use --runtime-only to preserve it"
   fi
   env_put "$file" "$ENV_OWNER_KEY" "$ENV_OWNER_VALUE"
 }
@@ -1114,6 +1132,11 @@ if [ "\${1:-}" = repair ] || [ "\${1:-}" = update ]; then
   if [ -f "\$source_file" ]; then
     asset_base="\$(cat "\$source_file")"
     case "\$asset_base" in file:///*) ;; *) printf 'FAIL  recorded repair source is invalid. Reinstall with: %s\n' "\$reinstall" >&2; exit 1 ;; esac
+  fi
+  repair_mode="\$(sed -n 's/^repair_mode=//p' "\$state" | tail -1)"
+  if [ "\$repair_mode" = runtime-only ]; then
+    printf 'INFO  repair refreshes only the recorded CozyGateway runtime\n'
+    exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") COZYGATEWAY_INSTALL_ASSET_BASE="\$asset_base" bash "\$bootstrap" --runtime-only
   fi
   harness="\$(sed -n 's/^harness=//p' "\$state" | tail -1)"
   if [ "\$harness" = cozyagents ]; then
@@ -2790,10 +2813,50 @@ install_with_cozyagents() {
   announce_listener
   pairing_and_finish
 }
+write_runtime_only_state() {
+  local staged="$STATE_FILE.runtime.$$"
+  [ "$DRY_RUN" = 1 ] && return
+  [ -f "$STATE_FILE" ] || die "runtime-only repair needs existing installer state"
+  umask 077
+  grep -v '^repair_mode=' "$STATE_FILE" > "$staged" || true
+  printf 'repair_mode=runtime-only\n' >> "$staged"
+  chmod 600 "$staged"
+  mv -f "$staged" "$STATE_FILE"
+}
+restart_existing_service() {
+  local plist unit task_xml
+  [ -f "$STATE_FILE" ] && [ -f "$CONFIG_JSON" ] && [ -f "$GATEWAY_ENV" ] || die "restart-existing-service needs an existing CozyGateway installation"
+  resolve_platform
+  if [ "$SERVICE_PLATFORM" = Darwin ]; then
+    plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
+    launchd_service_is_owned "$plist" || die "existing Gateway service is not owned by this installer"
+    run launchctl kickstart -k "gui/$(id -u)/$SERVICE_LABEL"
+  elif [ "$SERVICE_PLATFORM" = Linux ]; then
+    unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"
+    systemd_service_is_owned "$unit" || die "existing Gateway service is not owned by this installer"
+    run systemctl --user restart "$SERVICE_LABEL.service"
+  else
+    preflight_windows_service_ownership
+    stop_owned_windows_gateway 0 || die "existing Gateway service is not owned by this installer"
+    task_xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN \"$WINDOWS_TASK\" /XML 2>/dev/null || true)"
+    [ -z "$task_xml" ] || { MSYS_NO_PATHCONV=1 schtasks.exe /Run /TN "$WINDOWS_TASK" >/dev/null || die "owned Gateway Scheduled Task did not start"; }
+    [ -n "$task_xml" ] || { [ -f "$WINDOWS_VBS" ] && wscript.exe "$(to_windows_path "$WINDOWS_VBS")" || die "owned Gateway launcher is unavailable"; }
+  fi
+  wait_gateway_ready
+}
+runtime_only_repair() {
+  [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--runtime-only needs a verified release bundle"
+  restart_existing_service
+  write_runtime_only_state
+  write_cli_wrapper
+  is_windows || install_posix_cli
+  say "OK    updated CozyGateway runtime without changing Hermes profiles, plugins, services, or tokens"
+}
 main() {
   local prerequisite_missing=0 profile action
   if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
   preflight_service_manager
+  [ "$RUNTIME_ONLY" = 0 ] || { runtime_only_repair; return; }
   if NODE_RESOLVED="$(resolve_node)"; then say "OK    using Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
   elif [ "$DRY_RUN" = 1 ]; then say "DRY   install the current Node.js 24 release under $GATEWAY_DIR/runtime/node from checksum-verified nodejs.org assets"; prerequisite_missing=1
   else install_node_runtime
@@ -2832,6 +2895,7 @@ main() {
   HERMES_BIN="$HERMES_RESOLVED"; HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"; hydrate_profile_scope; discover_profiles
   say "Using Hermes root: $HERMES_ROOT"; say "Profiles: ${SELECTED[*]}"; [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"
   is_windows && preflight_windows_service_ownership
+  preflight_profile_env_ownership
   for profile in "${SELECTED[@]}"; do action="$(prior_service_action "$profile")"; record_service_action "$profile" "${action:-unknown}"; done
   write_state; write_gateway_env
   # Stage every profile before enabling any of them. Hermes can materialize inherited global
