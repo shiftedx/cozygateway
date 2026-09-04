@@ -108,6 +108,7 @@ chmod 700 "$tmp/agents.sh"
 
 cozy_env=(
   COZYGATEWAY_NODE="$real_node"
+  COZYGATEWAY_SUPERVISOR_SOURCE="$repo_root/scripts/gateway-supervisor.cjs"
   COZYGATEWAY_SERVICE_PLATFORM=Darwin
   COZYAGENTS_INSTALL_URL="$tmp/agents.sh"
 )

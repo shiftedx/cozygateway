@@ -1706,17 +1706,50 @@ windows_startup_dir() {
   to_posix_path "$native\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
 }
 windows_startup_entry_uses_current_wrapper() {
-  local entry="$1" bash_posix bash_native wrapper_native command expected actual
+  local entry="$1" wrapper_native prefix separator suffix command rest bash_path wrapper_path
   [ -f "$entry" ] || return 1
-  bash_posix="${COZYGATEWAY_GIT_BASH:-$(command -v bash)}"
-  bash_posix="$(to_posix_path "$bash_posix")"
-  [ -f "$bash_posix" ] || return 1
-  bash_native="$(to_windows_path "$bash_posix")"
   wrapper_native="$(to_windows_path "$WRAPPER")"
-  command="$(vbs_quote "\"$bash_native\" \"$wrapper_native\"")"
-  expected="$(printf 'Set shell = CreateObject("WScript.Shell")\ncommand = %s\nFor attempt = 0 To 3\n  code = shell.Run(command, 0, True)\n  If code = 0 Then Exit For\n  If attempt < 3 Then WScript.Sleep 60000\nNext' "$command")"
+  [ "$(tr -d '\r' < "$entry" | awk 'END { print NR }')" = 7 ] || return 1
+  [ "$(sed -n '1p' "$entry" | tr -d '\r')" = 'Set shell = CreateObject("WScript.Shell")' ] || return 1
+  [ "$(sed -n '3,7p' "$entry" | tr -d '\r')" = $'For attempt = 0 To 3\n  code = shell.Run(command, 0, True)\n  If code = 0 Then Exit For\n  If attempt < 3 Then WScript.Sleep 60000\nNext' ] || return 1
+  command="$(sed -n '2p' "$entry" | tr -d '\r')"
+  prefix='command = """'; separator='"" ""'; suffix='"""'
+  rest="${command#"$prefix"}"; [ "$rest" != "$command" ] || return 1
+  bash_path="${rest%%"$separator"*}"; rest="${rest#*"$separator"}"
+  [ "$rest" != "$bash_path" ] || return 1
+  wrapper_path="${rest%"$suffix"}"; [ "$wrapper_path" != "$rest" ] || return 1
+  [ "$rest" = "$wrapper_path$suffix" ] && [ -n "$bash_path" ] && [ "$wrapper_path" = "$wrapper_native" ]
+}
+windows_startup_entry_uses_legacy_wrapper() {
+  local entry="$1" wrapper_native prefix separator suffix command rest bash_path wrapper_path line_count
+  [ -f "$entry" ] || return 1
+  wrapper_native="$(to_windows_path "$WRAPPER")"
+  case "$wrapper_native" in *'"'*|*$'\r'*|*$'\n'*) return 1 ;; esac
+  line_count="$(tr -d '\r' < "$entry" | awk 'END { print NR }')"
+  [ "$line_count" = 3 ] || return 1
+  [ "$(sed -n '1p' "$entry" | tr -d '\r')" = 'Set shell = CreateObject("WScript.Shell")' ] || return 1
+  [ "$(sed -n '3p' "$entry" | tr -d '\r')" = 'shell.Run command, 0, False' ] || return 1
+  command="$(sed -n '2p' "$entry" | tr -d '\r')"
+  prefix='command = """'; separator='"" ""'; suffix='"""'
+  rest="${command#"$prefix"}"; [ "$rest" != "$command" ] || return 1
+  bash_path="${rest%%"$separator"*}"; rest="${rest#*"$separator"}"
+  [ "$rest" != "$bash_path" ] || return 1
+  wrapper_path="${rest%"$suffix"}"; [ "$wrapper_path" != "$rest" ] || return 1
+  [ "$rest" = "$wrapper_path$suffix" ] && [ -n "$bash_path" ] && [ "$wrapper_path" = "$wrapper_native" ]
+}
+windows_startup_entry_uses_legacy_direct_wrapper() {
+  local entry="$1" wrapper_native expected actual
+  [ -f "$entry" ] || return 1
+  wrapper_native="$(to_windows_path "$WRAPPER")"
+  case "$wrapper_native" in *'"'*|*$'\r'*|*$'\n'*) return 1 ;; esac
+  expected="$(printf 'Set shell = CreateObject("WScript.Shell")\ncommand = "%s"\nFor attempt = 0 To 3\n  code = shell.Run(command, 0, True)\n  If code = 0 Then Exit For\n  If attempt < 3 Then WScript.Sleep 60000\nNext' "$wrapper_native")"
   actual="$(tr -d '\r' < "$entry")"
   [ "$actual" = "$expected" ]
+}
+windows_startup_entry_is_owned() {
+  windows_startup_entry_uses_current_wrapper "$1" ||
+    windows_startup_entry_uses_legacy_wrapper "$1" ||
+    windows_startup_entry_uses_legacy_direct_wrapper "$1"
 }
 write_windows_launcher() {
   local bash_posix bash_native wrapper_native command
@@ -1880,20 +1913,41 @@ windows_gateway_ports_are_free() {
   done
 }
 windows_task_uses_current_supervisor() {
-  local xml recorded_command recorded_arguments vbs_native
+  local xml recorded_command recorded_arguments actual_command actual_arguments exec_count vbs_native
   xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
   [ -z "$xml" ] && return 1
+  exec_count="$(grep -o '<Exec>' <<<"$xml" | wc -l | tr -d ' ')"
+  [ "$exec_count" = 1 ] || return 1
+  actual_command="$(sed -n 's:.*<Command>\([^<]*\)</Command>.*:\1:p' <<<"$xml")"
+  actual_arguments="$(sed -n 's:.*<Arguments>\([^<]*\)</Arguments>.*:\1:p' <<<"$xml")"
   if [ -f "$WINDOWS_TASK_XML" ]; then
-    recorded_command="$(sed -n 's:.*\(<Command>[^<]*</Command>\).*:\1:p' "$WINDOWS_TASK_XML")"
-    recorded_arguments="$(sed -n 's:.*\(<Arguments>[^<]*</Arguments>\).*:\1:p' "$WINDOWS_TASK_XML")"
+    recorded_command="$(sed -n 's:.*<Command>\([^<]*\)</Command>.*:\1:p' "$WINDOWS_TASK_XML")"
+    recorded_arguments="$(sed -n 's:.*<Arguments>\([^<]*\)</Arguments>.*:\1:p' "$WINDOWS_TASK_XML")"
     [ -n "$recorded_command" ] && [ -n "$recorded_arguments" ] &&
-      grep -Fq "$recorded_command" <<<"$xml" && grep -Fq "$recorded_arguments" <<<"$xml" && return 0
+      [ "$actual_command" = "$recorded_command" ] && [ "$actual_arguments" = "$recorded_arguments" ] && return 0
   fi
   vbs_native="$(to_windows_path "$WINDOWS_VBS")"
-  [ -f "$WINDOWS_VBS" ] && windows_startup_entry_uses_current_wrapper "$WINDOWS_VBS" && grep -Fq "$vbs_native" <<<"$xml"
+  [ "$actual_command" = wscript.exe ] &&
+    { [ "$actual_arguments" = "&quot;$vbs_native&quot;" ] || [ "$actual_arguments" = "\"$vbs_native\"" ]; } &&
+    windows_startup_entry_is_owned "$WINDOWS_VBS"
 }
 windows_recorded_task_is_owned() {
   windows_task_uses_current_supervisor
+}
+windows_task_is_directly_owned_by_gateway_home() {
+  local xml exec_count command arguments node_native supervisor_native
+  xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
+  [ -n "$xml" ] || return 1
+  exec_count="$(grep -o '<Exec>' <<<"$xml" | wc -l | tr -d ' ')"; [ "$exec_count" = 1 ] || return 1
+  command="$(sed -n 's:.*<Command>\([^<]*\)</Command>.*:\1:p' <<<"$xml")"
+  arguments="$(sed -n 's:.*<Arguments>\([^<]*\)</Arguments>.*:\1:p' <<<"$xml")"
+  node_native="$(to_windows_path "$GATEWAY_DIR/runtime/node/node.exe")"
+  supervisor_native="$(to_windows_path "$SUPERVISOR")"
+  [ "$command" = "$node_native" ] && case "$arguments" in
+    "&quot;$supervisor_native&quot; &quot;--platform&quot; &quot;Windows&quot; "*) return 0 ;;
+    "\"$supervisor_native\" \"--platform\" \"Windows\" "*) return 0 ;;
+  esac
+  return 1
 }
 write_windows_task_xml() {
   local node_native supervisor_native arguments='' value escaped
@@ -1912,8 +1966,12 @@ TASK_XML
   chmod 600 "$WINDOWS_TASK_XML" 2>/dev/null || true
 }
 install_windows_service() {
-  local task_xml_native output code startup entry existing
+  local task_xml_native output code startup entry existing startup_foreign=0
   [ "$DRY_RUN" = 1 ] && { say "DRY   register current-user Scheduled Task $WINDOWS_TASK with Startup-folder fallback"; return; }
+  startup="$(windows_startup_dir)"; entry="$startup/$WINDOWS_TASK.vbs"
+  if [ -f "$entry" ] && ! windows_startup_entry_is_owned "$entry"; then
+    startup_foreign=1
+  fi
   if stop_owned_windows_gateway; then
     say "OK    stopped the previous CozyGateway process for an in-place update"
   fi
@@ -1930,14 +1988,13 @@ install_windows_service() {
   code=$?
   set -e
   if [ "$code" -ne 0 ]; then
-    startup="$(windows_startup_dir)"; entry="$startup/$WINDOWS_TASK.vbs"
+    [ "$startup_foreign" = 0 ] || die "Startup entry $entry is foreign; leaving it untouched"
     mkdir -p "$startup"; cp "$WINDOWS_VBS" "$entry"
     say "INFO  Scheduled Task unavailable ($output); installed current-user Startup fallback: $entry"
     wscript.exe "$(to_windows_path "$WINDOWS_VBS")"
   else
     say "OK    registered current-user Scheduled Task $WINDOWS_TASK"
-    startup="$(windows_startup_dir)"; entry="$startup/$WINDOWS_TASK.vbs"
-    if [ -f "$entry" ] && { cmp -s "$entry" "$WINDOWS_VBS" || windows_startup_entry_uses_current_wrapper "$entry"; }; then rm -f "$entry"; fi
+    if [ -f "$entry" ] && windows_startup_entry_is_owned "$entry"; then rm -f "$entry"; fi
     MSYS_NO_PATHCONV=1 schtasks.exe /Run /TN "$WINDOWS_TASK" >/dev/null || die "Scheduled Task $WINDOWS_TASK did not start"
   fi
 }
@@ -1976,6 +2033,51 @@ wait_attach_ready() {
   [ -n "$diagnosis" ] || diagnosis="Hermes attach health could not be read"
   die "$diagnosis"
 }
+systemd_service_is_owned() {
+  local unit="$1" line wrapper_line count
+  [ -f "$unit" ] || return 1
+  count="$(grep -c '^ExecStart=' "$unit" || true)"; [ "$count" = 1 ] || return 1
+  line="$(grep '^ExecStart=' "$unit")"
+  [ "$line" = "ExecStart=/bin/bash $WRAPPER" ] && return 0
+  [ -f "$WRAPPER" ] || return 1
+  wrapper_line="$(sed -n '3p' "$WRAPPER" | tr -d '\r')"
+  [ "$(tr -d '\r' < "$WRAPPER" | awk 'END { print NR }')" = 3 ] &&
+    [ "$(sed -n '1p' "$WRAPPER" | tr -d '\r')" = '#!/usr/bin/env bash' ] &&
+    [ "$(sed -n '2p' "$WRAPPER" | tr -d '\r')" = 'set -euo pipefail' ] &&
+    [ "$line" = "ExecStart=${wrapper_line#exec }" ]
+}
+launchd_service_is_owned() {
+  local plist="$1" actual reconstructed value count wrapper_line
+  [ -f "$plist" ] || return 1
+  count="$(grep -o '<key>ProgramArguments</key>' "$plist" | wc -l | tr -d ' ')"; [ "$count" = 1 ] || return 1
+  actual="$(awk '{ if (!on && match($0, /<key>ProgramArguments<\/key><array>/)) { on=1; $0=substr($0, RSTART+RLENGTH) } if (on) { done=($0 ~ /<\/array>/); if (done) sub(/<\/array>.*/, "", $0); while (match($0, /<string>[^<]*<\/string>/)) { print substr($0, RSTART+8, RLENGTH-17); $0=substr($0, RSTART+RLENGTH) } if (done) exit } }' "$plist")"
+  if [ "$actual" = "$(printf '/bin/bash\n%s' "$WRAPPER")" ]; then return 0; fi
+  [ -f "$WRAPPER" ] || return 1
+  reconstructed='exec '
+  while IFS= read -r value; do printf -v reconstructed '%s%q ' "$reconstructed" "$value"; done <<<"$actual"
+  wrapper_line="$(sed -n '3p' "$WRAPPER" | tr -d '\r')"
+  [ "$(tr -d '\r' < "$WRAPPER" | awk 'END { print NR }')" = 3 ] &&
+    [ "$(sed -n '1p' "$WRAPPER" | tr -d '\r')" = '#!/usr/bin/env bash' ] &&
+    [ "$(sed -n '2p' "$WRAPPER" | tr -d '\r')" = 'set -euo pipefail' ] &&
+    [ "$reconstructed" = "$wrapper_line" ]
+}
+posix_service_is_owned_or_absent() {
+  local path="$1"
+  [ ! -e "$path" ] && return 0
+  if [ "$SERVICE_PLATFORM" = Darwin ]; then launchd_service_is_owned "$path"; else systemd_service_is_owned "$path"; fi
+}
+remove_owned_posix_service() {
+  local path="$1"
+  if [ -e "$path" ] && ! posix_service_is_owned_or_absent "$path"; then
+    say "WARN  CozyGateway service ownership could not be verified; leaving it untouched"
+    return 1
+  fi
+  if [ "$SERVICE_PLATFORM" = Darwin ]; then
+    launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$path"
+  else
+    systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "$path"; systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+}
 install_service() {
   resolve_platform
   if [ "$DRY_RUN" = 1 ]; then
@@ -1994,6 +2096,7 @@ install_service() {
     write_wrapper
     build_supervisor_args
     local plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" loaded=0; mkdir -p "$HOME/Library/LaunchAgents"
+    posix_service_is_owned_or_absent "$plist" || die "$plist is foreign; leaving it untouched"
     {
     cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -2015,6 +2118,7 @@ PLIST
     write_wrapper
     build_supervisor_args
     local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"; mkdir -p "$unit_dir"
+    posix_service_is_owned_or_absent "$unit_dir/$SERVICE_UNIT" || die "$unit_dir/$SERVICE_UNIT is foreign; leaving it untouched"
     have loginctl || die "Linux logout/reboot persistence needs loginctl; install systemd-login or run CozyGateway as a system service"
     if [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)" != yes ]; then
       loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || die "Linux logout/reboot persistence needs lingering; run: sudo loginctl enable-linger $(id -un)"
@@ -2187,12 +2291,13 @@ uninstall_cozyagents() {
   [ -n "$home" ] || home="$COZYAGENTS_HOME_DIR"
   case "$home" in /*) ;; *) die "installer state has an unsafe CozyAgents home" ;; esac
   resolve_platform
+  HARNESS=cozyagents
   if [ "$SERVICE_PLATFORM" = Darwin ]; then
     if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
-    else launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; remove_posix_cli; fi
+    else remove_owned_posix_service "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" && remove_posix_cli || true; fi
   elif [ "$SERVICE_PLATFORM" = Linux ]; then
     if [ "$DRY_RUN" = 1 ]; then run systemctl --user disable --now "$SERVICE_UNIT"; run rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; run systemctl --user daemon-reload
-    else systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; remove_posix_cli; fi
+    else remove_owned_posix_service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT" && remove_posix_cli || true; fi
   elif windows_harness_owner; then
     # The native bootstrap installed the harness and removes it through the CozyAgents Windows
     # uninstaller; what is left here is the gateway task, its Startup fallback and its PATH entry.
@@ -2231,17 +2336,15 @@ uninstall() {
       local startup_entry task_xml owned=0
       startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
       task_xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
-      if [ -n "$task_xml" ] && windows_recorded_task_is_owned; then
+      if [ -n "$task_xml" ] && { windows_recorded_task_is_owned || windows_task_is_directly_owned_by_gateway_home; }; then
         MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true; owned=1
       elif [ -n "$task_xml" ]; then say "WARN  CozyGateway Scheduled Task ownership could not be verified; leaving it untouched"; fi
-      if [ -f "$WINDOWS_VBS" ] && windows_startup_entry_uses_current_wrapper "$WINDOWS_VBS"; then
-        if [ -f "$startup_entry" ] && cmp -s "$startup_entry" "$WINDOWS_VBS"; then rm -f "$startup_entry"; owned=1
-        elif [ -f "$startup_entry" ]; then say "WARN  CozyGateway Startup entry ownership could not be verified; leaving it untouched"; fi
-      fi
+      if [ -f "$startup_entry" ] && windows_startup_entry_is_owned "$startup_entry"; then rm -f "$startup_entry"; owned=1
+      elif [ -f "$startup_entry" ]; then say "WARN  CozyGateway Startup entry ownership could not be verified; leaving it untouched"; fi
       if [ "$owned" = 1 ]; then remove_windows_cli_path
       else say "WARN  CozyGateway Windows launcher ownership could not be verified; leaving task, Startup entry, and PATH untouched"; fi
-    elif [ "$SERVICE_PLATFORM" = Darwin ]; then launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; remove_posix_cli
-    elif [ "$SERVICE_PLATFORM" = Linux ]; then systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; remove_posix_cli
+    elif [ "$SERVICE_PLATFORM" = Darwin ]; then remove_owned_posix_service "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" && remove_posix_cli || true
+    elif [ "$SERVICE_PLATFORM" = Linux ]; then remove_owned_posix_service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT" && remove_posix_cli || true
     fi
     rm -rf "$GATEWAY_DIR"; say "OK    removed partial CozyGateway state; Hermes was not changed"
     return
@@ -2265,6 +2368,7 @@ uninstall() {
   [ "$dashboard_port" -ge 1 ] && [ "$dashboard_port" -le 65535 ] || die "installer state has an unsafe Dashboard port"
   DASHBOARD_PORT="$dashboard_port"
   resolve_platform
+  HARNESS=hermes
   if [ "$SERVICE_PLATFORM" = Windows ]; then
     local startup_entry
     startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
@@ -2279,10 +2383,10 @@ uninstall() {
     [ "$DRY_RUN" = 1 ] || remove_windows_cli_path
   elif [ "$SERVICE_PLATFORM" = Darwin ]; then
     if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
-    else launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"; remove_posix_cli; fi
+    else remove_owned_posix_service "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" && remove_posix_cli || true; fi
   else
     if [ "$DRY_RUN" = 1 ]; then run systemctl --user disable --now "$SERVICE_UNIT"; run rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; run systemctl --user daemon-reload
-    else systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; systemctl --user daemon-reload >/dev/null 2>&1 || true; remove_posix_cli; fi
+    else remove_owned_posix_service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT" && remove_posix_cli || true; fi
   fi
   IFS=',' read -r -a SELECTED <<<"$profiles"
   for p in "${SELECTED[@]}"; do

@@ -66,7 +66,6 @@ async function startDashboardIfNeeded(options) {
     .then((response) => response.status === 200 || response.status === 401)
     .catch(() => false);
   let child;
-  let restartTimer;
   if (!health) {
     const profile = options.windowsDashboardProfile ? ['-p', 'default'] : [];
     child = spawn(options.hermes, ['dashboard', ...profile, '--host', '127.0.0.1', '--port', options.dashboardPort, '--no-open', '--skip-build'], {
@@ -117,6 +116,7 @@ async function runGatewayOnce(options, gatewayEnv) {
 async function superviseGatewayOnWindows(options, gatewayEnv) {
   const crashTimes = [];
   let child;
+  let restartTimer;
   let deliberateRestart = false;
   let shuttingDown = false;
   let configBytes = readFileSync(options.config);

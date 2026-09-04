@@ -86,6 +86,7 @@ try {
         'cozygateway.mjs' = "console.log('fixture');`n"
         'cozygateway-hermes-attach-plugin.tar.gz' = 'plugin-fixture'
         'cozygateway-installer.sh' = "#!/usr/bin/env bash`nexit 0`n"
+        'gateway-supervisor.cjs' = "#!/usr/bin/env node`n"
         'install.ps1' = "param([switch]`$Repair)`nexit 0`n"
     }
     foreach ($entry in $assets.GetEnumerator()) {
