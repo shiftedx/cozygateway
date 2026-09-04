@@ -294,6 +294,9 @@ export interface AppDeps {
   runnerPresence?: {
     online: (runnerId: string) => boolean;
     lastContactAt: (runnerId: string) => number | null;
+    /** Version from this runner's current authenticated hello only; a stored last-reported value
+     *  cannot prove that an offline runner is running an installed update. */
+    agentVersion: (runnerId: string) => string | undefined;
   };
   /** Whether the legacy shared `COZYGATEWAY_RUNNER_TOKEN` is configured, which the roster shows as
    *  one row so the list and the lane never disagree about who exists. */
@@ -1062,6 +1065,11 @@ export function createApp(deps: AppDeps): Hono<Env> {
         // What the INSTALLER polls: the row exists (it just paired) long before the service it
         // registered has dialed in, so "am I attached" is a different question from "do I exist".
         attached,
+        // An update verifier may accept this only alongside `attached`: it is read from the live
+        // authenticated hello, never the durable roster observation left by an old connection.
+        ...(deps.runnerPresence?.agentVersion(row.id) === undefined
+          ? {}
+          : { agentVersion: deps.runnerPresence.agentVersion(row.id) }),
         renamed: row.displayName !== null,
       });
     });

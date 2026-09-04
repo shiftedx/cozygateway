@@ -25,6 +25,8 @@ PORT="${COZYGATEWAY_PORT:-8787}"
 PUBLIC_URL=""
 PREVIOUS_PORT=""
 DASHBOARD_PORT="${COZYGATEWAY_DASHBOARD_PORT:-9119}"
+DASHBOARD_PORT_EXPLICIT=0
+if [ "${COZYGATEWAY_DASHBOARD_PORT+x}" = x ]; then DASHBOARD_PORT_EXPLICIT=1; fi
 WINDOWS_OWNED_IDENTITY=0
 WINDOWS_OWNED_NODE_RESOLVED=""
 WINDOWS_OWNED_GATEWAY_ENV=""
@@ -120,7 +122,7 @@ while [ "$#" -gt 0 ]; do
     --port) need_value "$@"; PORT="$2"; PORT_EXPLICIT=1; shift ;;
     --public-url) need_value "$@"; PUBLIC_URL="$2"; PUBLIC_URL_EXPLICIT=1; shift ;;
     --clear-public-url) CLEAR_PUBLIC_URL=1 ;;
-    --dashboard-port) need_value "$@"; DASHBOARD_PORT="$2"; shift ;;
+    --dashboard-port) need_value "$@"; DASHBOARD_PORT="$2"; DASHBOARD_PORT_EXPLICIT=1; shift ;;
     --dry-run) DRY_RUN=1 ;;
     --service-platform) need_value "$@"; SERVICE_PLATFORM="$2"; shift ;;
     --status) STATUS=1 ;;
@@ -193,6 +195,7 @@ GATEWAY_ENV="$LOCAL_DIR/gateway.env"
 DASHBOARD_ENV="$LOCAL_DIR/dashboard.env"
 DASHBOARD_OWNER_PS1="$LOCAL_DIR/dashboard-owner.ps1"
 DASHBOARD_ELEVATION_PS1="$LOCAL_DIR/dashboard-owner-elevate.ps1"
+DASHBOARD_PORT_STATE="$LOCAL_DIR/dashboard-port"
 STATE_FILE="$LOCAL_DIR/install-state"
 WRAPPER="$LOCAL_DIR/run-gateway.sh"
 SUPERVISOR="$LOCAL_DIR/gateway-supervisor.cjs"
@@ -233,6 +236,29 @@ NODE
   # Opting into a public origin is a posture, not a label. Unless the operator explicitly supplied
   # another bind (which validation below will reject), move an existing LAN install back to loopback.
   [ "$PUBLIC_URL_EXPLICIT" = 0 ] || [ "$BIND_HOST_EXPLICIT" = 1 ] || BIND_HOST=127.0.0.1
+}
+hydrate_dashboard_port() {
+  local saved configured
+  [ "$DASHBOARD_PORT_EXPLICIT" = 1 ] && return 0
+  if [ -f "$CONFIG_JSON" ]; then
+    configured="$("$NODE_RESOLVED" - "$CONFIG_JSON" <<'NODE'
+const { readFileSync } = require('node:fs');
+const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const ports = (Array.isArray(config.hermesEndpoints) ? config.hermesEndpoints : [])
+  .map((endpoint) => /^ws:\/\/127\.0\.0\.1:(\d+)\/api\/ws$/.exec(endpoint?.url ?? '')?.[1])
+  .filter((port) => port !== undefined);
+if (ports.length === 1) process.stdout.write(ports[0]);
+NODE
+)" || die "could not read the existing private Dashboard endpoint from $CONFIG_JSON"
+    case "$configured" in ''|*[!0-9]*) ;; *)
+      [ "$configured" -ge 1 ] && [ "$configured" -le 65535 ] && { DASHBOARD_PORT="$configured"; return 0; }
+    esac
+  fi
+  [ -f "$DASHBOARD_PORT_STATE" ] || return 0
+  saved="$(tr -d '[:space:]' < "$DASHBOARD_PORT_STATE")"
+  case "$saved" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$saved" -ge 1 ] && [ "$saved" -le 65535 ] || return 0
+  DASHBOARD_PORT="$saved"
 }
 choose_fresh_listener() {
   local input answer
@@ -1045,6 +1071,13 @@ write_state() {
   command -v sync >/dev/null 2>&1 && sync -f "$staged" 2>/dev/null || true
   mv -f "$staged" "$STATE_FILE" || { rm -f "$staged"; return 1; }
 }
+write_dashboard_port_state() {
+  [ "$DRY_RUN" = 1 ] && return
+  umask 077
+  printf '%s\n' "$DASHBOARD_PORT" > "$DASHBOARD_PORT_STATE.tmp.$$"
+  chmod 600 "$DASHBOARD_PORT_STATE.tmp.$$"
+  mv -f "$DASHBOARD_PORT_STATE.tmp.$$" "$DASHBOARD_PORT_STATE"
+}
 resolve_platform() { normalize_service_platform; }
 preflight_service_manager() {
   resolve_platform
@@ -1717,7 +1750,7 @@ build_supervisor_args() {
   fi
   SUPERVISOR_ARGS=(--platform "$platform" --gateway-env "$gateway_env" --bundle "$bundle" --config "$config" --maintenance-socket "$socket" --maintenance-worker "$worker" --database "$database")
   if [ "${HARNESS:-}" = hermes ]; then
-    SUPERVISOR_ARGS+=(--dashboard-env "$dashboard_env" --hermes-root "$hermes_root" --hermes "$hermes" --hermes-launcher "$launcher" --owner-helper "$owner_helper" --dashboard-port "$DASHBOARD_PORT")
+    SUPERVISOR_ARGS+=(--dashboard-env "$dashboard_env" --hermes-root "$hermes_root" --hermes "$hermes" --hermes-launcher "$launcher" --owner-helper "$owner_helper" --dashboard-port "$DASHBOARD_PORT" --dashboard-port-state "$DASHBOARD_PORT_STATE")
     if is_windows; then SUPERVISOR_ARGS+=(--windows-dashboard-profile); fi
   fi
 }
@@ -2445,18 +2478,8 @@ start_dashboard() {
   [ "$DRY_RUN" = 1 ] && { say "DRY   start/reuse Hermes Dashboard at 127.0.0.1:$DASHBOARD_PORT as the control/read plane"; return; }
   if dashboard_ready; then
     dashboard_credentials_work && return
-    say "INFO  existing Hermes Dashboard rejected the configured local session token; restarting it with the installer-owned token"
-    if is_windows; then
-      HERMES_HOME="$hermes_root_arg" "$HERMES_RESOLVED" dashboard -p default --stop >/dev/null 2>&1 || die "could not stop the Dashboard that rejected the local credential"
-    else
-      HERMES_HOME="$hermes_root_arg" "$HERMES_RESOLVED" dashboard --stop >/dev/null 2>&1 || die "could not stop the Dashboard that rejected the local credential"
-    fi
-    for _ in $(seq 1 5); do dashboard_ready || break; sleep 1; done
-    if dashboard_ready && is_windows; then
-      stop_stubborn_windows_dashboard
-      for _ in $(seq 1 10); do dashboard_ready || break; sleep 1; done
-    fi
-    dashboard_ready && die "Dashboard stayed listening after stop; refusing to launch with an unverified credential"
+    say "WARN  existing Hermes Dashboard rejected the configured local session token; preserving it and letting the CozyGateway supervisor provision a private loopback Dashboard"
+    return
   fi
   launch_dashboard
   for _ in $(seq 1 90); do dashboard_ready && break; sleep 1; done
@@ -2758,7 +2781,7 @@ main() {
   elif [ "$DRY_RUN" = 1 ]; then say "DRY   install the current Node.js 24 release under $GATEWAY_DIR/runtime/node from checksum-verified nodejs.org assets"; prerequisite_missing=1
   else install_node_runtime
   fi
-  [ "$prerequisite_missing" = 1 ] || hydrate_listener_settings
+  [ "$prerequisite_missing" = 1 ] || { hydrate_listener_settings; hydrate_dashboard_port; }
   if [ "$STATUS" = 1 ]; then validate_listener_settings; status_install; return; fi
   [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--bundle must name the verified release bundle"
   # Step 1 of the approved order: the harness, before anything is installed.
@@ -2799,7 +2822,7 @@ main() {
   # would create an unowned legacy copy and make the next profile fail closed.
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
   for profile in "${SELECTED[@]}"; do enable_plugin "$profile"; done
-  write_gateway_config; write_cli_wrapper; write_dashboard_owner_helper; is_windows && write_dashboard_elevation_helper; start_dashboard; install_service; wait_gateway_ready
+  write_dashboard_port_state; write_gateway_config; write_cli_wrapper; write_dashboard_owner_helper; is_windows && write_dashboard_elevation_helper; start_dashboard; install_service; wait_gateway_ready
   ensure_hermes_gateways; write_state; wait_attach_ready
   is_windows || install_posix_cli
   announce_listener

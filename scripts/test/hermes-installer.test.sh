@@ -17,7 +17,7 @@ stop_test_pid() {
     *) kill "$pid" 2>/dev/null || true ;;
   esac
 }
-trap 'stop_test_pid "${supervisor_pid:-}"; stop_test_pid "${mock_dashboard_pid:-}"; stop_test_pid "${failed_dashboard_pid:-}"; stop_test_pid "${foreign_dashboard_pid:-}"; rm -rf "$tmp"' EXIT
+trap 'stop_test_pid "${supervisor_pid:-}"; stop_test_pid "${foreign_supervisor_pid:-}"; stop_test_pid "${mock_dashboard_pid:-}"; stop_test_pid "${failed_dashboard_pid:-}"; stop_test_pid "${foreign_dashboard_pid:-}"; rm -rf "$tmp"' EXIT
 # Under `set -e` a bare assertion dies with no output at all, so a failure on a machine you cannot
 # reach reads as "it stopped somewhere". Name the line and the command that failed.
 trap 'status=$?; [ "$status" -eq 0 ] || printf "FAIL  line %s exited %s: %s\n" "$LINENO" "$status" "$BASH_COMMAND" >&2' ERR
@@ -921,9 +921,10 @@ if (hermesArgs[0] === 'dashboard') {
   const windowsLauncher = process.platform === 'win32';
   // gateway-live is intentionally generated with service platform Darwin,
   // even when this fixture itself runs on Windows.
-  const expectedLauncherArgs = ['dashboard', '-p', 'default', '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
+  const port = hermesArgs[hermesArgs.indexOf('--port') + 1];
+  const expectedLauncherArgs = ['dashboard', '-p', 'default', '--host', '127.0.0.1', '--port', port, '--no-open', '--skip-build'];
   const descendantProfileArgs = ['-p', 'default'];
-  const descendantArgs = [process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT, 'dashboard', ...descendantProfileArgs, '--host', '127.0.0.1', '--port', process.env.COZYGATEWAY_TEST_DASHBOARD_PORT, '--no-open', '--skip-build'];
+  const descendantArgs = [process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT, 'dashboard', ...descendantProfileArgs, '--host', '127.0.0.1', '--port', port, '--no-open', '--skip-build'];
   const expectedToken = parseEnv(readFileSync(process.env.COZYGATEWAY_TEST_DASHBOARD_ENV, 'utf8')).DASHBOARD_SESSION_TOKEN;
   const homeMatches = resolve(process.env.HERMES_HOME) === resolve(process.env.COZYGATEWAY_TEST_EXPECTED_HERMES_HOME);
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_TRACE, JSON.stringify({
@@ -949,6 +950,14 @@ if (hermesArgs[0] === 'dashboard') {
 HERMES_STUB
 dashboard_auth_marker="$tmp/mock-dashboard-authenticated"
 mock_dashboard_port="$("$real_node" -e "const server=require('node:net').createServer();server.listen(0,'127.0.0.1',()=>{process.stdout.write(String(server.address().port));server.close()})")"
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" "$mock_dashboard_port" <<'NODE'
+const { readFileSync, writeFileSync } = require('node:fs');
+const [path, port] = process.argv.slice(2);
+const config = JSON.parse(readFileSync(path, 'utf8'));
+config.hermesEndpoints[0].url = `ws://127.0.0.1:${port}/api/ws`;
+writeFileSync(path, JSON.stringify(config));
+NODE
+rm -f "$tmp/gateway-live/local/dashboard-port"
 mkdir -p "$tmp/Hermes Bin"
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) hermes_stub="$tmp/Hermes Bin/hermes-stub.exe" ;; *) hermes_stub="$tmp/Hermes Bin/hermes-stub" ;; esac
 case "$(uname -s)" in
@@ -1135,9 +1144,9 @@ sed -n '1p' "$tmp/reload.log" | grep -Eq '^[0-9]+:8787$'
 sed -n '2p' "$tmp/reload.log" | grep -Eq '^[0-9]+:8998$'
 test "$(cut -d: -f1 "$tmp/reload.log" | sed -n '1p')" != "$(cut -d: -f1 "$tmp/reload.log" | sed -n '2p')"
 
-# A foreign process can bind the target port after the supervisor's initial
-# health decision but before authenticated readiness. Failed readiness must not
-# turn the dedicated port into authority to kill that non-Hermes listener.
+# A foreign OAuth or token-gated Dashboard is not CozyGateway-owned. The
+# supervisor must preserve it, choose a durable loopback fallback for its own
+# authenticated Dashboard, and repoint only its private control endpoint.
 foreign_dashboard_port="$("$real_node" -e "const server=require('node:net').createServer();server.listen(0,'127.0.0.1',()=>{process.stdout.write(String(server.address().port));server.close()})")"
 rm -f "$tmp/foreign-dashboard.pid" "$tmp/foreign-reload.log" "$tmp/mock-dashboard.pid"
 COZYGATEWAY_TEST_DASHBOARD_READY_DELAY_MS=3000 COZYGATEWAY_TEST_DASHBOARD_REJECT=1 HERMES_DASHBOARD_SESSION_TOKEN=foreign \
@@ -1147,9 +1156,14 @@ foreign_dashboard_pid=$!
 for _ in $(seq 1 50); do [ -s "$tmp/foreign-dashboard.pid" ] && break; sleep 0.1; done
 test -s "$tmp/foreign-dashboard.pid"
 foreign_dashboard_pid="$(cat "$tmp/foreign-dashboard.pid")"
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" "$foreign_dashboard_port" <<'NODE'
+const { readFileSync, writeFileSync } = require('node:fs');
+const [path, port] = process.argv.slice(2);
+const config = JSON.parse(readFileSync(path, 'utf8'));
+config.hermesEndpoints[0].url = `ws://127.0.0.1:${port}/api/ws`;
+writeFileSync(path, JSON.stringify(config));
+NODE
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) foreign_reload_log="$(cygpath -w "$tmp/foreign-reload.log")" ;; *) foreign_reload_log="$tmp/foreign-reload.log" ;; esac
-set +e
-foreign_supervisor_status=0
 (trap - ERR; NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_RELOAD_LOG="$foreign_reload_log" \
   COZYGATEWAY_TEST_DASHBOARD_RUNTIME="$dashboard_runtime" \
   COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER="$dashboard_auth_marker_env" COZYGATEWAY_TEST_DASHBOARD_ENV="$dashboard_env" \
@@ -1159,15 +1173,47 @@ foreign_supervisor_status=0
   "$real_node" "$tmp/supervisor.cjs" \
   --platform Windows --gateway-env "$tmp/gateway-live/local/gateway.env" --bundle "$tmp/reload-gateway.mjs" --config "$tmp/gateway-live/local/cozygateway.config.json" \
   --maintenance-socket unused --maintenance-worker unused --database unused --dashboard-env "$tmp/gateway-live/local/dashboard.env" --hermes-root "$tmp/hermes" \
-  --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$foreign_dashboard_port" --windows-dashboard-profile \
-  >"$tmp/foreign-supervisor.log" 2>&1) || foreign_supervisor_status=$?
-set -e
-test "$foreign_supervisor_status" -ne 0
-test ! -e "$tmp/foreign-reload.log"
-if ! "$real_node" -e 'try { process.kill(Number(process.argv[1]), 0); process.exit(0) } catch { process.exit(1) }' "$foreign_dashboard_pid"; then
-  echo 'failed readiness killed a non-owned loopback listener' >&2
+  --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$foreign_dashboard_port" --dashboard-port-state "$tmp/gateway-live/local/dashboard-port" --windows-dashboard-profile \
+  >"$tmp/foreign-supervisor.log" 2>&1) &
+foreign_supervisor_pid=$!
+for _ in $(seq 1 80); do [ -s "$tmp/foreign-reload.log" ] && break; sleep 0.1; done
+if [ ! -s "$tmp/foreign-reload.log" ]; then
+  cat "$tmp/foreign-supervisor.log" >&2
+  [ ! -f "$tmp/hermes-stub-trace" ] || cat "$tmp/hermes-stub-trace" >&2
   exit 1
 fi
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" "$tmp/gateway-live/local/dashboard-port" "$foreign_dashboard_port" <<'NODE'
+const { readFileSync } = require('node:fs');
+const [configPath, statePath, foreignPort] = process.argv.slice(2);
+const config = JSON.parse(readFileSync(configPath, 'utf8'));
+const port = Number(readFileSync(statePath, 'utf8').trim());
+if (!Number.isInteger(port) || port <= Number(foreignPort) || config.hermesEndpoints[0].url !== `ws://127.0.0.1:${port}/api/ws`) process.exit(1);
+NODE
+if ! "$real_node" -e 'try { process.kill(Number(process.argv[1]), 0); process.exit(0) } catch { process.exit(1) }' "$foreign_dashboard_pid"; then
+  echo 'fallback startup killed a non-owned loopback listener' >&2
+  exit 1
+fi
+mock_dashboard_pid="$(cat "$tmp/mock-dashboard.pid")"
+kill "$foreign_supervisor_pid" 2>/dev/null || true
+wait "$foreign_supervisor_pid" 2>/dev/null || true
+foreign_supervisor_pid=
+# A process loss between the endpoint rename and state rename leaves an old state value behind.
+# On restart the config remains authoritative and repairs that cache before launching Gateway.
+printf '%s\n' "$foreign_dashboard_port" > "$tmp/gateway-live/local/dashboard-port"
+if ! NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_RELOAD_LOG="$foreign_reload_log" \
+  COZYGATEWAY_TEST_DASHBOARD_RUNTIME="$dashboard_runtime" \
+  COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER="$dashboard_auth_marker_env" COZYGATEWAY_TEST_DASHBOARD_ENV="$dashboard_env" \
+  COZYGATEWAY_TEST_DASHBOARD_SCRIPT="$dashboard_script" COZYGATEWAY_TEST_DASHBOARD_PID_FILE="$dashboard_pid_file" \
+  COZYGATEWAY_TEST_HERMES_STUB_MARKER="$hermes_stub_marker" COZYGATEWAY_TEST_HERMES_STUB_TRACE="$hermes_stub_trace" COZYGATEWAY_TEST_EXPECTED_HERMES_HOME="$expected_hermes_home" \
+  "$real_node" "$tmp/supervisor.cjs" \
+  --platform Darwin --gateway-env "$tmp/gateway-live/local/gateway.env" --bundle "$tmp/reload-gateway.mjs" --config "$tmp/gateway-live/local/cozygateway.config.json" \
+  --maintenance-socket unused --maintenance-worker unused --database unused --dashboard-env "$tmp/gateway-live/local/dashboard.env" --hermes-root "$tmp/hermes" \
+  --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$foreign_dashboard_port" --dashboard-port-state "$tmp/gateway-live/local/dashboard-port" \
+  >"$tmp/foreign-restart-supervisor.log" 2>&1; then
+  cat "$tmp/foreign-restart-supervisor.log" >&2
+  exit 1
+fi
+grep -Fxq "$("$real_node" -e "const c=JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8')); process.stdout.write(c.hermesEndpoints[0].url.match(/:(\\d+)\\/api\\/ws$/)[1])" "$tmp/gateway-live/local/cozygateway.config.json")" "$tmp/gateway-live/local/dashboard-port"
 stop_test_pid "$foreign_dashboard_pid"
 foreign_dashboard_pid=
 
@@ -1176,6 +1222,16 @@ foreign_dashboard_pid=
 # supervisor exits; the successful cold start above remains detached.
 failed_dashboard_port="$("$real_node" -e "const server=require('node:net').createServer();server.listen(0,'127.0.0.1',()=>{process.stdout.write(String(server.address().port));server.close()})")"
 rm -f "$tmp/mock-dashboard.pid" "$tmp/supervisor-taskkill.log"
+failed_dashboard_state="$tmp/gateway-live/local/failed-dashboard-port"
+printf '%s\n' "$failed_dashboard_port" > "$failed_dashboard_state"
+"$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" "$failed_dashboard_port" <<'NODE'
+const { readFileSync, writeFileSync } = require('node:fs');
+const [path, port] = process.argv.slice(2);
+const config = JSON.parse(readFileSync(path, 'utf8'));
+config.hermesEndpoints[0].url = `ws://127.0.0.1:${port}/api/ws`;
+writeFileSync(path, JSON.stringify(config));
+NODE
+cp "$tmp/gateway-live/local/cozygateway.config.json" "$tmp/failed-dashboard-config-before"
 set +e
 failed_supervisor_status=0
 (trap - ERR; NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_DASHBOARD_READY_DELAY_MS=1000 \
@@ -1189,10 +1245,12 @@ failed_supervisor_status=0
   "$real_node" "$tmp/supervisor.cjs" \
   --platform Windows --gateway-env "$tmp/gateway-live/local/gateway.env" --bundle "$tmp/reload-gateway.mjs" --config "$tmp/gateway-live/local/cozygateway.config.json" \
   --maintenance-socket unused --maintenance-worker unused --database unused --dashboard-env "$tmp/gateway-live/local/dashboard.env" --hermes-root "$tmp/hermes" \
-  --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$failed_dashboard_port" --windows-dashboard-profile \
+  --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$failed_dashboard_port" --dashboard-port-state "$failed_dashboard_state" --windows-dashboard-profile \
   >"$tmp/failed-supervisor.log" 2>&1) || failed_supervisor_status=$?
 set -e
 test "$failed_supervisor_status" -ne 0
+cmp -s "$tmp/failed-dashboard-config-before" "$tmp/gateway-live/local/cozygateway.config.json"
+grep -Fxq "$failed_dashboard_port" "$failed_dashboard_state"
 if [ ! -s "$tmp/mock-dashboard.pid" ]; then
   echo 'failed-readiness Hermes fixture did not start' >&2
   cat "$tmp/failed-supervisor.log" >&2
@@ -1869,9 +1927,9 @@ fi
 cmp -s "$tmp/foreign-windows-startup.vbs" "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
 rm -f "$tmp/windows-appdata/Microsoft/Windows/Start Menu/Programs/Startup/CozyGateway.vbs"
 
-# Hermes Dashboard 0.20.x can report a successful `dashboard --stop` on Windows
-# while its Python child still owns the port. The fallback is allowed to stop
-# only that validated Hermes Dashboard listener, then installation continues.
+# A token-gated Dashboard on the conventional port may belong to another local
+# Hermes installation. Installation preserves it, registers the Gateway-owned
+# supervisor, and lets that supervisor select a private loopback fallback.
 : > "$tmp/windows-dashboard-wrong"
 dashboard_stop_home_log="$tmp/windows-dashboard-stop-home.log"
 dashboard_relaunch_home_log="$tmp/windows-dashboard-relaunch-home.log"
@@ -1884,21 +1942,15 @@ if [ "$dashboard_fallback_status" -ne 0 ]; then
   cat "$tmp/windows-dashboard-commands" >&2
 fi
 test "$dashboard_fallback_status" -eq 0
-grep -Fxq "$expected_windows_hermes_home" "$dashboard_stop_home_log"
-grep -Fxq "$expected_windows_hermes_home" "$dashboard_relaunch_home_log"
-grep -Fq 'dashboard-owner.ps1' "$tmp/windows-dashboard-commands"
-grep -Fq "$expected_windows_hermes_home" "$tmp/windows-dashboard-commands"
-grep -Fq 'COZYGATEWAY_DASHBOARD_OWNER_BEGIN' "$repo_root/scripts/agent-install.sh"
-test ! -e "$tmp/windows-dashboard-wrong"
-if grep -Fq 'Dashboard stayed listening after stop' <<<"$dashboard_fallback_output"; then
-  echo 'Windows Dashboard fallback did not release the validated listener' >&2
-  exit 1
-fi
+grep -Fq 'preserving it and letting the CozyGateway supervisor provision a private loopback Dashboard' <<<"$dashboard_fallback_output"
+test ! -e "$dashboard_stop_home_log"
+test ! -e "$dashboard_relaunch_home_log"
+! grep -Fq 'dashboard-owner.ps1' "$tmp/windows-dashboard-commands"
 
 # Windows uninstall must stop a Dashboard started by the managed wrapper before
 # removing the strict owner helper, while preserving the persisted install port.
 grep -Fxq 'dashboard_port=19119' "$tmp/gateway-windows-dashboard/local/install-state"
-dashboard_owner_calls_before_uninstall="$(grep -Fc 'dashboard-owner.ps1' "$tmp/windows-dashboard-commands")"
+dashboard_owner_calls_before_uninstall="$(grep -Fc 'dashboard-owner.ps1' "$tmp/windows-dashboard-commands" || true)"
 owner_stop_marker="$tmp/windows-dashboard-uninstall-owner-stopped"
 HOME="$tmp/windows-dashboard-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-dashboard-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-dashboard-commands" COZYGATEWAY_TEST_DASHBOARD_MODULE_OWNER=1 COZYGATEWAY_TEST_EXPECT_DASHBOARD_OWNER_PORT=19119 COZYGATEWAY_TEST_OWNER_STOP_MARKER="$owner_stop_marker" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-windows-dashboard" >/dev/null
 test "$(grep -Fc 'dashboard-owner.ps1' "$tmp/windows-dashboard-commands")" -gt "$dashboard_owner_calls_before_uninstall"
@@ -1963,16 +2015,11 @@ test "$(wc -l < "$tmp/curl.log")" = "$curl_count_before_uninstall"
 test "$(grep -Fc 'dashboard-owner.ps1' "$tmp/windows-fallback-commands")" -gt "$fallback_owner_calls_before_uninstall"
 test ! -e "$tmp/gateway-windows-fallback"
 
-# A listener alone is not sufficient: an existing Dashboard that rejects the
-# credential must be stopped/restarted or fail loudly, never silently accepted.
-if wrong_output="$(HOME="$tmp/wrong-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_DASHBOARD_TOKEN_CODE=401 COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-wrong" 2>&1)"; then
-  echo 'expected wrong Dashboard credential to fail' >&2
-  exit 1
-fi
-expect_contains "$wrong_output" 'Dashboard stayed listening after stop'
-test ! -e "$tmp/wrong-home/.local/bin/cozygateway"
-[ ! -f "$tmp/wrong-home/.profile" ] || ! grep -Fq '# CozyGateway CLI' "$tmp/wrong-home/.profile"
-[ ! -f "$tmp/wrong-home/.zprofile" ] || ! grep -Fq '# CozyGateway CLI' "$tmp/wrong-home/.zprofile"
+# A listener alone is not authority to restart it: an OAuth or token-gated
+# Dashboard is preserved and the registered supervisor owns a private fallback.
+wrong_output="$(HOME="$tmp/wrong-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_DASHBOARD_TOKEN_CODE=401 COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-wrong" 2>&1)"
+expect_contains "$wrong_output" 'preserving it and letting the CozyGateway supervisor provision a private loopback Dashboard'
+test -x "$tmp/wrong-home/.local/bin/cozygateway"
 
 if bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir / >/dev/null 2>&1; then
   echo 'expected unsafe gateway directory to be rejected' >&2

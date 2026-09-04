@@ -1439,7 +1439,7 @@ describe("paired runners (capability 52)", () => {
     expect(check(RunnerPairResponseSchema, { runner: fresh, gateway })).toBe(false);
   });
 
-  it("accepts what GET /runners/self answers, which is seven fields and no credential", () => {
+  it("accepts what GET /runners/self answers, including an optional live version and no credential", () => {
     const self = {
       id: runner.id,
       name: "kyle-mbp",
@@ -1454,8 +1454,9 @@ describe("paired runners (capability 52)", () => {
     // Paired but not yet dialed in: the row exists and says so honestly.
     expect(check(RunnerSelfSchema, { ...self, platform: null, lastSeenAt: null, attached: false })).toBe(true);
     expect(Object.keys(RunnerSelfSchema.properties).sort()).toEqual([
-      "attached", "default", "id", "lastSeenAt", "name", "platform", "renamed",
+      "agentVersion", "attached", "default", "id", "lastSeenAt", "name", "platform", "renamed",
     ]);
+    expect(check(RunnerSelfSchema, { ...self, agentVersion: "0.2.0" })).toBe(true);
     // It is a runner's view of itself, not the roster row: no token, and no other machine's facts.
     for (const leak of ["token", "runnerToken", "tokenHash", "backends"])
       expect(RunnerSelfSchema.properties).not.toHaveProperty(leak);

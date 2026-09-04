@@ -89,7 +89,7 @@ describe("what a release publishes", () => {
   });
 
   it("Hermes prelude cleans up only its owned Dashboard on failure", () => {
-    expect(SUPERVISOR_BODY).toContain("if (child) await stopOwnedDashboard(child, options)");
+    expect(SUPERVISOR_BODY).toContain("await stopOwnedDashboard(child, { ...options, dashboardPort: port });");
   });
 
   it("task action directly tracks the Node supervisor", () => {
