@@ -247,6 +247,19 @@ function commands(frames: RunnerServerFrame[]): Array<Extract<RunnerServerFrame,
   >;
 }
 
+describe("runner hello acknowledgement", () => {
+  it("uses the exact four-field CozyAgents runner contract without unimplemented capabilities", async () => {
+    const h = await harness({ heartbeatIntervalMs: 12_345 });
+    const runner = await fakeRunner(h);
+    expect(runner.frames.find((frame) => frame.kind === "hello_ack")).toEqual({
+      kind: "hello_ack",
+      version: 1,
+      capabilities: [],
+      heartbeatIntervalMs: 12_345,
+    });
+  });
+});
+
 async function receipt(
   ws: WebSocket,
   h: Harness,
