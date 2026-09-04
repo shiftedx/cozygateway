@@ -75,7 +75,7 @@ cozygateway repair   # `cozygateway update` is an alias
 | Hermes/attach operations | [Attach-v1 operations](docs/attach-v1-operations.md) |
 | Gateway runtime configuration and commands | [Gateway package README](packages/gateway/README.md) |
 | Client and gateway protocol | [Contract v1](contract/v1.md) and [conformance suite](packages/conformance/README.md) |
-| Support | [GitHub Discussions](https://github.com/shiftedx/cozygateway/discussions) |
+| Support | [Support guide](SUPPORT.md) · [GitHub Issues](https://github.com/shiftedx/cozygateway/issues) |
 
 ## Develop
 
