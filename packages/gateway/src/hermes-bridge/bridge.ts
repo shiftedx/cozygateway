@@ -136,6 +136,11 @@ export interface BotSessionAdoption {
   sessionId: string;
   previousSessionId: string;
 }
+export interface BotSessionDeletion {
+  name: string;
+  sessionId: string;
+  deletedAt: number;
+}
 export interface BotNewSessionResult {
   sessionId: string;
   previousSessionId: string;
@@ -300,6 +305,7 @@ export interface BotsSurface extends BotControlSurface {
     sessionId: string,
     limit: number,
   ): Promise<BotSessionAdoption>;
+  deleteSession(name: string, sessionId: string): Promise<BotSessionDeletion>;
   chatHistory(name: string): Promise<BotChatHistory>;
   sendChatMessage(
     name: string,

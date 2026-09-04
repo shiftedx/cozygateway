@@ -57,7 +57,7 @@ export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
  *  capability; it does NOT prove the list is complete, so adding one to the schema and forgetting
  *  it here type-checks cleanly and silently refuses the surface at negotiation. A test compares
  *  this list against the schema for exactly that reason. */
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "bot_config", "bot_history"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "memory_ownership", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "bot_config", "bot_history", "session_deletion"] as const satisfies readonly AttachV1Capability[];
 
 /** Why a memory request did or did not reach the attached plugin. */
 export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
@@ -537,6 +537,20 @@ export class AttachV1Ingress implements TurnEndpoint {
     );
   }
 
+  /** Capability 60's deletion is committed with the SQLite outbox, so this only wakes its normal
+   * ordered replay loop after that transaction succeeds. A disconnected or older peer receives
+   * no unknown command. */
+  canSendSessionDeletion(agentId: string): boolean {
+    const connection = this.#current.get(agentId);
+    return connection?.hello === true
+      && this.#allowed(agentId).includes("session_deletion")
+      && connection.capabilities.has("session_deletion");
+  }
+
+  flushQueuedCommands(agentId: string): void {
+    this.#flush(agentId, this.#current.get(agentId)?.commandCursor ?? 0);
+  }
+
   sendClarifyResolution(agentId: string, input: { threadId: string; turnId: string; clarifyId: string; optionId: string }, commandId?: string): boolean {
     return this.#enqueue(agentId, { kind: "resolve_clarify", ...input }, commandId);
   }
@@ -553,6 +567,7 @@ export class AttachV1Ingress implements TurnEndpoint {
     if (connection?.hello !== true) return "not_attached";
     if (!connection.capabilities.has("memory_management")) return "capability_not_negotiated";
     if (input.operation === "setup" && !connection.capabilities.has("memory_setup")) return "capability_not_negotiated";
+    if (input.operation === "create" && input.input.owner !== undefined && !connection.capabilities.has("memory_ownership")) return "capability_not_negotiated";
     return this.#send(connection, input) ? "sent" : "not_attached";
   }
 
@@ -914,6 +929,7 @@ function commandCapabilities(command: AttachV1Command): AttachV1Capability[] {
   if (command.kind === "resolve_approval") return ["approvals"];
   if (command.kind === "resolve_clarify") return ["clarify"];
   if (command.kind === "desktop_session_resume") return ["desktop_session_resume"];
+  if (command.kind === "session_deleted") return ["session_deletion"];
   if (command.kind === "cozyapp_action") return ["cozyapps"];
   if (command.kind === "turn" && (command.mediaIds?.length ?? 0) > 0) return ["draft", "media"];
   return ["draft"];

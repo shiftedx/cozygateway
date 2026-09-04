@@ -484,7 +484,7 @@ export function registerBotRoutes(
     app.post("/bots/:name/memory/sources/:source/items", requireDevice, async (c) => {
       const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
       const limited = memoryTicket(c); if (limited !== undefined) return limited;
-      try { const source = c.req.param("source"); const body = assertValid(BotMemoryWriteRequestSchema, await c.req.json()); const result = await memory.create(resolved.name, source, body); memory.audit(c.get("deviceId"), resolved.name, "create", source, result.item.id); return c.json(result, 201); } catch (error) { return memoryFailure(c, error); }
+      try { const source = c.req.param("source"); const body = assertValid(BotMemoryWriteRequestSchema, await c.req.json()); const result = await memory.create(resolved.name, source, { ...body, owner: "person" }); memory.audit(c.get("deviceId"), resolved.name, "create", source, result.item.id); return c.json(result, 201); } catch (error) { return memoryFailure(c, error); }
     });
     app.patch("/bots/:name/memory/sources/:source/items/:id", requireDevice, async (c) => {
       const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
@@ -1913,6 +1913,22 @@ export function registerBotRoutes(
       return c.json(
         await chat.adoptSession(resolved.name, sessionId, SESSION_LIST_LIMIT),
       );
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  // Capability 60. Only the gateway's direct native session store is deletable here. Dashboard,
+  // room, routine and app-action identities never pass through this authority.
+  app.delete("/bots/:name/sessions/:id", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const sessionId = c.req.param("id") ?? "";
+    if (sessionId.length === 0 || sessionId.length > 256)
+      return c.json(errorBody("invalid_request", "session id is required"), 400);
+    try {
+      await chat.deleteSession(resolved.name, sessionId);
+      return c.body(null, 204);
     } catch (err) {
       return failure(c, err);
     }

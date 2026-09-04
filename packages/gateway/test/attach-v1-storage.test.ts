@@ -7,6 +7,22 @@ import { describe, expect, it } from "vitest";
 import { openStorage } from "../src/storage.ts";
 
 describe("attach-v1 durable transport storage", () => {
+  it("commits a direct-session deletion and its one replay-safe tombstone together", () => {
+    const storage = openStorage(":memory:");
+    const stale = storage.nativeBotChat("sage", 1).sessionId;
+    storage.appendNativeBotMessage({ bot: "sage", sessionId: stale, messageId: "private", role: "user", text: "never crosses the tombstone", at: 2 });
+    storage.resetNativeBotChat("sage", 3);
+    const deleted = storage.deleteNativeBotSession({ bot: "sage", sessionId: stale, deletedAt: 4, enqueue: true });
+    expect(deleted).toMatchObject({ outcome: "deleted", sessionSha: createHash("sha256").update(stale).digest("hex") });
+    expect(storage.nativeBotMessages("sage", stale)).toEqual([]);
+    expect(storage.pendingAttachCommands("sage", 0, 10)).toMatchObject([{
+      commandId: `session-deleted:sage:${createHash("sha256").update(stale).digest("hex")}`,
+      command: { kind: "session_deleted", deletion: { revision: 1, at: 4 } },
+    }]);
+    expect(storage.deleteNativeBotSession({ bot: "sage", sessionId: stale, deletedAt: 5, enqueue: true })).toEqual({ outcome: "not_found" });
+    storage.close();
+  });
+
   it("reconciles only an issued contiguous plugin resume cursor", () => {
     const storage = openStorage(":memory:");
     storage.enqueueAttachCommand("sage", "c1", { kind: "interrupt", threadId: "t", turnId: "u" }, 1);

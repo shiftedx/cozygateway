@@ -2036,6 +2036,8 @@ export const BotMemoryItemSchema = Type.Object({
   tags: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })), trustScore: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
   relativePath: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })),
   backlinks: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 128 })), effectiveNextSession: Type.Optional(Type.Boolean()),
+  /** Capability 60: authoritative creator class. Absent is legacy/unknown, never inferred. */
+  owner: Type.Optional(Type.Union([Type.Literal("person"), Type.Literal("bot")])),
 }, { additionalProperties: false });
 export type BotMemoryItem = Static<typeof BotMemoryItemSchema>;
 /** `setupAvailable` is the GATEWAY's own answer, never the peer's: it is true exactly when the
@@ -2539,4 +2541,4 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  *
  * Additive: all read fields and the patch field are optional. Peers and clients below 59 retain
  * their prior shape, and clients gate catalogue-only rows and the enable write on `>= 59`. */
-export const BOTS_CAPABILITY_VERSION = 59;
+export const BOTS_CAPABILITY_VERSION = 60;

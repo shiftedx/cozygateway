@@ -35,7 +35,7 @@ const source = {
 };
 const item: BotMemoryItem = {
   id: "memory:coffee-order", sourceId: "files", kind: "memory", title: "Coffee",
-  snippet: "flat white with oat milk", timestampKind: "created", revision: "r1",
+  snippet: "flat white with oat milk", timestampKind: "created", revision: "r1", owner: "person",
 };
 
 async function until(predicate: () => boolean, timeoutMs = 4_000): Promise<void> {
@@ -115,7 +115,9 @@ describe("capability-42 memory setup for a runtime bot", () => {
       if (frame.kind === "hello_ack") { acked = true; return; }
       if (frame.kind !== "memory_request") return;
       requests.push(frame);
-      const result = frame.operation === "items" ? { items: [item], sources: [source] } : { sources: [source] };
+      const result = frame.operation === "items" ? { items: [item], sources: [source] }
+        : frame.operation === "create" ? { item }
+          : { sources: [source] };
       ws.send(JSON.stringify({ kind: "memory_result", requestId: frame.requestId, status: "ok", result }));
     });
     await once(ws, "open");
@@ -140,6 +142,23 @@ describe("capability-42 memory setup for a runtime bot", () => {
     expect(await response.json()).toEqual({ sources: [source], setupAvailable: true });
     expect(peer.requests.map((request) => request.operation)).toEqual(["setup"]);
     expect(peer.requests[0]?.input).toEqual(setupBody);
+    peer.ws.close();
+  });
+
+  it("marks an authenticated REST memory create as person-owned without accepting a caller owner", async () => {
+    const peer = await dial(["memory_management", "memory_ownership"]);
+    const response = await authed("/bots/sage/memory/sources/files/items", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: "flat white" }),
+    });
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({ item });
+    expect(peer.requests.at(-1)).toMatchObject({ operation: "create", input: { sourceId: "files", content: "flat white", owner: "person" } });
+    const forged = await authed("/bots/sage/memory/sources/files/items", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: "flat white", owner: "bot" }),
+    });
+    expect(forged.status).toBe(400);
     peer.ws.close();
   });
 

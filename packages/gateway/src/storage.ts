@@ -36,6 +36,12 @@ export type NativeInteractionResolutionRequest =
   | { outcome: "expired"; sessionId: string; turnId: string }
   | { outcome: "unknown" | "not_pending" };
 
+/** Capability 60's single authoritative deletion boundary.  A caller gets no partial success:
+ * the transcript is gone exactly when the replay-safe local-index tombstone is durable. */
+export type NativeSessionDeletion =
+  | { outcome: "deleted"; deletedAt: number; sessionSha: string }
+  | { outcome: "not_found" | "foreign" | "current" | "active" };
+
 /** Terminal receipts are reconnect aids, not permanent interaction history. Pending rows are
  * never pruned; retain only the newest bounded terminal proof per profile. */
 const NATIVE_INTERACTION_SETTLEMENT_LIMIT = 100;
@@ -3184,6 +3190,57 @@ export class Storage {
     if (!this.nativeBotHasSession(bot, sessionId)) return false;
     this.#db.prepare("UPDATE bot_native_chats SET session_id = ?, active_turn_id = NULL, updated_at = ? WHERE bot = ?").run(sessionId, now, bot);
     return true;
+  }
+
+  /** Delete one inactive, non-selected direct conversation and atomically append its Capability
+   * 60 receiver tombstone. `sessionId` never leaves the durable Gateway/peer boundary unhashed. */
+  deleteNativeBotSession(input: { bot: string; sessionId: string; deletedAt: number; enqueue: boolean }): NativeSessionDeletion {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const any = this.#db.prepare("SELECT bot, active_turn_id AS activeTurnId FROM bot_native_sessions WHERE session_id = ? LIMIT 1")
+        .get(input.sessionId) as { bot: string; activeTurnId: string | null } | undefined;
+      if (any === undefined) { this.#db.exec("COMMIT"); return { outcome: "not_found" }; }
+      if (any.bot !== input.bot) { this.#db.exec("COMMIT"); return { outcome: "foreign" }; }
+      const selected = this.#db.prepare("SELECT session_id AS sessionId FROM bot_native_chats WHERE bot = ?")
+        .get(input.bot) as { sessionId: string } | undefined;
+      if (selected?.sessionId === input.sessionId) { this.#db.exec("COMMIT"); return { outcome: "current" }; }
+      if (any.activeTurnId !== null) { this.#db.exec("COMMIT"); return { outcome: "active" }; }
+
+      this.#db.prepare(`DELETE FROM bot_message_receipts WHERE bot = ? AND message_id IN
+        (SELECT message_id FROM bot_native_messages WHERE bot = ? AND session_id = ?)`)
+        .run(input.bot, input.bot, input.sessionId);
+      this.#db.prepare(`DELETE FROM bot_turn_media_deliveries WHERE bot = ? AND message_id IN
+        (SELECT message_id FROM bot_native_messages WHERE bot = ? AND session_id = ?)`)
+        .run(input.bot, input.bot, input.sessionId);
+      for (const table of ["bot_native_messages", "bot_chat_tool_steps", "bot_chat_delegations", "bot_mobile_receipts", "bot_native_interactions", "bot_native_turn_terminals", "bot_desktop_resume_bindings"]) {
+        this.#db.prepare(`DELETE FROM ${table} WHERE bot = ? AND session_id = ?`).run(input.bot, input.sessionId);
+      }
+      this.#db.prepare("DELETE FROM bot_native_sessions WHERE bot = ? AND session_id = ?").run(input.bot, input.sessionId);
+      const sessionSha = createHash("sha256").update(input.sessionId).digest("hex");
+      if (input.enqueue) {
+        const commandId = `session-deleted:${input.bot}:${sessionSha}`;
+        const prior = this.#db.prepare("SELECT 1 AS found FROM attach_command_outbox WHERE agent_id = ? AND command_id = ?")
+          .get(input.bot, commandId) as { found: number } | undefined;
+        if (prior === undefined) {
+          this.#db.prepare("INSERT INTO attach_streams (agent_id, next_command_sequence, last_event_sequence, updated_at) VALUES (?, 1, 0, ?) ON CONFLICT(agent_id) DO NOTHING")
+            .run(input.bot, input.deletedAt);
+          const row = this.#db.prepare("SELECT next_command_sequence AS sequence FROM attach_streams WHERE agent_id = ?").get(input.bot) as { sequence: number };
+          const command: AttachV1Command = {
+            kind: "session_deleted", sessionSha,
+            deletion: { id: commandId, revision: row.sequence, at: input.deletedAt },
+          };
+          this.#db.prepare("INSERT INTO attach_command_outbox (agent_id, sequence, command_id, command_json, created_at, acked_at) VALUES (?, ?, ?, ?, ?, NULL)")
+            .run(input.bot, row.sequence, commandId, JSON.stringify(command), input.deletedAt);
+          this.#db.prepare("UPDATE attach_streams SET next_command_sequence = ?, updated_at = ? WHERE agent_id = ?")
+            .run(row.sequence + 1, input.deletedAt, input.bot);
+        }
+      }
+      this.#db.exec("COMMIT");
+      return { outcome: "deleted", deletedAt: input.deletedAt, sessionSha };
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   setNativeBotTurn(bot: string, sessionId: string, turnId: string | undefined, now: number): void {

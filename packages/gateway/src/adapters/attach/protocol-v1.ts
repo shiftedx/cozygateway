@@ -33,6 +33,8 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("mobile_notifications"),
   Type.Literal("memory_management"),
   Type.Literal("memory_setup"),
+  /** Capability 60: authoritative ownership metadata on memory mutations. */
+  Type.Literal("memory_ownership"),
   Type.Literal("delivery_receipts"),
   Type.Literal("delegation"),
   Type.Literal("thinking"),
@@ -41,6 +43,8 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("cozyapps"),
   Type.Literal("bot_config"),
   Type.Literal("bot_history"),
+  /** Capability 60: durable metadata-only local search tombstone. */
+  Type.Literal("session_deletion"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -155,6 +159,14 @@ const ResolveClarifyCommand = Type.Object({
 const DesktopSessionResumeCommand = Type.Object({
   kind: Type.Literal("desktop_session_resume"), threadId: Id, hermesSessionId: Id, resumeId: Id,
 });
+/** Capability 60. This is not a turn and carries no transcript, title, device, or host data. */
+const SessionDeletedCommand = Type.Object({
+  kind: Type.Literal("session_deleted"),
+  sessionSha: Type.String({ minLength: 64, maxLength: 64, pattern: "^[a-f0-9]{64}$" }),
+  deletion: Type.Object({
+    id: Id, revision: Type.Integer({ minimum: 1 }), at: Type.Integer({ minimum: 1 }),
+  }, { additionalProperties: false }),
+}, { additionalProperties: false });
 const AttachV1MemoryDataRequestSchema = Type.Object({
   kind: Type.Literal("memory_request"), requestId: Id,
   operation: Type.Union([Type.Literal("overview"), Type.Literal("items"), Type.Literal("item"), Type.Literal("create"), Type.Literal("update"), Type.Literal("delete"), Type.Literal("graph")]),
@@ -162,6 +174,8 @@ const AttachV1MemoryDataRequestSchema = Type.Object({
     sourceId: Type.Optional(Id), itemId: Type.Optional(Id), q: Type.Optional(Type.String({ maxLength: 512 })), kind: Type.Optional(BotMemoryKindSchema),
     since: Type.Optional(Type.Integer({ minimum: 0 })), until: Type.Optional(Type.Integer({ minimum: 0 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
     content: Type.Optional(Type.String({ minLength: 1, maxLength: 32_000 })), title: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })), category: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })), tags: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })), expectedRevision: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+    /** Capability 60 internal origin metadata. REST never accepts this field. */
+    owner: Type.Optional(Type.Union([Type.Literal("person"), Type.Literal("bot")])),
   }, { additionalProperties: false }),
 }, { additionalProperties: false });
 const AttachV1MemorySetupRequestSchema = Type.Object({
@@ -276,7 +290,7 @@ const DiscardCommand = Type.Object({
   originalKind: Type.Union([
     Type.Literal("turn"), Type.Literal("steer"), Type.Literal("interrupt"),
     Type.Literal("resolve_approval"), Type.Literal("resolve_clarify"),
-    Type.Literal("desktop_session_resume"), Type.Literal("delivery_receipt"),
+    Type.Literal("desktop_session_resume"), Type.Literal("session_deleted"), Type.Literal("delivery_receipt"),
     Type.Literal("cozyapp_action"),
   ]),
   reason: Type.String({ minLength: 1, maxLength: 512 }),
@@ -284,7 +298,7 @@ const DiscardCommand = Type.Object({
 
 export const AttachV1CommandSchema = Type.Union([
   TurnCommand, SteerCommand, InterruptCommand, ResolveApprovalCommand, ResolveClarifyCommand,
-  DesktopSessionResumeCommand, DeliveryReceiptCommand, CozyAppActionCommand, DiscardCommand,
+  DesktopSessionResumeCommand, SessionDeletedCommand, DeliveryReceiptCommand, CozyAppActionCommand, DiscardCommand,
 ]);
 export type AttachV1Command = Static<typeof AttachV1CommandSchema>;
 

@@ -43,6 +43,8 @@ function nativePlane(bots = ["sage", "luna"], storage = openStorage(":memory:"))
       desktopResumeCommands.push({ bot, ...input });
       return true;
     },
+    canSendSessionDeletion: () => false,
+    flushQueuedCommands: () => undefined,
   } as unknown as AttachV1Ingress;
   let now = 1_000;
   const plane = new NativeBotDataPlane({
@@ -207,6 +209,19 @@ describe("attach-v1 native Bot Mode sessions", () => {
     ]);
     expect(h.control.newSession).not.toHaveBeenCalled();
     expect(h.control.sessions).not.toHaveBeenCalled();
+    h.plane.close();
+    h.storage.close();
+  });
+
+  it("deletes only an inactive non-current direct conversation and erases its transcript", async () => {
+    const h = nativePlane(["sage"]);
+    const first = (await h.surface.canonicalChat("sage")).sessionId;
+    h.storage.appendNativeBotMessage({ bot: "sage", sessionId: first, messageId: "gone", role: "user", text: "private", at: 1_000 });
+    const current = (await h.surface.newSession("sage")).sessionId;
+    await expect(h.surface.deleteSession("sage", first)).resolves.toMatchObject({ name: "sage", sessionId: first });
+    expect((await h.surface.sessions("sage", 10)).sessions.map((row) => row.id)).toEqual([current]);
+    expect(h.storage.nativeBotMessages("sage", first)).toEqual([]);
+    await expect(h.surface.deleteSession("sage", current)).rejects.toThrow("active conversation");
     h.plane.close();
     h.storage.close();
   });

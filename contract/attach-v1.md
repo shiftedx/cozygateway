@@ -76,7 +76,12 @@ discards either durable outbox.
 
 ## Lifecycle
 
-Commands are `turn`, `steer`, `interrupt`, `resolve_approval`, and `resolve_clarify`. A
+Commands are `turn`, `steer`, `interrupt`, `resolve_approval`, and `resolve_clarify`. Capability
+60 additionally defines `session_deleted { sessionSha, deletion: { id, revision, at } }`: a
+durable, ordered, metadata-only tombstone for the peer's bounded local search projection.
+`sessionSha` is `sha256(sessionId)` and `deletion.id` is opaque; the command carries no raw
+session id, transcript, title, path, device, or human label. A peer applies the command
+idempotently and ACKs it through the ordinary command cursor. A
 capability-free `discard` transport tombstone replaces a disconnected queued command if the
 reconnecting plugin no longer negotiates its capability; it advances sequence/dedupe state but
 MUST invoke no Hermes action. Stable

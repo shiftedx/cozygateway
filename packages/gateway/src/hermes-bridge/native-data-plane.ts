@@ -57,6 +57,7 @@ import { BotNameTaken, BotNotFound } from "./crud.ts";
 import {
   BotSessionConflict,
   BotSessionNotFound,
+  type BotSessionDeletion,
   type BotControlSurface,
   type BotChatFileUpload,
   type BotChatPhotoUpload,
@@ -424,6 +425,7 @@ export class NativeBotDataPlane {
       sessions: (name, limit) => this.#sessions(name, limit),
       adoptSession: (name, sessionId, limit) =>
         this.#adoptSession(name, sessionId, limit),
+      deleteSession: (name, sessionId) => this.#deleteSession(name, sessionId),
       chatHistory: (name) => this.#history(name),
       sendChatMessage: (name, text, opts) => this.#send(name, text, opts),
       sendChatPhoto: (name, photo, opts) => this.#sendPhoto(name, photo, opts),
@@ -1353,6 +1355,26 @@ export class NativeBotDataPlane {
       updatedAt: now,
     });
     return { name, sessionId, previousSessionId };
+  }
+
+  /** Capability 60's only native direct-session deletion authority. Group/member threads never
+   * exist in `bot_native_sessions`; a selected or running direct chat is refused before any
+   * transcript row changes. */
+  async #deleteSession(name: string, sessionId: string): Promise<BotSessionDeletion> {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    const now = this.#now();
+    const deleted = this.#storage.deleteNativeBotSession({
+      bot, sessionId, deletedAt: now,
+      enqueue: this.#ingress.canSendSessionDeletion(bot),
+    });
+    if (deleted.outcome === "not_found") throw new BotSessionNotFound(sessionId);
+    if (deleted.outcome === "foreign") throw new BotSessionConflict(sessionId, "another bot");
+    if (deleted.outcome === "current") throw new BackendUnavailable("cannot delete the active conversation; select another session first");
+    if (deleted.outcome === "active") throw new BackendUnavailable("cannot delete a conversation with a running turn");
+    if (deleted.outcome !== "deleted") throw new BotSessionNotFound(sessionId);
+    this.#ingress.flushQueuedCommands(bot);
+    return { name: bot, sessionId, deletedAt: deleted.deletedAt };
   }
 
   async #history(name: string) {

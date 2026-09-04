@@ -857,7 +857,7 @@ describe("capability advertisement", () => {
     // Capability 59 adds optional skill provenance and installation fields, optional toolset
     // availability fields, and an optional additive `enabledSkills` patch list. The gateway relays
     // runtime rows and writes unchanged while keeping Hermes reads and writes on their old shape.
-    expect(BOTS_CAPABILITY_VERSION).toBe(59);
+    expect(BOTS_CAPABILITY_VERSION).toBe(60);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {
