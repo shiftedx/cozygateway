@@ -1507,6 +1507,33 @@ stop_owned_windows_gateway 0
             if ($uninstallReacquired) { $uninstallReplacement.Stop() }
         }
         Assert-True $uninstallReacquired 'uninstall must stop a running generated supervisor even before Node and bundle are resolved'
+
+        # Gateways installed before dashboard-port-state existed retain the exact
+        # prior wrapper identity. It remains owned and stoppable, while a foreign
+        # near-match still fails in the earlier port-change assertion.
+        $legacyWrapper = Join-Path $supervisorLocal 'run-gateway-legacy.sh'
+        $legacyText = Get-Content -LiteralPath $generatedWrapper -Raw
+        $legacyText = $legacyText -replace (' --dashboard-port-state ' + [regex]::Escape($dashboardPortStatePosix)), ''
+        Assert-True (-not ($legacyText -match '--dashboard-port-state')) 'legacy fixture must omit dashboard-port-state exactly'
+        Write-Utf8NoBom $legacyWrapper $legacyText
+        $uninstallSupervisor = Start-Process -FilePath $bashPath -ArgumentList ('"' + $legacyWrapper + '"') -PassThru
+        $legacyListening = $false
+        for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
+            $probe = [Net.Sockets.TcpClient]::new()
+            try { $probe.Connect('127.0.0.1', $supervisorPort); $legacyListening = $true; break }
+            catch { Start-Sleep -Milliseconds 100 }
+            finally { $probe.Dispose() }
+        }
+        Assert-True $legacyListening 'legacy owned supervisor fixture must start its managed child'
+        $legacyStopOutput = (& $bashPath $uninstallStopHarness $supervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $legacyWrapper $supervisorDashboardPort $nodePosix $bundlePosix $dashboardPortStatePosix 2>&1 | Out-String)
+        Assert-True ($LASTEXITCODE -eq 0) "legacy owned gateway stop helper failed: $legacyStopOutput"
+        Start-Sleep -Milliseconds 1500
+        $legacyReacquired = $false
+        $legacyReplacement = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $supervisorPort)
+        try { $legacyReplacement.Start(); $legacyReacquired = $true }
+        catch { $legacyReacquired = $false }
+        finally { if ($legacyReacquired) { $legacyReplacement.Stop() } }
+        Assert-True $legacyReacquired 'legacy owned wrapper without dashboard-port-state must remain stoppable'
     } finally {
         Stop-FixtureProcessTree $supervisor
         Stop-FixtureProcessTree $staleSupervisor
