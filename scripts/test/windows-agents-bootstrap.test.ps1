@@ -220,6 +220,7 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
         'COZYGATEWAY_GIT_BASH' = $fakeBash
         'COZYAGENTS_TEST_LOG' = $agentsLog
         'COZYAGENTS_INSTALL_URL' = $agentsInstaller
+        'COZYAGENTS_INSTALL_SHA256' = (Get-FileHash -LiteralPath $agentsInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
         # A hosted runner holds an administrator token, and the CozyAgents path refuses one. Every
         # case says it is not elevated except the one that is about the refusal.
         'COZYGATEWAY_TEST_ASSUME_ELEVATED' = '0'

@@ -20,6 +20,8 @@ param(
     [string] $Harness,
     # The CozyAgents Windows installer, as a path or a URL. Defaults to the published one-liner.
     [string] $CozyAgentsInstaller,
+    # Required for a custom CozyAgents installer source. The default is pinned below.
+    [string] $CozyAgentsInstallerSha256,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]] $InstallerArguments
 )
@@ -33,6 +35,7 @@ $ProgressPreference = 'SilentlyContinue'
 $PSNativeCommandUseErrorActionPreference = $false
 
 $script:CozyAgentsInstallUrlDefault = 'https://cozylabs.ai/agents.ps1'
+$script:CozyAgentsInstallSha256Default = '75cde8d569226a6ee2b5f198392fed9a7adb3ac0aab47c2ed3f5b2c165bb0abc'
 # Stays false unless a person or a recorded install actually said CozyAgents, because that is the
 # only answer allowed to replace a Hermes bridge in a config that already carries one.
 $script:HarnessChosen = $false
@@ -659,12 +662,20 @@ function Get-CozyAgentsInstallerSource {
     return $script:CozyAgentsInstallUrlDefault
 }
 
+function Get-CozyAgentsInstallerDigest {
+    param([string] $Source, [string] $Requested)
+    $expected = if (-not [string]::IsNullOrWhiteSpace($Requested)) { $Requested } elseif (-not [string]::IsNullOrWhiteSpace($env:COZYAGENTS_INSTALL_SHA256)) { $env:COZYAGENTS_INSTALL_SHA256 } elseif ($Source -eq $script:CozyAgentsInstallUrlDefault) { $script:CozyAgentsInstallSha256Default } else { $null }
+    if ([string]::IsNullOrWhiteSpace($expected)) { Fail 'COZYAGENTS_INSTALL_SHA256 is required for a custom CozyAgents installer source' }
+    if ($expected -notmatch '^[A-Fa-f0-9]{64}$') { Fail 'COZYAGENTS_INSTALL_SHA256 must be a SHA-256 digest' }
+    return $expected.ToLowerInvariant()
+}
+
 # The CozyAgents half of the install: its own verified one-liner does the bundle, the private Node,
 # the launcher and the scheduled task, and this script pairs it, because it is the one side that
 # can mint a runner code without asking anybody to read one off a screen. The installer is run in
 # this process the way irm | iex runs it, so no execution policy is consulted or changed.
 function Install-CozyAgentsHarness {
-    param([string] $AgentsHome, [string] $Source)
+    param([string] $AgentsHome, [string] $Source, [string] $ExpectedSha256)
     Write-Info 'installing CozyAgents, the harness that runs your bots on this machine.'
     # The scriptblock runs in this script's session state, so its $script: variables are this
     # script's: its $script:Tag, $script:Repo and $script:AssetBase are the same names as $tag,
@@ -673,6 +684,9 @@ function Install-CozyAgentsHarness {
     $previousAgentsHome = [Environment]::GetEnvironmentVariable('COZYAGENTS_HOME', 'Process')
     try {
         Copy-OrDownload $Source $staged
+        $actual = (Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne $ExpectedSha256) { Fail 'CozyAgents installer checksum mismatch' }
+        Write-Ok 'verified CozyAgents installer SHA-256'
         $content = [IO.File]::ReadAllText($staged).TrimStart([char]0xFEFF)
         $env:COZYAGENTS_HOME = $AgentsHome
         & ([scriptblock]::Create($content)) -NoPair -InstallHome $AgentsHome
@@ -843,7 +857,7 @@ function Install-WithCozyAgents {
 
     Invoke-CozyGatewayInstaller $bash $InstallerPath '' $ForwardedArguments 'cozyagents' $listener
     Set-CozyGatewayCommandPath $Bin $true
-    Install-CozyAgentsHarness $agentsHome $InstallerSource
+    Install-CozyAgentsHarness $agentsHome $InstallerSource $script:CozyAgentsInstallerSha256
     Write-RunnerModelEnv (Join-Path $agentsHome 'runner.env') $model
     Join-RunnerToGateway $agentsHome $CliPath $ConfigPath
     Complete-Pairing $CliPath $AlreadyConfigured $NoQr
@@ -897,6 +911,7 @@ $isDryRun = $env:COZYGATEWAY_INSTALL_DRYRUN -eq '1' -or $InstallerArguments -con
 $isNoQr = $InstallerArguments -contains '--no-qr'
 $alreadyConfigured = Test-Path -LiteralPath $configPath -PathType Leaf
 $cozyAgentsInstaller = Get-CozyAgentsInstallerSource $CozyAgentsInstaller
+$script:CozyAgentsInstallerSha256 = Get-CozyAgentsInstallerDigest $cozyAgentsInstaller $CozyAgentsInstallerSha256
 
 if ($Repair) {
     if (-not (Test-Path -LiteralPath $bootstrapPath -PathType Leaf) -or -not (Test-Path -LiteralPath "$bootstrapPath.sha256" -PathType Leaf)) {

@@ -50,6 +50,9 @@ HERMES_FOUND=""
 NO_QR=0
 COZYAGENTS_HOME_DIR="${COZYAGENTS_HOME:-$HOME/.cozyagents}"
 COZYAGENTS_INSTALL_URL_DEFAULT="https://cozylabs.ai/agents.sh"
+# Published alongside the reviewed CozyAgents release on 2026-09-04. This pins the secondary
+# installer before it is executed; its own bundle verification starts only after that boundary.
+COZYAGENTS_INSTALL_SHA256_DEFAULT="3aadbed6776d495e68c14ff47f1cde04ae5b702f62e083d65f433fa648328dd1"
 RUNNER_MODEL_PROVIDER="${COZYGATEWAY_RUNNER_MODEL_PROVIDER:-}"
 RUNNER_MODEL_ENDPOINT="${COZYGATEWAY_RUNNER_MODEL_ENDPOINT:-}"
 RUNNER_MODEL_ID="${COZYGATEWAY_RUNNER_MODEL_ID:-}"
@@ -607,8 +610,15 @@ windows_harness_owner() { is_windows && [ "${COZYGATEWAY_WINDOWS_HARNESS_OWNER:-
 # Node, the launcher and the user service, and this installer pairs it, because it is the one
 # side that can mint a runner code without asking anybody to read one off a screen.
 install_cozyagents_harness() {
-  local url stage installer launcher origin name
+  local url expected stage installer launcher origin name actual
   url="${COZYAGENTS_INSTALL_URL:-$COZYAGENTS_INSTALL_URL_DEFAULT}"
+  expected="${COZYAGENTS_INSTALL_SHA256:-}"
+  if [ "$url" = "$COZYAGENTS_INSTALL_URL_DEFAULT" ]; then
+    [ -n "$expected" ] || expected="$COZYAGENTS_INSTALL_SHA256_DEFAULT"
+  elif [ -z "$expected" ]; then
+    die "COZYAGENTS_INSTALL_SHA256 is required for a custom CozyAgents installer source"
+  fi
+  [[ "$expected" =~ ^[a-fA-F0-9]{64}$ ]] || die "COZYAGENTS_INSTALL_SHA256 must be a SHA-256 digest"
   origin="${PUBLIC_URL:-$(gateway_origin)}"
   name="$(hostname 2>/dev/null || uname -n)"; name="${name%.local}"
   if [ "$DRY_RUN" = 1 ]; then
@@ -619,7 +629,11 @@ install_cozyagents_harness() {
   stage="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-agents.XXXXXX")"; trap 'rm -rf "$stage"' RETURN
   installer="$stage/agents.sh"
   copy_or_download "$url" "$installer" || die "could not fetch the CozyAgents installer from $url"
+  actual="$(sha256_of "$installer" | tr '[:upper:]' '[:lower:]')"
+  expected="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
+  [ "$actual" = "$expected" ] || die "CozyAgents installer checksum mismatch"
   chmod 700 "$installer"
+  say "OK    verified CozyAgents installer SHA-256"
   say "INFO  installing CozyAgents, the harness that runs your bots on this machine."
   COZYAGENTS_HOME="$COZYAGENTS_HOME_DIR" bash "$installer" --no-pair --home "$COZYAGENTS_HOME_DIR" ||
     die "the CozyAgents install did not complete successfully"
@@ -2713,7 +2727,7 @@ install_with_cozyagents() {
   say "OK    harness: CozyAgents; your bots run on this computer under the CozyAgents runner"
   windows_harness_owner || confirm_cozyagents_model
   if [ "$prerequisite_missing" = 1 ]; then
-    say "DRY   after prerequisites, configure CozyGateway with no Hermes endpoint, install CozyAgents, and pair it"
+    say "DRY   after prerequisites, write a CozyAgents-only gateway config with no Hermes endpoint, install CozyAgents from ${COZYAGENTS_INSTALL_URL:-$COZYAGENTS_INSTALL_URL_DEFAULT} with SHA-256 verification, and pair it"
     return
   fi
   choose_fresh_listener

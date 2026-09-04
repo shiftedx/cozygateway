@@ -141,6 +141,14 @@ matches the tagged script's Git blob identity from the GitHub Contents API
 before execution; downloads performed by that official installer remain under
 the NousResearch installer trust boundary.
 
+When the CozyAgents harness is selected, the shared installer verifies its secondary installer
+against the pinned release SHA-256 before executing it. A custom `COZYAGENTS_INSTALL_URL` requires
+an explicit `COZYAGENTS_INSTALL_SHA256` (64 hexadecimal characters); there is no unverified
+override. The pin establishes integrity for the reviewed release bytes. The public one-line
+bootstrap itself still relies on HTTPS delivery until a release-attestation-aware bootstrap is
+available; release workflows publish GitHub build attestations that operators can verify with
+`gh attestation verify` before using downloaded artifacts.
+
 For each selected profile it installs and enables the archive, writes only the
 four CozyGateway variables to that profile's mode-600 `.env`, creates a distinct
 attach token and persistent spool, and restarts the profile's existing Hermes
