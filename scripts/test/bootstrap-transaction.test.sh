@@ -209,6 +209,23 @@ expect_absent "$XDG_CONFIG_HOME/systemd/user/cozygateway.service"
 grep -Fqx -- '--user disable --now cozygateway.service' "$manager_log" || fail 'new owned service was not unregistered'
 grep -Fqx -- '--user daemon-reload' "$manager_log" || fail 'manager was not reloaded after unregistering service'
 
+# Metadata can be missing after an interrupted legacy install while its owned
+# service already exists. The registration is still a preimage and survives.
+reset_fixture
+write_asset_pair "$asset_dir" prior
+mkdir -p "$HOME_DIR/local" "$XDG_CONFIG_HOME/systemd/user"
+printf '#!/usr/bin/env bash\nset -euo pipefail\nexec /usr/bin/node %q\n' "$asset_dir/gateway-supervisor.cjs" > "$HOME_DIR/local/run-gateway.sh"
+chmod 700 "$HOME_DIR/local/run-gateway.sh"
+printf '[Service]\nExecStart=/bin/bash %s\n' "$HOME_DIR/local/run-gateway.sh" > "$XDG_CONFIG_HOME/systemd/user/cozygateway.service"
+begin_bootstrap_transaction "$asset_dir"
+write_asset_pair "$asset_dir" fresh
+printf '#!/usr/bin/env bash\nset -euo pipefail\nexec /usr/bin/new-node %q\n' "$asset_dir/gateway-supervisor.cjs" > "$HOME_DIR/local/run-gateway.sh"
+printf '[Service]\nExecStart=/bin/bash %s\n' "$HOME_DIR/local/run-gateway.sh" > "$XDG_CONFIG_HOME/systemd/user/cozygateway.service"
+: > "$manager_log"
+PATH="$fake_bin:$PATH" COZYGATEWAY_TEST_SERVICE_LOG="$manager_log" recover_bootstrap_transaction "$asset_dir"
+expect_contents "$XDG_CONFIG_HOME/systemd/user/cozygateway.service" "$(printf '[Service]\nExecStart=/bin/bash %s' "$HOME_DIR/local/run-gateway.sh")"
+grep -Fqx -- '--user restart cozygateway.service' "$manager_log" || fail 'metadata-missing owned service was not restarted'
+
 # Runtime destinations and snapshot parents are all validated before the first
 # asset write. A redirected local tree or backup cannot yield a mixed release.
 for redirect in destination snapshot; do

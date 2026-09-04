@@ -24,8 +24,8 @@ BOOTSTRAP_ASSETS=(cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz agent-
 BOOTSTRAP_RUNTIME_FILES=(
   local/install-state local/cozygateway.config.json local/gateway.env local/gateway-supervisor.cjs
   local/run-gateway.sh local/dashboard.env local/dashboard-port local/dashboard-owner.ps1
-  local/dashboard-owner-elevate.ps1 local/run-gateway.vbs local/cozygateway-task.xml
-  bin/cozygateway bin/cozygateway.cmd
+  local/dashboard-owner-elevate.ps1 local/run-gateway.vbs local/cozygateway-task.xml local/profiles.json
+  local/bootstrap-source bin/cozygateway bin/cozygateway.cmd
 )
 bootstrap_lock=""
 release_bootstrap_lock() {
@@ -233,15 +233,11 @@ begin_bootstrap_transaction() {
     if [ -e "$asset_dir/$name" ]; then printf 'present:%s\n' "$name" >> "$backup/inventory"; cp "$asset_dir/$name" "$backup/$name" || die "could not snapshot $name"; else printf 'absent:%s\n' "$name" >> "$backup/inventory"; fi
   done; done
   for item in "${BOOTSTRAP_RUNTIME_FILES[@]}"; do bootstrap_snapshot_file "$(bootstrap_runtime_path "$item")" "$backup/runtime" "$backup/inventory" state "$item"; done
-  # A fresh bootstrap has no prior Gateway runtime to restore. Do not inspect
-  # an unrelated user service with the shared label in that case.
-  if [ -e "$HOME_DIR/local/install-state" ]; then
-    service_path="$(bootstrap_service_registration_path)"
-    bootstrap_service_is_owned_or_absent "$service_path" || die "bootstrap service registration is foreign"
-    bootstrap_snapshot_service_registration "$service_path" "$backup" "$backup/inventory"
-  else
-    printf 'service:absent:-\n' >> "$backup/inventory"
-  fi
+  # Service registration is independent of metadata: an interrupted older
+  # installer can have registered the service before writing install-state.
+  service_path="$(bootstrap_service_registration_path)"
+  bootstrap_service_is_owned_or_absent "$service_path" || die "bootstrap service registration is foreign"
+  bootstrap_snapshot_service_registration "$service_path" "$backup" "$backup/inventory"
   printf 'intent=replace-release-assets\n' > "$journal.next" && mv -f "$journal.next" "$journal" || die "could not activate bootstrap transaction"
 }
 bootstrap_xml_unescape() { printf '%s' "$1" | sed 's/&lt;/</g; s/&gt;/>/g; s/&amp;/\&/g'; }
