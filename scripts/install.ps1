@@ -1259,6 +1259,20 @@ function Confirm-CozyAgentsModel {
         return $answers
     }
     if (-not [string]::IsNullOrWhiteSpace($id)) { Fail 'COZYGATEWAY_RUNNER_MODEL_ID needs COZYGATEWAY_RUNNER_MODEL_PROVIDER or COZYGATEWAY_RUNNER_MODEL_ENDPOINT' }
+    $savedProvider = Get-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_PROVIDER'
+    $savedEndpoint = Get-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_ENDPOINT'
+    $savedId = Get-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_ID'
+    $validProvider = $savedProvider -and -not $savedEndpoint -and (Test-SafeModelWord $savedProvider)
+    $validEndpoint = $savedEndpoint -and -not $savedProvider -and (Test-SafeModelEndpoint $savedEndpoint)
+    if ((Test-SafeModelWord $savedId) -and ($validProvider -or $validEndpoint)) {
+        $answers.Provider = $savedProvider
+        $answers.Endpoint = $savedEndpoint
+        $answers.Id = $savedId
+        $answers.ShareHostAuth = (Get-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_SHARE_HOST_MODEL_AUTH') -eq '1'
+        $answers.PreserveExisting = $true
+        Write-Ok 'CozyAgents provider and model are already configured; keeping the saved model settings'
+        return $answers
+    }
     if (-not (Test-PromptAvailable 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT')) {
         Write-Info "no terminal to ask about a model on; set COZYRUNNER_MODEL_PROVIDER (or COZYRUNNER_MODEL_ENDPOINT) and COZYRUNNER_MODEL_ID in $RunnerEnvPath"
         return $answers
@@ -1329,12 +1343,12 @@ function Get-RunnerEnvValue {
 }
 
 function Set-RunnerEnvValue {
-    param([string] $Path, [string] $Name, [string] $Value)
+    param([string] $Path, [string] $Name, [string] $Value, [switch] $Remove)
     $lines = @()
     if (Test-Path -LiteralPath $Path -PathType Leaf) {
         $lines = @(Get-Content -LiteralPath $Path | Where-Object { -not ($_ -like "$Name=*") })
     }
-    $lines += "$Name=$Value"
+    if (-not $Remove) { $lines += "$Name=$Value" }
     [IO.File]::WriteAllText($Path, (($lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
     Protect-FileToOwner $Path
 }
@@ -1343,13 +1357,16 @@ function Set-RunnerEnvValue {
 # in this installer's own state. No key is ever written here.
 function Write-RunnerModelEnv {
     param([string] $RunnerEnvPath, [hashtable] $Answers)
+    if ($Answers.ContainsKey('PreserveExisting') -and $Answers.PreserveExisting) { return }
     if (-not $Answers.Provider -and -not $Answers.Endpoint) { return }
     if (-not $Answers.Id) { return }
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $RunnerEnvPath) | Out-Null
     Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_ID' $Answers.Id
     if ($Answers.Provider) {
+        Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_ENDPOINT' '' -Remove
         Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_PROVIDER' $Answers.Provider
     } else {
+        Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_PROVIDER' '' -Remove
         Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_ENDPOINT' $Answers.Endpoint
     }
     if ($Answers.ShareHostAuth) { Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_SHARE_HOST_MODEL_AUTH' '1' }

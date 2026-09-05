@@ -331,10 +331,36 @@ public static class $className {
         Assert-Contains (Read-LogText (Join-Path $dualHome 'local\cozygateway.config.json')) 'keep-me' 'existing gateway registrations must remain'
         $dualEnvironment['COZYAGENTS_HOME'] = ''
         $beforeRepairEnv = Read-LogText (Join-Path $dualAgents 'runner.env')
+        Write-Utf8NoBom (Join-Path $temp 'unused-model-answers') "openai`nshould-not-replace-saved-model`n"
+        $dualEnvironment['COZYGATEWAY_TEST_MODEL_PROMPT_INPUT'] = (Join-Path $temp 'unused-model-answers')
         $repaired = Invoke-Bootstrap $installer $dualEnvironment @('-Repair', '--no-qr')
         Assert-True ($repaired.ExitCode -eq 0) "dual repair failed: $($repaired.Output)"
+        Assert-Missing $repaired.Output 'Which provider should new bots use?' 'interactive repair must keep a saved valid model without prompting'
         Assert-Contains (Read-LogText (Join-Path $dualHome 'local\install-state')) 'harness=both' 'repair must retain both'
         Assert-True ((Read-LogText (Join-Path $dualAgents 'runner.env')) -eq $beforeRepairEnv) 'repair must recover recorded runner home and preserve all model and pairing values'
+        if ($initial -eq 'fresh') {
+            Write-Utf8NoBom (Join-Path $temp 'rerun-both-answer') "3`n"
+            $dualEnvironment['COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT'] = (Join-Path $temp 'rerun-both-answer')
+            $interactive = Invoke-Bootstrap $installer $dualEnvironment @('--no-qr')
+            Assert-True ($interactive.ExitCode -eq 0) "interactive both rerun failed: $($interactive.Output)"
+            Assert-Missing $interactive.Output 'Which provider should new bots use?' 'interactive both rerun must preserve its saved model'
+            Assert-True ((Read-LogText (Join-Path $dualAgents 'runner.env')) -eq $beforeRepairEnv) 'interactive both rerun must preserve the complete runner env'
+            $dualEnvironment['COZYGATEWAY_RUNNER_MODEL_PROVIDER'] = 'openai'
+            $dualEnvironment['COZYGATEWAY_RUNNER_MODEL_ID'] = 'replacement-model'
+            $providerChange = Invoke-Bootstrap $installer $dualEnvironment @('-Harness', 'both', '--no-qr')
+            Assert-True ($providerChange.ExitCode -eq 0) "provider change failed: $($providerChange.Output)"
+            $changedEnv = Read-LogText (Join-Path $dualAgents 'runner.env')
+            Assert-Contains $changedEnv 'COZYRUNNER_MODEL_PROVIDER=openai' 'explicit provider must replace the saved model source'
+            Assert-Missing $changedEnv 'COZYRUNNER_MODEL_ENDPOINT=' 'switching to a provider must remove the endpoint key'
+            $dualEnvironment['COZYGATEWAY_RUNNER_MODEL_PROVIDER'] = ''
+            $dualEnvironment['COZYGATEWAY_RUNNER_MODEL_ENDPOINT'] = 'http://127.0.0.1:1234/v1'
+            $endpointChange = Invoke-Bootstrap $installer $dualEnvironment @('-Harness', 'both', '--no-qr')
+            Assert-True ($endpointChange.ExitCode -eq 0) "endpoint change failed: $($endpointChange.Output)"
+            $changedEnv = Read-LogText (Join-Path $dualAgents 'runner.env')
+            Assert-Contains $changedEnv 'COZYRUNNER_MODEL_ENDPOINT=http://127.0.0.1:1234/v1' 'explicit endpoint must replace the saved model source'
+            Assert-Missing $changedEnv 'COZYRUNNER_MODEL_PROVIDER=' 'switching to an endpoint must remove the provider key'
+            Assert-Contains $changedEnv 'COZYRUNNER_TOKEN=paired-token' 'changing the model source must preserve runner pairing'
+        }
         Remove-Item -LiteralPath $agentsLog -Force -ErrorAction SilentlyContinue
         $removed = Invoke-Bootstrap $installer $dualEnvironment @('--uninstall')
         Assert-True ($removed.ExitCode -eq 0) "dual uninstall failed: $($removed.Output)"
