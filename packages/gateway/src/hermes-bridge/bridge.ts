@@ -446,6 +446,7 @@ export class HermesBridge implements BotControlSurface {
   #pollTimer: ReturnType<typeof setTimeout> | undefined;
   #seedRetryTimer: ReturnType<typeof setTimeout> | undefined;
   #seedRetryAt: number | undefined;
+  #seedRetryInFlight: Promise<void> | undefined;
   #refreshing: Promise<void> | undefined;
   #dirty = false;
   #closed = false;
@@ -735,7 +736,7 @@ export class HermesBridge implements BotControlSurface {
   /** Arms one timer for the earliest persisted profile seed.  The table, rather than this timer,
    * is the source of truth, so a container restart simply re-arms the same work after reconnect. */
   #schedulePendingSeedRetry(): void {
-    if (this.#closed) return;
+    if (this.#closed || this.#seedRetryInFlight !== undefined) return;
     const next = this.#storage.pendingHermesProfileSeeds()[0];
     if (next === undefined) return;
     // A second failed create may be due sooner than the timer already armed for the first one.
@@ -750,7 +751,14 @@ export class HermesBridge implements BotControlSurface {
     this.#seedRetryTimer = setTimeout(() => {
       this.#seedRetryTimer = undefined;
       this.#seedRetryAt = undefined;
-      void this.#retryPendingSeed(next.profile).finally(() => this.#schedulePendingSeedRetry());
+      const retry = this.#retryPendingSeed(next.profile);
+      this.#seedRetryInFlight = retry;
+      const settled = (): void => {
+        if (this.#seedRetryInFlight !== retry) return;
+        this.#seedRetryInFlight = undefined;
+        this.#schedulePendingSeedRetry();
+      };
+      void retry.then(settled, settled);
     }, wait);
     this.#seedRetryTimer.unref();
   }

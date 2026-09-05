@@ -10,7 +10,11 @@ import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
 import { createHermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge, type ProfileChangeEvent } from "../src/hermes-bridge/bridge.ts";
-import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
+import {
+  startFakeHermesServer,
+  type FakeHermesBehavior,
+  type FakeHermesServer,
+} from "./support/fake-hermes-server.ts";
 
 /** A phone-created Hermes profile is born `setup_required`: it is not in the config attach map,
  *  and on a native install the only thing that can put it there is the installer's provisioning
@@ -57,8 +61,12 @@ async function setup(opts: {
   deleteFails?: boolean;
   /** Holds the successful retry's dashboard read so shutdown can race an in-flight seed. */
   dashboardRetryGate?: () => Promise<void>;
+  dashboardShouldFail?: (
+    request: Parameters<NonNullable<FakeHermesBehavior["dashboard"]>>[0],
+  ) => boolean | Promise<boolean>;
   seedRetryBaseMs?: number;
   dbPath?: string;
+  now?: () => number;
 } = {}) {
   const names = new Set<string>(["default"]);
   const seen: Seen[] = [];
@@ -80,6 +88,8 @@ async function setup(opts: {
       "profiles.describe": () => ({ name: "x", toolsets: [], skills: [] }),
     },
     dashboard: async (request) => {
+      if (await opts.dashboardShouldFail?.(request))
+        return { status: 429, body: { detail: "too many login attempts" } };
       if (dashboardFailures > 0) {
         dashboardFailures -= 1;
         return { status: 429, body: { detail: "too many login attempts" } };
@@ -108,7 +118,7 @@ async function setup(opts: {
     client,
     storage,
     broadcast: () => {},
-    now: () => 1_800_000_000_000,
+    now: opts.now ?? (() => 1_800_000_000_000),
     logSink: (line) => logs.push(line),
     ...(opts.seedRetryBaseMs === undefined ? {} : { seedRetryBaseMs: opts.seedRetryBaseMs }),
     onProfileChange: (event) => {
@@ -309,5 +319,46 @@ describe("profile lifecycle hands the change to the provisioner", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("does not arm the same durable retry again while its attempt is in flight", async () => {
+    let releaseRetry: (() => void) | undefined;
+    const retryGate = new Promise<void>((resolve) => { releaseRetry = resolve; });
+    let nightOwlReads = 0;
+    let retryStarted = false;
+    const { authed, storage } = await setup({
+      seedRetryBaseMs: 250,
+      now: Date.now,
+      dashboardShouldFail: async (request) => {
+        if (request.method !== "GET") return false;
+        const profile = request.query.get("profile");
+        if (profile === "night-owl") {
+          nightOwlReads += 1;
+          if (nightOwlReads === 2) {
+            retryStarted = true;
+            await retryGate;
+          }
+          return nightOwlReads <= 2;
+        }
+        return profile === "second-bot";
+      },
+    });
+
+    expect((await authed("/bots", post({ name: "night-owl" }))).status).toBe(201);
+    await until(() => retryStarted);
+
+    // This second deferred create calls the scheduler while night-owl's due row is still present.
+    // It must not enqueue night-owl again behind the attempt already holding that profile's chain.
+    expect((await authed("/bots", post({ name: "second-bot" }))).status).toBe(201);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    releaseRetry?.();
+
+    await until(() => nightOwlReads >= 3 || storage.pendingHermesProfileSeeds()
+      .some((row) => row.profile === "night-owl" && row.attempts === 2));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(nightOwlReads).toBe(2);
+    expect(storage.pendingHermesProfileSeeds()).toContainEqual(
+      expect.objectContaining({ profile: "night-owl", attempts: 2 }),
+    );
   });
 });
