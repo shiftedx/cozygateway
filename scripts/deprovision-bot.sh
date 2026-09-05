@@ -35,7 +35,7 @@ set -euo pipefail
 HERMES_HOME_ROOT="${HERMES_HOME_ROOT:-$HOME/.hermes}"
 BOX_SSH="${BOX_SSH:-kmcdowell@192.168.99.106}"
 BOX_REPO="${BOX_REPO:-/home/kmcdowell/cozygateway}"
-BOX_CONFIG_REL="${BOX_CONFIG_REL:-docker/cozygateway.config.json}"
+BOX_CONFIG_REL="${BOX_CONFIG_REL:-local/config/cozygateway.config.json}"
 GATEWAY_URL="${GATEWAY_URL:-https://warm.cozylabs.ai}"
 VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-90}"
 # Names that are never a deletable bot. Mirrors RESERVED_PROFILE_NAMES in
@@ -248,10 +248,10 @@ remove_box_env_line() {
 }
 
 recreate_box_gateway() {
-  if [ "$DRY_RUN" = 1 ]; then say "  DRY  docker compose up -d gateway on $BOX_SSH"; return 0; fi
+  if [ "$DRY_RUN" = 1 ]; then say "  DRY  docker compose up -d --force-recreate gateway on $BOX_SSH"; return 0; fi
   # up -d, not --build: the image is unchanged, only the env and the mounted
   # config moved, and a recreate is what re-reads both.
-  ssh -o BatchMode=yes "$BOX_SSH" "cd '$BOX_REPO' && docker compose up -d gateway" >/dev/null
+  ssh -o BatchMode=yes "$BOX_SSH" "cd '$BOX_REPO' && docker compose up -d --force-recreate gateway" >/dev/null
   say "  box gateway recreated"
 }
 
