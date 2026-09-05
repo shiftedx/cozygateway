@@ -25,10 +25,19 @@ import {
   BotHistoryResolveRequestSchema,
   BotHistoryRestoreRequestSchema,
   BotHistoryTryRequestSchema,
+  ChatSessionConfigurationPatchSchema,
 } from "cozygateway-contract";
 import { MEMORY_KINDS, MemoryConflict, MemoryInvalidRequest, MemoryNotFound, createMemoryRateLimiter, type MemoryRateLimiter, type MemorySurface } from "./memory.ts";
 import { HistoryConflict, HistoryInvalidRequest, type HistorySurface } from "./bot-history.ts";
 import type { RunRoutineSurface } from "./native-data-plane.ts";
+import {
+  ChatConfigurationSessionNotFound,
+  ChatConfigurationStaleSession,
+  ChatConfigurationTurnActive,
+  ChatConfigurationUnavailable,
+  ChatConfigurationWorkspaceLocked,
+  type GatewayChatConfiguration,
+} from "../chat-configuration.ts";
 import type { BotMemoryKind } from "cozygateway-contract";
 
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
@@ -397,6 +406,9 @@ export function registerBotRoutes(
    *  unregistered, the same "404 rather than a refusal that implies one exists" rule `history`
    *  follows above. */
   runRoutine?: RunRoutineSurface,
+  /** Capability com.cozylabs.chat-configuration v1. It is assembled only with an adapter that
+   * can prepare a context; a connected but older peer remains unavailable per bot. */
+  chatConfiguration?: GatewayChatConfiguration,
 ): void {
   const chat = bots as BotsSurface;
   // One limiter per registered app, created here rather than at module scope so two gateways in one
@@ -407,6 +419,15 @@ export function registerBotRoutes(
   const photoNow = photoOptions.now ?? (() => Date.now());
   const memoryRate = memoryOptions.rateLimiter ?? createMemoryRateLimiter();
   const memoryNow = memoryOptions.now ?? (() => Date.now());
+  const chatConfigurationFailure = (c: Context<Env>, error: unknown) => {
+    if (error instanceof ChatConfigurationStaleSession || error instanceof ChatConfigurationWorkspaceLocked || error instanceof ChatConfigurationTurnActive)
+      return c.json(extensionErrorBody("conflict", error.message), 409);
+    if (error instanceof ChatConfigurationSessionNotFound)
+      return c.json(errorBody("not_found", error.message), 404);
+    if (error instanceof ChatConfigurationUnavailable)
+      return c.json(extensionErrorBody("unsupported_for_runtime", error.message), 409);
+    return failure(c, error);
+  };
   /** Spends this device's memory budget, answering `429` when it is empty. Every
    *  memory route pays, reads included: the cost being bounded is the attached
    *  plugin's single-in-flight scan, which a read occupies exactly as a write does. */
@@ -1159,6 +1180,43 @@ export function registerBotRoutes(
       return failure(c, err);
     }
   });
+
+  if (chatConfiguration !== undefined) {
+    app.get("/bots/:name/chat/configuration", requireDevice, async (c) => {
+      const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
+      try { return c.json(await chatConfiguration.snapshot(resolved.name)); }
+      catch (error) { return chatConfigurationFailure(c, error); }
+    });
+    app.put("/bots/:name/chat/configuration", requireDevice, async (c) => {
+      const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
+      let body: unknown;
+      try { body = await c.req.json(); } catch { body = undefined; }
+      try {
+        const patch = assertValid(ChatSessionConfigurationPatchSchema, body);
+        return c.json(await chatConfiguration.configure(resolved.name, patch));
+      } catch (error) { return chatConfigurationFailure(c, error); }
+    });
+    app.get("/bots/:name/chat/computers", requireDevice, async (c) => {
+      const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
+      try { return c.json({ computers: await chatConfiguration.computers(resolved.name) }); }
+      catch (error) { return chatConfigurationFailure(c, error); }
+    });
+    app.get("/bots/:name/chat/projects", requireDevice, async (c) => {
+      const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
+      const computerId = c.req.query("computerId");
+      if (computerId === undefined || computerId.length === 0) return c.json(errorBody("invalid_request", "computerId is required"), 400);
+      try { return c.json(await chatConfiguration.projects(resolved.name, computerId)); }
+      catch (error) { return chatConfigurationFailure(c, error); }
+    });
+    app.get("/bots/:name/chat/branches", requireDevice, async (c) => {
+      const resolved = canonicalName(c); if ("response" in resolved) return resolved.response;
+      const computerId = c.req.query("computerId"); const projectId = c.req.query("projectId");
+      if (computerId === undefined || computerId.length === 0 || projectId === undefined || projectId.length === 0)
+        return c.json(errorBody("invalid_request", "computerId and projectId are required"), 400);
+      try { return c.json(await chatConfiguration.branches(resolved.name, computerId, projectId)); }
+      catch (error) { return chatConfigurationFailure(c, error); }
+    });
+  }
 
   // Capability 40. Profile creation and attach readiness are different facts: the Mac-side
   // provisioner may still be wiring the bot after POST /bots has returned 201. This read has no

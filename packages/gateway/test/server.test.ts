@@ -382,6 +382,8 @@ describe("GatewayInfo.capabilities wiring", () => {
         "com.cozylabs.bots": expect.any(Number),
         "com.cozylabs.hermes-desktop-sessions": 4,
         "com.cozylabs.harness-settings": 1,
+        "com.cozylabs.chat-configuration": 1,
+        "com.cozylabs.provider-connections": 1,
         "com.cozylabs.mobile-node": MOBILE_NODE_CAPABILITY_VERSION,
       });
 

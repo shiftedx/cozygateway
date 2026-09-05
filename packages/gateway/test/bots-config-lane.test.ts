@@ -151,6 +151,30 @@ describe("attach-v1 config lane", () => {
     peer.ws.close();
   });
 
+  it("uses the independently negotiated chat configuration capability", async () => {
+    const configuration = { sessionId: "session-1", workspace: null, model: null };
+    const peer = await dial({
+      "chat.configuration.read": {
+        computer: { id: "computer-1", name: "Runner", isAvailable: true },
+        configuration: null,
+      },
+      "chat.configuration.prepare": { configuration },
+      "chat.projects": { projects: [] },
+      "chat.branches": { branches: [] },
+    }, ["chat_configuration"]);
+
+    await expect(config.readChatConfiguration("sage", "session-1")).resolves.toMatchObject({
+      computer: { id: "computer-1" }, configuration: null,
+    });
+    await expect(config.prepareChatConfiguration("sage", configuration)).resolves.toEqual({ configuration });
+    await expect(config.chatProjects("sage", "computer-1")).resolves.toEqual({ projects: [] });
+    await expect(config.chatBranches("sage", "computer-1", "project-1")).resolves.toEqual({ branches: [] });
+    expect(peer.requests.map((request) => request.operation)).toEqual([
+      "chat.configuration.read", "chat.configuration.prepare", "chat.projects", "chat.branches",
+    ]);
+    peer.ws.close();
+  });
+
   it("preserves a peer's additive row-local ignored details on profile writes", async () => {
     const peer = await dial({
       "profile.write": {
@@ -399,14 +423,14 @@ describe("native runtime bot config routing", () => {
     storage.close();
   });
 
-  it("keeps the 409 for delete, provider setup, and desktop transcripts", async () => {
-    const surface = { botProfile: vi.fn(async () => profile) };
+  it("exposes runtime provider catalogs while retaining unsupported delete and desktop transcripts", async () => {
+    const surface = { botProfile: vi.fn(async () => profile), modelConfig: vi.fn(async () => modelConfig) };
     const { plane, storage } = planeWith(surface as unknown as ConfigSurface, {
       deleteBot: vi.fn(), modelProviders: vi.fn(), desktopSessionTranscript: vi.fn(),
     } as Partial<BotsSurface>);
 
     await expect(plane.surface().deleteBot("sage")).rejects.toBeInstanceOf(UnsupportedForRuntime);
-    await expect(plane.surface().modelProviders("sage")).rejects.toMatchObject({ feature: "modelProviders" });
+    await expect(plane.surface().modelProviders("sage")).resolves.toMatchObject({ providers: expect.any(Array) });
     await expect(plane.surface().desktopSessionTranscript("sage", "x")).rejects.toMatchObject({
       feature: "desktopSessionTranscript",
     });

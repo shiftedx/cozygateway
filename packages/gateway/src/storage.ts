@@ -10,6 +10,9 @@ import type {
   BotInteractionSettlement,
   BotPendingClarification,
   BotSummary,
+  BotProfilePatch,
+  ChatModelSelection,
+  ChatWorkspaceSelection,
   Message,
   MessageRole,
   RichBlock,
@@ -47,6 +50,28 @@ export type NativeInteractionResolutionRequest =
 export type NativeSessionDeletion =
   | { outcome: "deleted"; deletedAt: number; sessionSha: string }
   | { outcome: "not_found" | "foreign" | "current" | "active" };
+
+export type NativeChatConfigurationUpdate =
+  | { outcome: "updated"; workspace: ChatWorkspaceSelection | null; model: ChatModelSelection | null }
+  | { outcome: "stale_session" | "workspace_locked" | "turn_active" | "not_found" };
+
+/** One immutable assignment of a local Bot Chat session to a concrete execution peer. The
+ * transport credential is gateway-private and never appears in an app or attach event payload. */
+export interface ChatExecutionRow {
+  executionId: string;
+  bot: string;
+  sessionId: string;
+  runnerId: string;
+  token: string;
+  operationId: string;
+  workspace: ChatWorkspaceSelection;
+  model?: ChatModelSelection | null;
+  sourceProfile?: BotProfilePatch;
+  launchModel?: { provider?: string; endpoint?: string; id: string };
+  harness?: "cozyagents" | "hermes";
+  stage: "starting" | "ready" | "deleted" | "failed";
+  createdAt: number;
+}
 
 /** Terminal receipts are reconnect aids, not permanent interaction history. Pending rows are
  * never pruned; retain only the newest bounded terminal proof per profile. */
@@ -432,6 +457,44 @@ CREATE TABLE IF NOT EXISTS bot_native_sessions (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bot_native_sessions_recent
   ON bot_native_sessions (bot, updated_at DESC, created_at DESC);
+-- Per-session choices deliberately live beside the gateway-owned native sessions rather than on a
+-- bot/runtime row: changing one chat must never relocate or alter another chat.
+CREATE TABLE IF NOT EXISTS bot_chat_configurations (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  workspace_json TEXT,
+  model_json TEXT,
+  workspace_locked INTEGER NOT NULL CHECK (workspace_locked IN (0, 1)),
+  explicitly_configured INTEGER NOT NULL DEFAULT 0 CHECK (explicitly_configured IN (0, 1)),
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bot, session_id)
+) STRICT, WITHOUT ROWID;
+-- Written only after an executing adapter reports workspace preparation succeeded. New sessions
+-- copy this safe preference; merely selecting a workspace must not overwrite it.
+CREATE TABLE IF NOT EXISTS bot_chat_workspace_defaults (
+  bot TEXT PRIMARY KEY,
+  workspace_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
+-- A chat may be prepared more than once before its first accepted turn. Keep each immutable
+-- execution identity for audit/retry, while readers select the newest non-deleted assignment.
+CREATE TABLE IF NOT EXISTS chat_executions (
+  execution_id TEXT PRIMARY KEY,
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  runner_id TEXT NOT NULL,
+  token TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  workspace_json TEXT NOT NULL,
+  model_json TEXT,
+  source_profile_json TEXT,
+  launch_model_json TEXT,
+  harness TEXT NOT NULL DEFAULT 'cozyagents',
+  stage TEXT NOT NULL CHECK (stage IN ('starting', 'ready', 'deleted', 'failed')),
+  created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS chat_executions_session_recent
+  ON chat_executions (bot, session_id, created_at DESC, execution_id DESC);
 -- A separately source-qualified, explicitly adopted Hermes desktop session. The raw Hermes id is
 -- never substituted for its local session id: this row is the only durable bridge between the two
 -- namespaces, and remains pending until the plugin positively confirms switch_session().
@@ -3219,6 +3282,165 @@ export class Storage {
     return sessionId;
   }
 
+  /** The session-scoped configuration is intentionally read without creating a chat pointer. */
+  nativeChatConfiguration(bot: string, sessionId: string): {
+    workspace: ChatWorkspaceSelection | null;
+    model: ChatModelSelection | null;
+    workspaceLocked: boolean;
+    explicitlyConfigured: boolean;
+    activeTurnId?: string;
+  } | undefined {
+    const session = this.#db.prepare(
+      "SELECT active_turn_id AS activeTurnId FROM bot_native_sessions WHERE bot = ? AND session_id = ?",
+    ).get(bot, sessionId) as { activeTurnId: string | null } | undefined;
+    if (session === undefined) return undefined;
+    const row = this.#db.prepare(
+      `SELECT workspace_json AS workspaceJson, model_json AS modelJson, workspace_locked AS workspaceLocked,
+              explicitly_configured AS explicitlyConfigured
+       FROM bot_chat_configurations WHERE bot = ? AND session_id = ?`,
+    ).get(bot, sessionId) as {
+      workspaceJson: string | null; modelJson: string | null; workspaceLocked: number; explicitlyConfigured: number;
+    } | undefined;
+    return {
+      workspace: row?.workspaceJson === null || row?.workspaceJson === undefined
+        ? null : JSON.parse(row.workspaceJson) as ChatWorkspaceSelection,
+      model: row?.modelJson === null || row?.modelJson === undefined
+        ? null : JSON.parse(row.modelJson) as ChatModelSelection,
+      workspaceLocked: row?.workspaceLocked === 1,
+      explicitlyConfigured: row?.explicitlyConfigured === 1,
+      ...(session.activeTurnId === null ? {} : { activeTurnId: session.activeTurnId }),
+    };
+  }
+
+  nativeChatWorkspaceDefault(bot: string): ChatWorkspaceSelection | null {
+    const row = this.#db.prepare(
+      "SELECT workspace_json AS workspaceJson FROM bot_chat_workspace_defaults WHERE bot = ?",
+    ).get(bot) as { workspaceJson: string } | undefined;
+    return row === undefined ? null : JSON.parse(row.workspaceJson) as ChatWorkspaceSelection;
+  }
+
+  /** Newest live assignment for this exact local session. Historical deleted assignments remain
+   * addressable by execution id so retry/replacement cannot silently retarget a past turn. */
+  chatExecution(bot: string, sessionId: string): ChatExecutionRow | undefined {
+    const row = this.#db.prepare(
+      `SELECT execution_id AS executionId, bot, session_id AS sessionId, runner_id AS runnerId,
+              token, operation_id AS operationId, workspace_json AS workspaceJson, stage,
+              model_json AS modelJson, source_profile_json AS sourceProfileJson,
+              launch_model_json AS launchModelJson, harness, created_at AS createdAt
+       FROM chat_executions
+       WHERE bot = ? AND session_id = ? AND stage != 'deleted'
+       ORDER BY created_at DESC, execution_id DESC LIMIT 1`,
+    ).get(bot, sessionId) as ChatExecutionDbRow | undefined;
+    return row === undefined ? undefined : chatExecution(row);
+  }
+
+  chatExecutionById(executionId: string): ChatExecutionRow | undefined {
+    const row = this.#db.prepare(
+      `SELECT execution_id AS executionId, bot, session_id AS sessionId, runner_id AS runnerId,
+              token, operation_id AS operationId, workspace_json AS workspaceJson, stage,
+              model_json AS modelJson, source_profile_json AS sourceProfileJson,
+              launch_model_json AS launchModelJson, harness, created_at AS createdAt
+       FROM chat_executions WHERE execution_id = ?`,
+    ).get(executionId) as ChatExecutionDbRow | undefined;
+    return row === undefined ? undefined : chatExecution(row);
+  }
+
+  chatExecutions(): ChatExecutionRow[] {
+    return (this.#db.prepare(
+      `SELECT execution_id AS executionId, bot, session_id AS sessionId, runner_id AS runnerId,
+              token, operation_id AS operationId, workspace_json AS workspaceJson, stage,
+              model_json AS modelJson, source_profile_json AS sourceProfileJson,
+              launch_model_json AS launchModelJson, harness, created_at AS createdAt FROM chat_executions ORDER BY created_at, execution_id`,
+    ).all() as unknown as ChatExecutionDbRow[]).map(chatExecution);
+  }
+
+  /** Execution identity, placement, token, operation and workspace never mutate in place. */
+  saveChatExecution(row: ChatExecutionRow): void {
+    this.#db.prepare(
+      `INSERT OR IGNORE INTO chat_executions
+         (execution_id, bot, session_id, runner_id, token, operation_id, workspace_json,
+          model_json, source_profile_json, launch_model_json, harness, stage, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(row.executionId, row.bot, row.sessionId, row.runnerId, row.token, row.operationId,
+      JSON.stringify(row.workspace), row.model === undefined ? null : JSON.stringify(row.model),
+      row.sourceProfile === undefined ? null : JSON.stringify(row.sourceProfile),
+      row.launchModel === undefined ? null : JSON.stringify(row.launchModel), row.harness ?? "cozyagents", row.stage, row.createdAt);
+  }
+
+  setChatExecutionStage(executionId: string, stage: ChatExecutionRow["stage"]): void {
+    this.#db.prepare("UPDATE chat_executions SET stage = ? WHERE execution_id = ?").run(stage, executionId);
+  }
+
+  /** Atomically guard the selected session and its current turn before accepting a patch. */
+  updateNativeChatConfiguration(input: {
+    bot: string;
+    sessionId: string;
+    workspace?: ChatWorkspaceSelection | null;
+    model?: ChatModelSelection | null;
+    now: number;
+  }): NativeChatConfigurationUpdate {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const selected = this.#db.prepare(
+        "SELECT session_id AS sessionId FROM bot_native_chats WHERE bot = ?",
+      ).get(input.bot) as { sessionId: string } | undefined;
+      if (selected === undefined) { this.#db.exec("COMMIT"); return { outcome: "not_found" }; }
+      if (selected.sessionId !== input.sessionId) { this.#db.exec("COMMIT"); return { outcome: "stale_session" }; }
+      const current = this.nativeChatConfiguration(input.bot, input.sessionId);
+      if (current === undefined) { this.#db.exec("COMMIT"); return { outcome: "not_found" }; }
+      if (input.workspace !== undefined && current.workspaceLocked) {
+        const same = JSON.stringify(input.workspace) === JSON.stringify(current.workspace);
+        if (!same) { this.#db.exec("COMMIT"); return { outcome: "workspace_locked" }; }
+      }
+      if (input.model !== undefined && current.activeTurnId !== undefined) {
+        this.#db.exec("COMMIT");
+        return { outcome: "turn_active" };
+      }
+      const workspace = input.workspace === undefined ? current.workspace : input.workspace;
+      const model = input.model === undefined ? current.model : input.model;
+      this.#db.prepare(
+        `INSERT INTO bot_chat_configurations
+           (bot, session_id, workspace_json, model_json, workspace_locked, explicitly_configured, updated_at)
+         VALUES (?, ?, ?, ?, ?, 1, ?)
+         ON CONFLICT(bot, session_id) DO UPDATE SET workspace_json = excluded.workspace_json,
+           model_json = excluded.model_json, explicitly_configured = 1, updated_at = excluded.updated_at`,
+      ).run(
+        input.bot, input.sessionId,
+        workspace === null ? null : JSON.stringify(workspace),
+        model === null ? null : JSON.stringify(model),
+        current.workspaceLocked ? 1 : 0, input.now,
+      );
+      this.#db.exec("COMMIT");
+      return { outcome: "updated", workspace, model };
+    } catch (error) {
+      try { this.#db.exec("ROLLBACK"); } catch { /* transaction already closed */ }
+      throw error;
+    }
+  }
+
+  /** Called by the turn admission owner, after the user turn is durably accepted. */
+  lockNativeChatWorkspace(bot: string, sessionId: string, now: number): boolean {
+    const session = this.#db.prepare(
+      "SELECT 1 AS found FROM bot_native_sessions WHERE bot = ? AND session_id = ?",
+    ).get(bot, sessionId) as { found: number } | undefined;
+    if (session === undefined) return false;
+    this.#db.prepare(
+      `INSERT INTO bot_chat_configurations
+         (bot, session_id, workspace_json, model_json, workspace_locked, updated_at)
+       VALUES (?, ?, NULL, NULL, 1, ?)
+       ON CONFLICT(bot, session_id) DO UPDATE SET workspace_locked = 1, updated_at = excluded.updated_at`,
+    ).run(bot, sessionId, now);
+    return true;
+  }
+
+  /** Only a successful adapter preparation becomes the bot's next-new-chat default. */
+  setNativeChatWorkspaceDefault(bot: string, workspace: ChatWorkspaceSelection, now: number): void {
+    this.#db.prepare(
+      `INSERT INTO bot_chat_workspace_defaults (bot, workspace_json, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(bot) DO UPDATE SET workspace_json = excluded.workspace_json, updated_at = excluded.updated_at`,
+    ).run(bot, JSON.stringify(workspace), now);
+  }
+
   /** Stage an explicit Hermes desktop adoption. This does NOT select the local chat: selection
    * follows only the plugin's source/profile-checked confirmation event. A previously confirmed
    * binding is deliberately re-staged with a fresh proof nonce: the plugin's raw-session mapping
@@ -3368,7 +3590,8 @@ export class Storage {
 
   /** Delete one inactive, non-selected direct conversation and atomically append its Capability
    * 60 receiver tombstone. `sessionId` never leaves the durable Gateway/peer boundary unhashed. */
-  deleteNativeBotSession(input: { bot: string; sessionId: string; deletedAt: number; enqueue: boolean }): NativeSessionDeletion {
+  deleteNativeBotSession(input: { bot: string; sessionId: string; deletedAt: number; enqueue: boolean; outboxAgentId?: string }): NativeSessionDeletion {
+    const outboxAgentId = input.outboxAgentId ?? input.bot;
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const any = this.#db.prepare("SELECT bot, active_turn_id AS activeTurnId FROM bot_native_sessions WHERE session_id = ? LIMIT 1")
@@ -3391,13 +3614,13 @@ export class Storage {
       const commandRows = this.#db.prepare(
         `SELECT sequence, command_json AS commandJson FROM attach_command_outbox
          WHERE agent_id = ? AND json_extract(command_json, '$.threadId') = ?`,
-      ).all(input.bot, input.sessionId) as Array<{ sequence: number; commandJson: string }>;
+      ).all(outboxAgentId, input.sessionId) as Array<{ sequence: number; commandJson: string }>;
       for (const row of commandRows) {
         const original = JSON.parse(row.commandJson) as AttachV1Command;
         this.#db.prepare(
           `UPDATE attach_command_outbox SET command_json = ?, cancelled_at = COALESCE(cancelled_at, ?),
            cancel_reason = COALESCE(cancel_reason, 'session deleted') WHERE agent_id = ? AND sequence = ?`,
-        ).run(JSON.stringify({ kind: "discard", originalKind: original.kind, reason: "session deleted" }), input.deletedAt, input.bot, row.sequence);
+        ).run(JSON.stringify({ kind: "discard", originalKind: original.kind, reason: "session deleted" }), input.deletedAt, outboxAgentId, row.sequence);
       }
       // Canonical-home scheduled events deliberately carry no threadId. Their admission-time
       // delivery binding is the canonical session association, so collect it before removing
@@ -3408,7 +3631,7 @@ export class Storage {
          JOIN attach_event_inbox AS inbox
            ON inbox.agent_id = delivery.agent_id AND inbox.event_id = delivery.event_id
          WHERE delivery.agent_id = ? AND delivery.thread_id = ?`,
-      ).all(input.bot, input.sessionId) as Array<{ sequence: number; eventId: string; frameJson: string }>;
+      ).all(outboxAgentId, input.sessionId) as Array<{ sequence: number; eventId: string; frameJson: string }>;
       const scheduledMediaIds = new Set<string>();
       for (const row of scheduledRows) {
         const frame = JSON.parse(row.frameJson) as AttachV1EventFrame;
@@ -3417,7 +3640,7 @@ export class Storage {
       const directEventRows = this.#db.prepare(
         `SELECT sequence, event_id AS eventId FROM attach_event_inbox
          WHERE agent_id = ? AND json_extract(frame_json, '$.event.threadId') = ?`,
-      ).all(input.bot, input.sessionId) as Array<{ sequence: number; eventId: string }>;
+      ).all(outboxAgentId, input.sessionId) as Array<{ sequence: number; eventId: string }>;
       const eventRows = new Map<number, { eventId: string }>([
         ...directEventRows.map((row) => [row.sequence, { eventId: row.eventId }] as const),
         ...scheduledRows.map((row) => [row.sequence, { eventId: row.eventId }] as const),
@@ -3427,10 +3650,10 @@ export class Storage {
           `UPDATE attach_event_inbox SET frame_json = ?, disposition = 'discarded', applied_at = COALESCE(applied_at, ?),
            projection_error = COALESCE(projection_error, 'session deleted'), dead_lettered_at = COALESCE(dead_lettered_at, ?)
            WHERE agent_id = ? AND sequence = ?`,
-        ).run(JSON.stringify({ kind: "event", sequence, eventId: row.eventId, event: { kind: "presence", state: "absent" } }), input.deletedAt, input.deletedAt, input.bot, sequence);
+        ).run(JSON.stringify({ kind: "event", sequence, eventId: row.eventId, event: { kind: "presence", state: "absent" } }), input.deletedAt, input.deletedAt, outboxAgentId, sequence);
       }
       this.#db.prepare("DELETE FROM attach_scheduled_deliveries WHERE agent_id = ? AND thread_id = ?")
-        .run(input.bot, input.sessionId);
+        .run(outboxAgentId, input.sessionId);
       this.#db.prepare(
         `DELETE FROM attach_media WHERE agent_id = ? AND media_id IN (
            SELECT json_extract(attachment.value, '$.fileId') FROM bot_native_messages AS message,
@@ -3444,7 +3667,7 @@ export class Storage {
            SELECT 1 FROM attach_event_inbox AS inbox, json_each(inbox.frame_json, '$.event.mediaIds') AS media
            WHERE inbox.agent_id = ? AND media.value = attach_media.media_id
          )`,
-      ).run(input.bot, input.bot, input.sessionId, input.bot, input.sessionId, input.bot);
+      ).run(outboxAgentId, input.bot, input.sessionId, input.bot, input.sessionId, outboxAgentId);
       const deleteUnreferencedMedia = this.#db.prepare(
         `DELETE FROM attach_media WHERE agent_id = ? AND media_id = ? AND NOT EXISTS (
            SELECT 1 FROM bot_native_messages AS message, json_each(message.attachments_json) AS attachment
@@ -3456,8 +3679,8 @@ export class Storage {
          )`,
       );
       for (const mediaId of scheduledMediaIds)
-        deleteUnreferencedMedia.run(input.bot, mediaId, input.bot, input.sessionId, input.bot);
-      for (const table of ["bot_native_messages", "bot_chat_tool_steps", "bot_chat_delegations", "bot_mobile_receipts", "bot_native_interactions", "bot_native_turn_terminals", "bot_desktop_resume_bindings"]) {
+        deleteUnreferencedMedia.run(outboxAgentId, mediaId, input.bot, input.sessionId, outboxAgentId);
+      for (const table of ["bot_native_messages", "bot_chat_tool_steps", "bot_chat_delegations", "bot_mobile_receipts", "bot_native_interactions", "bot_native_turn_terminals", "bot_desktop_resume_bindings", "bot_chat_configurations"]) {
         this.#db.prepare(`DELETE FROM ${table} WHERE bot = ? AND session_id = ?`).run(input.bot, input.sessionId);
       }
       this.#db.prepare("DELETE FROM bot_native_sessions WHERE bot = ? AND session_id = ?").run(input.bot, input.sessionId);
@@ -3465,19 +3688,19 @@ export class Storage {
       if (input.enqueue) {
         const commandId = `session-deleted:${input.bot}:${sessionSha}`;
         const prior = this.#db.prepare("SELECT 1 AS found FROM attach_command_outbox WHERE agent_id = ? AND command_id = ?")
-          .get(input.bot, commandId) as { found: number } | undefined;
+          .get(outboxAgentId, commandId) as { found: number } | undefined;
         if (prior === undefined) {
           this.#db.prepare("INSERT INTO attach_streams (agent_id, next_command_sequence, last_event_sequence, updated_at) VALUES (?, 1, 0, ?) ON CONFLICT(agent_id) DO NOTHING")
-            .run(input.bot, input.deletedAt);
-          const row = this.#db.prepare("SELECT next_command_sequence AS sequence FROM attach_streams WHERE agent_id = ?").get(input.bot) as { sequence: number };
+            .run(outboxAgentId, input.deletedAt);
+          const row = this.#db.prepare("SELECT next_command_sequence AS sequence FROM attach_streams WHERE agent_id = ?").get(outboxAgentId) as { sequence: number };
           const command: AttachV1Command = {
             kind: "session_deleted", sessionSha,
             deletion: { id: commandId, revision: row.sequence, at: input.deletedAt },
           };
           this.#db.prepare("INSERT INTO attach_command_outbox (agent_id, sequence, command_id, command_json, created_at, acked_at) VALUES (?, ?, ?, ?, ?, NULL)")
-            .run(input.bot, row.sequence, commandId, JSON.stringify(command), input.deletedAt);
+            .run(outboxAgentId, row.sequence, commandId, JSON.stringify(command), input.deletedAt);
           this.#db.prepare("UPDATE attach_streams SET next_command_sequence = ?, updated_at = ? WHERE agent_id = ?")
-            .run(row.sequence + 1, input.deletedAt, input.bot);
+            .run(row.sequence + 1, input.deletedAt, outboxAgentId);
         }
       }
       this.#db.exec("COMMIT");
@@ -3714,6 +3937,14 @@ export class Storage {
     this.#db
       .prepare("INSERT INTO bot_native_sessions (bot, session_id, created_at, updated_at, active_turn_id) VALUES (?, ?, ?, ?, NULL)")
       .run(bot, sessionId, now, now);
+    const workspace = this.nativeChatWorkspaceDefault(bot);
+    if (workspace !== null) {
+      this.#db.prepare(
+        `INSERT INTO bot_chat_configurations
+           (bot, session_id, workspace_json, model_json, workspace_locked, updated_at)
+         VALUES (?, ?, ?, NULL, 0, ?)`,
+      ).run(bot, sessionId, JSON.stringify(workspace), now);
+    }
     return sessionId;
   }
 
@@ -3798,6 +4029,9 @@ export class Storage {
    * never present a decision as submitted without retaining the exact command for replay. */
   requestNativeInteractionResolution(input: {
     bot: string;
+    /** The authenticated peer that receives the durable command. It can be a session execution
+     * identity while `bot` remains the source bot that owns the interaction record. */
+    outboxAgentId?: string;
     kind: "approval" | "clarify";
     interactionId: string;
     decision: string;
@@ -3806,6 +4040,7 @@ export class Storage {
     command: AttachV1Command;
     requestedAt: number;
   }): NativeInteractionResolutionRequest {
+    const outboxAgentId = input.outboxAgentId ?? input.bot;
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const row = this.#db
@@ -3861,20 +4096,20 @@ export class Storage {
           `INSERT INTO attach_streams (agent_id, next_command_sequence, last_event_sequence, updated_at)
            VALUES (?, 1, 0, ?) ON CONFLICT(agent_id) DO NOTHING`,
         )
-        .run(input.bot, input.requestedAt);
+        .run(outboxAgentId, input.requestedAt);
       const stream = this.#db
         .prepare("SELECT next_command_sequence AS sequence FROM attach_streams WHERE agent_id = ?")
-        .get(input.bot) as { sequence: number };
+        .get(outboxAgentId) as { sequence: number };
       this.#db
         .prepare(
           `INSERT INTO attach_command_outbox
              (agent_id, sequence, command_id, command_json, created_at, acked_at)
            VALUES (?, ?, ?, ?, ?, NULL)`,
         )
-        .run(input.bot, stream.sequence, input.commandId, JSON.stringify(input.command), input.requestedAt);
+        .run(outboxAgentId, stream.sequence, input.commandId, JSON.stringify(input.command), input.requestedAt);
       this.#db
         .prepare("UPDATE attach_streams SET next_command_sequence = ?, updated_at = ? WHERE agent_id = ?")
-        .run(stream.sequence + 1, input.requestedAt, input.bot);
+        .run(stream.sequence + 1, input.requestedAt, outboxAgentId);
       const marked = this.#db
         .prepare(
           `UPDATE bot_native_interactions
@@ -4161,6 +4396,8 @@ export class Storage {
       ["delegations", "bot_chat_delegations", "bot"],
       ["routineOverrides", "bot_routine_overrides", "bot"],
       ["chatPointer", "bot_native_chats", "bot"],
+      ["chatConfiguration", "bot_chat_configurations", "bot"],
+      ["chatWorkspaceDefault", "bot_chat_workspace_defaults", "bot"],
       ["sessions", "bot_native_sessions", "bot"],
       ["messages", "bot_native_messages", "bot"],
       ["receipts", "bot_message_receipts", "bot"],
@@ -4531,6 +4768,34 @@ interface NativeBotMessageDbRow {
   inReplyToId: string | null;
 }
 
+interface ChatExecutionDbRow {
+  executionId: string;
+  bot: string;
+  sessionId: string;
+  runnerId: string;
+  token: string;
+  operationId: string;
+  workspaceJson: string;
+  modelJson: string | null;
+  sourceProfileJson: string | null;
+  launchModelJson: string | null;
+  harness: "cozyagents" | "hermes";
+  stage: ChatExecutionRow["stage"];
+  createdAt: number;
+}
+
+function chatExecution(row: ChatExecutionDbRow): ChatExecutionRow {
+  return {
+    executionId: row.executionId, bot: row.bot, sessionId: row.sessionId, runnerId: row.runnerId,
+    token: row.token, operationId: row.operationId,
+    workspace: JSON.parse(row.workspaceJson) as ChatWorkspaceSelection,
+    ...(row.modelJson === null ? {} : { model: JSON.parse(row.modelJson) as ChatModelSelection | null }),
+    ...(row.sourceProfileJson === null ? {} : { sourceProfile: JSON.parse(row.sourceProfileJson) as BotProfilePatch }),
+    ...(row.launchModelJson === null ? {} : { launchModel: JSON.parse(row.launchModelJson) as { provider?: string; endpoint?: string; id: string } }),
+    harness: row.harness, stage: row.stage, createdAt: row.createdAt,
+  };
+}
+
 function nativeBotMessage(row: NativeBotMessageDbRow): BotChatMessage {
   return {
     id: row.id,
@@ -4586,6 +4851,25 @@ export function openStorage(dbPath: string): Storage {
   );
   if (!attachStreamColumns.has("session_deletion_capability"))
     db.exec("ALTER TABLE attach_streams ADD COLUMN session_deletion_capability INTEGER");
+  const chatConfigurationColumns = new Set(
+    (db.prepare("PRAGMA table_info(bot_chat_configurations)").all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!chatConfigurationColumns.has("explicitly_configured"))
+    db.exec("ALTER TABLE bot_chat_configurations ADD COLUMN explicitly_configured INTEGER NOT NULL DEFAULT 0");
+  // Chat execution rows carry only restart metadata.  The token remains in the gateway database;
+  // model endpoint/provider fields are metadata-only and no credential is ever duplicated here.
+  const chatExecutionColumns = new Set(
+    (db.prepare("PRAGMA table_info(chat_executions)").all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  for (const [name, sql] of [
+    ["model_json", "ALTER TABLE chat_executions ADD COLUMN model_json TEXT"],
+    ["source_profile_json", "ALTER TABLE chat_executions ADD COLUMN source_profile_json TEXT"],
+    ["launch_model_json", "ALTER TABLE chat_executions ADD COLUMN launch_model_json TEXT"],
+    ["harness", "ALTER TABLE chat_executions ADD COLUMN harness TEXT NOT NULL DEFAULT 'cozyagents'"],
+  ] as const)
+    if (!chatExecutionColumns.has(name)) db.exec(sql);
   // Capability 55. An existing database's `runners` predates the person-set display name; adding
   // it nullable is the whole migration. Nothing is backfilled: every existing row reopens with no
   // display name, which is exactly "nobody has renamed this yet" -- the honest state. Idempotent,

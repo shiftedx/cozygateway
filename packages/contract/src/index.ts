@@ -19,3 +19,5 @@ export * from "./harness-workspace.ts";
 export * from "./harness-update.ts";
 export * from "./hermes-session-management.ts";
 export * from "./cozyapps.ts";
+export * from "./chat-configuration.ts";
+export * from "./provider-connections.ts";

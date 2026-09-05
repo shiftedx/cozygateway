@@ -7,6 +7,9 @@ import {
   BotProfileSchema,
   BotRoutineListResponseSchema,
   BotRoutineWriteResponseSchema,
+  ChatBranchListSchema,
+  ChatProjectListSchema,
+  ModelProviderConnectionCatalogSchema,
 } from "cozygateway-contract";
 import type {
   BotModelConfig,
@@ -18,11 +21,23 @@ import type {
   BotRoutineListResponse,
   BotRoutinePatch,
   BotRoutineWriteResponse,
+  ChatBranchList,
+  ChatBranch,
+  ChatComputer,
+  ChatProjectList,
+  ChatProject,
+  ChatSessionConfiguration,
+  ModelProviderConnectionCatalog,
 } from "cozygateway-contract";
 
 import { BackendUnavailable } from "../errors.ts";
 import { createPhotoRateLimiter, type PhotoRateLimiter } from "./photos.ts";
-import { AttachV1ConfigAckSchema } from "../adapters/attach/protocol-v1.ts";
+import {
+  AttachV1ChatConfigurationPrepareResultSchema,
+  AttachV1ChatConfigurationReadResultSchema,
+  AttachV1ConfigAckSchema,
+  ProviderConnectionTransferResultSchema,
+} from "../adapters/attach/protocol-v1.ts";
 import type { AttachV1ConfigRequest, AttachV1ConfigResult } from "../adapters/attach/protocol-v1.ts";
 import type { ConfigSendOutcome } from "../adapters/attach/ingress-v1.ts";
 import type { BotRoutineList } from "./bridge.ts";
@@ -31,6 +46,7 @@ import { BotNotFound } from "./crud.ts";
 import { ModelConfigInvalid } from "./model-config.ts";
 import { RoutineNotFound, type RoutineWriteResult } from "./routines.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
+import type { ChatConfigurationDriver } from "../chat-configuration.ts";
 
 export type ConfigOperation = AttachV1ConfigRequest["operation"];
 type ConfigInput = AttachV1ConfigRequest["input"];
@@ -109,6 +125,19 @@ export interface ConfigSurface {
   /** Trigger one run now. It has no REST route in this version; the lane carries it so a peer
    *  implements the whole set once rather than growing a second wire change later. */
   runRoutine(name: string, id: string): Promise<void>;
+  chatProjects(name: string, computerId: string): Promise<ChatProjectList>;
+  chatBranches(name: string, computerId: string, projectId: string): Promise<ChatBranchList>;
+  readChatConfiguration(name: string, sessionId: string): Promise<{
+    computer: ChatComputer;
+    configuration: ChatSessionConfiguration | null;
+  }>;
+  prepareChatConfiguration(name: string, configuration: ChatSessionConfiguration): Promise<{
+    configuration: ChatSessionConfiguration;
+  }>;
+  providerConnections(name: string): Promise<ModelProviderConnectionCatalog>;
+  saveProviderConnection(name: string, handoffId: string): Promise<ModelProviderConnectionCatalog>;
+  testProviderConnection(name: string, id: string): Promise<ModelProviderConnectionCatalog>;
+  removeProviderConnection(name: string, id: string): Promise<ModelProviderConnectionCatalog>;
 }
 
 interface Pending {
@@ -131,6 +160,14 @@ function validResult(operation: ConfigOperation, result: unknown): result is Con
     case "routines.list": return Value.Check(BotRoutineListResponseSchema, result);
     case "routines.create": case "routines.update": return Value.Check(BotRoutineWriteResponseSchema, result);
     case "routines.delete": case "routines.run": return Value.Check(AttachV1ConfigAckSchema, result);
+    case "chat.projects": return Value.Check(ChatProjectListSchema, result);
+    case "chat.branches": return Value.Check(ChatBranchListSchema, result);
+    case "chat.configuration.read": return Value.Check(AttachV1ChatConfigurationReadResultSchema, result);
+    case "chat.configuration.prepare": return Value.Check(AttachV1ChatConfigurationPrepareResultSchema, result);
+    case "providers.connections.list": case "providers.connections.save":
+    case "providers.connections.test": case "providers.connections.remove": case "providers.connections.import":
+      return Value.Check(ModelProviderConnectionCatalogSchema, result);
+    case "providers.connections.transfer": return Value.Check(ProviderConnectionTransferResultSchema, result);
   }
 }
 
@@ -244,6 +281,46 @@ export class AttachConfigSurface implements ConfigSurface {
   async runRoutine(name: string, id: string): Promise<void> {
     await this.#request(name, "routines.run", { id });
   }
+  async chatProjects(name: string, computerId: string): Promise<ChatProjectList> {
+    return await this.#request(name, "chat.projects", { computerId }) as ChatProjectList;
+  }
+  async chatBranches(name: string, computerId: string, projectId: string): Promise<ChatBranchList> {
+    return await this.#request(name, "chat.branches", { computerId, projectId }) as ChatBranchList;
+  }
+  async readChatConfiguration(name: string, sessionId: string): Promise<{
+    computer: ChatComputer;
+    configuration: ChatSessionConfiguration | null;
+  }> {
+    return await this.#request(name, "chat.configuration.read", { sessionId }) as {
+      computer: ChatComputer;
+      configuration: ChatSessionConfiguration | null;
+    };
+  }
+  async prepareChatConfiguration(name: string, configuration: ChatSessionConfiguration): Promise<{
+    configuration: ChatSessionConfiguration;
+  }> {
+    return await this.#request(name, "chat.configuration.prepare", { configuration }) as {
+      configuration: ChatSessionConfiguration;
+    };
+  }
+  async providerConnections(name: string): Promise<ModelProviderConnectionCatalog> {
+    return await this.#request(name, "providers.connections.list", {}) as ModelProviderConnectionCatalog;
+  }
+  async saveProviderConnection(name: string, handoffId: string): Promise<ModelProviderConnectionCatalog> {
+    return await this.#request(name, "providers.connections.save", { handoffId }) as ModelProviderConnectionCatalog;
+  }
+  async testProviderConnection(name: string, id: string): Promise<ModelProviderConnectionCatalog> {
+    return await this.#request(name, "providers.connections.test", { id }) as ModelProviderConnectionCatalog;
+  }
+  async removeProviderConnection(name: string, id: string): Promise<ModelProviderConnectionCatalog> {
+    return await this.#request(name, "providers.connections.remove", { id }) as ModelProviderConnectionCatalog;
+  }
+  async transferProviderConnection(name: string, id: string, executionId: string): Promise<{ handoffId: string }> {
+    return await this.#request(name, "providers.connections.transfer", { id, executionId }) as { handoffId: string };
+  }
+  async importProviderConnection(name: string, handoffId: string): Promise<ModelProviderConnectionCatalog> {
+    return await this.#request(name, "providers.connections.import", { handoffId }) as ModelProviderConnectionCatalog;
+  }
 
   /** The published write response minus the bot name the caller already holds. `replacedId` and
    *  `orphanedId` are carried only when the peer sent them: an absent key means no rewrite
@@ -274,6 +351,58 @@ export class AttachConfigSurface implements ConfigSurface {
       pending.reject(new BackendUnavailable("gateway is shutting down"));
     }
     this.#pending.clear();
+  }
+}
+
+/** Adapter for the attached runtime's session-execution lane. The current protocol deliberately
+ * offers its executor computer through `chat.configuration.read`; it does not advertise a host
+ * inventory, so this adapter exposes only that same executor rather than inventing computers.
+ * A runtime that cannot prepare the selected context is unavailable before the gateway persists
+ * a selection or admits a turn. */
+export class AttachChatConfigurationDriver implements ChatConfigurationDriver {
+  readonly #surface: ConfigSurface;
+
+  constructor(surface: ConfigSurface) { this.#surface = surface; }
+
+  async availability(input: { bot: string; sessionId: string }): Promise<{ available: boolean; unavailableReason?: string }> {
+    try {
+      await this.#surface.readChatConfiguration(input.bot, input.sessionId);
+      return { available: true };
+    } catch (error) {
+      if (error instanceof ConfigNotNegotiated) return { available: false, unavailableReason: "the attached runtime does not support session execution configuration" };
+      if (error instanceof BackendUnavailable) return { available: false, unavailableReason: error.message };
+      throw error;
+    }
+  }
+
+  async computers(input: { bot: string; sessionId: string }): Promise<readonly ChatComputer[]> {
+    const result = await this.#surface.readChatConfiguration(input.bot, input.sessionId);
+    return [result.computer];
+  }
+
+  async projects(bot: string, computerId: string): Promise<readonly ChatProject[]> {
+    return (await this.#surface.chatProjects(bot, computerId)).projects;
+  }
+
+  async branches(bot: string, computerId: string, projectId: string): Promise<readonly ChatBranch[]> {
+    return (await this.#surface.chatBranches(bot, computerId, projectId)).branches;
+  }
+
+  async prepareContext(input: {
+    bot: string;
+    sessionId: string;
+    workspace: import("cozygateway-contract").ChatWorkspaceSelection | null;
+    model: import("cozygateway-contract").ChatModelSelection | null;
+  }): Promise<{ workspacePrepared: boolean }> {
+    const configuration: ChatSessionConfiguration = {
+      sessionId: input.sessionId,
+      workspace: input.workspace,
+      model: input.model,
+    };
+    const result = await this.#surface.prepareChatConfiguration(input.bot, configuration);
+    if (JSON.stringify(result.configuration) !== JSON.stringify(configuration))
+      throw new BackendUnavailable("runtime prepared a different chat configuration");
+    return { workspacePrepared: input.workspace !== null };
   }
 }
 

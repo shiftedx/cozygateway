@@ -42,6 +42,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from urllib.error import HTTPError
 from typing import Any, Dict, List, Optional, Set, Tuple
+from pathlib import Path
 
 from .attach_client import (
     AttachAuthError,
@@ -857,6 +858,11 @@ class AttachAdapter:
             str(extra.get("profile") or os.getenv("HERMES_PROFILE") or "").strip()
             or _profile_from_hermes_home()
         )
+        # Present only on a remote execution adapter. Its provider-import operation is refused on
+        # the ordinary source profile, so a handoff id cannot be consumed into arbitrary state.
+        self._execution_id: Optional[str] = str(extra.get("execution_id") or os.getenv("COZYGATEWAY_EXECUTION_ID") or "").strip() or None
+        # A remote execution process owns exactly one gateway conversation.
+        self._execution_session_id: Optional[str] = str(os.getenv("COZYGATEWAY_EXECUTION_SESSION_ID") or "").strip() or None
         self.ca_file: Optional[str] = (
             os.getenv("COZYGATEWAY_CA_FILE") or extra.get("ca_file") or None
         )
@@ -1195,6 +1201,7 @@ class AttachAdapter:
                 on_clarify=self._dispatch_clarify_command,
                 on_desktop_resume=self._on_desktop_resume_command,
                 on_memory=self._on_memory_command,
+                on_config=self._on_config_request,
                 on_cozyapp_action=self._on_cozyapp_action_command,
                 on_ready=self._on_transport_ready,
                 commands=hermes_gateway_commands(),
@@ -1240,6 +1247,12 @@ class AttachAdapter:
         if self._closing:
             return
         self._ready.set()
+        try:
+            from .execution_health import current
+            health = current()
+            if health is not None: health.mark_attach_online()
+        except Exception:
+            logger.debug("attach: execution health attach update failed", exc_info=True)
         self._mark_connected()  # type: ignore[attr-defined]
         _register_active_adapter(self)
         client = self._client
@@ -1669,6 +1682,99 @@ class AttachAdapter:
                 return
 
     # -- inbound turn ---------------------------------------------------------
+    def _execution_thread_allowed(self, thread_id: object) -> bool:
+        """Fail closed when this child process receives another conversation's frame."""
+        expected = getattr(self, "_execution_session_id", None)
+        return expected is None or thread_id == expected
+
+    def _execution_workspace_root(self, session_id: str) -> Optional[Path]:
+        """The dedicated child process carries its resolved workspace without re-making a worktree."""
+        if not self._execution_session_id or session_id != self._execution_session_id:
+            return None
+        raw = os.getenv("COZYGATEWAY_EXECUTION_WORKSPACE_ROOT", "")
+        try:
+            root = Path(raw).resolve(strict=True)
+            return root if root.is_dir() and Path.cwd().resolve() == root else None
+        except OSError:
+            return None
+
+    def toolsets_for_source(self, source: Any) -> Optional[List[str]]:
+        """Execution profile tool/MCP allow-list via Hermes' public adapter hook."""
+        if self._execution_session_id is None or getattr(source, "chat_id", None) != self._execution_session_id:
+            return None
+        try:
+            profile = json.loads(os.getenv("COZYGATEWAY_SOURCE_PROFILE_JSON", "{}"))
+        except json.JSONDecodeError:
+            return []
+        selected = profile.get("enabledToolsets", [])
+        mcp = profile.get("enabledMcpServers", [])
+        if not isinstance(selected, list) or not isinstance(mcp, list): return []
+        return [item for item in [*selected, *mcp] if isinstance(item, str) and item.strip()]
+
+    async def _apply_execution_launch_model(self, source: Any) -> bool:
+        """Install bootstrap model metadata on this child session before a turn can run."""
+        if self._execution_session_id is None:
+            return True
+        try:
+            selected = json.loads(os.getenv("COZYGATEWAY_EXECUTION_MODEL_JSON", "{}"))
+        except json.JSONDecodeError:
+            return False
+
+        if not selected:
+            return True
+        # Runner launch metadata uses {provider?, endpoint?, id}; a direct chat model
+        # selection uses {providerId, modelId}. Endpoint-only custom models deliberately wait
+        # for the execution-scoped provider import and subsequent chat prepare request.
+        provider = selected.get("providerId") or selected.get("provider")
+        model = selected.get("modelId") or selected.get("id")
+        if not isinstance(provider, str) or not provider or not isinstance(model, str) or not model:
+            return not bool(selected.get("endpoint"))
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        if runner is None or store is None:
+            return False
+        try:
+            entry = await store.get_or_create_session(source)
+            await store.set_model_override(entry.session_key, {"model": model, "provider": provider})
+            if provider.startswith("custom-"):
+                from .provider_connections import ProviderConnectionStore
+                override = ProviderConnectionStore().runtime_override(provider, model)
+                if override is None:
+                    return False
+                runner._session_state(entry.session_key).conversation.model_override = override
+            runner._evict_cached_agent(entry.session_key)
+            return True
+        except Exception:
+            logger.debug("attach: could not install execution launch model", exc_info=True)
+            return False
+
+    @staticmethod
+    def _set_session_effort(runner: Any, session_key: str, effort: Any) -> bool:
+        """Apply a Hermes reasoning level to exactly one GatewayRunner session.
+
+        Hermes Gateway exposes ``_set_session_reasoning_override`` specifically for the
+        session-scoped ``/reasoning`` command. It feeds ``_resolve_session_reasoning_config``
+        at turn dispatch, so it neither writes config.yaml nor changes another conversation.
+        ``None`` means inherit this isolated profile's configured default.
+        """
+        setter = getattr(runner, "_set_session_reasoning_override", None)
+        if not callable(setter):
+            return effort is None
+        if effort is None:
+            setter(session_key, None)
+            return True
+        if not isinstance(effort, str):
+            return False
+        try:
+            from hermes_constants import parse_reasoning_effort
+            parsed = parse_reasoning_effort(effort)
+        except Exception:
+            return False
+        if parsed is None:
+            return False
+        setter(session_key, parsed)
+        return True
+
     def _on_turn(self, turn: TurnFrame) -> None:
         """Bound to the client's ``on_turn``: schedule the inject as a task.
 
@@ -1679,6 +1785,9 @@ class AttachAdapter:
         distinct turns is treated as new rather than deduped (see ``_seen_turns``
         for the exact boundary).
         """
+        if not self._execution_thread_allowed(turn.thread_id):
+            logger.warning("attach: execution process refused a turn for another session")
+            return
         key = (turn.thread_id, turn.turn_id)
         if key in self._seen_turns:
             # Not moved to MRU here: a duplicate delivery does not extend its own
@@ -1694,6 +1803,254 @@ class AttachAdapter:
             return  # not in an event loop (defensive)
         self._spawn_background(loop, self._handle_turn(turn))
 
+    async def _on_config_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Serve the narrow session-execution lane without touching profile-wide settings.
+
+        Hermes' AsyncSessionStore persists a model override on one session key and the runner
+        rebuilds that session's cached agent before its next turn. That is the only public,
+        isolated model seam available to this adapter. Workspace/project routing has no matching
+        attach-safe API: its Hermes RPC takes a host path, which this wire deliberately never
+        carries, so those selections are refused rather than treated as decoration.
+        """
+        operation = request.get("operation")
+        input_value = request.get("input")
+        if not isinstance(operation, str) or not isinstance(input_value, dict):
+            return {"status": "invalid_request", "message": "invalid config request"}
+        if operation in {"model.read", "model.write"}:
+            return await self._on_model_config_request(operation, input_value)
+        if operation.startswith("providers.connections."):
+            try:
+                from .provider_connections import ProviderConnectionStore
+                provider_store = getattr(self, "_provider_connections", None)
+                if provider_store is None:
+                    provider_store = ProviderConnectionStore(); self._provider_connections = provider_store
+                if operation == "providers.connections.list":
+                    if input_value: return {"status": "invalid_request", "message": "list accepts no input"}
+                    return {"status": "ok", "result": provider_store.catalog()}
+                if operation == "providers.connections.save":
+                    handoff_id = input_value.get("handoffId")
+                    client = self._client
+                    fetch = getattr(client, "fetch_provider_handoff", None)
+                    if not isinstance(handoff_id, str) or not callable(fetch):
+                        return {"status": "invalid_request", "message": "handoffId is required"}
+                    handoff = await fetch(handoff_id)
+                    if handoff is None: return {"status": "unavailable", "message": "provider handoff is unavailable or expired"}
+                    return {"status": "ok", "result": provider_store.save(handoff)}
+                if operation == "providers.connections.transfer":
+                    identifier, execution_id = input_value.get("id"), input_value.get("executionId")
+                    transfer = getattr(self._client, "transfer_provider_connection", None)
+                    if not isinstance(identifier, str) or not isinstance(execution_id, str) or not callable(transfer):
+                        return {"status": "invalid_request", "message": "id and executionId are required"}
+                    handoff_id = await transfer(execution_id, provider_store.transfer_payload(identifier))
+                    if handoff_id is None: return {"status": "unavailable", "message": "provider transfer was not accepted"}
+                    return {"status": "ok", "result": {"handoffId": handoff_id}}
+                if operation == "providers.connections.import":
+                    handoff_id = input_value.get("handoffId")
+                    fetch = getattr(self._client, "fetch_provider_handoff", None)
+                    if self._execution_id is None: return {"status": "unavailable", "message": "provider import requires a scoped execution adapter"}
+                    if not isinstance(handoff_id, str) or not callable(fetch):
+                        return {"status": "invalid_request", "message": "handoffId is required"}
+                    handoff = await fetch(handoff_id)
+                    if handoff is None: return {"status": "unavailable", "message": "provider handoff is unavailable or expired"}
+                    return {"status": "ok", "result": provider_store.import_connection(handoff)}
+                identifier = input_value.get("id")
+                if not isinstance(identifier, str) or not identifier:
+                    return {"status": "invalid_request", "message": "connection id is required"}
+                if operation == "providers.connections.test": return {"status": "ok", "result": provider_store.test(identifier)}
+                if operation == "providers.connections.remove": return {"status": "ok", "result": provider_store.remove(identifier)}
+            except KeyError:
+                return {"status": "not_found", "message": "provider connection was not found"}
+            except Exception:
+                logger.debug("attach: provider connection request failed", exc_info=True)
+                return {"status": "unavailable", "message": "provider connection operation failed"}
+            return {"status": "invalid_request", "message": "unknown provider connection operation"}
+        try:
+            from .chat_context import ChatContextError, HermesChatContext, set_hermes_session_cwd
+            contexts = HermesChatContext(self._profile)
+        except Exception:
+            return {"status": "unavailable", "message": "local Hermes chat context is unavailable"}
+        if operation == "chat.projects":
+            computer_id = input_value.get("computerId")
+            if not isinstance(computer_id, str) or not computer_id:
+                return {"status": "invalid_request", "message": "computerId is required"}
+            try: return {"status": "ok", "result": {"projects": contexts.projects(computer_id)}}
+            except ChatContextError as exc: return {"status": "invalid_request", "message": str(exc)}
+        if operation == "chat.branches":
+            computer_id, project_id = input_value.get("computerId"), input_value.get("projectId")
+            if not isinstance(computer_id, str) or not isinstance(project_id, str) or not computer_id or not project_id:
+                return {"status": "invalid_request", "message": "computerId and projectId are required"}
+            try: return {"status": "ok", "result": {"branches": contexts.branches(computer_id, project_id)}}
+            except ChatContextError as exc: return {"status": "invalid_request", "message": str(exc)}
+        if operation == "chat.configuration.read":
+            session_id = input_value.get("sessionId")
+            if not isinstance(session_id, str) or not session_id:
+                return {"status": "invalid_request", "message": "sessionId is required"}
+            if not self._execution_thread_allowed(session_id):
+                return {"status": "invalid_request", "message": "chat session is not owned by this execution"}
+            return {
+                "status": "ok",
+                "result": {
+                    "computer": {"id": contexts.computer_id, "name": contexts.computer_name, "isAvailable": contexts.computer_available},
+                    "configuration": None,
+                },
+            }
+        if operation != "chat.configuration.prepare":
+            return {"status": "unavailable", "message": "this runtime does not serve that config operation"}
+        configuration = input_value.get("configuration")
+        if not isinstance(configuration, dict):
+            return {"status": "invalid_request", "message": "configuration is required"}
+        session_id = configuration.get("sessionId")
+        if not self._execution_thread_allowed(session_id):
+            return {"status": "invalid_request", "message": "chat session is not owned by this execution"}
+        workspace = configuration.get("workspace")
+        model = configuration.get("model")
+        if (not isinstance(session_id, str) or not session_id
+                or workspace is not None and not isinstance(workspace, dict)
+                or model is not None and not isinstance(model, dict)):
+            return {"status": "invalid_request", "message": "malformed chat configuration"}
+        if isinstance(model, dict) and (not isinstance(model.get("providerId"), str) or not model.get("providerId")
+                                       or not isinstance(model.get("modelId"), str) or not model.get("modelId")):
+            return {"status": "invalid_request", "message": "model providerId and modelId are required"}
+        if isinstance(model, dict) and model.get("effort") is not None:
+            if not isinstance(model.get("effort"), str):
+                return {"status": "invalid_request", "message": "model effort is invalid"}
+            try:
+                from hermes_constants import parse_reasoning_effort
+                valid_effort = parse_reasoning_effort(model["effort"])
+            except Exception:
+                valid_effort = None
+            if valid_effort is None:
+                return {"status": "invalid_request", "message": "model effort is invalid"}
+            if not callable(getattr(getattr(self, "gateway_runner", None), "_set_session_reasoning_override", None)):
+                return {"status": "unavailable", "message": "this Hermes build has no isolated effort override"}
+        if self._active_turn.get(session_id) is not None:
+            return {"status": "invalid_request", "message": "chat session is running"}
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        if runner is None or store is None:
+            return {"status": "unavailable", "message": "Hermes session store is unavailable"}
+        try:
+            source = self._inbound_source(session_id)
+            entry = await store.get_or_create_session(source)
+            runtime_override = None
+            if isinstance(model, dict) and str(model["providerId"]).startswith("custom-"):
+                from .provider_connections import ProviderConnectionStore
+                runtime_override = ProviderConnectionStore().runtime_override(model["providerId"], model["modelId"])
+                if runtime_override is None:
+                    return {"status": "not_found", "message": "custom provider connection was not found"}
+            if workspace is not None:
+                root = self._execution_workspace_root(session_id) or contexts.prepare_workspace(workspace, session_id)
+                # A standalone execution owns one OS process whose launch cwd is the resolved
+                # runner worktree. It deliberately avoids TUI's in-process cwd setter and never
+                # creates a second worktree. Shared Hermes adapters still use the session setter.
+                if self._execution_workspace_root(session_id) is None and not set_hermes_session_cwd(entry.session_key, root):
+                    return {"status": "unavailable", "message": "this Hermes build cannot set this session workspace"}
+            if model is None:
+                await store.set_model_override(entry.session_key, None)
+                if not self._set_session_effort(runner, entry.session_key, None):
+                    return {"status": "unavailable", "message": "this Hermes build cannot clear this session effort"}
+            else:
+                # AsyncSessionStore sanitizes the persisted value to model/provider/base_url and
+                # resolves credentials locally; no credential crosses the attach config lane.
+                await store.set_model_override(entry.session_key, {
+                    "model": model["modelId"], "provider": model["providerId"],
+                })
+                if runtime_override is not None:
+                    # Hermes' persistent store intentionally strips api_key. Its runtime session
+                    # state is the legitimate per-session seam that supplies the key to this turn.
+                    state = runner._session_state(entry.session_key)
+                    state.conversation.model_override = runtime_override
+                if not self._set_session_effort(runner, entry.session_key, model.get("effort")):
+                    return {"status": "invalid_request", "message": "model effort is not supported by this Hermes build"}
+            runner._evict_cached_agent(entry.session_key)
+        except ChatContextError as exc:
+            return {"status": "invalid_request", "message": str(exc)}
+        except Exception:
+            logger.debug("attach: session model preparation failed", exc_info=True)
+            return {"status": "unavailable", "message": "Hermes could not prepare this session model"}
+        try:
+            from .execution_health import current
+            health = current()
+            if health is not None: health.mark_configuration_ready()
+        except Exception:
+            logger.debug("attach: execution health configuration update failed", exc_info=True)
+        return {"status": "ok", "result": {"configuration": configuration}}
+
+    async def _on_model_config_request(self, operation: str, input_value: Dict[str, Any]) -> Dict[str, Any]:
+        """Serve custom-provider bot defaults without editing Hermes' process-wide config.
+
+        A profile default is stored as an opaque provider/model reference.  At dispatch it is
+        re-resolved from the private connection store and installed in the target session only.
+        """
+        from .provider_connections import BotModelDefaultStore, ProviderConnectionStore
+        providers = getattr(self, "_provider_connections", None)
+        if providers is None:
+            providers = ProviderConnectionStore(); self._provider_connections = providers
+        defaults = getattr(self, "_bot_model_defaults", None)
+        if defaults is None:
+            defaults = BotModelDefaultStore(); self._bot_model_defaults = defaults
+        if operation == "model.write":
+            if not input_value or set(input_value) - {"model", "effort"}:
+                return {"status": "invalid_request", "message": "invalid model patch"}
+            if input_value.get("effort") not in (None,):
+                return {"status": "unavailable", "message": "this Hermes attachment has no isolated effort default"}
+            if "model" in input_value:
+                selected = input_value["model"]
+                if selected is not None:
+                    if not isinstance(selected, str) or not self._custom_model_available(providers, selected):
+                        return {"status": "invalid_request", "message": "unknown custom provider model"}
+                defaults.write(selected)
+        return {"status": "ok", "result": self._bot_model_config(providers, defaults)}
+
+    @staticmethod
+    def _custom_model_available(providers: Any, selected: str) -> bool:
+        for connection in providers.catalog().get("connections", []):
+            prefix = str(connection.get("id") or "") + ":"
+            if selected.startswith(prefix):
+                return selected[len(prefix):] in set(connection.get("models") or []) | set(connection.get("manualModels") or [])
+        return False
+
+    @staticmethod
+    def _bot_model_config(providers: Any, defaults: Any) -> Dict[str, Any]:
+        catalog, rows = [], []
+        for connection in providers.catalog().get("connections", []):
+            identifier = connection["id"]
+            models = sorted(set(connection.get("models") or []) | set(connection.get("manualModels") or []))
+            catalog.extend({"id": f"{identifier}:{model}", "displayName": model} for model in models)
+            rows.append({"slug": identifier, "name": connection["name"], "authenticated": True,
+                         "modelCount": len(models), "baseUrl": connection["baseUrl"]})
+        return {"model": defaults.read()["model"], "effort": None, "catalog": catalog, "efforts": [], "providers": rows}
+
+    async def _apply_bot_default_model(self, turn: TurnFrame, source: Any) -> bool:
+        """Set a custom bot default on this session just before dispatch, never globally."""
+        if turn.chat_context is not None and turn.chat_context.get("model") is not None:
+            return True  # A prepared per-chat override wins over the bot default.
+        from .provider_connections import BotModelDefaultStore, ProviderConnectionStore
+        defaults = getattr(self, "_bot_model_defaults", None)
+        if defaults is None:
+            defaults = BotModelDefaultStore(); self._bot_model_defaults = defaults
+        selected = defaults.read()["model"]
+        if selected is None:
+            return True
+        providers = getattr(self, "_provider_connections", None)
+        if providers is None:
+            providers = ProviderConnectionStore(); self._provider_connections = providers
+        provider, separator, model = selected.partition(":")
+        override = providers.runtime_override(provider, model) if separator and model else None
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        if override is None or runner is None or store is None:
+            return False
+        try:
+            entry = await store.get_or_create_session(source)
+            await store.set_model_override(entry.session_key, {"model": model, "provider": provider})
+            runner._session_state(entry.session_key).conversation.model_override = override
+            runner._evict_cached_agent(entry.session_key)
+            return True
+        except Exception:
+            logger.debug("attach: could not install bot default for session", exc_info=True)
+            return False
+
     async def _handle_turn(self, turn: TurnFrame) -> None:
         """Inject one turn frame as a synthetic inbound message."""
         from gateway.platforms.base import MessageEvent, cache_media_bytes  # harness-defined identifiers
@@ -1705,6 +2062,10 @@ class AttachAdapter:
         # not MessageEvent.message_id. Carry the gateway-issued turn id on the
         # trusted source so worker/deferred ContextVar copies retain it.
         source = self._inbound_source(turn.thread_id, message_id=turn.turn_id)
+        if not await self._apply_execution_launch_model(source) or not await self._apply_bot_default_model(turn, source):
+            await self._safe_failed(turn.thread_id, turn.turn_id, "bot model unavailable")
+            self._cleanup_turn(turn.thread_id, turn.turn_id)
+            return
         # The persisted link represents the prior serialized Desktop segment. Drain it before
         # any mobile write starts; text/time dedupe would lose legitimate repeated turns. Hermes
         # 0.20.5's cross-process ``session_turn_leases`` serializes this session lineage, so this
@@ -1833,7 +2194,8 @@ class AttachAdapter:
         thread_id = command.get("threadId")
         raw_id = command.get("hermesSessionId")
         resume_id = command.get("resumeId")
-        if not all(isinstance(value, str) and 0 < len(value) <= 256 for value in (thread_id, raw_id, resume_id)):
+        if (not all(isinstance(value, str) and 0 < len(value) <= 256 for value in (thread_id, raw_id, resume_id))
+                or not self._execution_thread_allowed(thread_id)):
             return
         if any(marker in raw_id for marker in ("\x00", "\r", "\n", "..", "/", "\\")):
             return
@@ -1895,6 +2257,8 @@ class AttachAdapter:
     # -- mid-turn steer -------------------------------------------------------
     def _on_steer(self, frame: SteerFrame) -> None:
         """Bound to the client's ``on_steer``: schedule the injection as a task."""
+        if not self._execution_thread_allowed(frame.thread_id):
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1924,6 +2288,8 @@ class AttachAdapter:
     # -- hard interrupt -------------------------------------------------------
     def _on_interrupt(self, frame: InterruptFrame) -> None:
         """Bound to the client's ``on_interrupt``: schedule the native stop as a task."""
+        if not self._execution_thread_allowed(frame.thread_id):
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1988,7 +2354,7 @@ class AttachAdapter:
         """Resolve a durable v1 approval through Hermes' native slash-command seam."""
         thread_id = command.get("threadId")
         decision = command.get("decision")
-        if not isinstance(thread_id, str) or decision not in {"approve", "deny"}:
+        if not isinstance(thread_id, str) or decision not in {"approve", "deny"} or not self._execution_thread_allowed(thread_id):
             return
         try:
             loop = asyncio.get_running_loop()
@@ -1999,7 +2365,7 @@ class AttachAdapter:
     async def _dispatch_approval_command(self, command: Dict[str, Any]) -> None:
         thread_id = command.get("threadId")
         decision = command.get("decision")
-        if isinstance(thread_id, str) and decision in {"approve", "deny"}:
+        if isinstance(thread_id, str) and decision in {"approve", "deny"} and self._execution_thread_allowed(thread_id):
             await self._handle_approval_command(thread_id, decision)
 
     async def _handle_approval_command(self, thread_id: str, decision: str) -> None:
@@ -2021,7 +2387,8 @@ class AttachAdapter:
         turn_id = command.get("turnId")
         clarify_id = command.get("clarifyId")
         option_id = command.get("optionId")
-        if not all(isinstance(value, str) and value for value in (thread_id, turn_id, clarify_id, option_id)):
+        if (not all(isinstance(value, str) and value for value in (thread_id, turn_id, clarify_id, option_id))
+                or not self._execution_thread_allowed(thread_id)):
             return
         try:
             loop = asyncio.get_running_loop()
@@ -2105,7 +2472,8 @@ class AttachAdapter:
         turn_id = command.get("turnId")
         clarify_id = command.get("clarifyId")
         option_id = command.get("optionId")
-        if all(isinstance(value, str) and value for value in (thread_id, turn_id, clarify_id, option_id)):
+        if (all(isinstance(value, str) and value for value in (thread_id, turn_id, clarify_id, option_id))
+                and self._execution_thread_allowed(thread_id)):
             await self._handle_clarify_command(thread_id, turn_id, clarify_id, option_id)
 
     async def _handle_clarify_command(
@@ -5397,6 +5765,11 @@ def register(ctx: Any) -> None:
     The adapter is built lazily so importing this module (e.g. to call ``register``)
     never requires the harness to be fully initialized.
     """
+    try:
+        from .execution_health import start_from_environment
+        start_from_environment()
+    except Exception:
+        logger.debug("attach: execution health server unavailable", exc_info=True)
     ctx.register_platform(
         name=PLATFORM_NAME,
         label="CozyGateway",
