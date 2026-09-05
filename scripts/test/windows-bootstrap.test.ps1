@@ -148,13 +148,14 @@ function ConvertTo-PowerShellSingleQuotedLiteral {
 }
 
 function New-FakeUserNetTCPIPModule {
-    param([string] $MarkerPath)
-    $documents = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
-    Assert-True (-not [string]::IsNullOrWhiteSpace($documents)) 'Windows must expose the current user Documents directory for the PSModulePath regression test'
-    $windowsPowerShellRoot = Join-Path $documents 'WindowsPowerShell'
+    param([string] $FixtureRoot, [string] $MarkerPath)
+    Assert-True (Test-Path -LiteralPath $FixtureRoot -PathType Container) 'PSModulePath regression test requires its test-owned fixture root'
+    $windowsPowerShellRoot = Join-Path $FixtureRoot 'WindowsPowerShell'
     $modulesRoot = Join-Path $windowsPowerShellRoot 'Modules'
     $moduleRoot = Join-Path $modulesRoot 'NetTCPIP'
-    Assert-True (-not (Test-Path -LiteralPath $moduleRoot)) "PSModulePath regression test refuses to replace an existing user NetTCPIP module at $moduleRoot"
+    $fixtureRootPath = (Resolve-Path -LiteralPath $FixtureRoot).Path.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    Assert-True ($moduleRoot.StartsWith($fixtureRootPath + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) "PSModulePath regression test module must remain beneath its fixture root: $moduleRoot"
+    Assert-True (-not (Test-Path -LiteralPath $moduleRoot)) "PSModulePath regression test refuses to replace an existing fixture NetTCPIP module at $moduleRoot"
     $module = [pscustomobject]@{
         ModuleRoot = $moduleRoot
         ModulesRoot = $modulesRoot
@@ -356,6 +357,7 @@ function Invoke-ElevationWrapperHarness {
         [string] $CapturePath,
         [string] $ChildCapturePath,
         [hashtable] $Paths,
+        [string] $FixtureModuleRoot,
         [int] $ChildCode,
         [switch] $Cancel
     )
@@ -364,6 +366,7 @@ function Invoke-ElevationWrapperHarness {
     $resultPathLiteral = ConvertTo-PowerShellSingleQuotedLiteral $resultPath
     $cancelLiteral = if ($Cancel) { '$true' } else { '$false' }
     $childCaptureLiteral = ConvertTo-PowerShellSingleQuotedLiteral $ChildCapturePath
+    $fixtureModuleRootLiteral = ConvertTo-PowerShellSingleQuotedLiteral $FixtureModuleRoot
     $poisonPrefix = Join-Path (Split-Path -Parent $Harness) 'poisoned-installer-environment'
     $poisonPrefixLiteral = ConvertTo-PowerShellSingleQuotedLiteral $poisonPrefix
     $childBody = @'
@@ -449,7 +452,7 @@ Remove-Item -LiteralPath __START_CAPTURE__ -Force
 $poisonPrefix = __POISON_PREFIX__
 $env:PATH = Join-Path $poisonPrefix 'PATH'
 $env:PSHOME = Join-Path $poisonPrefix 'PSHOME'
-$env:PSModulePath = Join-Path $poisonPrefix 'PSModulePath'
+$env:PSModulePath = __FIXTURE_MODULE_ROOT__ + ';' + (Join-Path $poisonPrefix 'PSModulePath')
 $env:SystemRoot = Join-Path $poisonPrefix 'SystemRoot'
 $env:WINDIR = Join-Path $poisonPrefix 'WINDIR'
 $env:COMSPEC = Join-Path $poisonPrefix 'COMSPEC\cmd.exe'
@@ -473,7 +476,7 @@ foreach ($key in $before.Keys) {
 } | Export-Clixml -LiteralPath __RESULT_PATH__
 exit 0
 '@
-    $harnessBody = $harnessBody.Replace('__START_CAPTURE__', $startCaptureLiteral).Replace('__CANCEL__', $cancelLiteral).Replace('__RESULT_PATH__', $resultPathLiteral).Replace('__POISON_PREFIX__', $poisonPrefixLiteral)
+    $harnessBody = $harnessBody.Replace('__START_CAPTURE__', $startCaptureLiteral).Replace('__CANCEL__', $cancelLiteral).Replace('__RESULT_PATH__', $resultPathLiteral).Replace('__FIXTURE_MODULE_ROOT__', $fixtureModuleRootLiteral).Replace('__POISON_PREFIX__', $poisonPrefixLiteral)
     Write-Utf8NoBom $Harness $harnessBody
     Remove-Item -LiteralPath $CapturePath, $ChildCapturePath, $resultPath -Force -ErrorAction SilentlyContinue
     $keys = @('DASHBOARD_SESSION_TOKEN', 'PROVIDER_API_KEY', 'TASK2_REVIEW_ARBITRARY_SECRET')
@@ -792,9 +795,9 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     $portReservation.Start()
     $ownerProbePort = ([Net.IPEndPoint]$portReservation.LocalEndpoint).Port
     $portReservation.Stop()
-    $fakeUserNetTCPIP = New-FakeUserNetTCPIPModule $fakeModuleMarker
+    $fakeUserNetTCPIP = New-FakeUserNetTCPIPModule $temp $fakeModuleMarker
     try {
-        $wrapperResult = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths 0
+        $wrapperResult = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths $fakeUserNetTCPIP.ModulesRoot 0
         $ownerProbeResult = Invoke-OwnerHelperScript $instrumentedOwner $ownerProbePort
         $failedImportResult = Invoke-OwnerHelperScript $failedImportOwner $ownerProbePort
     } finally {
