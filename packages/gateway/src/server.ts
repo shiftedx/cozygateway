@@ -938,7 +938,7 @@ export async function startGateway(
         connectedRunners: runnerLane.connectedRunners(),
       });
     }
-    const attach = attachV1Ingress.health();
+    const attach = attachV1Ingress.connectionHealth(hermesProfileIds);
     return maintenanceRuntimeHealth({
       harness: "hermes",
       attach: { configured: attach.configured, online: attach.online },
@@ -1030,7 +1030,7 @@ export async function startGateway(
     hermesGlobalSkillsLog: traceLog,
     ...(harnessWorkspace.available ? { harnessWorkspace } : {}),
     ...(options.pairingAdmission === undefined ? {} : { pairingAdmission: options.pairingAdmission }),
-    attachHealth: () => attachV1Ingress.health(),
+    attachHealth: () => ({ ...attachV1Ingress.health(), hermes: attachV1Ingress.connectionHealth(hermesProfileIds) }),
     attachDeadLetters: () => storage.attachProjectionDeadLetters(),
     releaseAttachDeadLetter: (agentId, eventId) =>
       attachV1Ingress.releaseProjectionDeadLetter(agentId, eventId),

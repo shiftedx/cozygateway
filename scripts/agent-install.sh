@@ -2310,15 +2310,16 @@ attach_health() {
   curl -fsS --max-time 3 "$(gateway_origin)/health" 2>/dev/null
 }
 attach_ready() {
-  attach_health |
-    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{try{const h=JSON.parse(b).attach,c=h?.configured,o=h?.online,d=h?.deadLetters;process.exit([c,o,d].every(Number.isInteger)&&c>0&&o>=0&&d>=0&&o===c&&d===0?0:1)}catch{process.exit(1)}})'
+  [ "$(attach_health_diagnosis)" = __cozygateway_attach_healthy__ ]
 }
 attach_health_diagnosis() {
+  local expected=0
+  if declare -p SELECTED >/dev/null 2>&1; then expected="${#SELECTED[@]}"; fi
   attach_health |
-    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{const unreadable=()=>process.stdout.write("Hermes attach health could not be read");try{const h=JSON.parse(b).attach,c=h?.configured,o=h?.online,d=h?.deadLetters;if(![c,o,d].every(Number.isInteger)||c<0||o<0||d<0)return unreadable();const counts=`configured=${c}, online=${o}, deadLetters=${d}`;if(c===0)return process.stdout.write(`Hermes attach has no configured profiles (${counts})`);if(o!==c)return process.stdout.write(`Hermes attach profile count mismatch (${counts})`);if(d!==0)return process.stdout.write(`Hermes attach retained dead letters (${counts})`);return process.stdout.write("__cozygateway_attach_healthy__")}catch{return unreadable()}})'
+    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{const unreadable=()=>process.stdout.write("Hermes attach health could not be read");try{const h=JSON.parse(b).attach,scoped=h&&Object.hasOwn(h,"hermes"),s=scoped?h.hermes:h,c=s?.configured,o=s?.online,d=h?.deadLetters,expected=Number(process.argv[1]);if(![c,o,d].every(Number.isInteger)||c<0||o<0||d<0)return unreadable();const counts=`configured=${c}, online=${o}, deadLetters=${d}`;if(c===0)return process.stdout.write(`Hermes attach has no configured profiles (${counts})`);if(o!==c||(scoped&&expected>0&&c!==expected))return process.stdout.write(`Hermes attach profile count mismatch (${counts})`);if(d!==0)return process.stdout.write(`Hermes attach retained dead letters (${counts})`);return process.stdout.write("__cozygateway_attach_healthy__")}catch{return unreadable()}})' "$expected"
 }
 wait_attach_ready() {
-  [ "$DRY_RUN" = 1 ] && { say "DRY   require attach.configured > 0, attach.online == attach.configured, and zero dead letters"; return; }
+  [ "$DRY_RUN" = 1 ] && { say "DRY   require every selected Hermes profile online and zero dead letters (legacy health: attach.configured > 0, attach.online == attach.configured)"; return; }
   local attempt diagnosis
   for attempt in $(seq 1 30); do attach_ready && return; sleep 1; done
   diagnosis="$(attach_health_diagnosis || true)"

@@ -310,6 +310,8 @@ describe("cozygateway terminal menu", () => {
   it("requires zero dead letters before a managed listener is ready", () => {
     expect(isGatewayReady({ attach: { configured: 1, online: 1, deadLetters: 1 } })).toBe(false);
     expect(isGatewayReady({ attach: { configured: 1, online: 1, deadLetters: 0 } })).toBe(true);
+    expect(isGatewayReady({ attach: { configured: 2, online: 1, deadLetters: 0, hermes: { configured: 1, online: 1 } } })).toBe(true);
+    expect(isGatewayReady({ attach: { configured: 2, online: 1, deadLetters: 0, hermes: { configured: 1, online: 0 } } })).toBe(false);
   });
 
   it("pins local TLS health to the configured leaf certificate", () => {
