@@ -7,6 +7,7 @@ try {
     [IO.File]::WriteAllText($fixture, @'
 if (-not $env:COZYGATEWAY_TEST_USER_PATH_LOG) { Write-Output 'missing isolated PATH log'; exit 81 }
 if (-not $env:COZYGATEWAY_TEST_USER_PATH) { Write-Output 'missing simulated user PATH'; exit 82 }
+if (-not $env:COZYGATEWAY_TEST_APPDATA -or -not $env:COZYGATEWAY_TEST_SCHTASKS) { Write-Output 'missing isolated service registration'; exit 83 }
 [IO.File]::WriteAllText($env:COZYGATEWAY_TEST_USER_PATH_LOG, $env:COZYGATEWAY_TEST_USER_PATH)
 $env:PATH = 'child-process-only'
 if ($env:COZYGATEWAY_TEST_PATH_FAILURE -eq '1') { exit 9 }
@@ -21,7 +22,7 @@ exit 0
         Invoke-Expression $helper.Extent.Text
         foreach ($failure in @('0', '1')) {
             $before = @{}
-            foreach ($key in @('PATH', 'COZYGATEWAY_TEST_USER_PATH', 'COZYGATEWAY_TEST_USER_PATH_LOG')) {
+            foreach ($key in @('PATH', 'COZYGATEWAY_TEST_USER_PATH', 'COZYGATEWAY_TEST_USER_PATH_LOG', 'COZYGATEWAY_TEST_APPDATA', 'COZYGATEWAY_TEST_SCHTASKS')) {
                 $before[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
             }
             $result = Invoke-Bootstrap $fixture @{ 'COZYGATEWAY_TEST_PATH_FAILURE' = $failure }

@@ -176,13 +176,8 @@ function Invoke-Bootstrap {
     )
     # Every invocation writes PATH to a fixture file, including cases that do not assert PATH.
     # Never restore the real User PATH: another installer may update it during this suite.
-    $Environment = $Environment.Clone()
-    if ([string]::IsNullOrWhiteSpace([string]$Environment['COZYGATEWAY_TEST_USER_PATH_LOG'])) {
-        $Environment['COZYGATEWAY_TEST_USER_PATH_LOG'] = Join-Path $temp 'isolated-user-path.txt'
-    }
-    if (-not $Environment.ContainsKey('COZYGATEWAY_TEST_USER_PATH')) {
-        $Environment['COZYGATEWAY_TEST_USER_PATH'] = 'C:\Fixture Existing Tools'
-    }
+    . (Join-Path $repoRoot 'scripts\test\windows-fixture-environment.ps1')
+    $Environment = New-IsolatedBootstrapEnvironment $Environment $temp
     $old = @{}
     foreach ($key in $Environment.Keys) {
         $old[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
@@ -1380,7 +1375,7 @@ stop_owned_windows_gateway
         $cozyWrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $cozyWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix cozyagents $dashboardPortStatePosix 2>&1 | Out-String)
         Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $cozyWrapper)) "production writer must generate the CozyAgents supervisor wrapper: $cozyWrapperOutput"
         Assert-True (-not ((Get-Content -LiteralPath $cozyWrapper -Raw) -match '--dashboard-env')) 'CozyAgents supervisor wrapper must omit the complete Hermes argument group'
-        $cozySupervisor = Start-Process -FilePath $bashPath -ArgumentList ('"' + $cozyWrapper + '"') -PassThru
+        $cozySupervisor = Start-Process -WindowStyle Hidden -FilePath $bashPath -ArgumentList ('"' + $cozyWrapper + '"') -PassThru
         $cozyListening = $false
         for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
             $probe = [Net.Sockets.TcpClient]::new()
@@ -1529,7 +1524,7 @@ stop_owned_windows_gateway 0
         $legacyText = $legacyText -replace $stateArgument, ''
         Assert-True (-not ($legacyText -match '--dashboard-port-state')) 'legacy fixture must omit dashboard-port-state exactly'
         Write-Utf8NoBom $legacyWrapper $legacyText
-        $uninstallSupervisor = Start-Process -FilePath $bashPath -ArgumentList ('"' + $legacyWrapper + '"') -PassThru
+        $uninstallSupervisor = Start-Process -WindowStyle Hidden -FilePath $bashPath -ArgumentList ('"' + $legacyWrapper + '"') -PassThru
         $legacyListening = $false
         for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
             $probe = [Net.Sockets.TcpClient]::new()

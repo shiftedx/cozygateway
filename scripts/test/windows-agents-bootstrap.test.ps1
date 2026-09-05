@@ -45,13 +45,8 @@ function Invoke-Bootstrap {
     param([string] $Installer, [hashtable] $Environment, [string[]] $Arguments = @(), [switch] $ThroughExpression, [switch] $ThroughScriptBlock, [string] $Engine = 'powershell.exe')
     if ($env:COZYGATEWAY_TEST_BOOTSTRAP_ENGINE -and -not $PSBoundParameters.ContainsKey('Engine')) { $Engine = $env:COZYGATEWAY_TEST_BOOTSTRAP_ENGINE }
     # No fixture may fall back to writing the machine's actual per-user PATH.
-    $Environment = $Environment.Clone()
-    if ([string]::IsNullOrWhiteSpace([string]$Environment['COZYGATEWAY_TEST_USER_PATH_LOG'])) {
-        $Environment['COZYGATEWAY_TEST_USER_PATH_LOG'] = Join-Path $temp 'isolated-user-path.txt'
-    }
-    if (-not $Environment.ContainsKey('COZYGATEWAY_TEST_USER_PATH')) {
-        $Environment['COZYGATEWAY_TEST_USER_PATH'] = 'C:\Fixture Existing Tools'
-    }
+    . (Join-Path $repoRoot 'scripts\test\windows-fixture-environment.ps1')
+    $Environment = New-IsolatedBootstrapEnvironment $Environment $temp
     $old = @{}
     foreach ($key in $Environment.Keys) {
         $old[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')

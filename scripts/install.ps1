@@ -444,7 +444,7 @@ function Test-OwnedGatewayTask {
 
 function Get-GatewayScheduledTaskXml {
     try {
-        $taskXml = (& schtasks.exe /Query /TN CozyGateway /XML 2>$null | Out-String)
+        $taskXml = (& $(if ($env:COZYGATEWAY_TEST_SCHTASKS) { $env:COZYGATEWAY_TEST_SCHTASKS } else { 'schtasks.exe' }) /Query /TN CozyGateway /XML 2>$null | Out-String)
         if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($taskXml)) { return $taskXml }
     } catch { }
     return $null
@@ -453,7 +453,7 @@ function Get-GatewayScheduledTaskXml {
 function Register-GatewayScheduledTask {
     param([string] $TaskXmlPath)
     try {
-        & schtasks.exe /Create /F /TN CozyGateway /XML $TaskXmlPath | Out-Null
+        & $(if ($env:COZYGATEWAY_TEST_SCHTASKS) { $env:COZYGATEWAY_TEST_SCHTASKS } else { 'schtasks.exe' }) /Create /F /TN CozyGateway /XML $TaskXmlPath | Out-Null
         return $LASTEXITCODE -eq 0
     } catch {
         return $false
@@ -462,7 +462,7 @@ function Register-GatewayScheduledTask {
 
 function Remove-GatewayScheduledTask {
     try {
-        & schtasks.exe /Delete /F /TN CozyGateway | Out-Null
+        & $(if ($env:COZYGATEWAY_TEST_SCHTASKS) { $env:COZYGATEWAY_TEST_SCHTASKS } else { 'schtasks.exe' }) /Delete /F /TN CozyGateway | Out-Null
         return $LASTEXITCODE -eq 0
     } catch {
         return $false
@@ -471,7 +471,7 @@ function Remove-GatewayScheduledTask {
 
 function Start-GatewayScheduledTask {
     try {
-        & schtasks.exe /Run /TN CozyGateway | Out-Null
+        & $(if ($env:COZYGATEWAY_TEST_SCHTASKS) { $env:COZYGATEWAY_TEST_SCHTASKS } else { 'schtasks.exe' }) /Run /TN CozyGateway | Out-Null
         return $LASTEXITCODE -eq 0
     } catch {
         return $false
@@ -479,7 +479,8 @@ function Start-GatewayScheduledTask {
 }
 
 function Get-GatewayStartupEntryPath {
-    $appData = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
+    $appData = $env:COZYGATEWAY_TEST_APPDATA
+    if ([string]::IsNullOrWhiteSpace($appData)) { $appData = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData) }
     if ([string]::IsNullOrWhiteSpace($appData)) { $appData = $env:APPDATA }
     if ([string]::IsNullOrWhiteSpace($appData)) { Fail 'Windows Startup folder is unavailable' }
     return Join-Path $appData 'Microsoft\Windows\Start Menu\Programs\Startup\CozyGateway.vbs'
