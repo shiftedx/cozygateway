@@ -966,7 +966,7 @@ function Ensure-CompatibleHermes {
     $before = Get-HermesVersion $HermesPath
     if (Test-CompatibleHermesVersion $before) { return }
     Write-Info "Hermes v$($before.Text) must be updated for reliable multi-profile gateway attach"
-    & $HermesPath update --yes
+    & $HermesPath update --yes | Out-Host
     if ($LASTEXITCODE -ne 0) { Fail "Hermes update failed; Hermes v0.21.0 or newer is required. Resolve the update error, then retry this installer" }
     $after = Get-HermesVersion $HermesPath
     if (-not (Test-CompatibleHermesVersion $after)) {

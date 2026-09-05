@@ -12,6 +12,14 @@ function Assert-Throws([scriptblock]$Action, [string]$Message) {
     try { & $Action } catch { $failed = $true }
     if (-not $failed) { throw $Message }
 }
+$script:upgraded = $false
+function Get-HermesVersion {
+    return @{ Text = $(if ($script:upgraded) { '0.21.0' } else { '0.20.0' }); Core = $(if ($script:upgraded) { [version]'0.21.0' } else { [version]'0.20.0' }); IsPrerelease = $false }
+}
+function Fixture-HermesUpgrade { $script:upgraded = $true; $global:LASTEXITCODE = 0; 'fixture upstream update progress' }
+$upgradeOutput = @(Ensure-CompatibleHermes 'Fixture-HermesUpgrade')
+Assert-Equal $upgradeOutput.Count 0 'upgrade progress must not contaminate the resolved Hermes executable path'
+Assert-Equal $script:upgraded $true 'old Hermes must actually be upgraded'
 $savedLocal = $env:LOCALAPPDATA
 try {
     $env:LOCALAPPDATA = 'C:\Fixture Alias'
