@@ -61,6 +61,7 @@ export const ATTACH_PLUGIN_NAME = "cozygateway";
 
 /** The plugin stanza a fresh profile needs, in the shape the working profiles carry it. */
 export const ATTACH_PLUGIN_SEED = {
+  stream_reasoning_deltas: true,
   enabled: [ATTACH_PLUGIN_NAME],
   disabled: [] as string[],
   entries: { [ATTACH_PLUGIN_NAME]: { allow_tool_override: false } },
@@ -212,13 +213,15 @@ function planAttachPlugin(plugins: Record<string, unknown>): Record<string, unkn
   const isEnabled = enabled.includes(ATTACH_PLUGIN_NAME);
   const isDisabled = disabled.includes(ATTACH_PLUGIN_NAME);
   const hasEntry = entries[ATTACH_PLUGIN_NAME] !== undefined;
-  if (isEnabled && !isDisabled && hasEntry) return undefined;
+  const hasReasoningDeltas = plugins["stream_reasoning_deltas"] !== undefined;
+  if (isEnabled && !isDisabled && hasEntry && hasReasoningDeltas) return undefined;
 
   const patch: Record<string, unknown> = {};
   if (!isEnabled) patch["enabled"] = [...enabled, ATTACH_PLUGIN_NAME];
   if (isDisabled) patch["disabled"] = disabled.filter((name) => name !== ATTACH_PLUGIN_NAME);
   else if (plugins["disabled"] === undefined) patch["disabled"] = [];
   if (!hasEntry) patch["entries"] = { [ATTACH_PLUGIN_NAME]: { allow_tool_override: false } };
+  if (!hasReasoningDeltas) patch["stream_reasoning_deltas"] = true;
   return patch;
 }
 

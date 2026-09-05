@@ -447,6 +447,38 @@ describe("idempotency", () => {
 });
 
 describe("the attach-plugin binding", () => {
+  it("seeds the thinking-preview opt-in without overwriting explicit plugin settings", () => {
+    const missing = planBlankSlateSeed({
+      current: {
+        plugins: {
+          enabled: ["cozygateway"],
+          disabled: [],
+          entries: { cozygateway: { allow_tool_override: false } },
+          keep_alive: true,
+        },
+      },
+      blankSlate: false,
+    });
+    // The setting is attach-plugin reachability, not blank-slate toolset policy, and this is a
+    // deep-merge patch so unrelated plugin settings stay as Hermes (or the user) left them.
+    expect(missing.config).toEqual({ plugins: { stream_reasoning_deltas: true } });
+
+    const explicitFalse = planBlankSlateSeed({
+      current: {
+        plugins: {
+          enabled: ["cozygateway"],
+          disabled: [],
+          entries: { cozygateway: { allow_tool_override: false } },
+          stream_reasoning_deltas: false,
+          keep_alive: true,
+        },
+      },
+      blankSlate: false,
+    });
+    // An explicit value, including false, belongs to the profile owner and makes a retry a no-op.
+    expect(explicitFalse.config).toBeUndefined();
+  });
+
   it("unions the enabled list rather than replacing it, because the merge replaces arrays", () => {
     const plan = planBlankSlateSeed({
       current: { plugins: { enabled: ["house-lights"] } },
