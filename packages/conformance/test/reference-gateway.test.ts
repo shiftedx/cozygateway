@@ -33,10 +33,11 @@ afterAll(async () => {
   await reference.close();
   // The sink should only ever have collected the expected, harmless notify failures against the
   // unroutable relayUrl above, never some unrelated notifier error it accidentally swallowed.
-  // Both push legs land here: an agent reply ("notify failed") and, since the approval agent above
-  // raises one per turn, the approval leg ("approval notify failed").
+  // Every push leg lands here: an agent reply ("notify failed"), the approval leg ("approval
+  // notify failed") since the approval agent above raises one per turn, and the Bot Mode chat
+  // reply leg ("chat message notify failed") the repair hook's denied turns commit.
   for (const line of notifierLogLines) {
-    expect(line).toMatch(/^push: (approval )?notify failed for device .+: fetch failed$/);
+    expect(line).toMatch(/^push: (approval |chat message )?notify failed for device .+: fetch failed$/);
   }
 });
 
@@ -46,6 +47,9 @@ registerConformanceSuite({
   echoAgentId: "conformance-echo",
   stallAgentId: "conformance-stall",
   approvalAgentId: "conformance-approval",
+  // The same approval peer is a Bot Mode bot too, and it echoes a `repair` member from a JSON send
+  // onto its approval event, which is all the capability-62 repair hook asks of it.
+  repairApproval: { botName: "conformance-approval" },
 });
 
 // This end-to-end check is specific to the reference gateway's own fixture (a fake

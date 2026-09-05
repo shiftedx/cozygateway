@@ -77,6 +77,8 @@ export interface ConformanceEnv {
   botChatStop?: { botName: string; prompt?: string };
   /** Optional: one capability-19 Hermes bot. See "The optional bot new-session hook". */
   botNewSession?: { botName: string };
+  /** Optional: one capability-62 bot whose backend echoes a repair block. See "The optional repair hook". */
+  repairApproval?: { botName: string };
 }
 ```
 
@@ -202,6 +204,35 @@ is reported as skipped while every other assertion runs unchanged. The same hook
 
 The reference gateway implements it with an attach-v1 approval peer (one draft, one pending
 approval, then it parks until the approval is resolved).
+
+## The optional repair hook
+
+Capability 62 of `com.cozylabs.bots` (contract/ext-bots-v1.md row 62) lets an approval carry one
+typed MCP repair proposal, `repair`, on the attach-v1 approval event. The gateway validates the
+block and drops it, never the approval, when it fails. A black-box run can only prove the drop if a
+backend will send an invalid block on purpose, so the cases ride a hook.
+
+Declare `repairApproval: { botName }` and the approval lifecycle group adds three cases driven over
+the Bot Mode surface: a valid block is carried byte for byte on `bot_approval_pending`, on the
+`GET /bots/approvals` inbox row, and on the rebroadcast a fresh socket gets after
+`GET /bots/:name/chat/messages`; an invalid block yields the same approval with no `repair` member;
+and a plain send yields an approval with no `repair` member. Each case denies its approval and
+waits for the bot to be idle before the next one starts.
+
+**What the hook promises.** `repairApproval.botName` names a Bot Mode bot on the gateway under
+test whose approval-capable backend:
+
+1. on a chat send whose text is a JSON object with a `repair` member, raises one approval whose
+   attach-v1 `repair` block is exactly that member, as sent, and on any other text raises one
+   approval with no block;
+2. stays parked until the approval is resolved, and completes the turn after a deny;
+3. is idle when the group starts.
+
+**It is optional on purpose**, like every hook above: omit it and the three cases are reported as
+skipped while the rest of the approval group runs unchanged. The hookless runner declares no hook.
+
+The reference gateway implements it with the same attach-v1 approval peer, which echoes the
+`repair` member of a JSON send onto its approval event.
 
 ## Running the reference gateway's own conformance
 
