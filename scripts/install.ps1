@@ -44,14 +44,47 @@ function Write-Info { param([string] $Message) Write-Host "INFO  $Message" }
 function Write-Ok { param([string] $Message) Write-Host "OK    $Message" }
 function Fail { param([string] $Message) throw "FAIL  $Message" }
 
+function Get-CozyLocalAppData {
+    # Return the filesystem redirection target when hosted by an MSIX app.
+    # GetFullPath/LOCALAPPDATA alone can retain an alias invisible to Task Scheduler.
+    if (-not ('CozyGateway.KnownFolders' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace CozyGateway {
+    public static class KnownFolders {
+        [DllImport("shell32.dll")]
+        private static extern int SHGetKnownFolderPath(ref Guid id, uint flags, IntPtr token, out IntPtr path);
+        public static string LocalAppData() {
+            Guid id = new Guid("F1B32785-6FBA-4FCF-9D55-7B8E7F157091");
+            IntPtr path = IntPtr.Zero;
+            try {
+                const uint ReturnFilterRedirectionTarget = 0x00040000;
+                Marshal.ThrowExceptionForHR(SHGetKnownFolderPath(ref id, ReturnFilterRedirectionTarget, IntPtr.Zero, out path));
+                return Marshal.PtrToStringUni(path);
+            } finally { if (path != IntPtr.Zero) Marshal.FreeCoTaskMem(path); }
+        }
+    }
+}
+'@
+    }
+    $path = [CozyGateway.KnownFolders]::LocalAppData()
+    if ([string]::IsNullOrWhiteSpace($path)) { Fail 'Windows could not resolve the physical local application-data directory' }
+    return [IO.Path]::GetFullPath($path).TrimEnd('\')
+}
+
 function Resolve-InstallHome {
     param([string] $RequestedHome)
     if ([string]::IsNullOrWhiteSpace($RequestedHome)) {
-        $RequestedHome = Join-Path $env:LOCALAPPDATA 'cozygateway'
+        $RequestedHome = Join-Path (Get-CozyLocalAppData) 'cozygateway'
+        $existingHome = Join-Path $env:LOCALAPPDATA 'cozygateway'
+        if ((Test-Path -LiteralPath $existingHome) -and -not (Test-Path -LiteralPath $RequestedHome)) {
+            $RequestedHome = $existingHome
+        }
     }
     $full = [IO.Path]::GetFullPath($RequestedHome)
     $local = [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\')
-    if ($full.TrimEnd('\') -eq $local) { Fail 'COZYGATEWAY_HOME must name a dedicated directory' }
+    if ($full.TrimEnd('\') -eq $local -or $full.TrimEnd('\') -eq (Get-CozyLocalAppData)) { Fail 'COZYGATEWAY_HOME must name a dedicated directory' }
     return $full.TrimEnd('\')
 }
 
@@ -864,7 +897,7 @@ function Refresh-HermesEnvironment {
 function Resolve-NativeHermesPath {
     param([string] $Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
-    $full = [IO.Path]::GetFullPath($Path)
+    $full = Resolve-PhysicalHermesPath $Path
     if ([IO.Path]::GetExtension($full) -ieq '.cmd') {
         $full = [IO.Path]::ChangeExtension($full, '.exe')
     }
@@ -874,9 +907,30 @@ function Resolve-NativeHermesPath {
     return $null
 }
 
+function Resolve-PhysicalHermesPath {
+    param([string] $Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    $alias = [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\') + '\'
+    $physical = (Get-CozyLocalAppData).TrimEnd('\') + '\'
+    $hermesAlias = $alias + 'hermes'
+    if ($alias -ine $physical -and ($full -ieq $hermesAlias -or $full.StartsWith($hermesAlias + '\', [StringComparison]::OrdinalIgnoreCase))) {
+        $mapped = $physical + $full.Substring($alias.Length)
+        # Packaged apps can also read a pre-existing, unpackaged install through
+        # this path. Preserve it when there is no corresponding redirected item.
+        if ((Test-Path -LiteralPath $full) -and -not (Test-Path -LiteralPath $mapped)) { return $full }
+        return $mapped
+    }
+    return $full
+}
+
 function Find-Hermes {
     $resolved = Resolve-NativeHermesPath $env:COZYGATEWAY_TEST_HERMES
     if ($resolved) { return $resolved }
+    # An explicit empty home means a fresh installation, not the unrelated Hermes on PATH.
+    if (-not [string]::IsNullOrWhiteSpace($env:HERMES_HOME)) {
+        $env:HERMES_HOME = Resolve-PhysicalHermesPath $env:HERMES_HOME
+        return (Resolve-NativeHermesPath (Join-Path $env:HERMES_HOME 'bin\hermes.exe'))
+    }
     $command = Get-Command hermes.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($command) {
         $resolved = Resolve-NativeHermesPath $command.Source
@@ -921,10 +975,148 @@ function Ensure-CompatibleHermes {
     Write-Ok "updated Hermes from v$($before.Text) to v$($after.Text)"
 }
 
+function Get-HermesModelRequest {
+    $endpoint = $env:COZYGATEWAY_HERMES_MODEL_ENDPOINT
+    $model = $env:COZYGATEWAY_HERMES_MODEL_ID
+    if ([string]::IsNullOrWhiteSpace($endpoint) -and [string]::IsNullOrWhiteSpace($model)) { return $null }
+    if (-not (Test-SafeModelEndpoint $endpoint) -or -not (Test-SafeModelWord $model)) {
+        Fail 'set a valid COZYGATEWAY_HERMES_MODEL_ENDPOINT and COZYGATEWAY_HERMES_MODEL_ID together for unattended Hermes setup'
+    }
+    return @{ Endpoint = $endpoint; Id = $model }
+}
+
+function Get-HermesLauncherInterpreter {
+    param([string] $Launcher)
+    # uv's Windows trampoline stores its absolute Python path in its payload.
+    # Only recognize one unambiguous interpreter; other native launcher formats
+    # remain under their own installer's control.
+    $payload = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($Launcher))
+    $paths = @([regex]::Matches($payload, '(?i)[A-Z]:\\[^\x00\r\n"]+\\python(?:w)?\.exe') | ForEach-Object { $_.Value } | Select-Object -Unique)
+    if ($paths.Count -eq 1) { return $paths[0] }
+    return $null
+}
+
+function Repair-HermesLauncherInterpreter {
+    param([string] $Uv, [string] $Python, [string] $Repository)
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $Uv pip install --python $Python --reinstall-package hermes-agent --no-deps --editable $Repository | Out-Host
+        $repairExit = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousErrorAction }
+    if ($repairExit -ne 0) { Fail 'Hermes launcher repair failed; its existing command was retained' }
+}
+
+function Ensure-HermesLauncherInterpreter {
+    param([string] $HermesPath)
+    $bin = Split-Path -Parent $HermesPath
+    if ((Split-Path -Leaf $bin) -ine 'bin') { return }
+    $hermesHome = Split-Path -Parent $bin
+    $repository = Join-Path $hermesHome 'hermes-agent'
+    $python = Join-Path $repository 'venv\Scripts\python.exe'
+    $alias = [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\') + '\'
+    $physical = (Get-CozyLocalAppData).TrimEnd('\') + '\'
+    if ($alias -ieq $physical) { return }
+    $targets = @()
+    foreach ($candidate in @($HermesPath, (Join-Path $bin 'hermes-acp.exe'))) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        $interpreter = Get-HermesLauncherInterpreter $candidate
+        if (-not $interpreter -or $interpreter -ieq $python -or -not $interpreter.StartsWith($alias, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if (($physical + $interpreter.Substring($alias.Length)) -ieq $python) { $targets += $candidate }
+    }
+    if ($targets.Count -eq 0) { return }
+    if ($env:COZYGATEWAY_INSTALL_DRYRUN -eq '1') {
+        Write-Info 'dry run: would repair the Hermes launcher to use its physical Python path'
+        return
+    }
+    $uv = Join-Path $bin 'uv.exe'
+    foreach ($path in @($HermesPath, $python, $uv, $repository)) { Assert-BootstrapPathAndParents $path }
+    foreach ($path in @($python, $uv)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Fail 'Hermes launcher repair requires its managed Python and uv; rerun the Hermes installer' }
+    }
+    Write-Info 'Repairing the Hermes launcher for background access outside this packaged application.'
+    Repair-HermesLauncherInterpreter $uv $python $repository
+    foreach ($target in $targets) {
+        $rebuilt = Join-Path (Join-Path $repository 'venv\Scripts') (Split-Path -Leaf $target)
+        Assert-BootstrapPathAndParents $target
+        Assert-BootstrapPathAndParents $rebuilt
+        if ((Get-HermesLauncherInterpreter $rebuilt) -ine $python) { Fail 'Hermes rebuilt launcher does not target its physical Python path; its existing command was retained' }
+    }
+    # Stage first, then rename the old executable aside. Windows may allow a
+    # running image to be renamed even while overwriting it is prohibited.
+    # Leave a locked backup in place until its existing process exits.
+    foreach ($target in $targets) {
+        $rebuilt = Join-Path (Join-Path $repository 'venv\Scripts') (Split-Path -Leaf $target)
+        $suffix = [guid]::NewGuid().ToString('N')
+        $pending = "$target.pending-$suffix"
+        $backup = "$target.backup-$suffix"
+        Copy-Item -LiteralPath $rebuilt -Destination $pending
+        try {
+            try { Move-Item -LiteralPath $target -Destination $backup } catch {
+                Fail 'close the Hermes processes using its command, then rerun repair; its existing launcher was retained'
+            }
+            try { Move-Item -LiteralPath $pending -Destination $target } catch {
+                Move-Item -LiteralPath $backup -Destination $target
+                throw
+            }
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+        } finally { Remove-Item -LiteralPath $pending -Force -ErrorAction SilentlyContinue }
+    }
+    Write-Ok 'Hermes launcher uses its physical Python path'
+}
+
+function Expand-HermesArchive {
+    param([string] $Path, [string] $DestinationPath)
+    Assert-BootstrapRegularFile $Path 'Hermes archive' -MustExist
+    Assert-BootstrapPathAndParents $DestinationPath
+    $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+    if (-not (Test-Path -LiteralPath $tar -PathType Leaf)) { Fail 'Windows tar.exe is required to extract Hermes archives with long paths' }
+    New-Item -ItemType Directory -Force -Path $DestinationPath | Out-Null
+    & $tar -xf $Path -C $DestinationPath | Out-Host
+    if ($LASTEXITCODE -ne 0) { Fail 'Hermes archive extraction failed' }
+}
+
+function Invoke-OfficialHermesInstaller {
+    param([string] $InstallerPath, [string] $Tag, [string] $HermesHome, [bool] $NonInteractive)
+    Assert-BootstrapPathAndParents $HermesHome
+    $parameters = @{ HermesHome = $HermesHome; InstallDir = (Join-Path $HermesHome 'hermes-agent') }
+    if ($Tag) { $parameters['Tag'] = $Tag; $parameters['Branch'] = $Tag }
+    if ($NonInteractive) { $parameters['NonInteractive'] = $true; $parameters['SkipSetup'] = $true }
+    # Windows PowerShell 5.1 Expand-Archive fails on Hermes' long documentation
+    # paths. This function shadows it only inside the upstream invocation.
+    function Expand-Archive {
+        param([string] $Path, [string] $DestinationPath, [switch] $Force)
+        Expand-HermesArchive $Path $DestinationPath
+    }
+    # Upstream writes git --global compatibility settings and replaces GIT_CONFIG_COUNT.
+    # Contain those writes in a private temporary config and keep longpaths effective.
+    $gitConfig = Join-Path ([IO.Path]::GetTempPath()) ('cozy-hermes-git-' + [guid]::NewGuid().ToString('N'))
+    $oldGlobal = $env:GIT_CONFIG_GLOBAL
+    $oldCount = $env:GIT_CONFIG_COUNT; $oldKey = $env:GIT_CONFIG_KEY_0; $oldValue = $env:GIT_CONFIG_VALUE_0
+    $oldSsh = $env:GIT_SSH_COMMAND
+    try {
+        [IO.File]::WriteAllText($gitConfig, "[core]`nlongpaths = true`n[windows]`nappendAtomically = false`n")
+        Protect-FileToOwner $gitConfig
+        $env:GIT_CONFIG_GLOBAL = $gitConfig
+        $content = [IO.File]::ReadAllText($InstallerPath).TrimStart([char]0xFEFF)
+        & ([scriptblock]::Create($content)) @parameters | Out-Host
+    } finally {
+        $env:GIT_CONFIG_GLOBAL = $oldGlobal
+        $env:GIT_CONFIG_COUNT = $oldCount; $env:GIT_CONFIG_KEY_0 = $oldKey; $env:GIT_CONFIG_VALUE_0 = $oldValue
+        $env:GIT_SSH_COMMAND = $oldSsh
+        Remove-Item -LiteralPath $gitConfig -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Resolve-Hermes {
     param([string] $InstallerUri)
+    $script:FreshHermesInstall = $false
     $hermes = Find-Hermes
     if (-not $hermes) {
+        $tag = ''
+        $request = Get-HermesModelRequest
+        $hermesHome = if ($env:HERMES_HOME) { Resolve-PhysicalHermesPath $env:HERMES_HOME } else { Resolve-PhysicalHermesPath (Join-Path $env:LOCALAPPDATA 'hermes') }
+        $freshModelSetup = -not (Test-Path -LiteralPath (Join-Path $hermesHome 'config.yaml') -PathType Leaf)
         if ([string]::IsNullOrWhiteSpace($InstallerUri)) {
             $tag = Get-LatestTag 'NousResearch/hermes-agent'
             $InstallerUri = "https://raw.githubusercontent.com/NousResearch/hermes-agent/$tag/scripts/install.ps1"
@@ -933,27 +1125,29 @@ function Resolve-Hermes {
         $hermesInstaller = Join-Path ([IO.Path]::GetTempPath()) ("hermes-install-" + [guid]::NewGuid().ToString('N') + '.ps1')
         try {
             Copy-OrDownload $InstallerUri $hermesInstaller
-            $content = [IO.File]::ReadAllText($hermesInstaller).TrimStart([char]0xFEFF)
-            & ([scriptblock]::Create($content))
+            Invoke-OfficialHermesInstaller $hermesInstaller $tag $hermesHome ([bool]$request)
+            $script:FreshHermesInstall = $freshModelSetup
         } finally {
             Remove-Item -LiteralPath $hermesInstaller -Force -ErrorAction SilentlyContinue
         }
-        $hermesHome = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA 'hermes' }
         Refresh-HermesEnvironment $hermesHome
         $hermes = Find-Hermes
     }
     if (-not $hermes) { Fail 'Hermes installation did not produce hermes.exe; finish Hermes setup and run this command again' }
-    $configPath = (& $hermes -p default config path 2>$null | Select-Object -Last 1).Trim()
+    Ensure-HermesLauncherInterpreter $hermes
+    $configPath = [string](& $hermes -p default config path 2>$null | Select-Object -Last 1)
+    $configPath = $configPath.Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($configPath) -or -not (Test-Path -LiteralPath $configPath)) {
-        Fail 'Hermes default profile is not configured; finish Hermes setup and run this command again'
+        if (-not (Get-HermesModelRequest)) { Fail 'Hermes default profile is not configured; finish Hermes setup and run this command again' }
     }
     Ensure-CompatibleHermes $hermes
+    Ensure-HermesLauncherInterpreter $hermes
     return $hermes
 }
 
 function Get-HermesModelState {
     param([string] $HermesPath)
-    $statusOutput = (& $HermesPath status 2>&1 | Out-String)
+    $statusOutput = (& $HermesPath -p default status 2>&1 | Out-String)
     $statusExit = $LASTEXITCODE
     $modelMatch = [regex]::Match($statusOutput, '(?m)^\s*(?:Current model|Model):\s*(?<value>[^\r\n]+)')
     $providerMatch = [regex]::Match($statusOutput, '(?m)^\s*(?:Active provider|Provider):\s*(?<value>[^\r\n]+)')
@@ -961,25 +1155,39 @@ function Get-HermesModelState {
     $provider = if ($providerMatch.Success) { $providerMatch.Groups['value'].Value.Trim() } else { '' }
     $placeholder = '^(?i:\(?\s*(?:not set|not configured|unknown|none|null)\s*\)?)$'
     $hasModel = -not [string]::IsNullOrWhiteSpace($model) -and $model -notmatch $placeholder
-    $hasProvider = -not [string]::IsNullOrWhiteSpace($provider) -and $provider -notmatch $placeholder
+    # Hermes reports Auto when provider resolution has no usable credentials.
+    # A freshly copied template has a model name but is not configured yet.
+    $hasProvider = -not [string]::IsNullOrWhiteSpace($provider) -and $provider -notmatch $placeholder -and $provider -ine 'Auto'
     return [pscustomobject]@{
         Configured = ($statusExit -eq 0 -and $hasModel -and $hasProvider)
     }
 }
 
 function Confirm-HermesModel {
-    param([string] $HermesPath)
+    param([string] $HermesPath, [bool] $FreshInstall = $false)
     if ($env:COZYGATEWAY_INSTALL_DRYRUN -eq '1') {
         Write-Info 'dry run: would inspect Hermes model status and open model selection only when setup is incomplete'
         return
     }
+    $request = if ($FreshInstall) { Get-HermesModelRequest } else { $null }
     $state = Get-HermesModelState $HermesPath
-    if ($state.Configured) {
+    if ($state.Configured -and -not $request) {
         Write-Ok 'Hermes provider and model are already configured; skipping model selection'
         return
     }
+    if (-not $request) { $request = Get-HermesModelRequest }
+    if ($request) {
+        foreach ($setting in @(@('model.provider', 'custom'), @('model.base_url', $request.Endpoint), @('model.default', $request.Id))) {
+            & $HermesPath -p default config set $setting[0] $setting[1]
+            if ($LASTEXITCODE -ne 0) { Fail 'Hermes could not save the requested model configuration' }
+        }
+        $state = Get-HermesModelState $HermesPath
+        if (-not $state.Configured) { Fail 'Hermes did not report the requested model as configured' }
+        Write-Ok 'Hermes endpoint and model are configured'
+        return
+    }
     Write-Info 'Choose or confirm the Hermes inference provider and model.'
-    & $HermesPath model
+    & $HermesPath -p default model
     $modelExit = $LASTEXITCODE
     if ($modelExit -ne 0) {
         Fail 'Hermes model selection did not complete successfully'
@@ -989,6 +1197,41 @@ function Confirm-HermesModel {
         Fail 'Hermes needs an active provider and model before CozyGateway can be installed'
     }
     Write-Ok 'Hermes provider and model are configured'
+}
+
+function Ensure-HermesDashboardAssets {
+    param([string] $HermesPath)
+    if ($env:COZYGATEWAY_INSTALL_DRYRUN -eq '1') {
+        Write-Info 'dry run: would prepare Hermes Dashboard assets before starting its hidden service'
+        return
+    }
+    if ($env:COZYGATEWAY_TEST_DASHBOARD_BUILDER) {
+        & $env:COZYGATEWAY_TEST_DASHBOARD_BUILDER $HermesPath
+        if ($LASTEXITCODE -ne 0) { Fail 'Hermes Dashboard asset preparation failed' }
+        return
+    }
+    $configPath = (& $HermesPath -p default config path 2>$null | Select-Object -Last 1)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($configPath)) { Fail 'could not resolve Hermes home for Dashboard preparation' }
+    $hermesHome = Split-Path -Parent $configPath.Trim()
+    $python = Get-HermesLauncherInterpreter $HermesPath
+    if (-not $python) { $python = Join-Path $hermesHome 'hermes-agent\venv\Scripts\python.exe' }
+    Assert-BootstrapPathAndParents $python
+    if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { Fail 'Hermes virtual-environment Python is missing; finish its dependency installation before retrying' }
+    # Build only; never start a Dashboard or open a browser here. The upstream builder
+    # checks freshness and repairs EBADENGINE using its managed npm, never system npm.
+    $builder = @'
+from hermes_cli.main import PROJECT_ROOT, _build_web_ui
+import sys
+ok = _build_web_ui(PROJECT_ROOT / 'web', fatal=True)
+index = PROJECT_ROOT / 'hermes_cli' / 'web_dist' / 'index.html'
+if not ok or not index.is_file():
+    print('Hermes Dashboard assets were not built successfully', file=sys.stderr)
+    sys.exit(1)
+'@
+    Write-Info 'Preparing Hermes Dashboard assets before starting its hidden service.'
+    & $python -c $builder
+    if ($LASTEXITCODE -ne 0) { Fail 'Hermes Dashboard asset preparation failed; no new gateway service was started' }
+    Write-Ok 'Hermes Dashboard assets are ready'
 }
 
 function Resolve-GitBash {
@@ -1784,7 +2027,8 @@ if ($harness -eq 'cozyagents') {
 }
 
 $hermes = Resolve-Hermes $env:COZYGATEWAY_HERMES_INSTALL_URL
-Confirm-HermesModel $hermes
+Confirm-HermesModel $hermes -FreshInstall $script:FreshHermesInstall
+Ensure-HermesDashboardAssets $hermes
 $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH
 $listener = @()
 if ($harness -eq 'both') {

@@ -61,6 +61,7 @@ jobs:
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap.test.ps1
       - run: node --test scripts/test/windows-hidden-supervisor.test.mjs
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-launcher-stop.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-fresh-prerequisites.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/bootstrap-transaction.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-agents-bootstrap.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-dashboard-owner.test.ps1

@@ -32,6 +32,19 @@ runs `hermes model` interactively only when the active provider/model is
 incomplete, then verifies it
 before installing CozyGateway or printing a pairing QR.
 
+On Windows, the Hermes source checkout uses the same release tag as its
+installer. The official installer handles Git-to-ZIP fallback and managed npm
+compatibility; CozyGateway prepares the Dashboard assets before starting the
+background service. Packaged applications use the physical application-data
+directory, and repair corrects recognized Hermes launchers that still embed its
+package-only alias so Task Scheduler can use them.
+
+For unattended setup of an unconfigured Hermes default profile, set both
+`COZYGATEWAY_HERMES_MODEL_ENDPOINT` (an HTTP(S) API base URL) and
+`COZYGATEWAY_HERMES_MODEL_ID` before running the Windows installer. This uses
+Hermes' custom provider and skips the upstream setup wizard. An already
+configured default profile keeps its existing provider and model.
+
 Fresh interactive installs ask whether CozyChat may access the Gateway over the local network.
 No (the default) listens on `127.0.0.1:8787`; Yes listens on `0.0.0.0:8787` and makes the pairing
 QR use the detected LAN address. Non-interactive installs keep loopback unless `--bind-host`
