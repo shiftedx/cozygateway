@@ -858,7 +858,10 @@ describe("capability advertisement", () => {
     // Capability 59 adds optional skill provenance and installation fields, optional toolset
     // availability fields, and an optional additive `enabledSkills` patch list. The gateway relays
     // runtime rows and writes unchanged while keeping Hermes reads and writes on their old shape.
-    expect(BOTS_CAPABILITY_VERSION).toBe(61);
+    // Capability 62 lets an approval carry one typed MCP repair proposal (`repair`) on the attach-v1
+    // event, the pending frame, and the inbox row; the gateway validates the block and drops it,
+    // never the approval, when it fails.
+    expect(BOTS_CAPABILITY_VERSION).toBe(62);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {

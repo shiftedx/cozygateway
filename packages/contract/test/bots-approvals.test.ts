@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import {
   BOTS_CAPABILITY_VERSION,
   BotApprovalPendingFrameSchema,
+  BotApprovalRepairSchema,
   BotApprovalResolutionRequestedFrameSchema,
   BotApprovalResolvedFrameSchema,
   BotClarifyResolutionRequestedFrameSchema,
@@ -89,7 +90,7 @@ describe("bots approval frames", () => {
     expect(members).not.toContain("argSummary");
     expect(members).not.toContain("command");
     expect(members).not.toContain("description");
-    expect(members).toEqual(["type", "bot", "sessionId", "turnId", "toolCallId", "name", "updatedAt", "room", "detail"]);
+    expect(members).toEqual(["type", "bot", "sessionId", "turnId", "toolCallId", "name", "updatedAt", "room", "detail", "repair"]);
   });
 
   it("takes the three core outcomes and nothing else", () => {
@@ -124,7 +125,67 @@ describe("bots approval frames", () => {
     // absent for every 1:1 row, which is every row written before 51.
     expect(Object.keys(BotPendingApprovalSchema.properties)).toEqual([
       "bot", "sessionId", "turnId", "toolCallId", "ruleName", "createdAt", "resolutionRequestedAt",
-      "room",
+      "room", "repair",
     ]);
+  });
+});
+
+/** Capability 62 (contract/ext-bots-v1.md row 62): an approval may carry one typed MCP repair
+ *  proposal. The block is the shape the harness health record produces, closed sets and bounded
+ *  strings, and it rides the existing pending frame and the existing inbox row unchanged otherwise. */
+describe("approval repair proposal (capability 62)", () => {
+  const repair = {
+    kind: "mcp_reconnect",
+    server: "github",
+    impact: ["github_search_issues", "github_create_issue"],
+    scope: "server",
+    fingerprint: { previous: "sha256:1f3a", current: "sha256:9c0e" },
+    reason: "stale_tool",
+    policy: "approve_once",
+  };
+  const inboxRow = {
+    bot: "scout",
+    sessionId: "stored-1",
+    turnId: "runtime-1#1-1",
+    toolCallId: "4e8b2c1d9f0a4c1e8b2c1d9f0a4c1e8b",
+    ruleName: "mcp_reconnect",
+    createdAt: 1_800_000_000_000,
+  };
+
+  it("accepts the block on its own schema, on the pending frame, and on the inbox row", () => {
+    expect(check(BotApprovalRepairSchema, repair)).toBe(true);
+    // Nothing listed and nothing fingerprinted is still a proposal: the peer may not know either.
+    expect(check(BotApprovalRepairSchema, { ...repair, impact: [], fingerprint: {} })).toBe(true);
+    expect(check(BotApprovalPendingFrameSchema, { ...pending, repair })).toBe(true);
+    expect(check(ServerFrameSchema, { ...pending, repair })).toBe(true);
+    expect(check(BotPendingApprovalSchema, { ...inboxRow, repair })).toBe(true);
+    expect(check(BotPendingApprovalsSchema, { approvals: [{ ...inboxRow, repair }] })).toBe(true);
+  });
+
+  it("holds every closed set closed", () => {
+    for (const [field, value] of [
+      ["kind", "restart"], ["scope", "tool"], ["reason", "bored"], ["policy", "always"],
+    ] as const) {
+      expect(check(BotApprovalRepairSchema, { ...repair, [field]: value }), field).toBe(false);
+    }
+  });
+
+  it("holds the bounds and refuses a member the shape does not name", () => {
+    expect(check(BotApprovalRepairSchema, { ...repair, server: "" })).toBe(false);
+    expect(check(BotApprovalRepairSchema, { ...repair, server: "s".repeat(65) })).toBe(false);
+    expect(check(BotApprovalRepairSchema, { ...repair, impact: ["t".repeat(129)] })).toBe(false);
+    expect(check(BotApprovalRepairSchema, { ...repair, impact: [""] })).toBe(false);
+    expect(check(BotApprovalRepairSchema, {
+      ...repair, impact: Array.from({ length: 65 }, (_, i) => `tool_${i}`),
+    })).toBe(false);
+    expect(check(BotApprovalRepairSchema, { ...repair, fingerprint: { previous: "f".repeat(129) } })).toBe(false);
+    const { fingerprint: _drop, ...noFingerprint } = repair;
+    expect(check(BotApprovalRepairSchema, noFingerprint)).toBe(false);
+    // Closed objects: the only place a URL, header, or env value could ride is a member the shape
+    // never named, so an unnamed member fails the block outright.
+    expect(check(BotApprovalRepairSchema, { ...repair, url: "https://mcp.example" })).toBe(false);
+    expect(check(BotApprovalRepairSchema, {
+      ...repair, fingerprint: { ...repair.fingerprint, authorization: "Bearer x" },
+    })).toBe(false);
   });
 });

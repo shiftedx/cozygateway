@@ -775,6 +775,36 @@ export const BotThinkingActivityFrameSchema = Type.Object({
 });
 export type BotThinkingActivityFrame = Static<typeof BotThinkingActivityFrameSchema>;
 
+/** Capability 62. The MCP repair proposal an approval may carry: a runtime peer found one MCP
+ *  server's tool list stale (or the server crashed, refused, or would not re-list) and asks before
+ *  reconnecting it. Every set is closed and every string bounded. `server`, `impact` and both
+ *  fingerprints are configured names and opaque digests; a URL, header value, env value, or secret
+ *  is never among them, and the closed object leaves no member one could ride in. The gateway is
+ *  the authority on the block (contract/ext-bots-v1.md row 62): one that fails this schema or
+ *  carries a C0/C1 control or Unicode Format character is DROPPED and the approval kept, exactly
+ *  as a malformed capability-56 `detail` is, so a client only ever sees a block that validates. */
+export const BotApprovalRepairSchema = Type.Object({
+  kind: Type.Literal("mcp_reconnect"),
+  /** The MCP server name as configured on the runtime peer. */
+  server: Type.String({ minLength: 1, maxLength: 64 }),
+  /** Tool names the repair affects; empty when the peer could not list them. */
+  impact: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 64 }),
+  scope: Type.Literal("server"),
+  /** Opaque tool-list digests from the peer's health record; either side may be unknown. */
+  fingerprint: Type.Object({
+    previous: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+    current: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+  }, { additionalProperties: false }),
+  reason: Type.Union([
+    Type.Literal("stale_tool"), Type.Literal("relist_failed"),
+    Type.Literal("crashed"), Type.Literal("unauthorized"),
+  ]),
+  /** `approve_once`: approving reconnects this server once. `auto_refresh`: the operator allowed
+   *  the peer to refresh this server on its own, it already did, and the proposal is informational. */
+  policy: Type.Union([Type.Literal("approve_once"), Type.Literal("auto_refresh")]),
+}, { additionalProperties: false });
+export type BotApprovalRepair = Static<typeof BotApprovalRepairSchema>;
+
 export const BotApprovalPendingFrameSchema = Type.Object({
   type: Type.Literal("bot_approval_pending"),
   bot: Type.String(),
@@ -790,6 +820,9 @@ export const BotApprovalPendingFrameSchema = Type.Object({
    *  concretely covers (for example which Chrome and which profile a browser tool would drive).
    *  Absent when the runtime peer sent none. */
   detail: Type.Optional(Type.String()),
+  /** Capability 62. The MCP repair proposal this approval asks about, the block the gateway
+   *  validated. Absent for every approval that is not a repair proposal. */
+  repair: Type.Optional(BotApprovalRepairSchema),
 });
 export type BotApprovalPendingFrame = Static<typeof BotApprovalPendingFrameSchema>;
 
@@ -1654,6 +1687,9 @@ export const BotPendingApprovalSchema = Type.Object({
    *  which is every row written before 51. `sessionId` is then the gateway-owned
    *  `group:<room>:<member>` thread and `turnId` is the room member turn. */
   room: Type.Optional(Type.String()),
+  /** Capability 62. The same validated repair block the pending frame carried, so an inbox read
+   *  on a cold start renders the proposal the live frame did. Absent for every other approval. */
+  repair: Type.Optional(BotApprovalRepairSchema),
 });
 export type BotPendingApproval = Static<typeof BotPendingApprovalSchema>;
 
@@ -2562,4 +2598,25 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * request is `409 conflict` until a runner returns terminal `needs_attention` again. A deleted,
  * stopped, provisioning, ready, wrong-runner, or config-declared runtime is never a recovery
  * target. Clients that offer the action gate it on `>= 61`. */
-export const BOTS_CAPABILITY_VERSION = 61;
+/** Capability 62: AN APPROVAL CAN PROPOSE AN MCP REPAIR. `ApprovalEvent` on `attach-v1` gains
+ * optional `repair`, the typed block `BotApprovalRepairSchema` describes: which MCP server, which
+ * tools it affects, the closed reason from the runtime peer's health record, the opaque
+ * before/after fingerprints, and what approving does (`approve_once` reconnects that server once;
+ * `auto_refresh` says the operator allowed the peer to refresh on its own and the proposal is
+ * informational). Nothing new for delivery, replay, or resolution: the proposal IS an approval on
+ * the existing interaction inbox, `BotApprovalPendingFrame` and `BotPendingApproval` gain the same
+ * optional `repair`, and the durable interaction row stores it, so the live frame, the rebroadcast
+ * on reconnect, and a cold-start inbox read all show the block the peer sent. The approve and deny
+ * routes, `BotApprovalResolvedFrame`, and the settlement are unchanged; the harness performs the
+ * reconnect on approve and the gateway records nothing about its outcome.
+ *
+ * The gateway treats the block exactly as capability 56 treats `detail`: it validates the closed
+ * sets and bounds and refuses any C0/C1 control or Unicode Format character in `server`, `impact`
+ * or a fingerprint, and a block that fails is DROPPED while the approval is kept, because a real
+ * permission decision must never be lost over one presentation block. A valid block is carried
+ * byte for byte.
+ *
+ * Additive: every field is optional, so an approval that is not a repair proposal is byte
+ * identical to its pre-62 self on every surface. A client that renders the repair card gates it on
+ * `>= 62` and renders any other approval as it always has. */
+export const BOTS_CAPABILITY_VERSION = 62;
