@@ -50,6 +50,23 @@ const routine: BotRoutine = {
   nextRun: null,
 };
 
+const sage = { id: "sage", name: "Sage", avatar: null, runtime: "cozyagents" } as const;
+
+function planeWith(botConfig: ConfigSurface | undefined, control: Partial<BotsSurface>) {
+  const storage = openStorage(":memory:");
+  const plane = new NativeBotDataPlane({
+    control: control as BotsSurface,
+    storage,
+    ingress: {} as never,
+    nativeBots: ["sage"],
+    runtimeBots: [sage],
+    chatSuggestion: "",
+    broadcast: () => undefined,
+    ...(botConfig === undefined ? {} : { botConfig }),
+  });
+  return { plane, storage };
+}
+
 describe("attach-v1 config lane", () => {
   let server: Server;
   let port: number;
@@ -173,6 +190,51 @@ describe("attach-v1 config lane", () => {
       "chat.configuration.read", "chat.configuration.prepare", "chat.projects", "chat.branches",
     ]);
     peer.ws.close();
+  });
+
+  it("accepts a runtime peer's providers rows and projects them as the bot's provider catalog", async () => {
+    // The shape CozyAgents sends from its `model.read`: BotModelProviderSchema fields plus the extras
+    // (`id`, `models`, `manualModels`) its launcher reads, which the schema tolerates.
+    const withProviders = {
+      ...modelConfig,
+      catalog: [
+        { id: "anthropic:opus", displayName: "Opus", unauthenticated: true },
+        { id: "custom-1:private-model", displayName: "Private: private-model" },
+      ],
+      providers: [
+        { id: "anthropic", slug: "anthropic", name: "anthropic", authenticated: false, modelCount: 1 },
+        {
+          id: "custom-1", slug: "custom-1", name: "Private", authenticated: true, modelCount: 1,
+          baseUrl: "https://models.example.test/v1", models: ["private-model"], manualModels: ["private-model"],
+        },
+      ],
+    };
+    const peer = await dial({ "model.read": withProviders });
+    await expect(config.modelConfig("sage")).resolves.toEqual(withProviders);
+    const { plane, storage: planeStorage } = planeWith(config, { modelProviders: vi.fn() } as Partial<BotsSurface>);
+    await expect(plane.surface().modelProviders("sage")).resolves.toMatchObject({
+      providers: [{ slug: "anthropic", name: "anthropic", authenticated: false, models: ["opus"], modelCount: 1, methods: [] }],
+    });
+    plane.close();
+    planeStorage.close();
+    peer.ws.close();
+  });
+
+  it("refuses a providers row that carries only `id`: the frame is invalid and the read is a 503", async () => {
+    // The pre-P3b CozyAgents shape. On the wire the ingress refuses the whole `config_result`
+    // frame (the `result` union has no member for that row) and closes the peer's socket, so the
+    // read never reaches `validResult` and ends as unavailable at the lane timeout. Pinned so
+    // neither side can drift back without a red test.
+    const quick = new AttachConfigSurface(ingress, 200);
+    const peer = await dial({ "model.read": { ...modelConfig, providers: [{ id: "anthropic" }] } });
+    const closed = once(peer.ws, "close");
+    const pending = quick.modelConfig("sage");
+    await expect(pending).rejects.toBeInstanceOf(BackendUnavailable);
+    await expect(pending).rejects.toThrow("bot config reply timed out");
+    const [code, reason] = (await closed) as [number, Buffer];
+    expect(code).toBe(1008);
+    expect(String(reason)).toBe("attach-v1 invalid config_result frame");
+    quick.close();
   });
 
   it("preserves a peer's additive row-local ignored details on profile writes", async () => {
@@ -380,23 +442,6 @@ describe("attach-v1 config lane", () => {
 });
 
 describe("native runtime bot config routing", () => {
-  const sage = { id: "sage", name: "Sage", avatar: null, runtime: "cozyagents" } as const;
-
-  function planeWith(botConfig: ConfigSurface | undefined, control: Partial<BotsSurface>) {
-    const storage = openStorage(":memory:");
-    const plane = new NativeBotDataPlane({
-      control: control as BotsSurface,
-      storage,
-      ingress: {} as never,
-      nativeBots: ["sage"],
-      runtimeBots: [sage],
-      chatSuggestion: "",
-      broadcast: () => undefined,
-      ...(botConfig === undefined ? {} : { botConfig }),
-    });
-    return { plane, storage };
-  }
-
   it("routes the Dashboard-backed config surfaces to the peer for a runtime bot", async () => {
     const botProfile = vi.fn();
     const routines = vi.fn();

@@ -13,7 +13,9 @@ source topology file to be edited.
 - A **gateway harness** is one configured backend connection with a stable gateway-local id and a
   vendor identity.
 - A **harness configuration scope** is the harness-native boundary at which provider settings
-  apply. Hermes Agent exposes visible profiles as scopes.
+  apply. Hermes Agent exposes visible profiles as scopes. The `cozyagents` harness exposes one
+  scope per runtime bot, read-only: its providers are projected from the bot's `model.read` over
+  the attach-v1 `bot_config` lane, and field and OAuth writes answer `404 invalid_request`.
 - A **model provider** is discovered live from the selected harness. CozyGateway and CozyChat do
   not own a provider registry.
 
