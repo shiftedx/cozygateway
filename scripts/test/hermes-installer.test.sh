@@ -2054,6 +2054,12 @@ file "$tmp/gateway-windows-live/local/run-gateway.vbs" | grep -Fq 'CRLF'
 # An XML collision must contain exactly one matching Exec action. Expected
 # Command/Arguments hidden beside a second action cannot confer ownership.
 task_action="$(sed -n 's:.*<Actions Context="Author">\(.*\)</Actions>.*:\1:p' <<<"$windows_task_xml")"
+# Published native Node overrides were recorded using drive-rooted Windows
+# paths. Ownership checks must still reject foreign actions after conversion.
+state_native_node="$("$tmp/bin/cygpath" -w "$fake_node")"
+awk '!/^node_resolved=/' "$tmp/gateway-windows-live/local/install-state" > "$tmp/windows-native-node-state"
+printf 'node_resolved=%s\n' "$state_native_node" >> "$tmp/windows-native-node-state"
+mv "$tmp/windows-native-node-state" "$tmp/gateway-windows-live/local/install-state"
 cp "$tmp/gateway-windows-live/local/gateway-supervisor.cjs" "$tmp/windows-collision-supervisor-before"
 cp "$tmp/gateway-windows-live/local/run-gateway.sh" "$tmp/windows-collision-wrapper-before"
 if task_collision_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-collision-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_SCHTASKS_XML="$task_action<Exec><Command>foreign.exe</Command><Arguments>--side-effect</Arguments></Exec>" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$windows_native_hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live" 2>&1)"; then

@@ -351,6 +351,9 @@ resolve_node() {
     major="$(node_major "$private")"; [ "${major:-0}" -ge 24 ] && { printf '%s' "$private"; return; }
   fi
   candidate="$NODE_BIN"
+  if is_windows; then
+    case "$candidate" in [A-Za-z]:\\*|[A-Za-z]:/*) candidate="$(to_posix_path "$candidate")" || return 1 ;; esac
+  fi
   if case "$candidate" in */*) [ -x "$candidate" ] ;; *) have "$candidate" ;; esac; then
     major="$(node_major "$candidate")"
     if [ "${major:-0}" -ge 24 ]; then case "$candidate" in /*) printf '%s' "$candidate" ;; *) command -v "$candidate" ;; esac; return; fi
@@ -1939,8 +1942,10 @@ load_windows_state_identity() {
   NODE_RESOLVED="$(sed -n 's/^node_resolved=//p' "$STATE_FILE")"
   BUNDLE_PATH="$(sed -n 's/^bundle_path=//p' "$STATE_FILE")"
   [ -n "$NODE_RESOLVED" ] && [ -n "$BUNDLE_PATH" ] || return 1
-  case "$NODE_RESOLVED" in /*) ;; *) return 1 ;; esac
-  case "$BUNDLE_PATH" in /*) ;; *) return 1 ;; esac
+  # Older native bootstraps persisted COZYGATEWAY_NODE in drive-rooted Windows
+  # form. Convert only absolute identities; drive-relative paths grant no ownership.
+  case "$NODE_RESOLVED" in /*) ;; [A-Za-z]:\\*|[A-Za-z]:/*) NODE_RESOLVED="$(to_posix_path "$NODE_RESOLVED")" || return 1 ;; *) return 1 ;; esac
+  case "$BUNDLE_PATH" in /*) ;; [A-Za-z]:\\*|[A-Za-z]:/*) BUNDLE_PATH="$(to_posix_path "$BUNDLE_PATH")" || return 1 ;; *) return 1 ;; esac
 }
 preflight_windows_service_ownership() {
   local desired_node="$NODE_RESOLVED" desired_bundle="$BUNDLE_PATH" desired_dashboard_port="$DASHBOARD_PORT" task_xml startup_entry state_dashboard_port
