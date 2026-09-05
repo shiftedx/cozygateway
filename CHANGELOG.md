@@ -5,6 +5,15 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## Unreleased
+
+- Windows installation offers Hermes, CozyAgents, or both on one gateway, preserves the other
+  harness when adding one later, and keeps saved model settings and pairing during repair.
+- Gateway tasks and background children use hidden launchers. Windows upgrade recovery recognizes
+  older supervisors and restores task ownership before replacing its launcher files.
+- Hermes readiness is checked separately from native runtime bots so a combined installation can
+  finish without miscounting its profiles.
+
 ## 0.7 (2026-09-04 to 2026-09-05): runners, durability, and the phone-created bot fix
 
 - **v0.7.4** Bots created from CozyChat on a native install become ready on their own (#353);
