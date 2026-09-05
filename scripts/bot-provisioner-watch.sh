@@ -110,8 +110,8 @@ PY
 plugin_content_matches_source() {
   local dest="$1" source_files installed_files rel
   [ -d "$dest" ] || return 1
-  source_files="$(cd "$SRC_DIR" && find . -type f ! -path '*/__pycache__/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
-  installed_files="$(cd "$dest" && find . -type f ! -path '*/__pycache__/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
+  source_files="$(cd "$SRC_DIR" && find . -type f ! -path '*/__pycache__/*' ! -path '*/.pytest_cache/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
+  installed_files="$(cd "$dest" && find . -type f ! -path '*/__pycache__/*' ! -path '*/.pytest_cache/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
   [ "$source_files" = "$installed_files" ] || return 1
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue

@@ -303,6 +303,8 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   let nextRequestId = 1;
   /** Gated mode only. The dashboard session cookie header value, held here and nowhere else. */
   let sessionCookie: string | undefined;
+  /** One password exchange shared by the websocket ticket path and every dashboard request. */
+  let loginInFlight: Promise<void> | undefined;
   let ticketRetries = 0;
   let generation = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -493,6 +495,23 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     log("logged in to the hermes dashboard; session established");
   }
 
+  async function ensureSession(): Promise<void> {
+    if (auth.mode !== "password" || sessionCookie !== undefined) return;
+    if (loginInFlight !== undefined) return loginInFlight;
+    const attempt = login(
+      auth.baseUrl,
+      auth.username,
+      auth.password,
+      auth.provider ?? DEFAULT_AUTH_PROVIDER,
+    );
+    loginInFlight = attempt;
+    try {
+      await attempt;
+    } finally {
+      if (loginInFlight === attempt) loginInFlight = undefined;
+    }
+  }
+
   /** Gated leg 2: mint a single-use, 30s-TTL ws ticket against the held session. */
   async function mintTicket(baseUrl: string): Promise<string> {
     const cookie = sessionCookie;
@@ -509,7 +528,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     }
     if (response.status === 401 || response.status === 403) {
       await response.text().catch(() => "");
-      sessionCookie = undefined;
+      if (sessionCookie === cookie) sessionCookie = undefined;
       throw new SessionExpiredError(`hermes session is no longer valid (HTTP ${response.status})`);
     }
     if (!response.ok) {
@@ -530,14 +549,13 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
    *  the held session turns out to be stale. */
   async function resolveCredential(): Promise<{ param: string; value: string }> {
     if (auth.mode === "token") return { param: auth.param ?? "token", value: auth.token };
-    const provider = auth.provider ?? DEFAULT_AUTH_PROVIDER;
-    if (sessionCookie === undefined) await login(auth.baseUrl, auth.username, auth.password, provider);
+    await ensureSession();
     try {
       return { param: "ticket", value: await mintTicket(auth.baseUrl) };
     } catch (err) {
       if (!(err instanceof SessionExpiredError)) throw err;
       log("hermes session expired; logging in again");
-      await login(auth.baseUrl, auth.username, auth.password, provider);
+      await ensureSession();
       return { param: "ticket", value: await mintTicket(auth.baseUrl) };
     }
   }
@@ -553,24 +571,24 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     } = {},
   ): Promise<Response> {
     let relogged = false;
-    const send = async (): Promise<Response> => {
+    const send = async (): Promise<{ response: Response; cookie: string | undefined }> => {
       const headers: Record<string, string> = {
         accept: "application/json",
         ...(init.headers ?? {}),
       };
       if (init.body !== undefined) headers["content-type"] = "application/json";
+      let cookie: string | undefined;
       if (auth.mode === "password") {
-        if (sessionCookie === undefined) {
-          await login(auth.baseUrl, auth.username, auth.password, auth.provider ?? DEFAULT_AUTH_PROVIDER);
-        }
-        headers.cookie = sessionCookie!;
+        await ensureSession();
+        cookie = sessionCookie!;
+        headers.cookie = cookie;
       } else {
         headers["x-hermes-session-token"] = auth.token;
       }
       const timeoutSignal = AbortSignal.timeout(
         Math.max(1, init.timeoutMs ?? authHttpTimeoutMs),
       );
-      return doFetch(new URL(path, `${dashboardBaseUrl}/`), {
+      const response = await doFetch(new URL(path, `${dashboardBaseUrl}/`), {
         method: init.method ?? "GET",
         headers,
         ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
@@ -578,14 +596,17 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
           ? timeoutSignal
           : AbortSignal.any([init.signal, timeoutSignal]),
       });
+      return { response, cookie };
     };
 
-    let response = await send();
+    let attempt = await send();
+    let response = attempt.response;
     if (auth.mode === "password" && response.status === 401 && !relogged) {
       await response.text().catch(() => "");
-      sessionCookie = undefined;
+      if (sessionCookie === attempt.cookie) sessionCookie = undefined;
       relogged = true;
-      response = await send();
+      attempt = await send();
+      response = attempt.response;
     }
     return response;
   }

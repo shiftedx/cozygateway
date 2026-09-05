@@ -159,6 +159,83 @@ describe("gated password auth", () => {
     });
   }
 
+  it("shares one login across the first websocket ticket and concurrent dashboard requests", async () => {
+    const server = await gatedServer();
+    let releaseLogin: (() => void) | undefined;
+    const loginGate = new Promise<void>((resolve) => { releaseLogin = resolve; });
+    let loginAttempts = 0;
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith("/auth/password-login")) {
+        loginAttempts += 1;
+        await loginGate;
+      }
+      return fetch(input, init);
+    };
+    const c = gatedClient(server, { fetchImpl });
+
+    c.start();
+    await until(() => loginAttempts === 1);
+    const dashboard = c.dashboardResponse("/api/does-not-exist");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const concurrentLoginAttempts = loginAttempts;
+    releaseLogin?.();
+
+    expect((await dashboard).status).toBe(404);
+    await until(() => c.state() === "online");
+    expect(concurrentLoginAttempts).toBe(1);
+    expect(server.loginCount()).toBe(1);
+    expect(server.ticketMintCount()).toBe(1);
+  });
+
+  it("does not discard a newer session when an older dashboard request receives a late 401", async () => {
+    let releaseStale: (() => void) | undefined;
+    let staleStarted: (() => void) | undefined;
+    const staleGate = new Promise<void>((resolve) => { releaseStale = resolve; });
+    const sawStale = new Promise<void>((resolve) => { staleStarted = resolve; });
+    let loginAttempts = 0;
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === "/auth/password-login") {
+        loginAttempts += 1;
+        return new Response("", {
+          status: 200,
+          headers: { "set-cookie": `session=${loginAttempts === 1 ? "old" : "new"}; Path=/` },
+        });
+      }
+      const cookie = new Headers(init?.headers).get("cookie");
+      if (url.pathname === "/prime") return Response.json({ ok: true });
+      if (url.pathname === "/stale" && cookie === "session=old") {
+        staleStarted?.();
+        await staleGate;
+        return new Response("", { status: 401 });
+      }
+      if (url.pathname === "/refresh" && cookie === "session=old") {
+        return new Response("", { status: 401 });
+      }
+      return Response.json({ ok: true });
+    };
+    const c = createHermesClient({
+      url: "ws://127.0.0.1:1/api/ws",
+      auth: {
+        mode: "password", baseUrl: "http://dashboard.invalid",
+        username: USERNAME, password: PASSWORD,
+      },
+      fetchImpl,
+    });
+    clients.push(c);
+
+    await c.dashboardJson("/prime");
+    const stale = c.dashboardJson("/stale");
+    await sawStale;
+    await c.dashboardJson("/refresh");
+    expect(loginAttempts).toBe(2);
+
+    releaseStale?.();
+    await stale;
+    expect(loginAttempts).toBe(2);
+  });
+
   it("logs in, mints a ticket, and dials with it", async () => {
     const server = await gatedServer();
     const lines: string[] = [];

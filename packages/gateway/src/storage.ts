@@ -73,6 +73,16 @@ export interface ChatExecutionRow {
   createdAt: number;
 }
 
+/** A profile this gateway just created whose attach/blank-slate seed was interrupted.  This is
+ * deliberately not a general work queue: it holds only the caller's original tool selection so
+ * the bridge can finish the one idempotent profile write after a transient Hermes failure. */
+export interface PendingHermesProfileSeedRow {
+  profile: string;
+  selection: { toolsets?: readonly string[]; mcpServers?: readonly string[] };
+  attempts: number;
+  nextAttemptAt: number;
+}
+
 /** Terminal receipts are reconnect aids, not permanent interaction history. Pending rows are
  * never pruned; retain only the newest bounded terminal proof per profile. */
 const NATIVE_INTERACTION_SETTLEMENT_LIMIT = 100;
@@ -219,6 +229,15 @@ CREATE TABLE IF NOT EXISTS bot_roster (
   summary_json TEXT NOT NULL,
   position INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
+) STRICT;
+-- A phone-created profile is not eligible for native provisioning until its idempotent
+-- blank-slate/attach-plugin seed has succeeded.  Retain just that intent across a gateway
+-- restart; credentials and arbitrary profile configuration remain Hermes-owned.
+CREATE TABLE IF NOT EXISTS pending_hermes_profile_seeds (
+  profile TEXT PRIMARY KEY,
+  selection_json TEXT NOT NULL,
+  attempts INTEGER NOT NULL CHECK (attempts >= 1),
+  next_attempt_at INTEGER NOT NULL
 ) STRICT;
 -- Tool steps a bot's turn ran (contract/ext-bots-v1.md, capability 12). A CACHE of nothing: hermes
 -- keeps its tool lifecycle on a live event stream and replays none of it, so if these rows are not
@@ -1678,6 +1697,75 @@ export class Storage {
       bots: rows.map((row) => JSON.parse(row.summaryJson) as BotSummary),
       updatedAt: rows.length === 0 ? null : rows[0]!.updatedAt,
     };
+  }
+
+  /** Records the one seed pass that a successfully-created Hermes profile still needs.  The
+   * profile name is the identity: a retry may update its delay but can never replace the original
+   * user selection with a later unrelated request. */
+  savePendingHermesProfileSeed(row: PendingHermesProfileSeedRow): void {
+    this.#db.prepare(
+      `INSERT INTO pending_hermes_profile_seeds
+         (profile, selection_json, attempts, next_attempt_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(profile) DO UPDATE SET
+         attempts = excluded.attempts,
+         next_attempt_at = excluded.next_attempt_at`,
+    ).run(
+      row.profile,
+      JSON.stringify(row.selection),
+      row.attempts,
+      row.nextAttemptAt,
+    );
+  }
+
+  pendingHermesProfileSeeds(): PendingHermesProfileSeedRow[] {
+    const rows = this.#db.prepare(
+      `SELECT profile, selection_json AS selectionJson, attempts, next_attempt_at AS nextAttemptAt
+       FROM pending_hermes_profile_seeds ORDER BY next_attempt_at, profile`,
+    ).all() as unknown as Array<{
+      profile: string;
+      selectionJson: string;
+      attempts: number;
+      nextAttemptAt: number;
+    }>;
+    return rows.flatMap((row) => {
+      try {
+        const parsed: unknown = JSON.parse(row.selectionJson);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          this.removePendingHermesProfileSeed(row.profile);
+          return [];
+        }
+        const value = parsed as Record<string, unknown>;
+        const names = (field: "toolsets" | "mcpServers"): string[] | undefined => {
+          const raw = value[field];
+          return Array.isArray(raw) && raw.every((name) => typeof name === "string")
+            ? [...raw] as string[]
+            : undefined;
+        };
+        const toolsets = names("toolsets");
+        const mcpServers = names("mcpServers");
+        return [{
+          profile: row.profile,
+          selection: {
+            ...(toolsets === undefined ? {} : { toolsets }),
+            ...(mcpServers === undefined ? {} : { mcpServers }),
+          },
+          attempts: row.attempts,
+          nextAttemptAt: row.nextAttemptAt,
+        }];
+      } catch {
+        // Corrupt durable intent must not turn into a seed with an invented selection.  Removing
+        // the row is safer than retrying a profile after the user may have edited it manually.
+        this.removePendingHermesProfileSeed(row.profile);
+        return [];
+      }
+    });
+  }
+
+  removePendingHermesProfileSeed(profile: string): boolean {
+    return this.#db.prepare(
+      "DELETE FROM pending_hermes_profile_seeds WHERE profile = ?",
+    ).run(profile).changes === 1;
   }
 
   /** Writes one tool step, or updates the one already there (capability 12). Upsert rather than
