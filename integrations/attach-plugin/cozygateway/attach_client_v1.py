@@ -65,6 +65,9 @@ MOBILE_FAILURE_REASONS = frozenset({
 })
 MOBILE_STATUS_TIMEOUT_SECONDS = 30
 MOBILE_INTERACTION_TIMEOUT_SECONDS = 120
+# Absolute deadlines cross clock implementations/hosts. Reserve one second of
+# the existing maximum for subsecond skew; never widen the gateway policy.
+MOBILE_DEADLINE_HEADROOM_MS = 1000
 # How long to wait for hello_ack before concluding the handshake stalled and re-dialing with the
 # same hello. The gateway gives a peer 5 seconds to say hello; this is the matching budget in the
 # other direction.
@@ -278,7 +281,7 @@ class AttachV1Client:
             frame: Dict[str, Any] = {
                 "kind": "mobile_request", "requestId": request_id,
                 "command": command, "threadId": thread_id, "turnId": turn_id,
-                "expiresAt": int(time.time() * 1000) + timeout_seconds * 1000,
+                "expiresAt": int(time.time() * 1000) + max(1, int(timeout_seconds * 1000) - MOBILE_DEADLINE_HEADROOM_MS),
             }
             if purpose is not None:
                 frame["purpose"] = purpose
