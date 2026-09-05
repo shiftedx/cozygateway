@@ -1101,6 +1101,7 @@ write_state
 #!/usr/bin/env bash
 set -euo pipefail
 WINDOWS_TASK_XML="`$1"
+WINDOWS_VBS=/fixture/gateway/local/run-gateway.vbs
 GATEWAY_DIR=/fixture/gateway
 LOCAL_DIR=/fixture/gateway/local
 NODE_RESOLVED="`$2"
