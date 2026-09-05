@@ -67,3 +67,25 @@ installer retains strict physical-directory ownership checks, but no explicit MS
 virtualized-path migration is implemented here. The earlier installation needed manual
 steps in these areas. The current upstream Hermes installer was not downloaded or executed
 during this fixture-only follow-up.
+
+### Repair retry-owner follow-up
+
+A subsequent coordinated repair exposed a production lifecycle gap: stopping the Node
+supervisor left its outer WScript launcher in the 60-second retry sleep. A new task run
+could then be ignored by `MultipleInstancesPolicy=IgnoreNew`. Cleanup now includes every
+exactly owned local/Startup WScript launcher, terminates those before Node, and rechecks
+the executable, command arguments, and process creation time immediately before stopping
+each process. Existing VBS content validation must succeed before its path becomes an
+allowed process identity; foreign launchers and reused PIDs remain untouched.
+
+The no-launch regression reproduces a lone sleeping launcher, multiple owned launchers,
+launcher-before-child termination, forged executables, changed commands, and PID reuse.
+Its stop loop uses an in-memory taskkill scriptblock, so it cannot launch or terminate a
+real process. The original sleeping-launcher test failed before the change and passes
+afterward. Legacy ownership and hidden-launch checks also pass. `pnpm build` and
+`pnpm bundle` completed successfully; the updated installer artifact SHA-256 is
+`46196fa453fe2226fd7de2aa631c51685325fcf74b6e076f3c736dd68787000e`.
+
+The complete post-change Windows bootstrap and dual-agent suites passed, as did shell
+state-identity and hidden-task checks. The full Hermes shell rerun and the machine owner's
+coordinated repair results are tracked separately until they finish.
