@@ -67,6 +67,7 @@ import type {
 } from "./approvals.ts";
 import { GroupRooms, type RoomInteractionExpiry } from "./group-rooms.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
+import type { ProfileChangeEvent } from "./profile-provisioner.ts";
 import {
   BotNameInvalid,
   BotNameTaken,
@@ -114,6 +115,7 @@ const CHANGE_DEBOUNCE_MS = 250;
  *  member boundary of every room. */
 const EMPTY_NAMES: ReadonlySet<string> = new Set<string>();
 export type BotFocusScreen = "roster" | "routines";
+export type { ProfileChangeEvent } from "./profile-provisioner.ts";
 export interface BotRosterView {
   bots: BotSummary[];
   updatedAt: number | null;
@@ -400,6 +402,12 @@ export interface HermesBridgeOptions {
    *  socket, adapter, capability grant. Returns whether an identity was actually held. Wired by
    *  the server, absent in bridge-only tests. */
   revokeAttachIdentity?: (name: string) => boolean;
+  /** Told once per Hermes profile this bridge created or deleted, after the roster already reflects
+   *  the change and the response is about to go out. The server hands it to the profile
+   *  provisioner, which is what moves a phone-created bot past `setup_required` on a native
+   *  install. A throwing hook is logged and never fails the request; a refused create or delete
+   *  never reaches it. Absent in bridge-only tests and on gateways nothing may reprovision. */
+  onProfileChange?: (event: ProfileChangeEvent) => void;
 }
 
 /** Dashboard control/read plane. All Bot Mode conversation traffic is attach-v1. */
@@ -419,6 +427,7 @@ export class HermesBridge implements BotControlSurface {
   readonly #catalogTtlMs: number;
   readonly #catalogDegradedTtlMs: number;
   readonly #revokeAttachIdentity: (name: string) => boolean;
+  readonly #onProfileChange: ((event: ProfileChangeEvent) => void) | undefined;
   readonly #runtimeBotNames: () => ReadonlySet<string>;
   readonly #chains = new Map<string, Promise<unknown>>();
   readonly #routineWatch = new Map<string, number>();
@@ -449,6 +458,7 @@ export class HermesBridge implements BotControlSurface {
     this.#catalogDegradedTtlMs =
       opts.catalogDegradedTtlMs ?? CATALOG_DEGRADED_TTL_MS;
     this.#revokeAttachIdentity = opts.revokeAttachIdentity ?? (() => false);
+    this.#onProfileChange = opts.onProfileChange;
     this.#runtimeBotNames = opts.runtimeBotNames ?? ((): ReadonlySet<string> => EMPTY_NAMES);
     this.#log =
       opts.logSink ??
@@ -657,6 +667,7 @@ export class HermesBridge implements BotControlSurface {
     await this.refresh(`bot ${name} created`);
     const bot = this.#storage.botRoster().bots.find((row) => row.name === name);
     if (bot === undefined) throw new BotNotFound(name);
+    this.#profileChanged({ profile: name, change: "created" });
     return { bot, ...(warnings.length === 0 ? {} : { warnings }) };
   }
   /** The inverse of `createBot`, built for "no traces on the Hermes host": the dashboard's
@@ -708,6 +719,7 @@ export class HermesBridge implements BotControlSurface {
     if (hermesProfile === "already_absent" && !known && Object.keys(purged).length === 0)
       throw new BotNotFound(canon);
     await this.refresh(`bot ${canon} deleted`);
+    this.#profileChanged({ profile: canon, change: "deleted" });
     return {
       name: canon,
       hermesProfile,
@@ -720,6 +732,18 @@ export class HermesBridge implements BotControlSurface {
         `run scripts/deprovision-bot.sh ${canon} to sweep all of these and restart the box gateway`,
       ],
     };
+  }
+  /** The create or delete has already succeeded on Hermes and in the roster; from here the hook
+   *  is a courtesy to whoever provisions, never a reason to fail a request that is already true. */
+  #profileChanged(event: ProfileChangeEvent): void {
+    if (this.#onProfileChange === undefined) return;
+    try {
+      this.#onProfileChange(event);
+    } catch (error) {
+      this.#log(
+        `profile change hook failed for ${event.profile} (${event.change}): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
   health(): BridgeLiveness {
     const liveness = this.#client.liveness();

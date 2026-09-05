@@ -299,6 +299,17 @@ profile gets `plugins.enabled: [cozygateway]` (see
 profile saying it wants the phone surface. The rest is Mac-side and box-side
 work, which is what these two scripts do.
 
+**Scope of these scripts.** They are for the split deployment where the gateway
+runs in Docker on a separate box and Hermes runs on a Mac: they ssh to the box,
+edit its config, and recreate its container. A native install made by
+`install.sh` (gateway and Hermes on the same machine) does not use them and
+never installs them. There the gateway starts the installer's own provisioning
+run (`agent-install.sh` with the default `--profiles all` scope, local verified
+assets, no network) after a Hermes profile is created or deleted from the phone;
+that run restarts the gateway service, installs the profile's Hermes gateway
+service, and the row moves `setup_required` -> `starting` -> `ready` on its own.
+See `docs/agent-install.md` and the `profile-provisioner` module in the gateway.
+
 ### One profile, by hand
 
 ```bash

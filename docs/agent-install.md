@@ -128,8 +128,11 @@ It discovers Hermes with `hermes -p <profile> config path`, then uses that
 evidence to find the default home and named profile homes. Every discovered
 profile with a `config.yaml` is configured by default. That default remains a
 dynamic `all` scope, so update and repair runs automatically provision profiles
-created after the first install. Narrow the scope with `--profiles default,ops`
-only when that isolation is intentional.
+created after the first install. A profile created from the phone inherits the
+launch profile's `.env` from Hermes, CozyGateway keys included, so the installer
+mints it its own attach token and spool rather than reusing the copied ones.
+Narrow the scope with `--profiles default,ops` only when that isolation is
+intentional.
 
 The release bootstrap downloads and SHA-256 verifies three versioned release
 assets before execution: the gateway bundle, the complete Hermes attach plugin
