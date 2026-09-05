@@ -161,7 +161,9 @@ async function startFixedContainer(containerName = "cozygateway-gateway-1") {
 }
 
 describe("Compose maintenance supervisor", () => {
-  it("reports unavailable/up-to-date safely and persists one delayed restart handoff", async () => {
+  // This sidecar uses Unix sockets, POSIX credentials, and /usr/bin/python3.
+  // Native Windows supervision is exercised by windows-bootstrap.test.ps1.
+  it.skipIf(process.platform === "win32")("reports unavailable/up-to-date safely and persists one delayed restart handoff", async () => {
     const unavailable = await start();
     expect((await request(unavailable.socketPath, { action: "status" })).status).toMatchObject({ update: { state: "unavailable" } });
 
@@ -183,7 +185,7 @@ describe("Compose maintenance supervisor", () => {
       .toEqual({ ok: false, code: "invalid_request" });
   }, 12_000);
 
-  it("uses only the configured Docker Engine restart endpoint after the gateway receipt", async () => {
+  it.skipIf(process.platform === "win32")("uses only the configured Docker Engine restart endpoint after the gateway receipt", async () => {
     const fixed = await startFixedContainer();
     const receiptResponse = await gatewayRestart(fixed.socketPath, "fixed-container-request");
     expect(receiptResponse.status).toBe(202);

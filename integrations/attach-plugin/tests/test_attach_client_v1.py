@@ -633,6 +633,21 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await request, {"status": "ok", "result": GATEWAY_STATUS})
         await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": frame["requestId"], "status": "denied"}))
 
+    async def test_mobile_deadline_fits_gateway_budget_with_subsecond_clock_lead(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node", "mobile_location", "mobile_media"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        for command, budget_ms in (("device.status", 30_000), ("location.current", 30_000), ("camera.capture", 120_000)):
+            for clock_lead in (0.002, 0.5):
+                with self.subTest(command=command, clock_lead=clock_lead):
+                    with patch("cozygateway.attach_client_v1.time.time", return_value=1000 + clock_lead):
+                        request = __import__("asyncio").create_task(self.client._request_mobile(command, "thread", "turn", "Test clock budget"))
+                        await __import__("asyncio").sleep(0)
+                    frame = self.socket.sent[-1]
+                    request.cancel()
+                    self.assertEqual(await request, {"status": "cancelled"})
+                    self.assertGreater(frame["expiresAt"], 1_000_000)
+                    self.assertLessEqual(frame["expiresAt"], 1_000_000 + budget_ms)
+
     async def test_mobile_failures_are_closed_and_preserved(self):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
@@ -694,9 +709,9 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
             await __import__("asyncio").sleep(0)
         frame = self.socket.sent[-1]
         self.assertEqual(status_frame["command"], "device.status")
-        self.assertEqual(status_frame["expiresAt"], 1_030_000)
+        self.assertEqual(status_frame["expiresAt"], 1_029_000)
         self.assertEqual(frame["command"], "camera.capture")
-        self.assertEqual(frame["expiresAt"], 1_120_000)
+        self.assertEqual(frame["expiresAt"], 1_119_000)
         request.cancel()
         self.assertEqual(await request, {"status": "cancelled"})
 

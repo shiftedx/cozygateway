@@ -2,12 +2,12 @@ import { once } from "node:events";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { expect, it } from "vitest";
 import { WebSocket } from "ws";
-import type { ReadyFrame, ServerFrame } from "cozygateway-contract";
+import type { MobileNodePhoneStatusResult, ReadyFrame, ServerFrame } from "cozygateway-contract";
 
 import { startGateway, type RunningGateway } from "../src/server.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
@@ -75,8 +75,14 @@ async function runMobileToolE2E(tool: "status" | "location"): Promise<void> {
       ? { latitude: 41.88, longitude: -87.63 }
       : {
           appState: "background", lowPowerMode: false,
-          capabilities: [{ command: "device.status", permission: "not_required" }],
-        };
+          capabilities: [
+            { command: "device.status", permission: "not_required" },
+            { command: "location.current", permission: "authorized" },
+            { command: "camera.capture", permission: "unavailable" },
+            { command: "file.pick", permission: "not_required" },
+            { command: "notification.present", permission: "not_required" },
+          ],
+        } satisfies MobileNodePhoneStatusResult;
     appA.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: request.requestId, lease: request.lease, status: "ok", result: mobileResult }));
 
     const result = await harness.until((event) => event.e2e === "result");
@@ -104,7 +110,7 @@ function startHarness(gatewayUrl: string, hermes: HermesRuntime, tool: "status" 
       PATH: process.env.PATH ?? "", LANG: process.env.LANG ?? "C", TMPDIR: process.env.TMPDIR ?? tmpdir(),
       HERMES_AGENT_ROOT: hermes.root, HERMES_HOME: home,
       HERMES_PROFILE: "sage", COZYGATEWAY_URL: gatewayUrl,
-      COZYGATEWAY_TOKEN: "attach-secret", COZY_MOBILE_TOOL: tool, PYTHONPATH: `${PLUGIN_ROOT}:${hermes.root}`,
+      COZYGATEWAY_TOKEN: "attach-secret", COZY_MOBILE_TOOL: tool, PYTHONPATH: [PLUGIN_ROOT, hermes.root].join(delimiter),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -127,31 +133,39 @@ class Harness {
   readonly events: Array<Record<string, unknown>> = [];
   readonly child: ChildProcess;
   readonly home: string;
+  readonly #exit: Promise<number | null>;
   #stderr = "";
   #buffer = "";
 
   constructor(child: ChildProcess, home: string) {
     this.child = child;
     this.home = home;
+    this.#exit = new Promise((resolve) => child.once("exit", (code) => resolve(code)));
     child.stdout!.on("data", (chunk: Buffer) => this.#read(String(chunk)));
     child.stderr!.on("data", (chunk: Buffer) => { this.#stderr += String(chunk); });
   }
 
   async until(predicate: (event: Record<string, unknown>) => boolean): Promise<Record<string, unknown>> {
-    await until(() => this.events.some(predicate));
+    await until(() => {
+      if (this.events.some(predicate)) return true;
+      const error = this.events.find((event) => event.e2e === "error");
+      if (error) throw new Error(`Hermes harness failed: ${String(error.message)}`);
+      if (this.child.exitCode !== null || this.child.signalCode !== null) throw new Error("Hermes harness exited before the expected event");
+      return false;
+    });
     return this.events.find(predicate)!;
   }
 
   async exited(): Promise<void> {
-    const [code] = await once(this.child, "exit") as [number | null];
+    const code = await this.#exit;
     expect(code, this.#stderr).toBe(0);
   }
 
   async close(): Promise<void> {
     try {
-      if (this.child.exitCode === null) {
+      if (this.child.exitCode === null && this.child.signalCode === null) {
         this.child.kill();
-        await once(this.child, "exit");
+        await this.#exit;
       }
       if (this.#stderr && this.child.exitCode !== 0) throw new Error(this.#stderr);
     } finally {
