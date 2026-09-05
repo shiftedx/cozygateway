@@ -111,6 +111,10 @@ import {
 } from "./blank-slate-seed.ts";
 
 const CHANGE_DEBOUNCE_MS = 250;
+/** A seed is an idempotent profile write.  Retrying quickly handles a short Dashboard rate-limit
+ * window; the cap prevents one unavailable Dashboard from becoming a hot loop. */
+const SEED_RETRY_BASE_MS = 1_000;
+const SEED_RETRY_MAX_MS = 5 * 60_000;
 /** The answer a bridge with no runtime bots configured gives, allocated once: this is read on every
  *  member boundary of every room. */
 const EMPTY_NAMES: ReadonlySet<string> = new Set<string>();
@@ -377,6 +381,9 @@ export interface HermesBridgeOptions {
   /** Skill names a blank-slate bot keeps ON. Default `[]`: no playbooks until asked. Ignored when
    *  `seedBlankSlateBots` is false. */
   blankSlateSkillsOn?: readonly string[];
+  /** Internal test seam for the persisted seed retry. Production uses one second then exponential
+   * backoff capped at five minutes; this is intentionally not configuration or a wire option. */
+  seedRetryBaseMs?: number;
   /** Bot names served by a non-Hermes runtime (capability 45), read fresh on every call because
    *  the set is config-declared and the bridge is built before the data plane that knows it.
    *
@@ -420,6 +427,7 @@ export class HermesBridge implements BotControlSurface {
   readonly #bridgeProfile: string | undefined;
   readonly #seedBlankSlateBots: boolean;
   readonly #blankSlateSkillsOn: readonly string[];
+  readonly #seedRetryBaseMs: number;
   readonly #log: (line: string) => void;
   readonly #groups: GroupRooms;
   readonly #catalog = new Map<string, CachedCatalog>();
@@ -436,6 +444,8 @@ export class HermesBridge implements BotControlSurface {
   #refreshTimer: ReturnType<typeof setTimeout> | undefined;
   #routineTimer: ReturnType<typeof setTimeout> | undefined;
   #pollTimer: ReturnType<typeof setTimeout> | undefined;
+  #seedRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  #seedRetryAt: number | undefined;
   #refreshing: Promise<void> | undefined;
   #dirty = false;
   #closed = false;
@@ -454,6 +464,7 @@ export class HermesBridge implements BotControlSurface {
     this.#bridgeProfile = profile || undefined;
     this.#seedBlankSlateBots = opts.seedBlankSlateBots ?? true;
     this.#blankSlateSkillsOn = opts.blankSlateSkillsOn ?? BLANK_SLATE_SKILLS_ON;
+    this.#seedRetryBaseMs = Math.max(1, opts.seedRetryBaseMs ?? SEED_RETRY_BASE_MS);
     this.#catalogTtlMs = opts.catalogTtlMs ?? CATALOG_TTL_MS;
     this.#catalogDegradedTtlMs =
       opts.catalogDegradedTtlMs ?? CATALOG_DEGRADED_TTL_MS;
@@ -561,7 +572,10 @@ export class HermesBridge implements BotControlSurface {
   }
   start(): void {
     this.#client.onStateChange((state) => {
-      if (state === "online") this.refreshSoon("hermes online");
+      if (state === "online") {
+        this.refreshSoon("hermes online");
+        this.#schedulePendingSeedRetry();
+      }
     });
     this.#client.onEvent((event) => {
       if (event.type === "sessions.changed") this.refreshSoon(event.type);
@@ -569,7 +583,10 @@ export class HermesBridge implements BotControlSurface {
     });
     this.#client.start();
     // Discovery can connect the shared client before this bridge subscribes.
-    if (this.#client.state() === "online") this.refreshSoon("hermes already online");
+    if (this.#client.state() === "online") {
+      this.refreshSoon("hermes already online");
+      this.#schedulePendingSeedRetry();
+    }
   }
   roster(): BotRosterView {
     const cached = this.#storage.botRoster();
@@ -599,27 +616,37 @@ export class HermesBridge implements BotControlSurface {
       throw error;
     }
 
-    // The profile exists from here on. Everything below is best-effort decoration of a create that
-    // already succeeded: a failure is logged loudly and reported in `warnings`, never turned into a
-    // retry that can only collide with itself or into a 500 over a bot that now exists.
+    // The profile exists from here on. Metadata is best-effort decoration, but the idempotent seed
+    // is what enrolls its attach plugin.  Persist its original selection if Hermes is transiently
+    // unavailable, rather than leaving a phone-created profile permanently outside the watcher.
     const warnings: string[] = [];
+    let seedDeferred = false;
     const selection: BlankSlateSelection = {
       ...(input.toolsets === undefined ? {} : { toolsets: input.toolsets }),
       ...(input.mcpServers === undefined ? {} : { mcpServers: input.mcpServers }),
     };
+    // This lands immediately after Hermes accepted the profile.  A process crash or 429 during
+    // the very first config read therefore cannot strand a real profile outside recovery.
+    this.#storage.savePendingHermesProfileSeed({
+      profile: name,
+      selection,
+      attempts: 1,
+      nextAttemptAt: this.#now() + this.#seedRetryDelay(1),
+    });
     // Unconditional, where this used to be gated on the flag or a selection. The seed now also
     // writes the attach-plugin binding, and a bot without that binding is one nobody can talk to
     // (issue #183), so there is no configuration under which skipping this pass is correct.
     try {
-      const seed = await seedBlankSlateProfile(this.#client, name, {
+      const seed = await this.#chain(name, () => seedBlankSlateProfile(this.#client, name, {
         blankSlate: this.#seedBlankSlateBots,
         selection,
         skillsOn: this.#blankSlateSkillsOn,
-      });
+      }));
       this.#log(
         `bot ${name} seed: ${seed.wrote ? "written" : "already present"}` +
           `, blankSlate=${this.#seedBlankSlateBots}`,
       );
+      this.#storage.removePendingHermesProfileSeed(name);
       if (seed.skillCatalogUnavailable) {
         // Loud, and named as its own failure rather than folded into the generic seed warning:
         // everything else about this bot came out right, and the one thing that did not is the
@@ -643,9 +670,17 @@ export class HermesBridge implements BotControlSurface {
       }
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      this.#log(`bot ${name} seed FAILED, it starts on hermes platform defaults: ${detail}`);
+      this.#storage.savePendingHermesProfileSeed({
+        profile: name,
+        selection,
+        attempts: 1,
+        nextAttemptAt: this.#now() + this.#seedRetryDelay(1),
+      });
+      seedDeferred = true;
+      this.#schedulePendingSeedRetry();
+      this.#log(`bot ${name} seed deferred for retry: ${detail}`);
       warnings.push(
-        "the starting tool set could not be written, so this bot starts on Hermes' own defaults",
+        "the starting tool set could not be written yet; setup will retry automatically",
       );
     }
 
@@ -667,7 +702,10 @@ export class HermesBridge implements BotControlSurface {
       if (this.#hidden.has(name)) throw new BotNotFound(name);
       bot = this.#adoptCreatedRow(name, input.description?.trim() ?? "", meta);
     }
-    this.#profileChanged({ profile: name, change: "created" });
+    // The provisioner can only make this bot chattable after its seed enables the attach plugin.
+    // A deferred seed emits this lifecycle event from its successful retry instead.
+    if (!seedDeferred)
+      this.#profileChanged({ profile: name, change: "created" });
     return { bot, ...(warnings.length === 0 ? {} : { warnings }) };
   }
   /** The row for a profile Hermes accepted but `profiles.list` could not read back: built from
@@ -688,6 +726,75 @@ export class HermesBridge implements BotControlSurface {
     this.refreshSoon(`bot ${name} created (retry)`);
     return row;
   }
+  #seedRetryDelay(attempts: number): number {
+    return Math.min(
+      SEED_RETRY_MAX_MS,
+      this.#seedRetryBaseMs * (2 ** Math.max(0, attempts - 1)),
+    );
+  }
+  /** Arms one timer for the earliest persisted profile seed.  The table, rather than this timer,
+   * is the source of truth, so a container restart simply re-arms the same work after reconnect. */
+  #schedulePendingSeedRetry(): void {
+    if (this.#closed) return;
+    const next = this.#storage.pendingHermesProfileSeeds()[0];
+    if (next === undefined) return;
+    // A second failed create may be due sooner than the timer already armed for the first one.
+    // Re-arm only for that earlier durable deadline; otherwise preserve the existing timer.
+    if (this.#seedRetryTimer !== undefined) {
+      if (this.#seedRetryAt !== undefined && this.#seedRetryAt <= next.nextAttemptAt) return;
+      clearTimeout(this.#seedRetryTimer);
+      this.#seedRetryTimer = undefined;
+    }
+    const wait = Math.max(0, next.nextAttemptAt - this.#now());
+    this.#seedRetryAt = next.nextAttemptAt;
+    this.#seedRetryTimer = setTimeout(() => {
+      this.#seedRetryTimer = undefined;
+      this.#seedRetryAt = undefined;
+      void this.#retryPendingSeed(next.profile).finally(() => this.#schedulePendingSeedRetry());
+    }, wait);
+    this.#seedRetryTimer.unref();
+  }
+  async #retryPendingSeed(profile: string): Promise<void> {
+    await this.#chain(profile, async () => {
+      const row = this.#storage.pendingHermesProfileSeeds()
+        .find((seed) => seed.profile === profile);
+      if (row === undefined || this.#closed) return;
+      try {
+        const seed = await seedBlankSlateProfile(this.#client, profile, {
+          blankSlate: this.#seedBlankSlateBots,
+          selection: row.selection,
+          skillsOn: this.#blankSlateSkillsOn,
+        });
+        // `close()` may have run while Hermes was answering.  The durable row is deliberately
+        // left untouched for the next bridge process; its storage may already be closed.
+        if (this.#closed) return;
+        // A delete may have won while Hermes answered the seed request.  Do not emit a created
+        // lifecycle event for that cancelled intent (and do not recreate any local state).
+        if (!this.#storage.removePendingHermesProfileSeed(profile)) return;
+        this.#log(
+          `bot ${profile} deferred seed: ${seed.wrote ? "written" : "already present"}`,
+        );
+        this.#profileChanged({ profile, change: "created" });
+      } catch (error) {
+        // A delete (or shutdown) may have cancelled this intent while Hermes was answering.  Never
+        // upsert from a stale retry, or a deleted profile could acquire a fresh recovery record.
+        if (this.#closed) return;
+        const current = this.#storage.pendingHermesProfileSeeds()
+          .find((seed) => seed.profile === profile);
+        if (this.#closed || current === undefined || current.attempts !== row.attempts) return;
+        const detail = error instanceof Error ? error.message : String(error);
+        const attempts = row.attempts + 1;
+        // Keep `row.selection`, never an accidental later profile patch, as the create's intent.
+        this.#storage.savePendingHermesProfileSeed({
+          profile,
+          selection: row.selection,
+          attempts,
+          nextAttemptAt: this.#now() + this.#seedRetryDelay(attempts),
+        });
+        this.#log(`bot ${profile} deferred seed retry ${attempts} failed: ${detail}`);
+      }
+    });
+  }
   /** The inverse of `createBot`, built for "no traces on the Hermes host": the dashboard's
    *  `DELETE /api/profiles/:name` removes the whole profile directory (config, API keys,
    *  memories, sessions, skills, cron, the synced attach plugin and its .env with the tokens),
@@ -703,53 +810,58 @@ export class HermesBridge implements BotControlSurface {
     const active = this.#storage.nativeBotActiveTurn(canon);
     if (active !== undefined && opts.force !== true)
       throw new BotTurnActive(canon, active.turnId);
-    let hermesProfile: BotDeleteResponse["hermesProfile"];
-    try {
-      await this.#client.dashboardJson(`/api/profiles/${encodeURIComponent(canon)}`, {
-        method: "DELETE",
-      });
-      hermesProfile = "deleted";
-    } catch (error) {
-      if (error instanceof HermesRpcError && error.code === 404) {
-        hermesProfile = "already_absent";
-      } else if (error instanceof HermesRpcError) {
-        // 400 is the dashboard's own refusal (the default-profile guard); anything else is the
-        // backend failing. Either way nothing was deleted anywhere, so nothing is purged here.
-        throw new BackendUnavailable(
-          `hermes refused to delete profile "${canon}": ${error.message}`,
-        );
-      } else {
-        throw new BackendUnavailable(
-          `hermes could not be reached to delete profile "${canon}"; nothing was removed`,
-        );
+    return this.#chain(canon, async () => {
+      let hermesProfile: BotDeleteResponse["hermesProfile"];
+      try {
+        await this.#client.dashboardJson(`/api/profiles/${encodeURIComponent(canon)}`, {
+          method: "DELETE",
+        });
+        hermesProfile = "deleted";
+      } catch (error) {
+        if (error instanceof HermesRpcError && error.code === 404) {
+          hermesProfile = "already_absent";
+        } else if (error instanceof HermesRpcError) {
+          // 400 is the dashboard's own refusal (the default-profile guard); anything else is the
+          // backend failing. Either way nothing was deleted anywhere, so nothing is purged here.
+          throw new BackendUnavailable(
+            `hermes refused to delete profile "${canon}": ${error.message}`,
+          );
+        } else {
+          throw new BackendUnavailable(
+            `hermes could not be reached to delete profile "${canon}"; nothing was removed`,
+          );
+        }
       }
-    }
-    // Read BEFORE the purge empties the roster cache: this is the "did the gateway know it"
-    // half of the 404 decision.
-    const known = this.#storage.botRoster().bots.some((bot) => bot.name === canon);
-    // The FIRST mutation once the host has committed, deliberately ahead of the purge: from here
-    // on the bot's token authenticates nothing and its socket is closed, so no connection can
-    // race the sweep and write rows back in behind it. It is not moved ahead of the Hermes call
-    // for the mirror-image reason: a refusal above means nothing was deleted anywhere, and a bot
-    // still alive on its host must keep its identity.
-    const tokenRevoked = this.#revokeAttachIdentity(canon);
-    const purged = this.#storage.purgeBot(canon);
-    if (hermesProfile === "already_absent" && !known && Object.keys(purged).length === 0)
-      throw new BotNotFound(canon);
-    await this.refresh(`bot ${canon} deleted`);
-    this.#profileChanged({ profile: canon, change: "deleted" });
-    return {
-      name: canon,
-      hermesProfile,
-      purged,
-      tokenRevoked,
-      residue: [
-        `the box gateway config still maps profile ${canon} to its token env var`,
-        `the box .env still carries this bot's attach token line (it can no longer authenticate)`,
-        `the Hermes host may still have the launchd service ai.hermes.gateway-${canon} installed`,
-        `run scripts/deprovision-bot.sh ${canon} to sweep all of these and restart the box gateway`,
-      ],
-    };
+      // Remove only once Hermes has confirmed absence. A refused delete leaves its durable retry
+      // intact; sharing this profile chain prevents an in-flight retry from restoring it later.
+      this.#storage.removePendingHermesProfileSeed(canon);
+      // Read BEFORE the purge empties the roster cache: this is the "did the gateway know it"
+      // half of the 404 decision.
+      const known = this.#storage.botRoster().bots.some((bot) => bot.name === canon);
+      // The FIRST mutation once the host has committed, deliberately ahead of the purge: from here
+      // on the bot's token authenticates nothing and its socket is closed, so no connection can
+      // race the sweep and write rows back in behind it. It is not moved ahead of the Hermes call
+      // for the mirror-image reason: a refusal above means nothing was deleted anywhere, and a bot
+      // still alive on its host must keep its identity.
+      const tokenRevoked = this.#revokeAttachIdentity(canon);
+      const purged = this.#storage.purgeBot(canon);
+      if (hermesProfile === "already_absent" && !known && Object.keys(purged).length === 0)
+        throw new BotNotFound(canon);
+      await this.refresh(`bot ${canon} deleted`);
+      this.#profileChanged({ profile: canon, change: "deleted" });
+      return {
+        name: canon,
+        hermesProfile,
+        purged,
+        tokenRevoked,
+        residue: [
+          `the box gateway config still maps profile ${canon} to its token env var`,
+          `the box .env still carries this bot's attach token line (it can no longer authenticate)`,
+          `the Hermes host may still have the launchd service ai.hermes.gateway-${canon} installed`,
+          `run scripts/deprovision-bot.sh ${canon} to sweep all of these and restart the box gateway`,
+        ],
+      };
+    });
   }
   /** The create or delete has already succeeded on Hermes and in the roster; from here the hook
    *  is a courtesy to whoever provisions, never a reason to fail a request that is already true. */
@@ -1111,6 +1223,7 @@ export class HermesBridge implements BotControlSurface {
     if (this.#refreshTimer !== undefined) clearTimeout(this.#refreshTimer);
     if (this.#routineTimer !== undefined) clearTimeout(this.#routineTimer);
     if (this.#pollTimer !== undefined) clearTimeout(this.#pollTimer);
+    if (this.#seedRetryTimer !== undefined) clearTimeout(this.#seedRetryTimer);
     await this.#groups.close();
     await this.#client.close();
   }

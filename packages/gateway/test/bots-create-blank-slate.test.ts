@@ -498,8 +498,8 @@ describe("the seed is best-effort", () => {
     expect(res.status).toBe(201);
     const body = (await res.json()) as { bot: { name: string }; warnings: string[] };
     expect(body.bot.name).toBe("night-owl");
-    expect(body.warnings[0]).toContain("Hermes' own defaults");
-    expect(logs.join("\n")).toContain("seed FAILED");
+    expect(body.warnings[0]).toContain("retry automatically");
+    expect(logs.join("\n")).toContain("seed deferred for retry");
   });
 });
 
