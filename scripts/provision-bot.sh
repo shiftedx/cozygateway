@@ -58,6 +58,8 @@ VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-90}"
 SINGLE_HOLDER_CREDENTIALS=(DISCORD_BOT_TOKEN)
 DRY_RUN=0
 SKIP_VERIFY=0
+# Set when this run wrote the box env or config; the recreate is gated on it.
+BOX_CHANGED=0
 PROFILES=()
 
 say()  { printf '%s\n' "$*"; }
@@ -295,6 +297,7 @@ ensure_box_env_line() {
   # the remote process table and out of any shell history.
   printf '%s\n' "$value" | ssh -o BatchMode=yes "$BOX_SSH" \
     "read -r v; printf '%s=%s\n' '$key' \"\$v\" >> '$BOX_REPO/.env'"
+  BOX_CHANGED=1
   say "  box env $key written"
 }
 
@@ -331,6 +334,7 @@ os.replace(tmp, path)
 print("inserted")
 PY
 )"
+  [ "$out" = inserted ] && BOX_CHANGED=1
   say "  box config entry: $out"
 }
 
@@ -340,7 +344,11 @@ recreate_box_gateway() {
   # definition or the env_file content changed. The config lives in a bind-mounted DIRECTORY,
   # so a profile added to it alone leaves the running container untouched and the new bot
   # unauthorized (observed 2026-09-05). Not --build: the image is unchanged.
+  # Only when this run actually changed the box env or config. A sweep that merely refreshed
+  # a profile's plugin would otherwise bounce the live gateway once per profile.
+  if [ "$BOX_CHANGED" != 1 ]; then say "  box gateway unchanged, not recreated"; return 0; fi
   ssh -o BatchMode=yes "$BOX_SSH" "cd '$BOX_REPO' && docker compose up -d --force-recreate gateway" >/dev/null
+  BOX_CHANGED=0
   say "  box gateway recreated"
 }
 

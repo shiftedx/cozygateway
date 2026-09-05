@@ -43,6 +43,8 @@ VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-90}"
 # route, so the script and the API agree on what cannot be deleted.
 RESERVED_NAMES="hermes default test tmp root sudo"
 DRY_RUN=0
+# Set when this run removed a box env line or config entry; the recreate is gated on it.
+BOX_CHANGED=0
 SKIP_VERIFY=0
 PROFILES=()
 
@@ -244,6 +246,7 @@ remove_box_env_line() {
   fi
   ssh -o BatchMode=yes "$BOX_SSH" \
     "cd '$BOX_REPO' && grep -v '^${key}=' .env > .env.deprovision-tmp && chmod 600 .env.deprovision-tmp && mv .env.deprovision-tmp .env"
+  BOX_CHANGED=1
   say "  box env $key removed"
 }
 
@@ -251,7 +254,11 @@ recreate_box_gateway() {
   if [ "$DRY_RUN" = 1 ]; then say "  DRY  docker compose up -d --force-recreate gateway on $BOX_SSH"; return 0; fi
   # up -d, not --build: the image is unchanged, only the env and the mounted
   # config moved, and a recreate is what re-reads both.
+  # Only when this run actually changed the box env or config. A sweep that merely refreshed
+  # a profile's plugin would otherwise bounce the live gateway once per profile.
+  if [ "$BOX_CHANGED" != 1 ]; then say "  box gateway unchanged, not recreated"; return 0; fi
   ssh -o BatchMode=yes "$BOX_SSH" "cd '$BOX_REPO' && docker compose up -d --force-recreate gateway" >/dev/null
+  BOX_CHANGED=0
   say "  box gateway recreated"
 }
 
@@ -321,6 +328,7 @@ for profile in ${PROFILES[@]+"${PROFILES[@]}"}; do
 
   config_result="$(remove_box_config_entry "$profile" | tail -n 1)"
   say "  box config entry: $config_result"
+  [ "$config_result" = removed ] && BOX_CHANGED=1
   remove_box_env_line "$env_name"
   recreate_box_gateway
 
