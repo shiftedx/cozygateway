@@ -214,8 +214,8 @@ check_shadow_dir() {
 plugin_content_matches_source() {
   local dest="$1" source_files installed_files rel
   [ -d "$dest" ] || return 1
-  source_files="$(cd "$SRC_DIR" && find . -type f ! -path '*/__pycache__/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
-  installed_files="$(cd "$dest" && find . -type f ! -path '*/__pycache__/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
+  source_files="$(cd "$SRC_DIR" && find . -type f ! -path '*/__pycache__/*' ! -path '*/.pytest_cache/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
+  installed_files="$(cd "$dest" && find . -type f ! -path '*/__pycache__/*' ! -path '*/.pytest_cache/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
   [ "$source_files" = "$installed_files" ] || return 1
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
@@ -283,6 +283,46 @@ set_env_line() {
   chmod 600 "$tmp"
   mv "$tmp" "$file"
   say "  env $key set"
+}
+
+# A phone-created Hermes profile inherits the launch profile's environment. The default profile
+# deliberately has no CozyGateway binding, so its child has no chat-computer registry either. A
+# configured peer on this same Hermes home is the local authority for that opaque registry. Copy
+# only a complete, valid registry; an operator's partial or malformed values stay visible rather
+# than being silently replaced.
+inherit_chat_registry() {
+  local target="$1" candidate source="" id name projects
+  id="$(env_value "$target" HERMES_CHAT_COMPUTER_ID || true)"
+  name="$(env_value "$target" HERMES_CHAT_COMPUTER_NAME || true)"
+  projects="$(env_value "$target" HERMES_CHAT_PROJECTS_JSON || true)"
+  if [ -n "$id" ] && [ -n "$name" ] && [ -n "$projects" ]; then
+    say "  chat workspace registry already set"
+    return 0
+  fi
+  if [ -n "$id" ] || [ -n "$name" ] || [ -n "$projects" ]; then
+    warn "partial Hermes chat workspace registry is operator-owned; leaving it unchanged"
+    return 0
+  fi
+  for candidate in "$HERMES_HOME_ROOT"/profiles/*/.env; do
+    [ -f "$candidate" ] || continue
+    [ "$candidate" = "$target" ] && continue
+    id="$(env_value "$candidate" HERMES_CHAT_COMPUTER_ID || true)"
+    name="$(env_value "$candidate" HERMES_CHAT_COMPUTER_NAME || true)"
+    projects="$(env_value "$candidate" HERMES_CHAT_PROJECTS_JSON || true)"
+    [ -n "$id" ] && [ -n "$name" ] && [ -n "$projects" ] || continue
+    if printf '%s' "$projects" | "$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); assert isinstance(value, list)' >/dev/null 2>&1; then
+      source="$candidate"
+      break
+    fi
+  done
+  if [ -z "$source" ]; then
+    warn "no configured Hermes chat workspace registry to copy; leaving the new profile without a local workspace choice"
+    return 0
+  fi
+  set_env_line "$target" HERMES_CHAT_COMPUTER_ID "$id"
+  set_env_line "$target" HERMES_CHAT_COMPUTER_NAME "$name"
+  set_env_line "$target" HERMES_CHAT_PROJECTS_JSON "$projects"
+  say "  chat workspace registry copied from an existing configured Hermes profile"
 }
 
 # Same append-if-absent rule, over ssh, against the box's .env.
@@ -500,6 +540,7 @@ for profile in "${PROFILES[@]}"; do
   # and ack each other's events out of one file.
   set_env_line "$env_file" COZYGATEWAY_SPOOL_PATH \
     "$profile_dir/plugin-data/cozygateway/attach-v1.sqlite"
+  inherit_chat_registry "$env_file"
   ensure_box_env_line "$env_name" "$token"
   ensure_box_config_entry "$profile" "$env_name"
   recreate_box_gateway
