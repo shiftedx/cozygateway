@@ -387,7 +387,7 @@ function Test-OwnedGatewayStartupEntry {
 }
 
 function Test-OwnedGatewayTask {
-    param([string] $InstallRoot, [string] $TaskXml, [string] $LauncherPath = (Join-Path $InstallRoot 'local\run-gateway.vbs'))
+    param([string] $InstallRoot, [string] $TaskXml, [string] $LauncherPath = (Join-Path $InstallRoot 'local\run-gateway.vbs'), [string] $StatePath = (Join-Path $InstallRoot 'local\install-state'))
     $exec = Get-GatewayTaskExec $TaskXml
     if ($null -eq $exec) { return $false }
     $matches = [regex]::Matches($exec.Arguments, '"([^"]*)"')
@@ -398,7 +398,6 @@ function Test-OwnedGatewayTask {
         return $values.Count -eq 1 -and (Test-BootstrapPathEquals $values[0] ([IO.Path]::GetFullPath((Join-Path $InstallRoot 'local\run-gateway.vbs')))) -and (Test-OwnedGatewayStartupEntry $InstallRoot $LauncherPath)
     }
     $node = [IO.Path]::GetFullPath((Join-Path $InstallRoot 'runtime\node\node.exe'))
-    $statePath = Join-Path $InstallRoot 'local\install-state'
     if (Test-Path -LiteralPath $statePath -PathType Leaf) {
         $recordedNodes = @(Get-Content -LiteralPath $statePath | Where-Object { $_ -like 'node_resolved=*' })
         if ($recordedNodes.Count -gt 1) { return $false }
@@ -721,7 +720,7 @@ function Recover-BootstrapTransaction {
                 Assert-BootstrapRegularFile $snapshot 'Gateway Scheduled Task snapshot' -MustExist
                 $taskLauncher = Join-Path (Join-Path (Join-Path $backup 'runtime') 'local') 'run-gateway.vbs'
                 $taskXml = Get-Content -LiteralPath $snapshot -Raw -ErrorAction Stop
-                if (-not (Test-OwnedGatewayTask $InstallRoot $taskXml $taskLauncher)) { Fail 'Gateway Scheduled Task snapshot is invalid' }
+                if (-not (Test-OwnedGatewayTask $InstallRoot $taskXml $taskLauncher (Join-Path (Split-Path -Parent $taskLauncher) 'install-state'))) { Fail 'Gateway Scheduled Task snapshot is invalid' }
             }
             $registrations['task'] = [pscustomobject]@{ State = $presence; Snapshot = $snapshot }
             continue

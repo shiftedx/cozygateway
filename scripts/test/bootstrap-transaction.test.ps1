@@ -290,6 +290,17 @@ try {
     Recover-BootstrapTransaction $root (Join-Path $root 'bin') $assets | Out-Null
     Assert-True ($script:FakeTaskXml -eq $legacyTask) 'recovery must restore a prior hidden task from its snapshot'
     Finish-BootstrapRecovery $root
+    # Snapshot ownership follows its recorded Node, even if the update changed runtimes.
+    Reset-Fixture
+    Write-Assets 'old'
+    Write-TestFile (Join-Path $root 'local\install-state') "node_resolved=$systemNode`n"
+    $script:FakeTaskXml = $systemTask
+    Start-BootstrapTransaction $root (Join-Path $root 'bin') $assets
+    Write-TestFile (Join-Path $root 'local\install-state') "node_resolved=$privateNode`n"
+    $script:FakeTaskXml = New-OwnedTaskXml $root (Join-Path $root 'local\maintenance-worker.cjs')
+    Recover-BootstrapTransaction $root (Join-Path $root 'bin') $assets | Out-Null
+    Assert-True ($script:FakeTaskXml -eq $systemTask) 'recovery must validate previous runtime against snapshot identity'
+    Finish-BootstrapRecovery $root
     # These corruptions must all refuse before the first asset mutation.
     Assert-RecoveryRefusesBeforeAssetMutation 'malformed' {
         Set-Content -LiteralPath (Join-Path $backup 'inventory') -Value @('version=2', 'present:../outside') -Encoding ascii
