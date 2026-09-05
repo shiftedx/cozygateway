@@ -48,7 +48,7 @@ HERMES_HOME_ROOT="${HERMES_HOME_ROOT:-$HOME/.hermes}"
 HERMES_BIN="${HERMES_BIN:-hermes}"
 BOX_SSH="${BOX_SSH:-kmcdowell@192.168.99.106}"
 BOX_REPO="${BOX_REPO:-/home/kmcdowell/cozygateway}"
-BOX_CONFIG_REL="${BOX_CONFIG_REL:-docker/cozygateway.config.json}"
+BOX_CONFIG_REL="${BOX_CONFIG_REL:-local/config/cozygateway.config.json}"
 GATEWAY_URL="${GATEWAY_URL:-https://warm.cozylabs.ai}"
 HOME_CHANNEL="${HOME_CHANNEL:-thread}"
 INSTALLER_OWNER="${INSTALLER_OWNER:-cozylabs-v1}"
@@ -58,6 +58,8 @@ VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-90}"
 SINGLE_HOLDER_CREDENTIALS=(DISCORD_BOT_TOKEN)
 DRY_RUN=0
 SKIP_VERIFY=0
+# Set when this run wrote the box env or config; the recreate is gated on it.
+BOX_CHANGED=0
 PROFILES=()
 
 say()  { printf '%s\n' "$*"; }
@@ -295,6 +297,7 @@ ensure_box_env_line() {
   # the remote process table and out of any shell history.
   printf '%s\n' "$value" | ssh -o BatchMode=yes "$BOX_SSH" \
     "read -r v; printf '%s=%s\n' '$key' \"\$v\" >> '$BOX_REPO/.env'"
+  BOX_CHANGED=1
   say "  box env $key written"
 }
 
@@ -331,14 +334,21 @@ os.replace(tmp, path)
 print("inserted")
 PY
 )"
+  [ "$out" = inserted ] && BOX_CHANGED=1
   say "  box config entry: $out"
 }
 
 recreate_box_gateway() {
-  if [ "$DRY_RUN" = 1 ]; then say "  DRY  docker compose up -d gateway on $BOX_SSH"; return 0; fi
-  # up -d, not --build: the image is unchanged, only the env and the mounted
-  # config moved, and a recreate is what re-reads both.
-  ssh -o BatchMode=yes "$BOX_SSH" "cd '$BOX_REPO' && docker compose up -d gateway" >/dev/null
+  if [ "$DRY_RUN" = 1 ]; then say "  DRY  docker compose up -d --force-recreate gateway on $BOX_SSH"; return 0; fi
+  # --force-recreate, not a bare up -d: compose recreates on its own only when the service
+  # definition or the env_file content changed. The config lives in a bind-mounted DIRECTORY,
+  # so a profile added to it alone leaves the running container untouched and the new bot
+  # unauthorized (observed 2026-09-05). Not --build: the image is unchanged.
+  # Only when this run actually changed the box env or config. A sweep that merely refreshed
+  # a profile's plugin would otherwise bounce the live gateway once per profile.
+  if [ "$BOX_CHANGED" != 1 ]; then say "  box gateway unchanged, not recreated"; return 0; fi
+  ssh -o BatchMode=yes "$BOX_SSH" "cd '$BOX_REPO' && docker compose up -d --force-recreate gateway" >/dev/null
+  BOX_CHANGED=0
   say "  box gateway recreated"
 }
 
@@ -476,7 +486,12 @@ for profile in "${PROFILES[@]}"; do
     unclaim_inherited_platforms "$env_file"
   fi
 
-  ensure_env_line "$env_file" COZYGATEWAY_URL "$GATEWAY_URL"
+  # Upserted like the token and spool, NOT merely ensured: a fresh profile arrives with a COPY of
+  # the launch profile's .env, and when that launch profile is bound to some other gateway (a
+  # native install on this Mac, say) the copied COZYGATEWAY_URL points there. A plugin that
+  # dials the wrong gateway with this gateway's token is refused forever, and the row on the box
+  # never leaves setup_required (observed 2026-09-05: snug-nimbus and dewy-bayberry).
+  set_env_line "$env_file" COZYGATEWAY_URL "$GATEWAY_URL"
   ensure_env_line "$env_file" COZYGATEWAY_HOME_CHANNEL "$HOME_CHANNEL"
   ensure_env_line "$env_file" COZYGATEWAY_INSTALLER_OWNER "$INSTALLER_OWNER"
   set_env_line "$env_file" COZYGATEWAY_TOKEN "$token"
