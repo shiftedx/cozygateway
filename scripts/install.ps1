@@ -395,7 +395,7 @@ function Test-OwnedGatewayTask {
     $values = @($matches | ForEach-Object { $_.Groups[1].Value })
     $trustedWscript = [IO.Path]::Combine([Environment]::SystemDirectory, 'wscript.exe')
     if ([string]::Equals($exec.Command, 'wscript.exe', [StringComparison]::OrdinalIgnoreCase) -or (Test-BootstrapPathEquals $exec.Command $trustedWscript)) {
-        return $values.Count -eq 1 -and (Test-BootstrapPathEquals $values[0] ([IO.Path]::GetFullPath($LauncherPath))) -and (Test-OwnedGatewayStartupEntry $InstallRoot $LauncherPath)
+        return $values.Count -eq 1 -and (Test-BootstrapPathEquals $values[0] ([IO.Path]::GetFullPath((Join-Path $InstallRoot 'local\run-gateway.vbs')))) -and (Test-OwnedGatewayStartupEntry $InstallRoot $LauncherPath)
     }
     $node = [IO.Path]::GetFullPath((Join-Path $InstallRoot 'runtime\node\node.exe'))
     $statePath = Join-Path $InstallRoot 'local\install-state'
@@ -748,7 +748,13 @@ function Recover-BootstrapTransaction {
         # This check happens before the first asset copy or removal. It protects
         # a same-name foreign registration even when the snapshot says that no
         # registration existed before this failed first install.
-        $null = Get-GatewayRegistrationForRecovery $InstallRoot
+        $currentRegistration = Get-GatewayRegistrationForRecovery $InstallRoot
+        # Remove the verified current task while its launcher and runtime identity
+        # still exist. Restoring those files first invalidates the current task's
+        # ownership evidence (especially after a failed first installation).
+        if (-not [string]::IsNullOrWhiteSpace($currentRegistration.TaskXml) -and -not (Remove-GatewayScheduledTask)) {
+            Fail 'could not remove the failed Gateway Scheduled Task before restoring runtime state'
+        }
     }
     Write-Info 'recovering an interrupted CozyGateway bootstrap before fetching a new release'
     foreach ($record in $assetRecords) { Restore-BootstrapFile $record.Live $record.Snapshot $record.State '-' "asset $($record.Name)" }

@@ -268,6 +268,28 @@ try {
     Assert-Absent $script:StartupPath 'fresh recovery must remove its new owned Startup entry'
     Finish-BootstrapRecovery $root
 
+    # A newly installed hidden task must be removed before its launcher is rolled back.
+    Reset-Fixture
+    Write-Assets 'old'
+    Start-BootstrapTransaction $root (Join-Path $root 'bin') $assets
+    Write-Assets 'fresh'
+    Write-TestFile $legacyLauncher (New-OwnedStartupEntry $root 'C:\New\bash.exe')
+    $script:FakeTaskXml = $legacyTask
+    Recover-BootstrapTransaction $root (Join-Path $root 'bin') $assets | Out-Null
+    Assert-True ($null -eq $script:FakeTaskXml) 'recovery must remove a hidden task before removing its launcher'
+    Assert-Absent $legacyLauncher 'recovery must restore the absent prior launcher'
+    Finish-BootstrapRecovery $root
+
+    # A snapshotted launcher supplies validation bytes, not the task argument path.
+    Reset-Fixture
+    Write-Assets 'old'
+    Write-TestFile $legacyLauncher (New-OwnedStartupEntry $root 'C:\Old\bash.exe')
+    $script:FakeTaskXml = $legacyTask
+    Start-BootstrapTransaction $root (Join-Path $root 'bin') $assets
+    Write-TestFile $legacyLauncher (New-OwnedStartupEntry $root 'C:\New\bash.exe')
+    Recover-BootstrapTransaction $root (Join-Path $root 'bin') $assets | Out-Null
+    Assert-True ($script:FakeTaskXml -eq $legacyTask) 'recovery must restore a prior hidden task from its snapshot'
+    Finish-BootstrapRecovery $root
     # These corruptions must all refuse before the first asset mutation.
     Assert-RecoveryRefusesBeforeAssetMutation 'malformed' {
         Set-Content -LiteralPath (Join-Path $backup 'inventory') -Value @('version=2', 'present:../outside') -Encoding ascii
