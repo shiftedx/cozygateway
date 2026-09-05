@@ -507,8 +507,18 @@ export function sanitizeApprovalDetail(raw: string): string | undefined {
  *  over the card that describes it. */
 export function sanitizeApprovalRepair(raw: unknown): BotApprovalRepair | undefined {
   if (!check(BotApprovalRepairSchema, raw)) return undefined;
-  const strings = [raw.server, ...raw.impact, raw.fingerprint.previous ?? "", raw.fingerprint.current ?? ""];
-  return strings.some((value) => value.search(APPROVAL_DETAIL_CONTROL_CHARS) !== -1) ? undefined : raw;
+  const strings = [raw.server, ...raw.impact, ...Object.values(raw.fingerprint)];
+  return strings.some(unusableIdentifier) ? undefined : raw;
+}
+/** Capability 62. A repair-block string the schema accepted but no configured server, tool, or
+ *  digest is ever called: whitespace only, a C0/C1 control or Format character, or a lone
+ *  surrogate (`\p{Cs}` under the `u` flag matches an unpaired half, never a real astral pair). The
+ *  schema's `minLength`/`maxLength` bounds count UTF-16 code units, which row 62 states. */
+const LONE_SURROGATE = /\p{Cs}/u;
+function unusableIdentifier(value: string): boolean {
+  return value.trim().length === 0
+    || value.search(APPROVAL_DETAIL_CONTROL_CHARS) !== -1
+    || LONE_SURROGATE.test(value);
 }
 const ClarifyOption = Type.Object({ id: Id, label: Type.String({ minLength: 1, maxLength: 512 }) });
 const ClarifyEvent = Type.Object({

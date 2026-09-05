@@ -12,7 +12,7 @@ import type {
 } from "cozygateway-contract";
 
 import type { Storage, BotGroupCause, BotGroupLogRow, BotGroupRow, BotGroupTurnRow } from "../storage.ts";
-import { sanitizeApprovalDetail, type AttachV1EventFrame, type AttachV1TurnContext } from "../adapters/attach/protocol-v1.ts";
+import { sanitizeApprovalDetail, sanitizeApprovalRepair, type AttachV1EventFrame, type AttachV1TurnContext } from "../adapters/attach/protocol-v1.ts";
 import { normalizeProfileName } from "./crud.ts";
 import {
   GROUP_LOG_LIMIT,
@@ -1040,6 +1040,11 @@ export class GroupRooms {
     // Capability 56. Sanitized once, up front, exactly as the 1:1 lane does: the same sentence is
     // stored on the durable row, carried on the expiry payload, and broadcast on the live frame.
     const detail = event.detail === undefined ? undefined : sanitizeApprovalDetail(event.detail);
+    // Capability 62. The repair block too: validated once here, carried on the same three surfaces,
+    // dropped (never the approval) when it fails. A room card reads exactly like a 1:1 card.
+    const repair = sanitizeApprovalRepair(event.repair);
+    if (event.repair !== undefined && repair === undefined)
+      this.#log(`dropping repair block on room approval for "${turn.member}": failed validation`);
     const change = this.#storage.recordNativeInteraction({
       bot: turn.member,
       kind: "approval",
@@ -1050,6 +1055,7 @@ export class GroupRooms {
         name: event.name,
         room: { key: turn.key, name: room.name },
         ...(detail === undefined ? {} : { detail }),
+        ...(repair === undefined ? {} : { repair }),
       },
       status: outcome ?? "pending",
       ...(event.expiresAt === undefined ? {} : { expiresAt: event.expiresAt }),
@@ -1074,6 +1080,7 @@ export class GroupRooms {
           name: event.name,
           room: { key: turn.key, name: room.name },
           ...(detail === undefined ? {} : { detail }),
+          ...(repair === undefined ? {} : { repair }),
         },
         expiresAt: event.expiresAt ?? null,
         updatedAt: this.#now(),
@@ -1088,6 +1095,7 @@ export class GroupRooms {
         updatedAt: this.#now(),
         room: room.name,
         ...(detail === undefined ? {} : { detail }),
+        ...(repair === undefined ? {} : { repair }),
       });
     } else {
       this.#broadcast({

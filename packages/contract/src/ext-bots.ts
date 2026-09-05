@@ -782,7 +782,8 @@ export type BotThinkingActivityFrame = Static<typeof BotThinkingActivityFrameSch
  *  is never among them, and the closed object leaves no member one could ride in. The gateway is
  *  the authority on the block (contract/ext-bots-v1.md row 62): one that fails this schema or
  *  carries a C0/C1 control or Unicode Format character is DROPPED and the approval kept, exactly
- *  as a malformed capability-56 `detail` is, so a client only ever sees a block that validates. */
+ *  as a malformed capability-56 `detail` is, so a client only ever sees a block that validates.
+ *  The string bounds count UTF-16 code units, as TypeBox enforces them. */
 export const BotApprovalRepairSchema = Type.Object({
   kind: Type.Literal("mcp_reconnect"),
   /** The MCP server name as configured on the runtime peer. */

@@ -330,6 +330,53 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
     expect(h.storage.nativeInteraction("sage", "approval", "approval-no-detail")?.payload).not.toHaveProperty("detail");
   });
 
+  it("capability 62: carries a validated repair block on a room turn, drops an invalid one, and omits it when absent", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    const repair = {
+      kind: "mcp_reconnect", server: "github", impact: ["github_search_issues"], scope: "server",
+      fingerprint: { previous: "sha256:1f3a", current: "sha256:9c0e" }, reason: "stale_tool", policy: "approve_once",
+    };
+    const pendingFrame = (toolCallId: string): BotApprovalPendingFrame => h.frames.find(
+      (frame) => frame.type === "bot_approval_pending" && (frame as BotApprovalPendingFrame).toolCallId === toolCallId,
+    ) as BotApprovalPendingFrame;
+    const payload = (toolCallId: string) =>
+      h.storage.nativeInteraction("sage", "approval", toolCallId)?.payload as { repair?: unknown } | undefined;
+    const inboxRow = (toolCallId: string) =>
+      h.storage.pendingNativeApprovals(["sage"], 100).find((row) => row.toolCallId === toolCallId);
+
+    // Valid: the block the 1:1 lane would carry rides the room frame, the durable row, and the
+    // inbox row byte for byte, beside the room name.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-repair", callId: "call-1", name: "mcp_reconnect", status: "pending", repair,
+    })).toBe(true);
+    expect(pendingFrame("approval-repair")).toMatchObject({ bot: "sage", room: "Launch", name: "mcp_reconnect" });
+    expect(JSON.stringify(pendingFrame("approval-repair").repair)).toBe(JSON.stringify(repair));
+    expect(JSON.stringify(payload("approval-repair")?.repair)).toBe(JSON.stringify(repair));
+    expect(inboxRow("approval-repair")).toMatchObject({ room: "Launch" });
+    expect(JSON.stringify(inboxRow("approval-repair")?.repair)).toBe(JSON.stringify(repair));
+
+    // Invalid: dropped, the approval kept, on every surface.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-repair-bad", callId: "call-2", name: "mcp_reconnect", status: "pending",
+      repair: { ...repair, kind: "restart" },
+    })).toBe(true);
+    expect(pendingFrame("approval-repair-bad")).toMatchObject({ bot: "sage", room: "Launch" });
+    expect(pendingFrame("approval-repair-bad")).not.toHaveProperty("repair");
+    expect(payload("approval-repair-bad")).not.toHaveProperty("repair");
+    expect(inboxRow("approval-repair-bad")).not.toHaveProperty("repair");
+
+    // Absent: byte identical to a pre-62 room approval.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-plain", callId: "call-3", name: "terminal:rm", status: "pending",
+    })).toBe(true);
+    expect(pendingFrame("approval-plain")).not.toHaveProperty("repair");
+    expect(payload("approval-plain")).not.toHaveProperty("repair");
+  });
+
   it("lands a runtime member's room clarification in the inbox and resolves it through the unchanged route", async () => {
     const h = await setup();
     const turn = await blockedTurn(h, ["sage", "scout"]);

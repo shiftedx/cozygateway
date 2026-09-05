@@ -1419,7 +1419,6 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
         text: string,
       ): Promise<BotApprovalPendingFrame> {
         if (repairApproval === undefined) throw new Error("unreachable: skipped without hook");
-        const botName = repairApproval.botName.trim().toLowerCase();
         const before = socket.frames.length;
         const sent = await authFetch(
           token,
@@ -1427,9 +1426,14 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
           { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ text }) },
         );
         expect(sent.status).toBe(202);
+        // The 202 body names the canonical chat the turn runs in (`{ name, sessionId, message }`),
+        // and every Bot Mode frame is keyed by that sessionId: match on it rather than on how the
+        // gateway happens to spell the bot's name.
+        const { sessionId } = (await sent.json()) as { sessionId: string };
+        expect(typeof sessionId).toBe("string");
         const raised = (): BotApprovalPendingFrame | undefined =>
           framesOfType(socket.frames.slice(before), "bot_approval_pending")
-            .find((frame) => frame.bot === botName);
+            .find((frame) => frame.sessionId === sessionId);
         await waitFor(socket, () => raised() !== undefined, "bot_approval_pending");
         return assertValid(BotApprovalPendingFrameSchema, raised());
       }

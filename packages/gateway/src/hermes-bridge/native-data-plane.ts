@@ -2882,6 +2882,10 @@ export class NativeBotDataPlane {
     // Capability 62. Same discipline for the repair block: validate once, drop it (never the
     // approval) when it fails, and carry the one validated object on every surface below.
     const repair = sanitizeApprovalRepair(event.repair);
+    // Bounded and content-free: a dropped block is otherwise invisible, and it is the one symptom
+    // of a harness and gateway that disagree on the row.
+    if (event.repair !== undefined && repair === undefined)
+      this.#log(`dropping repair block on approval for "${bot}": failed validation`);
     const change = this.#storage.recordNativeInteraction({
       bot,
       kind: "approval",

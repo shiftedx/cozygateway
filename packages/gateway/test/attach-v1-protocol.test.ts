@@ -370,6 +370,15 @@ describe("sanitizeApprovalRepair (capability 62)", () => {
     expect(sanitizeApprovalRepair({ ...repair, fingerprint: { current: "sha256:\u202e9c0e" } })).toBeUndefined();
   });
 
+  it("drops a whitespace-only name and a lone surrogate, which no configured server or tool is called", () => {
+    expect(sanitizeApprovalRepair({ ...repair, server: "   " })).toBeUndefined();
+    expect(sanitizeApprovalRepair({ ...repair, impact: [" "] })).toBeUndefined();
+    expect(sanitizeApprovalRepair({ ...repair, server: "git\ud800hub" })).toBeUndefined();
+    expect(sanitizeApprovalRepair({ ...repair, fingerprint: { current: "\udc00" } })).toBeUndefined();
+    // A real astral code point is a valid pair, not a lone surrogate.
+    expect(sanitizeApprovalRepair({ ...repair, server: "git\u{1F600}hub" })).toEqual({ ...repair, server: "git\u{1F600}hub" });
+  });
+
   it("drops anything that is not the closed object", () => {
     expect(sanitizeApprovalRepair("mcp_reconnect")).toBeUndefined();
     expect(sanitizeApprovalRepair(null)).toBeUndefined();
