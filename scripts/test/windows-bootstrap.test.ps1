@@ -73,6 +73,7 @@ function New-ReleaseFixtures {
         'cozygateway-hermes-attach-plugin.tar.gz' = 'plugin-fixture'
         'cozygateway-installer.sh' = "#!/usr/bin/env bash`nexit 0`n"
         'install.ps1' = "param([switch]`$Repair)`nexit 0`n"
+        'windows-reconcile.ps1' = "param([string]`$InstallHome)`nexit 0`n"
     }
     foreach ($entry in $assets.GetEnumerator()) {
         $path = Join-Path $Directory $entry.Key

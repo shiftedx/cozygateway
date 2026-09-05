@@ -39,6 +39,7 @@ WINDOWS_OWNED_CONFIG_JSON=""
 DRY_RUN=0
 UNINSTALL=0
 STATUS=0
+RECONCILE_ONLY=0
 # Which harness runs the bots. Empty until choose_harness scans the machine or --harness answers
 # for it. COZYAGENTS_CHOSEN stays 0 unless a person or a recorded install actually said CozyAgents,
 # because that is the only answer allowed to take a Hermes bridge out of an existing config.
@@ -95,6 +96,7 @@ usage: agent-install.sh --bundle PATH --plugin-archive PATH [options]
   --dry-run               show discovered work without changing anything
   --service-platform OS   override service platform (Darwin, Linux, Windows)
   --status                report persistence and live gateway health
+  --reconcile-only        internal: repair recorded Windows Hermes profiles without replacing persistence
   --uninstall             remove only CozyGateway-owned service, plugins, env keys and state
 
 The gateway and attach plugin both stay on this machine. This installer never
@@ -121,6 +123,7 @@ while [ "$#" -gt 0 ]; do
     --dry-run) DRY_RUN=1 ;;
     --service-platform) need_value "$@"; SERVICE_PLATFORM="$2"; shift ;;
     --status) STATUS=1 ;;
+    --reconcile-only) RECONCILE_ONLY=1 ;;
     --uninstall) UNINSTALL=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown flag: $1" ;;
@@ -197,6 +200,7 @@ SERVICE_LABEL="ai.cozylabs.cozygateway"
 SERVICE_UNIT="cozygateway.service"
 WINDOWS_TASK="CozyGateway"
 WINDOWS_VBS="$LOCAL_DIR/run-gateway.vbs"
+WINDOWS_RECONCILER="${COZYGATEWAY_WINDOWS_RECONCILER:-$GATEWAY_DIR/bin/windows-reconcile.ps1}"
 INSTALL_ALREADY_CONFIGURED=0
 [ ! -f "$CONFIG_JSON" ] || INSTALL_ALREADY_CONFIGURED=1
 
@@ -796,7 +800,7 @@ EOF
 }
 
 install_plugin() {
-  local profile="$1" home="$2" target stage source
+  local profile="$1" home="$2" target stage source replacement backup stamp
   target="$home/plugins/cozygateway"
   case "$target" in "$HERMES_ROOT"/plugins/cozygateway|"$HERMES_ROOT"/profiles/*/plugins/cozygateway) ;; *) die "refusing plugin target outside the validated Hermes profile tree" ;; esac
   assert_plugin_target_path "$home" "$target"
@@ -819,8 +823,18 @@ install_plugin() {
     say "OK    attach plugin already current for Hermes profile $profile"
     return
   fi
-  mkdir -p "$home/plugins"; rm -rf "$target"; mv "$source" "$target"
-  printf 'installed by cozygateway agent-install.sh\n' > "$target/.cozygateway-installer-owned"
+  mkdir -p "$home/plugins"
+  stamp="$$.$RANDOM"
+  replacement="$home/plugins/.cozygateway.new.$stamp"
+  backup="$home/plugins/.cozygateway.old.$stamp"
+  mv "$source" "$replacement"
+  printf 'installed by cozygateway agent-install.sh\n' > "$replacement/.cozygateway-installer-owned"
+  if [ -e "$target" ]; then mv "$target" "$backup" || die "could not stage the previous plugin for profile $profile"; fi
+  if ! mv "$replacement" "$target"; then
+    [ ! -e "$backup" ] || mv "$backup" "$target" || true
+    die "could not promote the repaired plugin for profile $profile; the previous plugin was restored"
+  fi
+  [ ! -e "$backup" ] || rm -rf "$backup"
   record_plugin_change "$profile"
   rm -rf "$stage"; trap - RETURN
 }
@@ -925,13 +939,16 @@ prepare_dashboard_credential() {
   chmod 600 "$DASHBOARD_ENV"
 }
 write_gateway_env() {
-  local p token env_name profile_env spool_path seen_token seen_name
+  local p token cached_token env_name profile_env spool_path seen_token seen_name
   prepare_dashboard_credential
   [ "$DRY_RUN" = 1 ] && { say "DRY   write gateway token environment at $GATEWAY_ENV (values redacted)"; return; }
   umask 077; : > "$GATEWAY_ENV"
   env_write "$GATEWAY_ENV" COZYGATEWAY_HERMES_TOKEN "$DASHBOARD_SESSION_TOKEN"
   for p in "${SELECTED[@]}"; do
-    profile_env="$(profile_home "$p")/.env"; claim_profile_env "$profile_env"; token="$(env_get "$profile_env" COZYGATEWAY_TOKEN)"; safe_secret "$token" || token="$(new_token)"; env_name="$(token_env_name "$p")"
+    profile_env="$(profile_home "$p")/.env"; env_name="$(token_env_name "$p")"
+    token="$(env_get "$profile_env" COZYGATEWAY_TOKEN)"; cached_token="$(env_get "$GATEWAY_ENV" "$env_name")"
+    if ! safe_secret "$token"; then safe_secret "$cached_token" && token="$cached_token" || token="$(new_token)"; fi
+    claim_profile_env "$profile_env"
     for seen_token in "${TOKENS[@]:-}"; do [ "$token" != "$seen_token" ] || die "Hermes profiles must have distinct CozyGateway attach tokens"; done
     for seen_name in "${TOKEN_ENVS[@]:-}"; do [ "$env_name" != "$seen_name" ] || die "profile names produce the same token environment variable: $env_name"; done
     TOKENS+=("$token"); TOKEN_ENVS+=("$env_name")
@@ -970,6 +987,7 @@ ensure_hermes_gateways() {
     case "$state" in
       running)
         if plugin_changed_for "$profile"; then
+          say "RECONCILE_AFFECTED $profile"
           run "$HERMES_BIN" -p "$profile" gateway restart
           say "OK    restarted Hermes gateway service for profile $profile"
         else
@@ -978,11 +996,13 @@ ensure_hermes_gateways() {
         action="${prior:-preexisting}"
         ;;
       stopped)
+        say "RECONCILE_AFFECTED $profile"
         run "$HERMES_BIN" -p "$profile" gateway start
         action="${prior:-started}"
         say "OK    started existing Hermes gateway service for profile $profile"
         ;;
       absent)
+        say "RECONCILE_AFFECTED $profile"
         run "$HERMES_BIN" -p "$profile" gateway install --start-now --start-on-login
         action=installed
         say "OK    installed and started Hermes gateway service for profile $profile"
@@ -1000,12 +1020,14 @@ write_state() {
     printf 'profiles='; (IFS=,; printf '%s' "${SELECTED[*]}")
     printf '\nprofile_scope=%s' "$PROFILE_SPEC"
     printf '\nhermes_root=%s\n' "$HERMES_ROOT"
+    is_windows && printf 'hermes_root_native=%s\n' "$(to_windows_path "$HERMES_ROOT")"
     printf 'dashboard_port=%s\n' "$DASHBOARD_PORT"
     # Keep the exact executable that performed the install. `--uninstall` may
     # run long after PATH or COZYGATEWAY_HERMES_BIN changed, and must not tear
     # down the CozyGateway service before discovering it cannot reverse the
     # Hermes work it owns.
     printf 'hermes_bin=%s\n' "$HERMES_RESOLVED"
+    is_windows && printf 'hermes_bin_native=%s\n' "$(to_windows_path "$HERMES_RESOLVED")"
     for profile in "${SELECTED[@]}"; do printf 'service_%s=%s\n' "$profile" "$(service_action_for "$profile")"; done
   } > "$STATE_FILE"
   chmod 600 "$STATE_FILE"
@@ -1889,13 +1911,11 @@ windows_startup_entry_uses_current_wrapper() {
   [ -n "$bash_path" ] && [ "$wrapper_path" = "$wrapper_native" ]
 }
 write_windows_launcher() {
-  local bash_posix bash_native wrapper_native command
-  bash_posix="${COZYGATEWAY_GIT_BASH:-$(command -v bash)}"
-  bash_posix="$(to_posix_path "$bash_posix")"
-  [ -f "$bash_posix" ] || die "Git Bash executable is unavailable: $bash_posix"
-  bash_native="$(to_windows_path "$bash_posix")"
-  wrapper_native="$(to_windows_path "$WRAPPER")"
-  command="$(vbs_quote "\"$bash_native\" \"$wrapper_native\"")"
+  local reconciler_native home_native command
+  [ -f "$WINDOWS_RECONCILER" ] || die "verified Windows reconciler is unavailable: $WINDOWS_RECONCILER"
+  reconciler_native="$(to_windows_path "$WINDOWS_RECONCILER")"
+  home_native="$(to_windows_path "$GATEWAY_DIR")"
+  command="$(vbs_quote "\"$WINDOWS_POWERSHELL\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$reconciler_native\" -InstallHome \"$home_native\"")"
   [ "$DRY_RUN" = 1 ] && { say "DRY   write hidden Windows launcher at $WINDOWS_VBS"; return; }
   {
     printf 'Set shell = CreateObject("WScript.Shell")\r\n'
@@ -2549,6 +2569,31 @@ install_with_cozyagents() {
   announce_listener
   pairing_and_finish
 }
+
+reconcile_windows_hermes() {
+  local profile action recorded_root
+  is_windows || die "--reconcile-only is supported only by the Windows current-user reconciler"
+  [ -f "$STATE_FILE" ] || die "Windows reconcile metadata is absent"
+  [ "$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)" = hermes ] || die "Windows reconcile is available only for a Hermes installation"
+  recorded_root="$(sed -n 's/^hermes_root=//p' "$STATE_FILE" | tail -1)"
+  [ -n "$recorded_root" ] || die "Windows reconcile metadata has no Hermes root"
+  HERMES_RESOLVED="$(find_hermes)" || die "the current Hermes launcher could not be resolved"
+  HERMES_BIN="$HERMES_RESOLVED"
+  HERMES_ROOT="$(cd -P "$(discover_root)" && pwd)"
+  [ "$HERMES_ROOT" = "$recorded_root" ] || die "Hermes now resolves a different profile root; refusing to move credentials or sessions"
+  hydrate_profile_scope
+  discover_profiles
+  say "INFO  reconciling recorded Hermes profiles: ${SELECTED[*]}"
+  for profile in "${SELECTED[@]}"; do action="$(prior_service_action "$profile")"; record_service_action "$profile" "${action:-unknown}"; done
+  write_gateway_env
+  for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
+  for profile in "${SELECTED[@]}"; do enable_plugin "$profile"; done
+  write_gateway_config
+  ensure_hermes_gateways
+  write_state
+  if gateway_ready; then wait_attach_ready; else say "INFO  CozyGateway is not live yet; the reconciler will verify attachment after launch"; fi
+}
+
 main() {
   local prerequisite_missing=0 profile action
   if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
@@ -2559,6 +2604,13 @@ main() {
   fi
   [ "$prerequisite_missing" = 1 ] || hydrate_listener_settings
   if [ "$STATUS" = 1 ]; then validate_listener_settings; status_install; return; fi
+  if [ "$RECONCILE_ONLY" = 1 ]; then
+    [ "$prerequisite_missing" = 0 ] || die "the cached Node.js runtime is unavailable"
+    [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--bundle must name the cached verified release bundle"
+    [ -n "$PLUGIN_ARCHIVE" ] && [ -f "$PLUGIN_ARCHIVE" ] || die "--plugin-archive must name the cached verified release archive"
+    reconcile_windows_hermes
+    return
+  fi
   [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--bundle must name the verified release bundle"
   # Step 1 of the approved order: the harness, before anything is installed.
   choose_harness

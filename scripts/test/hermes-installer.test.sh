@@ -1325,6 +1325,7 @@ grep -Fqx 'export PATH="$HOME/.local/bin:$PATH" # CozyGateway CLI' "$tmp/linux-h
 # Exercise Windows persistence with fake native tools. The task is current-user,
 # limited privilege, starts immediately through the hidden VBS launcher, reports
 # merged persistence/health status, and falls back to Startup when schtasks fails.
+export COZYGATEWAY_WINDOWS_RECONCILER="$repo_root/scripts/windows-reconcile.ps1"
 mkdir -p "$tmp/windows-bin" "$tmp/windows-appdata"
 cat > "$tmp/windows-bin/schtasks.exe" <<'SCHTASKS'
 #!/usr/bin/env bash
@@ -1342,6 +1343,8 @@ SCHTASKS
 cat > "$tmp/windows-bin/wscript.exe" <<'WSCRIPT'
 #!/usr/bin/env bash
 printf 'wscript %s\n' "$*" >> "${COZYGATEWAY_TEST_WINDOWS_LOG:?}"
+[ -z "${COZYGATEWAY_TEST_RECONCILER:-}" ] || pwsh -NoProfile -File "$COZYGATEWAY_TEST_RECONCILER" \
+  -InstallHome "${COZYGATEWAY_TEST_RECONCILE_HOME:?}" -Once -NoLaunch -SkipAttachProof
 [ -z "${COZYGATEWAY_TEST_GATEWAY_MARKER:-}" ] || : > "$COZYGATEWAY_TEST_GATEWAY_MARKER"
 exit 0
 WSCRIPT
@@ -1551,6 +1554,15 @@ grep -Fq '[IO.Compression.ZipFile]::ExtractToDirectory' "$tmp/windows-node-comma
 grep -Fq "using Node.js 24 at $tmp/gateway-windows-node/runtime/node/node.exe" <<<"$(HOME="$tmp/windows-node-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-node-commands" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --status --gateway-dir "$tmp/gateway-windows-node")"
 
 windows_native_hermes="$("$tmp/bin/cygpath" -w "$tmp/bin/hermes")"
+mkdir -p "$tmp/gateway-windows-live/bin"
+cp "$repo_root/scripts/windows-reconcile.ps1" "$tmp/gateway-windows-live/bin/windows-reconcile.ps1"
+cp "$repo_root/scripts/agent-install.sh" "$tmp/gateway-windows-live/bin/agent-install.sh"
+cp "$tmp/gateway.mjs" "$tmp/gateway-windows-live/bin/cozygateway.mjs"
+cp "$tmp/plugin.tar.gz" "$tmp/gateway-windows-live/bin/cozygateway-hermes-attach-plugin.tar.gz"
+for cached in windows-reconcile.ps1 agent-install.sh cozygateway.mjs cozygateway-hermes-attach-plugin.tar.gz; do
+  if command -v shasum >/dev/null 2>&1; then cached_sha="$(shasum -a 256 "$tmp/gateway-windows-live/bin/$cached" | awk '{print $1}')"; else cached_sha="$(sha256sum "$tmp/gateway-windows-live/bin/$cached" | awk '{print $1}')"; fi
+  printf '%s  %s\n' "$cached_sha" "$cached" > "$tmp/gateway-windows-live/bin/$cached.sha256"
+done
 windows_output="$(HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$windows_native_hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-windows-live")"
 grep -Fqx "hermes_bin=$tmp/bin/hermes" "$tmp/gateway-windows-live/local/install-state"
 grep -Fq "const dashboardArgs = ['dashboard', ...(1 === 1 ? ['-p', 'default'] : [])" "$tmp/gateway-windows-live/local/run-gateway.sh"
@@ -1589,6 +1601,60 @@ grep -Fq 'shell.Run command, 0, False' "$tmp/gateway-windows-live/local/run-gate
 grep -Fq 'command = """' "$tmp/gateway-windows-live/local/run-gateway.vbs"
 grep -Eq '^COZYGATEWAY_SPOOL_PATH=[A-Za-z]:\\' "$tmp/hermes/.env"
 file "$tmp/gateway-windows-live/local/run-gateway.vbs" | grep -Fq 'CRLF'
+grep -Fq 'windows-reconcile.ps1' "$tmp/gateway-windows-live/local/run-gateway.vbs"
+if grep -Fq 'hermes-agent' "$tmp/gateway-windows-live/local/run-gateway.vbs"; then
+  echo 'Windows login task must not target the Hermes-managed checkout' >&2
+  exit 1
+fi
+
+invoke_windows_login_reconcile() {
+  HOME="$tmp/windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" \
+    COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/windows-hermes-update-commands" \
+    COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_GIT_BASH="$(command -v bash)" \
+    COZYGATEWAY_TEST_RECONCILER="$repo_root/scripts/windows-reconcile.ps1" COZYGATEWAY_TEST_RECONCILE_HOME="$tmp/gateway-windows-live" \
+    COZYGATEWAY_TEST_GATEWAY_MARKER="$tmp/windows-gateway-ready" \
+    COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-commands" \
+    "$tmp/windows-bin/wscript.exe" "$("$tmp/bin/cygpath" -w "$tmp/gateway-windows-live/local/run-gateway.vbs")"
+}
+
+# Reproduce the real post-update seam without rerunning the CozyGateway
+# installer. Hermes' updater may stop/recreate its profile gateway runtime while
+# the independently healthy CozyGateway Scheduled Task still launches only the
+# gateway wrapper. Login must reconcile the exact recorded profiles first.
+rm -rf "$tmp/hermes/profiles/active/plugins/cozygateway"
+printf 'stopped\n' > "$tmp/hermes/gateway-active.state"
+: > "$tmp/windows-hermes-update-commands"
+rm -f "$tmp/windows-gateway-ready"
+invoke_windows_login_reconcile
+test -f "$tmp/windows-gateway-ready"
+test -f "$tmp/hermes/profiles/active/plugins/cozygateway/.cozygateway-installer-owned"
+test "$(cat "$tmp/hermes/gateway-active.state")" = running
+grep -Fqx 'active:gateway:start' "$tmp/windows-hermes-update-commands"
+
+# A second login with current plugins and running services is a real no-op.
+: > "$tmp/windows-hermes-update-commands"
+invoke_windows_login_reconcile
+if grep -Eq ':gateway:(restart|start|install)$' "$tmp/windows-hermes-update-commands"; then
+  echo 'healthy login reconcile restarted a Hermes profile' >&2
+  exit 1
+fi
+
+# Replacing an updater-owned Hermes checkout can invalidate the recorded venv
+# executable. The root launcher remains stable; a missing profile plugin/env is
+# repaired from Gateway's verified cache without rotating the cached token.
+default_token_before="$(sed -n 's/^COZYGATEWAY_ATTACH_TOKEN_DEFAULT=//p' "$tmp/gateway-windows-live/local/gateway.env")"
+rm -rf "$tmp/hermes/plugins/cozygateway"
+rm -f "$tmp/hermes/.env"
+printf 'absent\n' > "$tmp/hermes/gateway-default.state"
+: > "$tmp/windows-hermes-update-commands"
+invoke_windows_login_reconcile
+test -f "$tmp/hermes/plugins/cozygateway/.cozygateway-installer-owned"
+test "$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$tmp/hermes/.env")" = "$default_token_before"
+grep -Fqx 'default:gateway:install' "$tmp/windows-hermes-update-commands"
+if grep -Eq '^(active|ops):gateway:(restart|start|install)$' "$tmp/windows-hermes-update-commands"; then
+  echo 'post-update reconcile touched a healthy sibling profile' >&2
+  exit 1
+fi
 # A native Windows Hermes child must receive a native HERMES_HOME. Git Bash's
 # /c/... form points native Hermes at the wrong root and makes credential login
 # fail after launch.

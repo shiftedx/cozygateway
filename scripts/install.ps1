@@ -982,8 +982,9 @@ try {
     Get-VerifiedAsset 'cozygateway-hermes-attach-plugin.tar.gz' (Join-Path $stage 'cozygateway-hermes-attach-plugin.tar.gz') $base
     Get-VerifiedAsset 'cozygateway-installer.sh' (Join-Path $stage 'agent-install.sh') $base
     Get-VerifiedAsset 'install.ps1' (Join-Path $stage 'cozygateway-bootstrap.ps1') $base
+    Get-VerifiedAsset 'windows-reconcile.ps1' (Join-Path $stage 'windows-reconcile.ps1') $base
     New-Item -ItemType Directory -Force -Path $bin | Out-Null
-    foreach ($asset in @('cozygateway.mjs', 'cozygateway-hermes-attach-plugin.tar.gz', 'agent-install.sh', 'cozygateway-bootstrap.ps1')) {
+    foreach ($asset in @('cozygateway.mjs', 'cozygateway-hermes-attach-plugin.tar.gz', 'agent-install.sh', 'cozygateway-bootstrap.ps1', 'windows-reconcile.ps1')) {
         Promote-VerifiedAsset $asset $stage $bin
     }
 } finally {

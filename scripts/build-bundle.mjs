@@ -79,12 +79,14 @@ const installer = "dist-bundle/cozygateway-installer.sh";
 writeFileSync(installer, readFileSync("scripts/agent-install.sh"), { mode: 0o700 });
 const windowsBootstrap = "dist-bundle/install.ps1";
 writeFileSync(windowsBootstrap, readFileSync("scripts/install.ps1"));
+const windowsReconciler = "dist-bundle/windows-reconcile.ps1";
+writeFileSync(windowsReconciler, readFileSync("scripts/windows-reconcile.ps1"));
 // The POSIX bootstrap ships as a release asset for the same reason the Windows one does: what a
 // person pipes into a shell should be bytes somebody signed off on at a version, not whatever the
 // branch says this minute. Serving it from a release is what lets the checksum mean anything.
 const posixBootstrap = "dist-bundle/install.sh";
 writeFileSync(posixBootstrap, readFileSync("scripts/install.sh"), { mode: 0o700 });
-for (const asset of [pluginArchive, installer, windowsBootstrap, posixBootstrap]) {
+for (const asset of [pluginArchive, installer, windowsBootstrap, windowsReconciler, posixBootstrap]) {
   const assetSha = createHash("sha256").update(readFileSync(asset)).digest("hex");
   writeFileSync(`${asset}.sha256`, `${assetSha}  ${asset.split("/").at(-1)}\n`);
 }
