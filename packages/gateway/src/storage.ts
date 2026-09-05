@@ -6,6 +6,7 @@ import type {
   BotChatAttachment,
   BotChatMessage,
   BotMobileReceipt,
+  BotApprovalRepair,
   BotGroupPendingInteraction,
   BotInteractionSettlement,
   BotPendingClarification,
@@ -4252,6 +4253,7 @@ export class Storage {
     createdAt: number;
     resolutionRequestedAt?: number;
     room?: string;
+    repair?: BotApprovalRepair;
   }> {
     if (bots.length === 0) return [];
     const placeholders = bots.map(() => "?").join(", ");
@@ -4261,6 +4263,7 @@ export class Storage {
                 interaction_id AS toolCallId,
                 json_extract(payload_json, '$.name') AS ruleName,
                 json_extract(payload_json, '$.room.name') AS room,
+                json_extract(payload_json, '$.repair') AS repairJson,
                 updated_at AS createdAt,
                 resolution_requested_at AS resolutionRequestedAt
          FROM bot_native_interactions
@@ -4275,15 +4278,19 @@ export class Storage {
         toolCallId: string;
         ruleName: string;
         room: string | null;
+        repairJson: string | null;
         createdAt: number;
         resolutionRequestedAt: number | null;
       }>;
-    return rows.map(({ resolutionRequestedAt, room, ...row }) => ({
+    return rows.map(({ resolutionRequestedAt, room, repairJson, ...row }) => ({
       ...row,
       ...(resolutionRequestedAt === null ? {} : { resolutionRequestedAt }),
       // Capability 51. A room approval is the same durable row with the room name recorded beside
       // the rule name, so one inbox answers for both lanes and a 1:1 row is byte-identical.
       ...(room === null ? {} : { room }),
+      // Capability 62. The repair block was validated on ingest and stored as sent, so the inbox
+      // row carries the same object the live frame did; absent for every other approval.
+      ...(repairJson === null ? {} : { repair: JSON.parse(repairJson) as BotApprovalRepair }),
     }));
   }
 

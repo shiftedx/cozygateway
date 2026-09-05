@@ -8,6 +8,7 @@ import {
   AttachV1MemoryRequestSchema,
   AttachV1ServerFrameSchema,
   sanitizeApprovalDetail,
+  sanitizeApprovalRepair,
 } from "../src/adapters/attach/protocol-v1.ts";
 
 describe("attach-v1 protocol", () => {
@@ -329,5 +330,64 @@ describe("sanitizeApprovalDetail (capability 56)", () => {
   it("keeps a detail already within the 400-character budget byte-identical apart from trimming", () => {
     const exact = "a".repeat(400);
     expect(sanitizeApprovalDetail(exact)).toBe(exact);
+  });
+});
+
+/** Capability 62 (contract/ext-bots-v1.md row 62). The repair proposal rides the approval event as
+ *  one typed block. Like `detail`, the WIRE schema must never fail over it (a schema failure closes
+ *  the whole attach socket), so `sanitizeApprovalRepair` is the sole authority: a valid block is
+ *  carried byte for byte and an invalid one is dropped while the approval is kept. */
+describe("sanitizeApprovalRepair (capability 62)", () => {
+  const repair = {
+    kind: "mcp_reconnect",
+    server: "github",
+    impact: ["github_search_issues", "github_create_issue"],
+    scope: "server",
+    fingerprint: { previous: "sha256:1f3a", current: "sha256:9c0e" },
+    reason: "stale_tool",
+    policy: "approve_once",
+  };
+
+  it("carries a valid block byte for byte", () => {
+    const sanitized = sanitizeApprovalRepair(repair);
+    expect(sanitized).toEqual(repair);
+    expect(JSON.stringify(sanitized)).toBe(JSON.stringify(repair));
+    expect(sanitizeApprovalRepair({ ...repair, impact: [], fingerprint: {} }))
+      .toEqual({ ...repair, impact: [], fingerprint: {} });
+  });
+
+  it("drops the block for an oversize impact entry, a control character in server, or an unknown kind", () => {
+    expect(sanitizeApprovalRepair({ ...repair, impact: ["t".repeat(129)] })).toBeUndefined();
+    // \u0000 (NUL, C0) and \u200b (zero-width space, Unicode Format/Cf): a name built from these
+    // renders invisible or reorders the card, so the whole block goes, not the character.
+    expect(sanitizeApprovalRepair({ ...repair, server: "git\u0000hub" })).toBeUndefined();
+    expect(sanitizeApprovalRepair({ ...repair, server: "git\u200bhub" })).toBeUndefined();
+    expect(sanitizeApprovalRepair({ ...repair, kind: "restart" })).toBeUndefined();
+  });
+
+  it("drops the block for a control or format character anywhere else a string sits", () => {
+    expect(sanitizeApprovalRepair({ ...repair, impact: ["github_search\u0007issues"] })).toBeUndefined();
+    expect(sanitizeApprovalRepair({ ...repair, fingerprint: { current: "sha256:\u202e9c0e" } })).toBeUndefined();
+  });
+
+  it("drops anything that is not the closed object", () => {
+    expect(sanitizeApprovalRepair("mcp_reconnect")).toBeUndefined();
+    expect(sanitizeApprovalRepair(null)).toBeUndefined();
+    expect(sanitizeApprovalRepair([repair])).toBeUndefined();
+    expect(sanitizeApprovalRepair({ ...repair, url: "https://mcp.example" })).toBeUndefined();
+    const { fingerprint: _drop, ...noFingerprint } = repair;
+    expect(sanitizeApprovalRepair(noFingerprint)).toBeUndefined();
+  });
+
+  it("never fails the event frame: the wire accepts a valid block and garbage alike", () => {
+    const base = {
+      kind: "approval", threadId: "t", turnId: "u", approvalId: "approval", callId: "call",
+      name: "mcp_reconnect", status: "pending",
+    };
+    for (const value of [repair, "nope", 7, { kind: "restart" }]) {
+      expect(check(AttachV1EventFrameSchema, {
+        kind: "event", sequence: 1, eventId: "e-repair", event: { ...base, repair: value },
+      })).toBe(true);
+    }
   });
 });

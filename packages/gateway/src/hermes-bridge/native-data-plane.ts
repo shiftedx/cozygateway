@@ -33,6 +33,7 @@ import type {
   BotDesktopHermesResumeResponse,
   BotPendingClarification,
   BotPendingApproval,
+  BotApprovalRepair,
   BotRoutine,
   BotModelConfig,
   BotModelConfigPatch,
@@ -43,7 +44,7 @@ import type {
 import type { AttachV1Ingress } from "../adapters/attach/ingress-v1.ts";
 import { blocksToText } from "../adapters/attach/blocks-to-text.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
-import { sanitizeApprovalDetail, type AttachV1EventFrame, type AttachV1MobileRequest } from "../adapters/attach/protocol-v1.ts";
+import { sanitizeApprovalDetail, sanitizeApprovalRepair, type AttachV1EventFrame, type AttachV1MobileRequest } from "../adapters/attach/protocol-v1.ts";
 import type { MobileNodeBroker, MobileNodeReceiptInput } from "../mobile-node.ts";
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import type { Storage } from "../storage.ts";
@@ -168,6 +169,9 @@ interface ApprovalPayload {
    *  concretely covers. Stored on the durable interaction row so a reconnecting app's rebroadcast
    *  carries the same sentence the live frame did. */
   detail?: string;
+  /** Capability 62. The validated MCP repair proposal, stored as sent so the live frame, the
+   *  rebroadcast on reconnect, and the inbox row all carry the block the peer raised. */
+  repair?: BotApprovalRepair;
 }
 interface ClarifyPayload {
   prompt: string;
@@ -2875,6 +2879,9 @@ export class NativeBotDataPlane {
     // Capability 56. Sanitize once, up front: the same sentence is stored on the durable row,
     // broadcast on the live frame, and re-emitted verbatim by `#rebroadcastPending` on reconnect.
     const detail = event.detail === undefined ? undefined : sanitizeApprovalDetail(event.detail);
+    // Capability 62. Same discipline for the repair block: validate once, drop it (never the
+    // approval) when it fails, and carry the one validated object on every surface below.
+    const repair = sanitizeApprovalRepair(event.repair);
     const change = this.#storage.recordNativeInteraction({
       bot,
       kind: "approval",
@@ -2884,6 +2891,7 @@ export class NativeBotDataPlane {
       payload: {
         name: event.name,
         ...(detail === undefined ? {} : { detail }),
+        ...(repair === undefined ? {} : { repair }),
       } satisfies ApprovalPayload,
       status: outcome ?? "pending",
       ...(event.expiresAt === undefined ? {} : { expiresAt: event.expiresAt }),
@@ -2904,6 +2912,7 @@ export class NativeBotDataPlane {
         name: event.name,
         updatedAt: this.#now(),
         ...(detail === undefined ? {} : { detail }),
+        ...(repair === undefined ? {} : { repair }),
       };
       this.#broadcast(wire);
       this.#onApproval?.({
@@ -2920,7 +2929,11 @@ export class NativeBotDataPlane {
           interactionId: event.approvalId,
           sessionId,
           turnId: event.turnId,
-          payload: { name: event.name, ...(detail === undefined ? {} : { detail }) },
+          payload: {
+            name: event.name,
+            ...(detail === undefined ? {} : { detail }),
+            ...(repair === undefined ? {} : { repair }),
+          },
           expiresAt: event.expiresAt,
           updatedAt: this.#now(),
         });
@@ -3230,6 +3243,7 @@ export class NativeBotDataPlane {
           updatedAt: pending.updatedAt,
           ...(payload.room === undefined ? {} : { room: payload.room.name }),
           ...(payload.detail === undefined ? {} : { detail: payload.detail }),
+          ...(payload.repair === undefined ? {} : { repair: payload.repair }),
         });
       } else {
         const payload = pending.payload as ClarifyPayload;
