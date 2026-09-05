@@ -393,7 +393,8 @@ function Test-OwnedGatewayTask {
     $matches = [regex]::Matches($exec.Arguments, '"([^"]*)"')
     if ($matches.Count -eq 0 -or (($matches | ForEach-Object { $_.Value }) -join ' ') -ne $exec.Arguments.Trim()) { return $false }
     $values = @($matches | ForEach-Object { $_.Groups[1].Value })
-    if ([string]::Equals($exec.Command, 'wscript.exe', [StringComparison]::OrdinalIgnoreCase)) {
+    $trustedWscript = [IO.Path]::Combine([Environment]::SystemDirectory, 'wscript.exe')
+    if ([string]::Equals($exec.Command, 'wscript.exe', [StringComparison]::OrdinalIgnoreCase) -or (Test-BootstrapPathEquals $exec.Command $trustedWscript)) {
         return $values.Count -eq 1 -and (Test-BootstrapPathEquals $values[0] ([IO.Path]::GetFullPath($LauncherPath))) -and (Test-OwnedGatewayStartupEntry $InstallRoot $LauncherPath)
     }
     $node = [IO.Path]::GetFullPath((Join-Path $InstallRoot 'runtime\node\node.exe'))

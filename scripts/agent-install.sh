@@ -2134,7 +2134,7 @@ windows_task_uses_current_supervisor() {
       [ "$actual_command" = "$recorded_command" ] && [ "$actual_arguments" = "$recorded_arguments" ] && return 0
   fi
   vbs_native="$(to_windows_path "$WINDOWS_VBS")"
-  [ "$actual_command" = wscript.exe ] &&
+  { [ "$actual_command" = wscript.exe ] || [ "$actual_command" = "${SYSTEMROOT:-C:\Windows}\System32\wscript.exe" ]; } &&
     { [ "$actual_arguments" = "&quot;$vbs_native&quot;" ] || [ "$actual_arguments" = "\"$vbs_native\"" ]; } &&
     windows_startup_entry_is_owned "$WINDOWS_VBS"
 }
@@ -2161,6 +2161,11 @@ windows_task_is_directly_owned_by_gateway_home() {
   windows_task_has_single_exec_action "$xml" || return 1
   command="$(sed -n 's:.*<Command>\([^<]*\)</Command>.*:\1:p' <<<"$xml")"
   arguments="$(sed -n 's:.*<Arguments>\([^<]*\)</Arguments>.*:\1:p' <<<"$xml")"
+  if [ "$command" = wscript.exe ] || [ "$command" = "${SYSTEMROOT:-C:\Windows}\System32\wscript.exe" ]; then
+    local vbs_native="$(to_windows_path "$WINDOWS_VBS")"
+    { [ "$arguments" = "&quot;$vbs_native&quot;" ] || [ "$arguments" = "\"$vbs_native\"" ]; } && windows_startup_entry_is_owned "$WINDOWS_VBS"
+    return
+  fi
   node_native="$(to_windows_path "$GATEWAY_DIR/runtime/node/node.exe")"
   supervisor_native="$(to_windows_path "$SUPERVISOR")"
   [ "$command" = "$node_native" ] || return 1
@@ -2227,20 +2232,20 @@ xml_unescape() {
   printf '%s' "$1" | sed 's/&lt;/</g; s/&gt;/>/g; s/&amp;/\&/g'
 }
 write_windows_task_xml() {
-  local node_native supervisor_native arguments='' value escaped user_sid task_start staged="$WINDOWS_TASK_XML.tmp.$$" utf8="$WINDOWS_TASK_XML.tmp.$$.utf8"
-  build_supervisor_args
+  local launcher_native arguments escaped user_sid task_start staged="$WINDOWS_TASK_XML.tmp.$$" utf8="$WINDOWS_TASK_XML.tmp.$$.utf8"
   user_sid="$(powershell.exe -NoProfile -NonInteractive -Command '[Security.Principal.WindowsIdentity]::GetCurrent().User.Value')"
   user_sid="$(tr -d '\r\n' <<<"$user_sid")"
   [[ "$user_sid" =~ ^S-[0-9]+(-[0-9]+)+$ ]] || die "could not resolve the current Windows user SID for Scheduled Task ownership"
   task_start="$(powershell.exe -NoProfile -NonInteractive -Command '(Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")')"
   task_start="$(tr -d '\r\n' <<<"$task_start")"
   [[ "$task_start" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] || die "could not resolve the current time for the Scheduled Task heartbeat"
-  node_native="$(to_windows_path "$NODE_RESOLVED")"; supervisor_native="$(to_windows_path "$SUPERVISOR")"
-  for value in "$supervisor_native" "${SUPERVISOR_ARGS[@]}"; do
-    case "$value" in *'"'*|*$'\r'*|*$'\n'*) die "refusing an unsafe Scheduled Task argument" ;; esac
-    arguments="${arguments}${arguments:+ }&quot;${value//&/&amp;}&quot;"
-  done
-  escaped="${node_native//&/&amp;}"
+  # A console-subsystem Node action can create a terminal even with hidden child spawns.
+  # WScript keeps the task alive while the existing launcher waits for its hidden supervisor.
+  launcher_native="$(to_windows_path "$WINDOWS_VBS")"
+  case "$launcher_native" in *'"'*|*$'\r'*|*$'\n'*) die "refusing an unsafe Scheduled Task argument" ;; esac
+  arguments="&quot;${launcher_native//&/&amp;}&quot;"
+  escaped="${SYSTEMROOT:-C:\Windows}\System32\wscript.exe"
+  escaped="${escaped//&/&amp;}"
   umask 077
   cat > "$utf8" <<TASK_XML
 <?xml version="1.0" encoding="UTF-16"?>
