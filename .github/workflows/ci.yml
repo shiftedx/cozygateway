@@ -62,6 +62,8 @@ jobs:
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/bootstrap-transaction.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-agents-bootstrap.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-dashboard-owner.test.ps1
+      - run: bash scripts/test/windows-state-identity.test.sh
+        shell: bash
       - run: bash scripts/test/hermes-installer.test.sh
         shell: bash
       - run: python -m unittest discover -s integrations/attach-plugin/tests -p test_spool_v1.py
