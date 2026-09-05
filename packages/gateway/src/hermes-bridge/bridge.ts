@@ -558,6 +558,8 @@ export class HermesBridge implements BotControlSurface {
       if (event.type === "cron.changed") this.#refreshRoutinesSoon();
     });
     this.#client.start();
+    // Discovery can connect the shared client before this bridge subscribes.
+    if (this.#client.state() === "online") this.refreshSoon("hermes already online");
   }
   roster(): BotRosterView {
     const cached = this.#storage.botRoster();
