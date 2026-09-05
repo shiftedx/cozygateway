@@ -243,8 +243,13 @@ gateway rather than at the peer.
 A peer that is attached but never negotiated `bot_config` is NOT reported as unavailable. It reads
 exactly like a bot with no config lane at all, which is the true answer: those routes keep the
 `409 unsupported_for_runtime` of capability 45, because the section is absent rather than
-temporarily unreachable. Deletion, model-provider setup, and desktop-session transcripts stay on
-that 409 for every runtime bot: none of the three has a peer-side equivalent.
+temporarily unreachable. Deletion, desktop-session transcripts, and model-provider credential
+writes stay on that 409 for every runtime bot: none of the three has a peer-side equivalent. The
+model-provider read is different: the gateway projects it read-only from the same `model.read`
+answer, so each `providers[]` row must carry `slug`, `name`, `authenticated`, and `modelCount`
+(`BotModelProviderSchema`, extras tolerated). A `config_result` whose body matches no operation's
+schema is refused as an invalid frame and the socket is closed with `1008`, so the pending read
+ends as `unavailable` at the lane timeout rather than as a cast.
 
 ## Bot history lane
 

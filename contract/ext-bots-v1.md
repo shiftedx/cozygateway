@@ -87,7 +87,7 @@ and does not register `/bots` routes.
 | 45 | Native runtime Bots: config-declared bots served by a non-Hermes attach peer appear on the roster with `runtime: "cozyagents"`, built from config and attach presence rather than the Dashboard; their Dashboard-backed routes answer 409 `unsupported_for_runtime`. |
 | 46 | Runtime Bots in rooms: a `runtime: "cozyagents"` bot can be a full member of a group room, its membership answered from gateway config rather than `profiles.list`, and a room turn's live draft is published as `bot_chat_delta` carrying `room`. |
 | 47 | Auditable ids: room and 1:1 transcript rows carry the identities the gateway already held at settlement. `BotGroupMessage` gains `messageId`, `turnId`, `epoch`, `cause`, and `attachTurn`; `BotGroupNote` gains `turnId`; `BotChatMessage` gains `turnId`, `authorBot`, and `inReplyToId`. Every field is optional, absent on rows written before 47, and never backfilled. |
-| 48 | Bot config lane: a runtime bot serves its own profile, model config, and routines over the attach-v1 `bot_config` lane, so those routes answer for it instead of 409. Deletion, model-provider setup, and desktop-session transcripts keep the 409. |
+| 48 | Bot config lane: a runtime bot serves its own profile, model config, and routines over the attach-v1 `bot_config` lane, so those routes answer for it instead of 409. Deletion and desktop-session transcripts keep the 409, as do the bot-scoped model-provider writes; the bot-scoped model-provider read answers the read-only `com.cozylabs.harness-settings` projection of the peer's `model.read` (see 41). |
 | 49 | Runtime bots created from the app: `POST /bots` accepts `runtime: "cozyagents"` and creates a gateway-owned bot with no Hermes profile, minting its attach token and enqueueing a `create_runtime` operation for a CozyRunner. `GET /bots/:name/runtime` projects `{stage, specGeneration, observedGeneration, lastRunnerContactAt}`, and `DELETE /bots/:name` answers for a runtime bot instead of 409. |
 | 50 | Bot history: a runtime bot checkpoints its own workspace into git and serves it over the attach-v1 `bot_history` lane. Five new runtime-bot-only routes carry the Changes list, a per-file diff, restore, the try/keep/discard experiment, and the per-file conflict choice. A Hermes bot answers 409 `unsupported_for_runtime`, and so does a runtime bot whose peer did not negotiate `bot_history`. Nothing content-shaped crosses the lane: summaries and counts, never files or patches. |
 | 51 | Room turns can ask: a runtime member's approval and clarify events on a room turn land in the existing interaction inbox (`sessionId` is the `group:<room>:<member>` thread) and resolve through the existing `/bots/:member/approvals/...` and `/bots/:member/clarifications/...` routes unchanged; tool events project as ephemeral `bot_tool_activity` carrying `room`; `BotGroup` and `bot_group_state` gain the optional `pendingInteractions` pointer array. The room transcript gains nothing and Hermes members are unchanged. |
@@ -157,6 +157,11 @@ a second, hand-copied schema.
   `hermes model`. It is normalized live from Hermes; CozyGateway has no provider registry. A setup
   field reports only `isSet`, never a value or redacted suffix. A method is `fields`, Hermes-hosted
   `oauth`, or an honest `external` CLI handoff.
+  For a `runtime: "cozyagents"` bot the gateway's `cozyagents` harness projects the same catalog
+  read-only from the peer's `model.read` (`providers` and `catalog`, `methods: []`). Credential entry
+  for its built-in providers is runtime-configured: the operator's environment owns the credentials,
+  so the harness-settings field and OAuth writes on a CozyAgents scope answer `404 invalid_request`
+  and the bot-scoped writes keep the 409 of capability 45.
 - `BotGroup`, `BotGroupDetail`, and `BotGroupMessage` are gateway-owned room resources.
   From capability 51 a `BotGroup` may carry `pendingInteractions`, at most 32 pointers to the
   approvals and clarifications its members are currently blocked on; it is absent when there are
@@ -698,7 +703,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `PATCH /bots/:name/profile` | `BotProfilePatch` | `BotProfileConfigureResponse` | Hermes profile update. Capability 57: `guardrailLevel` in the body is forwarded to a runtime bot's peer over the `bot_config` lane unchanged and is not acted on for a Hermes bot. Capability 58: `guardrailCeiling` is never accepted in the body; a body naming it is `400 invalid_request` naming the field. |
 | `GET /bots/:name/model-config` | — | `BotModelConfig` | Hermes profile model read. |
 | `PUT /bots/:name/model-config` | `BotModelConfigPatch` | `BotModelConfig` | Hermes profile model update. |
-| `GET /bots/:name/model-providers` | — | `BotModelProviderSetupCatalog` | Capability 41 compatibility route. New clients use `com.cozylabs.harness-settings`. |
+| `GET /bots/:name/model-providers` | — | `BotModelProviderSetupCatalog` | Capability 41 compatibility route. New clients use `com.cozylabs.harness-settings`. For a runtime bot, the `cozyagents` harness's read-only projection of the peer's `model.read`. |
 | `PUT /bots/:name/model-providers/:provider/fields/:field` | `BotModelProviderFieldUpdate` | `BotModelProviderSetupCatalog` | Writes one field through Hermes after re-validating that the field belongs to the provider. |
 | `DELETE /bots/:name/model-providers/:provider/fields/:field` | — | `BotModelProviderSetupCatalog` | Clears one Hermes-owned provider field and returns refreshed state. |
 | `POST /bots/:name/model-providers/:provider/oauth` | — | `BotModelProviderOAuthSession` | Starts a Hermes-hosted PKCE or device-code session. External CLI-only methods are rejected. |
@@ -812,10 +817,12 @@ same row, so a code from either place pairs the same way.
 ### A gateway with no Hermes endpoint (capability 52)
 
 `hermesEndpoints` is optional from 52. A gateway configured without one starts, serves `/bots` and
-`/runners` from its own runtime-bot rows, and advertises `com.cozylabs.bots`. The three
+`/runners` from its own runtime-bot rows, and advertises `com.cozylabs.bots`. The two
 Hermes-shaped capabilities beside it (`com.cozylabs.hermes-desktop-sessions`,
-`com.cozylabs.mobile-node`, `com.cozylabs.harness-settings`) are not advertised, because there is
-genuinely no Dashboard behind them. `/health` and `/ready` report `bridges: {"hermes": "absent"}`
+`com.cozylabs.mobile-node`) are not advertised, because there is genuinely no Dashboard behind
+them. `com.cozylabs.harness-settings` is advertised unconditionally: its `cozyagents` harness
+answers from runtime bots' config lanes, one read-only scope per runtime bot, with or without
+Hermes. `/health` and `/ready` report `bridges: {"hermes": "absent"}`
 and `/ready` answers `200`: there is no bridge to alarm on or de-route from, and restarting the
 process would fix nothing.
 
@@ -1026,9 +1033,11 @@ Committed transcript history remains the recovery source after reconnect.
 - A Dashboard-backed surface asked about a bot whose `runtime` is not Hermes answers `409` with
   extension code `unsupported_for_runtime`. The body is the core `ErrorBody` plus `runtime` (the
   bot's runtime) and `feature` (the surface method name, for example `botProfile` or `routines`).
-  Since capability 48 this covers the model-provider, desktop-session, and delete surfaces; the
-  profile, model-config, and routines surfaces answer over the config lane instead, and fall back
-  to this 409 when the peer did not negotiate `bot_config`. It is deliberately not a `404`: the bot exists and its chat lane works, so a client
+  Since capability 48 this covers the desktop-session and delete surfaces and the bot-scoped
+  model-provider writes; the profile, model-config, and routines surfaces answer over the config
+  lane instead, the model-provider read answers the read-only `com.cozylabs.harness-settings`
+  projection of that lane's `model.read`, and all of them fall back to this 409 when the peer did
+  not negotiate `bot_config`. It is deliberately not a `404`: the bot exists and its chat lane works, so a client
   must hide or disable that section rather than treat the bot as missing.
 - Native session ids, attach message ids, and attachment ids are opaque. Never infer a filesystem
   path, Hermes Dashboard id, or URL from them.
