@@ -1163,7 +1163,7 @@ if (hermesArgs[0] === 'dashboard') {
   if (process.env.HERMES_DASHBOARD_SESSION_TOKEN !== expectedToken) process.exit(42);
   if (!homeMatches) process.exit(43);
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_MARKER, `${hermesArgs.join(' ')}\n`);
-  const dashboardChild = spawn(process.env.COZYGATEWAY_TEST_DASHBOARD_RUNTIME, descendantArgs, { detached: windowsLauncher, stdio: 'ignore', env: process.env });
+  const dashboardChild = spawn(process.env.COZYGATEWAY_TEST_DASHBOARD_RUNTIME, descendantArgs, { detached: windowsLauncher, windowsHide: true, stdio: 'ignore', env: process.env });
   if (windowsLauncher) {
     dashboardChild.unref();
     process.exit(0);

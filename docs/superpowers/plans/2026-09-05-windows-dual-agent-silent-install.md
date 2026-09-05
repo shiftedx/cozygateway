@@ -24,3 +24,76 @@ CI could not start because of account billing; record local validation alongside
 Merging these fixes does not publish new installer release assets.
 
 Run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-agents-bootstrap.test.ps1`, the Windows bootstrap suite, and relevant shell installer tests after changes. Run CozyAgents runner/process/exec tests and typecheck for its modified helpers. Do not publish releases until there is a concrete tested result and publication authorization.
+
+### September 5 follow-up fixture qualification
+
+An isolated worktree based on merged gateway commit `4f46f9a` exposed another test-only
+console risk: the Hermes installer suite's real mock Dashboard child was detached on Windows
+without `windowsHide`. The fixture now sets it explicitly. A VM regression executes that
+exact fixture source with an injected child-process module; it failed on the missing option
+before the fix and passes afterward without launching a process. This does not establish the
+cause of the earlier unattributed WindowsTerminal/PseudoConsole observation.
+
+Passing local checks:
+
+- Hidden-supervisor and fixture launch tests: 4/4.
+- Complete Windows bootstrap and Windows agents bootstrap suites. The latter covers fresh
+  Both, both additive orders, one shared listener, saved Hermes profiles, runner pairing,
+  and repair preserving the complete runner model/pairing environment.
+- Windows PATH isolation, native transaction helper, Dashboard ownership, and legacy process suites.
+- Shell hidden-task, dual-state, state-identity, legacy-wrapper, runtime rollback,
+  attach-health diagnosis, and harness-choice suites.
+- Complete Hermes installer shell suite, including real mock Dashboard lifecycle,
+  duplicate-process ownership refusals, Scheduled Task registration and Startup fallback
+  through stubbed service commands.
+
+The process PATH was cleaned with the private validation helper and prepended with Git's
+`bin` and `usr/bin`; the user PATH was not changed. The first bootstrap run lacked `cygpath`
+on its process PATH; the complete rerun passed after that correction. The optional POSIX
+transaction suite failed its symlinked-inventory refusal assertion because Git Bash `ln -s`
+created a regular file copy on this host, confirmed with a separate disposable probe. The
+native Windows transaction suite passed while explicitly skipping its symlink-privilege case;
+the harness-choice suite likewise skipped POSIX mode-bit checks on NTFS.
+
+Live lifecycle/window observations and the post-repair agent checks are recorded separately
+by the machine owner. This fixture qualification does not prove a fresh public one-liner,
+reboot/logon behavior, or release publication.
+
+Fresh Hermes prerequisites also remain unqualified. `Resolve-Hermes` delegates to the
+official Hermes Windows installer; this repository adds no Git long-path ZIP fallback or
+Dashboard npm-version/build workaround, and Dashboard startup uses `--skip-build`. The
+bootstrap resolves its default home from `LOCALAPPDATA` using `GetFullPath`; the shell
+installer retains strict physical-directory ownership checks, but no explicit MSIX
+virtualized-path migration is implemented here. The earlier installation needed manual
+steps in these areas. The current upstream Hermes installer was not downloaded or executed
+during this fixture-only follow-up.
+
+### Repair retry-owner follow-up
+
+A subsequent coordinated repair exposed a production lifecycle gap: stopping the Node
+supervisor left its outer WScript launcher in the 60-second retry sleep. A new task run
+could then be ignored by `MultipleInstancesPolicy=IgnoreNew`. Cleanup now includes every
+exactly owned local/Startup WScript launcher, terminates those before Node, and rechecks
+the executable, command arguments, and process creation time immediately before stopping
+each process. Existing VBS content validation must succeed before its path becomes an
+allowed process identity; foreign launchers and reused PIDs remain untouched.
+
+The no-launch regression reproduces a lone sleeping launcher, multiple owned launchers,
+launcher-before-child termination, forged executables, changed commands, and PID reuse.
+Its stop loop uses an in-memory taskkill scriptblock, so it cannot launch or terminate a
+real process. The original sleeping-launcher test failed before the change and passes
+afterward. Legacy ownership and hidden-launch checks also pass. `pnpm build` and
+`pnpm bundle` completed successfully; the updated installer artifact SHA-256 is
+`46196fa453fe2226fd7de2aa631c51685325fcf74b6e076f3c736dd68787000e`.
+
+The complete post-change Windows bootstrap, dual-agent and Hermes shell suites passed,
+as did shell state-identity and hidden-task checks. All service commands in the Hermes
+Windows cases were stubbed; the corrected real mock Dashboard lifecycle also passed.
+
+The machine owner subsequently completed a coordinated live repair with installer hash
+`46196fa453fe2226fd7de2aa631c51685325fcf74b6e076f3c736dd68787000e`. Settings and pairing
+were preserved; the runner environment changed only in byte formatting. Both agents
+completed actual tool calls through the gateway. Bot crash recovery returned to ready in
+21 seconds. The two previously observed gateway WScript retry owners were replaced by one
+gateway launcher and one instance of each expected Node role. This is local-artifact live
+repair evidence, not publication or fresh public-installer qualification.

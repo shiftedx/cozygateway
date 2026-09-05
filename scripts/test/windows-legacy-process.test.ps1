@@ -19,13 +19,14 @@ try {
  }
  $args=@($values.NODE, '-', $values.GATEWAY_ENV, $values.DASHBOARD_ENV, $values.HERMES_ROOT, $values.HERMES, $values.LAUNCHER, $values.OWNER_HELPER, $values.DASHBOARD_PORT, $values.BUNDLE, $values.CONFIG)
  $command=($args | ForEach-Object { '"'+$_+'"' }) -join ' '
- if (-not (Is-ManagedGatewaySupervisor ([pscustomobject]@{CommandLine=$command}))) { throw 'exact released process not recognized' }
+ if (-not (Is-ManagedGatewaySupervisor ([pscustomobject]@{CommandLine=$command; ExecutablePath=$values.NODE}))) { throw 'exact released process not recognized' }
+ if (Is-ManagedGatewaySupervisor ([pscustomobject]@{CommandLine=$command; ExecutablePath='C:\Foreign\node.exe'})) { throw 'forged supervisor executable accepted' }
  foreach ($key in @('NODE','GATEWAY_ENV','DASHBOARD_ENV','HERMES_ROOT','HERMES','LAUNCHER','OWNER_HELPER','DASHBOARD_PORT','BUNDLE','CONFIG')) {
    $foreign=$command.Replace(('"'+$values[$key]+'"'), '"foreign"')
-   if (Is-ManagedGatewaySupervisor ([pscustomobject]@{CommandLine=$foreign})) { throw "foreign $key accepted" }
+   if (Is-ManagedGatewaySupervisor ([pscustomobject]@{CommandLine=$foreign; ExecutablePath=$values.NODE})) { throw "foreign $key accepted" }
  }
  $env:COZYGATEWAY_EXPECTED_LEGACY_INLINE='0'
- if (Is-ManagedGatewaySupervisor ([pscustomobject]@{CommandLine=$command})) { throw 'inline process accepted without verified legacy wrapper' }
+ if (Is-ManagedGatewaySupervisor ([pscustomobject]@{CommandLine=$command; ExecutablePath=$values.NODE})) { throw 'inline process accepted without verified legacy wrapper' }
  Write-Output 'PASS released legacy process recognition and unrelated-process refusals'
 } finally {
  foreach ($name in $before.Keys) { [Environment]::SetEnvironmentVariable($name,$before[$name],'Process') }

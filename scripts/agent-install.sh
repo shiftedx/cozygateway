@@ -2035,6 +2035,7 @@ preflight_windows_service_ownership() {
 }
 stop_owned_windows_gateway() {
   local config_native gateway_env_native dashboard_env_native node_native bundle_native hermes_root_native hermes_native launcher_native owner_helper_native dashboard_state_native worker_native database_native code release_code attempt expected_port check_target_port="${1:-1}"
+  local launcher_vbs_native= startup_vbs_native= startup_entry
   if [ "${WINDOWS_OWNED_IDENTITY:-0}" != 1 ] && ! load_windows_wrapper_identity; then
     [ "$check_target_port" = 0 ] && return 1
     windows_gateway_ports_are_free
@@ -2056,7 +2057,19 @@ stop_owned_windows_gateway() {
   fi
   worker_native="$(to_windows_path "$MAINTENANCE_WORKER")"
   database_native="$(to_windows_path "$LOCAL_DIR/cozygateway.sqlite")"
+  # Stop the outer retry owner too. Killing only Node leaves WScript sleeping for
+  # a minute, and the task's IgnoreNew policy then ignores the repair's /Run.
+  if [ -n "${WINDOWS_VBS:-}" ] && windows_startup_entry_is_owned "$WINDOWS_VBS"; then
+    launcher_vbs_native="$(to_windows_path "$WINDOWS_VBS")"
+  fi
+  if [ -n "${WINDOWS_TASK:-}" ]; then
+    startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
+    if windows_startup_entry_is_owned "$startup_entry"; then
+      startup_vbs_native="$(to_windows_path "$startup_entry")"
+    fi
+  fi
   set +e
+  COZYGATEWAY_EXPECTED_VBS="$launcher_vbs_native" COZYGATEWAY_EXPECTED_STARTUP_VBS="$startup_vbs_native" \
   MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_LEGACY_INLINE="${WINDOWS_OWNED_LEGACY_INLINE:-0}" COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_GATEWAY_ENV="$gateway_env_native" COZYGATEWAY_EXPECTED_DASHBOARD_ENV="$dashboard_env_native" COZYGATEWAY_EXPECTED_NODE="$node_native" COZYGATEWAY_EXPECTED_SUPERVISOR="$(to_windows_path "$SUPERVISOR")" COZYGATEWAY_EXPECTED_BUNDLE="$bundle_native" COZYGATEWAY_EXPECTED_WORKER="$worker_native" COZYGATEWAY_EXPECTED_DATABASE="$database_native" COZYGATEWAY_EXPECTED_HERMES_ROOT="$hermes_root_native" COZYGATEWAY_EXPECTED_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_OWNER_HELPER="$owner_helper_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$WINDOWS_OWNED_DASHBOARD_PORT" COZYGATEWAY_EXPECTED_DASHBOARD_PORT_STATE="$dashboard_state_native" powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
     function Same-Path([string] $Candidate, [string] $Expected) {
@@ -2067,10 +2080,12 @@ stop_owned_windows_gateway() {
       return @([regex]::Matches($Command, "[^\s`"]+|`"[^`"]*`"") | ForEach-Object { $_.Value.Trim([char]34) })
     }
     function Is-ManagedGatewayChild($Process) {
+      if (-not (Same-Path ([string]$Process.ExecutablePath) $env:COZYGATEWAY_EXPECTED_NODE)) { return $false }
       $tokens = Command-Tokens ([string]$Process.CommandLine)
       return $tokens.Count -eq 5 -and (Same-Path $tokens[0] $env:COZYGATEWAY_EXPECTED_NODE) -and (Same-Path $tokens[1] $env:COZYGATEWAY_EXPECTED_BUNDLE) -and $tokens[2] -eq "serve" -and $tokens[3] -eq "--config" -and (Same-Path $tokens[4] $env:COZYGATEWAY_EXPECTED_CONFIG)
     }
     function Is-ManagedGatewaySupervisor($Process) {
+      if (-not (Same-Path ([string]$Process.ExecutablePath) $env:COZYGATEWAY_EXPECTED_NODE)) { return $false }
       $tokens = Command-Tokens ([string]$Process.CommandLine)
       $expected = @($env:COZYGATEWAY_EXPECTED_NODE, $env:COZYGATEWAY_EXPECTED_SUPERVISOR,
         "--platform", "Windows", "--gateway-env", $env:COZYGATEWAY_EXPECTED_GATEWAY_ENV,
@@ -2107,9 +2122,17 @@ stop_owned_windows_gateway() {
       }
       return $true
     }
+    function Is-ManagedGatewayLauncher($Process) {
+      $trusted = Join-Path ([Environment]::SystemDirectory) "wscript.exe"
+      if (-not (Same-Path ([string]$Process.ExecutablePath) $trusted)) { return $false }
+      $tokens = Command-Tokens ([string]$Process.CommandLine)
+      if ($tokens.Count -ne 2) { return $false }
+      if ($tokens[0] -ine "wscript.exe" -and -not (Same-Path $tokens[0] $trusted)) { return $false }
+      return (Same-Path $tokens[1] $env:COZYGATEWAY_EXPECTED_VBS) -or (Same-Path $tokens[1] $env:COZYGATEWAY_EXPECTED_STARTUP_VBS)
+    }
     function Managed-GatewayProcesses {
       $all = @(Get-CimInstance Win32_Process)
-      return @($all | Where-Object { (Is-ManagedGatewaySupervisor $_) -or (Is-ManagedGatewayChild $_) })
+      return @($all | Where-Object { (Is-ManagedGatewayLauncher $_) -or (Is-ManagedGatewaySupervisor $_) -or (Is-ManagedGatewayChild $_) })
     }
     $managed = @(Managed-GatewayProcesses)
     if ($managed.Count -eq 0) {
@@ -2117,7 +2140,11 @@ stop_owned_windows_gateway() {
     }
     $taskkill = Join-Path ([Environment]::SystemDirectory) "taskkill.exe"
     if (-not [IO.File]::Exists($taskkill)) { throw "trusted taskkill.exe is unavailable" }
-    function Stop-ManagedGatewayProcess([int] $ProcessId) {
+    function Stop-ManagedGatewayProcess($Process) {
+      $ProcessId = [int]$Process.ProcessId
+      $current = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $ProcessId)
+      if ($null -eq $current -or $null -eq $Process.CreationDate -or $current.CreationDate -ne $Process.CreationDate) { return }
+      if (-not ((Is-ManagedGatewayLauncher $current) -or (Is-ManagedGatewaySupervisor $current) -or (Is-ManagedGatewayChild $current))) { return }
       $previousPreference = $ErrorActionPreference
       try {
         $ErrorActionPreference = "SilentlyContinue"
@@ -2127,15 +2154,15 @@ stop_owned_windows_gateway() {
       }
     }
     $stopped = [Collections.Generic.HashSet[int]]::new()
-    foreach ($process in $managed | Sort-Object { if (Is-ManagedGatewaySupervisor $_) { 0 } else { 1 } }) {
-      if ($stopped.Add([int]$process.ProcessId)) { Stop-ManagedGatewayProcess $process.ProcessId }
+    foreach ($process in $managed | Sort-Object { if (Is-ManagedGatewayLauncher $_) { 0 } elseif (Is-ManagedGatewaySupervisor $_) { 1 } else { 2 } }) {
+      if ($stopped.Add([int]$process.ProcessId)) { Stop-ManagedGatewayProcess $process }
     }
     Start-Sleep -Milliseconds 1200
     for ($attempt = 0; $attempt -lt 10; $attempt += 1) {
       $remaining = @(Managed-GatewayProcesses)
       if ($remaining.Count -eq 0) { break }
       foreach ($process in $remaining) {
-        if ($stopped.Add([int]$process.ProcessId)) { Stop-ManagedGatewayProcess $process.ProcessId }
+        if ($stopped.Add([int]$process.ProcessId)) { Stop-ManagedGatewayProcess $process }
       }
       Start-Sleep -Seconds 1
     }
