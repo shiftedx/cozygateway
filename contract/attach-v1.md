@@ -160,6 +160,18 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `del
   sentence is carried on the Bot Mode `bot_approval_pending` frame and the durable interaction
   record when present, and omitted (byte-identical to a pre-56 payload) when the raising event
   carried none. It never appears on the resolve path or on `bot_approval_resolved`.
+- `approval` (capability 62, `com.cozylabs.bots >= 62`) MAY carry `repair`, one typed MCP repair
+  proposal: `BotApprovalRepairSchema` on the bots contract (`kind: "mcp_reconnect"`, `server`,
+  `impact[]`, `scope: "server"`, `fingerprint { previous?, current? }`, `reason`, `policy`). The
+  field is untyped on this wire on purpose, as `detail` is unbounded: a schema failure on an event
+  frame closes the attach socket, and the rule for this block is to drop it and keep the approval.
+  The gateway is the sole authority on the block: it validates the closed sets and bounds and
+  refuses any C0/C1 control or Unicode Format (Cf) character in `server`, an `impact` entry, or a
+  fingerprint; a block that fails is dropped and the approval raised without it, and a valid block
+  is carried byte for byte on `bot_approval_pending`, the durable interaction record, and the
+  `GET /bots/approvals` inbox row. Nothing changes for `resolve_approval`: approving is the peer's
+  cue to reconnect that one server, and the gateway records nothing about the outcome. A peer
+  never puts a URL, header value, env value, or secret in the block.
 - Capability 51 (`com.cozylabs.bots`). A ROOM member turn may raise `approval`, `clarify` and
   `tool` events, which the gateway previously acknowledged and dropped. Nothing on this wire
   changes: the ids, the statuses, and the `resolve_approval` / `resolve_clarify` commands the

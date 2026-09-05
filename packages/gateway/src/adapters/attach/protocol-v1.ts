@@ -14,6 +14,7 @@ import {
   ChatBranchListSchema, ChatComputerSchema, ChatProjectListSchema,
   ChatSessionConfigurationSchema,
   ModelProviderConnectionCatalogSchema, ModelProviderConnectionIdSchema,
+  BotApprovalRepairSchema, type BotApprovalRepair, check,
 } from "cozygateway-contract";
 
 /** Stable attach-v1 data-plane contract. A peer dials /attach/v1 and completes hello negotiation
@@ -454,6 +455,11 @@ const ApprovalEvent = Type.Object({
    *  schema refusing, so an oversized or control-character-laden value is sanitised, never a
    *  reason to drop the frame or the connection carrying it. */
   detail: Type.Optional(Type.String()),
+  /** Capability 62. The MCP repair proposal this approval asks about (`BotApprovalRepairSchema`
+   *  on the bots contract). UNTYPED on the wire for the same reason `detail` is unbounded: a schema
+   *  failure here would close the whole attach socket over one block, when the rule is to drop the
+   *  block and keep the approval. `sanitizeApprovalRepair` below is the sole authority. */
+  repair: Type.Optional(Type.Unknown()),
 });
 /** Capability 56. Matches the C0 and C1 control character ranges (built from character codes
  *  rather than a literal escape, so no NUL or other control byte ever sits in this source file),
@@ -490,6 +496,29 @@ export function sanitizeApprovalDetail(raw: string): string | undefined {
   const lastSpace = truncated.lastIndexOf(" ");
   if (lastSpace > 0) truncated = truncated.slice(0, lastSpace);
   return `${truncated.trimEnd()}${APPROVAL_DETAIL_ELLIPSIS}`;
+}
+/** Capability 62. Validates a raw `ApprovalEvent.repair` against the closed bots-contract block and
+ *  refuses any C0/C1 control or Unicode Format (Cf) character in the server name, an affected tool
+ *  name, or a fingerprint (the same family capability 56 strips from `detail`; here every string is
+ *  an identifier, so one bad character fails the block rather than being cut out of a name). The
+ *  block is all or nothing: a valid one is returned as sent, byte for byte, and anything else is
+ *  `undefined`, which the caller reads as "keep the approval, carry no proposal". Never a reason to
+ *  refuse the frame or the approval: the decision a person is being asked for must not be lost
+ *  over the card that describes it. */
+export function sanitizeApprovalRepair(raw: unknown): BotApprovalRepair | undefined {
+  if (!check(BotApprovalRepairSchema, raw)) return undefined;
+  const strings = [raw.server, ...raw.impact, ...Object.values(raw.fingerprint)];
+  return strings.some(unusableIdentifier) ? undefined : raw;
+}
+/** Capability 62. A repair-block string the schema accepted but no configured server, tool, or
+ *  digest is ever called: whitespace only, a C0/C1 control or Format character, or a lone
+ *  surrogate (`\p{Cs}` under the `u` flag matches an unpaired half, never a real astral pair). The
+ *  schema's `minLength`/`maxLength` bounds count UTF-16 code units, which row 62 states. */
+const LONE_SURROGATE = /\p{Cs}/u;
+function unusableIdentifier(value: string): boolean {
+  return value.trim().length === 0
+    || value.search(APPROVAL_DETAIL_CONTROL_CHARS) !== -1
+    || LONE_SURROGATE.test(value);
 }
 const ClarifyOption = Type.Object({ id: Id, label: Type.String({ minLength: 1, maxLength: 512 }) });
 const ClarifyEvent = Type.Object({

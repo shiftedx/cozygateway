@@ -34,6 +34,7 @@ registerConformanceSuite({
   baseUrl: () => reference.gateway?.url ?? "",
   issueSetupCode: () => Promise.resolve(reference.gateway?.issueSetupCode() ?? ""),
   echoAgentId: "conformance-echo",
-  // Deliberately no stallAgentId, approvalAgentId, botModelConfig, botChatStop, or botNewSession:
+  // Deliberately no stallAgentId, approvalAgentId, repairApproval, botModelConfig, botChatStop, or
+  // botNewSession:
   // this is the hookless gateway a third party may be.
 });

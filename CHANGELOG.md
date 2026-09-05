@@ -7,6 +7,11 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## Unreleased
 
+- An approval can propose an MCP repair (`com.cozylabs.bots` capability 62, #366): `ApprovalEvent`
+  on attach-v1 gains optional typed `repair`, validated by the gateway and dropped (never the
+  approval) when malformed, then carried on `bot_approval_pending`, the `GET /bots/approvals` inbox
+  row, and the rebroadcast a reconnecting app gets. Approve and deny are unchanged. The conformance
+  suite gains an optional repair hook that proves all three outcomes against the reference gateway.
 - Windows installation offers Hermes, CozyAgents, or both on one gateway, preserves the other
   harness when adding one later, and keeps saved model settings and pairing during repair.
 - Gateway tasks and background children use hidden launchers. Windows upgrade recovery recognizes

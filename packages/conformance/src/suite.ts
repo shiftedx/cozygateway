@@ -23,7 +23,10 @@ import {
   ApprovalPendingFrameSchema,
   ApprovalResolveResponseSchema,
   ApprovalResolvedFrameSchema,
+  type BotApprovalPendingFrame,
+  BotApprovalPendingFrameSchema,
   BotChatStopResponseSchema,
+  BotInteractionRecoverySchema,
   BotModelConfigSchema,
   BotNewSessionResponseSchema,
   BotSessionAdoptResponseSchema,
@@ -96,6 +99,16 @@ export interface ConformanceEnv {
   /** OPTIONAL capability-19 bot with a persisted canonical conversation that may be replaced and
    *  restored by the new-session conformance group. */
   botNewSession?: { botName: string };
+  /** OPTIONAL repair hook (capability 62, contract/ext-bots-v1.md row 62). One Bot Mode bot whose
+   *  approval-capable backend echoes a repair proposal: on a chat send whose text is a JSON object
+   *  with a `repair` member, it raises one approval whose attach-v1 `repair` block is exactly that
+   *  member, as sent; on any other text it raises one approval with no block. Either way it stays
+   *  parked until the approval is resolved and completes the turn after a deny. That echo is what
+   *  lets a black-box run hand the gateway a valid block, an invalid one, and none, and hold it to
+   *  the row: valid rides the pending frame, the inbox row and the rebroadcast byte for byte,
+   *  invalid is dropped while the approval is kept, and an approval without one is unchanged. The
+   *  bot must be idle when the group starts. Omit it and the cases are reported as skipped. */
+  repairApproval?: { botName: string };
 }
 
 const TEST_TIMEOUT_MS = 10_000;
@@ -1379,6 +1392,179 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
           );
           expect(unauthed.status).toBe(401);
           expect(assertValid(ErrorBodySchema, await unauthed.json()).error.code).toBe("unauthorized");
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      // Capability 62 (contract/ext-bots-v1.md row 62): a repair proposal IS an approval carrying
+      // one optional typed block, so its cases live in this group and reuse nothing new for
+      // delivery or resolution. They ride the OPTIONAL repair hook (`ConformanceEnv.repairApproval`)
+      // because only a backend that echoes the block can hand the gateway an invalid one on purpose.
+      const repairApproval = env.repairApproval;
+      const repairIt = repairApproval === undefined ? it.skip : it;
+      const VALID_REPAIR = {
+        kind: "mcp_reconnect",
+        server: "github",
+        impact: ["github_search_issues", "github_create_issue"],
+        scope: "server",
+        fingerprint: { previous: "sha256:1f3a", current: "sha256:9c0e" },
+        reason: "stale_tool",
+        policy: "approve_once",
+      };
+
+      /** Send into the repair bot's chat and return the Bot Mode pending frame the backend raises. */
+      async function raiseRepairApproval(
+        token: string,
+        socket: Socket,
+        text: string,
+      ): Promise<BotApprovalPendingFrame> {
+        if (repairApproval === undefined) throw new Error("unreachable: skipped without hook");
+        const before = socket.frames.length;
+        const sent = await authFetch(
+          token,
+          `/bots/${encodeURIComponent(repairApproval.botName)}/chat/messages`,
+          { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ text }) },
+        );
+        expect(sent.status).toBe(202);
+        // The 202 body names the canonical chat the turn runs in (`{ name, sessionId, message }`),
+        // and every Bot Mode frame is keyed by that sessionId: match on it rather than on how the
+        // gateway happens to spell the bot's name.
+        const { sessionId } = (await sent.json()) as { sessionId: string };
+        expect(typeof sessionId).toBe("string");
+        const raised = (): BotApprovalPendingFrame | undefined =>
+          framesOfType(socket.frames.slice(before), "bot_approval_pending")
+            .find((frame) => frame.sessionId === sessionId);
+        await waitFor(socket, () => raised() !== undefined, "bot_approval_pending");
+        return assertValid(BotApprovalPendingFrameSchema, raised());
+      }
+
+      /** Deny the approval and wait until the bot's chat is idle again, so the next case starts
+       *  from the same state this one did. */
+      async function denyRepairApproval(
+        token: string,
+        socket: Socket,
+        frame: BotApprovalPendingFrame,
+      ): Promise<void> {
+        if (repairApproval === undefined) throw new Error("unreachable: skipped without hook");
+        const before = socket.frames.length;
+        const denied = await authFetch(
+          token,
+          `/bots/${encodeURIComponent(repairApproval.botName)}/approvals/${encodeURIComponent(frame.toolCallId)}/deny`,
+          { method: "POST" },
+        );
+        expect(denied.status).toBe(202);
+        await waitFor(
+          socket,
+          () =>
+            framesOfType(socket.frames.slice(before), "bot_approval_resolved")
+              .some((f) => f.toolCallId === frame.toolCallId && f.outcome === "denied"),
+          "bot_approval_resolved(denied)",
+        );
+        await waitFor(
+          socket,
+          () =>
+            framesOfType(socket.frames.slice(before), "bot_chat_state")
+              .some((f) => f.bot === frame.bot && f.running === false && f.inflight === false),
+          "bot chat idle after deny",
+        );
+      }
+
+      async function pendingInboxRow(token: string, toolCallId: string) {
+        const res = await authFetch(token, "/bots/approvals?state=pending");
+        expect(res.status).toBe(200);
+        const recovery = assertValid(BotInteractionRecoverySchema, await res.json());
+        return recovery.approvals.find((row) => row.toolCallId === toolCallId);
+      }
+
+      repairIt(
+        "a valid repair block rides the pending approval byte for byte: live frame, inbox row, and the rebroadcast a reconnecting app gets",
+        async () => {
+          if (repairApproval === undefined) throw new Error("unreachable: skipped without hook");
+          const { token } = await pairDevice("approval-repair-valid");
+          const socket = await authedSocket(token);
+          let reconnected: Socket | undefined;
+          let frame: BotApprovalPendingFrame | undefined;
+          try {
+            frame = await raiseRepairApproval(token, socket, JSON.stringify({ repair: VALID_REPAIR }));
+            expect(JSON.stringify(frame.repair)).toBe(JSON.stringify(VALID_REPAIR));
+
+            const raised = frame;
+            const row = await pendingInboxRow(token, raised.toolCallId);
+            expect(row).toBeDefined();
+            expect(JSON.stringify(row?.repair)).toBe(JSON.stringify(VALID_REPAIR));
+
+            // A reconnecting app opens a fresh socket and re-reads the chat, which rebroadcasts every
+            // still-pending approval: the block it sees is the one the live app saw.
+            reconnected = await authedSocket(token);
+            const history = await authFetch(
+              token,
+              `/bots/${encodeURIComponent(repairApproval.botName)}/chat/messages`,
+            );
+            expect(history.status).toBe(200);
+            const second = reconnected;
+            await waitFor(
+              second,
+              () => framesOfType(second.frames, "bot_approval_pending")
+                .some((f) => f.toolCallId === raised.toolCallId),
+              "rebroadcast bot_approval_pending",
+            );
+            const rebroadcast = framesOfType(second.frames, "bot_approval_pending")
+              .find((f) => f.toolCallId === raised.toolCallId);
+            expect(JSON.stringify(assertValid(BotApprovalPendingFrameSchema, rebroadcast).repair))
+              .toBe(JSON.stringify(VALID_REPAIR));
+          } finally {
+            // Deny even after a failed assertion, so one red case cannot park the bot and turn the
+            // next case's send into a steer of this turn.
+            if (frame !== undefined) await denyRepairApproval(token, socket, frame);
+            reconnected?.ws.close();
+            socket.ws.close();
+          }
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      repairIt(
+        "an invalid repair block is dropped and the approval is kept, on the frame and in the inbox",
+        async () => {
+          if (repairApproval === undefined) throw new Error("unreachable: skipped without hook");
+          const { token } = await pairDevice("approval-repair-invalid");
+          const socket = await authedSocket(token);
+          let frame: BotApprovalPendingFrame | undefined;
+          try {
+            frame = await raiseRepairApproval(
+              token,
+              socket,
+              JSON.stringify({ repair: { ...VALID_REPAIR, kind: "restart", impact: ["t".repeat(129)] } }),
+            );
+            expect(frame).not.toHaveProperty("repair");
+            const row = await pendingInboxRow(token, frame.toolCallId);
+            expect(row).toBeDefined();
+            expect(row).not.toHaveProperty("repair");
+          } finally {
+            if (frame !== undefined) await denyRepairApproval(token, socket, frame);
+            socket.ws.close();
+          }
+        },
+        TEST_TIMEOUT_MS,
+      );
+
+      repairIt(
+        "an approval that is not a repair proposal is unchanged: no repair member anywhere",
+        async () => {
+          if (repairApproval === undefined) throw new Error("unreachable: skipped without hook");
+          const { token } = await pairDevice("approval-repair-none");
+          const socket = await authedSocket(token);
+          let frame: BotApprovalPendingFrame | undefined;
+          try {
+            frame = await raiseRepairApproval(token, socket, "do something dangerous");
+            expect(frame).not.toHaveProperty("repair");
+            const row = await pendingInboxRow(token, frame.toolCallId);
+            expect(row).toBeDefined();
+            expect(row).not.toHaveProperty("repair");
+          } finally {
+            if (frame !== undefined) await denyRepairApproval(token, socket, frame);
+            socket.ws.close();
+          }
         },
         TEST_TIMEOUT_MS,
       );

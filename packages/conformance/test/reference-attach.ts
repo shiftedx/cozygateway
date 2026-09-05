@@ -25,6 +25,15 @@ interface CommandFrame {
   command: Command;
 }
 
+function repairFromText(text: string | undefined): unknown {
+  if (text === undefined || !text.startsWith("{")) return undefined;
+  try {
+    return (JSON.parse(text) as { repair?: unknown }).repair;
+  } catch {
+    return undefined;
+  }
+}
+
 class AttachPeer {
   #socket: WebSocket | undefined;
   #eventSequence = 0;
@@ -83,7 +92,11 @@ class AttachPeer {
     this.#event({ kind: "draft", threadId: command.threadId, turnId: command.turnId, blocks: [{ type: "paragraph", text: "Working…" }] });
     if (this.#kind === "approval") {
       this.#pending.set(command.turnId, command);
-      this.#event({ kind: "approval", threadId: command.threadId, turnId: command.turnId, approvalId: `approval:${command.turnId}`, callId: `call:${command.turnId}`, name: "reference tool", status: "pending" });
+      // Capability 62 repair hook: a send whose text is a JSON object with a `repair` member is
+      // echoed onto the approval event as its block, exactly as sent, so the suite can hand the
+      // gateway a valid block, an invalid one, and (any other text) none.
+      const repair = repairFromText(command.text);
+      this.#event({ kind: "approval", threadId: command.threadId, turnId: command.turnId, approvalId: `approval:${command.turnId}`, callId: `call:${command.turnId}`, name: "reference tool", status: "pending", ...(repair === undefined ? {} : { repair }) });
     }
   }
 
