@@ -67,7 +67,8 @@ Expected: `ready: true`, `hermes: true`, `online == configured`, `deadLetters: 0
 - `breezy-ivy` reports `needs_attention model_unavailable` because the LAN model endpoint
   `192.168.99.121:1234` was not answering. Not a gateway problem.
 - Windows native installs still do not auto-provision phone-created bots (`docs/agent-install.md`).
-- Latent: `HermesBridge.createBot` answers 404 when the post-create roster refresh times out,
-  though the profile exists. Seen once under a dashboard stall; not yet fixed.
+- Fixed the same day: `HermesBridge.createBot` used to answer 404 when the post-create roster
+  refresh failed, though the profile existed. It now answers 201 from the create's own data,
+  patches the cached roster, and refreshes again (`bots-create-roster-refresh.test.ts`).
 - The compose project warns about the orphan `cozygateway-maintenance-supervisor-1` container on
   every `up`. Harmless.

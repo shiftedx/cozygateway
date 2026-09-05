@@ -650,25 +650,43 @@ export class HermesBridge implements BotControlSurface {
     }
 
     const title = input.title?.trim();
+    const meta: Record<string, unknown> = { ...(title ? { title } : {}), created: this.#now() };
     try {
-      await this.#client.request("profiles.configure", {
-        name,
-        ui_meta: {
-          [UI_META_KEY]: {
-            ...(title ? { title } : {}),
-            created: this.#now(),
-          },
-        },
-      });
+      await this.#client.request("profiles.configure", { name, ui_meta: { [UI_META_KEY]: meta } });
     } catch {
       // The profile already exists. Metadata is presentation-only, so never turn a successful
       // create into a retry that can only collide with itself.
     }
     await this.refresh(`bot ${name} created`);
-    const bot = this.#storage.botRoster().bots.find((row) => row.name === name);
-    if (bot === undefined) throw new BotNotFound(name);
+    let bot = this.#storage.botRoster().bots.find((row) => row.name === name);
+    if (bot === undefined) {
+      // Hidden is the one honest absence: the operator keeps this name off the roster this gateway
+      // serves, so a 404 tells the truth. Anything else is the refresh having failed (it swallows
+      // its own errors, by design), and a 404 for a profile Hermes just accepted is a lie the app
+      // acts on: it drops the create and the bot appears, unexplained, on the next roster read.
+      if (this.#hidden.has(name)) throw new BotNotFound(name);
+      bot = this.#adoptCreatedRow(name, input.description?.trim() ?? "", meta);
+    }
     this.#profileChanged({ profile: name, change: "created" });
     return { bot, ...(warnings.length === 0 ? {} : { warnings }) };
+  }
+  /** The row for a profile Hermes accepted but `profiles.list` could not read back: built from
+   *  exactly what the create sent, appended to the cached roster so a read in the meantime shows
+   *  it, published, and superseded by Hermes' own row on the next successful refresh, which is
+   *  requested right away. */
+  #adoptCreatedRow(name: string, description: string, meta: Record<string, unknown>): BotSummary {
+    const at = this.#now();
+    const [row] = buildRoster(
+      [{ name, description: description.length === 0 ? null : description, hasAvatar: false, meta, lastActiveAt: null, preview: null }],
+      { hidden: this.#hidden, routedProfile: null, gatewayState: "idle", now: at },
+    );
+    if (row === undefined) throw new BotNotFound(name);
+    const bots = [...this.#storage.botRoster().bots.filter((existing) => existing.name !== name), row];
+    this.#storage.replaceBotRoster(bots.map((summary) => ({ name: summary.name, summary })), at);
+    this.#publish(bots, at);
+    this.#log(`bot ${name} created but the roster could not be read back; answering from the create and refreshing`);
+    this.refreshSoon(`bot ${name} created (retry)`);
+    return row;
   }
   /** The inverse of `createBot`, built for "no traces on the Hermes host": the dashboard's
    *  `DELETE /api/profiles/:name` removes the whole profile directory (config, API keys,
