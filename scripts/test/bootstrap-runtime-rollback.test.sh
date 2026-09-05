@@ -24,7 +24,22 @@ service_unit="$XDG_CONFIG_HOME/systemd/user/cozygateway.service"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 expect_absent() { [ ! -e "$1" ] && [ ! -L "$1" ] || fail "expected absence: $1"; }
 expect_contents() { [ "$(cat "$1")" = "$2" ] || fail "unexpected contents in $1"; }
-expect_mode() { [ "$(bootstrap_path_mode "$1")" = "$2" ] || fail "unexpected mode on $1"; }
+original_mode_paths=()
+original_modes=()
+record_mode() {
+  original_mode_paths+=("$1")
+  original_modes+=("$(bootstrap_path_mode "$1")")
+}
+expect_mode() {
+  local index
+  for index in "${!original_mode_paths[@]}"; do
+    if [ "${original_mode_paths[$index]}" = "$1" ]; then
+      [ "$(bootstrap_path_mode "$1")" = "${original_modes[$index]}" ] || fail "unexpected mode on $1"
+      return
+    fi
+  done
+  fail "missing original mode for $1"
+}
 expect_runtime_snapshot() {
   awk -F: -v id="$1" '$1 == "state" && $3 == id { found=1 } END { exit !found }' "$backup_dir/inventory" || fail "missing runtime snapshot for $1"
 }
@@ -109,6 +124,13 @@ printf 'log-before\n' > "$HOME_DIR/local/cozygateway.log"
 printf 'hermes-before\n' > "$tmp/hermes/profile/.env"
 printf 'agents-before\n' > "$tmp/agents/install.json"
 
+# NTFS does not expose arbitrary POSIX chmod bits. Assert restoration of each
+# actual original mode so permission rollback remains checked on every host.
+for item in "${BOOTSTRAP_RUNTIME_FILES[@]}"; do
+  path="$(bootstrap_runtime_path "$item")"
+  [ ! -f "$path" ] || record_mode "$path"
+done
+record_mode "$service_unit"
 begin_bootstrap_transaction "$asset_dir"
 # These names are the minimum runnable contract; explicit checks prevent a
 # future whitelist edit from silently reducing snapshot coverage.
@@ -142,9 +164,9 @@ recover_bootstrap_transaction "$asset_dir" --no-qr
 expect_absent "$old_installer_log"
 expect_contents "$asset_dir/cozygateway.mjs" 'old:cozygateway.mjs'
 expect_contents "$HOME_DIR/local/run-gateway.sh" "$(printf '#!/usr/bin/env bash\nset -euo pipefail\nexec /usr/bin/node %s' "$asset_dir/gateway-supervisor.cjs")"
-expect_mode "$HOME_DIR/local/run-gateway.sh" 700
+expect_mode "$HOME_DIR/local/run-gateway.sh"
 expect_contents "$service_unit" "$(printf '[Service]\nExecStart=/usr/bin/node %s' "$asset_dir/gateway-supervisor.cjs")"
-expect_mode "$service_unit" 600
+expect_mode "$service_unit"
 grep -Fqx -- '--user daemon-reload' "$manager_log" || fail 'recovery did not reload the restored owned service'
 grep -Fqx -- '--user restart cozygateway.service' "$manager_log" || fail 'recovery did not restart the restored owned service'
 index=0
@@ -153,7 +175,7 @@ for item in "${BOOTSTRAP_RUNTIME_FILES[@]}"; do
   case "$item" in local/run-gateway.sh|local/gateway-supervisor.cjs) index=$((index + 1)); continue ;; esac
   if [ $((index % 2)) -eq 0 ]; then
     expect_contents "$path" "old:$item"
-    expect_mode "$path" 600
+    expect_mode "$path"
   else
     expect_absent "$path"
   fi

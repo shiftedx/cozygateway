@@ -43,7 +43,7 @@ function healthOrigin(config: ReturnType<typeof loadConfig>): string {
 
 type GatewayHealth = {
   version?: string;
-  attach?: { configured?: number; online?: number; deadLetters?: number };
+  attach?: { configured?: number; online?: number; deadLetters?: number; hermes?: { configured?: number; online?: number } };
 };
 
 export function isExpectedCertificate(configured: Buffer, peer: Buffer): boolean {
@@ -88,14 +88,16 @@ async function fetchHealth(configPath: string, timeoutMs: number): Promise<Gatew
   });
 }
 
-export function isGatewayReady(health: { attach?: { configured?: number; online?: number; deadLetters?: number } }): boolean {
-  const configured = health.attach?.configured ?? 0;
-  return configured > 0 && health.attach?.online === configured && health.attach?.deadLetters === 0;
+export function isGatewayReady(health: GatewayHealth): boolean {
+  const scope = health.attach && ("hermes" in health.attach ? health.attach.hermes : health.attach);
+  const configured = scope?.configured ?? 0;
+  return Number.isInteger(configured) && configured > 0 && scope?.online === configured && health.attach?.deadLetters === 0;
 }
 
 function attachStatus(health: GatewayHealth): string {
-  const configured = health.attach?.configured ?? 0;
-  const online = health.attach?.online ?? 0;
+  const scope = health.attach && ("hermes" in health.attach ? health.attach.hermes : health.attach);
+  const configured = scope?.configured ?? 0;
+  const online = scope?.online ?? 0;
   const deadLetters = health.attach?.deadLetters ?? 0;
   const reasons = [
     ...(configured === 0 ? ["no Hermes profiles configured"] : []),

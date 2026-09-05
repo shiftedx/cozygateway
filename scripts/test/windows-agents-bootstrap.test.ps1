@@ -42,7 +42,11 @@ function Assert-NoBroadReadAcl {
 }
 
 function Invoke-Bootstrap {
-    param([string] $Installer, [hashtable] $Environment, [string[]] $Arguments = @())
+    param([string] $Installer, [hashtable] $Environment, [string[]] $Arguments = @(), [switch] $ThroughExpression, [switch] $ThroughScriptBlock, [string] $Engine = 'powershell.exe')
+    if ($env:COZYGATEWAY_TEST_BOOTSTRAP_ENGINE -and -not $PSBoundParameters.ContainsKey('Engine')) { $Engine = $env:COZYGATEWAY_TEST_BOOTSTRAP_ENGINE }
+    # No fixture may fall back to writing the machine's actual per-user PATH.
+    . (Join-Path $repoRoot 'scripts\test\windows-fixture-environment.ps1')
+    $Environment = New-IsolatedBootstrapEnvironment $Environment $temp
     $old = @{}
     foreach ($key in $Environment.Keys) {
         $old[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
@@ -51,7 +55,18 @@ function Invoke-Bootstrap {
     try {
         $previousPreference = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer @Arguments 2>&1
+        if ($ThroughScriptBlock) {
+            $argumentText = @($Arguments | ForEach-Object {
+                if ($_ -match '^--?[A-Za-z-]+$') { $_ } else { "'" + $_.Replace("'", "''") + "'" }
+            }) -join ' '
+            $expression = "& ([scriptblock]::Create((Get-Content -LiteralPath '" + $Installer.Replace("'", "''") + "' -Raw))) " + $argumentText
+            $output = & $Engine -NoProfile -Command $expression 2>&1
+        } elseif ($ThroughExpression) {
+            $expression = "Get-Content -LiteralPath '" + $Installer.Replace("'", "''") + "' -Raw | Invoke-Expression"
+            $output = & $Engine -NoProfile -Command $expression 2>&1
+        } else {
+            $output = & $Engine -NoProfile -ExecutionPolicy Bypass -File $Installer @Arguments 2>&1
+        }
         return @{ ExitCode = $LASTEXITCODE; Output = (($output | ForEach-Object { [string]$_ }) -join "`n") }
     } finally {
         $ErrorActionPreference = $previousPreference
@@ -212,6 +227,17 @@ Copy-Item -LiteralPath '$agentsFixture' -Destination (Join-Path `$target 'bin\co
     node = '$node'
     bundle = [ordered]@{ url = ''; sha256 = ''; path = (Join-Path `$target 'bin\cozyagents-fixture.js') }
 }
+if (`$env:COZYAGENTS_TEST_SCHEMA -eq '1') {
+    `$state = [ordered]@{
+        schemaVersion = 1
+        home = `$target
+        node = '$node'
+        assets = @(
+            [ordered]@{ name = 'cozyagents-update.mjs'; path = (Join-Path `$target 'must-not-run-update-worker.js') },
+            [ordered]@{ name = 'cozyagents.mjs'; path = (Join-Path `$target 'bin\cozyagents-fixture.js') }
+        )
+    }
+}
 Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | ConvertTo-Json -Depth 5)
 "@
 
@@ -238,6 +264,136 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
     }
 
     # ---------------------------------------------------------------------------
+    $expressionRun = Invoke-Bootstrap $installer (New-Environment @{
+        'COZYGATEWAY_HOME' = (Join-Path $temp 'Expression Gateway')
+        'COZYGATEWAY_INSTALL_DRYRUN' = '1'
+    }) -ThroughExpression
+    Assert-True ($expressionRun.ExitCode -eq 0) "the documented iex entry point failed: $($expressionRun.Output)"
+    Assert-Contains $expressionRun.Output 'would install CozyAgents from' 'iex must reach harness selection'
+    $rawArguments = Invoke-Bootstrap $installer (New-Environment @{
+        'COZYGATEWAY_HOME' = (Join-Path $temp 'Scriptblock Gateway')
+        'COZYGATEWAY_INSTALL_DRYRUN' = '1'
+    }) @('-Harness', 'both', '--no-qr') -ThroughScriptBlock
+    Assert-True ($rawArguments.ExitCode -eq 0) "scriptblock forwarding failed: $($rawArguments.Output)"
+    Assert-Contains $rawArguments.Output "would install CozyAgents from $agentsInstaller" 'forwarded --no-qr must not become the CozyAgents installer source'
+    $pwsh = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pwsh) {
+        $expression7 = Invoke-Bootstrap $installer (New-Environment @{
+            'COZYGATEWAY_HOME' = (Join-Path $temp 'Expression 7 Gateway')
+            'COZYGATEWAY_INSTALL_DRYRUN' = '1'
+        }) -ThroughExpression -Engine $pwsh.Source
+        Assert-True ($expression7.ExitCode -eq 0) "PowerShell 7 iex entry point failed: $($expression7.Output)"
+        Assert-Contains $expression7.Output 'would install CozyAgents from' 'PowerShell 7 iex must reach harness selection'
+    }
+
+    # Dual installs reuse one gateway and preserve the other harness in either addition order.
+    $dualHermes = Join-Path $temp 'dual-hermes.exe'
+    $dualConfig = Join-Path $temp 'hermes-config.yaml'
+    Write-Utf8NoBom $dualConfig 'model: fixture-model'
+    $className = 'DualHermes' + [guid]::NewGuid().ToString('N')
+    Add-Type -TypeDefinition @"
+using System;
+public static class $className {
+    public static void Main(string[] args) {
+        if (args[0] == "--version") Console.WriteLine("Hermes Agent v0.21.0");
+        else if (args[0] == "status") Console.WriteLine("Model: fixture-model\nProvider: fixture-provider");
+        else if (args[0] == "-p") Console.WriteLine(@"$dualConfig");
+    }
+}
+"@ -Language CSharp -OutputAssembly $dualHermes -OutputType ConsoleApplication
+    $dualStage = Join-Path $temp 'stage-dual'
+    New-GatewayStage $dualStage '127.0.0.1'
+    Write-Utf8NoBom (Join-Path $dualStage 'local\install-state') "harness=hermes`nhermes_root=/c/hermes`nprofiles=default,work`nprofile_scope=all`nprofile.default.port=9119`n"
+    $dualGatewayConfig = '{"host":"127.0.0.1","port":8787,"hermesEndpoints":[{"id":"default"}],"fixtureRegistration":"keep-me"}'
+    Write-Utf8NoBom (Join-Path $dualStage 'local\cozygateway.config.json') $dualGatewayConfig
+    $recordedAgentsHome = Join-Path $temp 'Recorded Agents Gateway'
+    Write-Utf8NoBom (Join-Path $recordedAgentsHome 'local\install-state') "harness=cozyagents`n"
+    $recordedAgents = Invoke-Bootstrap $installer (New-Environment @{
+        'COZYGATEWAY_HOME' = $recordedAgentsHome
+        'COZYGATEWAY_TEST_HERMES' = $dualHermes
+        'COZYGATEWAY_INSTALL_DRYRUN' = '1'
+    })
+    Assert-Contains $recordedAgents.Output 'harness: cozyagents' 'unattended reruns must retain CozyAgents even when standalone Hermes is available'
+    foreach ($initial in @('fresh', 'hermes', 'cozyagents')) {
+        $dualHome = Join-Path $temp "Dual $initial"
+        $dualAgents = Join-Path $temp "Agents $initial"
+        if ($initial -ne 'fresh') {
+            Write-Utf8NoBom (Join-Path $dualHome 'local\install-state') "harness=$initial`nprofiles=default,work`n"
+            Write-Utf8NoBom (Join-Path $dualHome 'local\cozygateway.config.json') $dualGatewayConfig
+        }
+        $tokenLine = if ($initial -eq 'fresh') { '' } else { "COZYRUNNER_TOKEN=keep-existing-token`n" }
+        Write-Utf8NoBom (Join-Path $dualAgents 'runner.env') "COZYRUNNER_MODEL_ENDPOINT=http://127.0.0.1:1234/v1`nCOZYRUNNER_MODEL_ID=fixture-model`n$tokenLine"
+        $dualEnvironment = New-Environment @{
+            'COZYGATEWAY_HOME' = $dualHome
+            'COZYAGENTS_HOME' = $dualAgents
+            'COZYGATEWAY_TEST_HERMES' = $dualHermes
+            'COZYGATEWAY_TEST_GATEWAY_STAGE' = $dualStage
+            'COZYGATEWAY_TEST_GATEWAY_DEST' = $dualHome
+            'COZYGATEWAY_TEST_USER_PATH' = 'C:\Existing Tools'
+            'COZYGATEWAY_TEST_USER_PATH_LOG' = (Join-Path $temp "dual-$initial-path")
+            'COZYAGENTS_TEST_SCHEMA' = $(if ($initial -eq 'fresh') { '1' } else { '0' })
+        }
+        $requested = switch ($initial) { 'hermes' { 'cozyagents' }; 'cozyagents' { 'hermes' }; default { 'both' } }
+        Remove-Item -LiteralPath $eventLog, $agentsLog -Force -ErrorAction SilentlyContinue
+        $dualArguments = @('-Harness', $requested)
+        if ($initial -ne 'fresh') { $dualArguments += '--no-qr' }
+        $dual = Invoke-Bootstrap $installer $dualEnvironment $dualArguments -ThroughScriptBlock:($initial -eq 'hermes')
+        Assert-True ($dual.ExitCode -eq 0) "dual $initial install failed: $($dual.Output)"
+        $dualState = Read-LogText (Join-Path $dualHome 'local\install-state')
+        Assert-Contains $dualState 'harness=both' 'adding either harness must persist both'
+        Assert-Contains $dualState 'profiles=default,work' 'both must preserve Hermes profiles'
+        Assert-Contains $dualState 'profile.default.port=9119' 'both must preserve Hermes profile metadata'
+        Assert-Contains $dualState 'cozyagents_home=/' 'both must record a shell-compatible runner home'
+        Assert-Contains (Read-LogText $eventLog) '--harness hermes' 'shared installer must explicitly take the Hermes path even when state previously says CozyAgents'
+        Assert-True (@((Read-LogText $eventLog) -split "`n" | Where-Object { $_ -like 'bash:*' }).Count -eq 1) 'dual installation must install the gateway exactly once'
+        Assert-Contains (Read-LogText $agentsLog) 'install NoPair=True' 'dual installation must install the runner'
+        if ($initial -eq 'fresh') {
+            Assert-Contains (Read-LogText $agentsLog) 'runner pair --gateway http://127.0.0.1:8787' 'fresh dual install must pair its runner to the shared listener'
+            Assert-True ([regex]::Matches($dual.Output, 'fake-qr').Count -eq 1) 'fresh dual installation must print exactly one device QR'
+            Assert-Contains (Read-LogText $eventLog) '--no-qr' 'shared installer must defer its QR until both harnesses are ready'
+        } else {
+            Assert-Missing (Read-LogText $agentsLog) 'runner pair' 'existing runner pairing must survive adding Hermes'
+            Assert-Missing $dual.Output 'fake-qr' '--no-qr must suppress the dual finale QR'
+        }
+        Assert-Contains (Read-LogText (Join-Path $dualHome 'local\cozygateway.config.json')) 'keep-me' 'existing gateway registrations must remain'
+        $dualEnvironment['COZYAGENTS_HOME'] = ''
+        $beforeRepairEnv = Read-LogText (Join-Path $dualAgents 'runner.env')
+        Write-Utf8NoBom (Join-Path $temp 'unused-model-answers') "openai`nshould-not-replace-saved-model`n"
+        $dualEnvironment['COZYGATEWAY_TEST_MODEL_PROMPT_INPUT'] = (Join-Path $temp 'unused-model-answers')
+        $repaired = Invoke-Bootstrap $installer $dualEnvironment @('-Repair', '--no-qr')
+        Assert-True ($repaired.ExitCode -eq 0) "dual repair failed: $($repaired.Output)"
+        Assert-Missing $repaired.Output 'Which provider should new bots use?' 'interactive repair must keep a saved valid model without prompting'
+        Assert-Contains (Read-LogText (Join-Path $dualHome 'local\install-state')) 'harness=both' 'repair must retain both'
+        Assert-True ((Read-LogText (Join-Path $dualAgents 'runner.env')) -eq $beforeRepairEnv) 'repair must recover recorded runner home and preserve all model and pairing values'
+        if ($initial -eq 'fresh') {
+            Write-Utf8NoBom (Join-Path $temp 'rerun-both-answer') "3`n"
+            $dualEnvironment['COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT'] = (Join-Path $temp 'rerun-both-answer')
+            $interactive = Invoke-Bootstrap $installer $dualEnvironment @('--no-qr')
+            Assert-True ($interactive.ExitCode -eq 0) "interactive both rerun failed: $($interactive.Output)"
+            Assert-Missing $interactive.Output 'Which provider should new bots use?' 'interactive both rerun must preserve its saved model'
+            Assert-True ((Read-LogText (Join-Path $dualAgents 'runner.env')) -eq $beforeRepairEnv) 'interactive both rerun must preserve the complete runner env'
+            $dualEnvironment['COZYGATEWAY_RUNNER_MODEL_PROVIDER'] = 'openai'
+            $dualEnvironment['COZYGATEWAY_RUNNER_MODEL_ID'] = 'replacement-model'
+            $providerChange = Invoke-Bootstrap $installer $dualEnvironment @('-Harness', 'both', '--no-qr')
+            Assert-True ($providerChange.ExitCode -eq 0) "provider change failed: $($providerChange.Output)"
+            $changedEnv = Read-LogText (Join-Path $dualAgents 'runner.env')
+            Assert-Contains $changedEnv 'COZYRUNNER_MODEL_PROVIDER=openai' 'explicit provider must replace the saved model source'
+            Assert-Missing $changedEnv 'COZYRUNNER_MODEL_ENDPOINT=' 'switching to a provider must remove the endpoint key'
+            $dualEnvironment['COZYGATEWAY_RUNNER_MODEL_PROVIDER'] = ''
+            $dualEnvironment['COZYGATEWAY_RUNNER_MODEL_ENDPOINT'] = 'http://127.0.0.1:1234/v1'
+            $endpointChange = Invoke-Bootstrap $installer $dualEnvironment @('-Harness', 'both', '--no-qr')
+            Assert-True ($endpointChange.ExitCode -eq 0) "endpoint change failed: $($endpointChange.Output)"
+            $changedEnv = Read-LogText (Join-Path $dualAgents 'runner.env')
+            Assert-Contains $changedEnv 'COZYRUNNER_MODEL_ENDPOINT=http://127.0.0.1:1234/v1' 'explicit endpoint must replace the saved model source'
+            Assert-Missing $changedEnv 'COZYRUNNER_MODEL_PROVIDER=' 'switching to an endpoint must remove the provider key'
+            Assert-Contains $changedEnv 'COZYRUNNER_TOKEN=paired-token' 'changing the model source must preserve runner pairing'
+        }
+        Remove-Item -LiteralPath $agentsLog -Force -ErrorAction SilentlyContinue
+        $removed = Invoke-Bootstrap $installer $dualEnvironment @('--uninstall')
+        Assert-True ($removed.ExitCode -eq 0) "dual uninstall failed: $($removed.Output)"
+        Assert-Contains ((Read-LogText $agentsLog).ToLowerInvariant()) ("uninstall --home $dualAgents --yes".ToLowerInvariant()) 'dual uninstall must remove the saved runner through its own uninstaller'
+    }
+
     # 1. The harness question
     # ---------------------------------------------------------------------------
     Write-Utf8NoBom (Join-Path $temp 'answer-enter') "`n"
@@ -250,7 +406,7 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
         'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT' = (Join-Path $temp 'answer-enter')
     })
     Assert-True ($enter.ExitCode -eq 0) "the harness question must not fail the dry run: $($enter.Output)"
-    Assert-Contains $enter.Output 'Which harness runs your bots? [1] CozyAgents (recommended) [2] Hermes Agent [1]' 'the harness question must be asked'
+    Assert-Contains $enter.Output 'Which harness runs your bots? [1] CozyAgents (recommended) [2] Hermes Agent [3] Both [1]' 'the harness question must be asked'
     Assert-Contains $enter.Output 'harness: cozyagents' 'Enter must take the recommended harness'
 
     $two = Invoke-Bootstrap $installer (New-Environment @{
@@ -261,12 +417,23 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
     Assert-Contains $two.Output 'harness: hermes' 'answering 2 must take Hermes'
     Assert-Contains $two.Output 'would install Hermes Agent' 'the Hermes answer must plan the Hermes bootstrap'
 
+    Write-Utf8NoBom (Join-Path $temp 'answer-three') "3`n"
+    $three = Invoke-Bootstrap $installer (New-Environment @{
+        'COZYGATEWAY_HOME' = (Join-Path $temp 'Both prompt Gateway')
+        'COZYGATEWAY_INSTALL_DRYRUN' = '1'
+        'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT' = (Join-Path $temp 'answer-three')
+    })
+    Assert-True ($three.ExitCode -eq 0) 'the Both prompt answer must succeed'
+    Assert-Contains $three.Output 'harness: both' 'answering 3 must select both'
+    Assert-Contains $three.Output 'would install Hermes Agent' 'Both must include Hermes'
+    Assert-Contains $three.Output 'would install CozyAgents from' 'Both must include CozyAgents'
+
     $retry = Invoke-Bootstrap $installer (New-Environment @{
         'COZYGATEWAY_HOME' = (Join-Path $temp 'Retry Gateway')
         'COZYGATEWAY_INSTALL_DRYRUN' = '1'
         'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT' = (Join-Path $temp 'answer-retry')
     })
-    Assert-Contains $retry.Output 'Please answer 1 or 2.' 'an unusable answer must be asked again'
+    Assert-Contains $retry.Output 'Please answer 1, 2 or 3.' 'an unusable answer must be asked again'
     Assert-Contains $retry.Output 'harness: cozyagents' 'the retry must land on the answer that was given'
 
     $flag = Invoke-Bootstrap $installer (New-Environment @{
@@ -420,7 +587,7 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
         'COZYGATEWAY_HOME' = $liveHome
         'COZYAGENTS_HOME' = $liveAgents
         'COZYGATEWAY_CODEX_AUTH_PATH' = $liveCodex
-        'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT' = (Join-Path $temp 'answer-two')
+        'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT' = (Join-Path $temp 'answer-enter')
         'COZYGATEWAY_TEST_PAIR_PROMPT_INPUT' = (Join-Path $temp 'pair-no')
         'COZYGATEWAY_TEST_GATEWAY_STAGE' = (Join-Path $temp 'stage-lan')
         'COZYGATEWAY_TEST_GATEWAY_DEST' = $liveHome
@@ -428,8 +595,8 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
         'COZYGATEWAY_TEST_USER_PATH_LOG' = $rerunPathLog
     })
     Assert-True ($rerun.ExitCode -eq 0) "the second run failed: $($rerun.Output)"
-    Assert-Missing $rerun.Output 'Which harness runs your bots?' 'a machine that answered the harness question is never asked again'
-    Assert-Contains $rerun.Output 'harness: cozyagents (already installed here)' 'the recorded harness is the one the install owns'
+    Assert-Contains $rerun.Output 'Which harness runs your bots?' 'interactive reruns must offer adding either harness'
+    Assert-Contains $rerun.Output 'harness: cozyagents (selected)' 'Enter must preserve the recorded harness'
     Assert-Missing $rerun.Output 'Allow CozyChat to access this Gateway over your local network?' 'the network question is asked once'
     Assert-Contains $rerun.Output 'Create a new CozyChat pairing code? [y/N]' 'an update must ask before minting a new code'
     Assert-Contains $rerun.Output 'no new pairing code created' 'answering no must mint nothing'
@@ -514,15 +681,13 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
         'COZYGATEWAY_INSTALL_DRYRUN' = '1'
         'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' = (Join-Path $temp 'model-answers')
     })
-    Assert-Contains $orphan.Output 'keeping it. Rerun with -Harness cozyagents to replace it.' 'a kept Hermes bridge must say how to replace it'
-    Assert-Contains $orphan.Output 'continuing as a Hermes install; nothing CozyAgents-owned is installed, paired, or configured here.' 'a kept bridge must make the whole run a Hermes install'
-    Assert-Contains $orphan.Output '& ([scriptblock]::Create((irm https://cozylabs.ai/install.ps1))) -Harness cozyagents' 'a kept bridge must show the form that can carry the flag'
+    Assert-Contains $orphan.Output 'harness: hermes' 'an unattended run must preserve a configured Hermes bridge'
     Assert-Missing $orphan.Output 'Which provider should new bots use?' 'a kept bridge must ask no CozyAgents question'
     Assert-Missing $orphan.Output 'would install CozyAgents from' 'a kept bridge must install no CozyAgents harness'
     Assert-True ((Read-LogText $agentsLog) -eq '') 'a kept bridge must run nothing CozyAgents owns'
     Assert-True ((Read-LogText (Join-Path $orphanHome 'local\cozygateway.config.json')).Contains('hermesEndpoints')) 'a kept bridge must survive the run'
 
-    # Asking for it outright is the one thing that takes the bridge out.
+    # Asking for CozyAgents adds it alongside the existing Hermes bridge.
     $chosen = Invoke-Bootstrap $installer (New-Environment @{
         'COZYGATEWAY_HOME' = $orphanHome
         'COZYAGENTS_HOME' = (Join-Path $temp 'orphan-cozyagents')

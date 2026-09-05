@@ -49,6 +49,13 @@ assert_diagnosis '{"attach":{"configured":0,"online":0,"deadLetters":0}}' 'Herme
 assert_diagnosis '{"attach":{"configured":1,"online":1,"deadLetters":3}}' 'Hermes attach retained dead letters (configured=1, online=1, deadLetters=3)'
 assert_diagnosis '{"attach":{"configured":1.5,"online":1.5,"deadLetters":0}}' 'Hermes attach health could not be read'
 assert_diagnosis 'not-json' 'Hermes attach health could not be read'
+HEALTH_JSON='{"attach":{"configured":2,"online":1,"deadLetters":0,"hermes":{"configured":1,"online":1,"degraded":0,"absent":0}}}'
+attach_ready || { echo 'an absent runtime bot must not block healthy Hermes' >&2; exit 1; }
+assert_diagnosis '{"attach":{"configured":2,"online":1,"deadLetters":0,"hermes":{"configured":1,"online":0,"degraded":0,"absent":1}}}' 'Hermes attach profile count mismatch (configured=1, online=0, deadLetters=0)'
+assert_diagnosis '{"attach":{"configured":2,"online":2,"deadLetters":0,"hermes":null}}' 'Hermes attach health could not be read'
+SELECTED=(default ops)
+assert_diagnosis '{"attach":{"configured":2,"online":2,"deadLetters":0,"hermes":{"configured":1,"online":1,"degraded":0,"absent":0}}}' 'Hermes attach profile count mismatch'
+unset SELECTED
 late_counter="${TMPDIR:-/tmp}/cozygateway-attach-health-counter.$$"
 printf '0\n' > "$late_counter"
 trap 'rm -f "$late_counter"' EXIT

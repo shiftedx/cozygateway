@@ -501,6 +501,7 @@ choose_harness() {
     if [ -z "$recorded" ] && grep -q '^hermes_root=' "$STATE_FILE"; then recorded=hermes; fi
   fi
   case "$recorded" in
+    both) HARNESS=hermes; say "OK    harnesses: Hermes and CozyAgents (already installed here)"; return 0 ;;
     cozyagents) HARNESS=cozyagents; COZYAGENTS_CHOSEN=1; say "OK    harness: cozyagents (already installed here)"; return 0 ;;
     hermes) HARNESS=hermes; say "OK    harness: hermes (already installed here)"; return 0 ;;
   esac
@@ -1088,11 +1089,20 @@ ensure_hermes_gateways() {
   done
 }
 write_state() {
-  local profile staged="$STATE_FILE.tmp.$$"
+  local profile staged="$STATE_FILE.tmp.$$" recorded="" agents_home=""
   [ "$DRY_RUN" = 1 ] && return
+  if [ -f "$STATE_FILE" ]; then
+    recorded="$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)"
+    agents_home="$(sed -n 's/^cozyagents_home=//p' "$STATE_FILE" | tail -1)"
+  fi
   umask 077
   {
-    printf 'harness=hermes\n'
+    if [ "$recorded" = cozyagents ] || [ "$recorded" = both ]; then
+      printf 'harness=both\n'
+      [ -z "$agents_home" ] || printf 'cozyagents_home=%s\n' "$agents_home"
+    else
+      printf 'harness=hermes\n'
+    fi
     printf 'profiles='; (IFS=,; printf '%s' "${SELECTED[*]}")
     printf '\nprofile_scope=%s' "$PROFILE_SPEC"
     printf '\nhermes_root=%s\n' "$HERMES_ROOT"
@@ -1758,7 +1768,7 @@ try {
   foreach ($name in $launchEnvironment.Keys) {
     Set-CozyProcessEnvironmentVariable ([string]$name) ([string]$launchEnvironment[$name])
   }
-  $child = & $startProcessCommand $powerShellExecutable -WorkingDirectory $trustedSystemDirectory -Verb RunAs -Wait -PassThru -ArgumentList $childArguments
+  $child = & $startProcessCommand $powerShellExecutable -WorkingDirectory $trustedSystemDirectory -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList $childArguments
   exit ([int]$child.ExitCode)
 } catch {
   exit 46
@@ -1897,8 +1907,56 @@ write_windows_launcher() {
   chmod 600 "$staged" 2>/dev/null || { rm -f "$staged"; return 1; }
   mv -f "$staged" "$WINDOWS_VBS"
 }
+load_windows_legacy_wrapper_identity() {
+  local line expected body_hash index value
+  local -a values paths expected_paths
+  [ "${HARNESS:-}" = hermes ] && [ -r "$WRAPPER" ] || return 1
+  [ "$(sed -n '1p' "$WRAPPER" | tr -d '\r')" = '#!/usr/bin/env bash' ] || return 1
+  [ "$(sed -n '2p' "$WRAPPER" | tr -d '\r')" = 'set -euo pipefail' ] || return 1
+  [ "$(tail -n 1 "$WRAPPER" | tr -d '\r')" = NODE ] || return 1
+  # Pin the exact Windows supervisor shipped in v0.6.5. Never source or evaluate
+  # a persisted wrapper to recover its arguments.
+  body_hash="$(tail -n +4 "$WRAPPER" | sed '$d' | tr -d '\r' | sha256sum | awk '{print $1}')"
+  [ "$body_hash" = 820562ca357aec94d5f31a10adb17f4a314de7a326bca02e4d27fdd323578a38 ] || return 1
+  line="$(sed -n '3p' "$WRAPPER" | tr -d '\r')"
+  mapfile -t values < <(printf '%s\n' "$line" | awk -F '"' '{for (i=2;i<=20;i+=2) print $i}')
+  [ "${#values[@]}" = 10 ] || return 1
+  for value in "${values[@]}"; do
+    [ -n "$value" ] || return 1
+    case "$value" in *'$'*|*'`'*) return 1 ;; esac
+  done
+  printf -v expected 'exec "%s" - "%s" "%s" "%s" "%s" "%s" "%s" "%s" "%s" "%s" <<\x27NODE\x27' "${values[@]}"
+  [ "$line" = "$expected" ] && [ "${values[7]}" = "$DASHBOARD_PORT" ] || return 1
+  paths=()
+  for index in 0 1 2 3 4 5 6 8 9; do paths+=("$(to_posix_path "${values[$index]}")"); done
+  expected_paths=("$NODE_RESOLVED" "$GATEWAY_ENV" "$DASHBOARD_ENV" "$HERMES_ROOT" "$HERMES_RESOLVED" "$HERMES_ROOT/bin/hermes.exe" "$DASHBOARD_OWNER_PS1" "$BUNDLE_PATH" "$CONFIG_JSON")
+  # Old releases did not persist Node identity. Permit the current resolved Node
+  # as well as the old private runtime, but never an unrelated executable.
+  if [ ! "${paths[0]}" -ef "${expected_paths[0]}" ]; then
+    expected_paths[0]="$(resolve_node)" || return 1
+  fi
+  for index in "${!paths[@]}"; do [ "${paths[$index]}" -ef "${expected_paths[$index]}" ] || return 1; done
+  WINDOWS_OWNED_NODE_RESOLVED="${paths[0]}"
+  WINDOWS_OWNED_GATEWAY_ENV="${paths[1]}"
+  WINDOWS_OWNED_DASHBOARD_ENV="${paths[2]}"
+  WINDOWS_OWNED_HERMES_ROOT="${paths[3]}"
+  WINDOWS_OWNED_HERMES_RESOLVED="${paths[4]}"
+  WINDOWS_OWNED_LAUNCHER="${paths[5]}"
+  WINDOWS_OWNED_DASHBOARD_OWNER_PS1="${paths[6]}"
+  WINDOWS_OWNED_DASHBOARD_PORT="${values[7]}"
+  WINDOWS_OWNED_BUNDLE_PATH="${paths[7]}"
+  WINDOWS_OWNED_CONFIG_JSON="${paths[8]}"
+  WINDOWS_OWNED_DASHBOARD_PORT_STATE=
+  WINDOWS_OWNED_LEGACY_INLINE=1
+  WINDOWS_OWNED_IDENTITY=1
+}
 load_windows_wrapper_identity() {
   local line expected='exec ' legacy_expected='exec ' value quoted skip_value=0 dashboard_state=''
+  WINDOWS_OWNED_LEGACY_INLINE=0
+  if [ -r "$WRAPPER" ] && [ "$(tr -d '\r' < "$WRAPPER" | awk 'END { print NR }')" != 3 ]; then
+    load_windows_legacy_wrapper_identity
+    return $?
+  fi
   [ -r "$WRAPPER" ] && [ -r "$SUPERVISOR" ] || return 1
   [ "$(tr -d '\r' < "$WRAPPER" | awk 'END { print NR }')" = 3 ] || return 1
   [ "$(sed -n '1p' "$WRAPPER" | tr -d '\r')" = '#!/usr/bin/env bash' ] || return 1
@@ -1999,7 +2057,7 @@ stop_owned_windows_gateway() {
   worker_native="$(to_windows_path "$MAINTENANCE_WORKER")"
   database_native="$(to_windows_path "$LOCAL_DIR/cozygateway.sqlite")"
   set +e
-  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_GATEWAY_ENV="$gateway_env_native" COZYGATEWAY_EXPECTED_DASHBOARD_ENV="$dashboard_env_native" COZYGATEWAY_EXPECTED_NODE="$node_native" COZYGATEWAY_EXPECTED_SUPERVISOR="$(to_windows_path "$SUPERVISOR")" COZYGATEWAY_EXPECTED_BUNDLE="$bundle_native" COZYGATEWAY_EXPECTED_WORKER="$worker_native" COZYGATEWAY_EXPECTED_DATABASE="$database_native" COZYGATEWAY_EXPECTED_HERMES_ROOT="$hermes_root_native" COZYGATEWAY_EXPECTED_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_OWNER_HELPER="$owner_helper_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$WINDOWS_OWNED_DASHBOARD_PORT" COZYGATEWAY_EXPECTED_DASHBOARD_PORT_STATE="$dashboard_state_native" powershell.exe -NoProfile -NonInteractive -Command '
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_LEGACY_INLINE="${WINDOWS_OWNED_LEGACY_INLINE:-0}" COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_GATEWAY_ENV="$gateway_env_native" COZYGATEWAY_EXPECTED_DASHBOARD_ENV="$dashboard_env_native" COZYGATEWAY_EXPECTED_NODE="$node_native" COZYGATEWAY_EXPECTED_SUPERVISOR="$(to_windows_path "$SUPERVISOR")" COZYGATEWAY_EXPECTED_BUNDLE="$bundle_native" COZYGATEWAY_EXPECTED_WORKER="$worker_native" COZYGATEWAY_EXPECTED_DATABASE="$database_native" COZYGATEWAY_EXPECTED_HERMES_ROOT="$hermes_root_native" COZYGATEWAY_EXPECTED_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_OWNER_HELPER="$owner_helper_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$WINDOWS_OWNED_DASHBOARD_PORT" COZYGATEWAY_EXPECTED_DASHBOARD_PORT_STATE="$dashboard_state_native" powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
     function Same-Path([string] $Candidate, [string] $Expected) {
       if ([string]::IsNullOrWhiteSpace($Candidate) -or [string]::IsNullOrWhiteSpace($Expected)) { return $false }
@@ -2027,6 +2085,19 @@ stop_owned_windows_gateway() {
           $expected += @("--dashboard-port-state", $env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT_STATE)
         }
         $expected += "--windows-dashboard-profile"
+      }
+      if ($env:COZYGATEWAY_EXPECTED_LEGACY_INLINE -eq "1") {
+        $expected = @($env:COZYGATEWAY_EXPECTED_NODE, "-", $env:COZYGATEWAY_EXPECTED_GATEWAY_ENV,
+          $env:COZYGATEWAY_EXPECTED_DASHBOARD_ENV, $env:COZYGATEWAY_EXPECTED_HERMES_ROOT,
+          $env:COZYGATEWAY_EXPECTED_HERMES, $env:COZYGATEWAY_EXPECTED_LAUNCHER,
+          $env:COZYGATEWAY_EXPECTED_OWNER_HELPER, $env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT,
+          $env:COZYGATEWAY_EXPECTED_BUNDLE, $env:COZYGATEWAY_EXPECTED_CONFIG)
+        if ($tokens.Count -ne $expected.Count) { return $false }
+        for ($index = 0; $index -lt $expected.Count; $index += 1) {
+          if ($index -eq 1 -or $index -eq 8) { if ($tokens[$index] -cne $expected[$index]) { return $false } }
+          elseif (-not (Same-Path $tokens[$index] $expected[$index])) { return $false }
+        }
+        return $true
       }
       if ($tokens.Count -ne $expected.Count) { return $false }
       $pathIndexes = @(0, 1, 5, 7, 9, 13, 15, 17, 19, 21, 23, 25, 29)
@@ -2124,7 +2195,7 @@ windows_task_uses_current_supervisor() {
       [ "$actual_command" = "$recorded_command" ] && [ "$actual_arguments" = "$recorded_arguments" ] && return 0
   fi
   vbs_native="$(to_windows_path "$WINDOWS_VBS")"
-  [ "$actual_command" = wscript.exe ] &&
+  { [ "$actual_command" = wscript.exe ] || [ "$actual_command" = "${SYSTEMROOT:-C:\Windows}\System32\wscript.exe" ]; } &&
     { [ "$actual_arguments" = "&quot;$vbs_native&quot;" ] || [ "$actual_arguments" = "\"$vbs_native\"" ]; } &&
     windows_startup_entry_is_owned "$WINDOWS_VBS"
 }
@@ -2151,6 +2222,11 @@ windows_task_is_directly_owned_by_gateway_home() {
   windows_task_has_single_exec_action "$xml" || return 1
   command="$(sed -n 's:.*<Command>\([^<]*\)</Command>.*:\1:p' <<<"$xml")"
   arguments="$(sed -n 's:.*<Arguments>\([^<]*\)</Arguments>.*:\1:p' <<<"$xml")"
+  if [ "$command" = wscript.exe ] || [ "$command" = "${SYSTEMROOT:-C:\Windows}\System32\wscript.exe" ]; then
+    local vbs_native="$(to_windows_path "$WINDOWS_VBS")"
+    { [ "$arguments" = "&quot;$vbs_native&quot;" ] || [ "$arguments" = "\"$vbs_native\"" ]; } && windows_startup_entry_is_owned "$WINDOWS_VBS"
+    return
+  fi
   node_native="$(to_windows_path "$GATEWAY_DIR/runtime/node/node.exe")"
   supervisor_native="$(to_windows_path "$SUPERVISOR")"
   [ "$command" = "$node_native" ] || return 1
@@ -2217,20 +2293,20 @@ xml_unescape() {
   printf '%s' "$1" | sed 's/&lt;/</g; s/&gt;/>/g; s/&amp;/\&/g'
 }
 write_windows_task_xml() {
-  local node_native supervisor_native arguments='' value escaped user_sid task_start staged="$WINDOWS_TASK_XML.tmp.$$" utf8="$WINDOWS_TASK_XML.tmp.$$.utf8"
-  build_supervisor_args
+  local launcher_native arguments escaped user_sid task_start staged="$WINDOWS_TASK_XML.tmp.$$" utf8="$WINDOWS_TASK_XML.tmp.$$.utf8"
   user_sid="$(powershell.exe -NoProfile -NonInteractive -Command '[Security.Principal.WindowsIdentity]::GetCurrent().User.Value')"
   user_sid="$(tr -d '\r\n' <<<"$user_sid")"
   [[ "$user_sid" =~ ^S-[0-9]+(-[0-9]+)+$ ]] || die "could not resolve the current Windows user SID for Scheduled Task ownership"
   task_start="$(powershell.exe -NoProfile -NonInteractive -Command '(Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")')"
   task_start="$(tr -d '\r\n' <<<"$task_start")"
   [[ "$task_start" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] || die "could not resolve the current time for the Scheduled Task heartbeat"
-  node_native="$(to_windows_path "$NODE_RESOLVED")"; supervisor_native="$(to_windows_path "$SUPERVISOR")"
-  for value in "$supervisor_native" "${SUPERVISOR_ARGS[@]}"; do
-    case "$value" in *'"'*|*$'\r'*|*$'\n'*) die "refusing an unsafe Scheduled Task argument" ;; esac
-    arguments="${arguments}${arguments:+ }&quot;${value//&/&amp;}&quot;"
-  done
-  escaped="${node_native//&/&amp;}"
+  # A console-subsystem Node action can create a terminal even with hidden child spawns.
+  # WScript keeps the task alive while the existing launcher waits for its hidden supervisor.
+  launcher_native="$(to_windows_path "$WINDOWS_VBS")"
+  case "$launcher_native" in *'"'*|*$'\r'*|*$'\n'*) die "refusing an unsafe Scheduled Task argument" ;; esac
+  arguments="&quot;${launcher_native//&/&amp;}&quot;"
+  escaped="${SYSTEMROOT:-C:\Windows}\System32\wscript.exe"
+  escaped="${escaped//&/&amp;}"
   umask 077
   cat > "$utf8" <<TASK_XML
 <?xml version="1.0" encoding="UTF-16"?>
@@ -2295,15 +2371,16 @@ attach_health() {
   curl -fsS --max-time 3 "$(gateway_origin)/health" 2>/dev/null
 }
 attach_ready() {
-  attach_health |
-    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{try{const h=JSON.parse(b).attach,c=h?.configured,o=h?.online,d=h?.deadLetters;process.exit([c,o,d].every(Number.isInteger)&&c>0&&o>=0&&d>=0&&o===c&&d===0?0:1)}catch{process.exit(1)}})'
+  [ "$(attach_health_diagnosis)" = __cozygateway_attach_healthy__ ]
 }
 attach_health_diagnosis() {
+  local expected=0
+  if declare -p SELECTED >/dev/null 2>&1; then expected="${#SELECTED[@]}"; fi
   attach_health |
-    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{const unreadable=()=>process.stdout.write("Hermes attach health could not be read");try{const h=JSON.parse(b).attach,c=h?.configured,o=h?.online,d=h?.deadLetters;if(![c,o,d].every(Number.isInteger)||c<0||o<0||d<0)return unreadable();const counts=`configured=${c}, online=${o}, deadLetters=${d}`;if(c===0)return process.stdout.write(`Hermes attach has no configured profiles (${counts})`);if(o!==c)return process.stdout.write(`Hermes attach profile count mismatch (${counts})`);if(d!==0)return process.stdout.write(`Hermes attach retained dead letters (${counts})`);return process.stdout.write("__cozygateway_attach_healthy__")}catch{return unreadable()}})'
+    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{const unreadable=()=>process.stdout.write("Hermes attach health could not be read");try{const h=JSON.parse(b).attach,scoped=h&&Object.hasOwn(h,"hermes"),s=scoped?h.hermes:h,c=s?.configured,o=s?.online,d=h?.deadLetters,expected=Number(process.argv[1]);if(![c,o,d].every(Number.isInteger)||c<0||o<0||d<0)return unreadable();const counts=`configured=${c}, online=${o}, deadLetters=${d}`;if(c===0)return process.stdout.write(`Hermes attach has no configured profiles (${counts})`);if(o!==c||(scoped&&expected>0&&c!==expected))return process.stdout.write(`Hermes attach profile count mismatch (${counts})`);if(d!==0)return process.stdout.write(`Hermes attach retained dead letters (${counts})`);return process.stdout.write("__cozygateway_attach_healthy__")}catch{return unreadable()}})' "$expected"
 }
 wait_attach_ready() {
-  [ "$DRY_RUN" = 1 ] && { say "DRY   require attach.configured > 0, attach.online == attach.configured, and zero dead letters"; return; }
+  [ "$DRY_RUN" = 1 ] && { say "DRY   require every selected Hermes profile online and zero dead letters (legacy health: attach.configured > 0, attach.online == attach.configured)"; return; }
   local attempt diagnosis
   for attempt in $(seq 1 30); do attach_ready && return; sleep 1; done
   diagnosis="$(attach_health_diagnosis || true)"
@@ -2792,6 +2869,7 @@ status_install() {
   [ ! -f "$STATE_FILE" ] || harness="$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)"
   if [ -z "$harness" ] && [ -f "$STATE_FILE" ] && grep -q '^hermes_root=' "$STATE_FILE"; then harness=hermes; fi
   case "$harness" in
+    both) say "OK    harnesses: Hermes Agent and CozyAgents"; status_runner || true ;;
     cozyagents) say "OK    harness: CozyAgents (bots run here under the CozyAgents runner)"; status_runner || true ;;
     hermes) say "OK    harness: Hermes Agent" ;;
   esac

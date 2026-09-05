@@ -105,6 +105,13 @@ export type BridgeLiveness = Static<typeof BridgeLivenessSchema>;
 /** Aggregate attach-v1 transport health. It intentionally contains no profile, connection, or
  * transcript identifiers: operators need fleet state and durable backlog, not chat metadata. */
 export const AttachHealthSummarySchema = Type.Object({
+  // Hermes-only liveness excludes separately registered runtime bots. No identities are exposed.
+  hermes: Type.Optional(Type.Object({
+    configured: Type.Integer({ minimum: 0 }),
+    online: Type.Integer({ minimum: 0 }),
+    degraded: Type.Integer({ minimum: 0 }),
+    absent: Type.Integer({ minimum: 0 }),
+  })),
   configured: Type.Integer({ minimum: 0 }),
   online: Type.Integer({ minimum: 0 }),
   degraded: Type.Integer({ minimum: 0 }),

@@ -16,6 +16,15 @@ ownership of those services; uninstall reverses only lifecycle work it caused.
 It also makes `cozygateway` available in new terminal sessions without a global
 package installation.
 
+The Windows bootstrap offers CozyAgents, Hermes Agent, or Both on interactive
+installs and reruns. Selecting a second agent adds it to the same gateway and
+keeps the existing agent. Both installs the Hermes attach profiles and a paired
+CozyAgents runner; it asks about the listener once and prints one device pairing
+QR after both are ready. Unattended repair keeps the recorded agent selection,
+CozyAgents home, model settings, runner credential, and Hermes profiles.
+Uninstall removes the gateway's managed attachments and invokes CozyAgents' own
+uninstaller when that runner was installed.
+
 On Windows, macOS, and Linux, missing Node.js 24+ is installed as a private,
 checksum-verified runtime under the CozyGateway home. Missing Hermes is
 installed with the verified official tagged NousResearch installer. Setup then

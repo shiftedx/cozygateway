@@ -15,6 +15,10 @@ tmp="$(cd -P "$tmp" && pwd)"
 trap 'rm -rf "$tmp"' EXIT
 trap 'status=$?; [ "$status" -eq 0 ] || printf "FAIL  line %s exited %s: %s\n" "$LINENO" "$status" "$BASH_COMMAND" >&2' ERR
 
+fixture_sha256() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  else sha256sum "$1" | awk '{print $1}'; fi
+}
 expect_contains() {
   local haystack="$1" needle="$2"
   if ! grep -Fq -e "$needle" <<<"$haystack"; then
@@ -31,6 +35,12 @@ expect_missing() {
 }
 
 mkdir -p "$tmp/bin" "$tmp/hermes-bin"
+# Windows dry runs must see fixture registrations only.
+cat > "$tmp/bin/schtasks.exe" <<'ABSENT_TASK'
+#!/usr/bin/env bash
+exit 1
+ABSENT_TASK
+chmod 700 "$tmp/bin/schtasks.exe"
 
 # The gateway bundle: `pair` is the only command the installer runs through it.
 cat > "$tmp/gateway.mjs" <<'BUNDLE'
@@ -111,7 +121,7 @@ cozy_env=(
   COZYGATEWAY_SUPERVISOR_SOURCE="$repo_root/scripts/gateway-supervisor.cjs"
   COZYGATEWAY_SERVICE_PLATFORM=Darwin
   COZYAGENTS_INSTALL_URL="$tmp/agents.sh"
-  COZYAGENTS_INSTALL_SHA256="$(shasum -a 256 "$tmp/agents.sh" | awk '{print $1}')"
+  COZYAGENTS_INSTALL_SHA256="$(fixture_sha256 "$tmp/agents.sh")"
 )
 
 # ---------------------------------------------------------------------------
@@ -211,7 +221,10 @@ grep -Fq 'COZYRUNNER_MODEL_PROVIDER=openai-codex' "$runner_env"
 grep -Fq 'COZYRUNNER_SHARE_HOST_MODEL_AUTH=1' "$runner_env"
 if grep -q 'COZYRUNNER_MODEL_ENDPOINT' "$runner_env"; then echo 'a provider answer must not also write an endpoint' >&2; exit 1; fi
 if grep -qi 'api_key' "$runner_env"; then echo 'the installer must never write a model key' >&2; exit 1; fi
-test "$(stat -c %a "$runner_env" 2>/dev/null || stat -f %Lp "$runner_env")" = 600
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) printf 'SKIP POSIX mode bits on NTFS (native Windows fixtures check ACLs)\n' ;;
+  *) test "$(stat -c %a "$runner_env" 2>/dev/null || stat -f %Lp "$runner_env")" = 600 ;;
+esac
 
 # The person typed no pairing code: the installer minted a runner code and handed it over in the
 # environment. A credential in waiting never reaches argv, where any process on this machine
@@ -408,7 +421,7 @@ windows_env=(
   COZYGATEWAY_TEST_REAL_NODE="$real_node"
   COZYGATEWAY_SERVICE_PLATFORM=Windows
   COZYAGENTS_INSTALL_URL="$tmp/agents.sh"
-  COZYAGENTS_INSTALL_SHA256="$(shasum -a 256 "$tmp/agents.sh" | awk '{print $1}')"
+  COZYAGENTS_INSTALL_SHA256="$(fixture_sha256 "$tmp/agents.sh")"
   APPDATA="$tmp/win-appdata"
 )
 

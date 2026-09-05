@@ -47,6 +47,13 @@ describe("attach-v1 federated health", () => {
     });
   }
 
+  it("counts only the selected Hermes identities without hiding an offline Hermes behind an online runtime bot", async () => {
+    await dial({ eventOutboxDepth: 0, oldestEventAgeMs: 0, eventAckCursor: 7, commandInboxDepth: 0 });
+    expect(ingress.connectionHealth(new Set(["sage"]))).toEqual({ configured: 1, online: 1, degraded: 0, absent: 0 });
+    expect(ingress.connectionHealth(new Set(["offline-hermes"]))).toEqual({ configured: 1, online: 0, degraded: 0, absent: 1 });
+    expect(ingress.connectionHealth(new Set(["sage", "offline-hermes"]))).toEqual({ configured: 2, online: 1, degraded: 0, absent: 1 });
+  });
+
   async function dial(telemetry: Record<string, unknown>): Promise<{ ws: WebSocket; frames: Array<Record<string, unknown>> }> {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, {
       headers: { authorization: "Bearer attach-bearer" },
@@ -86,6 +93,7 @@ describe("attach-v1 federated health", () => {
     peer.ws.send(JSON.stringify({ kind: "heartbeat", sentAt: clock, telemetry: { ...stalled, oldestEventAgeMs: 75_001 } }));
     await until(() => ingress.health().degraded === 1);
     expect(ingress.health()).toMatchObject({ queueDepth: 0, pluginOutboxDepth: 3, degraded: 1 });
+    expect(ingress.connectionHealth(new Set(["sage"]))).toEqual({ configured: 1, online: 0, degraded: 1, absent: 0 });
 
     clock = 31_002;
     peer.ws.send(JSON.stringify({

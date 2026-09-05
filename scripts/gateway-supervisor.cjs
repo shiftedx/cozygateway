@@ -136,7 +136,7 @@ async function startDashboardIfNeeded(options) {
   const start = async (port) => {
     const profile = options.windowsDashboardProfile ? ['-p', 'default'] : [];
     const child = spawn(options.hermes, ['dashboard', ...profile, '--host', '127.0.0.1', '--port', String(port), '--no-open', '--skip-build'], {
-      detached: true, stdio: 'ignore', env: environment,
+      detached: true, windowsHide: true, stdio: 'ignore', env: environment,
     });
     await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
     return child;
@@ -191,7 +191,7 @@ async function startDashboardIfNeeded(options) {
 
 function gatewayChild(options, gatewayEnv) {
   return spawn(process.execPath, [options.bundle, 'serve', '--config', options.config], {
-    stdio: 'inherit', env: { ...process.env, ...gatewayEnv },
+    stdio: 'inherit', windowsHide: true, env: { ...process.env, ...gatewayEnv },
   });
 }
 

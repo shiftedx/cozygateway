@@ -152,6 +152,16 @@ function Assert-RecoveryRefusesBeforeAssetMutation {
 
 try {
     Reset-Fixture
+    $privateNode = [IO.Path]::GetFullPath((Join-Path $root 'runtime\node\node.exe'))
+    $systemNode = 'C:\Program Files\nodejs\node.exe'
+    $systemTask = (New-OwnedTaskXml $root (Join-Path $root 'local\maintenance-worker.cjs')).Replace($privateNode, $systemNode)
+    Write-TestFile (Join-Path $root 'local\install-state') "node_resolved=/c/Program Files/nodejs/node.exe`n"
+    Assert-True (Test-OwnedGatewayTask $root $systemTask) 'the recorded external Node runtime must remain owned during repair'
+    $foreignTask = $systemTask.Replace($systemNode, 'C:\Other\node.exe')
+    Assert-True (-not (Test-OwnedGatewayTask $root $foreignTask)) 'an external Node runtime different from the record must remain foreign'
+    Write-TestFile (Join-Path $root 'local\install-state') "node_resolved=$systemNode`nnode_resolved=$systemNode`n"
+    Assert-True (-not (Test-OwnedGatewayTask $root $systemTask)) 'duplicate Node records must not grant task ownership'
+    Reset-Fixture
     $bundle = [IO.Path]::GetFullPath((Join-Path $root 'bin\cozygateway.mjs'))
     $taskXml = New-OwnedTaskXml $root (Join-Path $root 'local\maintenance-worker.cjs')
     Assert-True (Test-OwnedGatewayTask $root $taskXml) 'a strict direct Gateway task must be accepted for recovery'
@@ -258,6 +268,39 @@ try {
     Assert-Absent $script:StartupPath 'fresh recovery must remove its new owned Startup entry'
     Finish-BootstrapRecovery $root
 
+    # A newly installed hidden task must be removed before its launcher is rolled back.
+    Reset-Fixture
+    Write-Assets 'old'
+    Start-BootstrapTransaction $root (Join-Path $root 'bin') $assets
+    Write-Assets 'fresh'
+    Write-TestFile $legacyLauncher (New-OwnedStartupEntry $root 'C:\New\bash.exe')
+    $script:FakeTaskXml = $legacyTask
+    Recover-BootstrapTransaction $root (Join-Path $root 'bin') $assets | Out-Null
+    Assert-True ($null -eq $script:FakeTaskXml) 'recovery must remove a hidden task before removing its launcher'
+    Assert-Absent $legacyLauncher 'recovery must restore the absent prior launcher'
+    Finish-BootstrapRecovery $root
+
+    # A snapshotted launcher supplies validation bytes, not the task argument path.
+    Reset-Fixture
+    Write-Assets 'old'
+    Write-TestFile $legacyLauncher (New-OwnedStartupEntry $root 'C:\Old\bash.exe')
+    $script:FakeTaskXml = $legacyTask
+    Start-BootstrapTransaction $root (Join-Path $root 'bin') $assets
+    Write-TestFile $legacyLauncher (New-OwnedStartupEntry $root 'C:\New\bash.exe')
+    Recover-BootstrapTransaction $root (Join-Path $root 'bin') $assets | Out-Null
+    Assert-True ($script:FakeTaskXml -eq $legacyTask) 'recovery must restore a prior hidden task from its snapshot'
+    Finish-BootstrapRecovery $root
+    # Snapshot ownership follows its recorded Node, even if the update changed runtimes.
+    Reset-Fixture
+    Write-Assets 'old'
+    Write-TestFile (Join-Path $root 'local\install-state') "node_resolved=$systemNode`n"
+    $script:FakeTaskXml = $systemTask
+    Start-BootstrapTransaction $root (Join-Path $root 'bin') $assets
+    Write-TestFile (Join-Path $root 'local\install-state') "node_resolved=$privateNode`n"
+    $script:FakeTaskXml = New-OwnedTaskXml $root (Join-Path $root 'local\maintenance-worker.cjs')
+    Recover-BootstrapTransaction $root (Join-Path $root 'bin') $assets | Out-Null
+    Assert-True ($script:FakeTaskXml -eq $systemTask) 'recovery must validate previous runtime against snapshot identity'
+    Finish-BootstrapRecovery $root
     # These corruptions must all refuse before the first asset mutation.
     Assert-RecoveryRefusesBeforeAssetMutation 'malformed' {
         Set-Content -LiteralPath (Join-Path $backup 'inventory') -Value @('version=2', 'present:../outside') -Encoding ascii

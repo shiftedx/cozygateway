@@ -34,11 +34,13 @@ const servers: FakeHermesServer[] = [];
 const bridges: HermesBridge[] = [];
 const storages: Storage[] = [];
 
-afterEach(async () => {
+async function closeFixtures(): Promise<void> {
   for (const bridge of bridges.splice(0)) await bridge.close();
   for (const server of servers.splice(0)) await server.close();
   for (const storage of storages.splice(0)) storage.close();
-});
+}
+
+afterEach(closeFixtures);
 
 async function until(predicate: () => boolean, timeoutMs = 4_000): Promise<void> {
   const start = Date.now();
@@ -258,6 +260,8 @@ describe("profile lifecycle hands the change to the provisioner", () => {
       expect(resumedSeen).toEqual([{ profile: "night-owl", change: "created" }]);
       expect(resumedStorage.pendingHermesProfileSeeds()).toEqual([]);
     } finally {
+      // Stop retries and close the resumed SQLite handle before Windows removes its directory.
+      await closeFixtures();
       rmSync(dir, { recursive: true, force: true });
     }
   });

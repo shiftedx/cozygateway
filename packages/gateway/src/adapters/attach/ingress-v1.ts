@@ -484,21 +484,28 @@ export class AttachV1Ingress implements TurnEndpoint {
     const current = this.#current.get(agentId);
     return current?.hello === true && current.socket.readyState === WebSocket.OPEN && !current.degraded;
   }
-  health(): AttachHealthSummary {
+  /** Bounded liveness counts for one harness; never exposes its identities. */
+  connectionHealth(agentIds: ReadonlySet<string> = new Set(this.#tokens.values())) {
     let online = 0;
     let degraded = 0;
     const now = this.#now();
-    for (const connection of this.#current.values()) {
+    for (const [agentId, connection] of this.#current) {
+      if (!agentIds.has(agentId)) continue;
       if (!connection.hello || connection.socket.readyState !== WebSocket.OPEN) continue;
       if (connection.degraded || this.#pluginBacklogStalled(connection, now)) degraded += 1;
       else online += 1;
     }
-    const durable = this.#storage.attachHealth();
     return {
-      configured: this.#tokens.size,
+      configured: agentIds.size,
       online,
       degraded,
-      absent: Math.max(0, this.#tokens.size - online - degraded),
+      absent: Math.max(0, agentIds.size - online - degraded),
+    };
+  }
+  health(): AttachHealthSummary {
+    const durable = this.#storage.attachHealth();
+    return {
+      ...this.connectionHealth(),
       lastHeartbeatAt: this.#lastHeartbeatAt,
       ...durable,
     };
