@@ -4,7 +4,7 @@
 
 CozyGateway is a Node.js gateway that runs beside your agent. It implements the published [wire contract](contract/v1.md) for chat clients and connects agent harnesses through the [attach-v1](contract/attach-v1.md) WebSocket data plane. Pair a device with a short-lived code, then talk directly to your gateway—without creating an account for the gateway itself.
 
-[Quick start](#quickstart) · [Documentation](#documentation) · [Releases](https://github.com/shiftedx/cozygateway/releases) · [Contributing](CONTRIBUTING.md)
+[Quick start](#quickstart) · [Documentation](#documentation) · [Releases](https://github.com/shiftedx/cozygateway/releases) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 
 [CozyChat](https://github.com/shiftedx/cozychat) is the Apple client. [CozyAgents](https://github.com/shiftedx/cozyagents) runs agents on your computers. CozyGateway owns pairing, conversation state, and routing between them.
 
