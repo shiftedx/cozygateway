@@ -4,8 +4,8 @@ The CozyGateway one-liner for Windows:
   irm https://cozylabs.ai/install.ps1 | iex
 
 It installs one CozyGateway for the person running it, under their own profile and with no
-administrator rights, and it asks which harness runs their bots. A machine that already has
-Hermes Agent keeps it. A machine with none is offered CozyAgents first, and that path installs
+administrator rights, and it offers Hermes Agent, CozyAgents, or both. Adding either harness
+preserves the other one on the same gateway. A machine with none is offered CozyAgents first, which installs
 the harness through its own native one-liner, pairs this computer as a runner with a code minted
 here, and never asks anybody to read a code off a screen.
 
@@ -14,9 +14,9 @@ never offers to change it.
 #>
 param(
     [switch] $Repair,
-    # cozyagents or hermes. Skips the harness question, and is the one answer allowed to take a
-    # Hermes bridge out of a config that already has one.
-    [ValidateSet('cozyagents', 'hermes')]
+    # Skips the harness question. Adding a harness preserves the other installed harness.
+    # Invoke-Expression adds this attribute before binding defaults; its empty initial value is valid.
+    [ValidateSet('', 'cozyagents', 'hermes', 'both')]
     [string] $Harness,
     # The CozyAgents Windows installer, as a path or a URL. Defaults to the published one-liner.
     [string] $CozyAgentsInstaller,
@@ -36,9 +36,6 @@ $PSNativeCommandUseErrorActionPreference = $false
 
 $script:CozyAgentsInstallUrlDefault = 'https://cozylabs.ai/agents.ps1'
 $script:CozyAgentsInstallSha256Default = '75cde8d569226a6ee2b5f198392fed9a7adb3ac0aab47c2ed3f5b2c165bb0abc'
-# Stays false unless a person or a recorded install actually said CozyAgents, because that is the
-# only answer allowed to replace a Hermes bridge in a config that already carries one.
-$script:HarnessChosen = $false
 $script:PromptAnswers = @{}
 $script:PromptIndex = @{}
 
@@ -1018,13 +1015,11 @@ function Invoke-CozyGatewayInstaller {
         [string] $HarnessName = 'hermes',
         [string[]] $HarnessArguments = @()
     )
-    $arguments = @($InstallerPath, '--service-platform', 'Windows', '--gateway-dir', $script:InstallHome, '--bundle', $script:BundlePath)
-    if ($HarnessName -eq 'cozyagents') {
-        $arguments += @('--harness', 'cozyagents')
-        if ($HarnessArguments) { $arguments += $HarnessArguments }
-    } else {
+    $arguments = @($InstallerPath, '--service-platform', 'Windows', '--gateway-dir', $script:InstallHome, '--bundle', $script:BundlePath, '--harness', $HarnessName)
+    if ($HarnessName -eq 'hermes') {
         $arguments += @('--plugin-archive', $script:PluginPath)
     }
+    if ($HarnessArguments) { $arguments += $HarnessArguments }
     if ($env:COZYGATEWAY_INSTALL_DRYRUN -eq '1') { $arguments += '--dry-run' }
     if ($ForwardedArguments) { $arguments += $ForwardedArguments }
     $previousHermes = [Environment]::GetEnvironmentVariable('COZYGATEWAY_HERMES_BIN', 'Process')
@@ -1071,7 +1066,11 @@ function Protect-CozyGatewayHome {
         )
         [void]$acl.AddAccessRule($rule)
     }
-    (Get-Item -LiteralPath $Path).SetAccessControl($acl)
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        [IO.FileSystemAclExtensions]::SetAccessControl((Get-Item -LiteralPath $Path), $acl)
+    } else {
+        (Get-Item -LiteralPath $Path).SetAccessControl($acl)
+    }
 }
 
 function Set-CozyGatewayCommandPath {
@@ -1162,52 +1161,35 @@ function Test-HermesBridge {
     return ((Get-Content -LiteralPath $ConfigPath -Raw) -match '"hermesEndpoints"')
 }
 
-# The harness is the thing that actually runs a bot. A machine that already has Hermes keeps it,
-# with no question asked; a machine with none is offered CozyAgents first and takes it on Enter,
-# on -Harness, and whenever there is no terminal to ask on.
+# Each selection adds to the harnesses already registered with this gateway.
 function Select-Harness {
     param([string] $Requested, [string] $StatePath, [string] $ConfigPath)
-    $harness = ''
-    if ($Requested) {
-        if ($Requested -eq 'cozyagents') { $script:HarnessChosen = $true }
-        Write-Ok "harness: $Requested (from -Harness)"
-        $harness = $Requested
-    } else {
-        # A machine that answered this question once is never asked again: the recorded harness is
-        # the one this install owns, and changing it is an uninstall away.
-        $recorded = Get-RecordedHarness $StatePath
-        if ($recorded -eq 'cozyagents') {
-            $script:HarnessChosen = $true
-            Write-Ok 'harness: cozyagents (already installed here)'
-            $harness = 'cozyagents'
-        } elseif ($recorded -eq 'hermes') {
-            Write-Ok 'harness: hermes (already installed here)'
-            $harness = 'hermes'
-        } elseif (Find-Hermes) {
-            Write-Ok 'Hermes Agent is already installed; keeping it as the harness that runs your bots'
-            $harness = 'hermes'
-        } else {
-            $harness = 'cozyagents'
+    $recorded = Get-RecordedHarness $StatePath
+    if ($recorded -notin @('', 'hermes', 'cozyagents', 'both')) { Fail 'installer state has an invalid harness' }
+    $hasHermes = $recorded -in @('hermes', 'both') -or (Test-HermesBridge $ConfigPath)
+    $hasAgents = $recorded -in @('cozyagents', 'both')
+    $default = if ($hasHermes -and $hasAgents) { 'both' } elseif ($hasAgents) { 'cozyagents' } elseif ($hasHermes -or (Find-Hermes)) { 'hermes' } else { 'cozyagents' }
+    $harness = $Requested
+    $source = 'from -Harness'
+    if (-not $harness) {
+        $harness = $default
+        $source = 'already installed here'
+        if (Test-PromptAvailable 'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT') {
+            $fallback = switch ($default) { 'hermes' { '2' }; 'both' { '3' }; default { '1' } }
             while ($true) {
-                $answer = Get-PromptAnswer 'Which harness runs your bots? [1] CozyAgents (recommended) [2] Hermes Agent [1]' 'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT' '1'
+                $answer = Get-PromptAnswer "Which harness runs your bots? [1] CozyAgents (recommended) [2] Hermes Agent [3] Both [$fallback]" 'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT' $fallback
                 if ($null -eq $answer) { break }
                 $normalized = $answer.ToLowerInvariant()
-                if ($normalized -eq '1' -or $normalized -eq 'c' -or $normalized -eq 'cozyagents') { $script:HarnessChosen = $true; $harness = 'cozyagents'; break }
-                if ($normalized -eq '2' -or $normalized -eq 'h' -or $normalized -eq 'hermes') { $harness = 'hermes'; break }
-                Write-Host 'Please answer 1 or 2.'
+                if ($normalized -in @('1', 'c', 'cozyagents')) { $harness = 'cozyagents'; break }
+                if ($normalized -in @('2', 'h', 'hermes')) { $harness = 'hermes'; break }
+                if ($normalized -in @('3', 'b', 'both')) { $harness = 'both'; break }
+                Write-Host 'Please answer 1, 2 or 3.'
             }
-            if ($script:HarnessChosen -or $harness -eq 'hermes') { Write-Ok "harness: $harness" }
+            $source = 'selected'
         }
     }
-    # A Hermes bridge in a config that nobody asked to replace freezes the run: it stays a Hermes
-    # install end to end, and the Hermes install records harness=hermes, so the next run cannot
-    # read that kept bridge back as the explicit choice nobody made.
-    if ($harness -eq 'cozyagents' -and -not $script:HarnessChosen -and (Test-HermesBridge $ConfigPath)) {
-        Write-Host 'WARN  this config already has a Hermes endpoint and no one chose CozyAgents here; keeping it. Rerun with -Harness cozyagents to replace it.'
-        Write-Info 'continuing as a Hermes install; nothing CozyAgents-owned is installed, paired, or configured here.'
-        Write-Info 'irm | iex takes no parameters; to pass one, run: & ([scriptblock]::Create((irm https://cozylabs.ai/install.ps1))) -Harness cozyagents'
-        $harness = 'hermes'
-    }
+    if (($hasHermes -and $harness -eq 'cozyagents') -or ($hasAgents -and $harness -eq 'hermes') -or $recorded -eq 'both') { $harness = 'both' }
+    Write-Ok "harness: $harness ($source)"
     return $harness
 }
 
@@ -1331,7 +1313,11 @@ function Protect-FileToOwner {
         )
         [void]$acl.AddAccessRule($rule)
     }
-    (Get-Item -LiteralPath $Path).SetAccessControl($acl)
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        [IO.FileSystemAclExtensions]::SetAccessControl((Get-Item -LiteralPath $Path), $acl)
+    } else {
+        (Get-Item -LiteralPath $Path).SetAccessControl($acl)
+    }
 }
 
 function Get-RunnerEnvValue {
@@ -1372,8 +1358,30 @@ function Write-RunnerModelEnv {
 
 function Resolve-CozyAgentsHome {
     $candidate = $env:COZYAGENTS_HOME
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+        $record = Join-Path $script:InstallHome 'local\install-state'
+        if (Test-Path -LiteralPath $record -PathType Leaf) {
+            $line = Get-Content -LiteralPath $record | Where-Object { $_ -like 'cozyagents_home=*' } | Select-Object -Last 1
+            if ($line) {
+                $candidate = $line.Substring(16)
+                if ($candidate -match '^/([A-Za-z])/(.*)$') { $candidate = $matches[1] + ':\' + $matches[2].Replace('/', '\') }
+                elseif ($candidate -notmatch '^//[^/]+/[^/]+') { Fail 'installer state has an unsafe CozyAgents home' }
+            }
+        }
+    }
     if ([string]::IsNullOrWhiteSpace($candidate)) { $candidate = Join-Path $env:USERPROFILE '.cozyagents' }
     return ([IO.Path]::GetFullPath($candidate)).TrimEnd('\')
+}
+
+function Save-CozyAgentsState {
+    param([string] $StatePath, [string] $HarnessName, [string] $AgentsHome)
+    if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) { Fail 'the gateway did not write installation metadata' }
+    $homePosix = $AgentsHome.Replace('\', '/')
+    if ($homePosix -match '^([A-Za-z]):/(.*)$') { $homePosix = '/' + $matches[1].ToLowerInvariant() + '/' + $matches[2] }
+    if ($homePosix -match '[\r\n]') { Fail 'CozyAgents home must not contain a newline' }
+    $lines = @(Get-Content -LiteralPath $StatePath | Where-Object { $_ -notmatch '^(harness|cozyagents_home)=' })
+    $lines += @("harness=$HarnessName", "cozyagents_home=$homePosix")
+    [IO.File]::WriteAllText($StatePath, (($lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
 }
 
 function Get-CozyAgentsInstallerSource {
@@ -1585,6 +1593,7 @@ function Install-WithCozyAgents {
             Install-CozyAgentsHarness $agentsHome $InstallerSource $script:CozyAgentsInstallerSha256
             Write-RunnerModelEnv (Join-Path $agentsHome 'runner.env') $model
             Join-RunnerToGateway $agentsHome $CliPath $ConfigPath
+            Save-CozyAgentsState (Join-Path $script:InstallHome 'local\install-state') 'cozyagents' $agentsHome
             Complete-Pairing $CliPath $AlreadyConfigured $NoQr
         } {
             Restart-OwnedGatewayService $script:InstallHome
@@ -1666,8 +1675,9 @@ if ($Repair) {
     if ($repairMode -eq 'runtime-only' -and $InstallerArguments -notcontains '--runtime-only') {
         $InstallerArguments = @('--runtime-only') + @($InstallerArguments)
     }
-    if ((Get-RecordedHarness $statePath) -eq 'cozyagents') {
-        $Harness = 'cozyagents'
+    $repairHarness = Get-RecordedHarness $statePath
+    if ($repairHarness) { $Harness = $repairHarness }
+    if ($Harness -eq 'cozyagents') {
         Write-Info 'repair refreshes verified runtime assets, then restarts CozyGateway'
     } elseif ($repairMode -eq 'runtime-only') {
         Write-Info 'repair refreshes verified runtime assets, then restarts CozyGateway'
@@ -1678,8 +1688,8 @@ if ($Repair) {
 }
 
 if ($isUninstall) {
-    $recorded = if ($Harness) { $Harness } else { Get-RecordedHarness $statePath }
-    if ($recorded -eq 'cozyagents') {
+    $recorded = Get-RecordedHarness $statePath
+    if ($recorded -in @('cozyagents', 'both') -or $Harness -in @('cozyagents', 'both')) {
         Uninstall-WithCozyAgents $bin $installerPath $InstallerArguments ([bool]$isDryRun)
         return
     }
@@ -1695,17 +1705,17 @@ if ($isUninstall) {
 
 # Step 1 of the approved order: the harness, before anything is installed.
 $harness = Select-Harness $Harness $statePath $configPath
-if ($harness -eq 'cozyagents') { Deny-Elevation }
+if ($harness -in @('cozyagents', 'both')) { Deny-Elevation }
 
 if ($isDryRun) {
-    if ($harness -eq 'cozyagents') {
+    if ($harness -in @('cozyagents', 'both')) {
         $agentsHome = Resolve-CozyAgentsHome
         Write-Info "dry run: would ask for the model provider or a local endpoint, and the model id, then write COZYRUNNER_MODEL_* into $(Join-Path $agentsHome 'runner.env')"
         Write-Info 'dry run: would ask whether CozyChat may reach this Gateway over your local network'
-        Write-Info 'dry run: would resolve and checksum-verify the CozyGateway release assets, and no Hermes attach plugin'
+        if ($harness -eq 'cozyagents') { Write-Info 'dry run: would resolve and checksum-verify the CozyGateway release assets, and no Hermes attach plugin' }
         Write-Info "dry run: would install CozyGateway under $script:InstallHome without administrator rights"
         Write-Info "dry run: would install CozyAgents from $cozyAgentsInstaller with -NoPair, then pair this computer as a runner with a code minted here"
-        return
+        if ($harness -eq 'cozyagents') { return }
     }
     if (Find-Hermes) {
         Write-Info 'dry run: would inspect Hermes model status and open model selection only when setup is incomplete'
@@ -1727,6 +1737,14 @@ if ($harness -eq 'cozyagents') {
 $hermes = Resolve-Hermes $env:COZYGATEWAY_HERMES_INSTALL_URL
 Confirm-HermesModel $hermes
 $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH
+$listener = @()
+if ($harness -eq 'both') {
+    $agentsHome = Resolve-CozyAgentsHome
+    $model = Confirm-CozyAgentsModel (Join-Path $agentsHome 'runner.env')
+    $listener = Select-Listener $alreadyConfigured $InstallerArguments
+    # The native bootstrap prints the device QR only after both harnesses are ready.
+    $listener = @($listener) + @('--no-qr')
+}
 
 Protect-CozyGatewayHome $script:InstallHome
 $assets = @('cozygateway.mjs', 'cozygateway-hermes-attach-plugin.tar.gz', 'agent-install.sh', 'gateway-supervisor.cjs', 'cozygateway-bootstrap.ps1')
@@ -1750,9 +1768,19 @@ try {
     Get-VerifiedAsset 'install.ps1' (Join-Path $stage 'cozygateway-bootstrap.ps1') $base
     New-Item -ItemType Directory -Force -Path $bin | Out-Null
     Invoke-TransactionalRelease $script:InstallHome $bin $stage $assets {
-        Invoke-CozyGatewayInstaller $bash $installerPath $hermes $InstallerArguments
+        Invoke-CozyGatewayInstaller $bash $installerPath $hermes $InstallerArguments 'hermes' $listener
         Save-ExplicitBootstrapSource $script:InstallHome $explicitAssetBase
         Set-CozyGatewayCommandPath $bin $true
+        if ($harness -eq 'both') {
+            # Record both before runner setup so the persisted selection remains repairable.
+            Save-CozyAgentsState $statePath 'both' $agentsHome
+            Install-CozyAgentsHarness $agentsHome $cozyAgentsInstaller $script:CozyAgentsInstallerSha256
+            Write-RunnerModelEnv (Join-Path $agentsHome 'runner.env') $model
+            Join-RunnerToGateway $agentsHome $cliPath $configPath
+            Save-CozyAgentsState $statePath 'both' $agentsHome
+            Write-Ok 'Hermes and CozyAgents share this CozyGateway'
+            Complete-Pairing $cliPath $alreadyConfigured $isNoQr
+        }
     } {
         Restart-OwnedGatewayService $script:InstallHome
     }

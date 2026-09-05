@@ -36,8 +36,18 @@ The command shows gateway status and lets you create a fresh pairing code. Scan 
 
 ### Windows PowerShell
 
+Choose Hermes, CozyAgents, or both, then configure the selected agents.
+
 ```powershell
 irm https://cozylabs.ai/install.ps1 | iex
+```
+
+Both agents use the same gateway. Repeat the command to add either agent later;
+existing profiles, runner pairing, and gateway settings are preserved. For an
+unattended selection, use `-Harness hermes`, `-Harness cozyagents`, or `-Harness both`:
+
+```powershell
+& ([scriptblock]::Create((irm https://cozylabs.ai/install.ps1))) -Harness both
 ```
 
 Open a new PowerShell or Terminal window, then run `cozygateway` to check the installation or make a pairing code.

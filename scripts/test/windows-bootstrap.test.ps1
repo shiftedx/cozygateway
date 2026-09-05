@@ -1220,7 +1220,7 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
     $dashboardOutput = Join-Path $supervisorRoot 'dashboard.stdout.log'
     $dashboardError = Join-Path $supervisorRoot 'dashboard.stderr.log'
     $dashboardArguments = '"{0}" {1}' -f $dashboardSource, $supervisorDashboardPort
-    $dashboard = Start-Process -FilePath $nodeExecutable -ArgumentList $dashboardArguments -RedirectStandardOutput $dashboardOutput -RedirectStandardError $dashboardError -PassThru
+    $dashboard = Start-Process -WindowStyle Hidden -FilePath $nodeExecutable -ArgumentList $dashboardArguments -RedirectStandardOutput $dashboardOutput -RedirectStandardError $dashboardError -PassThru
     $dashboardReady = $false
     for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
         $dashboardProbe = [Net.Sockets.TcpClient]::new()
@@ -1285,10 +1285,10 @@ printf '%s\n' "`${SUPERVISOR_ARGS[@]}"
     Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $generatedWrapper)) "production writer must generate the supervisor: $wrapperOutput"
     Assert-True ($wrapperOutput.Replace("`r`n", "`n").Contains("--dashboard-port-state`n$dashboardPortStateNative")) "Windows supervisor arguments must pass dashboard port state as a native path: $wrapperOutput"
     $wrapperArgument = '"' + $generatedWrapper + '"'
-    $supervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
-    $staleSupervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
+    $supervisor = Start-Process -WindowStyle Hidden -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
+    $staleSupervisor = Start-Process -WindowStyle Hidden -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
     $foreignArguments = '"{0}" serve --config "{1}" --foreign' -f $supervisorBundle, $supervisorConfig
-    $foreignChild = Start-Process -FilePath $nodeExecutable -ArgumentList $foreignArguments -PassThru
+    $foreignChild = Start-Process -WindowStyle Hidden -FilePath $nodeExecutable -ArgumentList $foreignArguments -PassThru
     $uninstallSupervisor = $null
     $cozySupervisor = $null
     $foreignOldPortListener = $null
@@ -1409,7 +1409,7 @@ const server = net.createServer();
 server.listen(Number(process.argv[2]), '127.0.0.1');
 process.on('SIGTERM', () => server.close(() => process.exit(0)));
 '@
-        $foreignOldPortListener = Start-Process -FilePath $nodeExecutable -ArgumentList ('"{0}" {1}' -f $foreignListenerSource, $supervisorPort) -PassThru
+        $foreignOldPortListener = Start-Process -WindowStyle Hidden -FilePath $nodeExecutable -ArgumentList ('"{0}" {1}' -f $foreignListenerSource, $supervisorPort) -PassThru
         $foreignOldPortReady = $false
         for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
             $probe = [Net.Sockets.TcpClient]::new()
@@ -1437,7 +1437,7 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
         Assert-True (-not $foreignOldPortListener.HasExited) 'gateway port cleanup must not stop a foreign old-port listener'
         Stop-FixtureProcessTree $foreignOldPortListener
         $foreignOldPortListener = $null
-        $uninstallSupervisor = Start-Process -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
+        $uninstallSupervisor = Start-Process -WindowStyle Hidden -FilePath $bashPath -ArgumentList $wrapperArgument -PassThru
         $uninstallListening = $false
         for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
             $probe = [Net.Sockets.TcpClient]::new()
