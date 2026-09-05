@@ -62,6 +62,14 @@ make_directory_symlink() {
   esac
 }
 mkdir -p "$tmp/hermes/profiles/ops" "$tmp/hermes/profiles/active" "$tmp/bin"
+# Early platform-selection dry runs must never inspect the host registration.
+# Detailed Windows cases later prepend their own task fake ahead of this one.
+export APPDATA="$tmp/windows-appdata"
+cat > "$tmp/bin/schtasks.exe" <<'ABSENT_TASK'
+#!/usr/bin/env bash
+exit 1
+ABSENT_TASK
+chmod 700 "$tmp/bin/schtasks.exe"
 # Installer retry loops exercise deterministic synchronous fakes here. Avoid
 # spending real seconds between probes; timing-specific cases prepend their own
 # sleep fixture below.
