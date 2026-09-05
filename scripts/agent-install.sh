@@ -501,6 +501,7 @@ choose_harness() {
     if [ -z "$recorded" ] && grep -q '^hermes_root=' "$STATE_FILE"; then recorded=hermes; fi
   fi
   case "$recorded" in
+    both) HARNESS=hermes; say "OK    harnesses: Hermes and CozyAgents (already installed here)"; return 0 ;;
     cozyagents) HARNESS=cozyagents; COZYAGENTS_CHOSEN=1; say "OK    harness: cozyagents (already installed here)"; return 0 ;;
     hermes) HARNESS=hermes; say "OK    harness: hermes (already installed here)"; return 0 ;;
   esac
@@ -1088,11 +1089,20 @@ ensure_hermes_gateways() {
   done
 }
 write_state() {
-  local profile staged="$STATE_FILE.tmp.$$"
+  local profile staged="$STATE_FILE.tmp.$$" recorded="" agents_home=""
   [ "$DRY_RUN" = 1 ] && return
+  if [ -f "$STATE_FILE" ]; then
+    recorded="$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)"
+    agents_home="$(sed -n 's/^cozyagents_home=//p' "$STATE_FILE" | tail -1)"
+  fi
   umask 077
   {
-    printf 'harness=hermes\n'
+    if [ "$recorded" = cozyagents ] || [ "$recorded" = both ]; then
+      printf 'harness=both\n'
+      [ -z "$agents_home" ] || printf 'cozyagents_home=%s\n' "$agents_home"
+    else
+      printf 'harness=hermes\n'
+    fi
     printf 'profiles='; (IFS=,; printf '%s' "${SELECTED[*]}")
     printf '\nprofile_scope=%s' "$PROFILE_SPEC"
     printf '\nhermes_root=%s\n' "$HERMES_ROOT"
@@ -1758,7 +1768,7 @@ try {
   foreach ($name in $launchEnvironment.Keys) {
     Set-CozyProcessEnvironmentVariable ([string]$name) ([string]$launchEnvironment[$name])
   }
-  $child = & $startProcessCommand $powerShellExecutable -WorkingDirectory $trustedSystemDirectory -Verb RunAs -Wait -PassThru -ArgumentList $childArguments
+  $child = & $startProcessCommand $powerShellExecutable -WorkingDirectory $trustedSystemDirectory -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList $childArguments
   exit ([int]$child.ExitCode)
 } catch {
   exit 46
@@ -2792,6 +2802,7 @@ status_install() {
   [ ! -f "$STATE_FILE" ] || harness="$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)"
   if [ -z "$harness" ] && [ -f "$STATE_FILE" ] && grep -q '^hermes_root=' "$STATE_FILE"; then harness=hermes; fi
   case "$harness" in
+    both) say "OK    harnesses: Hermes Agent and CozyAgents"; status_runner || true ;;
     cozyagents) say "OK    harness: CozyAgents (bots run here under the CozyAgents runner)"; status_runner || true ;;
     hermes) say "OK    harness: Hermes Agent" ;;
   esac

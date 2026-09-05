@@ -2031,7 +2031,7 @@ grep -Fq 'repair does not accept extra arguments' "$tmp/gateway-windows-live/bin
 grep -Fq 'Get-FileHash -LiteralPath $p -Algorithm SHA256' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
 grep -Fq 'set "COZYGATEWAY_HOME=' "$tmp/gateway-windows-live/bin/cozygateway.cmd"
 trusted_windows_powershell="${SYSTEMROOT:-C:\Windows}\System32\WindowsPowerShell\v1.0\powershell.exe"
-grep -Fq "\"$trusted_windows_powershell\" -NoProfile" "$tmp/gateway-windows-live/bin/cozygateway.cmd"
+grep -Fiq "\"$trusted_windows_powershell\" -NoProfile" "$tmp/gateway-windows-live/bin/cozygateway.cmd"
 if grep -Eq '^powershell\.exe ' "$tmp/gateway-windows-live/bin/cozygateway.cmd"; then
   echo 'Windows repair shim must not resolve PowerShell from the caller working directory or PATH' >&2
   exit 1
