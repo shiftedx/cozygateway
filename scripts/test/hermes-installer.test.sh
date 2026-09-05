@@ -2290,12 +2290,15 @@ atomic_gateway="$tmp/gateway-atomic-env"
 cp -R "$tmp/hermes" "$atomic_hermes"
 mkdir -p "$atomic_gateway/local"
 printf 'old-gateway-env-must-survive\n' > "$atomic_gateway/local/gateway.env"
-for profile_env in "$atomic_hermes/.env" "$atomic_hermes/profiles/ops/.env"; do
-  cat > "$profile_env" <<'OWNED_PROFILE_ENV'
-COZYGATEWAY_INSTALLER_OWNER=cozylabs-v1
-COZYGATEWAY_URL=http://127.0.0.1:8787
-COZYGATEWAY_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-OWNED_PROFILE_ENV
+# Each profile OWNS its token (its spool path is scoped to itself), so the shared value is a
+# genuine duplicate rather than a launch .env copy the installer would replace with a fresh token.
+for profile_home_dir in "$atomic_hermes" "$atomic_hermes/profiles/ops"; do
+  printf '%s\n' \
+    'COZYGATEWAY_INSTALLER_OWNER=cozylabs-v1' \
+    'COZYGATEWAY_URL=http://127.0.0.1:8787' \
+    'COZYGATEWAY_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    "COZYGATEWAY_SPOOL_PATH=$profile_home_dir/plugin-data/cozygateway/attach-v1.sqlite" \
+    > "$profile_home_dir/.env"
 done
 atomic_env_before="$(file_sha256 "$atomic_gateway/local/gateway.env")"
 if atomic_env_output="$(HOME="$tmp/atomic-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$atomic_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/atomic-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --profiles default,ops --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$atomic_gateway" 2>&1)"; then
@@ -2330,5 +2333,39 @@ if no_systemd_output="$(HOME="$tmp/no-systemd-home" PATH="$tmp/no-systemd-bin:/u
 fi
 grep -Fq 'no systemd user manager is running' <<<"$no_systemd_output"
 test ! -e "$tmp/gateway-no-systemd"
+
+# A profile created from the phone (Hermes `profiles.create`) arrives with a byte copy of the
+# launch profile's .env, CozyGateway keys included: the default profile's token and a spool path
+# inside the DEFAULT profile. A repair must recognise the copy as inherited, mint the new profile
+# its own token, and scope its spool to its own directory, rather than dying on the duplicate.
+phone_hermes="$tmp/hermes-phone"
+phone_gateway="$tmp/gateway-phone"
+cp -R "$tmp/hermes" "$phone_hermes"
+rm -rf "$phone_hermes/profiles/phone"
+HOME="$tmp/phone-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$phone_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/phone-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --no-qr --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$phone_gateway" >/dev/null
+phone_default_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$phone_hermes/.env")"
+test -n "$phone_default_token"
+test "$(sed -n 's/^COZYGATEWAY_SPOOL_PATH=//p' "$phone_hermes/.env")" = "$phone_hermes/plugin-data/cozygateway/attach-v1.sqlite"
+mkdir -p "$phone_hermes/profiles/phone"
+printf '{}\n' > "$phone_hermes/profiles/phone/config.yaml"
+cp "$phone_hermes/.env" "$phone_hermes/profiles/phone/.env"
+if ! phone_output="$(HOME="$tmp/phone-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$phone_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/phone-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --no-qr --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$phone_gateway" 2>&1)"; then
+  printf 'a repair after a phone-created profile inherited the launch .env failed:\n%s\n' "$phone_output" >&2; exit 1
+fi
+phone_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$phone_hermes/profiles/phone/.env")"
+test -n "$phone_token"
+test "$phone_token" != "$phone_default_token"
+test "$phone_default_token" = "$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$phone_hermes/.env")"
+test "$(sed -n 's/^COZYGATEWAY_SPOOL_PATH=//p' "$phone_hermes/profiles/phone/.env")" = "$phone_hermes/profiles/phone/plugin-data/cozygateway/attach-v1.sqlite"
+test "$(sed -n 's/^COZYGATEWAY_ATTACH_TOKEN_PHONE=//p' "$phone_gateway/local/gateway.env")" = "$phone_token"
+test "$(sed -n 's/^COZYGATEWAY_ATTACH_TOKEN_DEFAULT=//p' "$phone_gateway/local/gateway.env")" = "$phone_default_token"
+grep -q '^phone:gateway:install$' "$tmp/phone-commands"
+"$real_node" - "$phone_gateway/local/cozygateway.config.json" <<'NODE'
+const { readFileSync } = require('node:fs');
+const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const profiles = config.hermesEndpoints?.[0]?.profiles ?? {};
+if (profiles.phone?.tokenEnv !== 'COZYGATEWAY_ATTACH_TOKEN_PHONE') process.exit(1);
+if (profiles.default?.tokenEnv !== 'COZYGATEWAY_ATTACH_TOKEN_DEFAULT') process.exit(1);
+NODE
 
 echo 'hermes installer dry-run tests passed'

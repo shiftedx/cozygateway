@@ -1018,13 +1018,20 @@ write_gateway_env() {
   umask 077; : > "$staged"
   env_write "$staged" COZYGATEWAY_HERMES_TOKEN "$DASHBOARD_SESSION_TOKEN"
   for p in "${SELECTED[@]}"; do
-    profile_env="$(profile_home "$p")/.env"; claim_profile_env "$profile_env"; token="$(env_get "$profile_env" COZYGATEWAY_TOKEN)"; safe_secret "$token" || token="$(new_token)"; env_name="$(token_env_name "$p")"
+    profile_env="$(profile_home "$p")/.env"; claim_profile_env "$profile_env"; env_name="$(token_env_name "$p")"
+    spool_path="$(profile_home "$p")/plugin-data/cozygateway/attach-v1.sqlite"
+    is_windows && spool_path="$(to_windows_path "$spool_path")"
+    # A token found in the profile is reused only when it is that profile's OWN. Hermes
+    # `profiles.create` (the phone's POST /bots) copies the launch profile's .env into the new
+    # profile wholesale, CozyGateway keys included, so a bare COZYGATEWAY_TOKEN proves nothing:
+    # the copied one belongs to the default profile. The spool path is the marker only this
+    # installer writes, and it names the profile it was written for.
+    token="$(env_get "$profile_env" COZYGATEWAY_TOKEN)"
+    if ! safe_secret "$token" || [ "$(env_get "$profile_env" COZYGATEWAY_SPOOL_PATH)" != "$spool_path" ]; then token="$(new_token)"; fi
     for seen_token in "${TOKENS[@]:-}"; do [ "$token" != "$seen_token" ] || die "Hermes profiles must have distinct CozyGateway attach tokens"; done
     for seen_name in "${TOKEN_ENVS[@]:-}"; do [ "$env_name" != "$seen_name" ] || die "profile names produce the same token environment variable: $env_name"; done
     TOKENS+=("$token"); TOKEN_ENVS+=("$env_name")
     env_put "$profile_env" COZYGATEWAY_URL "$(gateway_origin)"; env_put "$profile_env" COZYGATEWAY_TOKEN "$token"
-    spool_path="$(profile_home "$p")/plugin-data/cozygateway/attach-v1.sqlite"
-    is_windows && spool_path="$(to_windows_path "$spool_path")"
     env_put "$profile_env" COZYGATEWAY_SPOOL_PATH "$spool_path"; env_put "$profile_env" COZYGATEWAY_HOME_CHANNEL thread
     env_write "$staged" "$env_name" "$token"
   done

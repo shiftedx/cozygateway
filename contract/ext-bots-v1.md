@@ -213,7 +213,14 @@ Every profile returned by Hermes is exposed as a CozyChat bot. A configured prof
 `syncState: "setup_required"`, a null native chat id, and cannot accept native chat actions.
 Profile lifecycle belongs to Hermes, and from capability 37 both ends of it are reachable from the
 phone: `POST /bots` creates the profile and `DELETE /bots/:name` removes it. The installer's
-default dynamic `--profiles all` scope re-discovers and provisions profiles on update/repair.
+default dynamic `--profiles all` scope re-discovers and provisions profiles on update/repair. On a
+native install (one un-namespaced Hermes endpoint written by `agent-install.sh`) the gateway starts
+that provisioning run itself, unattended and from the already-verified local assets, after a Hermes
+profile is created or deleted through these routes, so `setup_required` is transient there: the row
+moves through `starting` to `ready` with nobody at a terminal. The run restarts the gateway service
+partway through; a client polling `GET /bots/:name/readiness` treats the transport errors of that
+restart as non-terminal, exactly as it already did. Windows installs, narrowed `--profiles` scopes,
+runtime-only repairs, and every gateway without installer state keep the manual repair path.
 
 `POST /bots` creates the Hermes profile and then SEEDS it as a blank slate: the `file` + `terminal`
 toolset floor on the `cozygateway` and `cli` platforms, `approvals.mode: manual`, inherited MCP

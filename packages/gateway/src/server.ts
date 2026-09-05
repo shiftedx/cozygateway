@@ -31,6 +31,7 @@ import {
 
 import { hermesEndpoints, nativeBots, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
 import { fileGatewaySettings, type GatewaySettingsStore } from "./gateway-settings.ts";
+import { createInstallerProvisioner, type ProfileChangeEvent, type ProfileProvisioner } from "./hermes-bridge/profile-provisioner.ts";
 import {
   discoverGatewayMaintenance,
   type GatewayMaintenanceRuntimeHealth,
@@ -191,6 +192,12 @@ export interface StartGatewayOptions {
   /** Test-only `/pair` admission seam. The production path always uses the default bucket built
    *  from its wall clock; a long-running black-box harness may supply a virtual-clock bucket. */
   pairingAdmission?: PairingAttemptLimiter;
+  /** What moves a phone-created Hermes profile past `setup_required`. Omitted, and with
+   *  `configPath` set, the gateway builds `createInstallerProvisioner` from the installer state
+   *  beside the config, which reruns the shipped installer unattended after a Hermes profile is
+   *  created or deleted (and stays off when that state says this is not such an install). A host
+   *  or test may hand in its own; `null` turns it off outright. */
+  profileProvisioner?: ProfileProvisioner | null;
 }
 
 /** The assembly seam between Hermes' settled-chat event and the relay notifier. Kept pure so the
@@ -302,6 +309,17 @@ export async function startGateway(
   // Transition records deliberately have a useful production default. They remain injectable so
   // embedded hosts and tests can collect them without intercepting stderr.
   const traceLog = options.traceLog ?? ((line: string) => process.stderr.write(`${line}\n`));
+  // Phone-created bot provisioning. Only a native install has the installer state this reads;
+  // every other host (docker, conformance, tests) resolves to undefined and the hook stays absent.
+  const profileProvisioner: ProfileProvisioner | undefined = options.profileProvisioner === null
+    ? undefined
+    : options.profileProvisioner
+      ?? (options.configPath === undefined
+        ? undefined
+        : createInstallerProvisioner({
+            configPath: options.configPath,
+            log: (line) => process.stderr.write(`[provisioner] ${line}\n`),
+          }));
   let gatewaySettings: GatewaySettingsStore | undefined;
   if (options.configPath !== undefined) {
     try {
@@ -508,6 +526,11 @@ export async function startGateway(
     seedBlankSlateBots: memberOptions.seedBlankSlateBots,
     blankSlateSkillsOn: memberOptions.blankSlateSkillsOn,
     revokeAttachIdentity: (name) => killAttachIdentity(publicProfileId(endpoint, name)),
+    // Only the shape the installer writes, one un-namespaced Hermes endpoint, is one the installer
+    // can reprovision; a federated member's profiles live on some other box's Hermes.
+    ...(profileProvisioner !== undefined && clientMembers.length === 1 && endpoint.namespace === false
+      ? { onProfileChange: (event: ProfileChangeEvent) => profileProvisioner.provision(event) }
+      : {}),
     // Capability 46. Room membership is the only thing that reads this: a runtime bot has no
     // Dashboard profile, so a room naming one has to be answered from config rather than from
     // `profiles.list`. Shared by every bridge member because a runtime bot belongs to the gateway
