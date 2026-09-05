@@ -174,6 +174,15 @@ function Invoke-Bootstrap {
         [hashtable] $Environment,
         [string[]] $Arguments = @()
     )
+    # Every invocation writes PATH to a fixture file, including cases that do not assert PATH.
+    # Never restore the real User PATH: another installer may update it during this suite.
+    $Environment = $Environment.Clone()
+    if ([string]::IsNullOrWhiteSpace([string]$Environment['COZYGATEWAY_TEST_USER_PATH_LOG'])) {
+        $Environment['COZYGATEWAY_TEST_USER_PATH_LOG'] = Join-Path $temp 'isolated-user-path.txt'
+    }
+    if (-not $Environment.ContainsKey('COZYGATEWAY_TEST_USER_PATH')) {
+        $Environment['COZYGATEWAY_TEST_USER_PATH'] = 'C:\Fixture Existing Tools'
+    }
     $old = @{}
     foreach ($key in $Environment.Keys) {
         $old[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
