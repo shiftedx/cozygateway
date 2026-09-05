@@ -152,6 +152,16 @@ function Assert-RecoveryRefusesBeforeAssetMutation {
 
 try {
     Reset-Fixture
+    $privateNode = [IO.Path]::GetFullPath((Join-Path $root 'runtime\node\node.exe'))
+    $systemNode = 'C:\Program Files\nodejs\node.exe'
+    $systemTask = (New-OwnedTaskXml $root (Join-Path $root 'local\maintenance-worker.cjs')).Replace($privateNode, $systemNode)
+    Write-TestFile (Join-Path $root 'local\install-state') "node_resolved=/c/Program Files/nodejs/node.exe`n"
+    Assert-True (Test-OwnedGatewayTask $root $systemTask) 'the recorded external Node runtime must remain owned during repair'
+    $foreignTask = $systemTask.Replace($systemNode, 'C:\Other\node.exe')
+    Assert-True (-not (Test-OwnedGatewayTask $root $foreignTask)) 'an external Node runtime different from the record must remain foreign'
+    Write-TestFile (Join-Path $root 'local\install-state') "node_resolved=$systemNode`nnode_resolved=$systemNode`n"
+    Assert-True (-not (Test-OwnedGatewayTask $root $systemTask)) 'duplicate Node records must not grant task ownership'
+    Reset-Fixture
     $bundle = [IO.Path]::GetFullPath((Join-Path $root 'bin\cozygateway.mjs'))
     $taskXml = New-OwnedTaskXml $root (Join-Path $root 'local\maintenance-worker.cjs')
     Assert-True (Test-OwnedGatewayTask $root $taskXml) 'a strict direct Gateway task must be accepted for recovery'

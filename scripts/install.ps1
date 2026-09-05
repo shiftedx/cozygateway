@@ -398,6 +398,17 @@ function Test-OwnedGatewayTask {
         return $values.Count -eq 1 -and (Test-BootstrapPathEquals $values[0] ([IO.Path]::GetFullPath($LauncherPath))) -and (Test-OwnedGatewayStartupEntry $InstallRoot $LauncherPath)
     }
     $node = [IO.Path]::GetFullPath((Join-Path $InstallRoot 'runtime\node\node.exe'))
+    $statePath = Join-Path $InstallRoot 'local\install-state'
+    if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+        $recordedNodes = @(Get-Content -LiteralPath $statePath | Where-Object { $_ -like 'node_resolved=*' })
+        if ($recordedNodes.Count -gt 1) { return $false }
+        if ($recordedNodes.Count -eq 1) {
+            $recordedNode = $recordedNodes[0].Substring(14)
+            if ($recordedNode -match '^/([A-Za-z])/(.*)$') { $recordedNode = $matches[1] + ':\' + $matches[2].Replace('/', '\') }
+            if ($recordedNode -notmatch '^[A-Za-z]:[\\/]') { return $false }
+            $node = [IO.Path]::GetFullPath($recordedNode)
+        }
+    }
     $supervisor = [IO.Path]::GetFullPath((Join-Path $InstallRoot 'local\gateway-supervisor.cjs'))
     if (-not (Test-BootstrapPathEquals $exec.Command $node) -or $values.Count -lt 1 -or -not (Test-BootstrapPathEquals $values[0] $supervisor)) { return $false }
     $required = @{
