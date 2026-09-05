@@ -7,6 +7,10 @@ import {
   APPROVALS_CAPABILITY_VERSION,
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
+  CHAT_CONFIGURATION_CAPABILITY_ID,
+  CHAT_CONFIGURATION_CAPABILITY_VERSION,
+  PROVIDER_CONNECTIONS_CAPABILITY_ID,
+  PROVIDER_CONNECTIONS_CAPABILITY_VERSION,
   HERMES_DESKTOP_SESSIONS_CAPABILITY_ID,
   HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION,
   HERMES_SESSION_MANAGEMENT_CAPABILITY_ID,
@@ -54,6 +58,7 @@ import { createApp } from "./http.ts";
 import { listenerOrigin } from "./configure.ts";
 import { primaryLanAddress } from "./lan.ts";
 import { RunnerLane } from "./runner/lane.ts";
+import { RunnerChatExecutionDriver } from "./runner/chat-executions.ts";
 import {
   LEGACY_RUNNER_ID,
   LEGACY_RUNNER_NAME,
@@ -79,13 +84,15 @@ import { DEFAULT_CHAT_SUGGESTION, parseHermesOptions } from "./hermes-bridge/con
 import { HermesBridge, type BotsSurface } from "./hermes-bridge/bridge.ts";
 import { FederatedBotControlSurface, endpointStorage } from "./hermes-bridge/federation.ts";
 import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
-import { AttachConfigSurface } from "./hermes-bridge/bot-config.ts";
+import { AttachChatConfigurationDriver, AttachConfigSurface } from "./hermes-bridge/bot-config.ts";
+import { GatewayChatConfiguration, type ChatConfigurationDriver } from "./chat-configuration.ts";
+import { GatewayProviderConnections } from "./provider-connections.ts";
 import { AttachHistorySurface } from "./hermes-bridge/bot-history.ts";
 import { AttachMemorySurface } from "./hermes-bridge/memory.ts";
 import { PHOTO_SWEEP_MS } from "./hermes-bridge/photos.ts";
 import { resolveTlsMaterial } from "./tls.ts";
 import type { TraceLog } from "./trace.ts";
-import { GatewayHarnessSettings, HermesHarnessModelSettingsAdapter } from "./harness-settings.ts";
+import { CozyAgentsHarnessModelSettingsAdapter, GatewayHarnessSettings, HermesHarnessModelSettingsAdapter } from "./harness-settings.ts";
 import { GatewayHarnessWorkspace, discoverHermesWorkspace } from "./hermes-bridge/workspace.ts";
 import { GatewayHarnessUpdates, discoverHermesUpdates } from "./hermes-bridge/update.ts";
 import {
@@ -249,12 +256,14 @@ export function gatewayInfoForConfig(
       // endpoint, since there is genuinely no Dashboard, no desktop session and no harness setting
       // behind them.
       [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION,
+      [CHAT_CONFIGURATION_CAPABILITY_ID]: CHAT_CONFIGURATION_CAPABILITY_VERSION,
+      [PROVIDER_CONNECTIONS_CAPABILITY_ID]: PROVIDER_CONNECTIONS_CAPABILITY_VERSION,
+      [HARNESS_SETTINGS_CAPABILITY_ID]: HARNESS_SETTINGS_CAPABILITY_VERSION,
       ...(hermesEndpoints(config).length === 0
         ? {}
         : {
             [HERMES_DESKTOP_SESSIONS_CAPABILITY_ID]: HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION,
             [MOBILE_NODE_CAPABILITY_ID]: MOBILE_NODE_CAPABILITY_VERSION,
-            [HARNESS_SETTINGS_CAPABILITY_ID]: HARNESS_SETTINGS_CAPABILITY_VERSION,
           }),
       ...(config.pushRelayUrl === undefined
         ? {}
@@ -567,9 +576,6 @@ export async function startGateway(
           raiseLiveActivityFrame(presence);
         },
       ));
-  const harnessSettings = new GatewayHarnessSettings(
-    harnessModelAdapters,
-  );
   // Every configured Hermes profile has one attach identity shared by the core thread surface and
   // Bot Mode. Token resolution fails closed before the listener opens.
   const nativeBotIds = [
@@ -608,9 +614,14 @@ export async function startGateway(
       throw new Error("duplicate attach credential; every bot must use a distinct token");
     attachTokens.set(bot.token, bot.id);
   }
+  for (const execution of storage.chatExecutions()) {
+    if (execution.stage !== "deleted" && storage.nativeBotHasSession(execution.bot, execution.sessionId))
+      attachTokens.set(execution.token, execution.executionId);
+  }
   let nativeBotPlane: NativeBotDataPlane | undefined;
   let memorySurface: AttachMemorySurface | undefined;
   let configSurface: AttachConfigSurface | undefined;
+  let chatConfiguration: GatewayChatConfiguration | undefined;
   let historySurface: AttachHistorySurface | undefined;
   let botsSurface: BotsSurface;
   // Hermes profiles only: runtime bot ids (from `nativeBots(config)`) are intentionally absent
@@ -630,6 +641,7 @@ export async function startGateway(
     trace: traceLog,
     events: {
       canAcceptEvent: (agentId, frame) => {
+        if (storage.chatExecutionById(agentId)) return nativeBotPlane?.canAccept(agentId, frame) === true;
         if (bridge instanceof HermesBridge && bridge.canAcceptGroupAttachEvent(agentId, frame)) return true;
         if (nativeBotPlane?.canAccept(agentId, frame)) return true;
         if (!("threadId" in frame.event))
@@ -640,6 +652,7 @@ export async function startGateway(
         return thread !== undefined && thread.agentId === agentId;
       },
       onEvent: (agentId, frame) => {
+        if (storage.chatExecutionById(agentId)) return nativeBotPlane?.handle(agentId, frame) === true;
         if (frame.event.kind === "cozyapp_upsert") {
           try {
             assertValidCozyAppTree(frame.event.tree);
@@ -677,6 +690,8 @@ export async function startGateway(
       onScheduledDeliveryFailed: (agentId, failure) =>
         nativeBotPlane?.recordScheduledDeliveryFailure(agentId, failure),
       onPresence: (agentId, state) => {
+        // A chat execution is a transport peer, never another bot in the roster.
+        if (storage.chatExecutionById(agentId)) return;
         hub.broadcast({
           type: "presence",
           agentId,
@@ -689,6 +704,45 @@ export async function startGateway(
   });
   memorySurface = new AttachMemorySurface(attachV1Ingress, 12_000, traceLog);
   configSurface = new AttachConfigSurface(attachV1Ingress, 12_000, traceLog);
+  const harnessSettings = new GatewayHarnessSettings([
+    ...harnessModelAdapters,
+    new CozyAgentsHarnessModelSettingsAdapter(
+      () => mergeRuntimeBots(configRuntimeBots, storage.runtimeBots()).bots.map((bot) => ({ id: bot.id, name: bot.name })),
+      (bot) => configSurface!.modelConfig(bot),
+    ),
+  ]);
+  const providerConnections = new GatewayProviderConnections({
+    ownsExecution: (bot, executionId) => {
+      const execution = storage.chatExecutionById(executionId);
+      return execution?.bot === bot && execution.stage !== "deleted" && storage.nativeBotHasSession(bot, execution.sessionId);
+    },
+    knownBot: (bot) => hermesProfileIds.has(bot) || configRuntimeBots.some((entry) => entry.id === bot) || storage.runtimeBot(bot) !== undefined,
+    resolveScope: (harnessId, scopeId) => {
+      if (harnessId === "cozyagents") return configRuntimeBots.find((bot) => bot.id === scopeId)?.id ?? storage.runtimeBot(scopeId)?.id;
+      const member = clientMembers.find(({ endpoint }) => (endpoint.id ?? "default") === harnessId);
+      if (!member || !harnessSettings.adapter(harnessId).descriptor().scopes.some((scope) => scope.id === scopeId)) return undefined;
+      return publicProfileId(member.endpoint, scopeId);
+    },
+    control: {
+      list: (bot) => configSurface!.providerConnections(bot),
+      save: (bot, handoffId) => configSurface!.saveProviderConnection(bot, handoffId),
+      test: (bot, id) => configSurface!.testProviderConnection(bot, id),
+      remove: (bot, id) => configSurface!.removeProviderConnection(bot, id),
+    },
+  });
+  const attachedChatDriver = new AttachChatConfigurationDriver(configSurface);
+  let executionChatDriver: RunnerChatExecutionDriver | undefined;
+  const chatDriver: ChatConfigurationDriver = {
+    availability: (input) => (executionChatDriver ?? attachedChatDriver).availability(input),
+    computers: (input) => (executionChatDriver ?? attachedChatDriver).computers(input),
+    projects: (bot, computerId) => (executionChatDriver ?? attachedChatDriver).projects(bot, computerId),
+    branches: (bot, computerId, projectId) => (executionChatDriver ?? attachedChatDriver).branches(bot, computerId, projectId),
+    prepareContext: (input) => (executionChatDriver ?? attachedChatDriver).prepareContext(input),
+  };
+  chatConfiguration = new GatewayChatConfiguration({
+    storage,
+    driver: chatDriver,
+  });
   historySurface = new AttachHistorySurface(attachV1Ingress, 12_000, traceLog);
   const attachEndpoint: TurnEndpoint = {
     isAttached: (agentId) => attachV1Ingress.isAttached(agentId),
@@ -803,6 +857,7 @@ export async function startGateway(
       },
     },
     botConfig: configSurface,
+    chatConfiguration,
     botHistory: historySurface,
     chatSuggestion,
     turnTimeoutMs: config.turnTimeoutSeconds * 1000,
@@ -856,6 +911,25 @@ export async function startGateway(
     onReceipt: () => bridge.refreshSoon("runner receipt"),
     now: () => Date.now(),
   });
+  executionChatDriver = new RunnerChatExecutionDriver({
+    storage, lane: runnerLane, surface: {
+      botProfile: (bot) => nativePlane.surface().botProfile(bot),
+      modelConfig: (bot) => nativePlane.surface().modelConfig(bot),
+      providerConnections: (bot) => configSurface!.providerConnections(bot),
+      prepareChatConfiguration: (peer, configuration) => configSurface!.prepareChatConfiguration(peer, configuration),
+    }, local: attachedChatDriver,
+    runtimeBot: (bot) => configRuntimeBots.some((entry) => entry.id === bot) || storage.runtimeBot(bot) !== undefined,
+    harness: (bot) => hermesProfileIds.has(bot) ? "hermes"
+      : configRuntimeBots.some((entry) => entry.id === bot) || storage.runtimeBot(bot) !== undefined ? "cozyagents" : undefined,
+    name: runnerName, tokens: attachTokens,
+    isAttached: (peer) => attachV1Ingress.isAttached(peer),
+    disconnect: (peer) => attachV1Ingress.disconnectAgent(peer),
+    prepareProvider: async (bot, executionId, model) => {
+      const { handoffId } = await configSurface!.transferProviderConnection(bot, model.providerId, executionId);
+      try { await configSurface!.importProviderConnection(executionId, handoffId); }
+      finally { providerConnections.handoffs.revoke(handoffId); }
+    },
+  });
   readMaintenanceRuntimeHealth = () => {
     if (endpoints.length === 0) {
       return maintenanceRuntimeHealth({
@@ -897,6 +971,11 @@ export async function startGateway(
     },
     unregister: (id) => {
       const revoked = killAttachIdentity(id);
+      for (const execution of storage.chatExecutions()) if (execution.bot === id) {
+        storage.setChatExecutionStage(execution.executionId, "deleted");
+        attachTokens.delete(execution.token);
+        attachV1Ingress.disconnectAgent(execution.executionId);
+      }
       nativePlane.removeRuntimeBot(id);
       return revoked;
     },
@@ -921,6 +1000,8 @@ export async function startGateway(
   });
   for (const [profileId] of profileEntries)
     attachV1Ingress.replayUnapplied(profileId);
+  for (const execution of storage.chatExecutions()) if (execution.stage === "ready")
+    attachV1Ingress.replayUnapplied(execution.executionId);
   const runner = new TurnRunner({
     storage,
     hub,
@@ -942,6 +1023,7 @@ export async function startGateway(
     ...(maintenance === undefined ? {} : { maintenance }),
     gatewaySettingsLog: traceLog,
     harnessSettings,
+    providerConnections,
     ...(harnessUpdates.available ? { harnessUpdates } : {}),
     ...(hermesSessions.available ? { hermesSessions } : {}),
     ...(hermesGlobalSkills === undefined ? {} : { hermesGlobalSkills }),
@@ -958,11 +1040,12 @@ export async function startGateway(
     // gets is decided in one place rather than in each of the five routes.
     ...(nativeHistory === undefined ? {} : { history: nativeHistory }),
     ...(nativeRunRoutine === undefined ? {} : { runRoutine: nativeRunRoutine }),
+    ...(chatConfiguration === undefined ? {} : { chatConfiguration }),
     attachTokens,
     attachMediaAllowed: (agentId: string) =>
       // Capability 49: a bot created through `POST /bots {runtime}` has no config line to be found
       // in, so the gateway-owned row is the other half of the same rollout gate.
-      storage.runtimeBot(agentId) !== undefined || allowedAttachMedia(config, agentId),
+      storage.runtimeBot(agentId) !== undefined || storage.chatExecutionById(agentId)?.stage === "ready" || allowedAttachMedia(config, agentId),
     sendCozyAppAction: (action, deviceId) => {
       if (!nativeBotPlane?.registerCozyAppActionOrigin(action.creatorBot, action.appId, action.id, deviceId, Math.max(30_000, config.turnTimeoutSeconds * 1000))) return false;
       const queued = attachV1Ingress.sendCozyAppAction(action.creatorBot, { appId: action.appId, actionId: action.actionId, actionRequestId: action.id });
@@ -1109,6 +1192,7 @@ export async function startGateway(
       // The bots bridge holds a dial-out socket and its own timers; closing it cancels both.
       await Promise.all(bridgeMembers.map((member) => member.bridge.close()));
       nativeBotPlane.close();
+      executionChatDriver?.close();
       runnerLane.close();
       mobileNode?.close();
       await new Promise<void>((resolve, reject) => {

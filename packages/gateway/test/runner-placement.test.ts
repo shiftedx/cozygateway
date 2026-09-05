@@ -205,9 +205,9 @@ async function until(predicate: () => boolean, timeoutMs = 4_000): Promise<void>
   }
 }
 
-function commands(runner: Runner): Array<Extract<RunnerServerFrame, { kind: "command" }>> {
+function commands(runner: Runner): Array<Extract<RunnerServerFrame, { command: "create_runtime" | "delete_runtime" }>> {
   return runner.frames.filter((frame) => frame.kind === "command") as Array<
-    Extract<RunnerServerFrame, { kind: "command" }>
+    Extract<RunnerServerFrame, { command: "create_runtime" | "delete_runtime" }>
   >;
 }
 

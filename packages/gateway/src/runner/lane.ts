@@ -22,6 +22,9 @@ import {
   type RunnerCreateRuntimePayload,
   type RunnerReceipt,
   type RunnerServerFrame,
+  type RunnerChatCommandFrame,
+  type RunnerChatFrame,
+  type RunnerHello,
   platformLabel,
 } from "./protocol.ts";
 
@@ -65,6 +68,8 @@ interface RunnerConnection {
    *  back to the roster's durable observation: an offline row cannot prove which binary is now
    *  running. */
   agentVersion: string | undefined;
+  chatExecution?: boolean;
+  chatExecutionHarnesses?: readonly ("cozyagents" | "hermes")[];
   lastSeenAt: number;
 }
 
@@ -92,6 +97,8 @@ export class RunnerLane {
   readonly #pendingConnections: PendingWebsocketLimiter;
   #heartbeat: ReturnType<typeof setInterval> | undefined;
   #closed = false;
+  readonly #chatListeners = new Set<(runnerId: string, frame: RunnerChatFrame) => void>();
+  readonly #chatConnections = new Set<(runnerId: string, hello: RunnerHello | undefined) => void>();
 
   constructor(opts: RunnerLaneOptions) {
     this.#token = opts.token;
@@ -128,6 +135,28 @@ export class RunnerLane {
   /** Every runner holding a live, hello-completed socket, by lane key. */
   connectedRunners(): readonly string[] {
     return this.#attached().map((connection) => connection.key);
+  }
+
+  chatCapableRunners(harness?: "cozyagents" | "hermes"): readonly string[] {
+    return this.#attached().filter((connection) => connection.chatExecution
+      && (harness === undefined || connection.chatExecutionHarnesses?.includes(harness))).map((connection) => connection.key);
+  }
+
+  sendChatCommand(runnerId: string, frame: RunnerChatCommandFrame): boolean {
+    const connection = this.#connections.get(runnerId);
+    if (!connection?.hello || !connection.chatExecution || connection.socket.readyState !== WebSocket.OPEN) return false;
+    connection.socket.send(JSON.stringify(frame));
+    return true;
+  }
+
+  onChatFrame(listener: (runnerId: string, frame: RunnerChatFrame) => void): () => void {
+    this.#chatListeners.add(listener);
+    return () => this.#chatListeners.delete(listener);
+  }
+
+  onChatConnection(listener: (runnerId: string, hello: RunnerHello | undefined) => void): () => void {
+    this.#chatConnections.add(listener);
+    return () => this.#chatConnections.delete(listener);
   }
 
   /** The version this runner proved on its current authenticated hello, if it is attached now. */
@@ -332,6 +361,8 @@ export class RunnerLane {
         connection.runnerId = frame.runnerId;
         connection.backends = frame.backends;
         connection.agentVersion = frame.agentVersion;
+        connection.chatExecution = frame.capabilities?.chat_execution === 1 && frame.backends.includes("process");
+        connection.chatExecutionHarnesses = frame.chatExecutionHarnesses ?? ["cozyagents"];
         this.#connections.set(connection.key, connection);
         if (connection.rowId !== undefined) {
           this.#roster?.observe(connection.rowId, {
@@ -350,7 +381,7 @@ export class RunnerLane {
           JSON.stringify({
             kind: "hello_ack",
             version: RUNNER_V1_VERSION,
-            capabilities: [],
+            capabilities: connection.chatExecution ? ["chat_execution"] : [],
             heartbeatIntervalMs: this.#heartbeatIntervalMs,
           } satisfies RunnerServerFrame),
         );
@@ -367,6 +398,7 @@ export class RunnerLane {
           includeUnassigned: this.#takesUnassigned(connection.key),
         });
         this.dispatchPending();
+        for (const listener of this.#chatConnections) listener(connection.key, frame);
         return;
       }
       if (frame.kind === "hello") {
@@ -374,6 +406,11 @@ export class RunnerLane {
         return;
       }
       if (frame.kind === "heartbeat") return;
+      if (frame.kind === "chat_execution_receipt" || frame.kind === "chat_workspace_result") {
+        if (!connection.chatExecution) { socket.close(1008, "chat execution capability required"); return; }
+        for (const listener of this.#chatListeners) listener(connection.key, frame);
+        return;
+      }
       this.#receipt(frame);
     });
 
@@ -382,6 +419,7 @@ export class RunnerLane {
       releasePending?.();
       if (this.#connections.get(connection.key)?.socket === socket) {
         this.#connections.delete(connection.key);
+        for (const listener of this.#chatConnections) listener(connection.key, undefined);
         this.#log(`runner ${connection.key} detached`);
       }
       if (this.#connections.size === 0) {

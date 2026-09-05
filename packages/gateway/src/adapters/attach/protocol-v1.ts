@@ -11,6 +11,9 @@ import {
   BotHistoryListResponseSchema, BotHistoryDiffResponseSchema, BotHistoryRestoreResponseSchema,
   BotHistoryTryStartResponseSchema, BotHistoryTryKeepResponseSchema, BotHistoryTryDiscardResponseSchema,
   BotHistoryResolveResponseSchema, BotHistoryResolveChoiceSchema,
+  ChatBranchListSchema, ChatComputerSchema, ChatProjectListSchema,
+  ChatSessionConfigurationSchema,
+  ModelProviderConnectionCatalogSchema, ModelProviderConnectionIdSchema,
 } from "cozygateway-contract";
 
 /** Stable attach-v1 data-plane contract. A peer dials /attach/v1 and completes hello negotiation
@@ -42,6 +45,11 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("desktop_session_sync"),
   Type.Literal("cozyapps"),
   Type.Literal("bot_config"),
+  /** Session-scoped execution configuration travels on the same bounded request/reply frame
+   * family as bot_config, but is negotiated independently so a runtime never claims profile
+   * administration merely by supporting per-chat context. */
+  Type.Literal("chat_configuration"),
+  Type.Literal("provider_connections"),
   Type.Literal("bot_history"),
   /** Capability 60: durable metadata-only local search tombstone. */
   Type.Literal("session_deletion"),
@@ -142,6 +150,7 @@ const TurnCommand = Type.Object({
   kind: Type.Literal("turn"), threadId: Id, turnId: Id, messageId: Id, text: Type.String(),
   mediaIds: Type.Optional(Type.Array(Id, { maxItems: 16 })),
   context: Type.Optional(TurnContext),
+  chatContext: Type.Optional(ChatSessionConfigurationSchema),
 });
 const SteerCommand = Type.Object({
   kind: Type.Literal("steer"), threadId: Id, turnId: Id, messageId: Id, text: Type.String(),
@@ -204,6 +213,18 @@ const ConfigRequestFrame = <const O extends string, I extends TSchema>(operation
 /** A routine write names the routine it acts on separately from the published patch body, because
  * the patch schema deliberately has no id: on REST the id is the path segment. */
 const RoutineIdInput = Type.Object({ id: Id }, { additionalProperties: false });
+const ChatProjectsInput = Type.Object({ computerId: Id }, { additionalProperties: false });
+const ChatBranchesInput = Type.Object({ computerId: Id, projectId: Id }, { additionalProperties: false });
+const ChatConfigurationReadInput = Type.Object({ sessionId: Id }, { additionalProperties: false });
+export const AttachV1ChatConfigurationReadResultSchema = Type.Object({
+  computer: ChatComputerSchema,
+  configuration: Type.Union([ChatSessionConfigurationSchema, Type.Null()]),
+}, { additionalProperties: false });
+const ChatConfigurationPrepareInput = Type.Object({ configuration: ChatSessionConfigurationSchema }, { additionalProperties: false });
+export const AttachV1ChatConfigurationPrepareResultSchema = Type.Object({ configuration: ChatSessionConfigurationSchema }, { additionalProperties: false });
+const ProviderConnectionHandoffInput = Type.Object({ handoffId: Id }, { additionalProperties: false });
+export const ProviderConnectionTransferResultSchema = Type.Object({ handoffId: Type.String({ pattern: "^[a-f0-9]{64}$" }) }, { additionalProperties: false });
+const ProviderConnectionIdInput = Type.Object({ id: ModelProviderConnectionIdSchema }, { additionalProperties: false });
 export const AttachV1ConfigRequestSchema = Type.Union([
   ConfigRequestFrame("profile.read", NoInput),
   ConfigRequestFrame("profile.write", BotProfilePatchSchema),
@@ -214,6 +235,16 @@ export const AttachV1ConfigRequestSchema = Type.Union([
   ConfigRequestFrame("routines.update", Type.Object({ id: Id, patch: BotRoutinePatchSchema }, { additionalProperties: false })),
   ConfigRequestFrame("routines.delete", RoutineIdInput),
   ConfigRequestFrame("routines.run", RoutineIdInput),
+  ConfigRequestFrame("chat.projects", ChatProjectsInput),
+  ConfigRequestFrame("chat.branches", ChatBranchesInput),
+  ConfigRequestFrame("chat.configuration.read", ChatConfigurationReadInput),
+  ConfigRequestFrame("chat.configuration.prepare", ChatConfigurationPrepareInput),
+  ConfigRequestFrame("providers.connections.list", NoInput),
+  ConfigRequestFrame("providers.connections.save", ProviderConnectionHandoffInput),
+  ConfigRequestFrame("providers.connections.test", ProviderConnectionIdInput),
+  ConfigRequestFrame("providers.connections.remove", ProviderConnectionIdInput),
+  ConfigRequestFrame("providers.connections.transfer", Type.Object({ id: ModelProviderConnectionIdSchema, executionId: Type.String({ pattern: "^chatx_[a-f0-9]{32}$" }) }, { additionalProperties: false })),
+  ConfigRequestFrame("providers.connections.import", ProviderConnectionHandoffInput),
 ]);
 export type AttachV1ConfigRequest = Static<typeof AttachV1ConfigRequestSchema>;
 /** The answer to an operation that stores no body. `ok: false` is not a refusal channel: a peer
@@ -531,6 +562,10 @@ export const AttachV1ConfigResultSchema = Type.Object({
   result: Type.Optional(Type.Union([
     BotProfileSchema, BotProfileConfigureResponseSchema, BotModelConfigSchema,
     BotRoutineListResponseSchema, BotRoutineWriteResponseSchema, AttachV1ConfigAckSchema,
+    ChatProjectListSchema, ChatBranchListSchema, AttachV1ChatConfigurationReadResultSchema,
+    AttachV1ChatConfigurationPrepareResultSchema,
+    ModelProviderConnectionCatalogSchema,
+    ProviderConnectionTransferResultSchema,
   ])),
   message: Type.Optional(Type.String({ maxLength: 512 })),
 }, { additionalProperties: false });

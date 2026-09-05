@@ -34,6 +34,8 @@ import type {
   BotPendingClarification,
   BotPendingApproval,
   BotRoutine,
+  BotModelConfig,
+  BotModelConfigPatch,
   RichBlock,
   ServerFrame,
 } from "cozygateway-contract";
@@ -45,6 +47,8 @@ import { sanitizeApprovalDetail, type AttachV1EventFrame, type AttachV1MobileReq
 import type { MobileNodeBroker, MobileNodeReceiptInput } from "../mobile-node.ts";
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import type { Storage } from "../storage.ts";
+import type { GatewayChatConfiguration } from "../chat-configuration.ts";
+import { CozyAgentsHarnessModelSettingsAdapter } from "../harness-settings.ts";
 import { ATTACH_MEDIA_TTL_MS } from "./photos.ts";
 import type {
   BotApprovalDecision,
@@ -115,6 +119,8 @@ export interface NativeBotDataPlaneOptions {
    * routines over it, so those surfaces route here instead of refusing. Absent means no gateway on
    * this deployment negotiated the lane and every config surface keeps its 409. */
   botConfig?: ConfigSurface;
+  /** Session execution context is prepared before the first turn is queued. */
+  chatConfiguration?: GatewayChatConfiguration;
   /** Capability 50. The attach-v1 bot-history lane. A runtime bot checkpoints its own workspace
    * and serves the Changes/Undo/Try surface over it. Absent means this deployment serves no
    * history at all and `historySurface()` answers `undefined`, so the routes are never registered
@@ -287,6 +293,7 @@ export class NativeBotDataPlane {
   readonly #runnerName: (runnerId: string) => string | undefined;
   readonly #runtimeLifecycle: RuntimeBotLifecycle | undefined;
   readonly #botConfig: ConfigSurface | undefined;
+  readonly #chatConfiguration: GatewayChatConfiguration | undefined;
   readonly #botHistory: HistorySurface | undefined;
   readonly #chatSuggestion: string;
   readonly #broadcast: (frame: ServerFrame) => void;
@@ -345,6 +352,7 @@ export class NativeBotDataPlane {
     );
     this.#runtimeLifecycle = opts.runtimeLifecycle;
     this.#botConfig = opts.botConfig;
+    this.#chatConfiguration = opts.chatConfiguration;
     this.#botHistory = opts.botHistory;
     this.#chatSuggestion = opts.chatSuggestion;
     this.#broadcast = opts.broadcast;
@@ -458,7 +466,17 @@ export class NativeBotDataPlane {
         return (...args: unknown[]) => {
           const name = typeof args[0] === "string" ? normalize(args[0]) : undefined;
           const runtimeBot = name === undefined ? undefined : this.#runtimeBots.get(name);
+          if ((property === "modelConfig" || property === "configureModel") && name !== undefined && runtimeBot === undefined && this.#botConfig !== undefined
+              && this.#ingress.negotiatedCapabilities?.(name)?.has("provider_connections")) {
+            if (property === "modelConfig") return this.#hermesModelConfig(name);
+            if (property === "configureModel") return this.#configureHermesModel(name, args[1] as BotModelConfigPatch);
+          }
           if (name === undefined || runtimeBot === undefined) return bound(...args);
+          if (property === "modelProviders" && this.#botConfig !== undefined) {
+            return new CozyAgentsHarnessModelSettingsAdapter(
+              () => [{ id: name, name: runtimeBot.name }], (bot) => this.#botConfig!.modelConfig(bot),
+            ).modelProviders(name);
+          }
           // A runtime bot owns its own profile, model selection and routines and serves them over
           // the attach-v1 config lane, so those methods are answered by the peer rather than
           // refused. Everything else in this set has no peer-side equivalent and keeps its 409:
@@ -481,6 +499,31 @@ export class NativeBotDataPlane {
         };
       },
     }) as BotsSurface;
+  }
+
+  async #hermesModelConfig(name: string): Promise<BotModelConfig> {
+    const [builtin, custom] = await Promise.all([this.#control.modelConfig(name), this.#botConfig!.modelConfig(name)]);
+    return {
+      model: custom.model ?? builtin.model, effort: custom.model ? custom.effort ?? builtin.effort : builtin.effort,
+      catalog: [...builtin.catalog, ...custom.catalog.filter((entry) => !builtin.catalog.some((existing) => existing.id === entry.id))],
+      efforts: [...new Set([...builtin.efforts, ...custom.efforts])],
+      providers: [...builtin.providers ?? [], ...custom.providers ?? []],
+    };
+  }
+
+  async #configureHermesModel(name: string, patch: BotModelConfigPatch): Promise<BotModelConfig> {
+    const current = await this.#botConfig!.modelConfig(name);
+    const custom = typeof patch.model === "string" && patch.model.startsWith("custom-")
+      || patch.model === undefined && current.model?.startsWith("custom-");
+    if (custom) {
+      if (patch.model !== undefined) await this.#botConfig!.configureModel(name, { model: patch.model });
+      if (patch.effort !== undefined) await this.#control.configureModel(name, { effort: patch.effort });
+    }
+    else {
+      await this.#control.configureModel(name, patch);
+      if (patch.model !== undefined) await this.#botConfig!.configureModel(name, { model: null });
+    }
+    return this.#hermesModelConfig(name);
   }
 
   #pendingApprovals(): BotPendingApproval[] {
@@ -780,9 +823,39 @@ export class NativeBotDataPlane {
     return this.#native.has(normalize(bot));
   }
 
+  /** Resolve a source Bot Chat/session to its attached peer. Once a session has an execution row,
+   * it must be ready on that exact peer; falling back to the source profile would run it in the
+   * wrong workspace. Legacy chats with no execution row retain their existing source-peer lane. */
+  #executionPeer(bot: string, sessionId: string): string | undefined {
+    const execution = this.#storage.chatExecution(bot, sessionId);
+    if (execution === undefined) return bot;
+    return execution.stage === "ready" ? execution.executionId : undefined;
+  }
+
+  /** Translate an authenticated execution peer back to its source bot only for its bound session.
+   * Events from a different session are refused before they enter the durable inbox. */
+  #eventRoute(agentId: string, frame: AttachV1EventFrame): { bot: string; peer: string } | undefined {
+    const direct = normalize(agentId);
+    if (this.handles(direct)) {
+      // Once a session is assigned to an execution peer, its source profile cannot still write
+      // the same transcript merely because it remains attached for other chats and rooms.
+      if ("threadId" in frame.event && this.#storage.chatExecution(direct, frame.event.threadId) !== undefined)
+        return undefined;
+      return { bot: direct, peer: agentId };
+    }
+    const execution = this.#storage.chatExecutionById(agentId);
+    if (execution === undefined || execution.stage !== "ready" || !this.handles(execution.bot)) return undefined;
+    if (!("threadId" in frame.event) || frame.event.threadId !== execution.sessionId) return undefined;
+    // Desktop adoption and canonical scheduled delivery are profile-owned, never a remote chat
+    // execution. Let their original source lane keep handling them.
+    if (frame.event.kind === "desktop_session_resumed" || frame.event.kind === "desktop_session_message" || frame.event.kind === "scheduled") return undefined;
+    return { bot: execution.bot, peer: agentId };
+  }
+
   canAccept(bot: string, frame: AttachV1EventFrame): boolean {
-    const key = normalize(bot);
-    if (!this.handles(key)) return false;
+    const route = this.#eventRoute(bot, frame);
+    if (route === undefined) return false;
+    const key = route.bot;
     if (frame.event.kind === "scheduled") {
       if ("target" in frame.event) return frame.event.target.kind === "canonical_home";
       return frame.event.threadId === this.#storage.nativeBotChat(key, this.#now()).sessionId;
@@ -808,25 +881,34 @@ export class NativeBotDataPlane {
   }
 
   mobileRequest(bot: string, frame: AttachV1MobileRequest): void {
-    const key = normalize(bot);
+    const peer = bot;
+    let key = normalize(bot);
     if (!this.handles(key)) {
-      this.#mobileNode?.reject(key, frame.requestId);
+      const execution = this.#storage.chatExecutionById(bot);
+      if (execution === undefined || execution.stage !== "ready" || !this.handles(execution.bot)
+          || execution.sessionId !== frame.threadId) {
+        this.#mobileNode?.reject(peer, frame.requestId);
+        return;
+      }
+      key = execution.bot;
+    } else if (this.#storage.chatExecution(key, frame.threadId) !== undefined) {
+      this.#mobileNode?.reject(peer, frame.requestId);
       return;
     }
     const privateOrigin = this.#cozyAppOrigins.get(this.#nativeTurnKey(key, frame.threadId, frame.turnId));
     if (privateOrigin !== undefined) {
       if (privateOrigin.expiresAt < this.#now()) {
         this.#cozyAppOrigins.delete(this.#nativeTurnKey(key, frame.threadId, frame.turnId));
-        this.#mobileNode?.reject(key, frame.requestId);
+        this.#mobileNode?.reject(peer, frame.requestId);
         return;
       }
       const { kind: _kind, ...request } = frame;
-      this.#mobileNode?.invoke({ ...request, bot: key, agentId: key, deviceId: privateOrigin.deviceId });
+      this.#mobileNode?.invoke({ ...request, bot: key, agentId: peer, deviceId: privateOrigin.deviceId });
       return;
     }
     const chat = this.#storage.nativeBotChat(key, this.#now());
     if (chat.sessionId !== frame.threadId || chat.activeTurnId !== frame.turnId) {
-      this.#mobileNode?.reject(key, frame.requestId);
+      this.#mobileNode?.reject(peer, frame.requestId);
       return;
     }
     // `kind` belongs to the attach envelope, not to the phone frame. Spreading the whole attach
@@ -834,7 +916,7 @@ export class NativeBotDataPlane {
     // anything carrying an extra one. Strip it here, at the boundary it stops being meaningful.
     const { kind: _kind, ...request } = frame;
     this.#mobileNode?.invoke({
-      ...request, bot: key, agentId: key, deviceId: this.#turnOrigins.get(this.#nativeTurnKey(key, frame.threadId, frame.turnId)),
+      ...request, bot: key, agentId: peer, deviceId: this.#turnOrigins.get(this.#nativeTurnKey(key, frame.threadId, frame.turnId)),
     });
   }
 
@@ -896,7 +978,8 @@ export class NativeBotDataPlane {
   }
 
   handleAttachPresence(bot: string, state: "online" | "degraded" | "absent"): void {
-    const key = normalize(bot);
+    const execution = this.#storage.chatExecutionById(bot);
+    const key = execution?.stage === "ready" ? execution.bot : normalize(bot);
     if (!this.handles(key)) return;
     this.#attachPresence.set(key, state);
     const chat = this.#storage.nativeBotChat(key, this.#now());
@@ -926,8 +1009,10 @@ export class NativeBotDataPlane {
   }
 
   handle(bot: string, frame: AttachV1EventFrame): boolean {
-    const key = normalize(bot);
-    if (!this.handles(key)) return false;
+    const route = this.#eventRoute(bot, frame);
+    if (route === undefined) return false;
+    const key = route.bot;
+    const peer = route.peer;
     const event = frame.event;
     if (event.kind === "presence" || event.kind === "media") return true;
     if (event.kind === "desktop_session_resumed") {
@@ -1004,7 +1089,7 @@ export class NativeBotDataPlane {
     // own durable group-turn binding.
     if (!this.#storage.nativeBotHasSession(key, sessionId)) return false;
     if ("turnId" in event) {
-      const command = this.#storage.attachTurnCommand(key, event.turnId);
+      const command = this.#storage.attachTurnCommand(peer, event.turnId);
       const terminal = this.#storage.nativeBotTurnTerminal(key, sessionId, event.turnId);
       if (terminal !== undefined) {
         // A delegation batch legitimately outlives its turn (async delegate_task): a child's
@@ -1012,7 +1097,7 @@ export class NativeBotDataPlane {
         // at-least-once replay of an already-settled state is acknowledged inside #delegation.
         if (event.kind === "delegation")
           return this.#delegation(key, sessionId, event, false);
-        const delivery = this.#storage.nativeBotTurnDelivery(key, event.turnId);
+        const delivery = this.#storage.nativeBotTurnDelivery(peer, event.turnId);
         // An acknowledged Hermes turn may finish after something else sealed it: the local
         // response deadline, the stale-turn reaper, or the plugin's own interrupt seal. The
         // durable reply is still authoritative -- it is the one thing the user was waiting for,
@@ -1383,19 +1468,20 @@ export class NativeBotDataPlane {
     // A deletion is only committed with its receiver tombstone. The negotiated capability is
     // durable across an attach outage, but an unverified or older runtime must not lose a
     // conversation it cannot be told to forget.
-    if (!this.#ingress.canSendSessionDeletion(bot))
+    const peer = this.#executionPeer(bot, sessionId);
+    if (peer === undefined || !this.#ingress.canSendSessionDeletion(peer))
       throw new BackendUnavailable("cannot delete a conversation until the attached runtime has negotiated capability 60");
     const now = this.#now();
     const deleted = this.#storage.deleteNativeBotSession({
       bot, sessionId, deletedAt: now,
-      enqueue: true,
+      enqueue: true, outboxAgentId: peer,
     });
     if (deleted.outcome === "not_found") throw new BotSessionNotFound(sessionId);
     if (deleted.outcome === "foreign") throw new BotSessionConflict(sessionId, "another bot");
     if (deleted.outcome === "current") throw new BackendUnavailable("cannot delete the active conversation; select another session first");
     if (deleted.outcome === "active") throw new BackendUnavailable("cannot delete a conversation with a running turn");
     if (deleted.outcome !== "deleted") throw new BotSessionNotFound(sessionId);
-    this.#ingress.flushQueuedCommands(bot);
+    this.#ingress.flushQueuedCommands(peer);
     return { name: bot, sessionId, deletedAt: deleted.deletedAt };
   }
 
@@ -1436,14 +1522,26 @@ export class NativeBotDataPlane {
     const chat = this.#storage.nativeBotChat(bot, now);
     const messageId = opts?.clientId ?? randomUUID();
     const turnId = chat.activeTurnId ?? randomUUID();
+    // Context preparation may await the runtime. It rechecks the stored selection before it
+    // returns, so no selection changed while preparing can be admitted with an older carrier.
+    const chatContext = chat.activeTurnId === undefined && this.#chatConfiguration !== undefined
+      ? (await this.#chatConfiguration.prepareContext(bot, chat.sessionId)).configuration
+      : undefined;
+    const currentChat = this.#storage.nativeBotChat(bot, this.#now());
+    if (currentChat.sessionId !== chat.sessionId || currentChat.activeTurnId !== chat.activeTurnId)
+      throw new BackendUnavailable("This chat changed while its workspace was starting. Try sending again.");
+    const peer = this.#executionPeer(bot, chat.sessionId);
+    if (peer === undefined)
+      throw new BackendUnavailable(`chat execution for "${bot}" is not ready`);
     const accepted = chat.activeTurnId === undefined
-      ? this.#ingress.sendNativeTurn(bot, {
+      ? this.#ingress.sendNativeTurn(peer, {
           threadId: chat.sessionId,
           turnId,
           messageId,
           text,
+          ...(chatContext?.workspace == null && chatContext?.model == null ? {} : { chatContext }),
         })
-      : this.#ingress.sendNativeSteer(bot, {
+      : this.#ingress.sendNativeSteer(peer, {
           threadId: chat.sessionId,
           turnId,
           messageId,
@@ -1451,6 +1549,8 @@ export class NativeBotDataPlane {
         });
     if (!accepted)
       throw new BackendUnavailable(`native attach-v1 profile "${bot}" is unavailable`);
+    if (chat.activeTurnId === undefined && this.#chatConfiguration !== undefined)
+      this.#chatConfiguration.recordAcceptedTurn(bot, chat.sessionId);
     const message = this.#storage.appendNativeBotMessage({
       bot,
       sessionId: chat.sessionId,
@@ -1483,7 +1583,8 @@ export class NativeBotDataPlane {
     const chat = this.#storage.nativeBotChat(bot, this.#now());
     if (chat.activeTurnId === undefined) return "idle";
     this.#cancelMobileTurn(bot, chat.sessionId, chat.activeTurnId);
-    if (!this.#ingress.sendNativeInterrupt(bot, {
+    const peer = this.#executionPeer(bot, chat.sessionId);
+    if (peer === undefined || !this.#ingress.sendNativeInterrupt(peer, {
       threadId: chat.sessionId,
       turnId: chat.activeTurnId,
     })) {
@@ -1552,10 +1653,19 @@ export class NativeBotDataPlane {
         `native attach-v1 profile "${bot}" cannot accept a ${input.label} while a turn is running`,
       );
     }
+    const chatContext = this.#chatConfiguration === undefined
+      ? undefined
+      : (await this.#chatConfiguration.prepareContext(bot, chat.sessionId)).configuration;
+    const currentChat = this.#storage.nativeBotChat(bot, this.#now());
+    if (currentChat.sessionId !== chat.sessionId || currentChat.activeTurnId !== chat.activeTurnId)
+      throw new BackendUnavailable("This chat changed while its workspace was starting. Try sending again.");
+    const peer = this.#executionPeer(bot, chat.sessionId);
+    if (peer === undefined)
+      throw new BackendUnavailable(`chat execution for "${bot}" is not ready`);
     // Persist before the socket can carry the command into another process. If enqueue rejects,
     // remove this exact unreferenced row so failure stays atomic from the app's point of view.
     this.#storage.saveAttachMedia(
-      bot,
+      peer,
       {
         mediaId,
         mimeType: input.mime,
@@ -1568,16 +1678,19 @@ export class NativeBotDataPlane {
       input.bytes,
       now,
     );
-    if (!this.#ingress.sendNativeTurn(bot, {
+    if (!this.#ingress.sendNativeTurn(peer, {
       threadId: chat.sessionId,
       turnId,
       messageId,
       text: input.text,
       mediaIds: [mediaId],
+      ...(chatContext?.workspace == null && chatContext?.model == null ? {} : { chatContext }),
     })) {
-      this.#storage.deleteAttachMedia(bot, mediaId);
+      this.#storage.deleteAttachMedia(peer, mediaId);
       throw new BackendUnavailable(`native attach-v1 profile "${bot}" is unavailable`);
     }
+    if (this.#chatConfiguration !== undefined)
+      this.#chatConfiguration.recordAcceptedTurn(bot, chat.sessionId);
     const attachment: AttachmentBlock = {
       type: "attachment",
       fileId: mediaId,
@@ -1628,7 +1741,8 @@ export class NativeBotDataPlane {
     if (previous.activeTurnId !== undefined) {
       this.#discardLiveTurn(this.#nativeTurnKey(bot, previous.sessionId, previous.activeTurnId));
       this.#cancelMobileTurn(bot, previous.sessionId, previous.activeTurnId);
-      this.#ingress.sendNativeInterrupt(bot, {
+      const peer = this.#executionPeer(bot, previous.sessionId);
+      if (peer !== undefined) this.#ingress.sendNativeInterrupt(peer, {
         threadId: previous.sessionId,
         turnId: previous.activeTurnId,
       });
@@ -1660,12 +1774,14 @@ export class NativeBotDataPlane {
     if (binding === undefined) return "unknown";
     if (binding.status !== "pending")
       return binding.status === "expired" ? "expired" : "not_pending";
-    const requested = this.#ingress.requestNativeApprovalResolution(bot, {
+    const peer = this.#executionPeer(bot, binding.sessionId);
+    if (peer === undefined) return "unsupported";
+    const requested = this.#ingress.requestNativeApprovalResolution(peer, {
       threadId: binding.sessionId,
       turnId: binding.turnId,
       approvalId,
       decision,
-    });
+    }, bot);
     if (requested.outcome === "expired") {
       // Capability 51: a room interaction's session is a member thread, never a chat session.
       const room = payloadRoom(binding.payload);
@@ -1698,12 +1814,14 @@ export class NativeBotDataPlane {
     const payload = binding.payload as ClarifyPayload;
     if (!payload.options.some((option) => option.id === optionId))
       return "invalid_option";
-    const requested = this.#ingress.requestNativeClarifyResolution(bot, {
+    const peer = this.#executionPeer(bot, binding.sessionId);
+    if (peer === undefined) return "unsupported";
+    const requested = this.#ingress.requestNativeClarifyResolution(peer, {
       threadId: binding.sessionId,
       turnId: binding.turnId,
       clarifyId,
       optionId,
-    });
+    }, bot);
     if (requested.outcome === "expired") {
       const room = payloadRoom(binding.payload);
       this.#clearInteractionTimer("clarify", bot, clarifyId);
@@ -2487,10 +2605,11 @@ export class NativeBotDataPlane {
         ...(terminal.cause === undefined ? {} : { cause: terminal.cause }),
       };
     }
-    const delivery = this.#storage.nativeBotTurnDelivery(bot, turnId);
-    const presence = this.#attachPresence.get(bot);
+    const peer = this.#executionPeer(bot, sessionId);
+    const delivery = peer === undefined ? undefined : this.#storage.nativeBotTurnDelivery(peer, turnId);
+    const presence = peer === undefined ? "absent" : this.#attachPresence.get(peer);
     const detached = presence === undefined
-      ? this.#ingress.isAttached?.(bot) !== true
+      ? this.#ingress.isAttached?.(peer ?? bot) !== true
       : presence !== "online";
     const connection = detached
       ? presence === "degraded"
@@ -2528,7 +2647,8 @@ export class NativeBotDataPlane {
 
   #scheduleTurnTimeout(bot: string, sessionId: string, turnId: string): void {
     if (this.#turnTimeoutMs <= 0) return;
-    const delivery = this.#storage.nativeBotTurnDelivery(bot, turnId);
+    const peer = this.#executionPeer(bot, sessionId);
+    const delivery = peer === undefined ? undefined : this.#storage.nativeBotTurnDelivery(peer, turnId);
     if (delivery === undefined) return;
     this.#clearTurnTimeout(bot, sessionId, turnId);
     const key = this.#nativeTurnKey(bot, sessionId, turnId);
@@ -2544,18 +2664,19 @@ export class NativeBotDataPlane {
     this.#turnTimers.delete(this.#nativeTurnKey(bot, sessionId, turnId));
     const chat = this.#storage.nativeBotChat(bot, this.#now());
     if (chat.sessionId !== sessionId || chat.activeTurnId !== turnId) return;
-    const delivery = this.#storage.nativeBotTurnDelivery(bot, turnId);
+    const peer = this.#executionPeer(bot, sessionId);
+    const delivery = peer === undefined ? undefined : this.#storage.nativeBotTurnDelivery(peer, turnId);
     if (delivery === undefined) return;
     if (delivery.acknowledgedAt === null) {
       this.#storage.cancelAttachCommand(
-        bot,
+        peer ?? bot,
         delivery.sequence,
         delivery.commandId,
         "native turn timed out",
         this.#now(),
       );
     } else {
-      this.#ingress.sendNativeInterrupt(bot, { threadId: sessionId, turnId });
+      if (peer !== undefined) this.#ingress.sendNativeInterrupt(peer, { threadId: sessionId, turnId });
     }
     this.#finish(bot, sessionId, turnId, {
       phase: "timeout",
@@ -2566,7 +2687,8 @@ export class NativeBotDataPlane {
   #seedTurnActivity(bot: string, sessionId: string, turnId: string): void {
     const key = this.#nativeTurnKey(bot, sessionId, turnId);
     if (!this.#turnActivity.has(key)) {
-      const delivery = this.#storage.nativeBotTurnDelivery(bot, turnId);
+      const peer = this.#executionPeer(bot, sessionId);
+      const delivery = peer === undefined ? undefined : this.#storage.nativeBotTurnDelivery(peer, turnId);
       this.#turnActivity.set(key, delivery?.queuedAt ?? this.#now());
     }
     this.#startStaleTurnSweep();

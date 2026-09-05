@@ -62,7 +62,7 @@ export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
  *  capability; it does NOT prove the list is complete, so adding one to the schema and forgetting
  *  it here type-checks cleanly and silently refuses the surface at negotiation. A test compares
  *  this list against the schema for exactly that reason. */
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "memory_ownership", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "bot_config", "bot_history", "session_deletion"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "memory_ownership", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "bot_config", "chat_configuration", "provider_connections", "bot_history", "session_deletion"] as const satisfies readonly AttachV1Capability[];
 
 /** Why a memory request did or did not reach the attached plugin. */
 export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
@@ -338,8 +338,8 @@ export class AttachV1Ingress implements TurnEndpoint {
         return;
       }
       if (frame.kind === "config_result") {
-        if (!connection.capabilities.has("bot_config")) {
-          socket.close(1008, "attach-v1 capability not negotiated: bot_config");
+        if (!connection.capabilities.has("bot_config") && !connection.capabilities.has("chat_configuration") && !connection.capabilities.has("provider_connections")) {
+          socket.close(1008, "attach-v1 capability not negotiated: config lane");
           return;
         }
         this.#events.onConfigResult?.(agentId, frame);
@@ -521,13 +521,15 @@ export class AttachV1Ingress implements TurnEndpoint {
   requestNativeApprovalResolution(
     agentId: string,
     input: { threadId: string; turnId: string; approvalId: string; decision: "approve" | "deny" },
+    sourceBot = agentId,
   ): NativeInteractionResolutionRequest | { outcome: "unsupported" } {
     const requestedAt = this.#now();
-    const expired = this.#storage.expireNativeInteractionIfDue(agentId, "approval", input.approvalId, requestedAt);
+    const expired = this.#storage.expireNativeInteractionIfDue(sourceBot, "approval", input.approvalId, requestedAt);
     if (expired !== undefined) return { outcome: "expired", ...expired };
     if (!this.#canResolve(agentId, "approvals")) return { outcome: "unsupported" };
     const result = this.#storage.requestNativeInteractionResolution({
-      bot: agentId,
+      bot: sourceBot,
+      outboxAgentId: agentId,
       kind: "approval",
       interactionId: input.approvalId,
       decision: input.decision,
@@ -609,7 +611,9 @@ export class AttachV1Ingress implements TurnEndpoint {
     if (![...this.#tokens.values()].includes(agentId)) return "unknown_bot";
     const connection = this.#current.get(agentId);
     if (connection?.hello !== true) return "not_attached";
-    if (!connection.capabilities.has("bot_config")) return "capability_not_negotiated";
+    const capability = input.operation.startsWith("chat.") ? "chat_configuration"
+      : input.operation.startsWith("providers.connections.") ? "provider_connections" : "bot_config";
+    if (!connection.capabilities.has(capability)) return "capability_not_negotiated";
     return this.#send(connection, input) ? "sent" : "not_attached";
   }
 
@@ -627,13 +631,15 @@ export class AttachV1Ingress implements TurnEndpoint {
   requestNativeClarifyResolution(
     agentId: string,
     input: { threadId: string; turnId: string; clarifyId: string; optionId: string },
+    sourceBot = agentId,
   ): NativeInteractionResolutionRequest | { outcome: "unsupported" } {
     const requestedAt = this.#now();
-    const expired = this.#storage.expireNativeInteractionIfDue(agentId, "clarify", input.clarifyId, requestedAt);
+    const expired = this.#storage.expireNativeInteractionIfDue(sourceBot, "clarify", input.clarifyId, requestedAt);
     if (expired !== undefined) return { outcome: "expired", ...expired };
     if (!this.#canResolve(agentId, "clarify")) return { outcome: "unsupported" };
     const result = this.#storage.requestNativeInteractionResolution({
-      bot: agentId,
+      bot: sourceBot,
+      outboxAgentId: agentId,
       kind: "clarify",
       interactionId: input.clarifyId,
       decision: "select",

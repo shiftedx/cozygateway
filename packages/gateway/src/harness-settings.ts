@@ -3,6 +3,7 @@ import type {
   GatewayHarnessCatalog,
   ModelProviderOAuthSession,
   ModelProviderSetupCatalog,
+  BotModelConfig,
 } from "cozygateway-contract";
 
 import type { HermesBridgeConfig, ResolvedHermesEndpoint } from "./config.ts";
@@ -119,6 +120,52 @@ export class GatewayHarnessSettings {
     if (!adapter) throw new HarnessSettingsInvalid(`unknown agent harness: ${harnessId}`);
     return adapter;
   }
+}
+
+/** CozyAgents keeps the Pi catalog and credentials on each runtime. This adapter only projects
+ * that catalog into the same Settings navigation used by other harnesses. */
+export class CozyAgentsHarnessModelSettingsAdapter implements HarnessModelSettingsAdapter {
+  readonly scopes: () => GatewayHarness["scopes"];
+  readonly read: (bot: string) => Promise<BotModelConfig>;
+  constructor(
+    scopes: () => GatewayHarness["scopes"],
+    read: (bot: string) => Promise<BotModelConfig>,
+  ) { this.scopes = scopes; this.read = read; }
+
+  descriptor(): GatewayHarness {
+    return {
+      id: "cozyagents", vendor: { id: "cozyagents", name: "CozyAgents", logoAsset: "cozyagents" }, scopes: this.scopes(),
+    };
+  }
+
+  async modelProviders(scopeId: string): Promise<ModelProviderSetupCatalog> {
+    if (!this.scopes().some((scope) => scope.id === scopeId)) throw new HarnessSettingsInvalid("unknown CozyAgents scope");
+    const config = await this.read(scopeId);
+    const ids = new Set([
+      ...(config.providers ?? []).map((provider) => provider.slug),
+      ...config.catalog.flatMap((model) => model.id.includes(":") ? [model.id.split(":", 1)[0]!] : []),
+    ]);
+    return {
+      providers: [...ids].filter((id) => !id.startsWith("custom-")).map((id) => {
+        const provider = config.providers?.find((entry) => entry.slug === id);
+        const models = config.catalog.filter((entry) => entry.id.startsWith(`${id}:`));
+        return {
+          slug: id, name: provider?.name ?? id,
+          authenticated: provider?.authenticated ?? models.some((entry) => !entry.unauthenticated),
+          models: models.map((entry) => entry.id.slice(id.length + 1)),
+          modelCount: models.length, methods: [],
+        };
+      }),
+      updatedAt: Date.now(),
+    };
+  }
+
+  async configureField(): Promise<ModelProviderSetupCatalog> { throw new HarnessSettingsInvalid("this provider is configured by its runtime"); }
+  async clearField(): Promise<ModelProviderSetupCatalog> { throw new HarnessSettingsInvalid("this provider is configured by its runtime"); }
+  async startOAuth(): Promise<ModelProviderOAuthSession> { throw new HarnessSettingsInvalid("OAuth is unavailable on this runtime"); }
+  async pollOAuth(): Promise<ModelProviderOAuthSession> { throw new HarnessSettingsInvalid("OAuth is unavailable on this runtime"); }
+  async submitOAuthCode(): Promise<ModelProviderOAuthSession> { throw new HarnessSettingsInvalid("OAuth is unavailable on this runtime"); }
+  async cancelOAuth(): Promise<void> { throw new HarnessSettingsInvalid("OAuth is unavailable on this runtime"); }
 }
 
 function visibleScopes(config: HermesBridgeConfig): GatewayHarness["scopes"] {

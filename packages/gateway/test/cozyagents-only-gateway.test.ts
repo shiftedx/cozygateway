@@ -73,7 +73,9 @@ describe("a gateway configured with no Hermes endpoint", () => {
     };
     expect(health.capabilities["com.cozylabs.bots"]).toBeGreaterThanOrEqual(52);
     expect(health.capabilities["com.cozylabs.hermes-desktop-sessions"]).toBeUndefined();
-    expect(health.capabilities["com.cozylabs.harness-settings"]).toBeUndefined();
+    expect(health.capabilities["com.cozylabs.harness-settings"]).toBe(1);
+    expect(health.capabilities["com.cozylabs.provider-connections"]).toBe(1);
+    expect(health.capabilities["com.cozylabs.chat-configuration"]).toBe(1);
     expect(health.bridges).toEqual({ hermes: "absent" });
   });
 

@@ -165,6 +165,7 @@ class TurnFrame:
     turn_id: str
     text: str
     media_ids: List[str] = field(default_factory=list)
+    chat_context: Optional[Dict[str, Any]] = None
 
 
 def parse_turn_frame(frame: Any) -> Optional[TurnFrame]:
@@ -189,7 +190,42 @@ def parse_turn_frame(frame: Any) -> Optional[TurnFrame]:
         media_ids = []
     if not isinstance(media_ids, list) or len(media_ids) > 16 or any(not isinstance(item, str) or not item for item in media_ids):
         return None
-    return TurnFrame(thread_id=thread_id, turn_id=turn_id, text=text, media_ids=media_ids)
+    chat_context = frame.get("chatContext")
+    if chat_context is not None:
+        if not _valid_chat_context(chat_context, thread_id):
+            return None
+    return TurnFrame(thread_id=thread_id, turn_id=turn_id, text=text, media_ids=media_ids, chat_context=chat_context)
+
+
+def _valid_chat_context(value: Any, thread_id: str) -> bool:
+    """Keep the carrier bound to the same stable attach thread before an adapter acts on it.
+
+    The gateway prepares the context before enqueue; this parser is the second boundary so a
+    malformed or cross-session replay cannot be applied to a different Hermes session.
+    """
+    if not isinstance(value, dict) or set(value) != {"sessionId", "workspace", "model"}:
+        return False
+    if value.get("sessionId") != thread_id:
+        return False
+    workspace = value.get("workspace")
+    model = value.get("model")
+    if workspace is not None:
+        if not isinstance(workspace, dict) or set(workspace) - {"computerId", "projectId", "mode", "branch"}:
+            return False
+        if not isinstance(workspace.get("computerId"), str) or not isinstance(workspace.get("projectId"), str):
+            return False
+        if workspace.get("mode") not in {"direct", "worktree"}:
+            return False
+        if "branch" in workspace and (not isinstance(workspace["branch"], str) or not workspace["branch"]):
+            return False
+    if model is not None:
+        if not isinstance(model, dict) or set(model) - {"providerId", "modelId", "effort"}:
+            return False
+        if not isinstance(model.get("providerId"), str) or not isinstance(model.get("modelId"), str):
+            return False
+        if "effort" in model and (not isinstance(model["effort"], str) or not model["effort"]):
+            return False
+    return True
 
 
 @dataclass

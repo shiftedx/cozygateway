@@ -366,8 +366,38 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
             "draft", "media", "tools", "approvals", "clarify", "scheduled",
             "mobile_node", "mobile_location", "mobile_media", "mobile_notifications",
             "memory_management", "memory_setup", "delivery_receipts", "delegation", "thinking",
-            "desktop_session_resume", "desktop_session_sync", "cozyapps",
+            "desktop_session_resume", "desktop_session_sync", "cozyapps", "bot_config", "chat_configuration", "provider_connections",
         })
+
+    async def test_provider_handoff_uses_the_attach_bearer_without_a_socket_frame(self):
+        class HandoffResponse:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def read(self, _limit): return b'{"name":"Local","baseUrl":"https://local.test/v1","apiKey":"secret"}'
+
+        with patch("cozygateway.attach_client_v1.urlopen", return_value=HandoffResponse()) as opener:
+            handoff = await self.client.fetch_provider_handoff("handoff id")
+        self.assertEqual(handoff["apiKey"], "secret")
+        request = opener.call_args.args[0]
+        self.assertTrue(request.full_url.endswith("/attach/v1/provider-handoffs/handoff%20id"))
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+        self.assertFalse(any(frame["kind"] == "config_result" for frame in self.socket.sent))
+
+    async def test_provider_transfer_posts_a_bounded_private_payload_without_redirects(self):
+        class TransferResponse:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def read(self, _limit): return b'{"handoffId":"handoff"}'
+        class Opener:
+            def __init__(self): self.request = None
+            def open(self, request, timeout): self.request = request; self.timeout = timeout; return TransferResponse()
+        opener = Opener()
+        with patch("cozygateway.attach_client_v1.build_opener", return_value=opener):
+            handoff = await self.client.transfer_provider_connection("execution", {"id":"custom-id","name":"Local","baseUrl":"https://local.test/v1","apiKey":"secret","manualModels":["model"]})
+        self.assertEqual(handoff, "handoff"); self.assertEqual(opener.timeout, 5)
+        self.assertTrue(opener.request.full_url.endswith("/attach/v1/provider-transfers/execution"))
+        self.assertEqual(opener.request.get_header("Authorization"), "Bearer secret")
+        self.assertIn(b'"apiKey":"secret"', opener.request.data)
 
     def test_hello_ack_budget_is_not_a_one_second_race(self):
         """Regression: the budget was 1s and named for mobile status.

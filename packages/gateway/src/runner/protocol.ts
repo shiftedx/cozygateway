@@ -1,4 +1,58 @@
 import { type Static, Type } from "@sinclair/typebox";
+import { ChatBranchSchema, ChatProjectSchema, type ChatWorkspaceSelection } from "cozygateway-contract";
+
+export const ChatExecutionStageSchema = Type.Union([
+  Type.Literal("starting"), Type.Literal("ready"), Type.Literal("deleted"), Type.Literal("failed"),
+]);
+const ChatExecutionIdentity = {
+  executionId: Type.String({ pattern: "^chatx_[0-9a-f]{32}$" }),
+  botId: Type.String({ minLength: 1, maxLength: 64 }),
+  sessionId: Type.String({ minLength: 1, maxLength: 200 }),
+  stage: ChatExecutionStageSchema,
+};
+export const RunnerChatExecutionReceiptSchema = Type.Object({
+  kind: Type.Literal("chat_execution_receipt"),
+  operationId: Type.String({ minLength: 1, maxLength: 120 }),
+  ...ChatExecutionIdentity,
+  code: Type.Optional(Type.String({ pattern: "^[a-z0-9_]{1,120}$" })),
+}, { additionalProperties: false });
+export type RunnerChatExecutionReceipt = Static<typeof RunnerChatExecutionReceiptSchema>;
+export const RunnerChatWorkspaceResultSchema = Type.Object({
+  kind: Type.Literal("chat_workspace_result"),
+  requestId: Type.String({ minLength: 1, maxLength: 120 }),
+  result: Type.Optional(Type.Union([
+    Type.Object({ projects: Type.Array(ChatProjectSchema, { maxItems: 1024 }) }, { additionalProperties: false }),
+    Type.Object({ branches: Type.Array(ChatBranchSchema, { maxItems: 4096 }) }, { additionalProperties: false }),
+  ])),
+  error: Type.Optional(Type.Object({ code: Type.String({ pattern: "^[a-z0-9_]{1,120}$" }) }, { additionalProperties: false })),
+}, { additionalProperties: false });
+export type RunnerChatWorkspaceResult = Static<typeof RunnerChatWorkspaceResultSchema>;
+export type RunnerChatFrame = RunnerChatExecutionReceipt | RunnerChatWorkspaceResult;
+
+export interface RunnerCreateChatExecutionPayload {
+  operationId: string;
+  executionId: string;
+  botId: string;
+  sessionId: string;
+  attachToken: string;
+  model?: RunnerCreateRuntimePayload["model"];
+  credentialMode?: "transfer_required";
+  harness?: "cozyagents" | "hermes";
+  workspace: ChatWorkspaceSelection;
+  sourceProfile?: {
+    soul?: string;
+    disabledSkills?: string[];
+    enabledSkills?: string[];
+    enabledToolsets?: string[];
+    enabledMcpServers?: string[];
+    guardrailLevel?: string;
+  };
+}
+export type RunnerChatCommandFrame =
+  | { kind: "command"; command: "create_chat_execution"; payload: RunnerCreateChatExecutionPayload }
+  | { kind: "command"; command: "delete_chat_execution"; payload: { operationId: string; executionId: string } }
+  | { kind: "command"; command: "list_chat_projects"; payload: { requestId: string } }
+  | { kind: "command"; command: "list_chat_branches"; payload: { requestId: string; projectId: string } };
 
 /** The private control protocol between this gateway and one CozyRunner (ADR 0002, capability 49).
  *  It is NOT the app-facing contract: no phone speaks it, and nothing here is published in
@@ -64,6 +118,9 @@ export const RunnerHelloSchema = Type.Object({
     }),
   ),
   agentVersion: Type.Optional(Type.String({ minLength: 1, maxLength: 40 })),
+  capabilities: Type.Optional(Type.Object({ chat_execution: Type.Optional(Type.Literal(1)) })),
+  chatExecutionHarnesses: Type.Optional(Type.Array(Type.Union([Type.Literal("cozyagents"), Type.Literal("hermes")]), { maxItems: 2, uniqueItems: true })),
+  executionInventory: Type.Optional(Type.Array(Type.Object(ChatExecutionIdentity), { maxItems: 256 })),
   inventory: Type.Optional(
     Type.Array(
       // Additive fields are ALLOWED here and on every other runner frame: a runner that starts
@@ -104,6 +161,8 @@ export const RunnerClientFrameSchema = Type.Union([
   RunnerHelloSchema,
   RunnerHeartbeatSchema,
   RunnerReceiptSchema,
+  RunnerChatExecutionReceiptSchema,
+  RunnerChatWorkspaceResultSchema,
 ]);
 export type RunnerClientFrame = Static<typeof RunnerClientFrameSchema>;
 
@@ -139,15 +198,16 @@ export interface RunnerDeleteRuntimePayload {
 /** The frame kinds this gateway understands. A frame naming anything else is IGNORED with a log
  *  line rather than closing the socket, so a runner that adds a frame type stays connected to an
  *  older gateway instead of being disconnected mid-reconciliation. */
-export const RUNNER_CLIENT_FRAME_KINDS: ReadonlySet<string> = new Set(["hello", "heartbeat", "receipt"]);
+export const RUNNER_CLIENT_FRAME_KINDS: ReadonlySet<string> = new Set(["hello", "heartbeat", "receipt", "chat_execution_receipt", "chat_workspace_result"]);
 
 export type RunnerServerFrame =
   // The runner parses hello acknowledgements as an exact four-field wire frame. The gateway does
   // not implement any optional runner commands yet, so it acknowledges an explicit empty set.
-  | { kind: "hello_ack"; version: number; capabilities: readonly []; heartbeatIntervalMs: number }
+  | { kind: "hello_ack"; version: number; capabilities: readonly string[]; heartbeatIntervalMs: number }
   | { kind: "heartbeat"; sentAt: number }
   | { kind: "command"; command: "create_runtime"; payload: RunnerCreateRuntimePayload }
-  | { kind: "command"; command: "delete_runtime"; payload: RunnerDeleteRuntimePayload };
+  | { kind: "command"; command: "delete_runtime"; payload: RunnerDeleteRuntimePayload }
+  | RunnerChatCommandFrame;
 
 /** The flat string a roster row stores for a reported platform. One shape, decided once here, so
  *  every reader sees the same value: `darwin/arm64` or `linux/x64/6.8.0`. */

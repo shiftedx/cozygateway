@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, NotRequired, Optional, TypedDict, Union
 from urllib.error import HTTPError
 from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from websockets.exceptions import ConnectionClosed
 
@@ -78,7 +78,7 @@ HELLO_VERSION = 2
 HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
     "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "delivery_receipts",
-    "delegation", "thinking", "desktop_session_sync",
+    "delegation", "thinking", "desktop_session_sync", "bot_config", "chat_configuration", "provider_connections",
     "desktop_session_resume", "cozyapps",
 )
 # Terminal states a delivery_receipt command may carry, and the stages a failure may name.
@@ -145,6 +145,7 @@ class AttachV1ClientConfig:
     on_clarify: Optional[Callable[[Dict[str, Any]], None]] = None
     on_desktop_resume: Optional[Callable[[Dict[str, Any]], None]] = None
     on_memory: Optional[Callable[[Dict[str, Any]], None]] = None
+    on_config: Optional[Callable[[Dict[str, Any]], Any]] = None
     on_cozyapp_action: Optional[Callable[[Dict[str, Any]], None]] = None
     on_ready: Optional[Callable[[], None]] = None
     connect_factory: Optional[Callable[..., Any]] = None
@@ -305,6 +306,57 @@ class AttachV1Client:
             raise RuntimeError("attach-v1 client is not connected")
         async with self._send_lock:
             await self._ws.send(json.dumps(frame, separators=(",", ":")))
+
+    async def fetch_provider_handoff(self, handoff_id: str) -> Optional[Dict[str, Any]]:
+        """Consume one agent-bound credential handoff over authenticated HTTPS/HTTP.
+
+        The credential never enters the attach spool or a WebSocket frame; it is returned only to
+        the local provider store that performs the save.
+        """
+        if not isinstance(handoff_id, str) or not handoff_id or len(handoff_id) > 256:
+            return None
+        token = self._config.token_provider() if self._config.token_provider is not None else self._config.token
+        url = self._config.gateway_url.rstrip("/") + "/attach/v1/provider-handoffs/" + quote(handoff_id, safe="")
+        def fetch() -> Optional[Dict[str, Any]]:
+            try:
+                request = Request(url, headers={"authorization": f"Bearer {token}", "accept": "application/json"})
+                with urlopen(request, timeout=8) as response:
+                    value = json.loads(response.read(1_000_000).decode("utf-8"))
+                return value if isinstance(value, dict) else None
+            except Exception:
+                return None
+        return await asyncio.to_thread(fetch)
+
+    async def transfer_provider_connection(self, execution_id: str, provider: Dict[str, Any]) -> Optional[str]:
+        """Deliver one private provider payload to the gateway's execution-bound handoff.
+
+        This deliberately bypasses the durable attach command/event lanes. Redirects are refused
+        so an authenticated bearer and provider key cannot be replayed to a different origin.
+        """
+        if not isinstance(execution_id, str) or not execution_id or len(execution_id) > 256:
+            return None
+        try:
+            body = json.dumps(provider, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError):
+            return None
+        if len(body) > 32 * 1024: return None
+        token = self._config.token_provider() if self._config.token_provider is not None else self._config.token
+        url = self._config.gateway_url.rstrip("/") + "/attach/v1/provider-transfers/" + quote(execution_id, safe="")
+        def send() -> Optional[str]:
+            try:
+                class NoRedirect(HTTPRedirectHandler):
+                    def redirect_request(self, req, fp, code, msg, headers, newurl):
+                        raise HTTPError(req.full_url, code, "redirect refused", headers, fp)
+                request = Request(url, data=body, method="POST", headers={
+                    "authorization": f"Bearer {token}", "content-type": "application/json", "accept": "application/json",
+                })
+                with build_opener(NoRedirect()).open(request, timeout=5) as response:
+                    value = json.loads(response.read(32 * 1024).decode("utf-8"))
+                handoff_id = value.get("handoffId") if isinstance(value, dict) else None
+                return handoff_id if isinstance(handoff_id, str) and handoff_id and len(handoff_id) <= 256 else None
+            except Exception:
+                return None
+        return await asyncio.to_thread(send)
 
     async def replay(self) -> None:
         async with self._flow_lock:
@@ -1010,6 +1062,21 @@ class AttachV1Client:
                     await outcome
             except Exception:
                 return
+        elif kind == "config_request":
+            request_id = frame.get("requestId")
+            if not isinstance(request_id, str) or not request_id:
+                return
+            response: Dict[str, Any] = {"kind": "config_result", "requestId": request_id, "status": "unavailable"}
+            if self._config.on_config is not None:
+                try:
+                    outcome = self._config.on_config(frame)
+                    if inspect.isawaitable(outcome):
+                        outcome = await outcome
+                    if isinstance(outcome, dict) and outcome.get("status") in {"ok", "not_found", "invalid_request", "unavailable"}:
+                        response.update({key: value for key, value in outcome.items() if key in {"status", "result", "message"}})
+                except Exception:
+                    logger.debug("attach-v1: config request failed", exc_info=True)
+            await self._send(response)
         elif kind == "ack" and frame.get("channel") == "event":
             if isinstance(frame.get("sequence"), int) and isinstance(frame.get("id"), str):
                 async with self._flow_lock:

@@ -73,6 +73,9 @@ import {
 } from "./hermes-bridge/global-skills.ts";
 import type { MemorySurface } from "./hermes-bridge/memory.ts";
 import type { HistorySurface } from "./hermes-bridge/bot-history.ts";
+import type { GatewayChatConfiguration } from "./chat-configuration.ts";
+import type { GatewayProviderConnections } from "./provider-connections.ts";
+import { providerConnectionRoutes } from "./provider-connection-routes.ts";
 import type { RunRoutineSurface } from "./hermes-bridge/native-data-plane.ts";
 import { registerBotRoutes } from "./hermes-bridge/routes.ts";
 import { resolveByteRange } from "./hermes-bridge/routes.ts";
@@ -198,6 +201,9 @@ export interface AppDeps {
   /** Capability 53. Forces a runtime bot's routine to run now, over the existing capability-48
    * `bot_config` lane. Absent leaves `POST /bots/:name/routines/:id/run` unregistered. */
   runRoutine?: RunRoutineSurface;
+  /** Session-scoped execution context. Omitted until an attached adapter can prepare it. */
+  chatConfiguration?: GatewayChatConfiguration;
+  providerConnections?: GatewayProviderConnections;
   /** attach-v1 bearer token → authenticated agent. Enables only the media side channel; device
    * routes never accept this credential. */
   attachTokens?: ReadonlyMap<string, string>;
@@ -480,6 +486,13 @@ export function createApp(deps: AppDeps): Hono<Env> {
       return undefined;
     }
   };
+
+  if (deps.providerConnections) app.route("/", providerConnectionRoutes({
+    service: deps.providerConnections,
+    requireDevice,
+    attachIdentity: (authorization) => deps.attachTokens === undefined
+      ? undefined : resolveAttachBearer(deps.attachTokens, authorization),
+  }));
 
   app.get("/gateway/settings", requireDevice, (c) => {
     if (deps.gatewaySettings === undefined)
@@ -1690,6 +1703,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
       {},
       deps.history,
       deps.runRoutine,
+      deps.chatConfiguration,
     );
   }
 
