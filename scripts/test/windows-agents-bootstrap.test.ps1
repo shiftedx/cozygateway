@@ -42,7 +42,7 @@ function Assert-NoBroadReadAcl {
 }
 
 function Invoke-Bootstrap {
-    param([string] $Installer, [hashtable] $Environment, [string[]] $Arguments = @(), [switch] $ThroughExpression, [string] $Engine = 'powershell.exe')
+    param([string] $Installer, [hashtable] $Environment, [string[]] $Arguments = @(), [switch] $ThroughExpression, [switch] $ThroughScriptBlock, [string] $Engine = 'powershell.exe')
     if ($env:COZYGATEWAY_TEST_BOOTSTRAP_ENGINE -and -not $PSBoundParameters.ContainsKey('Engine')) { $Engine = $env:COZYGATEWAY_TEST_BOOTSTRAP_ENGINE }
     # No fixture may fall back to writing the machine's actual per-user PATH.
     $Environment = $Environment.Clone()
@@ -60,7 +60,13 @@ function Invoke-Bootstrap {
     try {
         $previousPreference = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        if ($ThroughExpression) {
+        if ($ThroughScriptBlock) {
+            $argumentText = @($Arguments | ForEach-Object {
+                if ($_ -match '^--?[A-Za-z-]+$') { $_ } else { "'" + $_.Replace("'", "''") + "'" }
+            }) -join ' '
+            $expression = "& ([scriptblock]::Create((Get-Content -LiteralPath '" + $Installer.Replace("'", "''") + "' -Raw))) " + $argumentText
+            $output = & $Engine -NoProfile -Command $expression 2>&1
+        } elseif ($ThroughExpression) {
             $expression = "Get-Content -LiteralPath '" + $Installer.Replace("'", "''") + "' -Raw | Invoke-Expression"
             $output = & $Engine -NoProfile -Command $expression 2>&1
         } else {
@@ -226,6 +232,17 @@ Copy-Item -LiteralPath '$agentsFixture' -Destination (Join-Path `$target 'bin\co
     node = '$node'
     bundle = [ordered]@{ url = ''; sha256 = ''; path = (Join-Path `$target 'bin\cozyagents-fixture.js') }
 }
+if (`$env:COZYAGENTS_TEST_SCHEMA -eq '1') {
+    `$state = [ordered]@{
+        schemaVersion = 1
+        home = `$target
+        node = '$node'
+        assets = @(
+            [ordered]@{ name = 'cozyagents-update.mjs'; path = (Join-Path `$target 'must-not-run-update-worker.js') },
+            [ordered]@{ name = 'cozyagents.mjs'; path = (Join-Path `$target 'bin\cozyagents-fixture.js') }
+        )
+    }
+}
 Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | ConvertTo-Json -Depth 5)
 "@
 
@@ -258,6 +275,12 @@ Set-Content -LiteralPath (Join-Path `$target 'install.json') -Value (`$state | C
     }) -ThroughExpression
     Assert-True ($expressionRun.ExitCode -eq 0) "the documented iex entry point failed: $($expressionRun.Output)"
     Assert-Contains $expressionRun.Output 'would install CozyAgents from' 'iex must reach harness selection'
+    $rawArguments = Invoke-Bootstrap $installer (New-Environment @{
+        'COZYGATEWAY_HOME' = (Join-Path $temp 'Scriptblock Gateway')
+        'COZYGATEWAY_INSTALL_DRYRUN' = '1'
+    }) @('-Harness', 'both', '--no-qr') -ThroughScriptBlock
+    Assert-True ($rawArguments.ExitCode -eq 0) "scriptblock forwarding failed: $($rawArguments.Output)"
+    Assert-Contains $rawArguments.Output "would install CozyAgents from $agentsInstaller" 'forwarded --no-qr must not become the CozyAgents installer source'
     $pwsh = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($pwsh) {
         $expression7 = Invoke-Bootstrap $installer (New-Environment @{
@@ -313,12 +336,13 @@ public static class $className {
             'COZYGATEWAY_TEST_GATEWAY_DEST' = $dualHome
             'COZYGATEWAY_TEST_USER_PATH' = 'C:\Existing Tools'
             'COZYGATEWAY_TEST_USER_PATH_LOG' = (Join-Path $temp "dual-$initial-path")
+            'COZYAGENTS_TEST_SCHEMA' = $(if ($initial -eq 'fresh') { '1' } else { '0' })
         }
         $requested = switch ($initial) { 'hermes' { 'cozyagents' }; 'cozyagents' { 'hermes' }; default { 'both' } }
         Remove-Item -LiteralPath $eventLog, $agentsLog -Force -ErrorAction SilentlyContinue
         $dualArguments = @('-Harness', $requested)
         if ($initial -ne 'fresh') { $dualArguments += '--no-qr' }
-        $dual = Invoke-Bootstrap $installer $dualEnvironment $dualArguments
+        $dual = Invoke-Bootstrap $installer $dualEnvironment $dualArguments -ThroughScriptBlock:($initial -eq 'hermes')
         Assert-True ($dual.ExitCode -eq 0) "dual $initial install failed: $($dual.Output)"
         $dualState = Read-LogText (Join-Path $dualHome 'local\install-state')
         Assert-Contains $dualState 'harness=both' 'adding either harness must persist both'

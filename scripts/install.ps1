@@ -12,6 +12,7 @@ here, and never asks anybody to read a code off a screen.
 `irm | iex` runs in the current process, so the execution policy is not consulted and this script
 never offers to change it.
 #>
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [switch] $Repair,
     # Skips the harness question. Adding a harness preserves the other installed harness.
@@ -1452,8 +1453,21 @@ function Get-CozyAgentsCommand {
     param([string] $AgentsHome)
     $statePath = Join-Path $AgentsHome 'install.json'
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-    $node = [string]$state.node
-    $bundle = [string]$state.bundle.path
+    $nodeProperty = $state.PSObject.Properties['node']
+    $node = if ($nodeProperty) { [string]$nodeProperty.Value } else { '' }
+    $bundle = ''
+    $schema = $state.PSObject.Properties['schemaVersion']
+    if ($schema) {
+        if ($schema.Value -ne 1) { Fail 'the CozyAgents install record has an unsupported schema version' }
+        $assets = $state.PSObject.Properties['assets']
+        if ($assets) {
+            $main = @($assets.Value | Where-Object { $_.PSObject.Properties['name'] -and $_.name -eq 'cozyagents.mjs' })
+            if ($main.Count -eq 1 -and $main[0].PSObject.Properties['path']) { $bundle = [string]$main[0].path }
+        }
+    } else {
+        $legacyBundle = $state.PSObject.Properties['bundle']
+        if ($legacyBundle -and $legacyBundle.Value.PSObject.Properties['path']) { $bundle = [string]$legacyBundle.Value.path }
+    }
     if ([string]::IsNullOrWhiteSpace($node) -or [string]::IsNullOrWhiteSpace($bundle)) {
         Fail 'the CozyAgents install did not record the node and bundle this computer pairs with'
     }
