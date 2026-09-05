@@ -1907,8 +1907,56 @@ write_windows_launcher() {
   chmod 600 "$staged" 2>/dev/null || { rm -f "$staged"; return 1; }
   mv -f "$staged" "$WINDOWS_VBS"
 }
+load_windows_legacy_wrapper_identity() {
+  local line expected body_hash index value
+  local -a values paths expected_paths
+  [ "${HARNESS:-}" = hermes ] && [ -r "$WRAPPER" ] || return 1
+  [ "$(sed -n '1p' "$WRAPPER" | tr -d '\r')" = '#!/usr/bin/env bash' ] || return 1
+  [ "$(sed -n '2p' "$WRAPPER" | tr -d '\r')" = 'set -euo pipefail' ] || return 1
+  [ "$(tail -n 1 "$WRAPPER" | tr -d '\r')" = NODE ] || return 1
+  # Pin the exact Windows supervisor shipped in v0.6.5. Never source or evaluate
+  # a persisted wrapper to recover its arguments.
+  body_hash="$(tail -n +4 "$WRAPPER" | sed '$d' | tr -d '\r' | sha256sum | awk '{print $1}')"
+  [ "$body_hash" = 820562ca357aec94d5f31a10adb17f4a314de7a326bca02e4d27fdd323578a38 ] || return 1
+  line="$(sed -n '3p' "$WRAPPER" | tr -d '\r')"
+  mapfile -t values < <(printf '%s\n' "$line" | awk -F '"' '{for (i=2;i<=20;i+=2) print $i}')
+  [ "${#values[@]}" = 10 ] || return 1
+  for value in "${values[@]}"; do
+    [ -n "$value" ] || return 1
+    case "$value" in *'$'*|*'`'*) return 1 ;; esac
+  done
+  printf -v expected 'exec "%s" - "%s" "%s" "%s" "%s" "%s" "%s" "%s" "%s" "%s" <<\x27NODE\x27' "${values[@]}"
+  [ "$line" = "$expected" ] && [ "${values[7]}" = "$DASHBOARD_PORT" ] || return 1
+  paths=()
+  for index in 0 1 2 3 4 5 6 8 9; do paths+=("$(to_posix_path "${values[$index]}")"); done
+  expected_paths=("$NODE_RESOLVED" "$GATEWAY_ENV" "$DASHBOARD_ENV" "$HERMES_ROOT" "$HERMES_RESOLVED" "$HERMES_ROOT/bin/hermes.exe" "$DASHBOARD_OWNER_PS1" "$BUNDLE_PATH" "$CONFIG_JSON")
+  # Old releases did not persist Node identity. Permit the current resolved Node
+  # as well as the old private runtime, but never an unrelated executable.
+  if [ ! "${paths[0]}" -ef "${expected_paths[0]}" ]; then
+    expected_paths[0]="$(resolve_node)" || return 1
+  fi
+  for index in "${!paths[@]}"; do [ "${paths[$index]}" -ef "${expected_paths[$index]}" ] || return 1; done
+  WINDOWS_OWNED_NODE_RESOLVED="${paths[0]}"
+  WINDOWS_OWNED_GATEWAY_ENV="${paths[1]}"
+  WINDOWS_OWNED_DASHBOARD_ENV="${paths[2]}"
+  WINDOWS_OWNED_HERMES_ROOT="${paths[3]}"
+  WINDOWS_OWNED_HERMES_RESOLVED="${paths[4]}"
+  WINDOWS_OWNED_LAUNCHER="${paths[5]}"
+  WINDOWS_OWNED_DASHBOARD_OWNER_PS1="${paths[6]}"
+  WINDOWS_OWNED_DASHBOARD_PORT="${values[7]}"
+  WINDOWS_OWNED_BUNDLE_PATH="${paths[7]}"
+  WINDOWS_OWNED_CONFIG_JSON="${paths[8]}"
+  WINDOWS_OWNED_DASHBOARD_PORT_STATE=
+  WINDOWS_OWNED_LEGACY_INLINE=1
+  WINDOWS_OWNED_IDENTITY=1
+}
 load_windows_wrapper_identity() {
   local line expected='exec ' legacy_expected='exec ' value quoted skip_value=0 dashboard_state=''
+  WINDOWS_OWNED_LEGACY_INLINE=0
+  if [ -r "$WRAPPER" ] && [ "$(tr -d '\r' < "$WRAPPER" | awk 'END { print NR }')" != 3 ]; then
+    load_windows_legacy_wrapper_identity
+    return $?
+  fi
   [ -r "$WRAPPER" ] && [ -r "$SUPERVISOR" ] || return 1
   [ "$(tr -d '\r' < "$WRAPPER" | awk 'END { print NR }')" = 3 ] || return 1
   [ "$(sed -n '1p' "$WRAPPER" | tr -d '\r')" = '#!/usr/bin/env bash' ] || return 1
@@ -2009,7 +2057,7 @@ stop_owned_windows_gateway() {
   worker_native="$(to_windows_path "$MAINTENANCE_WORKER")"
   database_native="$(to_windows_path "$LOCAL_DIR/cozygateway.sqlite")"
   set +e
-  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_GATEWAY_ENV="$gateway_env_native" COZYGATEWAY_EXPECTED_DASHBOARD_ENV="$dashboard_env_native" COZYGATEWAY_EXPECTED_NODE="$node_native" COZYGATEWAY_EXPECTED_SUPERVISOR="$(to_windows_path "$SUPERVISOR")" COZYGATEWAY_EXPECTED_BUNDLE="$bundle_native" COZYGATEWAY_EXPECTED_WORKER="$worker_native" COZYGATEWAY_EXPECTED_DATABASE="$database_native" COZYGATEWAY_EXPECTED_HERMES_ROOT="$hermes_root_native" COZYGATEWAY_EXPECTED_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_OWNER_HELPER="$owner_helper_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$WINDOWS_OWNED_DASHBOARD_PORT" COZYGATEWAY_EXPECTED_DASHBOARD_PORT_STATE="$dashboard_state_native" powershell.exe -NoProfile -NonInteractive -Command '
+  MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_LEGACY_INLINE="${WINDOWS_OWNED_LEGACY_INLINE:-0}" COZYGATEWAY_EXPECTED_CONFIG="$config_native" COZYGATEWAY_EXPECTED_GATEWAY_ENV="$gateway_env_native" COZYGATEWAY_EXPECTED_DASHBOARD_ENV="$dashboard_env_native" COZYGATEWAY_EXPECTED_NODE="$node_native" COZYGATEWAY_EXPECTED_SUPERVISOR="$(to_windows_path "$SUPERVISOR")" COZYGATEWAY_EXPECTED_BUNDLE="$bundle_native" COZYGATEWAY_EXPECTED_WORKER="$worker_native" COZYGATEWAY_EXPECTED_DATABASE="$database_native" COZYGATEWAY_EXPECTED_HERMES_ROOT="$hermes_root_native" COZYGATEWAY_EXPECTED_HERMES="$hermes_native" COZYGATEWAY_EXPECTED_LAUNCHER="$launcher_native" COZYGATEWAY_EXPECTED_OWNER_HELPER="$owner_helper_native" COZYGATEWAY_EXPECTED_DASHBOARD_PORT="$WINDOWS_OWNED_DASHBOARD_PORT" COZYGATEWAY_EXPECTED_DASHBOARD_PORT_STATE="$dashboard_state_native" powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
     function Same-Path([string] $Candidate, [string] $Expected) {
       if ([string]::IsNullOrWhiteSpace($Candidate) -or [string]::IsNullOrWhiteSpace($Expected)) { return $false }
@@ -2037,6 +2085,19 @@ stop_owned_windows_gateway() {
           $expected += @("--dashboard-port-state", $env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT_STATE)
         }
         $expected += "--windows-dashboard-profile"
+      }
+      if ($env:COZYGATEWAY_EXPECTED_LEGACY_INLINE -eq "1") {
+        $expected = @($env:COZYGATEWAY_EXPECTED_NODE, "-", $env:COZYGATEWAY_EXPECTED_GATEWAY_ENV,
+          $env:COZYGATEWAY_EXPECTED_DASHBOARD_ENV, $env:COZYGATEWAY_EXPECTED_HERMES_ROOT,
+          $env:COZYGATEWAY_EXPECTED_HERMES, $env:COZYGATEWAY_EXPECTED_LAUNCHER,
+          $env:COZYGATEWAY_EXPECTED_OWNER_HELPER, $env:COZYGATEWAY_EXPECTED_DASHBOARD_PORT,
+          $env:COZYGATEWAY_EXPECTED_BUNDLE, $env:COZYGATEWAY_EXPECTED_CONFIG)
+        if ($tokens.Count -ne $expected.Count) { return $false }
+        for ($index = 0; $index -lt $expected.Count; $index += 1) {
+          if ($index -eq 1 -or $index -eq 8) { if ($tokens[$index] -cne $expected[$index]) { return $false } }
+          elseif (-not (Same-Path $tokens[$index] $expected[$index])) { return $false }
+        }
+        return $true
       }
       if ($tokens.Count -ne $expected.Count) { return $false }
       $pathIndexes = @(0, 1, 5, 7, 9, 13, 15, 17, 19, 21, 23, 25, 29)
