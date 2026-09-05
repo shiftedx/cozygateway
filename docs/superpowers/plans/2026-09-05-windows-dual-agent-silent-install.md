@@ -86,6 +86,14 @@ afterward. Legacy ownership and hidden-launch checks also pass. `pnpm build` and
 `pnpm bundle` completed successfully; the updated installer artifact SHA-256 is
 `46196fa453fe2226fd7de2aa631c51685325fcf74b6e076f3c736dd68787000e`.
 
-The complete post-change Windows bootstrap and dual-agent suites passed, as did shell
-state-identity and hidden-task checks. The full Hermes shell rerun and the machine owner's
-coordinated repair results are tracked separately until they finish.
+The complete post-change Windows bootstrap, dual-agent and Hermes shell suites passed,
+as did shell state-identity and hidden-task checks. All service commands in the Hermes
+Windows cases were stubbed; the corrected real mock Dashboard lifecycle also passed.
+
+The machine owner subsequently completed a coordinated live repair with installer hash
+`46196fa453fe2226fd7de2aa631c51685325fcf74b6e076f3c736dd68787000e`. Settings and pairing
+were preserved; the runner environment changed only in byte formatting. Both agents
+completed actual tool calls through the gateway. Bot crash recovery returned to ready in
+21 seconds. The two previously observed gateway WScript retry owners were replaced by one
+gateway launcher and one instance of each expected Node role. This is local-artifact live
+repair evidence, not publication or fresh public-installer qualification.
