@@ -2,7 +2,7 @@
 
 **Goal:** Install Hermes and CozyAgents on the same gateway through the Windows one-liner, preserve either agent when adding the other, and prevent background console windows.
 
-**Approved requirements:** The user selected an initial Hermes / CozyAgents / Both choice and additive later installs. Initial validation used a local model; subsequent inference checks are paused while the operator prepares a replacement inference host. Do not resume the original loopback endpoint. The initial installer terminal may be visible; background processes must remain hidden. Preserve credentials, profiles, pairing, and listener configuration on repair.
+**Approved requirements:** The user selected an initial Hermes / CozyAgents / Both choice and additive later installs. Initial validation used a local model; the operator later moved inference to another host and repaired its tool calling. Follow-up validation uses that replacement host. Do not resume the original loopback endpoint. The initial installer terminal may be visible; background processes must remain hidden. Preserve credentials, profiles, pairing, and listener configuration on repair.
 
 ## Tasks
 
@@ -16,8 +16,11 @@
 The dual installation and repair completed using local verified build artifacts. Both agents
 returned replies through the same gateway before the inference host changed. Console flashes were
 reproduced and hidden launchers added; later window snapshots contained no visible agent consoles.
-The CozyAgents runner is intentionally paused. Final validation against the replacement inference
-host, live verification of the latest runner recovery fixes, and reboot/logon testing remain open.
+The replacement host now passes a direct automatic tool call, Hermes replied through the gateway,
+and the CozyAgents live tool-call readiness probe passes. Deletion of an old failed bot can still
+wait behind its recovery retries; final lifecycle qualification and reboot/logon testing remain open.
+A test-only WScript dialog was reproduced and its fixture launcher isolated. Hosted CozyAgents
+CI could not start because of account billing; record local validation alongside that limitation.
 Merging these fixes does not publish new installer release assets.
 
 Run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-agents-bootstrap.test.ps1`, the Windows bootstrap suite, and relevant shell installer tests after changes. Run CozyAgents runner/process/exec tests and typecheck for its modified helpers. Do not publish releases until there is a concrete tested result and publication authorization.
