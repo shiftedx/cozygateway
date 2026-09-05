@@ -45,6 +45,7 @@ interface Harness {
   attachTokens: Map<string, string>;
   port: number;
   lane: RunnerLane;
+  openUpgradeCount: () => number;
   /** Moves the lane's clock, for the heartbeat ceiling. */
   advance: (ms: number) => void;
   /** Everything the create/delete path and the lane logged, for the "no secrets" assertions. */
@@ -132,7 +133,10 @@ async function setup(
   registerBotRoutes(app as never, requireDevice as never, plane.surface());
 
   const server = createServer();
+  let openUpgrades = 0;
   server.on("upgrade", (req, socket, head) => {
+    openUpgrades += 1;
+    socket.once("close", () => { openUpgrades -= 1; });
     const path = (req.url ?? "").split("?")[0];
     if (path === "/runner/v1") lane.handleUpgrade(req, socket, head);
     else if (path === "/attach/v1") ingress.handleUpgrade(req, socket, head);
@@ -150,6 +154,7 @@ async function setup(
     attachTokens,
     port,
     lane,
+    openUpgradeCount: () => openUpgrades,
     advance: (ms) => {
       clock += ms;
     },
@@ -284,6 +289,8 @@ describe("runtime bot creation without a runner", () => {
       await once(invalid, "open");
       const [code] = (await once(invalid, "close")) as [number];
       expect(code).toBe(1008);
+      // The client's close event can precede the server's capacity release.
+      await until(() => h.openUpgradeCount() === 0);
     }
     const held = new WebSocket(`ws://127.0.0.1:${h.port}/runner/v1`, {
       headers: { authorization: `Bearer ${RUNNER_TOKEN}` },
@@ -293,6 +300,7 @@ describe("runtime bot creation without a runner", () => {
     await expect(rejectedRunnerUpgrade(h)).resolves.toBe(503);
     held.close();
     await once(held, "close");
+    await until(() => h.openUpgradeCount() === 0);
     const valid = await fakeRunner(h);
     valid.ws.close();
   });
