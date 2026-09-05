@@ -2093,7 +2093,7 @@ describe("attach-v1 native Bot Mode plane", () => {
 describe("native runtime bots", () => {
   const sage = { id: "sage", name: "Sage", avatar: null, runtime: "cozyagents" } as const;
 
-  it("lists a native runtime bot from config without any Dashboard row", () => {
+  it("projects native runtime readiness separately from active work", async () => {
     const storage = openStorage(":memory:");
     let attached = false;
     const control = {
@@ -2102,7 +2102,10 @@ describe("native runtime bots", () => {
     const plane = new NativeBotDataPlane({
       control,
       storage,
-      ingress: { isAttached: () => attached } as unknown as AttachV1Ingress,
+      ingress: {
+        isAttached: () => attached,
+        sendNativeTurn: () => true,
+      } as unknown as AttachV1Ingress,
       nativeBots: ["sage"],
       runtimeBots: [sage],
       chatSuggestion: "",
@@ -2134,6 +2137,12 @@ describe("native runtime bots", () => {
 
     attached = true;
     plane.handleAttachPresence("sage", "online");
+    expect(plane.surface().roster().bots[0]).toMatchObject({
+      syncState: "ready",
+      active: false,
+    });
+
+    await plane.surface().sendChatMessage("sage", "start working");
     expect(plane.surface().roster().bots[0]).toMatchObject({
       syncState: "ready",
       active: true,
@@ -2245,7 +2254,7 @@ describe("native runtime bots", () => {
     // `restart_profile` is a Hermes-plugin repair. A config-declared bot has no plugin to restart,
     // so CozyApps readiness must not hold its row at `starting`.
     const row = plane.surface().roster().bots[0];
-    expect(row).toMatchObject({ name: "sage", syncState: "ready", active: true });
+    expect(row).toMatchObject({ name: "sage", syncState: "ready", active: false });
     expect(row).not.toHaveProperty("cozyApps");
     expect(row).not.toHaveProperty("syncRepair");
     expect(plane.surface().readiness("sage")).toEqual({

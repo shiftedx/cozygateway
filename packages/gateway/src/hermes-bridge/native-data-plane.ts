@@ -610,6 +610,7 @@ export class NativeBotDataPlane {
     bot: NonNullable<NativeBotDataPlaneOptions["runtimeBots"]>[number],
   ): BotSummary {
     const id = normalize(bot.id);
+    const chat = this.#storage.nativeBotChat(id, this.#now());
     const runnerId = bot.runnerId ?? undefined;
     const runnerName = runnerId === undefined ? undefined : this.#runnerName(runnerId);
     return {
@@ -622,7 +623,7 @@ export class NativeBotDataPlane {
       hasAvatar: false,
       group: null,
       pinned: false,
-      active: this.#syncState(id) === "ready",
+      active: chat.activeTurnId !== undefined,
       meta: null,
       runtime: bot.runtime,
       ...(runnerId === undefined ? {} : { runnerId }),
