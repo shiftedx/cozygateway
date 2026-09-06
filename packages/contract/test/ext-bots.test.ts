@@ -42,6 +42,7 @@ import {
   BotModelProviderFieldUpdateSchema,
   BotModelProviderOAuthSessionSchema,
   BotModelProviderSetupCatalogSchema,
+  BotMcpServerSchema,
   BotNewSessionResponseSchema,
   BotProfileConfigureResponseSchema,
   BotProfilePatchSchema,
@@ -578,6 +579,55 @@ describe("profile", () => {
       expect(check(BotProfilePatchSchema, { guardrailCeiling }), String(guardrailCeiling)).toBe(false);
     }
   });
+
+  // Optional and CLOSED: capability 63. `repair` is the read-only projection of the harness's own
+  // per-server MCP repair setting. Two names and no others, because the name IS the contract:
+  // `approve_once` means that server's reconnect asks first, `auto_refresh` means the operator let
+  // the peer refresh it alone. A third name is the harness's refusal to make, not a value this
+  // gateway passes through untyped.
+  it("carries the per-server MCP repair policy, closed and optional (capability 63)", () => {
+    const row = { name: "github", installed: true, enabled: true };
+    expect(check(BotMcpServerSchema, row)).toBe(true);
+    for (const repair of ["approve_once", "auto_refresh"]) {
+      expect(check(BotMcpServerSchema, { ...row, repair }), repair).toBe(true);
+    }
+    for (const repair of ["auto_reconnect", "Approve_Once", "", " ", null, 0, true, ["approve_once"]]) {
+      expect(check(BotMcpServerSchema, { ...row, repair }), JSON.stringify(repair)).toBe(false);
+    }
+  });
+
+  // Absence is SILENCE, never a default. A Hermes bot has no such setting, a peer below 63 answers
+  // nothing, and a peer at 63 that has not set one for that server answers nothing either. Reading
+  // an absent field as `approve_once` would tell a person their server asks first when nobody said
+  // so, which is exactly the claim this row must not let a client invent.
+  it("leaves the repair policy absent rather than defaulting it (capability 63)", () => {
+    const base = {
+      name: "scout",
+      description: "",
+      soul: "",
+      skills: [],
+      toolsets: [],
+      toolsetsPinned: false,
+      model: { provider: "", default: "" },
+      runtimeInert: [],
+    };
+    const row = { name: "github", installed: true, enabled: true };
+    expect(check(BotProfileSchema, { ...base, mcpServers: [row] })).toBe(true);
+    expect(check(BotProfileSchema, { ...base, mcpServers: [{ ...row, repair: "auto_refresh" }] })).toBe(true);
+    // A row whose policy the peer got wrong fails the whole read rather than reaching a client as
+    // an unvalidated string: the lane's own convention, pinned here at the schema.
+    expect(check(BotProfileSchema, { ...base, mcpServers: [{ ...row, repair: "auto_reconnect" }] })).toBe(false);
+  });
+
+  // READ-ONLY: capability 63 grants no write. The only write surface that names MCP servers is
+  // `enabledMcpServers`, a list of NAMES, and it stays a list of names: a client cannot send a row,
+  // so it cannot send a policy. Setting the policy is done on the harness, not through this gateway.
+  it("gives the repair policy no write surface at all (capability 63)", () => {
+    expect(check(BotProfilePatchSchema, { enabledMcpServers: ["github"] })).toBe(true);
+    expect(check(BotProfilePatchSchema, {
+      enabledMcpServers: [{ name: "github", repair: "auto_refresh" }],
+    })).toBe(false);
+  });
 });
 
 describe("routines", () => {
@@ -861,7 +911,10 @@ describe("capability advertisement", () => {
     // Capability 62 lets an approval carry one typed MCP repair proposal (`repair`) on the attach-v1
     // event, the pending frame, and the inbox row; the gateway validates the block and drops it,
     // never the approval, when it fails.
-    expect(BOTS_CAPABILITY_VERSION).toBe(62);
+    // Capability 63 declares the harness's per-server MCP repair policy on `BotMcpServer.repair`:
+    // optional, closed to `approve_once` and `auto_refresh`, READ-ONLY metadata the gateway relays
+    // and never stores, computes, writes, or backfills. Absence is silence, not `approve_once`.
+    expect(BOTS_CAPABILITY_VERSION).toBe(63);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {

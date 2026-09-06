@@ -33,6 +33,14 @@ extension. It pins the capability id/version, root-relative list projection, and
 headers for a partial download without requiring every core-conformance target to expose Hermes
 managed files.
 
+`test/fixtures/bot-mcp-repair-policy-v1.json` is the client fixture for capability 63's per-server
+MCP repair policy (`contract/ext-bots-v1.md` row 63). The policy rides the capability-48 `bot_config`
+`profile.read`, which needs a runtime peer, so the portable check is the payload itself: the two
+closed names on one profile read, a server row that carries none, the values a decoder must refuse
+instead of passing through as a string, and the profile patch that names MCP servers by name and
+only by name. A client gates the field on `com.cozylabs.bots >= 63` and renders no policy at all
+when the field is absent, because absent means the peer reported none, never `approve_once`.
+
 ## The reference Hermes/attach echo peer
 
 The suite drives a Hermes profile through an attach-v1 peer, whose observable semantics are frozen

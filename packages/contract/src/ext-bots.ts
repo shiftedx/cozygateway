@@ -1054,11 +1054,42 @@ export const BotToolsetSchema = Type.Object({
 });
 export type BotToolset = Static<typeof BotToolsetSchema>;
 
+/** What one MCP server's repair costs the person watching it (capability 63).
+ *
+ *  Two literals and no others, because the name IS the contract: `approve_once` means reconnecting
+ *  that server asks first, every time; `auto_refresh` means the operator already allowed the peer
+ *  to refresh that server on its own, so a reconnect happens without a question. Those are the two
+ *  settings capability 62's `BotApprovalRepair.policy` reports on a live proposal, and this is the
+ *  same fact read off the server row instead of off one approval.
+ *
+ *  Closed for the reason every closed set on this contract is closed: an open string here would let
+ *  a peer hand a client an uninterpretable value in the position where the client renders a
+ *  PERMISSION, and a typo would render as a policy nobody set. A third name is the runtime peer's
+ *  refusal to make, not something this gateway passes through untyped. */
+export const BotMcpRepairPolicySchema = Type.Union([
+  Type.Literal("approve_once"),
+  Type.Literal("auto_refresh"),
+]);
+export type BotMcpRepairPolicy = Static<typeof BotMcpRepairPolicySchema>;
+
 /** One MCP server as the edit screen sees it: the union of the servers the profile DEFINES and the
  *  bundled catalog's menu. `installed` is true for a server the profile defines, and the catalog's
  *  own flag otherwise; `fromCatalog` marks a row the profile does not define yet, which is offered
  *  so a user can turn it on (the gateway copies its definition from the launch profile on write).
- *  `auth` is passed through only when the gateway sends it. */
+ *  `auth` is passed through only when the gateway sends it.
+ *
+ *  `repair` (capability 63) is OPTIONAL and READ-ONLY METADATA: it is the harness's own per-server
+ *  repair setting, projected onto this row so a client can say what a reconnect will cost before it
+ *  costs it. It never appears on `BotProfilePatchSchema`, and the only write surface that names MCP
+ *  servers, `enabledMcpServers`, is a list of NAMES, so there is no shape a client could send a
+ *  policy in. Changing the setting is done on the harness. This gateway neither stores, computes,
+ *  writes, nor executes anything from it: it validates the closed union and relays what the peer
+ *  answered on the capability-48 `bot_config` `profile.read`.
+ *
+ *  ABSENT IS SILENCE, NEVER A DEFAULT. A Hermes bot has no such setting, a runtime peer below 63
+ *  answers nothing, and a peer at 63 with no policy recorded for that server answers nothing too.
+ *  Reading an absent field as `approve_once` would tell a person a server asks first when nobody
+ *  said so, so it is never backfilled and a client renders no policy at all when it is missing. */
 export const BotMcpServerSchema = Type.Object({
   name: Type.String(),
   installed: Type.Boolean(),
@@ -1068,6 +1099,7 @@ export const BotMcpServerSchema = Type.Object({
   transport: Type.Optional(Type.String()),
   requires: Type.Optional(Type.Array(Type.String())),
   fromCatalog: Type.Optional(Type.Boolean()),
+  repair: Type.Optional(BotMcpRepairPolicySchema),
 });
 export type BotMcpServer = Static<typeof BotMcpServerSchema>;
 
@@ -2620,4 +2652,27 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * Additive: every field is optional, so an approval that is not a repair proposal is byte
  * identical to its pre-62 self on every surface. A client that renders the repair card gates it on
  * `>= 62` and renders any other approval as it always has. */
-export const BOTS_CAPABILITY_VERSION = 62;
+/** Capability 63: THE PER-SERVER MCP REPAIR POLICY, DECLARED BEFORE IT IS EMITTED. `BotMcpServer`
+ * gains optional `repair`, closed to `approve_once` and `auto_refresh`
+ * (`BotMcpRepairPolicySchema`), carried on the existing capability-48 `bot_config` `profile.read`
+ * of the runtime peer. No new route, no new lane, no new operation: the harness already keeps this
+ * setting per MCP server, and capability 62 already reports it on one live proposal; 63 is the same
+ * fact read off the server row, so a client can say what a reconnect will cost before one is
+ * proposed.
+ *
+ * READ-ONLY METADATA. The field never appears on `BotProfilePatchSchema`, and `enabledMcpServers`
+ * stays a list of NAMES, so no request shape can carry a policy. The gateway does not store,
+ * compute, write, execute, or interpret it, exactly as it does not for capability 58's
+ * `guardrailCeiling`: it validates the closed union and relays the peer's answer. Nothing here
+ * performs a repair or mutates a policy.
+ *
+ * ABSENT IS SILENCE, NEVER `approve_once`. A Hermes bot, a peer below 63, and a peer at 63 with no
+ * policy recorded for that server all answer with the field simply missing, and it is never
+ * backfilled. An unknown value is not tolerated: the `bot_config` lane's existing convention refuses
+ * the whole `config_result` frame, so a client never receives an unvalidated string in the position
+ * where it renders a permission.
+ *
+ * Additive: the field is optional, so a peer and a client below 63 are byte identical to their
+ * pre-63 selves. A peer emits `repair` only when the gateway advertised `com.cozylabs.bots >= 63`
+ * on `hello_ack`; a client renders the policy only on `>= 63`. */
+export const BOTS_CAPABILITY_VERSION = 63;

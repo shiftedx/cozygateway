@@ -317,6 +317,79 @@ describe("attach-v1 config lane", () => {
     peer.ws.close();
   });
 
+  // Capability 63: the per-server MCP repair policy is the HARNESS's setting, projected read-only
+  // onto the profile row. Real socket, real ingress, real config surface, real data plane: what the
+  // peer put on `profile.read` is what the bot's profile surface answers, for each of the two names.
+  it("carries the per-server MCP repair policy from the peer's profile.read through to the bot profile surface, for both names", async () => {
+    for (const repair of ["approve_once", "auto_refresh"] as const) {
+      const row = { name: "github", installed: true, enabled: true, repair };
+      const peer = await dial({ "profile.read": { ...profile, mcpServers: [row] } });
+      const { plane, storage: planeStorage } = planeWith(config, { botProfile: vi.fn() } as unknown as Partial<BotsSurface>);
+
+      await expect(plane.surface().botProfile("sage")).resolves.toEqual({
+        ...profile,
+        mcpServers: [row],
+      });
+      // A read, never a write: the request that carried it named no policy at all.
+      expect(peer.requests.map((request) => request.input)).toEqual([{}]);
+
+      plane.close();
+      planeStorage.close();
+      peer.ws.close();
+    }
+  });
+
+  // Absent stays absent. A Hermes-shaped row, a peer below 63, and a peer at 63 that has set no
+  // policy for that server all answer the same way, and none of them is backfilled with a default:
+  // reading silence as `approve_once` would claim a server asks first when nobody said so.
+  it("leaves the repair policy absent on a server the peer answered without one", async () => {
+    const peer = await dial({
+      "profile.read": { ...profile, mcpServers: [{ name: "github", installed: true, enabled: true }] },
+    });
+    const read = await config.botProfile("sage");
+    expect(read.mcpServers[0] && "repair" in read.mcpServers[0]).toBe(false);
+    peer.ws.close();
+  });
+
+  // The lane retains NOTHING: there is no stored copy to go stale and no rebroadcast to replay.
+  // A second read after the peer changed its own setting answers the peer's current value, and the
+  // policy never becomes a durable command or event on the way past.
+  it("re-reads the repair policy from the peer instead of keeping a copy of it", async () => {
+    const server = (repair: string) => ({ name: "github", installed: true, enabled: true, repair });
+    const first = await dial({ "profile.read": { ...profile, mcpServers: [server("approve_once")] } });
+    await expect(config.botProfile("sage")).resolves.toMatchObject({ mcpServers: [server("approve_once")] });
+    first.ws.close();
+    await until(() => first.ws.readyState === first.ws.CLOSED);
+
+    const second = await dial({ "profile.read": { ...profile, mcpServers: [server("auto_refresh")] } });
+    await expect(config.botProfile("sage")).resolves.toMatchObject({ mcpServers: [server("auto_refresh")] });
+    expect(storage.attachCommandCursor("sage")).toBe(0);
+    expect(storage.attachEventCursor("sage")).toBe(0);
+    second.ws.close();
+  });
+
+  // An unknown policy follows the lane's existing convention exactly as the pre-P3b providers row
+  // does: the `config_result` frame is invalid, the ingress refuses it and closes the peer's socket,
+  // and the read ends unavailable at the lane timeout. Fail closed, never an unvalidated string
+  // handed to a client that would render it as a permission.
+  it("refuses an unknown repair policy: the frame is invalid and the read is unavailable", async () => {
+    const quick = new AttachConfigSurface(ingress, 200);
+    const peer = await dial({
+      "profile.read": {
+        ...profile,
+        mcpServers: [{ name: "github", installed: true, enabled: true, repair: "auto_reconnect" }],
+      },
+    });
+    const closed = once(peer.ws, "close");
+    const pending = quick.botProfile("sage");
+    await expect(pending).rejects.toBeInstanceOf(BackendUnavailable);
+    await expect(pending).rejects.toThrow("bot config reply timed out");
+    const [code, reason] = (await closed) as [number, Buffer];
+    expect(code).toBe(1008);
+    expect(String(reason)).toBe("attach-v1 invalid config_result frame");
+    quick.close();
+  });
+
   it("rejects per status rather than collapsing every refusal into one failure", async () => {
     const peer = await dial({ "profile.read": profile });
     await expect(config.routines("sage")).rejects.toBeInstanceOf(BackendUnavailable);

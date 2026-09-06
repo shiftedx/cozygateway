@@ -245,6 +245,16 @@ On a write, on `routines.list`, or on `routines.create` it is the peer failing t
 asked, and stays a `503`. On a routine operation carrying `input.id` it names that routine and is a
 `404` about the routine.
 
+Capability 63 (`com.cozylabs.bots >= 63`): a `profile.read` result's `BotProfile.mcpServers` rows
+MAY each carry `repair`, that server's own repair policy on the peer, closed to `approve_once` or
+`auto_refresh`. It is READ-ONLY: `profile.write` carries no such field, its `enabledMcpServers` is a
+list of names, and the gateway never asks a peer to change a policy. A peer emits it only when the
+gateway advertised `com.cozylabs.bots >= 63` on `hello_ack`, and omits it entirely for a server it
+records no policy for, because absence is silence rather than `approve_once`. Unlike the untyped
+`repair` on an `approval` event above, this one is inside a published schema on a lane whose results
+are validated whole, so an unknown value makes the `config_result` frame invalid and the ingress
+refuses the frame and closes the socket: the two names are the entire vocabulary.
+
 `status` is `ok`, `not_found`, `invalid_request`, or `unavailable`, and the four are kept apart
 because they are four different things an operator has to do: nothing, fix the id, fix the input,
 or go and look at the peer. `ok` with a body that does not match the operation is refused rather
