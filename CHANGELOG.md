@@ -11,17 +11,24 @@ release; everything older is marked pre-release so installers resolve one "lates
   block naming the action, its category, the target system and resource, the exact material change,
   the side effects, why a decision is required, the sha256 hash of the exact payload, the
   expiration, whether a retry is idempotent, and the scope the peer asked for. A decision may leave
-  a standing grant bound to profile, user, conversation, task, target, payload hash and expiration:
-  `once` covers exactly that payload on that task and only while the retry is idempotent,
-  `category` covers any payload of that action on that resource until it expires or is revoked. A
+  a standing grant, and only where the person explicitly asks for one: a plain approve is one
+  decision on one ask and leaves no policy behind. A grant is bound to profile, user, conversation,
+  task, target, payload hash and expiration: `once` covers at most one later ask with that payload
+  on that task, only while the retry is idempotent, and dies with the ask or ten minutes from the
+  decision, whichever is sooner; `category` covers any payload of that action on that resource
+  until it expires or is revoked. A
   grant is a policy record a later invocation is consulted against, never a replay: a changed
   material field changes the hash and forces a fresh decision, and an expired grant is dead
   whatever its scope says. Money movement, secret access or disclosure, destructive actions, locks
   and alarms, public publishing and broad account changes require a decision on every invocation
   and can be covered by no grant. `GET /bots/:name/approvals/grants` is the revocation view and
-  `DELETE /bots/:name/approvals/grants/:grantId` ends one immediately. The gateway relays and
-  validates: a covered ask still raises its card, names the grant, and settles through the same
-  `resolve_approval` a tapped card sends. An approval with no block and a decision with no body are
+  `DELETE /bots/:name/approvals/grants/:grantId` ends one immediately; the view is the same bounded
+  window the gateway consults, so no grant can answer for a person without being visible to them.
+  The gateway relays and validates: a covered ask still raises its card, names the grant on the
+  frame, the reconnect rebroadcast and the inbox row, and settles through the same
+  `resolve_approval` a tapped card sends, and a person can still deny that one ask or revoke the
+  grant. `category` is the peer's own assertion: classifying an action into the always-require list
+  belongs to the harness that raises it. An approval with no block and a decision with no body are
   byte identical to their pre-66 selves.
 
 - Durable Artifacts and independent delivery (`com.cozylabs.bots` capability 65): a declared Task

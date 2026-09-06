@@ -15,6 +15,9 @@ export type BotApprovalResolveOutcome =
   | "scope_required"
   /** Capability 66. The asked-for grant expiry is in the past or past the ceiling. */
   | "invalid_grant"
+  /** Capability 66. The decision stands, but the standing grant it asked for was NOT created,
+   *  because this decision already carries one. Never reported as success. */
+  | "grant_not_recorded"
   | "resolution_pending"
   | "unknown"
   | "not_pending"

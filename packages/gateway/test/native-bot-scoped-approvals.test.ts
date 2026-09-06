@@ -39,10 +39,13 @@ async function startTurn(): Promise<Harness> {
     },
     sendNativeInterrupt: () => true,
     sendApprovalResolution: () => true,
+    // Mirrors the real ingress, including capability 66's override: a replacement command carries
+    // its own id, because the outbox holds one command per id per peer.
     requestNativeApprovalResolution: (
       _peer: string,
       input: { threadId: string; turnId: string; approvalId: string; decision: string },
       sourceBot: string,
+      opts?: { override?: boolean },
     ) => {
       resolutions.push({ approvalId: input.approvalId, decision: input.decision });
       const result = storage.requestNativeInteractionResolution({
@@ -50,9 +53,12 @@ async function startTurn(): Promise<Harness> {
         kind: "approval",
         interactionId: input.approvalId,
         decision: input.decision,
-        commandId: `approval:${sourceBot}:${input.approvalId}`,
+        commandId: opts?.override === true
+          ? `approval:${sourceBot}:${input.approvalId}:${input.decision}`
+          : `approval:${sourceBot}:${input.approvalId}`,
         command: { kind: "resolve_approval", ...input } as never,
         requestedAt: now,
+        ...(opts?.override === true ? { override: true } : {}),
       });
       return result;
     },
@@ -195,27 +201,74 @@ describe("typed scoped approvals (capability 66)", () => {
     harness.close();
   });
 
-  it("honors a standing once grant for the same payload hash and refuses a changed one", async () => {
+  it("records no standing grant for a plain approve, so the next identical ask asks again", async () => {
     const harness = await startTurn();
     const { plane, sessionId, turnId } = harness;
 
     plane.handle("sage", approvalEvent(sessionId, turnId, "approval-1", { scope }));
+    // A body-less approve is one decision on one ask. It is the request every client below 66
+    // sends and the request a person makes by tapping Approve, and it leaves no policy behind.
     expect(await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1"))
       .toBe("requested");
+    expect(plane.surface().approvalGrants!("sage")).toEqual([]);
+
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-2", { scope }));
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-2")).toBe(false);
+    expect(pendingFrames(harness.frames).map((frame) => frame.toolCallId))
+      .toEqual(["approval-1", "approval-2"]);
+    harness.close();
+  });
+
+  it("covers exactly one later ask with an explicit once grant, and asks again after that", async () => {
+    const harness = await startTurn();
+    const { plane, sessionId, turnId } = harness;
+
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-1", { scope }));
+    expect(await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1", {
+      grant: "once",
+    })).toBe("requested");
 
     // The same target and the same payload, retried inside the same task: the standing grant is
-    // consulted and the decision relayed without asking again.
+    // consulted once and the decision relayed without asking again.
     plane.handle("sage", approvalEvent(sessionId, turnId, "approval-2", { scope }));
     expect(harness.resolutions.filter((row) => row.approvalId === "approval-2"))
       .toEqual([{ approvalId: "approval-2", decision: "approve" }]);
     expect(pendingFrames(harness.frames).find((frame) => frame.toolCallId === "approval-2")?.grantId)
       .toBe("grant:sage:approval-1");
 
+    // Spent. A second retry is a fresh question, and the grant is gone from the view.
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-3", { scope }));
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-3")).toBe(false);
+    expect(plane.surface().approvalGrants!("sage")).toEqual([]);
+
     // One material field changed, so the payload hash changed: no standing approval covers it.
-    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-3", {
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-4", {
       scope: { ...scope, change: "append two lines to notes.md", payloadHash: HASH_B },
     }));
-    expect(harness.resolutions.some((row) => row.approvalId === "approval-3")).toBe(false);
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-4")).toBe(false);
+    harness.close();
+  });
+
+  it("bounds a once grant by the ask and by its own ceiling, never by the value the peer chose", async () => {
+    const harness = await startTurn();
+    const { plane, sessionId, turnId } = harness;
+
+    // A peer asking for a grant that outlives the decade gets the gateway's ceiling instead.
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-1", {
+      scope: { ...scope, expiresAt: 4_102_444_800_000 },
+    }));
+    await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1", { grant: "once" });
+    const ceiling = plane.surface().approvalGrants!("sage")[0]!;
+    expect(ceiling.expiresAt).toBeLessThanOrEqual(2_000 + 10 * 60 * 1_000);
+
+    // A shorter ask wins over the ceiling: the grant dies with the question it answered.
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-2", {
+      scope: { ...scope, expiresAt: 1_500 },
+    }));
+    await plane.surface().resolveApproval("sage", "approval-2", "approve", "device-1", { grant: "once" });
+    const shortest = plane.surface().approvalGrants!("sage")
+      .find((grant) => grant.grantId === "grant:sage:approval-2")!;
+    expect(shortest.expiresAt).toBe(1_500);
     harness.close();
   });
 
@@ -225,7 +278,7 @@ describe("typed scoped approvals (capability 66)", () => {
     const once = { ...scope, retry: "not_idempotent" as const };
 
     plane.handle("sage", approvalEvent(sessionId, turnId, "approval-1", { scope: once }));
-    await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1");
+    await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1", { grant: "once" });
     plane.handle("sage", approvalEvent(sessionId, turnId, "approval-2", { scope: once }));
 
     expect(harness.resolutions.some((row) => row.approvalId === "approval-2")).toBe(false);
@@ -238,9 +291,15 @@ describe("typed scoped approvals (capability 66)", () => {
     const shortLived = { ...scope, expiresAt: 2_000 };
 
     plane.handle("sage", approvalEvent(sessionId, turnId, "approval-1", { scope: shortLived }));
-    await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1");
+    await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1", { grant: "once" });
 
     harness.setNow(3_000);
+    // A FRESH ask, still live, over a grant that is not: the storage-level expiry filter is the
+    // only thing that can refuse this one.
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-fresh", {
+      scope: { ...shortLived, expiresAt: 9_000_000 },
+    }));
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-fresh")).toBe(false);
     plane.handle("sage", approvalEvent(sessionId, turnId, "approval-2", { scope: shortLived }));
     expect(harness.resolutions.some((row) => row.approvalId === "approval-2")).toBe(false);
     harness.close();
@@ -333,6 +392,99 @@ describe("typed scoped approvals (capability 66)", () => {
     );
     // The material change sentence and the payload hash are the approval's, not the grant's.
     expect(JSON.stringify(grant)).not.toContain(scope.change);
+    harness.close();
+  });
+
+  it("creates the grant a duplicate decision asks for, and never reports one it did not create", async () => {
+    const harness = await startTurn();
+    const { plane, sessionId, turnId } = harness;
+
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-1", { scope }));
+    expect(await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1"))
+      .toBe("requested");
+
+    // The person taps Approve, then decides to make it a policy. The decision already stands, so
+    // the relay is a duplicate, but the policy they asked for is new and is created.
+    expect(await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1", {
+      grant: "category", expiresAt: 8_000_000,
+    })).toBe("requested");
+    expect(plane.surface().approvalGrants!("sage").map((grant) => grant.scope)).toEqual(["category"]);
+
+    // Asking again for a DIFFERENT policy on the same decision creates nothing, and says so rather
+    // than answering success for a policy change that did not happen.
+    expect(await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1", {
+      grant: "once",
+    })).toBe("grant_not_recorded");
+    expect(plane.surface().approvalGrants!("sage").map((grant) => grant.scope)).toEqual(["category"]);
+    harness.close();
+  });
+
+  it("says what covered an auto-approved ask on the rebroadcast and the inbox, and lets the person deny it", async () => {
+    const harness = await startTurn();
+    const { plane, storage, sessionId, turnId } = harness;
+
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-1", { scope }));
+    await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1", {
+      grant: "category", expiresAt: 8_000_000,
+    });
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-2", {
+      scope: { ...scope, payloadHash: HASH_B },
+    }));
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-2")).toBe(true);
+
+    // Persisted, so a reconnect and a cold inbox read both say why the card settled itself.
+    expect((storage.nativeInteraction("sage", "approval", "approval-2")?.payload as { grantId?: string }).grantId)
+      .toBe("grant:sage:approval-1");
+    const inbox = plane.surface().pendingApprovals().find((row) => row.toolCallId === "approval-2");
+    expect(inbox?.grantId).toBe("grant:sage:approval-1");
+
+    const before = pendingFrames(harness.frames).length;
+    await plane.surface().chatHistory("sage");
+    const rebroadcast = pendingFrames(harness.frames).slice(before)
+      .find((frame) => frame.toolCallId === "approval-2");
+    expect(rebroadcast?.grantId).toBe("grant:sage:approval-1");
+
+    // The person disagrees with their own standing policy on this one ask. A deny is admitted, not
+    // refused as a conflicting decision, and the peer's terminal remains the only proof.
+    expect(await plane.surface().resolveApproval("sage", "approval-2", "deny", "device-1"))
+      .toBe("requested");
+    expect(harness.resolutions.filter((row) => row.approvalId === "approval-2")
+      .map((row) => row.decision)).toEqual(["approve", "deny"]);
+    harness.close();
+  });
+
+  it("keeps every grant that can auto-approve inside the view a person can revoke from", async () => {
+    const harness = await startTurn();
+    const { plane, storage, sessionId, turnId } = harness;
+
+    // One more live grant than the view holds. The window is the same on both sides, so the grant
+    // that falls out of the list falls out of the consult too rather than deciding invisibly.
+    for (let index = 0; index <= 100; index += 1) {
+      storage.recordApprovalGrant({
+        bot: "sage",
+        grantId: `grant:sage:filler-${String(index).padStart(3, "0")}`,
+        scope: "category",
+        deviceId: "device-1",
+        sessionId,
+        turnId: null,
+        approvalId: `filler-${index}`,
+        action: index === 0 ? scope.action : `filler.action.${index}`,
+        category: "other",
+        system: scope.system,
+        resource: scope.resource,
+        payloadHash: null,
+        expiresAt: 8_000_000,
+        createdAt: 1_000 + index,
+      });
+    }
+    const listed = plane.surface().approvalGrants!("sage");
+    expect(listed).toHaveLength(100);
+    expect(listed.some((grant) => grant.grantId === "grant:sage:filler-000")).toBe(false);
+
+    // filler-000 is the oldest and the only one whose action matches this ask. It is outside the
+    // view, so it is outside the consult: the ask is raised for a person to answer.
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-1", { scope }));
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-1")).toBe(false);
     harness.close();
   });
 });

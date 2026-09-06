@@ -1840,6 +1840,10 @@ export const BotPendingApprovalSchema = Type.Object({
   /** Capability 66. The same validated scoped-approval block the pending frame carried, so an
    *  inbox opened cold renders the card the live frame did. Absent for every other approval. */
   scope: Type.Optional(BotApprovalScopeSchema),
+  /** Capability 66. The standing grant that is settling this ask without a person tapping it, the
+   *  same id the live frame named. Present only on a covered ask, so a cold inbox read says why a
+   *  card is already resolving and which grant to revoke. */
+  grantId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
 });
 export type BotPendingApproval = Static<typeof BotPendingApprovalSchema>;
 

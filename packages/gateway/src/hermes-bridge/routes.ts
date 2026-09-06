@@ -153,7 +153,10 @@ function extensionErrorBody(
     // Capability 66. Two different sentences again: one says this action can never be granted a
     // category, the other says this approval has nothing to bound a category grant by.
     | "approval_category_forbidden"
-    | "approval_scope_required",
+    | "approval_scope_required"
+    // Capability 66. The decision was relayed and the policy was not created: two different facts
+    // in one answer, which is why it is neither a plain success nor a plain failure code.
+    | "approval_grant_not_recorded",
   message: string,
 ): ErrorBody {
   return { error: { code, message } };
@@ -811,6 +814,14 @@ export function registerBotRoutes(
             extensionErrorBody(
               "approval_scope_required",
               "this approval carries no scope block to bound a category grant",
+            ),
+            409,
+          );
+        case "grant_not_recorded":
+          return c.json(
+            extensionErrorBody(
+              "approval_grant_not_recorded",
+              "the decision stands, but this decision already carries a standing approval and no new one was created",
             ),
             409,
           );

@@ -54,12 +54,17 @@ describe("scoped approvals v1 client fixture", () => {
     // rather than silent.
     const honored = assertValid(BotApprovalPendingFrameSchema, fixture["pendingFrameHonored"]) as BotApprovalPendingFrame;
     expect(honored.grantId).toBe("grant:sage:approval-0");
+    // The same attribution survives a reconnect: it is on the durable record, so the cold inbox
+    // read carries it and a person can revoke the grant that answered for them.
+    const covered = assertValid(BotPendingApprovalSchema, fixture["inboxRowCovered"]) as BotPendingApproval;
+    expect(covered.grantId).toBe(honored.grantId);
   });
 
   it("names the always-require categories once, and the fixture repeats the contract's list", () => {
     expect(fixture["alwaysRequire"]).toEqual([...ALWAYS_REQUIRE_APPROVAL_CATEGORIES]);
     // The money-movement approval in this fixture is on that list: a client must never offer a
-    // category grant for it, whatever the peer asked for.
+    // category grant for it, whatever the peer asked for. The category is the PEER's assertion, so
+    // this is a guarantee about what a declared category can be covered by, not a classifier.
     const frame = fixture["pendingFrame"] as { scope: { category: string } };
     expect(ALWAYS_REQUIRE_APPROVAL_CATEGORIES).toContain(frame.scope.category);
   });

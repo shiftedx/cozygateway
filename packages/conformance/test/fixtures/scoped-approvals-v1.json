@@ -3,7 +3,7 @@
     "id": "com.cozylabs.bots",
     "minimumVersion": 66
   },
-  "note": "Capability 66, contract/ext-bots-v1.md row 66. A typed scope block names what an approval would do and binds it to a payload hash; a decision may leave a standing grant a later invocation is consulted against, never a replay. The six always-require categories can be covered by no grant of any kind. Everything is additive: the pre66 approval and the pre66 decision below are byte identical to the ones a client sent before this row existed.",
+  "note": "Capability 66, contract/ext-bots-v1.md row 66. A typed scope block names what an approval would do and binds it to a payload hash; a standing grant exists only where a person asked for one, and a later invocation is consulted against it, never a replay. A once grant covers at most one later ask. The six always-require categories are covered by no grant, on the peer's own declaration: classifying the action belongs to the harness that raises it. Everything is additive: the pre66 approval and the pre66 decision below are byte identical to the ones a client sent before this row existed.",
   "alwaysRequire": [
     "money_movement",
     "secret_access",
@@ -27,7 +27,10 @@
       "system": "stripe",
       "resource": "account/acct_1",
       "change": "send 40.00 USD to vendor acct_2",
-      "effects": ["the balance drops by 40.00 USD", "the vendor is notified"],
+      "effects": [
+        "the balance drops by 40.00 USD",
+        "the vendor is notified"
+      ],
       "reason": "always_require",
       "payloadHash": "3b1f0c9d5a2e47b8c6d0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6",
       "expiresAt": 1800000060000,
@@ -51,7 +54,9 @@
       "system": "workspace",
       "resource": "repo/notes.md",
       "change": "append one line to notes.md",
-      "effects": ["one file changes on disk"],
+      "effects": [
+        "one file changes on disk"
+      ],
       "reason": "guardrail",
       "payloadHash": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
       "expiresAt": 1800000160000,
@@ -82,7 +87,10 @@
       "system": "stripe",
       "resource": "account/acct_1",
       "change": "send 40.00 USD to vendor acct_2",
-      "effects": ["the balance drops by 40.00 USD", "the vendor is notified"],
+      "effects": [
+        "the balance drops by 40.00 USD",
+        "the vendor is notified"
+      ],
       "reason": "always_require",
       "payloadHash": "3b1f0c9d5a2e47b8c6d0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6",
       "expiresAt": 1800000060000,
@@ -100,12 +108,26 @@
   },
   "decisions": {
     "pre66": {},
-    "once": { "grant": "once" },
-    "category": { "grant": "category", "expiresAt": 1800003600000 },
+    "once": {
+      "grant": "once"
+    },
+    "category": {
+      "grant": "category",
+      "expiresAt": 1800003600000
+    },
     "refused": [
-      { "grant": "forever" },
-      { "grant": "category", "expiresAt": -1 },
-      { "grant": "category", "expiresAt": 1800003600000, "reason": "trust me" }
+      {
+        "grant": "forever"
+      },
+      {
+        "grant": "category",
+        "expiresAt": -1
+      },
+      {
+        "grant": "category",
+        "expiresAt": 1800003600000,
+        "reason": "trust me"
+      }
     ]
   },
   "grants": {
@@ -192,5 +214,14 @@
       "requested": "once",
       "endpoint": "https://payments.example/transfer"
     }
-  ]
+  ],
+  "inboxRowCovered": {
+    "bot": "sage",
+    "sessionId": "session-1",
+    "turnId": "turn-2",
+    "toolCallId": "approval-2",
+    "ruleName": "workspace_write",
+    "createdAt": 1800000100000,
+    "grantId": "grant:sage:approval-0"
+  }
 }

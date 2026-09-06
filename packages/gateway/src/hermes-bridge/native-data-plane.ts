@@ -166,6 +166,11 @@ export interface NativeBotDataPlaneOptions {
 /** Capability 66. The ceiling on a standing category grant: one day. A person can revoke one at
  *  any moment, and nothing here extends an existing grant. */
 const APPROVAL_GRANT_MAX_MS = 24 * 60 * 60 * 1_000;
+/** Capability 66. The gateway's own ceiling on a `once` grant, which answers ONE later ask. A once
+ *  grant lives until the ask it answered expires or this bound passes, whichever is sooner: the
+ *  peer's own `expiresAt` can shorten it and can never extend it. Ten minutes is the same bound the
+ *  durable interaction record already falls back to for an approval that names no expiry. */
+const APPROVAL_ONCE_GRANT_MAX_MS = 10 * 60 * 1_000;
 
 interface ApprovalPayload {
   name: string;
@@ -183,6 +188,10 @@ interface ApprovalPayload {
   /** Capability 66. The validated scoped-approval block, stored as sent for the same reason: it is
    *  what a person reads before deciding, and what a decision's standing grant is bounded by. */
   scope?: BotApprovalScope;
+  /** Capability 66. The standing grant that settled this ask without asking. Persisted so the
+   *  rebroadcast and the inbox row say why a card the person never tapped is already resolving,
+   *  and so a deny on it is read as countermanding the gateway rather than a rival decision. */
+  grantId?: string;
 }
 interface ClarifyPayload {
   prompt: string;
@@ -1763,10 +1772,11 @@ export class NativeBotDataPlane {
     return { sessionId, previousSessionId: previous.sessionId };
   }
 
-  /** Capability 66. Does a standing grant already cover this exact proposal? An always-require
-   *  category is never consulted at all, and a `once` grant is consulted only when the peer called
-   *  the retry idempotent: a mutation is never automatically replayed. */
-  #standingGrant(
+  /** Capability 66. Does a standing grant already cover this exact proposal, and if it is a
+   *  single-use one, spend it? An always-require category is never consulted at all, and a `once`
+   *  grant is consulted only when the peer called the retry idempotent: a mutation is never
+   *  automatically replayed, and never more than once even then. */
+  #claimGrant(
     bot: string,
     sessionId: string,
     turnId: string,
@@ -1777,7 +1787,7 @@ export class NativeBotDataPlane {
     // The ask's own expiration bounds the consult too: a stale proposal is never covered, however
     // long the grant behind it still had to run.
     if (scope.expiresAt <= now) return undefined;
-    return this.#storage.standingApprovalGrant({
+    return this.#storage.claimApprovalGrant({
       bot,
       sessionId,
       turnId,
@@ -1862,12 +1872,19 @@ export class NativeBotDataPlane {
     }
     const peer = this.#executionPeer(bot, binding.sessionId);
     if (peer === undefined) return "unsupported";
+    // Capability 66. A deny on an ask the GATEWAY settled from a standing grant is the person
+    // countermanding their own policy, not a rival decision, so it replaces the requested marker
+    // instead of colliding with it. Only that case: a decision the gateway did not make still
+    // conflicts exactly as it did before this row.
+    const covering = (binding.payload as ApprovalPayload).grantId;
+    const override = decision === "deny" && covering !== undefined
+      && binding.requestedDecision === "approve";
     const requested = this.#ingress.requestNativeApprovalResolution(peer, {
       threadId: binding.sessionId,
       turnId: binding.turnId,
       approvalId,
       decision,
-    }, bot);
+    }, bot, override ? { override: true } : undefined);
     if (requested.outcome === "expired") {
       // Capability 51: a room interaction's session is a member thread, never a chat session.
       const room = payloadRoom(binding.payload);
@@ -1876,36 +1893,43 @@ export class NativeBotDataPlane {
       if (room === undefined) this.#state(bot, requested.sessionId, "polling", true);
       return "expired";
     }
-    if (requested.outcome === "requested") {
-      this.#emitApprovalResolutionRequested(bot, binding.sessionId, binding.turnId, approvalId);
-      // Capability 66. The standing approval this decision leaves behind. It is written only for a
-      // scoped approval whose category may be covered at all, only on the fresh admission, and its
-      // id is derived from the approval, so a retried decision writes no second grant.
-      if (decision === "approve" && scope !== undefined
-        && !ALWAYS_REQUIRE_APPROVAL_CATEGORIES.includes(scope.category)) {
-        const category = grantRequest?.grant === "category";
-        this.#storage.recordApprovalGrant({
-          bot,
-          grantId: `grant:${bot}:${approvalId}`,
-          scope: category ? "category" : "once",
-          deviceId,
-          sessionId: binding.sessionId,
-          turnId: category ? null : binding.turnId,
-          approvalId,
-          action: scope.action,
-          category: scope.category,
-          system: scope.system,
-          resource: scope.resource,
-          payloadHash: category ? null : scope.payloadHash,
-          // A category grant runs to the bound the person set, never past the ask's own
-          // expiration for a once grant.
-          expiresAt: category ? grantRequest.expiresAt! : scope.expiresAt,
-          createdAt: this.#now(),
-        });
-      }
-      return "requested";
+    if (requested.outcome === "requested" || requested.outcome === "already_requested") {
+      if (requested.outcome === "requested")
+        this.#emitApprovalResolutionRequested(bot, binding.sessionId, binding.turnId, approvalId);
+      // Capability 66. The standing approval this decision leaves behind. It exists ONLY because a
+      // person explicitly asked for one: a plain approve is one decision on one ask and leaves no
+      // policy at all, which is what a client below 66, and a person simply tapping Approve, send.
+      if (grantRequest?.grant === undefined || decision !== "approve") return "requested";
+      if (scope === undefined) return "scope_required";
+      if (ALWAYS_REQUIRE_APPROVAL_CATEGORIES.includes(scope.category)) return "category_forbidden";
+      const category = grantRequest.grant === "category";
+      const now = this.#now();
+      const recorded = this.#storage.recordApprovalGrant({
+        bot,
+        grantId: `grant:${bot}:${approvalId}`,
+        scope: category ? "category" : "once",
+        deviceId,
+        sessionId: binding.sessionId,
+        turnId: category ? null : binding.turnId,
+        approvalId,
+        action: scope.action,
+        category: scope.category,
+        system: scope.system,
+        resource: scope.resource,
+        payloadHash: category ? null : scope.payloadHash,
+        // A category grant runs to the bound the person set. A once grant dies with the ask it
+        // answered or at the gateway's own ceiling, whichever comes first, so the value the peer
+        // chose can only ever shorten it.
+        expiresAt: category
+          ? grantRequest.expiresAt!
+          : Math.min(scope.expiresAt, now + APPROVAL_ONCE_GRANT_MAX_MS),
+        createdAt: now,
+      });
+      // A decision carries at most one standing grant. A second one asking for a different policy
+      // is told nothing was created rather than answered success for a policy change that did not
+      // happen.
+      return recorded ? "requested" : "grant_not_recorded";
     }
-    if (requested.outcome === "already_requested") return "requested";
     if (requested.outcome === "resolution_pending") return "resolution_pending";
     return requested.outcome;
   }
@@ -3038,7 +3062,7 @@ export class NativeBotDataPlane {
       // `resolve_approval` the peer performs.
       const grantId = scope === undefined
         ? undefined
-        : this.#standingGrant(bot, sessionId, event.turnId, scope);
+        : this.#claimGrant(bot, sessionId, event.turnId, scope);
       const wire: BotApprovalPendingFrame = {
         type: "bot_approval_pending",
         bot,
@@ -3076,9 +3100,13 @@ export class NativeBotDataPlane {
         });
       this.#state(bot, sessionId, "polling", true);
       // Capability 66. A covered ask is settled from the standing grant through the very same
-      // relay path a tapped card uses; nothing is replayed and nothing is executed here.
-      if (grantId !== undefined)
+      // relay path a tapped card uses; nothing is replayed and nothing is executed here. The grant
+      // is named on the durable record FIRST, so a reconnect between these two lines still shows
+      // the person what settled their card.
+      if (grantId !== undefined) {
+        this.#storage.attachInteractionGrant(bot, event.approvalId, grantId);
         this.#honorApprovalGrant(bot, sessionId, event.turnId, event.approvalId, grantId);
+      }
     } else {
       this.#clearInteractionTimer("approval", bot, event.approvalId);
       this.#emitApprovalResolved(
@@ -3368,6 +3396,7 @@ export class NativeBotDataPlane {
           ...(payload.detail === undefined ? {} : { detail: payload.detail }),
           ...(payload.repair === undefined ? {} : { repair: payload.repair }),
           ...(payload.scope === undefined ? {} : { scope: payload.scope }),
+          ...(payload.grantId === undefined ? {} : { grantId: payload.grantId }),
         });
       } else {
         const payload = pending.payload as ClarifyPayload;

@@ -130,7 +130,7 @@ describe("bots approval frames", () => {
     // absent for every 1:1 row, which is every row written before 51.
     expect(Object.keys(BotPendingApprovalSchema.properties)).toEqual([
       "bot", "sessionId", "turnId", "toolCallId", "ruleName", "createdAt", "resolutionRequestedAt",
-      "room", "repair", "scope",
+      "room", "repair", "scope", "grantId",
     ]);
   });
 });
@@ -219,6 +219,13 @@ describe("the scoped-approval block (capability 66)", () => {
     expect(check(BotPendingApprovalSchema, {
       bot: "scout", sessionId: "stored-1", turnId: "runtime-1#1-1",
       toolCallId: pending.toolCallId, ruleName: "payments.transfer", createdAt: 1, scope,
+    })).toBe(true);
+    // A covered ask names its grant on the inbox row too, so a cold read says why a card nobody
+    // tapped is already resolving.
+    expect(check(BotPendingApprovalSchema, {
+      bot: "scout", sessionId: "stored-1", turnId: "runtime-1#1-1",
+      toolCallId: pending.toolCallId, ruleName: "workspace.write", createdAt: 1,
+      grantId: "grant:scout:approval-1",
     })).toBe(true);
     // Absent is the pre-66 approval, which every earlier assertion in this file already pins.
     expect(check(BotApprovalPendingFrameSchema, pending)).toBe(true);

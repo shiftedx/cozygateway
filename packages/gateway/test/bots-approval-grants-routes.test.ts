@@ -91,6 +91,15 @@ describe("capability-66 scoped approval decisions and grants", () => {
     expect(bound.status).toBe(400);
   });
 
+  it("answers 409 rather than success when the decision stands but the grant was not created", async () => {
+    const response = await mount({ resolveApproval: async () => "grant_not_recorded" as const })
+      .request("/bots/sage/approvals/call-1/approve", json({ grant: "once" }));
+
+    expect(response.status).toBe(409);
+    expect((await response.json() as { error: { code: string } }).error.code)
+      .toBe("approval_grant_not_recorded");
+  });
+
   it("never reads a body on a deny, so a denial stays the pre-66 request", async () => {
     const resolveApproval = vi.fn(async () => "requested" as const);
     const response = await mount({ resolveApproval }).request(

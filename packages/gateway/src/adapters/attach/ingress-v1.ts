@@ -551,6 +551,10 @@ export class AttachV1Ingress implements TurnEndpoint {
     agentId: string,
     input: { threadId: string; turnId: string; approvalId: string; decision: "approve" | "deny" },
     sourceBot = agentId,
+    /** Capability 66. Set only when a person is countermanding a decision the GATEWAY admitted off
+     *  a standing grant. The replacement command carries its own id, because the outbox holds one
+     *  command per id per peer and the original is already in it. */
+    opts?: { override?: boolean },
   ): NativeInteractionResolutionRequest | { outcome: "unsupported" } {
     const requestedAt = this.#now();
     const expired = this.#storage.expireNativeInteractionIfDue(sourceBot, "approval", input.approvalId, requestedAt);
@@ -562,9 +566,12 @@ export class AttachV1Ingress implements TurnEndpoint {
       kind: "approval",
       interactionId: input.approvalId,
       decision: input.decision,
-      commandId: `approval:${agentId}:${input.approvalId}`,
+      commandId: opts?.override === true
+        ? `approval:${agentId}:${input.approvalId}:${input.decision}`
+        : `approval:${agentId}:${input.approvalId}`,
       command: { kind: "resolve_approval", ...input },
       requestedAt,
+      ...(opts?.override === true ? { override: true } : {}),
     });
     if (result.outcome === "requested" || result.outcome === "already_requested")
       this.#flush(agentId, this.#current.get(agentId)?.commandCursor ?? 0);

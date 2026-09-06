@@ -184,7 +184,13 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `del
   or be covered by one. A valid block is carried byte for byte on `bot_approval_pending`, the
   durable interaction record, and the `GET /bots/approvals` inbox row. Nothing changes for
   `resolve_approval`: when a standing grant already covers an ask, the gateway sends the same
-  `resolve_approval` a tapped card sends, and the peer is the one that acts. A peer never puts a
+  `resolve_approval` a tapped card sends, and the peer is the one that acts. A grant exists only
+  where a person explicitly asked for one, a `once` grant covers a single later ask, and a person
+  who denies such an ask replaces the gateway's own requested decision, so the peer may receive an
+  approve followed by a deny for one `approvalId`: its existing rule is unchanged, the first
+  TERMINAL wins and the gateway records nothing else. `category` is the PEER's own assertion, and
+  the gateway cannot classify an action at this seam: declaring an always-require category
+  correctly is the raising harness's job, not a guarantee this wire makes. A peer never puts a
   secret, credential, URL, header or env value in the block, and emits it only when the gateway
   advertised `com.cozylabs.bots >= 66` on `hello_ack`.
 - Capability 51 (`com.cozylabs.bots`). A ROOM member turn may raise `approval`, `clarify` and
