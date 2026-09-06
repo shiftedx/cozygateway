@@ -334,6 +334,17 @@ test_streaming_reader_answers_without_pyyaml() {
   printf 'display:\n  streaming: false\n  platforms:\n    cozygateway:\n      streaming: false\n' > "$dir/off/config.yaml"
   printf 'display:\n  streaming: true\n  platforms:\n    telegram:\n      streaming: false\n  runtime_footer:\n    fields:\n      - model\n' > "$dir/telegram-only/config.yaml"
   printf 'display: {streaming: true}\n' > "$dir/unjudgeable/config.yaml"
+  mkdir -p "$dir/nested-block" "$dir/nested-block-top" "$dir/null-value"
+  # An operator who tuned streaming as a BLOCK. PyYAML reads a mapping, which is
+  # not absence, and writing `true` over it would throw their settings away.
+  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming:\n        enabled: true\n        min_interval_ms: 400\n' \
+    > "$dir/nested-block/config.yaml"
+  printf 'display:\n  streaming:\n    a: b\n  platforms:\n    cozygateway:\n      streaming: true\n' \
+    > "$dir/nested-block-top/config.yaml"
+  # A key with nothing under it at all IS absent, the way PyYAML reads it, so
+  # this one is still repaired.
+  printf 'display:\n  streaming:\n  platforms:\n    cozygateway:\n      streaming: true\n' \
+    > "$dir/null-value/config.yaml"
 
   read_with() {
     PYTHON="$1" bash -c '
@@ -364,6 +375,14 @@ SH
   answer="$(read_with "$TMP/python3-nosite" "$dir/unjudgeable" | tr '\n' ' ')"
   [ -z "$answer" ] || fail "stdlib probe judged a flow mapping it cannot read: $answer"
 
+  answer="$(read_with "$TMP/python3-nosite" "$dir/nested-block" | tr '\n' ' ')"
+  [ -z "$answer" ] || fail "stdlib probe called a nested block absent: $answer"
+  answer="$(read_with "$TMP/python3-nosite" "$dir/nested-block-top" | tr '\n' ' ')"
+  [ -z "$answer" ] || fail "stdlib probe called a nested block absent: $answer"
+  answer="$(read_with "$TMP/python3-nosite" "$dir/null-value" | tr '\n' ' ')"
+  [ "$answer" = 'display.streaming ' ] \
+    || fail "stdlib probe on a key with no value answered: $answer"
+
   # A Windows interpreter writes CRLF on a text stream. The reader writes bytes
   # so it does not, and the caller strips a carriage return anyway; neither may
   # be dropped, because a "\r" glued to a key name is written into a config file
@@ -386,7 +405,7 @@ SH
     return 0
   fi
   local case_dir
-  for case_dir in mute both off telegram-only; do
+  for case_dir in mute both off telegram-only nested-block nested-block-top null-value; do
     [ "$(read_with "$YAML_PYTHON" "$dir/$case_dir" | tr '\n' ' ')" \
       = "$(read_with "$TMP/python3-nosite" "$dir/$case_dir" | tr '\n' ' ')" ] \
       || fail "the two readers disagree on $case_dir"

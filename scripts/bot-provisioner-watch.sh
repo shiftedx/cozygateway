@@ -81,6 +81,13 @@ PYTHON="$HERMES_HOME_ROOT/hermes-agent/venv/bin/python"
 [ -n "$PYTHON" ] || { log "sweep aborted: no python3"; exit 1; }
 [ -d "$SRC_DIR" ] || { log "sweep aborted: staged attach plugin is missing: $SRC_DIR"; exit 1; }
 
+# NOTE on PyYAML: this read, unlike the streaming read below, still REQUIRES
+# PyYAML and stops the run without it. That is deliberate and unchanged: these
+# two scripts are the dev-box provisioner (docs/plans/2026-09-05-auto-provision-
+# phone-created-bots.md), they run beside a Hermes venv that always has PyYAML,
+# and "is this profile opted in" decides whether a bot is touched at all, which
+# is not a question to answer conservatively from a partial parse. The
+# host-PyYAML-free guarantee covers the shipped installer and the streaming keys.
 # Opted in: config.yaml lists the plugin. Structural, not a grep, because the
 # bare name appears in the disabled list too.
 opted_in() {
@@ -159,7 +166,8 @@ def absent_without_yaml(text):
 
     Returns the wanted keys this file certainly does not carry, or None when it
     uses something this probe cannot judge WHERE ONE OF THOSE KEYS COULD BE (a
-    flow mapping, an anchor, a merge key, a sequence, a line it cannot parse),
+    flow mapping, an anchor, a sequence, or any line it cannot parse, which is
+    what a merge key or a quoted key arrives as),
     or anywhere at all for a tab or a second document. None means "assume they
     are present", so the caller writes nothing: the only safe way to be unsure
     about somebody's config file. Everything outside `display` is skipped rather
@@ -167,6 +175,7 @@ def absent_without_yaml(text):
     """
     stack = []
     present = set()
+    containers = set()
     seen_top = set()
     inside_block_scalar_at = None
     for raw in text.splitlines():
@@ -199,6 +208,12 @@ def absent_without_yaml(text):
             if on_the_way(path):
                 return None
             continue
+        # Every mapping that has a key under it. A wanted key written as
+        # `streaming:` with its value on the following, more indented lines has
+        # an EMPTY value here and is still present: PyYAML reads a dict, not
+        # None. Without this the probe would call it absent and the caller would
+        # replace the operator's block with a boolean.
+        containers.add(path)
         key = match.group("key")
         value = match.group("rest").strip()
         if value.startswith("#"):
@@ -211,7 +226,7 @@ def absent_without_yaml(text):
             continue
         if value in ("{}", "[]"):
             value = "empty"
-        elif value[:1] in ("{", "[", "&", "*") or key == "<<":
+        elif value[:1] in ("{", "[", "&", "*"):
             if on_the_way(here):
                 return None
             value = "unjudged"
@@ -223,13 +238,17 @@ def absent_without_yaml(text):
             present.add(here)
         if value == "":
             stack.append((indent, key))
-    return [".".join(name) for name in WANTED if name not in present]
+    return [
+        ".".join(name)
+        for name in WANTED
+        if name not in present and name not in containers
+    ]
 
 
 def main():
     path = Path(sys.argv[2]) / "config.yaml"
     try:
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
     except Exception:
         sys.exit(1)
     try:
@@ -248,7 +267,7 @@ def main():
     # Written as BYTES on purpose. A Windows interpreter translates "\n" into
     # CRLF on a text stream, and the caller would then carry a "\r" inside every
     # key name it went on to write.
-    sys.stdout.buffer.write("".join(name + "\n" for name in absent).encode())
+    sys.stdout.buffer.write("".join(name + "\n" for name in absent).encode("utf-8"))
 
 
 main()
