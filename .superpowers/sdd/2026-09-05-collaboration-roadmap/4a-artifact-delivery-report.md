@@ -4,7 +4,7 @@ Status: IMPLEMENTED, LOCAL GATES PASS, NOT REVIEWED, NOT MERGED, NOT DEPLOYED.
 
 ## Exact heads
 
-- Worktree: `/Users/kmcdowell/Documents/repos/worktrees/4a-artifact-delivery`, branch `codex/4a-artifact-delivery`, pushed to origin.
+- Worktree: `<repos>/worktrees/4a-artifact-delivery`, branch `codex/4a-artifact-delivery`, pushed to origin.
 - Base: `398f927` (cozygateway origin/main, capability 64 durable Tasks).
 - Commits on the branch:
   - `a9c7d9a` Add durable Artifact records and independent delivery (capability 65)
