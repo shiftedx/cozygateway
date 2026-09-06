@@ -135,10 +135,12 @@ function mobileRequestRow(row: Omit<BotMobileRequest, "deviceId"> & { deviceId: 
 
 /** Lifecycle order. A step that does not move a request forward is dropped rather than applied,
  *  so a late `routed` cannot un-execute a request and a replay cannot rewind one. */
+function isTerminalMobileRequestState(state: string): boolean {
+  return (MOBILE_REQUEST_TERMINAL_STATES as readonly string[]).includes(state);
+}
+
 function mobileRequestRank(state: MobileRequestState): number {
-  return MOBILE_REQUEST_TERMINAL_STATES.includes(state as (typeof MOBILE_REQUEST_TERMINAL_STATES)[number])
-    ? MOBILE_REQUEST_STATES.length
-    : MOBILE_REQUEST_STATES.indexOf(state);
+  return isTerminalMobileRequestState(state) ? MOBILE_REQUEST_STATES.length : MOBILE_REQUEST_STATES.indexOf(state);
 }
 
 const BOT_MOBILE_RECEIPT_COLUMNS = `
@@ -4282,7 +4284,7 @@ export class Storage {
     // A record belongs to the conversation and profile that opened it. A later step naming a
     // different one is a binding violation, not an update.
     if (existing.bot !== input.bot || existing.sessionId !== input.sessionId) return undefined;
-    if (MOBILE_REQUEST_TERMINAL_STATES.includes(existing.state as BotMobileRequest["state"] & (typeof MOBILE_REQUEST_TERMINAL_STATES)[number])) return undefined;
+    if (isTerminalMobileRequestState(existing.state)) return undefined;
     if (mobileRequestRank(input.state) <= mobileRequestRank(existing.state)) return undefined;
     this.#db
       .prepare("UPDATE bot_mobile_requests SET state = ?, updated_at = ? WHERE request_id = ?")

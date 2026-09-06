@@ -426,8 +426,8 @@ export class MobileNodeBroker {
       if (route.status !== "available" || (requiresForeground(pending.command) && route.foreground !== true)) continue;
       try {
         const outcome = normalizeSendOutcome(this.#send(deviceId, pending.frame));
-        if (outcome !== "sent")
-          this.#diagnose(outcome, pending.command, true, this.#route(deviceId, pending.command));
+        if (outcome === "sent") this.#life(pending.frame, deviceId, "routed");
+        else this.#diagnose(outcome, pending.command, true, this.#route(deviceId, pending.command));
       } catch {
         this.#diagnose(
           "frame_send_failed",

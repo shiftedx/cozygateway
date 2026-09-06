@@ -15,6 +15,7 @@ import {
   type MobileNodeRoute,
 } from "../src/mobile-node.ts";
 import { openStorage } from "../src/storage.ts";
+import type { TraceLog } from "../src/trace.ts";
 
 const purpose = "Report phone readiness";
 
@@ -36,6 +37,7 @@ function harness(options: {
   route?: (deviceId: string, command: string) => MobileNodeRoute;
   receipt?: () => boolean;
   now?: () => number;
+  trace?: TraceLog;
 } = {}) {
   const lifecycle = vi.fn<(event: MobileNodeLifecycleEvent) => void>();
   const send = vi.fn((_deviceId: string, _frame: unknown) => "sent" as const);
@@ -47,6 +49,7 @@ function harness(options: {
     send,
     result,
     receipt: options.receipt ?? (() => true),
+    ...(options.trace === undefined ? {} : { trace: options.trace }),
     now: options.now ?? (() => 1_000),
   });
   return { broker, lifecycle, send, result };
@@ -146,8 +149,10 @@ describe("capability-68 typed phone capability request lifecycle", () => {
     expect(states(foreground.lifecycle, "req-1").at(-1)).toBe("foreground_required");
   });
 
-  it("refuses a result from another device and leaves the request pending", () => {
-    const { broker, lifecycle, send, result } = harness();
+  it("refuses a result from another device, logs it, and leaves the request pending", () => {
+    const lines: string[] = [];
+    const trace: TraceLog = (line) => lines.push(line);
+    const { broker, lifecycle, send, result } = harness({ trace });
     broker.invoke(statusRequest());
     broker.result("phone-b", {
       type: "mobile_node_result", requestId: "req-1", lease: lease(send, "req-1"), status: "denied",
@@ -155,6 +160,9 @@ describe("capability-68 typed phone capability request lifecycle", () => {
 
     expect(result).not.toHaveBeenCalled();
     expect(states(lifecycle, "req-1")).toEqual(["requested", "routed"]);
+    // Refused AND said out loud, with a bounded reason and no phone content.
+    const logged = lines.map((line) => JSON.parse(line) as { event: string; reason?: string });
+    expect(logged.some((entry) => entry.event === "mobile_node_failure" && entry.reason === "cross_device_result")).toBe(true);
 
     // The bound device still settles it.
     broker.result("phone-a", {
