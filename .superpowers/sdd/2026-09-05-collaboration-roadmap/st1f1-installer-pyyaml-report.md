@@ -181,3 +181,56 @@ which hides the user site-packages and makes this machine PyYAML-free like the r
   (one new case).
 - `pnpm test:installer`, the whole chain: `exit=0`.
 - `pnpm -r typecheck` under Node 24: 4 of 4 projects `Done`.
+
+### Independent review r0, folded into this same round
+
+Review verdict on 7295458 was FAIL on spec. Disposition of every finding:
+
+- **C1 (Critical), fixed.** The probe called a wanted key ABSENT when its value was a nested block
+  mapping: such a key line carries no value, so it opened a stack frame and was never recorded as
+  present, while PyYAML reads a mapping there. The caller would then have run `config set` over an
+  operator's tuned block and replaced it with a boolean, which is exactly the overwrite the
+  conservative rule exists to prevent. Every mapping that has a key under it is now recorded, and a
+  wanted key counts as present when anything was parsed inside it. A key with nothing under it at
+  all stays absent, which is what PyYAML reads (`None`) and what a repair should fix, so the null
+  repair is not lost.
+  RED then GREEN at the reader (M4 below), and differentially: the reviewer's own fuzz harness,
+  same seed 7, same 3243 comparable documents, went from 209 unsafe to **0 unsafe**; a second run
+  at seed 4242 compared 3260 documents with **0 unsafe**; the reviewer's 64 hand-built shapes give
+  **exact 48, conservative 16, unsafe 0** (was 2 unsafe, both C1).
+- **I1 (Important), fixed** in the same change as the third CI failure above: the reader answers in
+  UTF-8 bytes so no interpreter's newline convention can reach a key name, and each caller strips a
+  carriage return at the boundary as well.
+- **I2 (Important), narrowed rather than widened.** `provision-bot.sh` and `bot-provisioner-watch.sh`
+  still require PyYAML for their pre-existing `plugins.enabled` read and still stop the run without
+  it. That is deliberate and unchanged: those two are the dev-box provisioner, they run beside a
+  Hermes venv that always has PyYAML, and "is this profile opted in" decides whether a bot is
+  touched at all, which is not a question to answer conservatively from a partial parse. Both
+  scripts now say so at that read, and the guarantee this packet makes is stated for what it is:
+  the shipped installer, and the streaming keys, need no host PyYAML.
+- **M1, fixed.** The merge-key test in the value branch could never fire (the key regex cannot
+  match `<<`), and a `<<: *defaults` line is already caught by the unparsable-line branch. The dead
+  condition is gone and the docstring says which branch actually handles it.
+- **M2, fixed.** The config file is read with `encoding="utf-8"` rather than the locale's encoding.
+- **M3, left alone as instructed.** `BOX_SSH` and `BOX_REPO` in `scripts/provision-bot.sh` carry an
+  operator default; they are pre-existing at base e0dccc8, untouched by this packet, and consistent
+  with the dev-box-only ruling for that script.
+- **M4, fixed.** `test_streaming_reader_answers_without_pyyaml` gained the C1 shapes: a nested block
+  under the platform key, a nested block under the top-level key, and a key with no value at all
+  (which must still be reported absent). Against the pre-fix reader:
+  `FAIL: stdlib probe called a nested block absent: display.platforms.cozygateway.streaming`.
+  The agreement half now covers all seven shapes.
+
+The reader remains byte identical in all three scripts (same md5 for the extracted body).
+
+### Tests after the review fixes
+
+Each suite run twice, normally and with `HOME` pointed at an empty directory (no PyYAML anywhere):
+
+- `plugin-rollout.test.sh`: exit 0 both ways, 15 cases, zero `FAIL` lines.
+- `hermes-installer.test.sh`: exit 0 both ways, zero `FAIL` lines.
+- `bootstrap-transaction.test.sh`: exit 0 both ways.
+- `pnpm test:installer`: exit 0.
+- `pnpm -r typecheck` under Node 24: 4 of 4 `Done`.
+- Differential against PyYAML: fuzz seed 7, 3243 comparable, 0 unsafe; fuzz seed 4242, 3260
+  comparable, 0 unsafe; 64 hand-built shapes, 0 unsafe.
