@@ -234,7 +234,7 @@ weakened to make a test pass.
 
 ## Fix round 1 (review r0)
 
-Head after this round: `6a1c7ef` on `codex/4e-artifact-task-join`, pushed. Node 24
+This round is `c54a8fb` (code, tests, contract, changelog and this section) on `codex/4e-artifact-task-join`, followed by one commit that records this line. Both are pushed. Node 24
 (`PATH=/opt/homebrew/opt/node@24/bin:$PATH`) for every command. Logs under `<scratch>/4e/logs/r1-*`.
 No full suite, per the standing ruling. C1, I2, I3 and minors M1 and M2 are taken; M3 (a migration
 nulling pre-4e claimed `task_id`) and M4 (declare-time replay not upgrading a join) are untouched.
