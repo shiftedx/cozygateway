@@ -442,3 +442,65 @@ $ pnpm -r typecheck                           contract, relay, gateway, conforma
 
 The uncoverable test passed RED as well as GREEN: nothing was coverable before the change, so it is
 the guard that the derivation did not widen anything, not a case the change made pass.
+
+## Fix round 2
+
+One scoped item, the lead's ruling: a plain (Hermes-shaped) ask is coverable ONLY by a person's
+single-use once grant. A category grant requires a declared category and never covers a plain ask,
+because a plain ask declares none and the always-require exclusion cannot bite on it, so letting a
+category grant cover the placeholder `other` would silently pre-approve a destructive or publishing
+action nobody classified.
+
+The round-1 addendum did allow it, and its test asserted it, so this is enforcement, not a test-only
+change. Both halves are now closed:
+
+- **At grant creation**: `#resolveApproval` tracks whether the binding was DERIVED (the ask carried
+  no block of its own) and refuses `grant: "category"` over a derived one with the new outcome
+  `category_undeclared`, checked both in the pre-relay guard and again at the recording step. The
+  route renders it as `409 approval_category_undeclared`, "this approval declares no category, so it
+  can be granted one decision at a time and never a category". A `once` grant on the same card is
+  unaffected.
+- **At the consult**: `Storage.claimApprovalGrant` gained `allowCategory`, false for a derived
+  binding, so the `scope = 'category'` arm of the match is switched off entirely. A category grant
+  that reaches a derived binding by any other route, including one planted directly in the store
+  with the same action, system and resource, cannot answer for a plain ask.
+
+Row 66 now states the rule, says the recorded `other` is a placeholder for UNDECLARED rather than a
+claim that the action is harmless, and names the refusal code. The attach bullet and the changelog
+entry say the same in one line each.
+
+Covering test, `packages/gateway/test/native-bot-scoped-approvals.test.ts`: "never lets a category
+grant cover a plain approval, and refuses to create one on a plain card" (creation refused with
+`category_undeclared` and no grant recorded; a category grant planted straight into the store with
+the derived binding's own action, system and resource does not cover the next plain ask; the
+person's once grant still does). "covers a later identical plain approval from a grant a person made
+on the plain card" was rewritten to use a second once grant instead of a category one. Route
+mapping: `packages/gateway/test/bots-approval-grants-routes.test.ts` "answers 409 when a category is
+asked for over an approval that declares none".
+
+```
+RED  $ cd packages/gateway && npx vitest run test/native-bot-scoped-approvals.test.ts
+     × never lets a category grant cover a plain approval, and refuses to create one on a plain card
+       AssertionError: expected 'requested' to be 'category_undeclared'
+     Test Files  1 failed (1)
+          Tests  1 failed | 17 passed (18)
+
+GREEN $ cd packages/gateway && npx vitest run test/native-bot-scoped-approvals.test.ts
+     Test Files  1 passed (1)
+          Tests  18 passed (18)
+
+$ cd packages/gateway && npx vitest run test/native-bot-scoped-approvals.test.ts \
+    test/bots-approval-grants-routes.test.ts test/native-bot-approval-detail.test.ts \
+    test/native-bot-approval-repair.test.ts test/approvals.test.ts \
+    test/bots-pending-approvals-routes.test.ts test/bots-rooms-interactions.test.ts \
+    test/attach-v1-storage.test.ts
+     Test Files  8 passed (8)
+          Tests  85 passed (85)
+
+$ cd packages/gateway && npx vitest run   Test Files 132 passed | 1 skipped (133)
+                                          Tests 1477 passed | 2 skipped (1479)
+$ pnpm -r typecheck                       contract, relay, gateway, conformance: Done
+```
+
+The gateway package suite was run whole again because the consult signature changed; the shared
+resolution path was not touched this round. `.121` and hosted CI remain UNKNOWN.

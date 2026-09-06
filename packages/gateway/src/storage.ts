@@ -4532,6 +4532,11 @@ export class Storage {
     resource: string;
     payloadHash: string;
     allowOnce: boolean;
+    /** Capability 66. False for a binding DERIVED from a plain approval: a plain ask declares no
+     * category, so nothing can say it is not a destructive or a publishing one, and a standing
+     * category policy must never answer for an action nobody classified. Only a person's own
+     * single-use grant covers one. */
+    allowCategory: boolean;
     now: number;
   }): string | undefined {
     return this.tasks.atomic(() => {
@@ -4540,7 +4545,7 @@ export class Storage {
           `SELECT grant_id AS grantId, scope FROM bot_approval_grants
            WHERE ${LIVE_APPROVAL_GRANT}
              AND session_id = ? AND action = ? AND category = ? AND system = ? AND resource = ?
-             AND (scope = 'category'
+             AND ((? = 1 AND scope = 'category')
                   OR (? = 1 AND scope = 'once' AND turn_id = ? AND payload_hash = ?))
              AND grant_id IN (
                SELECT grant_id FROM bot_approval_grants
@@ -4553,8 +4558,8 @@ export class Storage {
         )
         .get(
           input.bot, input.now, input.sessionId, input.action, input.category, input.system,
-          input.resource, input.allowOnce ? 1 : 0, input.turnId, input.payloadHash,
-          input.bot, input.now,
+          input.resource, input.allowCategory ? 1 : 0, input.allowOnce ? 1 : 0, input.turnId,
+          input.payloadHash, input.bot, input.now,
         ) as { grantId: string; scope: string } | undefined;
       if (row === undefined) return undefined;
       if (row.scope === "once")

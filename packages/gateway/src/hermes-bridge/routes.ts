@@ -156,7 +156,10 @@ function extensionErrorBody(
     | "approval_scope_required"
     // Capability 66. The decision was relayed and the policy was not created: two different facts
     // in one answer, which is why it is neither a plain success nor a plain failure code.
-    | "approval_grant_not_recorded",
+    | "approval_grant_not_recorded"
+    // Capability 66. A category policy needs a declared category; an undeclared ask gets neither
+    // the policy nor a silent downgrade to one.
+    | "approval_category_undeclared",
   message: string,
 ): ErrorBody {
   return { error: { code, message } };
@@ -822,6 +825,14 @@ export function registerBotRoutes(
             extensionErrorBody(
               "approval_grant_not_recorded",
               "the decision stands, but this decision already carries a standing approval and no new one was created",
+            ),
+            409,
+          );
+        case "category_undeclared":
+          return c.json(
+            extensionErrorBody(
+              "approval_category_undeclared",
+              "this approval declares no category, so it can be granted one decision at a time and never a category",
             ),
             409,
           );

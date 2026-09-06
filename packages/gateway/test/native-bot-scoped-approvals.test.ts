@@ -513,20 +513,58 @@ describe("typed scoped approvals (capability 66)", () => {
     plane.handle("sage", approvalEvent(sessionId, turnId, "approval-3", { detail }));
     expect(harness.resolutions.some((row) => row.approvalId === "approval-3")).toBe(false);
 
-    // A category grant made on the same plain card covers every later ask with the same content.
-    await plane.surface().resolveApproval("sage", "approval-3", "approve", "device-1", {
-      grant: "category", expiresAt: 8_000_000,
-    });
+    // A second single-use grant covers the next one, and different content is a different ask: the
+    // sentence is part of what was bound.
+    await plane.surface().resolveApproval("sage", "approval-3", "approve", "device-1", { grant: "once" });
     plane.handle("sage", approvalEvent(sessionId, turnId, "approval-4", { detail }));
     expect(harness.resolutions.some((row) => row.approvalId === "approval-4")).toBe(true);
-    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-5", { detail }));
-    expect(harness.resolutions.some((row) => row.approvalId === "approval-5")).toBe(true);
-
-    // Different content is a different ask: the sentence is part of what was bound.
-    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-6", {
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-5", {
       detail: "opens Chrome with the Personal profile",
     }));
-    expect(harness.resolutions.some((row) => row.approvalId === "approval-6")).toBe(false);
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-5")).toBe(false);
+    harness.close();
+  });
+
+  it("never lets a category grant cover a plain approval, and refuses to create one on a plain card", async () => {
+    const harness = await startTurn();
+    const { plane, storage, sessionId, turnId } = harness;
+    const detail = "opens Chrome with the Work profile";
+
+    // A plain ask declares no category, so nothing can say it is not a destructive or a publishing
+    // one. A standing category policy over an undeclared action is refused at the source.
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-1", { detail }));
+    expect(await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1", {
+      grant: "category", expiresAt: 8_000_000,
+    })).toBe("category_undeclared");
+    expect(plane.surface().approvalGrants!("sage")).toEqual([]);
+
+    // And refused again at the consult, so a category grant that matches a plain ask's derived
+    // binding by any other route still cannot answer for it.
+    storage.recordApprovalGrant({
+      bot: "sage",
+      grantId: "grant:sage:planted",
+      scope: "category",
+      deviceId: "device-1",
+      sessionId,
+      turnId: null,
+      approvalId: "planted",
+      action: "workspace_write",
+      category: "other",
+      system: "attach",
+      resource: detail,
+      payloadHash: null,
+      expiresAt: 8_000_000,
+      createdAt: 1_000,
+    });
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-2", { detail }));
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-2")).toBe(false);
+
+    // The person's own single-use grant is still the way to cover one.
+    expect(await plane.surface().resolveApproval("sage", "approval-2", "approve", "device-1", {
+      grant: "once",
+    })).toBe("requested");
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-3", { detail }));
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-3")).toBe(true);
     harness.close();
   });
 

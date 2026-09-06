@@ -193,7 +193,9 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `del
   correctly is the raising harness's job, not a guarantee this wire makes. A peer that sends NO
   block is unchanged and needs no change: where its approval carries the capability-56 `detail`
   sentence, the gateway derives a binding from that sentence and the rule name so a person can
-  cover a later identical ask, and where it does not, the ask is simply never covered. Neither the
+  cover a later identical ask with a single-use grant, and where it does not, the ask is simply
+  never covered. A category grant never covers a plain ask, because a plain ask declares no
+  category for the always-require exclusion to read. Neither the
   event such a peer sends nor the commands it receives differ. A peer never puts a secret,
   credential, URL, header or env value in the block, and emits it only when the gateway advertised
   `com.cozylabs.bots >= 66` on `hello_ack`.

@@ -100,6 +100,15 @@ describe("capability-66 scoped approval decisions and grants", () => {
       .toBe("approval_grant_not_recorded");
   });
 
+  it("answers 409 when a category is asked for over an approval that declares none", async () => {
+    const response = await mount({ resolveApproval: async () => "category_undeclared" as const })
+      .request("/bots/sage/approvals/call-1/approve", json({ grant: "category", expiresAt: 9_000_000 }));
+
+    expect(response.status).toBe(409);
+    expect((await response.json() as { error: { code: string } }).error.code)
+      .toBe("approval_category_undeclared");
+  });
+
   it("never reads a body on a deny, so a denial stays the pre-66 request", async () => {
     const resolveApproval = vi.fn(async () => "requested" as const);
     const response = await mount({ resolveApproval }).request(

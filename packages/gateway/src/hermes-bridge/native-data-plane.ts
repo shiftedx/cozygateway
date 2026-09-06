@@ -1848,6 +1848,9 @@ export class NativeBotDataPlane {
       resource: scope.resource,
       payloadHash: scope.payloadHash,
       allowOnce: derived || scope.retry === "idempotent",
+      // A category grant needs a DECLARED category. A derived binding has none, so only the
+      // person's own single-use grant can answer for a plain ask.
+      allowCategory: !derived,
       now,
     });
   }
@@ -1916,8 +1919,13 @@ export class NativeBotDataPlane {
     // does not, `scope` stays undefined and asking for a grant is refused with `scope_required`,
     // which is what "there is nothing here to bound a grant by" already means.
     const scope = payload.scope ?? plainApprovalScope(payload, binding.expiresAt);
+    const derived = payload.scope === undefined;
     if (grantRequest?.grant === "category") {
       if (scope === undefined || grantRequest.expiresAt === undefined) return "scope_required";
+      // A category is something a peer DECLARES. A plain ask declares none, and the gateway cannot
+      // classify one, so a standing category policy over it would silently pre-approve a
+      // destructive or publishing action nobody categorized. One ask at a time is the only offer.
+      if (derived) return "category_undeclared";
       if (ALWAYS_REQUIRE_APPROVAL_CATEGORIES.includes(scope.category)) return "category_forbidden";
       const now = this.#now();
       // A standing grant is bounded in time by construction: a dead or unbounded expiry is refused
@@ -1957,6 +1965,7 @@ export class NativeBotDataPlane {
       if (grantRequest?.grant === undefined || decision !== "approve") return "requested";
       if (scope === undefined) return "scope_required";
       if (ALWAYS_REQUIRE_APPROVAL_CATEGORIES.includes(scope.category)) return "category_forbidden";
+      if (derived && grantRequest.grant === "category") return "category_undeclared";
       const category = grantRequest.grant === "category";
       const now = this.#now();
       const recorded = this.#storage.recordApprovalGrant({
