@@ -20,6 +20,7 @@ import {
   AttachV1GapSchema,
   AttachV1HeartbeatSchema,
   AttachV1HelloSchema,
+  sanitizeActiveTurns,
   AttachV1ConfigResultSchema,
   AttachV1HistoryResultSchema,
   AttachV1MemoryResultSchema,
@@ -78,7 +79,9 @@ export interface AttachV1Events {
   onEvent(agentId: string, frame: AttachV1EventFrame): boolean;
   /** Authorization/canonical-target check performed before inbox admission. */
   canAcceptEvent?(agentId: string, frame: AttachV1EventFrame): boolean;
-  onHello?(agentId: string): void;
+  /** Capability 69. `activeTurns` is what the peer declared it still carries at hello: an empty
+   * array is the declaration "none", and `undefined` is a peer that cannot declare. */
+  onHello?(agentId: string, activeTurns?: readonly string[]): void;
   onTaskTurnQueued?(agentId: string, command: Extract<AttachV1Command, { kind: "turn" }>): void;
   onPresence(agentId: string, state: "online" | "degraded" | "absent"): void;
   /** The peer took a command off the wire. Transport-only proof: it says the command reached the
@@ -306,10 +309,17 @@ export class AttachV1Ingress implements TurnEndpoint {
         });
         this.#presence(agentId, "online");
         this.#storage.tasks.hello(agentId, receivedAt);
-        this.#events.onHello?.(agentId);
         this.flushTaskCommands();
         this.#refreshDegraded(agentId, connection);
         this.#flush(agentId, connection.commandCursor);
+        // Capability 69. Reconciliation runs LAST, after the durable outbox has been handed to
+        // the peer. A command still sitting in the outbox is one the peer has never seen, so it
+        // could not have declared it; reconciling before the flush would read "not declared" as
+        // "lost" and fail a message that is about to be delivered.
+        const activeTurns = sanitizeActiveTurns(frame.activeTurns);
+        if (frame.activeTurns !== undefined && activeTurns === undefined)
+          this.#log(`attach-v1: profile "${agentId}" sent an unusable activeTurns declaration on hello; treating it as undeclared`);
+        this.#events.onHello?.(agentId, activeTurns);
         return;
       }
       if (frame.kind === "hello") return;

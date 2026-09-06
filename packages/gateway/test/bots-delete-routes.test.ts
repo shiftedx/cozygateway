@@ -185,6 +185,10 @@ function seedEverything(storage: Storage, bot: string, deviceId: string): string
   storage.recordNativeBotTerminal({
     bot, sessionId, turnId: `${bot}-t1`, status: "interrupted", cause: "cancelled", completedAt: NOW,
   });
+  // Capability 69. A pending steer holds a person's own words against this bot's conversation.
+  storage.recordPendingNativeSteer({
+    bot, sessionId, turnId: `${bot}-t1`, messageId: `${bot}-steer-1`, text: "and the timeline?", at: NOW,
+  });
   storage.recordBotMobileReceipt({
     requestId: `${bot}-phone-1`, bot, sessionId, turnId: `${bot}-t1`, command: "device.status",
     sharedDescription: "Device status", purpose: "Check phone status", sharedAt: NOW,
@@ -255,6 +259,7 @@ describe("DELETE /bots/:name deletes the profile and purges the gateway", () => 
     for (const area of [
       "roster", "toolSteps", "delegations", "routineOverrides", "chatPointer", "sessions",
       "messages", "receipts", "mobileReceipts", "turnMediaDeliveries", "interactions", "turnTerminals",
+      "pendingSteers",
       "attachStream", "attachCommands", "attachMedia", "liveActivities",
       "coreMessages", "coreThreads", "agentRow",
     ]) {
@@ -265,6 +270,10 @@ describe("DELETE /bots/:name deletes the profile and purges the gateway", () => 
     // Reads agree with the report, and the OTHER bot is untouched throughout.
     expect(h.storage.botRoster().bots.some((b) => b.name === BOT)).toBe(false);
     expect(h.storage.nativeBotMessages(BOT, `${BOT}-x`)).toEqual([]);
+    // The deleted bot keeps no one's words; the other bot keeps its own.
+    expect(h.storage.pendingNativeSteers(BOT, h.storage.nativeBotChat(BOT, NOW).sessionId)).toEqual([]);
+    expect(h.storage.pendingNativeSteers(KEEPER, h.storage.nativeBotChat(KEEPER, NOW).sessionId)
+      .map((steer) => steer.text)).toEqual(["and the timeline?"]);
     expect(h.storage.threadById(`thread-${BOT}`)).toBeUndefined();
     expect(h.storage.listAgents().some((a) => a.id === BOT)).toBe(false);
     expect(h.storage.listAgents().some((a) => a.id === KEEPER)).toBe(true);
@@ -375,7 +384,7 @@ describe("DELETE /bots/:name deletes the profile and purges the gateway", () => 
 describe("capability 37 is additive", () => {
   it("advertises the bumped integer and adds no field to any pre-37 shape", async () => {
     const h = await setup();
-    expect(BOTS_CAPABILITY_VERSION).toBe(68);
+    expect(BOTS_CAPABILITY_VERSION).toBe(69);
 
     const before = (await (await h.authed("/bots")).json()) as { bots: Array<Record<string, unknown>> };
     expect((await h.authed(`/bots/${BOT}`, DELETE_REQUEST)).status).toBe(200);

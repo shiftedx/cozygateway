@@ -219,6 +219,24 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `del
   directly, and invokes the existing push decision once. An explicit native Bot Mode target must equal
   the gateway's currently selected canonical/home session; a foreign or historical target is rejected
   before inbox admission.
+- Capability 69 (`com.cozylabs.bots`). `hello` may carry `activeTurns`, the turn ids the peer
+  STILL CARRIES as running at the moment it re-attaches, ids only. It is
+  the one fact only the peer holds: a gateway turn is durable, so a peer that restarted, crashed
+  or dropped a turn internally leaves the gateway believing work is running that no process owns.
+  An EMPTY ARRAY is a real declaration ("I hold none"); an ABSENT field is a peer that cannot
+  declare, and is never read as either answer. `failed` may likewise carry the closed
+  `reason: "unknown_turn"`, which a peer sends when it was handed a `steer` (or any work) for a
+  turn it does not hold. Both fields are optional and a peer below 69 sends neither; nothing the
+  gateway sends changes, so a peer that never declares is byte identical to its pre-69 self.
+  `activeTurns` is deliberately UNVALIDATED by the hello schema and sanitized by the gateway, the
+  way capability 56's `detail` and 62's `repair` are: refusing a hello over one malformed
+  best-effort field would take the profile dark and reconnect-loop. A declaration that is not an
+  array of 1 to 256 character ids, or that carries more than 1024 of them, degrades to "cannot
+  declare" with one bounded log line and is never truncated; repeated ids collapse. A peer that
+  declares must declare COMPLETELY: an omitted turn it has acknowledged and is still running will
+  be sealed. What the gateway does with these fields is capability 69 of
+  `contract/ext-bots-v1.md`: seal the acknowledged turns the peer does not carry, bound the ones
+  it cannot speak for, and promote an unanswered steer.
 - `presence` supplements transport health. The gateway reports online only after hello, degraded
   after missed heartbeats/backpressure, and absent after timeout/close. Clients reconnect with
   exponential backoff and jitter.

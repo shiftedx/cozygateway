@@ -749,7 +749,10 @@ export async function startGateway(
       // The plugin-facing receipt is the ingress' own business; this is the half the USER sees.
       onScheduledDeliveryFailed: (agentId, failure) =>
         nativeBotPlane?.recordScheduledDeliveryFailure(agentId, failure),
-      onHello: (agentId) => mobileNode?.disconnectAgent(agentId),
+      onHello: (agentId, activeTurns) => {
+        mobileNode?.disconnectAgent(agentId);
+        nativeBotPlane?.handleAttachHello(agentId, activeTurns);
+      },
       onTaskTurnQueued: (agentId, command) => nativeBotPlane?.taskTurnQueued(agentId, command),
       onPresence: (agentId, state) => {
         // A chat execution is a transport peer, never another bot in the roster.

@@ -706,6 +706,25 @@ CREATE TABLE IF NOT EXISTS bot_native_turn_terminals (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bot_native_turn_terminals_session
   ON bot_native_turn_terminals (bot, session_id, completed_at DESC);
+-- Capability 69. A steer's words, kept from the moment the steer is dispatched until something
+-- proves they were heard: a frame from the peer on that turn, a rescued reply in that session, a
+-- promotion into a new durable turn, or a visible failed-delivery row. DURABLE, because the whole
+-- point is that a gateway restart between the steer and the seal must not drop what a person said.
+CREATE TABLE IF NOT EXISTS bot_native_pending_steers (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  media_ids_json TEXT,
+  context_json TEXT,
+  origin_device TEXT,
+  created_at INTEGER NOT NULL,
+  settled_at INTEGER,
+  PRIMARY KEY (bot, message_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_native_pending_steers_open
+  ON bot_native_pending_steers (bot, session_id, turn_id, created_at);
 -- CozyApps are gateway-owned user library records. The tree is validated before every write;
 -- SQLite only owns durable identity, revision, and bot cleanup.
 CREATE TABLE IF NOT EXISTS cozy_apps (
@@ -4125,6 +4144,122 @@ export class Storage {
       .run(turnId ?? null, now, bot, sessionId);
   }
 
+  /** Capability 69. Every nonterminal native turn this profile is still carrying, across all of
+   * its local sessions and not just the canonical chat, so hello reconciliation can answer the
+   * only question that matters at a re-attach: what does this gateway think is running? */
+  nativeBotActiveTurns(bot: string): { sessionId: string; turnId: string }[] {
+    return this.#db
+      .prepare(
+        `SELECT session_id AS sessionId, active_turn_id AS turnId FROM bot_native_sessions
+         WHERE bot = ? AND active_turn_id IS NOT NULL`,
+      )
+      .all(bot) as unknown as { sessionId: string; turnId: string }[];
+  }
+
+  /** Capability 69. Remember one steer's words until something proves they were heard. Ordered by
+   * arrival, so several steers on one dead turn are promoted in the order the person sent them
+   * rather than the last one silently replacing the rest. */
+  recordPendingNativeSteer(input: {
+    bot: string; sessionId: string; turnId: string; messageId: string; text: string;
+    mediaIds?: readonly string[]; context?: unknown; originDevice?: string; at: number;
+  }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO bot_native_pending_steers
+           (bot, session_id, turn_id, message_id, text, media_ids_json, context_json, origin_device, created_at, settled_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(bot, message_id) DO NOTHING`,
+      )
+      .run(
+        input.bot, input.sessionId, input.turnId, input.messageId, input.text,
+        input.mediaIds === undefined || input.mediaIds.length === 0 ? null : JSON.stringify([...input.mediaIds]),
+        input.context === undefined ? null : JSON.stringify(input.context),
+        input.originDevice ?? null,
+        input.at,
+      );
+  }
+
+  /** Move one still-open steer onto the turn that now carries it. Promotion re-dispatches the
+   * steers that followed the promoted one onto the new turn, and they stay open there. */
+  movePendingNativeSteer(bot: string, messageId: string, turnId: string): void {
+    this.#db
+      .prepare("UPDATE bot_native_pending_steers SET turn_id = ? WHERE bot = ? AND message_id = ? AND settled_at IS NULL")
+      .run(turnId, bot, messageId);
+  }
+
+  /** Settle exactly one steer, by the message id that identifies the person's words. */
+  settlePendingNativeSteer(bot: string, messageId: string, at: number): void {
+    this.#db
+      .prepare("UPDATE bot_native_pending_steers SET settled_at = ? WHERE bot = ? AND message_id = ? AND settled_at IS NULL")
+      .run(at, bot, messageId);
+  }
+
+  /** Unsettled steers, oldest first. `turnId` narrows to one turn; omitting it asks the whole
+   * conversation, which is what a rescued reply settles. */
+  pendingNativeSteers(bot: string, sessionId: string, turnId?: string): {
+    turnId: string; messageId: string; text: string; mediaIds?: string[]; context?: unknown; originDevice?: string;
+  }[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT turn_id AS turnId, message_id AS messageId, text, media_ids_json AS mediaIdsJson,
+                context_json AS contextJson, origin_device AS originDevice
+         FROM bot_native_pending_steers
+         WHERE bot = ? AND session_id = ? AND settled_at IS NULL AND (? IS NULL OR turn_id = ?)
+         ORDER BY created_at, message_id`,
+      )
+      .all(bot, sessionId, turnId ?? null, turnId ?? null) as unknown as {
+        turnId: string; messageId: string; text: string; mediaIdsJson: string | null;
+        contextJson: string | null; originDevice: string | null;
+      }[];
+    return rows.map((row) => ({
+      turnId: row.turnId,
+      messageId: row.messageId,
+      text: row.text,
+      ...(row.mediaIdsJson === null ? {} : { mediaIds: JSON.parse(row.mediaIdsJson) as string[] }),
+      ...(row.contextJson === null ? {} : { context: JSON.parse(row.contextJson) as unknown }),
+      ...(row.originDevice === null ? {} : { originDevice: row.originDevice }),
+    }));
+  }
+
+  /** Settle every open steer for one turn, or for the whole conversation when `turnId` is
+   * omitted. Settling is idempotent and never deletes: the row is the record that the words were
+   * accounted for. */
+  settlePendingNativeSteers(bot: string, sessionId: string, turnId: string | undefined, at: number): void {
+    this.#db
+      .prepare(
+        `UPDATE bot_native_pending_steers SET settled_at = ?
+         WHERE bot = ? AND session_id = ? AND settled_at IS NULL AND (? IS NULL OR turn_id = ?)`,
+      )
+      .run(at, bot, sessionId, turnId ?? null, turnId ?? null);
+  }
+
+  /** Capability 69. The outbox row for one steer command, so a promotion can cancel a steer the
+   * peer never took off the wire instead of letting it arrive after the promoted turn. */
+  attachSteerDelivery(agentId: string, messageId: string): {
+    sequence: number; commandId: string; acknowledgedAt: number | null;
+  } | undefined {
+    return this.#db
+      .prepare(
+        `SELECT sequence, command_id AS commandId, acked_at AS acknowledgedAt
+         FROM attach_command_outbox
+         WHERE agent_id = ? AND cancelled_at IS NULL
+           AND json_extract(command_json, '$.kind') = 'steer'
+           AND json_extract(command_json, '$.messageId') = ?
+         ORDER BY sequence DESC LIMIT 1`,
+      )
+      .get(agentId, messageId) as { sequence: number; commandId: string; acknowledgedAt: number | null } | undefined;
+  }
+
+  /** Capability 69. Move one user row onto the turn that will actually answer it. The only caller
+   * is steer promotion: the person's message was committed against a turn the peer had already
+   * lost, and the promoted turn is the one that answers it, so the causation link
+   * (`BotChatMessage.inReplyToId`) has to follow rather than dangle on a dead id. */
+  rebindNativeBotMessageTurn(bot: string, sessionId: string, messageId: string, turnId: string): void {
+    this.#db
+      .prepare("UPDATE bot_native_messages SET turn_id = ? WHERE bot = ? AND session_id = ? AND message_id = ?")
+      .run(turnId, bot, sessionId, messageId);
+  }
+
   clearNativeBotTurn(bot: string, sessionId: string, turnId: string, now: number): boolean {
     const cleared = this.#db
       .prepare(
@@ -5076,6 +5211,10 @@ export class Storage {
       // takes its grants with it rather than leaving policy pointing at an identity that is gone.
       ["approvalGrants", "bot_approval_grants", "bot"],
       ["turnTerminals", "bot_native_turn_terminals", "bot"],
+      // Capability 69. A pending steer holds a person's own words against a conversation with
+      // this bot. Deleting the bot takes them with it rather than leaving text keyed to an
+      // identity that no longer exists and a promotion that can never run.
+      ["pendingSteers", "bot_native_pending_steers", "bot"],
       ["attachStream", "attach_streams", "agent_id"],
       ["attachCommands", "attach_command_outbox", "agent_id"],
       ["attachEvents", "attach_event_inbox", "agent_id"],

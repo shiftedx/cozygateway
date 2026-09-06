@@ -2863,4 +2863,15 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * `task_completed` payload of `contract/push-v0.md`, deduplicated against capability 64's own
  * completion notification record. Additive: a client that never reads the route and a phone that
  * never sends `mobile_node_progress` are byte identical to their pre-68 selves. */
-export const BOTS_CAPABILITY_VERSION = 68;
+/** Capability 69: a reply is never lost to a stale native turn. Attach-v1 `hello` may declare the
+ * turn ids a peer still carries and `failed` may carry the closed `reason: "unknown_turn"`. On
+ * hello the gateway seals the ACKNOWLEDGED nonterminal turns the peer does not carry, through the
+ * existing turn transition; a turn the peer declares active, and a turn still queued in the
+ * outbox, are never sealed by reconciliation. A turn whose peer is disconnected runs on ADR 0004's
+ * provisional 120 second owner-loss lease, and one whose peer re-attached without declaring runs
+ * on a longer grace, instead of the long silence ceiling. Unanswered steers on a dead turn are
+ * promoted, in order, into a new durable turn with the same text, media and chat context, and an
+ * orphaned commit carrying words is projected rather than discarded.
+ * Additive: no route, frame, field or status value is added, and a peer that sends neither new
+ * field, like every client, is byte identical to its pre-69 self. */
+export const BOTS_CAPABILITY_VERSION = 69;
