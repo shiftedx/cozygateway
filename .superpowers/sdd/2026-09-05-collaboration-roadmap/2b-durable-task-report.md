@@ -30,3 +30,8 @@ RED: `pnpm --filter cozygateway exec vitest run test/task-terminal-immutability.
 GREEN: `pnpm --filter cozygateway exec vitest run test/task-terminal-immutability.test.ts test/native-bot-data-plane.test.ts test/attach-boot-replay.test.ts`: 3 files, 67 passed. Includes late final/interim duplicate delivery, newer active-turn pointer isolation, user-cancel suppression, process reconstruction and journal-before-apply reply recovery. Existing issue 193 assertions now require delivered replies with the original timeout/interruption outcome.
 
 Only production callers of `recordNativeBotTerminal` are native data plane normal settlement and late reply handling. Storage now retains the first outcome. Late replies retain delivery but do not replace it or emit misleading completed row23 state. This is a prerequisite correction, not Task implementation completion.
+
+## Interim commits at the durable journal boundary
+
+RED: task-terminal-immutability focused run, 8 tests: 1 failed and 7 passed. An interim `continues:true` commit incorrectly caused the next verification event to return `ignored_terminal`.
+GREEN: `pnpm --filter cozygateway exec vitest run test/task-terminal-immutability.test.ts test/attach-v1-storage.test.ts`, 2 files, 31 passed. The added test closes and reopens SQLite after the interim commit, replays it as a duplicate, admits subsequent Verification and final commit, then refuses a later conflicting terminal. Storage now seals only final commits.

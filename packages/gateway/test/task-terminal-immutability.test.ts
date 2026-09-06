@@ -1,3 +1,5 @@
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { openStorage } from "../src/storage.ts";
 import { NativeBotDataPlane } from "../src/hermes-bridge/native-data-plane.ts";
@@ -39,6 +41,24 @@ describe("Task Run first-terminal immutability at native ingress", () => {
       });
     }
   }
+  it("keeps the attach journal open after an interim commit so final proof can arrive", () => {
+    const root = join(process.cwd(), "../../benchmark-runs/2b-durable-task");
+    mkdirSync(root, { recursive: true });
+    const directory = mkdtempSync(join(root, "interim-restart-"));
+    const path = join(directory, "gateway.sqlite");
+    let storage = openStorage(path);
+    storage.enqueueAttachCommand("sage", "turn", { kind: "turn", threadId: "session", turnId: "run", messageId: "user", text: "work" }, 1);
+    const interim = { kind: "event" as const, sequence: 1, eventId: "interim", event: { kind: "commit" as const, threadId: "session", turnId: "run", messageId: "interim-reply", blocks: [{ type: "paragraph" as const, text: "Still working" }], continues: true as const } };
+    expect(storage.acceptAttachEvent("sage", interim, 2).status).toBe("accepted");
+    storage.close();
+    storage = openStorage(path);
+    expect(storage.acceptAttachEvent("sage", interim, 2).status).toBe("duplicate");
+    expect(storage.acceptAttachEvent("sage", { kind: "event", sequence: 2, eventId: "verify", event: { kind: "tool", threadId: "session", turnId: "run", callId: "check", name: "test", role: "verification", status: "running" } }, 3).status).toBe("accepted");
+    expect(storage.acceptAttachEvent("sage", { ...interim, sequence: 3, eventId: "final", event: { kind: "commit", threadId: "session", turnId: "run", messageId: "final-reply", blocks: [] } }, 4).status).toBe("accepted");
+    expect(storage.acceptAttachEvent("sage", { kind: "event", sequence: 4, eventId: "late-failure", event: { kind: "failed", threadId: "session", turnId: "run", messageId: "late" } }, 5).status).toBe("ignored_terminal");
+    storage.close();
+    rmSync(directory, { recursive: true });
+  });
   it("refuses a storage-level rewrite of the first outcome", () => {
     const storage = openStorage(":memory:");
     storage.recordNativeBotTerminal({ bot: "sage", sessionId: "session", turnId: "run", status: "failed", completedAt: 1 });

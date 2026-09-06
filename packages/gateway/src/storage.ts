@@ -2767,7 +2767,7 @@ export class Storage {
       if (discardReason !== undefined) return quarantine(discardReason);
       const event = frame.event;
       const turnId = "turnId" in event ? event.turnId : undefined;
-      const terminal = event.kind === "commit" || event.kind === "failed" || event.kind === "cancelled" || event.kind === "interrupted";
+      const terminal = (event.kind === "commit" && event.continues !== true) || event.kind === "failed" || event.kind === "cancelled" || event.kind === "interrupted";
       const sealed = turnId === undefined
         ? undefined
         : (this.#db.prepare("SELECT event_id AS eventId FROM attach_turn_terminals WHERE agent_id = ? AND turn_id = ?").get(agentId, turnId) as { eventId: string } | undefined);
