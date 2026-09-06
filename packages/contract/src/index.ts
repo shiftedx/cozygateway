@@ -22,3 +22,4 @@ export * from "./cozyapps.ts";
 export * from "./chat-configuration.ts";
 export * from "./provider-connections.ts";
 export * from "./tasks.ts";
+export * from "./artifacts.ts";

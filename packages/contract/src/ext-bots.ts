@@ -2681,4 +2681,8 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
 /** Capability 64: durable gateway Task projection, append-only stream, authenticated commands
  * and full replacement updates. Run identity remains the attach turn. Optional unknown tool
  * roles fail closed as possible effects. Earlier clients ignore additive frames. */
-export const BOTS_CAPABILITY_VERSION = 64;
+/** Capability 65: durable gateway Artifact records with byte-verified commitment, retained
+ * originals, tombstoned deletion, supersession, and a delivery lifecycle with its own identity
+ * and retries. Delivery is separate from Task completion, and the existing attachment surface is
+ * unchanged for every client below 65. The shapes live in `artifacts.ts`. */
+export const BOTS_CAPABILITY_VERSION = 65;

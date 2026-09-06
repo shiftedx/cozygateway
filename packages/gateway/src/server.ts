@@ -1021,6 +1021,7 @@ export async function startGateway(
 
   storage.tasks.runtime((bot) => runtimeBotService?.owns(bot) === true ? runtimeBotService.projection(bot).stage : undefined);
   storage.tasks.reconcile();
+  if (config.artifactStoreBytes !== undefined) storage.artifacts.capacity(config.artifactStoreBytes);
   storage.tasks.observe((frame) => hub.broadcast(frame), BOTS_CAPABILITY_VERSION);
   const app = createApp({
     storage,

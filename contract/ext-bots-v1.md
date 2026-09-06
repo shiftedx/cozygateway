@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 63. This extension is independent of the frozen core
+Status: v1 extension, capability version 65. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -31,7 +31,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 63 }
+"capabilities": { "com.cozylabs.bots": 65 }
 ```
 
 Versioned additions are additive and clients compare `>=`, never equality. Explicitly withdrawn or
@@ -104,6 +104,7 @@ and does not register `/bots` routes.
 | 62 | An approval can propose an MCP repair: `ApprovalEvent` on attach-v1 gains optional `repair`, one typed block a runtime peer sends when it wants to reconnect an MCP server whose tool list went stale, crashed, refused, or would not re-list, and must ask first. The block is `BotApprovalRepair`: `kind` (`mcp_reconnect`), `server` (the configured MCP server name, 1-64 characters), `impact` (the affected tool names, 0-64 entries of 1-128 characters), `scope` (`server`), `fingerprint` (`{ previous?, current? }`, opaque digests of 1-128 characters), `reason` (`stale_tool`, `relist_failed`, `crashed`, `unauthorized`, from the peer's own health record), and `policy` (`approve_once`: approving reconnects that server once; `auto_refresh`: the operator allowed the peer to refresh that server on its own, it already did, and the proposal is informational). Every set is closed, both objects are closed, and no URL, header value, env value, or secret is ever in `server`, `impact`, or a fingerprint. The gateway treats the block as capability 56 treats `detail`: it validates the sets and bounds and refuses any C0/C1 control or Unicode Format (Cf) character, a lone surrogate, or a whitespace-only value in a string (the bounds count UTF-16 code units, as the schema enforces them), and a block that fails is DROPPED while the approval is kept, never a reason to refuse the frame, with one bounded content-free log line; a valid block is carried byte for byte. `BotApprovalPendingFrame` and the `BotPendingApproval` inbox row gain the same optional `repair`, and the durable interaction record stores it, so the live frame, the rebroadcast on reconnect, and a cold-start `GET /bots/approvals` read all show the block the peer sent. Resolution is the unchanged approve or deny: the peer performs the reconnect on approve, and the gateway records nothing about the outcome beyond the existing settlement. Additive: an approval that is not a repair proposal is byte identical to its pre-62 self on every surface, and a client renders the repair card only on `>= 62`. |
 | 63 | The per-server MCP repair policy, declared before it is emitted: `BotMcpServer` gains optional `repair`, closed to `approve_once` (reconnecting that server asks first, every time) and `auto_refresh` (the operator already allowed the peer to refresh that server on its own, so a reconnect happens without a question). It is the same setting capability 62 reports as `BotApprovalRepair.policy` on one live proposal, read off the server row instead, so a client can say what a reconnect will cost before one is proposed. It rides the existing capability-48 `bot_config` `profile.read` of the runtime peer: no new route, no new lane, no new operation. READ-ONLY METADATA: `BotProfilePatch` does not gain it and never will, `enabledMcpServers` stays a list of NAMES so no request shape can carry a policy, and the setting is changed on the harness rather than through this gateway. The gateway does not store, compute, write, execute, or interpret the value, exactly as it does not for capability 58's `guardrailCeiling`; it validates the closed union and relays what the peer answered. No repair is performed and no policy is mutated here. An absent wire field means the policy was not projected or is unknown, and the gateway never fills it in. Hermes and peers below 63 omit it. A known CozyAgents peer at 63 may project its effective `approve_once` default even when the operator omitted that config key: `approve_once` requires approval and does not grant repair permission. An unknown value is NOT tolerated: it follows the `bot_config` lane's existing convention, the whole `config_result` frame is invalid, the ingress refuses it with one bounded content-free log line and closes the peer's socket, and the read ends `503 backend_unavailable`, so a client never receives an unvalidated string in the position where it renders a policy. Additive: the field is optional, so a peer and a client below 63 are byte identical to their pre-63 selves. EMISSION GATING: a peer emits `repair` only when the gateway advertised `com.cozylabs.bots >= 63` on `hello_ack`, and only with one of the two names; a client renders the policy only on `>= 63`. |
 | 64 | Durable gateway Tasks: ten states, the 45 enumerated ADR 0004 reasons, append-only transitions and accepted intents, existing attach turn identity as Run identity, and full-replace `bot_task_updated` frames. See the Task surface below. |
+| 65 | Durable gateway Artifacts: byte-verified commitment over the bytes the existing attach media route stored, retained originals, explicit deletion with a tombstone, supersession and versions, and a delivery lifecycle with its own identity and retries. See the Artifact surface below. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -1108,3 +1109,61 @@ must supply an explicit decision identity, issuer, Task/Run binding and recorded
 persists that decision before appending `failed`, only from blocked and only after actual execution
 has ended. The reader is absent by default; retry budget exhaustion and timeout do not substitute
 for such a decision. No extra public Task command is introduced.
+
+### Artifact surface (capability 65)
+
+An Artifact is a declared Task output the gateway owns: a stable identity, provenance to its Bot,
+producing peer, session, Task and Run, plus filename, media type, byte size, SHA-256, validation
+status, version and supersession, and the producer's `draft` / `review_copy` / `final` mark. The
+closed states, marks, validation values and delivery states are defined in
+`packages/contract/src/artifacts.ts`.
+
+There is no second upload authority. Bytes reach the gateway through the existing
+`POST /attach/v1/media/:mediaId` route, which already validates the allowlisted type, the declared
+size and the digest. Commitment then recomputes the SHA-256 and the byte count over those STORED
+bytes and requires both to equal the declaration. Metadata alone is never validation: a digest
+mismatch, a size mismatch, absent bytes, or an exceeded operator capacity all record
+`commit_failed` with the reason on the record, visibly, rather than silently dropping either the
+declaration or the bytes. `validation` says what the bytes proved rather than why the commit
+failed: `mismatch` only for a digest or size mismatch, `unvalidated` when the bytes were never
+there to compare, and `verified` for a capacity refusal, where the bytes did match and the store
+refused to retain them.
+
+Producer routes use the attach bearer and are scoped to the authenticated identity, so a foreign
+or guessed id is the same `404` an absent one gets: `POST /attach/v1/artifacts` declares,
+`GET /attach/v1/artifacts/:artifactId` reads, `POST /attach/v1/artifacts/:artifactId/commit`
+commits one `mediaId`, `POST /attach/v1/artifacts/:artifactId/deliveries` retries delivery under a
+new delivery id, and `POST /attach/v1/artifacts/:artifactId/deliveries/:deliveryId` reports the one
+platform fact the producer owns (`delivered` or `failed`).
+
+Paired-device routes are `GET /bots/:name/artifacts`, `GET /bots/groups/:name/artifacts`,
+`GET /artifacts/:artifactId`, `GET /artifacts/:artifactId/latest` (the supersession chain's tip),
+`GET /artifacts/:artifactId/content`, and `DELETE /artifacts/:artifactId`. Discovery never needs
+the chat message the Artifact was mentioned in. `content` serves the retained original with
+`nosniff` and `Content-Disposition: attachment`, never a host path or a credential; `location` on
+the record is that gateway-relative path and is absent on a tombstone.
+
+Delivery is a separate object with its own identity and states. `queued` is NOT received;
+`delivered` is platform commitment; `acknowledged` is authenticated client receipt or download and
+says nothing about whether a person read the Artifact. A download served by this gateway is itself
+the platform commitment for that attempt, so it records both facts at once. Duplicate receipts and
+reconnecting clients update once and keep the first fact. A retry is only available once the
+current attempt failed, references the SAME committed Artifact, and never re-admits the generating
+Task or Run; a completed Task stays completed when its delivery fails.
+
+Originals are retained until an explicit deletion. Age, the media staging deadline, storage
+cleanup, and deleting the conversation the Artifact was produced in do not remove one; committing
+clears the staging deadline on those bytes for exactly that reason. Deleting the owning Bot is
+itself an explicit deletion and takes the records with it. An explicit `DELETE` leaves a truthful
+tombstone carrying the provenance, the digest and the version while the bytes stop being reachable
+(`410` on `content`); the bytes themselves go through the existing unreferenced-media rule, so an
+object still reachable as a durable attachment stays reachable there.
+
+Capability 65 is also the canonical Artifact commitment producer capability 64 declared and left
+absent: the Task's source-bound reference reader is bound to these records, scoped by Task, Bot,
+authenticated peer, session and Run, and reports only explicit declarations and their real
+commitment status. Attachments, file ids and delivery are still not commitment evidence, and a
+Task never leaves `verifying` on a declared reference that has not committed.
+
+Additive: a client below 65 never calls these routes and its attachment behavior is byte identical
+to its pre-65 self.

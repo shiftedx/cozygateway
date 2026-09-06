@@ -1,3 +1,4 @@
+import { registerArtifactRoutes } from "./artifact-routes.ts";
 import { registerTaskRoutes } from "./task-routes.ts";
 import { createHash, randomUUID } from "node:crypto";
 
@@ -1672,6 +1673,15 @@ export function createApp(deps: AppDeps): Hono<Env> {
   });
 
   registerTaskRoutes(app, requireDevice, deps.storage, deps.now, deps.flushTaskCommands ?? (() => {}));
+
+  // Capability 65. Both halves are registered unconditionally, because /health advertises 65
+  // unconditionally: a gateway with no attach peer configured must refuse a producer request with
+  // the 401 its own middleware answers, never with a 404 that says the surface does not exist.
+  registerArtifactRoutes(app, requireDevice, deps.storage, deps.now, {
+    auth: requireAttach,
+    agentOf: attachAgent,
+    botOf: (agentId) => deps.storage.chatExecutionById(agentId)?.bot ?? agentId,
+  });
 
   // Vendor extension, registered last so it cannot shadow a core route (contract/ext-bots-v1.md).
   if (deps.bots !== undefined) {
