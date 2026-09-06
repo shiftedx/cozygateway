@@ -3006,13 +3006,7 @@ export class Storage {
         `INSERT INTO bot_native_turn_terminals
            (bot, session_id, turn_id, status, cause, completed_at)
          VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(bot, turn_id) DO UPDATE SET
-           session_id = excluded.session_id,
-           status = excluded.status,
-           cause = excluded.cause,
-           completed_at = excluded.completed_at
-         WHERE bot_native_turn_terminals.status != 'completed'
-           AND excluded.status = 'completed'`,
+         ON CONFLICT(bot, turn_id) DO NOTHING`,
       )
       .run(
         input.bot,

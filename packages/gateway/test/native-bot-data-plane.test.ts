@@ -1026,7 +1026,7 @@ describe("attach-v1 native Bot Mode plane", () => {
       expect((await plane.surface().chatHistory("sage")).messages).toContainEqual(
         expect.objectContaining({ id: "late-final", text: "finished after timeout" }),
       );
-      expect(storage.nativeBotLastTerminal("sage", sent.sessionId)).toEqual({ status: "completed" });
+      expect(storage.nativeBotLastTerminal("sage", sent.sessionId)).toEqual({ status: "timed_out" });
       plane.close();
       storage.close();
     } finally {
@@ -1078,7 +1078,7 @@ describe("attach-v1 native Bot Mode plane", () => {
       })).toBe(true);
       expect(await plane.surface().chatHistory("sage")).toMatchObject({
         running: false,
-        status: "completed",
+        status: "timed_out",
         messages: [{ text: "running" }, { id: "eventual-final", text: "The real answer." }],
       });
       expect(plane.handle("sage", {

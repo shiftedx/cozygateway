@@ -21,3 +21,12 @@ An initial workspace build needs the lead's serialized gate slot before gateway 
 ## Remaining
 
 Durable storage, production direct/room ingress, commands/fences, waits, reconciliation, notification, public routes/portable conformance, integrated gates and independent review remain. No lifecycle or release completeness claim.
+
+## First-terminal correction
+
+Lead granted one bootstrap heavy slot: `pnpm -r build` passed contract, relay, gateway, conformance. Slot released immediately.
+
+RED: `pnpm --filter cozygateway exec vitest run test/task-terminal-immutability.test.ts`: 7 tests, 4 failed and 3 passed. Late final commits changed timed_out/failed/interrupted to completed; storage also allowed this rewrite.
+GREEN: `pnpm --filter cozygateway exec vitest run test/task-terminal-immutability.test.ts test/native-bot-data-plane.test.ts test/attach-boot-replay.test.ts`: 3 files, 67 passed. Includes late final/interim duplicate delivery, newer active-turn pointer isolation, user-cancel suppression, process reconstruction and journal-before-apply reply recovery. Existing issue 193 assertions now require delivered replies with the original timeout/interruption outcome.
+
+Only production callers of `recordNativeBotTerminal` are native data plane normal settlement and late reply handling. Storage now retains the first outcome. Late replies retain delivery but do not replace it or emit misleading completed row23 state. This is a prerequisite correction, not Task implementation completion.

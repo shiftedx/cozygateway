@@ -1103,15 +1103,9 @@ export class NativeBotDataPlane {
         if (event.kind === "delegation")
           return this.#delegation(key, sessionId, event, false);
         const delivery = this.#storage.nativeBotTurnDelivery(peer, event.turnId);
-        // An acknowledged Hermes turn may finish after something else sealed it: the local
-        // response deadline, the stale-turn reaper, or the plugin's own interrupt seal. The
-        // durable reply is still authoritative -- it is the one thing the user was waiting for,
-        // and this used to honor it only past a `timed_out` seal, so a commit landing after any
-        // other provisional terminal was acknowledged and silently dropped (issue #193). The
-        // projection is idempotent by messageId, so an at-least-once retry is safe.
-        // The one exception is an explicit user cancel (`cause: "cancelled"`): the user said
-        // stop and the plugin witnessed it, so a late reply stays suppressed. Every other seal
-        // is a provisional gateway guess that the durable reply outranks.
+        // Reply delivery survives gateway deadlines and journal-before-apply crashes. The first
+        // terminal remains authoritative: a late answer cannot rewrite Run or Task outcome.
+        // Explicit user cancellation suppresses late delivery as before.
         if (
           event.kind === "commit" &&
           command?.threadId === sessionId &&
@@ -1123,15 +1117,9 @@ export class NativeBotDataPlane {
             key, sessionId, event.messageId, event.blocks, event.mediaIds, event.mediaPositions,
             event.turnId,
           );
-          if (committed && event.continues !== true && terminal.status !== "completed") {
-            this.#storage.recordNativeBotTerminal({
-              bot: key, sessionId, turnId: event.turnId,
-              status: "completed", completedAt: this.#now(),
-            });
-            // The provisional seal may have left the durable pointer standing (a crash between
-            // journal and apply does exactly that); settle it with the same guarded clear.
-            this.#storage.clearNativeBotTurn(key, sessionId, event.turnId, this.#now());
-            this.#state(key, sessionId, "complete", false, { status: "completed" });
+          if (committed && event.continues !== true) {
+            const cleared = this.#storage.clearNativeBotTurn(key, sessionId, event.turnId, this.#now());
+            if (cleared) this.#state(key, sessionId, terminal.status === "completed" ? "complete" : "failed", false, terminal);
           }
           return committed;
         }
