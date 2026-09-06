@@ -7,6 +7,7 @@ import { NativeBotDataPlane } from "../src/hermes-bridge/native-data-plane.ts";
 import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 import type { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { AttachV1EventFrame } from "../src/adapters/attach/protocol-v1.ts";
+import { DEFAULT_ARTIFACT_STORE_BYTES } from "../src/artifacts.ts";
 import { openStorage, type Storage } from "../src/storage.ts";
 
 const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -132,6 +133,52 @@ describe("derived Artifacts from legacy attachment deliveries", () => {
     expect(storage.artifacts.list({ bot: "sage" })).toHaveLength(1);
   });
 
+  it("acknowledges a redelivered attachment from the later message's receipt", async () => {
+    const storage = open();
+    const fixture = plane(storage);
+    seedMedia(storage, "media_chart");
+    await deliver(fixture, "morning", ["media_chart"]);
+    await deliver(fixture, "evening", ["media_chart"]);
+    const [record] = storage.artifacts.list({ bot: "sage" });
+    expect(record?.delivery).toMatchObject({ state: "delivered" });
+
+    // The phone was offline for the first message and displayed only the second. The bytes still
+    // reached an authenticated client, so the record must not stay delivered forever.
+    expect(fixture.instance.surface().recordDisplayed("sage", ["evening"], "device-1")).toEqual({ recorded: 1 });
+    expect(storage.artifacts.get(record!.artifactId)?.delivery).toMatchObject({ state: "acknowledged" });
+    const acknowledgedAt = storage.artifacts.get(record!.artifactId)?.delivery?.acknowledgedAt;
+    // The earlier message's receipt is the same fact arriving late, and keeps the first one.
+    fixture.instance.surface().recordDisplayed("sage", ["morning"], "device-1");
+    expect(storage.artifacts.get(record!.artifactId)?.delivery?.acknowledgedAt).toBe(acknowledgedAt);
+  });
+
+  it("bounds retained artifact bytes by a conservative default when the operator sets none", () => {
+    const storage = open();
+    // No `capacity` call: this is the ceiling an existing deployment gets after upgrading.
+    expect(DEFAULT_ARTIFACT_STORE_BYTES).toBe(2_147_483_648);
+    const refused = storage.artifacts.derive({
+      createdBy: "sage", bot: "sage", sessionId: "session-1", sourceMessageId: "message-1",
+      mediaId: "media_huge", filename: "big.bin", mediaType: "application/octet-stream",
+      sizeBytes: DEFAULT_ARTIFACT_STORE_BYTES + 1,
+    }, 100);
+    expect(refused.outcome).toBe("refused");
+    expect(refused.record).toMatchObject({
+      origin: "derived", state: "commit_failed", failureReason: "capacity",
+    });
+    expect(refused.record?.location).toBeUndefined();
+  });
+
+  it("refuses a producer declaration that claims a derived identity", () => {
+    const storage = open();
+    const declared = storage.artifacts.declare({
+      artifactId: "derived-0123456789abcdef0123456789abcdef", bot: "sage", sessionId: "session-1",
+      createdBy: "sage", filename: "chart.png", mediaType: "image/png", sizeBytes: PNG.byteLength,
+      sha256: PNG_SHA, mark: "final",
+    }, 50);
+    expect(declared.outcome).toBe("reserved");
+    expect(storage.artifacts.get("derived-0123456789abcdef0123456789abcdef")).toBeUndefined();
+  });
+
   it("leaves a capable peer's declaration alone and upgrades a derived record in place", async () => {
     const storage = open();
     const fixture = plane(storage);
@@ -167,6 +214,46 @@ describe("derived Artifacts from legacy attachment deliveries", () => {
       state: "committed", validation: "verified",
     });
     expect(storage.artifacts.get("artifact-late")).toBeUndefined();
+    // Nothing is left pointing at the id the upgrade retired, and nothing supersedes itself.
+    expect(storage.artifacts.get(derived!.artifactId)?.supersedesArtifactId).toBeUndefined();
+    expect(storage.artifacts.get(derived!.artifactId)?.supersededByArtifactId).toBeUndefined();
+  });
+
+  it("never leaves a dangling or self-referencing supersession when it upgrades", async () => {
+    const storage = open();
+    const fixture = plane(storage);
+    seedMedia(storage, "media_first");
+    await deliver(fixture, "first-answer", ["media_first"]);
+    const derived = storage.artifacts.list({ bot: "sage" })[0]!;
+
+    // A peer declares over the same media and names the derived record as the one it replaces.
+    storage.artifacts.declare({
+      artifactId: "artifact-v2", bot: "sage", sessionId: "session-1", createdBy: "sage",
+      filename: "chart.png", mediaType: "image/png", sizeBytes: PNG.byteLength,
+      sha256: PNG_SHA, mark: "final", supersedesArtifactId: derived.artifactId,
+    }, 70);
+    expect(storage.artifacts.commit("sage", "artifact-v2", "media_first", 80).outcome).toBe("committed");
+    const upgraded = storage.artifacts.get(derived.artifactId)!;
+    expect(upgraded.supersedesArtifactId).toBeUndefined();
+    expect(upgraded.supersededByArtifactId).toBeUndefined();
+    expect(storage.artifacts.latest(derived.artifactId)?.artifactId).toBe(derived.artifactId);
+
+    // A record that named the retired declaration follows the upgrade instead of dangling.
+    seedMedia(storage, "media_second");
+    await deliver(fixture, "second-answer", ["media_second"]);
+    const secondDerived = storage.artifacts.list({ bot: "sage" }).find((row) => row.sourceMessageId === "second-answer")!;
+    storage.artifacts.declare({
+      artifactId: "artifact-v3", bot: "sage", sessionId: "session-1", createdBy: "sage",
+      filename: "chart.png", mediaType: "image/png", sizeBytes: PNG.byteLength,
+      sha256: PNG_SHA, mark: "final",
+    }, 90);
+    storage.artifacts.declare({
+      artifactId: "artifact-v4", bot: "sage", sessionId: "session-1", createdBy: "sage",
+      filename: "chart.png", mediaType: "image/png", sizeBytes: PNG.byteLength,
+      sha256: PNG_SHA, mark: "final", supersedesArtifactId: "artifact-v3",
+    }, 91);
+    expect(storage.artifacts.commit("sage", "artifact-v3", "media_second", 95).outcome).toBe("committed");
+    expect(storage.artifacts.get("artifact-v4")?.supersedesArtifactId).toBe(secondDerived.artifactId);
   });
 
   it("counts media shared by two records once against the operator capacity", () => {

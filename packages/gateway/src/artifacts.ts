@@ -12,6 +12,12 @@ import type { TaskArtifactReference } from "./tasks.ts";
  *
  * Delivery is a separate object with its own identity, so a failed delivery leaves a completed
  * Task completed, and a retry names the same committed Artifact rather than the Run that made it. */
+/** The ceiling on retained Artifact originals when an operator sets none. Derivation retains every
+ * delivered attachment until an explicit deletion, so the DEFAULT configuration has to be a bounded
+ * one: 2 GiB is far above what a normal deployment accumulates and far below a disk. An operator
+ * raises or lowers it with `artifactStoreBytes`. */
+export const DEFAULT_ARTIFACT_STORE_BYTES = 2_147_483_648;
+
 export interface ArtifactDeclaration {
   artifactId: string; bot: string; sessionId: string; room?: string;
   taskId?: string; runId?: string; createdBy: string;
@@ -47,7 +53,7 @@ const DELIVERY_SELECT = `SELECT delivery_id AS deliveryId, artifact_id AS artifa
 
 export class Artifacts {
   readonly #db: DatabaseSync;
-  #capacityBytes = Number.POSITIVE_INFINITY;
+  #capacityBytes = DEFAULT_ARTIFACT_STORE_BYTES;
   #committed: ((taskId: string, runId: string, at: number) => void) | undefined;
 
   constructor(db: DatabaseSync) {
@@ -87,7 +93,10 @@ export class Artifacts {
    * Task remains derived from its own event stream; this only says when to look again. */
   onCommitment(notify: (taskId: string, runId: string, at: number) => void): void { this.#committed = notify; }
 
-  declare(input: ArtifactDeclaration, at: number): { outcome: "created" | "replayed" | "conflict"; record?: Artifact } {
+  declare(input: ArtifactDeclaration, at: number): { outcome: "created" | "replayed" | "conflict" | "reserved"; record?: Artifact } {
+    // The derived identity space belongs to the gateway. A producer that could claim one of those
+    // ids would suppress the record for its own attachment without anyone seeing why.
+    if (input.artifactId.startsWith(DERIVED_PREFIX)) return { outcome: "reserved" };
     const existing = this.#row(input.artifactId);
     if (existing !== undefined) {
       return this.#sameDeclaration(existing, input)
@@ -164,11 +173,18 @@ export class Artifacts {
         ).run(row.sessionId, row.room, row.taskId, row.runId, row.filename, row.mediaType,
           row.sizeBytes, row.sha256, row.mark, row.version, row.supersedes, at, mediaId, target);
         this.#db.prepare("DELETE FROM artifacts WHERE artifact_id = ?").run(artifactId);
+        // The declaration that named the record it is being folded into supersedes nothing: a
+        // record may not supersede itself. Anything that named the retired id follows the upgrade
+        // rather than dangling.
+        if (row.supersedes === target)
+          this.#db.prepare("UPDATE artifacts SET supersedes = NULL WHERE artifact_id = ?").run(target);
+        this.#db.prepare("UPDATE artifacts SET supersedes = ? WHERE supersedes = ?").run(target, artifactId);
+        this.#db.prepare("UPDATE artifacts SET superseded_by = ? WHERE superseded_by = ?").run(target, artifactId);
       }
       // A committed original is retained until an explicit deletion, so the producer's temporary
       // staging deadline no longer applies to these bytes.
       this.#db.prepare("UPDATE attach_media SET expires_at = NULL WHERE agent_id = ? AND media_id = ?").run(createdBy, mediaId);
-      if (row.supersedes !== null)
+      if (row.supersedes !== null && row.supersedes !== target)
         this.#db.prepare("UPDATE artifacts SET superseded_by = ? WHERE artifact_id = ?").run(target, row.supersedes);
       this.#db.exec("RELEASE artifact_commit");
     } catch (error) {
@@ -194,9 +210,12 @@ export class Artifacts {
     filename: string; mediaType: string; sizeBytes: number;
   }, at: number): { outcome: "created" | "existing" | "refused"; record?: Artifact } {
     const artifactId = derivedArtifactId(input.createdBy, input.mediaId);
+    // One query with an explicit order: the derived identity wins over a record that merely binds
+    // the same media, so the answer never depends on compound-select row order.
     const existing = this.#db.prepare(
-      `${SELECT} WHERE created_by = ? AND media_id = ? UNION ALL ${SELECT} WHERE artifact_id = ?`,
-    ).get(input.createdBy, input.mediaId, artifactId) as ArtifactRow | undefined;
+      `${SELECT} WHERE (created_by = ? AND media_id = ?) OR artifact_id = ?
+       ORDER BY (artifact_id = ?) DESC, created_at ASC, artifact_id ASC LIMIT 1`,
+    ).get(input.createdBy, input.mediaId, artifactId, artifactId) as ArtifactRow | undefined;
     // An explicitly deleted record is found by its identity too, so a later receipt or a
     // redelivery never resurrects bytes a person asked the gateway to stop offering.
     // A record the store once refused for capacity is retried by a later delivery, so raising the
@@ -240,11 +259,20 @@ export class Artifacts {
 
   /** Capability 31's receipt is the acknowledgement for an attachment the gateway derived: the
    * device reported it put that message on screen, so its bytes reached an authenticated client.
-   * It is still never a claim that a person read the artifact. */
+   * It is still never a claim that a person read the artifact.
+   *
+   * The match is every message that references the record's media, not just the first one the
+   * record was derived from. A bot that sends the same file twice has one record, and a receipt
+   * for either message is the same true fact about the same bytes. */
   acknowledgeMessage(bot: string, messageId: string, at: number): number {
     const rows = this.#db.prepare(
-      "SELECT artifact_id AS artifactId FROM artifacts WHERE bot = ? AND source_message_id = ? AND state = 'committed'",
-    ).all(bot, messageId) as unknown as Array<{ artifactId: string }>;
+      `SELECT artifact_id AS artifactId FROM artifacts
+       WHERE bot = ? AND state = 'committed' AND media_id IS NOT NULL
+         AND (source_message_id = ?
+           OR EXISTS (SELECT 1 FROM bot_native_messages AS message, json_each(message.attachments_json) AS attachment
+             WHERE message.bot = artifacts.bot AND message.message_id = ?
+               AND json_extract(attachment.value, '$.fileId') = artifacts.media_id))`,
+    ).all(bot, messageId, messageId) as unknown as Array<{ artifactId: string }>;
     let acknowledged = 0;
     for (const row of rows) if (this.acknowledge(row.artifactId, at)) acknowledged += 1;
     return acknowledged;
@@ -479,6 +507,8 @@ export class Artifacts {
 /** Stable, derivable identity: the same peer and the same stored object always name the same
  * record, so a redelivery or a replayed event cannot make a second one even if the row is read
  * concurrently. It is a digest of the pair, not the media id, so it never leaks one id as another. */
+const DERIVED_PREFIX = "derived-";
+
 function derivedArtifactId(createdBy: string, mediaId: string): string {
-  return `derived-${createHash("sha256").update(`${createdBy}\u0000${mediaId}`).digest("hex").slice(0, 32)}`;
+  return `${DERIVED_PREFIX}${createHash("sha256").update(`${createdBy}\u0000${mediaId}`).digest("hex").slice(0, 32)}`;
 }

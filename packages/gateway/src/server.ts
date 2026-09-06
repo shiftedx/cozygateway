@@ -35,6 +35,7 @@ import {
   type ServerFrame,
 } from "cozygateway-contract";
 
+import { DEFAULT_ARTIFACT_STORE_BYTES } from "./artifacts.ts";
 import { hermesEndpoints, nativeBots, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
 import { fileGatewaySettings, type GatewaySettingsStore } from "./gateway-settings.ts";
 import { createInstallerProvisioner, type ProfileChangeEvent, type ProfileProvisioner } from "./hermes-bridge/profile-provisioner.ts";
@@ -1079,7 +1080,9 @@ export async function startGateway(
 
   storage.tasks.runtime((bot) => runtimeBotService?.owns(bot) === true ? runtimeBotService.projection(bot).stage : undefined);
   storage.tasks.reconcile();
-  if (config.artifactStoreBytes !== undefined) storage.artifacts.capacity(config.artifactStoreBytes);
+  // Always bounded. Derivation retains every delivered attachment until an explicit deletion, so
+  // an operator who sets nothing gets the conservative default rather than an unbounded store.
+  storage.artifacts.capacity(config.artifactStoreBytes ?? DEFAULT_ARTIFACT_STORE_BYTES);
   storage.tasks.observe((frame) => hub.broadcast(frame), BOTS_CAPABILITY_VERSION);
   const app = createApp({
     storage,

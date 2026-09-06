@@ -177,3 +177,74 @@ packet added 6 gateway tests, 1 contract test and 1 conformance test, so the bas
   against a scratch gateway.
 - Base counts (1477 / 192 / 92) are stated by arithmetic from the added tests rather than by a
   separate run of the base tree; every pre-existing test file passes on this branch unchanged.
+
+## Fix round 1 (review r0)
+
+Head after this round: `<pending>` on `codex/4d-legacy-attachment-artifacts`, pushed. Node 24 for
+every command. The three items the lead deferred (orphan `commit_failed` row after a capacity
+refusal that a declaration later wins, the schema not expressing the `sha256` / `mark` pairing, and
+no `room` on derived records) are untouched.
+
+### I1, a redelivered attachment could never be acknowledged by the later message
+
+`acknowledgeMessage` matched on `source_message_id` alone, so a bot that sent the same file twice
+had one record naming the FIRST message, and a receipt for the second acknowledged nothing. The
+match is now every message that references the record's media: the record's own
+`source_message_id`, or any durable transcript row for that bot whose attachments name the record's
+`media_id`. No schema change and no second table; the same JSON reference the retention guards
+already use. A receipt for either message acknowledges once, and the later one keeps the first
+`acknowledgedAt`. Proved by "acknowledges a redelivered attachment from the later message's
+receipt".
+
+### I2, retention was unbounded by default and undeclared to operators
+
+`DEFAULT_ARTIFACT_STORE_BYTES` is 2 GiB, applied by `Artifacts` itself and by `server.ts`
+(`config.artifactStoreBytes ?? DEFAULT_ARTIFACT_STORE_BYTES`), so an existing deployment that
+changes no config upgrades into a bounded store rather than an unbounded one. Two GiB is far above
+what a normal deployment accumulates and far below a disk; an operator raises or lowers it with the
+existing `artifactStoreBytes` key. The refusal stays visible: `commit_failed` with
+`failureReason: "capacity"`, no bytes bound, the attachment keeping the retention it already had,
+and a later delivery retrying once the ceiling is raised.
+
+The operator-facing half is now written down: a new "Artifact retention and the store ceiling"
+section in `docs/self-host-docker.md` says plainly that attachments which used to expire are now
+retained until the Artifact is deleted, what does and does not reclaim them, the config key with an
+example, the 2 GiB default, and what the refusal looks like. The CHANGELOG entry carries the same
+warning and the key. The contract's derived-records section says the ceiling is bounded by default.
+Proved by "bounds retained artifact bytes by a conservative default when the operator sets none".
+
+### Minors taken
+
+- The `derived-` id space is reserved: `declare` answers a new `reserved` outcome for any id with
+  that prefix and the producer route maps it to `400`, so a peer cannot claim a derived identity
+  and silently suppress the record for its own attachment.
+- The upgrade can no longer produce a self-superseding or dangling record: a declaration that named
+  the record it is folded into supersedes nothing, and anything that named the retired declaration
+  is repointed at the surviving identity. Proved by "never leaves a dangling or self-referencing
+  supersession when it upgrades" plus two assertions added to the existing upgrade test.
+- The derive lookup is one query with an explicit `ORDER BY` (the derived identity first, then
+  oldest), so it no longer depends on `UNION ALL` row order.
+- Derivation moved after `seal?.()` in `#commit`, so a store failure while deriving cannot leave a
+  turn unsealed. An Artifact is a secondary fact and must not block a turn's terminal.
+
+### Fix round 1 gates
+
+```
+pnpm -r typecheck                                    exit 0, four packages Done
+pnpm --filter cozygateway exec vitest run test/derived-artifacts.test.ts test/artifacts.test.ts \
+  test/artifact-routes.test.ts test/attach-v1-storage.test.ts test/attach-v1-delivery-receipts.test.ts \
+  test/turn-media-receipts.test.ts test/native-bot-scheduled-media.test.ts \
+  test/native-bot-inline-media-positions.test.ts test/native-bot-data-plane.test.ts test/config.test.ts
+                                                     Test Files 10 passed (10)  Tests 168 passed
+pnpm --filter cozygateway exec vitest run            Test Files 133 passed | 1 skipped (134)
+                                                     Tests 1487 passed | 2 skipped (1489)
+pnpm --filter cozygateway-contract exec vitest run test/artifacts.test.ts        4 passed
+pnpm --filter cozygateway-conformance exec vitest run test/artifact-delivery-fixture.test.ts  4 passed
+```
+
+RED for this round, before the fixes (`<scratch>/4d/logs/`, same file):
+`Test Files 1 failed (1)   Tests 4 failed | 6 passed (10)`, the four new cases for I1, I2, the
+reserved id space and the supersession guards. GREEN: `Tests 10 passed (10)`. The whole gateway
+package moved from 1483 to 1487 passing, which is the four new cases and no regression; the default
+ceiling was run against the whole package deliberately, because it changes startup for every
+deployment.

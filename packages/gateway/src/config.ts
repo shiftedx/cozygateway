@@ -130,9 +130,10 @@ const GatewayConfigSchema = Type.Object({
   staleTurnInterruptGraceSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
   staleTurnCeilingSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
   /** Capability 65. Operator ceiling, in bytes, on the retained Artifact originals this gateway
-   *  holds. A commit that would exceed it fails visibly with `capacity` on the record rather than
-   *  reclaiming an original: retention is only ended by an explicit deletion. Omitted means no
-   *  ceiling. Config-file only. */
+   *  holds. A commit or a derivation that would exceed it fails visibly with `capacity` on the
+   *  record rather than reclaiming an original: retention is only ended by an explicit deletion.
+   *  Omitted means the conservative default in artifacts.ts (2 GiB), never an unbounded store,
+   *  because every delivered attachment is now retained as a derived Artifact. Config-file only. */
   artifactStoreBytes: Type.Optional(Type.Integer({ minimum: 1 })),
   /** Capability id -> integer version, surfaced verbatim as GatewayInfo.capabilities (contract
    *  v1.md section 5). Optional; a gateway with nothing to advertise omits it and gets an empty

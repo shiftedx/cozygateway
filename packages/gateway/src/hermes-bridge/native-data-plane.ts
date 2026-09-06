@@ -2294,15 +2294,16 @@ export class NativeBotDataPlane {
     // owner is already looking at.
     if (turnId !== undefined && attachments !== undefined && attachments.length > 0)
       this.#storage.bindTurnMediaDelivery(bot, messageId, `turn:${turnId}`);
+    seal?.();
     // Capability 65. A peer below 65 declares no Artifact, so the gateway derives one minimal
     // record per delivered attachment here, at the moment the bytes were committed to a person.
-    // A peer that DID declare this media already owns a record and none is derived.
+    // A peer that DID declare this media already owns a record and none is derived. It runs after
+    // the seal because an Artifact is a secondary fact and must never block a turn's terminal.
     for (const attachment of attachments ?? [])
       this.#storage.artifacts.derive({
         createdBy: bot, bot, sessionId, sourceMessageId: messageId, mediaId: attachment.fileId,
         filename: attachment.name, mediaType: attachment.mimeType, sizeBytes: attachment.size,
       }, now);
-    seal?.();
     this.#broadcast({
       type: "bot_chat",
       bot,

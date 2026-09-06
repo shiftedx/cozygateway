@@ -32,6 +32,12 @@ release; everything older is marked pre-release so installers resolve one "lates
   names its `sourceMessageId` and omits `sha256`, `mark`, `taskId` and `runId`, because nothing was
   declared. A capable peer declaring the same media upgrades the existing record in place instead
   of duplicating it, and the operator's retained-bytes ceiling now counts each stored object once.
+  Operators: retention changes for attachments that used to expire. A delivered attachment's bytes
+  are now kept until the Artifact is explicitly deleted, where before a producer's staging deadline
+  reclaimed them, so a chatty bot's files accumulate instead of self-pruning. The store is bounded
+  by `artifactStoreBytes` in the gateway config, which now defaults to 2 GiB instead of no ceiling;
+  over the ceiling the record is written `commit_failed` with `failureReason: "capacity"` and binds
+  no bytes, so the refusal is visible and the attachment keeps the retention it already had.
 
 - Typed scoped approvals (`com.cozylabs.bots` capability 66): an approval may carry one validated
   block naming the action, its category, the target system and resource, the exact material change,
