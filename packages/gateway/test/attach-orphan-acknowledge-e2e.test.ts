@@ -11,7 +11,14 @@ import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-her
  *  binding never existed or is gone) used to decline projection forever, dead-letter, and block
  *  every later journaled event for the agent -- acknowledged on the wire, never applied, nothing
  *  in the app. An orphaned event is a fact about the past, not future work: the gateway now
- *  acknowledges it and the stream keeps applying. */
+ *  acknowledges it and the stream keeps applying.
+ *
+ *  Capability 69 narrows what "acknowledged" costs. Acknowledging an orphan is right for
+ *  bookkeeping (a tool step, a draft, a delegation card for a turn that is over), and it was
+ *  wrong for the one orphan that is not bookkeeping: a COMMIT is the bot answering a person, and
+ *  dropping it is how a live reply vanished. Such a commit is now projected as an ordinary reply
+ *  bound to no turn. The invariant this test exists for is unchanged and still asserted: the
+ *  stream keeps applying, and the real turn's own answer still lands and still seals. */
 it("an orphaned event does not block later turns from applying", async () => {
   process.env["ORPHAN_DASHBOARD_TOKEN"] = "dashboard-secret";
   process.env["ORPHAN_SAGE_TOKEN"] = "attach-secret";
@@ -66,7 +73,10 @@ it("an orphaned event does not block later turns from applying", async () => {
     await until(() => gateway!.storage.unappliedAttachEvents("sage").length === 0);
     const history = (await (await fetch(`${gateway.url}/bots/sage/chat/messages`, { headers: { authorization: `Bearer ${deviceToken}` } })).json()) as { messages: BotChatMessage[]; status?: string };
     expect(history.messages.some((message) => message.id === "real-answer")).toBe(true);
-    expect(history.messages.some((message) => message.id === "orphan-answer")).toBe(false);
+    // Capability 69: the words the bot said are kept, and they answer no turn.
+    const orphan = history.messages.find((message) => message.id === "orphan-answer");
+    expect(orphan).toMatchObject({ role: "assistant", text: "from a discarded turn" });
+    expect(orphan?.turnId).toBeUndefined();
     expect(history.status).toBe("completed");
   } finally {
     for (const socket of sockets) if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close();

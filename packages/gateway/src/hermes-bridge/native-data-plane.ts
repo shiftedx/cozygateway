@@ -431,6 +431,9 @@ export class NativeBotDataPlane {
    *  promotion and falls back to the visible failed-delivery row, which still preserves the text.
    *  Persist it beside the turn command when a durable steer command lands. */
   readonly #pendingSteers = new Map<string, { messageId: string; text: string; mediaIds?: string[] }>();
+  // `mediaIds` is the media half of "the same text and media": a steer carries none today (an
+  // attachment send is refused while a turn is running), so promotion re-sends text alone until
+  // a steer can carry media, and the shape does not have to change when it can.
   #staleTurnSweep: ReturnType<typeof setInterval> | undefined;
 
   constructor(opts: NativeBotDataPlaneOptions) {
@@ -1073,7 +1076,8 @@ export class NativeBotDataPlane {
     // off the lease; nothing else does.
     if (state === "absent")
       for (const turn of this.#storage.nativeBotActiveTurns(key))
-        this.#markOwnerLost(key, turn.sessionId, turn.turnId);
+        if (this.#executionPeer(key, turn.sessionId) === bot)
+          this.#markOwnerLost(key, turn.sessionId, turn.turnId);
     const chat = this.#storage.nativeBotChat(key, this.#now());
     if (chat.activeTurnId !== undefined) {
       this.#flushLiveTurn(this.#nativeTurnKey(key, chat.sessionId, chat.activeTurnId));
@@ -1095,6 +1099,10 @@ export class NativeBotDataPlane {
     if (bot === undefined) return;
     const declared = activeTurns === undefined ? undefined : new Set(activeTurns);
     for (const turn of this.#storage.nativeBotActiveTurns(bot)) {
+      // One profile can be served by several attach identities: a chat execution runs its own
+      // session on its own peer. A peer only ever speaks for the sessions it runs, so a hello
+      // from the profile can never seal a turn a chat execution is carrying, or the reverse.
+      if (this.#executionPeer(bot, turn.sessionId) !== peer) continue;
       const key = this.#nativeTurnKey(bot, turn.sessionId, turn.turnId);
       if (declared === undefined) {
         this.#markOwnerLost(bot, turn.sessionId, turn.turnId);

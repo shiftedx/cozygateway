@@ -1,0 +1,69 @@
+{
+  "capability": { "id": "com.cozylabs.bots", "minimumVersion": 69 },
+  "helloPre69": {
+    "kind": "hello",
+    "version": 2,
+    "instanceId": "hermes-sage",
+    "capabilities": ["draft", "scheduled"],
+    "resume": { "eventSequence": 0, "commandSequence": 0 }
+  },
+  "helloCarryingNoTurns": {
+    "kind": "hello",
+    "version": 2,
+    "instanceId": "hermes-sage",
+    "capabilities": ["draft", "scheduled"],
+    "resume": { "eventSequence": 0, "commandSequence": 0 },
+    "activeTurns": []
+  },
+  "helloCarryingOneTurn": {
+    "kind": "hello",
+    "version": 2,
+    "instanceId": "hermes-sage",
+    "capabilities": ["draft", "scheduled"],
+    "resume": { "eventSequence": 0, "commandSequence": 0 },
+    "activeTurns": ["turn-still-running"]
+  },
+  "helloWithDuplicateTurns": {
+    "kind": "hello",
+    "version": 2,
+    "instanceId": "hermes-sage",
+    "capabilities": ["draft"],
+    "activeTurns": ["turn-a", "turn-a"]
+  },
+  "failedPre69": {
+    "kind": "event",
+    "sequence": 7,
+    "eventId": "failed-plain",
+    "event": {
+      "kind": "failed",
+      "threadId": "session-1",
+      "turnId": "turn-dead",
+      "messageId": "client-2",
+      "message": "the model call failed"
+    }
+  },
+  "failedUnknownTurn": {
+    "kind": "event",
+    "sequence": 8,
+    "eventId": "failed-unknown-turn",
+    "event": {
+      "kind": "failed",
+      "threadId": "session-1",
+      "turnId": "turn-dead",
+      "messageId": "client-2",
+      "reason": "unknown_turn"
+    }
+  },
+  "failedUnknownReason": {
+    "kind": "event",
+    "sequence": 9,
+    "eventId": "failed-bad-reason",
+    "event": {
+      "kind": "failed",
+      "threadId": "session-1",
+      "turnId": "turn-dead",
+      "messageId": "client-2",
+      "reason": "peer_restarted"
+    }
+  }
+}
