@@ -78,9 +78,45 @@ cat > "$tmp/bin/sleep" <<'SLEEP'
 exit 0
 SLEEP
 chmod 700 "$tmp/bin/sleep"
-printf '{}\n' > "$tmp/hermes/config.yaml"
-printf '{}\n' > "$tmp/hermes/profiles/ops/config.yaml"
-printf '{}\n' > "$tmp/hermes/profiles/active/config.yaml"
+# Profiles as the current seed leaves them: reachable AND streaming. The
+# installer repairs the display keys only when they are absent, so a fixture
+# that carries them keeps every case below about the thing it is testing.
+# `active` says false on purpose, which the installer must never overrule.
+cat > "$tmp/hermes/config.yaml" <<'PROFILE_YAML'
+display:
+  streaming: true
+  platforms:
+    cozygateway:
+      streaming: true
+PROFILE_YAML
+cp "$tmp/hermes/config.yaml" "$tmp/hermes/profiles/ops/config.yaml"
+cat > "$tmp/hermes/profiles/active/config.yaml" <<'PROFILE_YAML'
+display:
+  streaming: false
+  platforms:
+    cozygateway:
+      streaming: false
+PROFILE_YAML
+# The installer reads that config STRUCTURALLY, which needs PyYAML: in
+# production Hermes' own venv python supplies it, so the fixture puts a
+# delegating one exactly where the installer looks. HOME is handed back because
+# several cases below fake it, and a faked HOME can hide a user site-packages.
+real_home_for_yaml="$HOME"
+yaml_python=""
+for candidate in /usr/bin/python3 "$(command -v python3 || true)"; do
+  [ -n "$candidate" ] || continue
+  if "$candidate" -c 'import yaml' >/dev/null 2>&1; then yaml_python="$candidate"; break; fi
+done
+if [ -z "$yaml_python" ]; then
+  printf 'FAIL  no python3 with PyYAML on this host, and the installer needs one to read profile config\n' >&2
+  exit 1
+fi
+mkdir -p "$tmp/hermes/hermes-agent/venv/bin"
+cat > "$tmp/hermes/hermes-agent/venv/bin/python" <<PYTHON_DELEGATE
+#!/bin/sh
+exec env HOME="$real_home_for_yaml" "$yaml_python" "\$@"
+PYTHON_DELEGATE
+chmod 700 "$tmp/hermes/hermes-agent/venv/bin/python"
 credential_marker="$tmp/dashboard-credential-was-evaluated"
 # shellcheck disable=SC2016
 printf '%s\n' \
@@ -116,6 +152,10 @@ if [ "$1" = status ]; then
     exit 0
   fi
   printf 'Current model: test/model\nActive provider: test-provider\n'
+  exit 0
+fi
+if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "set" ] && [[ "$5" = display.* ]]; then
+  printf '%s\n' "$profile:config-set:$5=$6" >> "${COZYGATEWAY_TEST_COMMAND_LOG:?}"
   exit 0
 fi
 if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "path" ]; then
@@ -407,6 +447,17 @@ if ! all_profiles_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="
   exit 1
 fi
 grep -Fq 'Profiles: default active ops' <<<"$all_profiles_output"
+# Streaming: absent keys are written, an explicit false is not. Hermes streams a
+# reply only when the profile says so, so a profile created before the seed
+# carried these keys is reachable and mute until the installer repairs it.
+expect_contains "$all_profiles_output" 'streaming is already decided in config.yaml for Hermes profile active'
+expect_contains "$all_profiles_output" 'streaming is already decided in config.yaml for Hermes profile ops'
+printf '{}\n' > "$tmp/hermes/profiles/ops/config.yaml"
+mute_profile_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --profiles all --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-scoped" 2>&1)"
+expect_contains "$mute_profile_output" 'set display.streaming to true for Hermes profile ops'
+expect_contains "$mute_profile_output" 'set display.platforms.cozygateway.streaming to true for Hermes profile ops'
+expect_contains "$mute_profile_output" 'streaming is already decided in config.yaml for Hermes profile active'
+cp "$tmp/hermes/config.yaml" "$tmp/hermes/profiles/ops/config.yaml"
 printf 'profiles=../unsafe\n' > "$tmp/gateway-scoped/local/install-state"
 if malformed_scope_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-scoped" 2>&1)"; then
   echo 'malformed recorded profile scope must fail closed' >&2
