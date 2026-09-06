@@ -31,6 +31,7 @@ function seedMedia(storage: Storage, mediaId: string, expiresAt?: number): void 
  * existing attach route and commits a turn reply that names it. No declaration is ever made. */
 function plane(storage: Storage) {
   const sent: Array<Record<string, unknown>> = [];
+  const frames: Array<Record<string, unknown>> = [];
   let now = 10;
   const instance = new NativeBotDataPlane({
     control: {} as BotsSurface,
@@ -45,11 +46,11 @@ function plane(storage: Storage) {
     } as unknown as AttachV1Ingress,
     nativeBots: ["sage"],
     chatSuggestion: "",
-    broadcast: () => undefined,
+    broadcast: (frame: Record<string, unknown>) => { frames.push(frame); },
     now: () => now++,
   });
   planes.push(instance);
-  return { instance, sent };
+  return { instance, sent, frames };
 }
 
 function open(): Storage {
@@ -97,6 +98,17 @@ describe("derived Artifacts from legacy attachment deliveries", () => {
     expect(derived[0]?.mark).toBeUndefined();
     expect(derived[0]?.taskId).toBeUndefined();
     expect(derived[0]?.runId).toBeUndefined();
+
+    // A client below 65 is byte identical to its pre-65 self: the transcript row it receives
+    // carries the same attachment block and no frame announces the derived record.
+    const delivered = fixture.frames.filter((frame) => frame["type"] === "bot_chat")
+      .flatMap((frame) => (frame["messages"] as Array<Record<string, unknown>>))
+      .find((message) => message["id"] === "answer");
+    expect(delivered?.["attachments"]).toEqual([{
+      type: "attachment", fileId: "media_chart", name: "chart.png", mimeType: "image/png",
+      size: PNG.byteLength, mediaKind: "image",
+    }]);
+    expect(fixture.frames.some((frame) => JSON.stringify(frame).includes("artifact"))).toBe(false);
 
     // Capability 31's receipt is the acknowledgement, and a duplicate one keeps the first fact.
     expect(fixture.instance.surface().recordDisplayed("sage", ["answer"], "device-1")).toEqual({ recorded: 1 });

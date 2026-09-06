@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { Artifact, ArtifactDelivery, ArtifactFailureReason, ArtifactMark } from "cozygateway-contract";
+import type { Artifact, ArtifactDelivery, ArtifactFailureReason, ArtifactMark, ArtifactOrigin } from "cozygateway-contract";
 import type { TaskArtifactReference } from "./tasks.ts";
 
 /** Capability 65. The gateway-owned Artifact record and its independent delivery lifecycle.
@@ -23,10 +23,11 @@ interface ArtifactRow {
   artifactId: string; bot: string; sessionId: string; room: string | null;
   taskId: string | null; runId: string | null; createdBy: string;
   filename: string; mediaType: string; sizeBytes: number; sha256: string;
-  state: Artifact["state"]; mark: ArtifactMark; validation: Artifact["validation"];
+  state: Artifact["state"]; mark: ArtifactMark | ""; validation: Artifact["validation"];
   version: number; supersedes: string | null; supersededBy: string | null;
   createdAt: number; committedAt: number | null; deletedAt: number | null;
   failureReason: ArtifactFailureReason | null; mediaId: string | null;
+  origin: ArtifactOrigin; sourceMessageId: string | null;
 }
 interface DeliveryRow {
   deliveryId: string; artifactId: string; attempt: number; state: ArtifactDelivery["state"];
@@ -38,7 +39,8 @@ const SELECT = `SELECT artifact_id AS artifactId, bot, session_id AS sessionId, 
   run_id AS runId, created_by AS createdBy, filename, media_type AS mediaType, size_bytes AS sizeBytes,
   sha256, state, mark, validation, version, supersedes, superseded_by AS supersededBy,
   created_at AS createdAt, committed_at AS committedAt, deleted_at AS deletedAt,
-  failure_reason AS failureReason, media_id AS mediaId FROM artifacts`;
+  failure_reason AS failureReason, media_id AS mediaId, origin,
+  source_message_id AS sourceMessageId FROM artifacts`;
 const DELIVERY_SELECT = `SELECT delivery_id AS deliveryId, artifact_id AS artifactId, attempt, state,
   queued_at AS queuedAt, delivered_at AS deliveredAt, acknowledged_at AS acknowledgedAt,
   failed_at AS failedAt, reason FROM artifact_deliveries`;
@@ -57,7 +59,8 @@ export class Artifacts {
         media_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL,
         state TEXT NOT NULL, mark TEXT NOT NULL, validation TEXT NOT NULL, version INTEGER NOT NULL,
         supersedes TEXT, superseded_by TEXT, created_at INTEGER NOT NULL, committed_at INTEGER,
-        deleted_at INTEGER, failure_reason TEXT, media_id TEXT
+        deleted_at INTEGER, failure_reason TEXT, media_id TEXT,
+        origin TEXT NOT NULL DEFAULT 'declared', source_message_id TEXT
       ) STRICT;
       CREATE INDEX IF NOT EXISTS artifacts_bot ON artifacts (bot, created_at DESC);
       CREATE INDEX IF NOT EXISTS artifacts_source ON artifacts (task_id, run_id);
@@ -68,6 +71,12 @@ export class Artifacts {
         UNIQUE (artifact_id, attempt)
       ) STRICT;
     `);
+    // Row 65 shipped without these two columns, so an existing store is widened in place. A record
+    // written before `origin` existed is a declaration, which is exactly what the default says.
+    const columns = new Set((db.prepare("PRAGMA table_info(artifacts)").all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name));
+    if (!columns.has("origin")) db.exec("ALTER TABLE artifacts ADD COLUMN origin TEXT NOT NULL DEFAULT 'declared'");
+    if (!columns.has("source_message_id")) db.exec("ALTER TABLE artifacts ADD COLUMN source_message_id TEXT");
   }
 
   /** Operator ceiling on retained original bytes. Exceeding it fails a commit visibly; it never
@@ -94,8 +103,9 @@ export class Artifacts {
     this.#db.prepare(
       `INSERT INTO artifacts (artifact_id, bot, session_id, room, task_id, run_id, created_by, filename,
          media_type, size_bytes, sha256, state, mark, validation, version, supersedes, superseded_by,
-         created_at, committed_at, deleted_at, failure_reason, media_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'declared', ?, 'unvalidated', ?, ?, NULL, ?, NULL, NULL, NULL, NULL)`,
+         created_at, committed_at, deleted_at, failure_reason, media_id, origin, source_message_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'declared', ?, 'unvalidated', ?, ?, NULL, ?, NULL, NULL, NULL, NULL,
+         'declared', NULL)`,
     ).run(input.artifactId, input.bot, input.sessionId, input.room ?? null, input.taskId ?? null,
       input.runId ?? null, input.createdBy, input.filename, input.mediaType, input.sizeBytes,
       input.sha256, input.mark, version, input.supersedesArtifactId ?? null, at);
@@ -126,30 +136,107 @@ export class Artifacts {
       return { outcome: "mismatch", record: this.#fail(artifactId, "checksum", "mismatch", at) };
     if (stored.bytes.byteLength !== row.sizeBytes)
       return { outcome: "mismatch", record: this.#fail(artifactId, "size", "mismatch", at) };
-    const retained = this.#db.prepare("SELECT COALESCE(SUM(size_bytes), 0) AS bytes FROM artifacts WHERE state = 'committed'")
-      .get() as { bytes: number };
-    if (retained.bytes + row.sizeBytes > this.#capacityBytes)
+    if (!this.#retains(createdBy, mediaId) && this.#retainedBytes() + row.sizeBytes > this.#capacityBytes)
       return { outcome: "capacity", record: this.#fail(artifactId, "capacity", "verified", at) };
+
+    // A derived record already stands for exactly these bytes, so the declaration upgrades it in
+    // place. The identity clients have already discovered stays the one identity for this media,
+    // and the delivery it already completed is not replayed.
+    const derived = this.#db.prepare(
+      `${SELECT} WHERE created_by = ? AND media_id = ? AND origin = 'derived' AND state = 'committed' AND artifact_id <> ?`,
+    ).get(createdBy, mediaId, artifactId) as ArtifactRow | undefined;
+    const target = derived?.artifactId ?? artifactId;
 
     this.#db.exec("SAVEPOINT artifact_commit");
     try {
-      this.#db.prepare(
-        `UPDATE artifacts SET state = 'committed', validation = 'verified', committed_at = ?,
-         failure_reason = NULL, media_id = ? WHERE artifact_id = ?`,
-      ).run(at, mediaId, artifactId);
+      if (derived === undefined) {
+        this.#db.prepare(
+          `UPDATE artifacts SET state = 'committed', validation = 'verified', committed_at = ?,
+           failure_reason = NULL, media_id = ? WHERE artifact_id = ?`,
+        ).run(at, mediaId, artifactId);
+        this.#queue(artifactId, randomUUID().replaceAll("-", ""), 1, at);
+      } else {
+        this.#db.prepare(
+          `UPDATE artifacts SET origin = 'declared', session_id = ?, room = ?, task_id = ?, run_id = ?,
+             filename = ?, media_type = ?, size_bytes = ?, sha256 = ?, mark = ?, version = ?,
+             supersedes = ?, state = 'committed', validation = 'verified', committed_at = ?,
+             failure_reason = NULL, media_id = ? WHERE artifact_id = ?`,
+        ).run(row.sessionId, row.room, row.taskId, row.runId, row.filename, row.mediaType,
+          row.sizeBytes, row.sha256, row.mark, row.version, row.supersedes, at, mediaId, target);
+        this.#db.prepare("DELETE FROM artifacts WHERE artifact_id = ?").run(artifactId);
+      }
       // A committed original is retained until an explicit deletion, so the producer's temporary
       // staging deadline no longer applies to these bytes.
       this.#db.prepare("UPDATE attach_media SET expires_at = NULL WHERE agent_id = ? AND media_id = ?").run(createdBy, mediaId);
       if (row.supersedes !== null)
-        this.#db.prepare("UPDATE artifacts SET superseded_by = ? WHERE artifact_id = ?").run(artifactId, row.supersedes);
-      this.#queue(artifactId, randomUUID().replaceAll("-", ""), 1, at);
+        this.#db.prepare("UPDATE artifacts SET superseded_by = ? WHERE artifact_id = ?").run(target, row.supersedes);
       this.#db.exec("RELEASE artifact_commit");
     } catch (error) {
       this.#db.exec("ROLLBACK TO artifact_commit; RELEASE artifact_commit");
       throw error;
     }
     this.#notify(row, at);
-    return { outcome: "committed", record: this.#record(this.#row(artifactId)!) };
+    return { outcome: "committed", record: this.#record(this.#row(target)!) };
+  }
+
+  /** Capability 65 for peers that never heard of it. An attachment a peer delivered without a
+   * declaration still becomes exactly one record, so a Hermes bot's files are discoverable,
+   * downloadable, deletable and retained like any other Artifact with no change to the peer.
+   *
+   * It claims only what the gateway actually knows: the stored object's filename, media type and
+   * byte size, the bot that sent it, and the message it arrived in. No checksum, because nothing
+   * was declared to prove the bytes against; no mark and no Task, for the same reason.
+   *
+   * The identity is a function of the peer and the media, so a redelivery, a replayed event and a
+   * duplicate receipt all name the record that already exists instead of making another. */
+  derive(input: {
+    createdBy: string; bot: string; sessionId: string; sourceMessageId: string; mediaId: string;
+    filename: string; mediaType: string; sizeBytes: number;
+  }, at: number): { outcome: "created" | "existing"; record?: Artifact } {
+    const artifactId = derivedArtifactId(input.createdBy, input.mediaId);
+    const existing = this.#db.prepare(
+      `${SELECT} WHERE created_by = ? AND media_id = ? UNION ALL ${SELECT} WHERE artifact_id = ?`,
+    ).get(input.createdBy, input.mediaId, artifactId) as ArtifactRow | undefined;
+    // An explicitly deleted record is found by its identity too, so a later receipt or a
+    // redelivery never resurrects bytes a person asked the gateway to stop offering.
+    if (existing !== undefined) return { outcome: "existing", record: this.#record(existing) };
+    this.#db.exec("SAVEPOINT artifact_derive");
+    try {
+      this.#db.prepare(
+        `INSERT INTO artifacts (artifact_id, bot, session_id, room, task_id, run_id, created_by, filename,
+           media_type, size_bytes, sha256, state, mark, validation, version, supersedes, superseded_by,
+           created_at, committed_at, deleted_at, failure_reason, media_id, origin, source_message_id)
+         VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, '', 'committed', '', 'unvalidated', 1, NULL, NULL,
+           ?, ?, NULL, NULL, ?, 'derived', ?)`,
+      ).run(artifactId, input.bot, input.sessionId, input.createdBy, input.filename, input.mediaType,
+        input.sizeBytes, at, at, input.mediaId, input.sourceMessageId);
+      // Retained like a committed original: the producer's staging deadline stops applying.
+      this.#db.prepare("UPDATE attach_media SET expires_at = NULL WHERE agent_id = ? AND media_id = ?")
+        .run(input.createdBy, input.mediaId);
+      // The gateway durably projected the attachment into the transcript and announced it, which
+      // IS the platform commitment for this delivery. Receipt is still a separate, later fact.
+      this.#db.prepare(
+        `INSERT INTO artifact_deliveries (delivery_id, artifact_id, attempt, state, queued_at, delivered_at)
+         VALUES (?, ?, 1, 'delivered', ?, ?)`,
+      ).run(randomUUID().replaceAll("-", ""), artifactId, at, at);
+      this.#db.exec("RELEASE artifact_derive");
+    } catch (error) {
+      this.#db.exec("ROLLBACK TO artifact_derive; RELEASE artifact_derive");
+      throw error;
+    }
+    return { outcome: "created", record: this.#record(this.#row(artifactId)!) };
+  }
+
+  /** Capability 31's receipt is the acknowledgement for an attachment the gateway derived: the
+   * device reported it put that message on screen, so its bytes reached an authenticated client.
+   * It is still never a claim that a person read the artifact. */
+  acknowledgeMessage(bot: string, messageId: string, at: number): number {
+    const rows = this.#db.prepare(
+      "SELECT artifact_id AS artifactId FROM artifacts WHERE bot = ? AND source_message_id = ? AND state = 'committed'",
+    ).all(bot, messageId) as unknown as Array<{ artifactId: string }>;
+    let acknowledged = 0;
+    for (const row of rows) if (this.acknowledge(row.artifactId, at)) acknowledged += 1;
+    return acknowledged;
   }
 
   get(artifactId: string): Artifact | undefined {
@@ -273,6 +360,21 @@ export class Artifacts {
     }));
   }
 
+  /** Retained bytes, counted once per stored object. Two records over the same media, a derived
+   * one and the declaration that upgraded from it or a second declaration, retain one copy. */
+  #retainedBytes(): number {
+    return (this.#db.prepare(
+      `SELECT COALESCE(SUM(size_bytes), 0) AS bytes FROM
+         (SELECT DISTINCT created_by, media_id, size_bytes FROM artifacts
+          WHERE state = 'committed' AND media_id IS NOT NULL)`,
+    ).get() as { bytes: number }).bytes;
+  }
+
+  #retains(createdBy: string, mediaId: string): boolean {
+    return this.#db.prepare("SELECT 1 FROM artifacts WHERE state = 'committed' AND created_by = ? AND media_id = ?")
+      .get(createdBy, mediaId) !== undefined;
+  }
+
   #queue(artifactId: string, deliveryId: string, attempt: number, at: number): void {
     this.#db.prepare(
       "INSERT INTO artifact_deliveries (delivery_id, artifact_id, attempt, state, queued_at) VALUES (?, ?, ?, 'queued', ?)",
@@ -314,9 +416,14 @@ export class Artifacts {
     const delivery = this.#delivery(row.artifactId);
     return {
       artifactId: row.artifactId, bot: row.bot, sessionId: row.sessionId, createdBy: row.createdBy,
-      filename: row.filename, mediaType: row.mediaType, sizeBytes: row.sizeBytes, sha256: row.sha256,
-      state: row.state, mark: row.mark, validation: row.validation, version: row.version,
-      createdAt: row.createdAt,
+      filename: row.filename, mediaType: row.mediaType, sizeBytes: row.sizeBytes,
+      state: row.state, validation: row.validation, version: row.version,
+      createdAt: row.createdAt, origin: row.origin,
+      // A derived record declared no digest and no mark, so it reports neither. The columns hold
+      // the empty string rather than NULL only because row 65 created them NOT NULL.
+      ...(row.sha256 === "" ? {} : { sha256: row.sha256 }),
+      ...(row.mark === "" ? {} : { mark: row.mark }),
+      ...(row.sourceMessageId === null ? {} : { sourceMessageId: row.sourceMessageId }),
       ...(row.room === null ? {} : { room: row.room }),
       ...(row.taskId === null ? {} : { taskId: row.taskId }),
       ...(row.runId === null ? {} : { runId: row.runId }),
@@ -336,4 +443,11 @@ export class Artifacts {
       } }),
     };
   }
+}
+
+/** Stable, derivable identity: the same peer and the same stored object always name the same
+ * record, so a redelivery or a replayed event cannot make a second one even if the row is read
+ * concurrently. It is a digest of the pair, not the media id, so it never leaks one id as another. */
+function derivedArtifactId(createdBy: string, mediaId: string): string {
+  return `derived-${createHash("sha256").update(`${createdBy}\u0000${mediaId}`).digest("hex").slice(0, 32)}`;
 }
