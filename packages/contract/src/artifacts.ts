@@ -18,7 +18,8 @@ export const ArtifactStateSchema = Type.Union(ARTIFACT_STATES.map((value) => Typ
 export type ArtifactState = Static<typeof ArtifactStateSchema>;
 
 /** Draft, a copy circulated for review, or the final output. The producer declares it; the
- * gateway stores and reports it and never infers it. */
+ * gateway stores and reports it and never infers it. There is deliberately no value for "the
+ * producer did not say": that is absence, and a client renders it as no mark. */
 export const ARTIFACT_MARKS = ["draft", "review_copy", "final"] as const;
 export const ArtifactMarkSchema = Type.Union(ARTIFACT_MARKS.map((value) => Type.Literal(value)));
 export type ArtifactMark = Static<typeof ArtifactMarkSchema>;
@@ -58,6 +59,9 @@ export type ArtifactDelivery = Static<typeof ArtifactDeliverySchema>;
 
 export const ArtifactSchema = Type.Object({
   artifactId: Id, bot: Id, sessionId: Id, room: Type.Optional(Id),
+  /** `runId` is what the producer stated: the attach turn identity capability 64 made the Run
+   * identity. `taskId` is the gateway's own join from that Run, never a producer claim, and it is
+   * absent when this gateway cannot map the Run to a Task of this Bot. */
   taskId: Type.Optional(Id), runId: Type.Optional(Id), createdBy: Id,
   filename: Type.String({ minLength: 1, maxLength: 255 }), mediaType: Type.String({ minLength: 1, maxLength: 255 }),
   sizeBytes: Type.Integer({ minimum: 0 }),
@@ -65,7 +69,8 @@ export const ArtifactSchema = Type.Object({
    * record: nothing was declared there, so no checksum may be claimed. */
   sha256: Type.Optional(Type.String({ minLength: 64, maxLength: 64 })),
   state: ArtifactStateSchema,
-  /** The producer's own mark. Absent on a `derived` record for the same reason. */
+  /** The producer's own mark. Absent on a `derived` record for the same reason, and absent on a
+   * `declared` one whose producer did not state a mark. Absence is unstated, never `draft`. */
   mark: Type.Optional(ArtifactMarkSchema),
   validation: ArtifactValidationSchema,
   origin: Type.Optional(ArtifactOriginSchema),
@@ -87,10 +92,15 @@ export const ArtifactListSchema = Type.Object({ artifacts: Type.Array(ArtifactSc
 
 export const ArtifactDeclareRequestSchema = Type.Object({
   artifactId: Id, sessionId: Id, room: Type.Optional(Id),
+  /** The Run the producer is executing, which is its own attach turn identity. The gateway joins
+   * the owning Task from it. `taskId` is accepted for compatibility with the first row 65 clients
+   * and IGNORED: the Task id is minted gateway-side and reaches a peer on no frame, so a peer
+   * learns its own Task id only by reading `taskId` back off the record it just declared. */
   taskId: Type.Optional(Id), runId: Type.Optional(Id),
   filename: Type.String({ minLength: 1, maxLength: 255 }), mediaType: Type.String({ minLength: 1, maxLength: 255 }),
   sizeBytes: Type.Integer({ minimum: 0 }), sha256: Type.String({ minLength: 64, maxLength: 64 }),
-  mark: ArtifactMarkSchema, supersedesArtifactId: Type.Optional(Id),
+  /** Optional: a producer that did not say leaves it out and the record reports no mark. */
+  mark: Type.Optional(ArtifactMarkSchema), supersedesArtifactId: Type.Optional(Id),
 });
 export type ArtifactDeclareRequest = Static<typeof ArtifactDeclareRequestSchema>;
 

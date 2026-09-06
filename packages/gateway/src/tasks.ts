@@ -6,7 +6,10 @@ import type { AttachV1Command, AttachV1EventFrame } from "./adapters/attach/prot
 const TERMINAL = new Set<TaskState>(["completed", "failed", "cancelled"]);
 const LIVE_CHILD = new Set(["queued", "starting", "running", "stalling"]);
 const WAIT = new Set<TaskState>(["waiting_for_approval", "waiting_for_user_input", "waiting_for_device"]);
-export interface TaskArtifactReference { artifactId: string; status: "pending" | "committed" | "failed" }
+/** `deleted` is a reference that reached a terminal state without ever committing, so it will
+ * never be proved. It is separate from `failed` because a refused commitment and a person deleting
+ * the record before one are different facts and get different Task reasons. */
+export interface TaskArtifactReference { artifactId: string; status: "pending" | "committed" | "failed" | "deleted" }
 /** Initiative 4 binds this to its canonical declaration/commitment reader. No attachment or
  * delivery record is evidence. Missing previously declared references remain unproven. */
 export type TaskArtifactReader = (source: { taskId: string; bot: string; peer: string; sessionId: string; runId: string }) => readonly TaskArtifactReference[];
@@ -88,6 +91,15 @@ export class Tasks {
     const run = this.#db.prepare(`${RUN_SELECT} WHERE task_id = ? AND run_id = ?`).get(taskId, runId) as RunRow | undefined;
     if (run === undefined) return;
     this.atomic(() => this.#settleRequirements(run, at));
+  }
+
+  /** Capability 65's upgrade seam: a commit that lands on a record the gateway already derived for
+   * the same bytes keeps the derived identity and retires the declared one. A requirement recorded
+   * against the retired id follows it, because a Task must never wait on an identity that no
+   * longer resolves. Called inside the commit's own savepoint, so the swap and the requirement
+   * move together or not at all. */
+  artifactIdentityReplaced(retired: string, surviving: string): void {
+    this.#db.prepare("UPDATE OR REPLACE task_required_artifacts SET artifact_id = ? WHERE artifact_id = ?").run(surviving, retired);
   }
 
   runtime(reader: (bot: string) => string | undefined): void { this.#runtime = reader; }
@@ -187,6 +199,23 @@ export class Tasks {
           if (view.state === "queued" && (stage === "stopped" || stage === "needs_attention")) this.append(view.taskId, `runtime:${run.runId}:${stage}:${view.lastEvent.seq}`, stage === "stopped" ? "waiting_for_user_input" : "blocked", stage === "stopped" ? "runtime_stopped" : "runtime_needs_attention", "gateway", at, { kind: "run", id: run.runId });
           if (stage === "ready" && (transition?.reason === "runtime_stopped" || transition?.reason === "runtime_needs_attention")) this.append(view.taskId, `runtime:${run.runId}:ready:${transition.seq}`, "queued", "runtime_ready", "gateway", at, { kind: "run", id: run.runId });
           this.#settleRequirements(run, at);
+          // A required Artifact that is still only declared while its Run's execution has ended
+          // waits on a producer that is not coming back: no absence episode is ever opened for an
+          // ended Run, so nothing else would settle this Task. The lease is ADR 0004's provisional
+          // 120 seconds, the same bound owner loss gets, and it is re-evaluated with measured
+          // findings. A missing artifact settles failed; it is never sealed completed. The lease
+          // restarts at gateway boot, exactly as the owner lease does: a producer cannot commit to
+          // a gateway that was not running, so downtime is not counted against it.
+          const verifying = this.#read(view.taskId)?.view;
+          if (verifying?.state === "verifying" && verifying.currentRun.runId === run.runId
+            && this.#executionEnded(run.peer, run.runId)
+            && at - Math.max(verifying.at, this.#bootAt) >= 120_000) {
+            const unproven = this.#artifactReferences(run).find((artifact) => artifact.status === "pending");
+            if (unproven !== undefined) {
+              this.append(view.taskId, `artifacts:${run.runId}:unproven`, "failed", "verification_failed", "gateway", at, { kind: "artifact", id: unproven.artifactId });
+              continue;
+            }
+          }
           const live = this.#live.has(run.peer);
           if (live) {
             const absence = this.#db.prepare("SELECT episode FROM task_absences WHERE task_id = ? AND run_id = ? AND reattached_at IS NULL ORDER BY absent_at DESC LIMIT 1").get(view.taskId, run.runId) as { episode: string } | undefined;
@@ -340,6 +369,17 @@ export class Tasks {
     return this.#db.prepare(`${RUN_SELECT} WHERE peer = ? AND run_id = ?`).get(peer, runId) as RunRow | undefined;
   }
 
+  /** Capability 65's Task join. A Run is the attach turn identity capability 64 already binds to
+   * one Task, one peer and one session, so an Artifact naming its Run needs no Task id on the
+   * wire: the gateway reads the owning Task here. A Run this gateway does not hold for this peer
+   * has no Task, and the caller is expected to record that absence rather than guess. */
+  taskOfRun(peer: string, runId: string): { taskId: string; bot: string; sessionId: string } | undefined {
+    const run = this.run(peer, runId);
+    if (run === undefined) return undefined;
+    const task = this.#db.prepare(`${TASK_SELECT} WHERE task_id = ?`).get(run.taskId) as TaskRow | undefined;
+    return task === undefined ? undefined : { taskId: task.taskId, bot: task.bot, sessionId: run.sessionId };
+  }
+
   acknowledged(peer: string, command: AttachV1Command, at: number): void {
     if (command.kind !== "turn") return;
     const run = this.run(peer, command.turnId);
@@ -426,6 +466,11 @@ export class Tasks {
       this.append(run.taskId, `children:${run.runId}:failed`, "blocked", failed.status === "unknown" ? "child_unknown" : "child_failed", "gateway", at, { kind: "child", id: `${failed.batchId}/${failed.childId}` });
     } else if (artifacts.some((artifact) => artifact.status === "failed")) {
       this.append(run.taskId, `artifacts:${run.runId}:failed`, "blocked", "artifact_commit_failed", "gateway", at, { kind: "artifact", id: artifacts.find((artifact) => artifact.status === "failed")!.artifactId });
+    } else if (artifacts.some((artifact) => artifact.status === "deleted")) {
+      // A required reference that was deleted before it ever committed is terminal and unproven.
+      // The Task leaves verifying rather than waiting on bytes nobody will ever offer, and it is
+      // never sealed completed on a missing artifact.
+      this.append(run.taskId, `artifacts:${run.runId}:deleted`, "blocked", "verification_failed", "gateway", at, { kind: "artifact", id: artifacts.find((artifact) => artifact.status === "deleted")!.artifactId });
     } else if ((required.length === 0 || (children.length > 0 && children.every((child) => !LIVE_CHILD.has(child.status) && children.filter((sibling) => sibling.batchId === child.batchId).length >= child.count))) && artifacts.every((artifact) => artifact.status === "committed")) this.append(run.taskId, `children:${run.runId}:settled`, "completed", "terminal_proof_recorded", "gateway", at, { kind: "run", id: run.runId });
   }
 

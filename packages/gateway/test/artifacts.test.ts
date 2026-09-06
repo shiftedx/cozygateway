@@ -37,7 +37,7 @@ function upload(storage: Storage, agentId: string, mediaId: string, bytes = BYTE
 function declaration(overrides: Partial<Parameters<Storage["artifacts"]["declare"]>[0]> = {}) {
   return {
     artifactId: "artifact-1", bot: "sage", sessionId: "session-1", createdBy: "sage",
-    taskId: "task-1", runId: "run-1", filename: "report.pdf", mediaType: "application/pdf",
+    runId: "run-1", filename: "report.pdf", mediaType: "application/pdf",
     sizeBytes: BYTES.byteLength, sha256: SHA, mark: "final" as const, ...overrides,
   };
 }
@@ -201,7 +201,7 @@ describe("durable Artifact records", () => {
     // Explicit deletion is the one authority. Provenance survives; bytes do not.
     expect(storage.deleteArtifact("artifact-1", 220)).toBe("deleted");
     const tombstone = storage.artifacts.get("artifact-1");
-    expect(tombstone).toMatchObject({ state: "deleted", deletedAt: 220, bot: "sage", taskId: "task-1", runId: "run-1", sha256: SHA, version: 1 });
+    expect(tombstone).toMatchObject({ state: "deleted", deletedAt: 220, bot: "sage", runId: "run-1", sha256: SHA, version: 1 });
     expect(tombstone?.location).toBeUndefined();
     expect(storage.artifacts.original("artifact-1")).toBeUndefined();
     expect(storage.attachMediaInfo("sage", "media-1", 230)).toBeUndefined();
@@ -228,13 +228,14 @@ describe("durable Artifact records", () => {
     upload(storage, "sage", "media-1");
     upload(storage, "luna", "media-2");
     storage.artifacts.declare(declaration(), 100);
-    storage.artifacts.declare(declaration({ artifactId: "artifact-room", bot: "luna", createdBy: "luna", room: "room-1", taskId: "task-2" }), 100);
+    storage.artifacts.declare(declaration({ artifactId: "artifact-room", bot: "luna", createdBy: "luna", room: "room-1" }), 100);
     expect(storage.artifacts.list({ bot: "sage" }).map((record) => record.artifactId)).toEqual(["artifact-1"]);
     expect(storage.artifacts.list({ bot: "luna" }).map((record) => record.artifactId)).toEqual(["artifact-room"]);
     expect(storage.artifacts.list({ room: "room-1" }).map((record) => record.artifactId)).toEqual(["artifact-room"]);
     expect(storage.artifacts.list({ room: "room-2" })).toEqual([]);
-    // Discovery does not depend on the originating chat message existing at all.
-    expect(storage.artifacts.list({ taskId: "task-1" }).map((record) => record.artifactId)).toEqual(["artifact-1"]);
+    // Discovery does not depend on the originating chat message existing at all. Listing by Task
+    // needs a real Task to join to and is proved in `artifact-task-join.test.ts`.
+    expect(storage.artifacts.list({ taskId: "task-1" })).toEqual([]);
   });
 });
 
@@ -245,7 +246,7 @@ describe("Artifact commitment as the canonical Task reference producer", () => {
     storage.enqueueAttachCommand("sage", "turn", { kind: "turn", threadId: sessionId, turnId: "run-1", messageId: "user", text: "make the report" }, 100);
     const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
     upload(storage, "sage", "media-1");
-    storage.artifacts.declare(declaration({ taskId, runId: "run-1", sessionId }), 100);
+    storage.artifacts.declare(declaration({ runId: "run-1", sessionId }), 100);
 
     storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: sessionId, turnId: "run-1", messageId: "answer", blocks: [] } }, 110);
     expect(storage.tasks.read(taskId)?.view.state).toBe("verifying");
@@ -261,7 +262,7 @@ describe("Artifact commitment as the canonical Task reference producer", () => {
     storage.enqueueAttachCommand("sage", "turn", { kind: "turn", threadId: sessionId, turnId: "run-1", messageId: "user", text: "make the report" }, 100);
     const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
     upload(storage, "sage", "media-1");
-    storage.artifacts.declare(declaration({ artifactId: "artifact-bad", taskId, runId: "run-1", sessionId, sha256: "c".repeat(64) }), 100);
+    storage.artifacts.declare(declaration({ artifactId: "artifact-bad", runId: "run-1", sessionId, sha256: "c".repeat(64) }), 100);
     storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: sessionId, turnId: "run-1", messageId: "answer", blocks: [] } }, 110);
     storage.artifacts.commit("sage", "artifact-bad", "media-1", 120);
     expect(storage.tasks.read(taskId)?.view.state).toBe("blocked");
@@ -272,7 +273,7 @@ describe("Artifact commitment as the canonical Task reference producer", () => {
     good.enqueueAttachCommand("sage", "turn", { kind: "turn", threadId: goodSession, turnId: "run-1", messageId: "user", text: "make the report" }, 100);
     const goodTask = good.tasks.list({ bot: "sage" })[0]!.taskId;
     upload(good, "sage", "media-1");
-    good.artifacts.declare(declaration({ taskId: goodTask, runId: "run-1", sessionId: goodSession }), 100);
+    good.artifacts.declare(declaration({ runId: "run-1", sessionId: goodSession }), 100);
     good.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: goodSession, turnId: "run-1", messageId: "answer", blocks: [] } }, 110);
     const deliveryId = good.artifacts.commit("sage", "artifact-1", "media-1", 120).record!.delivery!.deliveryId;
     expect(good.tasks.read(goodTask)?.view.state).toBe("completed");
