@@ -94,7 +94,8 @@ export const ArtifactDeclareRequestSchema = Type.Object({
   artifactId: Id, sessionId: Id, room: Type.Optional(Id),
   /** The Run the producer is executing, which is its own attach turn identity. The gateway joins
    * the owning Task from it. `taskId` is accepted for compatibility with the first row 65 clients
-   * and IGNORED: the Task id is minted gateway-side and no peer can know it. */
+   * and IGNORED: the Task id is minted gateway-side and reaches a peer on no frame, so a peer
+   * learns its own Task id only by reading `taskId` back off the record it just declared. */
   taskId: Type.Optional(Id), runId: Type.Optional(Id),
   filename: Type.String({ minLength: 1, maxLength: 255 }), mediaType: Type.String({ minLength: 1, maxLength: 255 }),
   sizeBytes: Type.Integer({ minimum: 0 }), sha256: Type.String({ minLength: 64, maxLength: 64 }),

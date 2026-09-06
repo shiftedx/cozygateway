@@ -1221,6 +1221,7 @@ export class Storage {
     // The Task id is minted gateway-side and no attach-v1 frame carries it to a peer, so the
     // gateway resolves the owning Task from the Run identity capability 64 already established.
     this.artifacts.taskJoin((peer, runId) => this.tasks.taskOfRun(peer, runId));
+    this.artifacts.onIdentityReplaced((retired, surviving) => { this.tasks.artifactIdentityReplaced(retired, surviving); });
     this.artifacts.onCommitment((taskId, runId, at) => { this.tasks.artifactsSettled(taskId, runId, at); });
   }
 

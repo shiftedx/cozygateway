@@ -19,6 +19,15 @@ release; everything older is marked pre-release so installers resolve one "lates
   the record while keeping the stated `runId`, which reads as absent Task provenance rather than a
   guess, and a `taskId` a peer sends is dropped in favor of the gateway's own join. A joined
   record keeps its Task `verifying` until it commits and appears in the Task view's artifacts.
+  Waiting on one is bounded: a required Artifact that reaches a terminal state without committing
+  releases the Task into `blocked` with a truthful reason, `artifact_commit_failed` for a refused
+  commitment and `verification_failed` for a record deleted before it ever committed, and a
+  required Artifact that is still only declared when its Run's execution has ended settles the Task
+  `failed` with `verification_failed` after the provisional 120 second lease. A Task is never
+  sealed `completed` on a missing artifact, and a record deleted after it committed does not reopen
+  its Task. A commit that upgrades a record the gateway derived for the same bytes now carries the
+  Task's requirement across the identity swap, so a successful commitment cannot strand the Task on
+  an identity that no longer resolves.
 - An Artifact `mark` a producer never stated stays unstated (`com.cozylabs.bots` row 65,
   additive). `mark` is now optional on a declaration and on a record: its three values are the
   three things a producer can say, and absence is "did not say", never a default of `draft`. A

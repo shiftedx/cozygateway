@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { openStorage, type Storage } from "../src/storage.ts";
 
@@ -10,7 +10,11 @@ const BYTES = new TextEncoder().encode("%PDF-1.7\njoined\n");
 const SHA = createHash("sha256").update(BYTES).digest("hex");
 const stores: Storage[] = [];
 const directories: string[] = [];
+// The provisional artifact lease is measured against the gateway's own clock and its boot, so
+// every store here is opened at a known time rather than at whatever `Date.now()` says.
+beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(0); });
 afterEach(() => {
+  vi.useRealTimers();
   for (const store of stores.splice(0)) store.close();
   for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
@@ -150,6 +154,82 @@ describe("Artifact to Task join by Run identity", () => {
     expect(replay.record).toMatchObject({ taskId, committedAt: 120, state: "committed" });
     expect(reopened.tasks.read(taskId)?.view.artifacts).toEqual([{ artifactId: "artifact-1" }]);
     expect(reopened.artifacts.list({ taskId })).toHaveLength(1);
+  });
+
+  it("carries the Task requirement across the identity swap when a commit upgrades a derived record", () => {
+    const storage = open();
+    const { taskId, sessionId } = admit(storage, "sage", "run-1");
+    upload(storage, "sage", "media-1");
+    // Declared during the turn, joined to the Task, bytes uploaded and not yet committed.
+    storage.artifacts.declare(declaration({ sessionId }), 100);
+    storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: sessionId, turnId: "run-1", messageId: "answer", blocks: [] } }, 110);
+    expect(storage.tasks.read(taskId)?.view.artifacts).toEqual([{ artifactId: "artifact-1" }]);
+
+    // The same bytes reach the transcript as an ordinary attachment, so 4d derives its own record:
+    // a declaration in flight binds no media yet and does not suppress derivation.
+    const derived = storage.artifacts.derive({
+      createdBy: "sage", bot: "sage", sessionId, sourceMessageId: "answer", mediaId: "media-1",
+      filename: "report.pdf", mediaType: "application/pdf", sizeBytes: BYTES.byteLength,
+    }, 115);
+    expect(derived.outcome).toBe("created");
+
+    // The commit succeeds and upgrades that record, which retires the declared id. The Task's
+    // requirement follows it, so a successful commitment settles the Task instead of stranding it.
+    const committed = storage.artifacts.commit("sage", "artifact-1", "media-1", 120);
+    expect(committed.outcome).toBe("committed");
+    expect(committed.record?.artifactId).toBe(derived.record?.artifactId);
+    expect(committed.record?.taskId).toBe(taskId);
+    expect(storage.artifacts.get("artifact-1")).toBeUndefined();
+    expect(storage.tasks.read(taskId)?.view.artifacts).toEqual([{ artifactId: derived.record!.artifactId }]);
+    expect(storage.tasks.read(taskId)?.view.state).toBe("completed");
+  });
+
+  it("releases a Task from verifying when a required Artifact is deleted before it ever commits", () => {
+    const storage = open();
+    const { taskId, sessionId } = admit(storage, "sage", "run-1");
+    upload(storage, "sage", "media-1");
+    storage.artifacts.declare(declaration({ sessionId }), 100);
+    storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: sessionId, turnId: "run-1", messageId: "answer", blocks: [] } }, 110);
+    expect(storage.tasks.read(taskId)?.view.state).toBe("verifying");
+
+    // The producer died between declaring and committing, and a person deleted the dangling
+    // record. It will never commit, so the Task stops waiting and says why.
+    expect(storage.deleteArtifact("artifact-1", 300)).toBe("deleted");
+    expect(storage.tasks.read(taskId)?.view.state).toBe("blocked");
+    expect(storage.tasks.read(taskId)?.view.lastEvent.reason).toBe("verification_failed");
+    // A refused commitment is a different fact and keeps its own reason.
+    const other = open();
+    const second = admit(other, "sage", "run-1");
+    upload(other, "sage", "media-1");
+    other.artifacts.declare(declaration({ sessionId: second.sessionId, sha256: "c".repeat(64) }), 100);
+    other.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: second.sessionId, turnId: "run-1", messageId: "answer", blocks: [] } }, 110);
+    other.artifacts.commit("sage", "artifact-1", "media-1", 120);
+    expect(other.tasks.read(second.taskId)?.view.state).toBe("blocked");
+    expect(other.tasks.read(second.taskId)?.view.lastEvent.reason).toBe("artifact_commit_failed");
+  });
+
+  it("settles a Task failed when its Run has ended and a required Artifact never committed", () => {
+    const storage = open();
+    const { taskId, sessionId } = admit(storage, "sage", "run-1");
+    upload(storage, "sage", "media-1");
+    storage.artifacts.declare(declaration({ sessionId }), 100);
+    storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: sessionId, turnId: "run-1", messageId: "answer", blocks: [] } }, 110);
+
+    // Inside the lease nothing moves: a producer may still be uploading and committing.
+    storage.tasks.reconcile(110 + 119_000);
+    expect(storage.tasks.read(taskId)?.view.state).toBe("verifying");
+
+    // Past it, the Run's execution has ended and no absence episode is ever opened for an ended
+    // Run, so this is the only thing that can settle the Task. It fails, never completes.
+    storage.tasks.reconcile(110 + 120_000);
+    const settled = storage.tasks.read(taskId)!.view;
+    expect(settled.state).toBe("failed");
+    expect(settled.lastEvent.reason).toBe("verification_failed");
+    expect(settled.lastEvent.ref).toEqual({ kind: "artifact", id: "artifact-1" });
+    // Terminal and stable: a later reconcile adds nothing.
+    const events = storage.tasks.read(taskId)!.events.length;
+    storage.tasks.reconcile(110 + 400_000);
+    expect(storage.tasks.read(taskId)!.events).toHaveLength(events);
   });
 
   it("stores and reports a declared record with no mark as unstated, never as draft", () => {

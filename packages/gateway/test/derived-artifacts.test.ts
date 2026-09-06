@@ -196,12 +196,15 @@ describe("derived Artifacts from legacy attachment deliveries", () => {
 
     // The other order: the attachment was delivered first, and the declaration arrives later.
     seedMedia(storage, "media_late");
-    await deliver(fixture, "late-answer", ["media_late"]);
+    const late = await deliver(fixture, "late-answer", ["media_late"]);
     const derived = storage.artifacts.list({ bot: "sage" }).find((record) => record.origin === "derived");
     expect(derived).toBeDefined();
+    // The declaration names the Run that delivered those bytes, so the gateway joins it to that
+    // turn's own Task and the upgrade has a real join to carry across the identity swap.
+    const lateTask = storage.tasks.list({ bot: "sage" }).find((view) => view.currentRun.runId === late.turnId)!;
     storage.artifacts.declare({
-      artifactId: "artifact-late", bot: "sage", sessionId: "session-1", createdBy: "sage",
-      runId: "run-2", filename: "chart.png", mediaType: "image/png",
+      artifactId: "artifact-late", bot: "sage", sessionId: late.sessionId, createdBy: "sage",
+      runId: late.turnId, filename: "chart.png", mediaType: "image/png",
       sizeBytes: PNG.byteLength, sha256: PNG_SHA, mark: "review_copy",
     }, 70);
     const committed = storage.artifacts.commit("sage", "artifact-late", "media_late", 80);
@@ -210,10 +213,12 @@ describe("derived Artifacts from legacy attachment deliveries", () => {
     expect(storage.artifacts.list({ bot: "sage" })).toHaveLength(2);
     expect(committed.record?.artifactId).toBe(derived!.artifactId);
     expect(storage.artifacts.get(derived!.artifactId)).toMatchObject({
-      origin: "declared", sha256: PNG_SHA, mark: "review_copy", runId: "run-2",
+      origin: "declared", sha256: PNG_SHA, mark: "review_copy", runId: late.turnId, taskId: lateTask.taskId,
       state: "committed", validation: "verified",
     });
     expect(storage.artifacts.get("artifact-late")).toBeUndefined();
+    // The Task keeps exactly one reference, and it is the identity that survived.
+    expect(storage.tasks.read(lateTask.taskId)?.view.artifacts).toEqual([{ artifactId: derived!.artifactId }]);
     // Nothing is left pointing at the id the upgrade retired, and nothing supersedes itself.
     expect(storage.artifacts.get(derived!.artifactId)?.supersedesArtifactId).toBeUndefined();
     expect(storage.artifacts.get(derived!.artifactId)?.supersededByArtifactId).toBeUndefined();

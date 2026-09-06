@@ -231,3 +231,133 @@ weakened to make a test pass.
   `ponytail:` comment about filing an unstated mark as `draft` can now be removed, and its report's
   two named gaps are both closed by this branch. That follow-up is a CozyAgents change and is not
   in this worktree.
+
+## Fix round 1 (review r0)
+
+Head after this round: `6a1c7ef` on `codex/4e-artifact-task-join`, pushed. Node 24
+(`PATH=/opt/homebrew/opt/node@24/bin:$PATH`) for every command. Logs under `<scratch>/4e/logs/r1-*`.
+No full suite, per the standing ruling. C1, I2, I3 and minors M1 and M2 are taken; M3 (a migration
+nulling pre-4e claimed `task_id`) and M4 (declare-time replay not upgrading a join) are untouched.
+
+### C1, a successful commitment that upgrades a derived record stranded the Task
+
+4d's upgrade keeps the derived identity and deletes the declared row, but the Task had already
+recorded a requirement against the DECLARED id at the turn's commit event, and
+`#artifactReferences` re-adds any required id the reader no longer returns as `pending`. So a
+successful, verified commitment left the Task `verifying` forever against an artifact id that
+resolved to nothing. 4e is what armed it, because before the join the record was never in the
+reference set at all.
+
+The requirement now follows the record across the swap, inside the commit's own savepoint, next to
+the existing supersession follow-ups: `Artifacts.onIdentityReplaced(retired, surviving)` is bound
+by `Storage` to `Tasks.artifactIdentityReplaced`, which is one
+`UPDATE OR REPLACE task_required_artifacts SET artifact_id = ? WHERE artifact_id = ?`. The write
+stays in the Task's own module rather than Artifacts reaching into Task state, which is the same
+binder shape `taskJoin` and `onCommitment` already use.
+
+### I2, a declared record that never commits no longer stalls its Task forever
+
+Two gateway-side halves, both from the lead's ruling.
+
+- A required reference that reaches a TERMINAL state without committing releases the Task from
+  `verifying` into `blocked` with a truthful reason. `taskReferences` gains a fourth status,
+  `deleted`, so a refused commitment (`artifact_commit_failed`) and a record deleted before it ever
+  committed (`verification_failed`) stay different facts rather than being flattened into one.
+  Commitment is still read FIRST, so a record deleted AFTER it committed proved its bytes and does
+  not reopen its Task. `Artifacts.forget` now notifies the Task, because a deletion moves a
+  reference and something has to look again.
+- When the producing Run's execution has ended and a required reference is still only declared, the
+  Task settles `failed` with `verification_failed` after ADR 0004's provisional 120 second lease.
+  This is the case the owner lease cannot reach: no absence episode is opened for a Run whose
+  execution already ended, which is exactly what the reviewer's 400 second reconcile showed. The
+  lease restarts at gateway boot, the same way the owner lease does, because a producer cannot
+  commit to a gateway that was not running. Nothing is ever sealed `completed` on a missing
+  artifact; the settlement is a failure with the artifact as its `ref`.
+
+### I3, the missing upgrade-with-a-join test
+
+`derived-artifacts.test.ts` "leaves a capable peer's declaration alone and upgrades a derived record
+in place" now declares against the REAL session and Run of the delivery it upgrades, asserts the
+upgraded record carries that turn's real `taskId` alongside its `runId`, and asserts the Task holds
+exactly one reference, the identity that survived. The `taskId` assertion the packet had removed is
+restored as a gateway-established join rather than a peer claim.
+
+### Minors
+
+- M1: the derive probe's claim is corrected where it was overstated, in the code comment and in the
+  contract prose. The probe answers "does a record already BIND these bytes", which is what a
+  `media_id` means; a declaration in flight binds none until it commits, so it does not suppress
+  derivation and its commit upgrades that record in place instead. Matching an in-flight
+  declaration by digest was considered and rejected: identical bytes from one peer are not
+  necessarily the same delivery, and suppressing derivation on a declaration that then commits
+  against a different `mediaId` would lose 4d's guarantee that every delivered attachment has a
+  record. With C1 fixed, deriving and upgrading is the correct path, so the fix is to say what the
+  code does rather than to guess harder.
+- M2: the schema comment no longer says the Task id is one "no peer can know". It says the id
+  reaches a peer on no frame and that a peer learns its own Task id by reading `taskId` back off
+  the record, which is what the contract prose already said.
+
+### Contract text
+
+Row 65's Artifact surface gains a paragraph under the Task join: waiting is bounded, a terminal
+non-committed reference releases the Task into `blocked` with `artifact_commit_failed` or
+`verification_failed`, a record deleted after it committed does not reopen its Task, and an ended
+Run with a still-declared requirement settles `failed` after the provisional 120 second lease. The
+derived-records section states that the requirement follows the surviving identity across an
+upgrade, and that nothing is derived for media a record already BINDS, which a declaration does at
+its commit. The CHANGELOG entry carries the same two facts.
+
+### Red then green
+
+RED for this round, the final tests against this branch's previous head's source
+(`<scratch>/4e/logs/r1-red-gateway.log`; the three source files were restored with
+`git checkout HEAD -- ...` and copied back afterwards, no `git stash`):
+
+```
+pnpm --filter cozygateway exec vitest run test/artifact-task-join.test.ts
+  Test Files  1 failed (1)     Tests  3 failed | 6 passed (9)
+  expected [ …(2) ] to deeply equal [ Array(1) ]      (C1: the phantom pending reference)
+  expected 'verifying' to be 'blocked'                (I2: deletion released nothing)
+  expected 'verifying' to be 'failed'                 (I2: the ended Run waited forever)
+```
+
+The three new cases are the reviewer's probe scenarios A and B as tests. The I3 test is coverage
+rather than a repro: the join itself was already right across the swap, and what was missing was
+the requirement and any evidence of either.
+
+GREEN:
+
+| Command | Result |
+| --- | --- |
+| `pnpm -r typecheck` | exit 0, four packages Done |
+| `pnpm --filter cozygateway exec vitest run test/artifact-task-join.test.ts` | 9 passed |
+| `pnpm --filter cozygateway exec vitest run` over the 12 files touching Tasks, artifacts, storage and the routes (`artifact-task-join`, `artifacts`, `artifact-routes`, `derived-artifacts`, `durable-tasks`, `task-routes`, `task-terminal-immutability`, `task-public-ingress`, `tasks-closed-store`, `attach-v1-storage`, `native-bot-data-plane`, `storage`) | 12 files passed, 205 passed |
+| `pnpm --filter cozygateway exec vitest run test/attach-v1-delivery-receipts.test.ts test/bots-delete-routes.test.ts test/turn-media-receipts.test.ts` | 3 files passed, 24 passed |
+| `pnpm --filter cozygateway-contract exec vitest run` | 20 files, 205 passed |
+| `pnpm --filter cozygateway-conformance exec vitest run` | 10 files, 102 passed / 19 skipped |
+
+Every file in the package that mentions `verifying`, `awaiting_artifacts` or `reconcile` was run,
+because the lease is a change to reconcile that every deployment gets.
+
+### Note on the new tests' clock
+
+`artifact-task-join.test.ts` now uses fake timers pinned at 0 for the whole file. The lease is
+measured against the gateway's own clock and its boot time, and `Tasks.read` reconciles at
+`Date.now()`, so a test that mixes synthetic event times with a real wall clock would fire the
+lease on the first read. This is the same pattern `durable-tasks.test.ts` already uses for the
+owner lease.
+
+### Round 1 self-review
+
+- The lease's first implementation measured only from the `verifying` transition's own timestamp,
+  which fired immediately on any read in a test and, worse, would have failed every waiting Task at
+  once on a gateway restarted after downtime. The boot floor (`Math.max(verifying.at, bootAt)`) is
+  the same rule the owner lease already applies, for the same reason.
+- `blocked` rather than `failed` for a terminal non-committed reference is deliberate: it matches
+  what a refused commitment already did before this packet, and it leaves the person a retry and a
+  cancel. Only the ended-Run timeout, where nothing further can happen at all, is terminal.
+- Remaining concern: the 120 second lease is provisional and unmeasured, as ADR 0004 says. A
+  producer that legitimately takes longer than two minutes between its turn's commit event and its
+  artifact commit will have its Task failed. Nothing on this wire does that today, because 4b
+  declares and commits inline inside `send_file`, but a deferred-commit producer would need the
+  bound raised, and this is the first place that number binds a producer rather than a socket.

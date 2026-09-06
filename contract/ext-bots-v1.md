@@ -1288,6 +1288,16 @@ authenticated peer, session and Run, and reports only explicit declarations and 
 commitment status. Attachments, file ids and delivery are still not commitment evidence, and a
 Task never leaves `verifying` on a declared reference that has not committed.
 
+Waiting is bounded, and a Task is never sealed `completed` on an artifact that is missing. A
+required reference that reaches a TERMINAL state without committing releases the Task from
+`verifying` into `blocked`: a refused commitment with `artifact_commit_failed`, and a record
+deleted before it ever committed with `verification_failed`, because those are different facts. A
+record deleted AFTER it committed proved its bytes and does not reopen its Task. And when the
+producing Run's execution has ended while a required reference is still only declared, the Task
+settles `failed` with `verification_failed` after ADR 0004's provisional 120 second lease, the same
+bound owner loss gets: no absence episode is opened for a Run that already ended, so nothing else
+would ever settle it.
+
 ### The Task join, resolved from the Run
 
 A producer cannot name a Task. The Task id is minted gateway-side at turn admission and no
@@ -1349,7 +1359,11 @@ A capable peer that declares media the gateway already derived a record for UPGR
 place rather than adding a second one: the commit answers with the existing identity, which is the
 identity clients already discovered, carrying the declaration's digest, mark, Task and Run, and the
 declaring record id it replaced stops resolving. A peer MUST read `artifactId` from the commit
-response rather than assume its own. Nothing is derived for media a peer already declared.
+response rather than assume its own, and a requirement the producing Task recorded against the
+retired id follows the surviving one, so a successful commitment never leaves a Task verifying
+against an identity that no longer resolves. Nothing is derived for media a record already BINDS,
+which a declaration does at its commit: a declaration still in flight names no stored object yet,
+so its attachment is derived and its commit then upgrades that record in place.
 
 Retention follows the Artifact rule, not the attachment rule: a derived record's original is
 retained until an explicit Artifact deletion, so deleting the message or the conversation the

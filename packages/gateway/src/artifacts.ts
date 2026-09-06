@@ -62,6 +62,7 @@ export class Artifacts {
   #capacityBytes = DEFAULT_ARTIFACT_STORE_BYTES;
   #committed: ((taskId: string, runId: string, at: number) => void) | undefined;
   #taskOfRun: ArtifactTaskJoin | undefined;
+  #replaced: ((retired: string, surviving: string) => void) | undefined;
 
   constructor(db: DatabaseSync) {
     this.#db = db;
@@ -99,6 +100,10 @@ export class Artifacts {
   /** Called after a commitment moves, so the durable Task can re-run its own settlement. The
    * Task remains derived from its own event stream; this only says when to look again. */
   onCommitment(notify: (taskId: string, runId: string, at: number) => void): void { this.#committed = notify; }
+
+  /** Called when a commit retires one identity in favor of another, so anything holding the
+   * retired id can follow it rather than waiting on a record that no longer resolves. */
+  onIdentityReplaced(notify: (retired: string, surviving: string) => void): void { this.#replaced = notify; }
 
   /** The Task join. No new frame reaches the peer: the producer names the Run it is executing,
    * which capability 64 already gave it, and the gateway resolves the Task itself. */
@@ -212,6 +217,10 @@ export class Artifacts {
           this.#db.prepare("UPDATE artifacts SET supersedes = NULL WHERE artifact_id = ?").run(target);
         this.#db.prepare("UPDATE artifacts SET supersedes = ? WHERE supersedes = ?").run(target, artifactId);
         this.#db.prepare("UPDATE artifacts SET superseded_by = ? WHERE superseded_by = ?").run(target, artifactId);
+        // The Task the declaration joined recorded a requirement against the id being retired.
+        // Move it with the record, inside this savepoint, or a successful commitment would leave
+        // the Task verifying forever against an identity that no longer exists.
+        this.#replaced?.(artifactId, target);
       }
       // A committed original is retained until an explicit deletion, so the producer's temporary
       // staging deadline no longer applies to these bytes.
@@ -248,6 +257,9 @@ export class Artifacts {
       `${SELECT} WHERE (created_by = ? AND media_id = ?) OR artifact_id = ?
        ORDER BY (artifact_id = ?) DESC, created_at ASC, artifact_id ASC LIMIT 1`,
     ).get(input.createdBy, input.mediaId, artifactId, artifactId) as ArtifactRow | undefined;
+    // The probe answers "does a record already BIND these bytes", which is what a media_id means.
+    // A declaration in flight binds none until it commits, so it does not suppress derivation: its
+    // commit upgrades this record in place instead, carrying the Task requirement with it.
     // An explicitly deleted record is found by its identity too, so a later receipt or a
     // redelivery never resurrects bytes a person asked the gateway to stop offering.
     // A record the store once refused for capacity is retried by a later delivery, so raising the
@@ -361,6 +373,8 @@ export class Artifacts {
     const row = this.#row(artifactId);
     if (row === undefined || row.state === "deleted") return { outcome: "absent" };
     this.#db.prepare("UPDATE artifacts SET state = 'deleted', deleted_at = ?, media_id = NULL WHERE artifact_id = ?").run(at, artifactId);
+    // Deletion moves a reference to a terminal state, so a Task waiting on it has to look again.
+    this.#notify(row, at);
     return { outcome: "deleted", ...(row.mediaId === null ? {} : { media: { agentId: row.createdBy, mediaId: row.mediaId } }) };
   }
 
@@ -427,7 +441,12 @@ export class Artifacts {
     ).all(source.taskId, source.bot, source.peer, source.sessionId, source.runId) as unknown as ArtifactRow[];
     return rows.map((row) => ({
       artifactId: row.artifactId,
-      status: row.committedAt !== null ? "committed" : row.state === "commit_failed" ? "failed" : "pending",
+      // Commitment first: a record deleted AFTER it committed proved its bytes, and deleting it
+      // afterwards is not a claim the Task never finished. A record deleted before it committed
+      // never will, so it is terminal and unproven rather than pending forever.
+      status: row.committedAt !== null ? "committed"
+        : row.state === "commit_failed" ? "failed"
+        : row.state === "deleted" ? "deleted" : "pending",
     }));
   }
 
