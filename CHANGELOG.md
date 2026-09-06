@@ -5,18 +5,26 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
-## Unreleased
+## 0.7.6 (2026-09-06): rooms without a Hermes endpoint, installer fixes
 
-- Rooms work on a gateway that has no Hermes endpoint. A room is a gateway-owned attach-v1
-  conversation, and capability 46 already made a runtime bot a full member, but with zero
-  `hermesEndpoints` the control surface was the federated one, whose group methods refuse every
-  call as `cross-endpoint groups are not supported`: `POST /bots/groups` answered 503 and a
-  CozyAgents-only deployment, the product's default path, could not hold a room at all. The
-  gateway now owns its rooms directly in that configuration, answering membership from its own
-  runtime bots, and the room event hooks and interaction deadlines are wired there too, so a room
-  turn's approvals and its Tasks behave as they do beside a Hermes endpoint. A room spanning two
-  Hermes endpoints is still refused, which is what that refusal was written for, and a mixed or
-  Hermes-only room is unchanged. No wire change: no route, frame or capability row moved.
+- Rooms on a gateway with no `hermesEndpoints` entry (`com.cozylabs.bots` capabilities 46 and 52,
+  #380): a gateway with zero Hermes endpoints now owns its rooms end to end: create, list, detail,
+  member turns on the gateway-owned `group:<room>:<member>` thread, room-scoped Tasks, room
+  approvals and delete. Bridge selection on a gateway that has a Hermes endpoint is untouched; the
+  room host is built only when there are no bridge members. The contract now states exactly which
+  gateway shapes host a room: two or more endpoints, or a single `namespace: true` endpoint, still
+  refuse every room with 503. New conformance file for the Hermes-free shape.
+
+- Installer and provisioner scripts no longer require host PyYAML to read a profile's streaming
+  keys (#381): one reader with two modes shared verbatim by `scripts/agent-install.sh`,
+  `scripts/provision-bot.sh` and `scripts/bot-provisioner-watch.sh` (PyYAML when the interpreter has
+  it, Hermes' own venv python tried first; otherwise a conservative stdlib probe that reports a key
+  present whenever it cannot judge, so an unsure host writes nothing and restarts nothing; a key
+  whose value is a nested mapping counts as present). The reader answers in UTF-8 bytes and callers
+  strip a carriage return, so a Windows interpreter no longer corrupts key names. `scripts/install.sh`
+  bootstrap recognizes Git Bash as the `Windows` service platform with an empty registration path
+  and no-op restart and removal, instead of dying on an unsupported platform. The two dev-box
+  provisioner scripts still need PyYAML for their pre-existing `plugins.enabled` read.
 
 ## 0.7.5 (2026-09-06): durable Tasks and Artifacts, scoped approvals, dashboard records
 
