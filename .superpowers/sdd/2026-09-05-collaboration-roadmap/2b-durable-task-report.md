@@ -59,3 +59,11 @@ Focused evidence under explicit Node 24:
 - Granted gateway typecheck first exposed four unsafe RunRow casts; required-row lookup corrected them. Granted rerun `pnpm --filter cozygateway typecheck` passed. Later route/device/dispatch changes still need integrated typecheck/build.
 
 Remaining acceptance: boot/read/hello expiry and ACK resume reconciliation; retry/pause/cancel predecessor races; room retry/timeout integration; Artifact reference seam; physical restart and command-state matrix coverage; public attach/frame portable conformance; advertise 64 only after final zero-failure gates and independent adversarial review. All evidence is deterministic local integration. Live .121 and hosted CI remain unavailable; no production services touched and no true runtime-generation evidence claimed.
+
+## Recovery and wait corrections after 14ce1c0
+
+RED/GREEN at actual SQLite/attach seams: hello resume cursor left Task queued (then 31 passed with attach storage); reserved retry cancellation landed before its live predecessor stopped (then 12 passed with routes); foreign profile sharing opaque interaction IDs supplied the wrong legacy first-seen deadline (physical restart test reproduced 600010 instead of 600100, then fixed); due clarification read remained waiting; overlapping approvals restored running while a second approval remained pending. All now have focused regressions.
+
+Latest combined command: `pnpm --filter cozygateway exec vitest run test/durable-tasks.test.ts test/native-bot-data-plane.test.ts test/task-routes.test.ts`: 3 files, 71 passed, zero failed. Task tests now 12. Expiry migration source-fences profile peers or durable chat execution ownership plus session. Native expiry uses the same conditional durable settlement for reads and timers, broadcasts the terminal interaction frame, and clamps suspended budget at the persisted deadline. Overlapping wait clocks count the union once. ACK cursor reconciliation and Task start share a savepoint. A reserved Run consults its predecessor's execution proof before cancel/pause can land.
+
+These are focused corrections, not completion of remaining room, Artifact reference, device recovery, conformance and integrated review acceptance.

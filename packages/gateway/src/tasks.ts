@@ -20,6 +20,7 @@ export class Tasks {
   #bootAt = Date.now();
   #reconciling = false;
   #observer: ((frame: ServerFrame) => void) | undefined;
+  #expireInteraction: ((bot: string, kind: "approval" | "clarify", id: string, at: number) => void) | undefined;
   #runtime: ((bot: string) => string | undefined) | undefined;
   constructor(db: DatabaseSync) {
     this.#db = db;
@@ -40,12 +41,19 @@ export class Tasks {
     // Legacy peers omitted deadlines. Preserve a first-seen bound across restart and replay.
     db.exec(`UPDATE bot_native_interactions SET expires_at = COALESCE((
       SELECT MIN(received_at) FROM attach_event_inbox WHERE disposition = 'accepted'
+      AND (agent_id = bot_native_interactions.bot OR EXISTS (
+        SELECT 1 FROM chat_executions WHERE execution_id = attach_event_inbox.agent_id
+        AND bot = bot_native_interactions.bot AND session_id = bot_native_interactions.session_id
+      ))
+      AND json_extract(frame_json, '$.event.status') = 'pending'
       AND json_extract(frame_json, '$.event.kind') = bot_native_interactions.kind
       AND json_extract(frame_json, '$.event.threadId') = bot_native_interactions.session_id
       AND json_extract(frame_json, '$.event.turnId') = bot_native_interactions.turn_id
       AND COALESCE(json_extract(frame_json, '$.event.approvalId'), json_extract(frame_json, '$.event.clarifyId')) = bot_native_interactions.interaction_id
     ), updated_at) + 600000 WHERE expires_at IS NULL AND status = 'pending'`);
   }
+
+  expireInteractions(expire: (bot: string, kind: "approval" | "clarify", id: string, at: number) => void): void { this.#expireInteraction = expire; }
 
   runtime(reader: (bot: string) => string | undefined): void { this.#runtime = reader; }
 
@@ -96,9 +104,16 @@ export class Tasks {
     this.#reconciling = true;
     try {
       this.atomic(() => {
+        const due = this.#db.prepare("SELECT bot, kind, interaction_id AS id FROM bot_native_interactions WHERE status = 'pending' AND expires_at <= ?").all(at) as unknown as { bot: string; kind: "approval" | "clarify"; id: string }[];
+        for (const interaction of due) this.#expireInteraction?.(interaction.bot, interaction.kind, interaction.id, at);
         for (const view of this.list()) {
           if (TERMINAL.has(view.state)) continue;
           const run = this.#taskRun(view.taskId, view.currentRun.runId);
+          const pending = view.pendingIntent;
+          if (pending !== undefined && (pending.command === "cancel" || pending.command === "pause") && this.#executionEnded(run.peer, run.runId)) {
+            this.append(view.taskId, `command:${pending.idempotencyKey}:landed`, pending.command === "cancel" ? "cancelled" : "waiting_for_user_input", pending.command === "cancel" ? "user_cancelled" : "user_paused", "user", at, { kind: "run", id: run.runId });
+            continue;
+          }
           const transition = [...this.events(view.taskId)].reverse().find((event) => event.from !== event.to);
           const stage = this.#runtime?.(view.bot);
           if (view.state === "queued" && (stage === "stopped" || stage === "needs_attention")) this.append(view.taskId, `runtime:${run.runId}:${stage}`, stage === "stopped" ? "waiting_for_user_input" : "blocked", stage === "stopped" ? "runtime_stopped" : "runtime_needs_attention", "gateway", at, { kind: "run", id: run.runId });
@@ -179,7 +194,9 @@ export class Tasks {
   #executionEnded(peer: string, runId: string): boolean {
     if (this.#db.prepare("SELECT 1 FROM attach_turn_terminals WHERE agent_id = ? AND turn_id = ?").get(peer, runId) !== undefined) return true;
     const outbox = this.#db.prepare("SELECT cancelled_at AS cancelledAt FROM attach_command_outbox WHERE agent_id = ? AND json_extract(command_json, '$.kind') = 'turn' AND json_extract(command_json, '$.turnId') = ?").get(peer, runId) as { cancelledAt: number | null } | undefined;
-    return outbox === undefined || outbox.cancelledAt !== null;
+    if (outbox !== undefined) return outbox.cancelledAt !== null;
+    const reserved = this.run(peer, runId);
+    return reserved?.predecessorRunId == null || this.#executionEnded(peer, reserved.predecessorRunId);
   }
 
   #queue(taskId: string, id: string, peer: string, command: AttachV1Command, predecessor?: string): void {
@@ -349,16 +366,19 @@ export class Tasks {
     const requested: TaskReason = kind === "approval" ? "approval_requested" : kind === "clarification" ? "clarification_requested" : "device_requested";
     if (status === "pending") {
       this.#db.prepare("INSERT OR IGNORE INTO task_waits VALUES (?, ?, ?, ?, ?, ?, NULL)").run(taskId, runId, kind, id, at, expiresAt);
-      if (["running", "verifying"].includes(view.state)) this.append(taskId, `wait:${runId}:${kind}:${id}:pending`, kind === "approval" ? "waiting_for_approval" : kind === "clarification" ? "waiting_for_user_input" : "waiting_for_device", requested, "harness", at, { kind: refKind, id });
+      if (["running", "verifying", ...WAIT].includes(view.state)) this.append(taskId, `wait:${runId}:${kind}:${id}:pending`, WAIT.has(view.state) ? view.state : kind === "approval" ? "waiting_for_approval" : kind === "clarification" ? "waiting_for_user_input" : "waiting_for_device", requested, "harness", at, { kind: refKind, id });
       return;
     }
-    const changed = this.#db.prepare("UPDATE task_waits SET settled_at = ? WHERE task_id = ? AND run_id = ? AND kind = ? AND record_id = ? AND settled_at IS NULL").run(at, taskId, runId, kind, id).changes === 1;
+    const changed = this.#db.prepare("UPDATE task_waits SET settled_at = MIN(?, expires_at) WHERE task_id = ? AND run_id = ? AND kind = ? AND record_id = ? AND settled_at IS NULL").run(at, taskId, runId, kind, id).changes === 1;
     if (!changed) return;
     const entry = [...this.events(taskId)].reverse().find((event) => event.reason === requested && event.ref?.id === id);
     if (entry === undefined || !WAIT.has(view.state)) return;
     const expired = status === "expired";
     const reason: TaskReason = kind === "approval" ? expired ? "approval_expired" : status === "approved" ? "approval_approved" : "approval_denied" : kind === "clarification" ? expired ? "clarification_expired" : "clarification_answered" : expired ? "device_request_expired" : status === "lost" ? "device_request_lost" : status === "ok" ? "device_answered" : "device_refused";
-    this.append(taskId, `wait:${runId}:${kind}:${id}:settled`, entry.from ?? "running", reason, expired || status === "lost" ? "gateway" : kind === "device" ? "device" : "user", at, { kind: refKind, id });
+    const next = this.waiting(this.#taskRun(taskId, runId).peer, runId);
+    const base = [...this.events(taskId)].reverse().find((event) => event.seq <= entry.seq && ["approval_requested", "clarification_requested", "device_requested"].includes(event.reason) && (event.from === "running" || event.from === "verifying"))?.from ?? "running";
+    const restored = next === undefined ? base : next.kind === "approval" ? "waiting_for_approval" : next.kind === "clarification" ? "waiting_for_user_input" : "waiting_for_device";
+    this.append(taskId, `wait:${runId}:${kind}:${id}:settled`, restored, reason, expired || status === "lost" ? "gateway" : kind === "device" ? "device" : "user", at, { kind: refKind, id });
   }
 
   waiting(peer: string, runId: string): TaskWaitingOn | undefined {

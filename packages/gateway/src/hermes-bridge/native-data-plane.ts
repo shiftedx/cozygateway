@@ -363,6 +363,7 @@ export class NativeBotDataPlane {
     this.#onChatMessage = opts.onChatMessage;
     this.#onApproval = opts.onApproval;
     this.#now = opts.now ?? Date.now;
+    this.#storage.tasks.expireInteractions((bot, kind, id, at) => this.#expireInteraction(bot, kind, id, at));
     this.#turnTimeoutMs = opts.turnTimeoutMs ?? 0;
     this.#staleTurnSweepMs = opts.staleTurnSweepMs ?? 60_000;
     this.#staleTurnInterruptGraceMs = opts.staleTurnInterruptGraceMs ?? 120_000;
@@ -534,24 +535,14 @@ export class NativeBotDataPlane {
     // A cold restart schedules already-due expiry timers with a zero delay. That is still one
     // event-loop turn too late for a user who opens the inbox or taps a push immediately, so settle
     // those durable rows synchronously before projecting the snapshot.
-    for (const due of this.#storage.dueNativeApprovalIds([...this.#native], this.#now())) {
-      // Capability 51. Read the room BEFORE the expiry, so the terminal frame can name the room a
-      // member turn raised it in.
-      const room = payloadRoom(this.#storage.nativeInteraction(due.bot, "approval", due.interactionId)?.payload);
-      const expired = this.#storage.expireNativeApprovalIfDue(due.bot, due.interactionId, this.#now());
-      if (expired === undefined) continue;
-      this.#clearInteractionTimer("approval", due.bot, due.interactionId);
-      this.#emitApprovalResolved(due.bot, expired.sessionId, expired.turnId, due.interactionId, "expired", room);
-      // A room interaction's `sessionId` is the gateway-owned member thread, which is not a chat
-      // session, so nudging chat state for it would describe a chat that does not exist.
-      if (room === undefined) this.#state(due.bot, expired.sessionId, "polling", true);
-    }
+    this.#expireDueInteractions();
     // Storage also receives the configured set: a durable row from a removed/reconfigured profile
     // is intentionally invisible because its existing action route correctly rejects that bot.
     return this.#storage.pendingNativeApprovals([...this.#native], 100);
   }
 
   #pendingClarifications(): BotPendingClarification[] {
+    this.#expireDueInteractions();
     return this.#storage.pendingNativeClarifications([...this.#native], 100);
   }
 
@@ -3129,6 +3120,22 @@ export class NativeBotDataPlane {
     this.#broadcast(wire);
   }
 
+  #expireDueInteractions(): void {
+    for (const bot of this.#native) for (const pending of this.#storage.pendingNativeInteractions(bot)) {
+      if (pending.expiresAt !== null && pending.expiresAt <= this.#now()) this.#expireInteraction(bot, pending.kind, pending.interactionId, this.#now());
+    }
+  }
+
+  #expireInteraction(bot: string, kind: "approval" | "clarify", id: string, at: number): void {
+    const room = payloadRoom(this.#storage.nativeInteraction(bot, kind, id)?.payload);
+    const expired = this.#storage.expireNativeInteractionIfDue(bot, kind, id, at);
+    if (expired === undefined) return;
+    this.#clearInteractionTimer(kind, bot, id);
+    if (kind === "approval") this.#emitApprovalResolved(bot, expired.sessionId, expired.turnId, id, "expired", room);
+    else this.#broadcast({ type: "bot_clarify_resolved", bot, sessionId: expired.sessionId, turnId: expired.turnId, clarifyId: id, outcome: "expired", updatedAt: at, ...(room === undefined ? {} : { room }) });
+    if (room === undefined) this.#state(bot, expired.sessionId, "polling", true);
+  }
+
   #scheduleInteractionExpiry(pending: {
     bot: string;
     kind: "approval" | "clarify";
@@ -3145,41 +3152,7 @@ export class NativeBotDataPlane {
     const prior = this.#interactionTimers.get(key);
     if (prior !== undefined) clearTimeout(prior);
     const timer = setTimeout(
-      () => {
-        if (
-          !this.#storage.resolveNativeInteraction(
-            pending.bot,
-            pending.kind,
-            pending.interactionId,
-            "expired",
-            this.#now(),
-          )
-        )
-          return;
-        const room = payloadRoom(pending.payload);
-        if (pending.kind === "approval") {
-          this.#emitApprovalResolved(
-            pending.bot,
-            pending.sessionId,
-            pending.turnId,
-            pending.interactionId,
-            "expired",
-            room,
-          );
-        } else {
-          this.#broadcast({
-            type: "bot_clarify_resolved",
-            bot: pending.bot,
-            sessionId: pending.sessionId,
-            turnId: pending.turnId,
-            clarifyId: pending.interactionId,
-            outcome: "expired",
-            updatedAt: this.#now(),
-            ...(room === undefined ? {} : { room }),
-          });
-        }
-        this.#interactionTimers.delete(key);
-      },
+      () => this.#expireInteraction(pending.bot, pending.kind, pending.interactionId, this.#now()),
       Math.max(0, expiresAt - this.#now()),
     );
     timer.unref();

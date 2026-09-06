@@ -1070,6 +1070,7 @@ export class Storage {
   constructor(db: DatabaseSync) {
     this.#db = db;
     this.tasks = new Tasks(db);
+    this.tasks.expireInteractions((bot, kind, id, at) => { this.expireNativeInteractionIfDue(bot, kind, id, at); });
   }
 
   createSetupCode(code: string, expiresAt: number, kind: SetupCodeKind = "device"): void {
@@ -2614,13 +2615,12 @@ export class Storage {
       )
       .get(agentId, agentId) as { sequence: number };
     if (commandThrough > row.sequence) return false;
-    this.#db
-      .prepare(
-        `UPDATE attach_command_outbox SET acked_at = COALESCE(acked_at, ?)
-         WHERE agent_id = ? AND sequence <= ?`,
-      )
-      .run(reconciledAt, agentId, commandThrough);
-    return true;
+    return this.tasks.atomic(() => {
+      const admitted = this.#db.prepare("SELECT command_json AS json FROM attach_command_outbox WHERE agent_id = ? AND sequence <= ? AND acked_at IS NULL AND cancelled_at IS NULL ORDER BY sequence").all(agentId, commandThrough) as unknown as { json: string }[];
+      this.#db.prepare("UPDATE attach_command_outbox SET acked_at = COALESCE(acked_at, ?) WHERE agent_id = ? AND sequence <= ?").run(reconciledAt, agentId, commandThrough);
+      for (const command of admitted) this.tasks.acknowledged(agentId, JSON.parse(command.json) as AttachV1Command, reconciledAt);
+      return true;
+    });
   }
 
   attachCommandCursor(agentId: string): number {
