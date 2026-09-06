@@ -22,6 +22,8 @@ const GRACE_MS = 120_000;
 const CEILING_MS = 1_800_000;
 /** ADR 0004's provisional owner-loss lease, the same bound a Task gets. */
 const LEASE_MS = 120_000;
+/** The longer window a peer that re-attached but cannot declare its turns gets. */
+const GRACE_WINDOW_MS = 600_000;
 
 interface Harness {
   storage: Storage;
@@ -32,26 +34,42 @@ interface Harness {
   turns: Array<Record<string, unknown>>;
   steers: Array<Record<string, unknown>>;
   now: () => number;
+  /** Whether a dispatched command is taken off the wire, i.e. whether the bot is awake. */
+  deliver: (value: boolean) => void;
+  /** Make the next dispatch fail, the way an unavailable peer does. */
+  refuse: () => void;
+  /** Drop every piece of in-process bookkeeping and rebuild the plane on the same durable store. */
+  restart: () => { storage: Storage; plane: NativeBotDataPlane; close: () => void };
   advance: (ms: number) => void;
   event: (eventId: string, event: Record<string, unknown>) => boolean;
   close: () => void;
 }
 
-async function startTurn(): Promise<Harness> {
+async function startTurn(opts: { awake?: boolean } = {}): Promise<Harness> {
   const storage = openStorage(":memory:");
   const frames: ServerFrame[] = [];
   let now = 1_000_000;
   const turns: Array<Record<string, unknown>> = [];
   const steers: Array<Record<string, unknown>> = [];
   let sequence = 0;
+  let acknowledge = opts.awake !== false;
+  let refuse = false;
   const ingress = {
     sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+      if (refuse) return false;
       turns.push(input);
-      storage.enqueueAttachCommand(bot, `turn-command-${turns.length}`, { kind: "turn", ...input } as never, now);
+      const commandId = `turn-command-${turns.length}`;
+      const sequence = storage.enqueueAttachCommand(bot, commandId, { kind: "turn", ...input } as never, now).sequence;
+      // A peer that is awake takes the command off the wire. A queued turn for a sleeping bot
+      // never does, which is the whole difference reconciliation has to respect.
+      if (acknowledge) storage.ackAttachCommand(bot, sequence, commandId, now);
       return true;
     },
-    sendNativeSteer: (_bot: string, input: Record<string, unknown>) => {
+    sendNativeSteer: (bot: string, input: Record<string, unknown>) => {
       steers.push(input);
+      const commandId = `steer-command-${steers.length}`;
+      const sequence = storage.enqueueAttachCommand(bot, commandId, { kind: "steer", ...input } as never, now).sequence;
+      if (acknowledge) storage.ackAttachCommand(bot, sequence, commandId, now);
       return true;
     },
     sendNativeInterrupt: () => true,
@@ -82,6 +100,25 @@ async function startTurn(): Promise<Harness> {
     turns,
     steers,
     now: () => now,
+    deliver: (value: boolean) => { acknowledge = value; },
+    refuse: () => { refuse = true; },
+    restart: () => {
+      plane.close();
+      const revived = new NativeBotDataPlane({
+        control: {} as BotsSurface,
+        storage,
+        ingress,
+        nativeBots: ["sage"],
+        chatSuggestion: "",
+        broadcast: (frame) => frames.push(frame),
+        now: () => now,
+        log: () => {},
+        staleTurnSweepMs: SWEEP_MS,
+        staleTurnInterruptGraceMs: GRACE_MS,
+        staleTurnCeilingMs: CEILING_MS,
+      });
+      return { storage, plane: revived, close: () => { revived.close(); storage.close(); } };
+    },
     advance: (ms) => { now += ms; vi.advanceTimersByTime(ms); },
     event: (eventId, event) => {
       sequence += 1;
@@ -129,19 +166,38 @@ describe("HF2: a stale native turn never swallows a reply", () => {
     harness.close();
   });
 
-  it("bounds an older peer's undeclared turn to the owner-loss lease instead of the long ceiling", async () => {
+  it("bounds an older peer's undeclared turn to the undeclared grace, not the long ceiling", async () => {
     const harness = await startTurn();
 
-    // A peer that cannot declare its active turns re-attaches. It gets a short grace, not 30
-    // minutes: the ONLY thing that keeps this turn alive now is a frame proving it is running.
+    // A peer that cannot declare its active turns re-attaches. It gets a grace, not 30 minutes:
+    // the ONLY thing that keeps this turn alive now is a frame proving it is running.
     harness.plane.handleAttachHello("sage", undefined);
-    harness.advance(SWEEP_MS);
+    harness.advance(GRACE_WINDOW_MS - SWEEP_MS);
     expect(terminalOf(harness)).toBeUndefined();
 
-    harness.advance(LEASE_MS);
+    harness.advance(SWEEP_MS);
 
     expect(terminalOf(harness)).toBeDefined();
     expect(harness.storage.nativeBotChat("sage", harness.now()).activeTurnId).toBeUndefined();
+    harness.close();
+  });
+
+  it("never reaps a turn a re-attached older peer is still working on quietly", async () => {
+    const harness = await startTurn();
+    harness.plane.handleAttachHello("sage", undefined);
+
+    // A minute of frame silence inside one long prefill-bound model call, which is ordinary on a
+    // shared endpoint. The peer is attached and the run is alive; nothing may end it.
+    harness.advance(60_000);
+    expect(terminalOf(harness)).toBeUndefined();
+
+    // And one progress frame resets the window, so a slow run that keeps breathing never dies.
+    harness.event("thinking-1", {
+      kind: "thinking", threadId: harness.sessionId, turnId: harness.turnId,
+      text: "reading the plan", seq: 1, lastActiveAt: harness.now(),
+    });
+    harness.advance(GRACE_WINDOW_MS - SWEEP_MS);
+    expect(terminalOf(harness)).toBeUndefined();
     harness.close();
   });
 
@@ -249,6 +305,85 @@ describe("HF2: a stale native turn never swallows a reply", () => {
     });
     expect(harness.frames.some((frame) =>
       frame.type === "bot_chat" && frame.messages.some((message) => message.id === "orphan-answer"))).toBe(true);
+
+    // C1. The person was answered, so the steer is accounted for. Sealing the dead turn now must
+    // NOT ask the same question a second time and pay for a second answer.
+    harness.plane.handleAttachHello("sage", []);
+    expect(harness.turns).toHaveLength(1);
+    expect(harness.storage.nativeBotMessages("sage", harness.sessionId)
+      .filter((message) => message.text === "two weeks, give or take")).toHaveLength(1);
+    expect(harness.storage.pendingNativeSteers("sage", harness.sessionId)).toEqual([]);
+    harness.close();
+  });
+
+  it("never seals a turn the peer has not been handed yet, and never promotes one", async () => {
+    // C2. The laptop is asleep. The gateway accepts the turn and queues the command durably; the
+    // peer has never seen it, so its truthful "I hold none" at hello says nothing about it.
+    const harness = await startTurn({ awake: false });
+    await harness.plane.surface().sendChatMessage("sage", "and the timeline?", { clientId: "client-2" });
+    expect(harness.steers).toHaveLength(1);
+
+    harness.plane.handleAttachHello("sage", []);
+
+    expect(terminalOf(harness)).toBeUndefined();
+    expect(harness.storage.nativeBotChat("sage", harness.now()).activeTurnId).toBe(harness.turnId);
+    // Both messages are still exactly one queued turn and one queued steer, waiting to be run.
+    expect(harness.turns).toHaveLength(1);
+    expect(harness.steers).toHaveLength(1);
+    // And the lease does not run against a turn nobody has been handed either.
+    harness.advance(GRACE_WINDOW_MS + SWEEP_MS);
+    expect(terminalOf(harness)).toBeUndefined();
+    harness.close();
+  });
+
+  it("promotes several steers on one dead turn in the order the person sent them", async () => {
+    const harness = await startTurn();
+    await harness.plane.surface().sendChatMessage("sage", "and the timeline?", { clientId: "client-2" });
+    await harness.plane.surface().sendChatMessage("sage", "and the budget?", { clientId: "client-3" });
+    expect(harness.steers).toHaveLength(2);
+
+    harness.plane.handleAttachHello("sage", []);
+
+    // The oldest becomes the durable turn; the one that followed it is re-dispatched onto that
+    // turn, in order, rather than silently replacing the first.
+    expect(harness.turns).toHaveLength(2);
+    expect(harness.turns[1]).toMatchObject({ text: "and the timeline?" });
+    const promoted = String(harness.turns[1]?.["turnId"]);
+    expect(harness.steers.at(-1)).toMatchObject({ turnId: promoted, text: "and the budget?" });
+    expect(harness.storage.pendingNativeSteers("sage", harness.sessionId).map((steer) => steer.text))
+      .toEqual(["and the budget?"]);
+    harness.close();
+  });
+
+  it("keeps a steer across a gateway restart and still promotes it", async () => {
+    const harness = await startTurn();
+    await harness.plane.surface().sendChatMessage("sage", "and the timeline?", { clientId: "client-2" });
+
+    // The gateway restarts. The in-process bookkeeping is gone; the person's words are not.
+    const restarted = harness.restart();
+    expect(restarted.storage.pendingNativeSteers("sage", harness.sessionId).map((steer) => steer.text))
+      .toEqual(["and the timeline?"]);
+
+    restarted.plane.handleAttachHello("sage", []);
+
+    expect(harness.turns).toHaveLength(2);
+    expect(harness.turns[1]).toMatchObject({ text: "and the timeline?" });
+    restarted.close();
+  });
+
+  it("records a visible failed delivery when a steer cannot be promoted at all", async () => {
+    const harness = await startTurn();
+    await harness.plane.surface().sendChatMessage("sage", "and the timeline?", { clientId: "client-2" });
+    harness.refuse();
+
+    harness.plane.handleAttachHello("sage", []);
+
+    // Nothing was dispatched, and the words are on the conversation rather than gone.
+    expect(harness.turns).toHaveLength(1);
+    const failed = harness.storage.nativeBotMessages("sage", harness.sessionId).at(-1);
+    expect(failed?.marker).toBe("delivery.failed");
+    expect(failed?.text).toContain("and the timeline?");
+    expect(harness.storage.pendingNativeSteers("sage", harness.sessionId)).toEqual([]);
     harness.close();
   });
 

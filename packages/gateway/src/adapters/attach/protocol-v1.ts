@@ -112,9 +112,17 @@ export const AttachV1HelloSchema = Type.Object({
    *  that restarted, crashed, or dropped a turn internally leaves the gateway believing work is
    *  running that no process owns, and the next thing the person says goes out as a steer on a
    *  dead turn. An EMPTY ARRAY is a real declaration ("I hold none"); ABSENT is a peer that
-   *  cannot declare, which the gateway reads as unknown and bounds by the owner-loss lease
-   *  rather than by the long silence ceiling. Ids only: no text, thread, media or tool detail. */
-  activeTurns: Type.Optional(Type.Array(Id, { maxItems: 256, uniqueItems: true })),
+   *  cannot declare, which the gateway reads as unknown and bounds by a short grace rather than
+   *  by the long silence ceiling. Ids only: no text, thread, media or tool detail.
+   *
+   *  UNTYPED on the wire for the same reason `detail`, `repair` and `scope` are: a schema failure
+   *  on `hello` closes the whole attach socket (1002/1008), so a plugin bug that repeated an id,
+   *  or a peer legitimately holding more turns than a bound allowed, would take the profile dark
+   *  and reconnect-loop over an OPTIONAL, best-effort declaration. `sanitizeActiveTurns` below is
+   *  the sole authority: it degrades a malformed or oversized declaration to "cannot declare",
+   *  which is the safe reading, and NEVER truncates one, because a truncated declaration would
+   *  seal turns the peer actually holds. */
+  activeTurns: Type.Optional(Type.Unknown()),
 });
 export type AttachV1Hello = Static<typeof AttachV1HelloSchema>;
 
@@ -500,6 +508,21 @@ const ApprovalEvent = Type.Object({
    *  `sanitizeApprovalScope` below is the sole authority. */
   scope: Type.Optional(Type.Unknown()),
 });
+/** Capability 69. The sole authority on `hello.activeTurns`. Returns the declared turn ids, or
+ *  `undefined` meaning THIS PEER CANNOT DECLARE, which the gateway reads as neither "holds them"
+ *  nor "holds none". Everything malformed degrades to `undefined` rather than to a shorter list:
+ *  a partial declaration would make the gateway seal live work. Duplicates are collapsed, because
+ *  a repeated id says the same true thing twice. */
+export function sanitizeActiveTurns(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.length > 1024) return undefined;
+  const ids = new Set<string>();
+  for (const entry of value) {
+    if (typeof entry !== "string" || entry.length < 1 || entry.length > 256) return undefined;
+    ids.add(entry);
+  }
+  return [...ids];
+}
+
 /** Capability 56. Matches the C0 and C1 control character ranges (built from character codes
  *  rather than a literal escape, so no NUL or other control byte ever sits in this source file),
  *  plus every Unicode "Format" (Cf) code point: zero-width space and joiners, the bidi override
