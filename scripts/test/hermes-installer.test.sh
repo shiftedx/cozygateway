@@ -20,7 +20,14 @@ stop_test_pid() {
 trap 'stop_test_pid "${supervisor_pid:-}"; stop_test_pid "${foreign_supervisor_pid:-}"; stop_test_pid "${mock_dashboard_pid:-}"; stop_test_pid "${failed_dashboard_pid:-}"; stop_test_pid "${foreign_dashboard_pid:-}"; rm -rf "$tmp"' EXIT
 # Under `set -e` a bare assertion dies with no output at all, so a failure on a machine you cannot
 # reach reads as "it stopped somewhere". Name the line and the command that failed.
-trap 'status=$?; [ "$status" -eq 0 ] || printf "FAIL  line %s exited %s: %s\n" "$LINENO" "$status" "$BASH_COMMAND" >&2' ERR
+err_trap='status=$?; [ "$status" -eq 0 ] || printf "FAIL  line %s exited %s: %s\n" "$LINENO" "$status" "$BASH_COMMAND" >&2'
+trap "$err_trap" ERR
+# A command this suite deliberately kills, or deliberately makes fail, is not a
+# failure, and the trap above prints it as one. That is a false alarm somebody
+# then has to chase through a CI log, so the trap is lifted for exactly those
+# commands with `trap - ERR` and put back with `trap "$err_trap" ERR` straight
+# after. Both have to be written out at this level: bash restores the ERR trap
+# when a function that changed it returns, so a helper would clear nothing.
 
 # An assertion that greps a captured string and fails prints only the line number, which says
 # nothing about what the string actually contained. This shows it.
@@ -400,8 +407,10 @@ printf 'new verified bundle after interrupted bootstrap\n' > "$tmp/release-asset
 if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/cozygateway.mjs" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/cozygateway.mjs" | awk '{print $1}')"; fi
 printf '%s  cozygateway.mjs\n' "$asset_sha" > "$tmp/release-assets/cozygateway.mjs.sha256"
 set +e
+trap - ERR  # this run is killed on purpose, mid-promotion
 HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-killed" COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION=cozygateway.mjs bash "$repo_root/scripts/install.sh" >"$tmp/bootstrap-killed.log" 2>&1
 bootstrap_killed_status=$?
+trap "$err_trap" ERR
 set -e
 test "$bootstrap_killed_status" -ne 0
 test -f "$tmp/bootstrap-live-home/.bootstrap-transaction"

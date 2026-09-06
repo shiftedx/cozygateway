@@ -121,7 +121,7 @@ PY
 # enough to be certain, and otherwise says the keys are present so nothing is
 # written.
 streaming_keys_absent() {
-  "$PYTHON" - --streaming-keys "$1" <<'PY'
+  "$PYTHON" - --streaming-keys "$1" <<'PY' | tr -d '\r'
 import re
 import sys
 from pathlib import Path
@@ -245,8 +245,10 @@ def main():
             absent = absent_with_yaml(text, yaml)
         except Exception:
             sys.exit(1)
-    for name in absent:
-        print(name)
+    # Written as BYTES on purpose. A Windows interpreter translates "\n" into
+    # CRLF on a text stream, and the caller would then carry a "\r" inside every
+    # key name it went on to write.
+    sys.stdout.buffer.write("".join(name + "\n" for name in absent).encode())
 
 
 main()

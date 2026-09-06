@@ -364,6 +364,23 @@ SH
   answer="$(read_with "$TMP/python3-nosite" "$dir/unjudgeable" | tr '\n' ' ')"
   [ -z "$answer" ] || fail "stdlib probe judged a flow mapping it cannot read: $answer"
 
+  # A Windows interpreter writes CRLF on a text stream. The reader writes bytes
+  # so it does not, and the caller strips a carriage return anyway; neither may
+  # be dropped, because a "\r" glued to a key name is written into a config file
+  # as part of the key. Emulated with an interpreter that ends every line the
+  # Windows way.
+  cat > "$TMP/python3-crlf" <<'SH'
+#!/bin/sh
+python3 -S "$@" | sed 's/$/\r/'
+SH
+  chmod +x "$TMP/python3-crlf"
+  answer="$(read_with "$TMP/python3-crlf" "$dir/mute")"
+  case "$answer" in
+    *$'\r'*) fail 'a carriage return from a Windows interpreter reached the caller' ;;
+  esac
+  [ "$(printf '%s' "$answer" | tr '\n' ' ')" = 'display.streaming display.platforms.cozygateway.streaming' ] \
+    || fail "the CRLF interpreter answered: $answer"
+
   if [ -z "$YAML_PYTHON" ]; then
     printf 'note: no PyYAML on this host, so the agreement half of the reader case did not run\n'
     return 0
