@@ -1,7 +1,7 @@
 # 2b durable Task report
 
-Status: IN_PROGRESS. Base 54dc248 (gateway main 766b04c plus reviewed capability 63 dependency).
-Row 64 reserved; not advertised until the vertical slice qualifies. No merge or deployment.
+Status: IMPLEMENTED, INDEPENDENTLY REVIEWED, LOCAL GATES PASS. Qualified implementation 7bc9010; test-only corrections f715c17 and 32e638d. Current base dc471465 after rebasing the original 54dc248 dependency tip.
+Capability 64 is advertised. No merge or deployment. Historical checkpoint notes below retain the evidence timeline; the final qualification section is authoritative for readiness.
 
 ## Decisions grounded in source
 
@@ -99,3 +99,26 @@ Remaining named coverage is now explicit: all eight nonterminal command classes 
 Candidate advertises64 via the single BOTS_CAPABILITY_VERSION constant and removes the reserved table marker. Observer installation now uses that explicit server capability floor; focused test proves server63 omits Task observations and64 emits them. Existing protocol has no client extension-version negotiation: older clients ignore additive unknown frames; no per-client filtering is claimed. The portable conformance suite now includes an optional durableTasks hook enabled by the actual reference attach gateway, exercising real advertised>=64 health, paired HTTP reads, actual /ws replacement decode, same-view agreement and unauthorized/refused routes. This is distinct from the three-test decoder fixture and must pass the candidate's full gate.
 
 No new Artifact or recovery-closure producer was added. Both absent-by-default source readers remain bounded by the lead's rulings. Exact-head workspace build/typecheck/test and final independent review are the remaining release gates.
+
+
+## Final qualification and handoff
+
+Implementation source 7bc9010 passed the four-package workspace build. The first workspace typecheck found a test closure narrowing error; f715c17 captures the already-narrowed turn id and all four package typechecks passed. The first full test run found only one legacy assertion expecting capability63; 32e638d changes that assertion to64. Neither correction changes production source or built output. Per lead ruling, the production-identical build was not repeated.
+
+`PATH=/opt/homebrew/opt/node@24/bin:$PATH pnpm -r test` at 32e638d passed exit0:
+
+| Package | Passed | Skipped | Failed |
+| --- | ---: | ---: | ---: |
+| contract | 183 | 0 | 0 |
+| relay | 161 | 0 | 0 |
+| gateway | 1427 | 2 | 0 |
+| conformance | 80 | 18 | 0 |
+| Total | 1851 | 20 | 0 |
+
+Skips remain distinct from passes: the gateway suite has its existing skipped integration coverage; conformance optional hooks remain skipped where the fixture does not provide them, including the new durableTasks hook on the hookless runner. The configured reference gateway runs the new actual public Task hook successfully. No baseline failure exception was used, and no deadline was increased.
+
+Durable local gate logs were moved from the temporary benchmark directory into this ledger's ignored `2b-gate-logs/`: `7bc9010/build.log`, `7bc9010/typecheck.log`, `7bc9010/typecheck-rerun.log`, `f715c17/test.log`, and `qualified/test-rerun.log`. They retain failed and green attempts. The adjacent `2b-durable-task-independent-review.md` imports the independent source/acceptance PASS7bc9010 and scoped PASSf715c17. Lead reviews the final numeric capability assertion; production source remains exactly the independently reviewed tree.
+
+Rollout: capability64 activates the full Task replacement observer and advertises through existing gateway/attach surfaces. No client-version handshake is introduced. Lower server capability omits Task observation; older clients use the established additive/ignore-unknown rule. Native/core/room work uses existing attach turn identities, commands and terminal journals. No model execution, automatic acknowledged-turn replay, alternate retry authority, or terminal rewrite is introduced.
+
+Remaining external integration ceilings are explicit: canonical Artifact declarations/commitment must bind the absent-default source reader in initiative4a; a trusted operator/policy producer must bind explicit recovery-closure decisions before no_recovery_remaining can occur in production. No producer was invented or simulated as production evidence. Runtime Generation is unknown without a declared wire fact; current authenticated attach connection and durable absence episodes fence the evidence available here. The 120-second lease is provisional pending live performance qualification. Live .121 and hosted CI billing are unavailable. All retained evidence is deterministic local integration; no production bot/service, merge or deployment was touched.
