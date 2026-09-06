@@ -7,6 +7,14 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## Unreleased
 
+- The per-server MCP repair policy is declared before it is emitted (`com.cozylabs.bots` capability
+  63): `BotMcpServer` gains optional `repair`, closed to `approve_once` or `auto_refresh`, carried
+  on the existing capability-48 `bot_config` `profile.read`. It is read-only metadata the gateway
+  relays and never stores, writes, or executes; the profile patch has no shape for it. An absent
+  wire field is unprojected or unknown, and the gateway leaves it absent. A known CozyAgents peer
+  may project its effective `approve_once` default after negotiating 63, which still requires an
+  approval rather than granting repair permission. An unknown value follows the lane's existing
+  convention: the `config_result` frame is refused and the read is unavailable.
 - An approval can propose an MCP repair (`com.cozylabs.bots` capability 62, #366): `ApprovalEvent`
   on attach-v1 gains optional typed `repair`, validated by the gateway and dropped (never the
   approval) when malformed, then carried on `bot_approval_pending`, the `GET /bots/approvals` inbox
