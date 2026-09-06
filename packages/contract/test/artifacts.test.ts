@@ -17,7 +17,7 @@ describe("capability 65 Artifact schemas", () => {
     expect([...ARTIFACT_MARKS]).toEqual(["draft", "review_copy", "final"]);
     expect([...ARTIFACT_VALIDATIONS]).toEqual(["unvalidated", "verified", "mismatch"]);
     expect([...ARTIFACT_DELIVERY_STATES]).toEqual(["queued", "delivered", "acknowledged", "failed"]);
-    expect(BOTS_CAPABILITY_VERSION).toBe(67);
+    expect(BOTS_CAPABILITY_VERSION).toBe(68);
   });
 
   it("requires provenance, byte evidence and a closed state on every record", () => {

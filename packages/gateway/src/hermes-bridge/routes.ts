@@ -920,6 +920,18 @@ export function registerBotRoutes(
     return c.json({ grants: chat.approvalGrants?.(resolved.name) ?? [] });
   });
 
+  // Capability 68. The reconciliation read: what happened to the phone capability requests this
+  // conversation opened. A request is bound to one conversation, so the conversation is required
+  // rather than defaulted: a read that names none could only answer for the wrong one.
+  app.get("/bots/:name/mobile-requests", requireDevice, (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const sessionId = c.req.query("sessionId");
+    if (sessionId === undefined || sessionId === "")
+      return c.json(errorBody("invalid_request", "sessionId is required"), 400);
+    return c.json({ requests: chat.mobileRequests?.(resolved.name, sessionId) ?? [] });
+  });
+
   app.delete("/bots/:name/approvals/grants/:grantId", requireDevice, (c) => {
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;

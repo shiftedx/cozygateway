@@ -35,14 +35,17 @@ afterAll(async () => {
   // unroutable relayUrl above, never some unrelated notifier error it accidentally swallowed.
   // Every push leg lands here: an agent reply ("notify failed"), the approval leg ("approval
   // notify failed") since the approval agent above raises one per turn, and the Bot Mode chat
-  // reply leg ("chat message notify failed") the repair hook's denied turns commit.
+  // reply leg ("chat message notify failed") the repair hook's denied turns commit, and the
+  // capability-68 Task completion leg ("task completion notify failed"), which every completed
+  // conformance Task raises for the paired device that has no live socket.
   for (const line of notifierLogLines) {
-    expect(line).toMatch(/^push: (approval |chat message )?notify failed for device .+: fetch failed$/);
+    expect(line).toMatch(/^push: (approval |chat message |task completion )?notify failed for device .+: fetch failed$/);
   }
 });
 
 registerConformanceSuite({
   durableTasks: true,
+  mobileRequestLifecycle: true,
   artifactDelivery: true,
   baseUrl: () => reference.gateway?.url ?? "",
   issueSetupCode: () => Promise.resolve(reference.gateway?.issueSetupCode() ?? ""),

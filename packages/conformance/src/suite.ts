@@ -26,6 +26,7 @@ import {
   ApprovalResolvedFrameSchema,
   type BotApprovalPendingFrame,
   BotApprovalPendingFrameSchema,
+  BotMobileRequestListSchema,
   BotChatStopResponseSchema,
   BotInteractionRecoverySchema,
   BotModelConfigSchema,
@@ -56,6 +57,11 @@ import {
 export interface ConformanceEnv {
   /** Enable row 64 Task reads/updates for the reference attach echo peer. */
   durableTasks?: boolean;
+  /** Enable the row 68 phone capability request lifecycle group. A gateway declaring it promises
+   *  the reconciliation route exists, is device authenticated, is scoped to one conversation, and
+   *  that the pre-68 phone wire is unchanged. It does NOT have to have run a phone request: the
+   *  portable assertions are about authorization, scoping, and what a peer below 68 still gets. */
+  mobileRequestLifecycle?: boolean;
   /** Enable the row 65 Artifact public-route group. A gateway declaring it promises the routes
    *  exist and are device authenticated; it does NOT have to have produced any Artifact, because
    *  the portable assertions are about authorization, absent identities, and the older-peer
@@ -312,6 +318,46 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
       const attachment = await authFetch(token, `/bots/${bot}/chat/attachments/${guessed}`);
       expect(attachment.status).toBe(404);
       assertValid(ErrorBodySchema, await attachment.json());
+    });
+  });
+
+  describe.skipIf(env.mobileRequestLifecycle !== true)("phone capability request lifecycle capability 68", () => {
+    it("scopes the reconciliation read to one authenticated conversation and leaves the pre-68 phone wire alone", async () => {
+      const health = assertValid(GatewayInfoSchema, await (await fetch(`${env.baseUrl()}/health`)).json());
+      expect(health.capabilities?.["com.cozylabs.bots"]).toBeGreaterThanOrEqual(68);
+      // The phone wire is versioned on its own id, and row 68's optional stage report lives there.
+      expect(health.capabilities?.["com.cozylabs.mobile-node"]).toBeGreaterThanOrEqual(6);
+
+      const bot = encodeURIComponent(env.echoAgentId);
+      expect((await fetch(`${env.baseUrl()}/bots/${bot}/mobile-requests?sessionId=any`)).status).toBe(401);
+
+      const { token } = await pairDevice("Mobile request conformance");
+      // A request belongs to ONE conversation, so a read naming none is refused rather than
+      // answered for the wrong one.
+      const unscoped = await authFetch(token, `/bots/${bot}/mobile-requests`);
+      expect(unscoped.status).toBe(400);
+      assertValid(ErrorBodySchema, await unscoped.json());
+
+      const scoped = await authFetch(token, `/bots/${bot}/mobile-requests?sessionId=conformance-unknown-session`);
+      expect(scoped.status).toBe(200);
+      // A conversation with no phone requests answers an empty list, never another one's records.
+      expect(assertValid(BotMobileRequestListSchema, await scoped.json()).requests).toEqual([]);
+
+      // A stage report from a socket that never advertised as a phone node creates nothing and
+      // does not disturb the socket: byte identical to how every other frame it cannot act on is
+      // handled, and no phantom lifecycle record exists afterwards.
+      const socket = await authedSocket(token);
+      try {
+        socket.ws.send(JSON.stringify({
+          type: "mobile_node_progress", requestId: "conformance-unknown-request",
+          lease: "c".repeat(43), stage: "executing",
+        }));
+        const thread = await createThread(token, "Mobile request conformance");
+        await sendMessage(token, thread.id, "Prove the socket still works");
+        await waitForMessageCount(token, thread.id, 2);
+        const after = await authFetch(token, `/bots/${bot}/mobile-requests?sessionId=${encodeURIComponent(thread.id)}`);
+        expect(assertValid(BotMobileRequestListSchema, await after.json()).requests).toEqual([]);
+      } finally { socket.ws.close(); }
     });
   });
 

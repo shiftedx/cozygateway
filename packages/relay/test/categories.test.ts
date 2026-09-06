@@ -15,6 +15,7 @@ describe("push category registry", () => {
       "approval.pending",
       "approval.resolved",
       "mobile.status.wake",
+      "task.completed",
     ]);
   });
 
@@ -29,10 +30,11 @@ describe("push category registry", () => {
     expect(PUSH_CATEGORIES["approval.pending"].requiresCollapseId).toBe(true);
     expect(PUSH_CATEGORIES["approval.resolved"].requiresCollapseId).toBe(true);
     expect(PUSH_CATEGORIES["mobile.status.wake"].requiresCollapseId).toBe(true);
+    expect(PUSH_CATEGORIES["task.completed"].requiresCollapseId).toBe(true);
   });
 
   it("ships a value-free fallback alert per category (the relay cannot read the ciphertext)", () => {
-    for (const id of ["message", "approval.pending", "approval.resolved"] as const) {
+    for (const id of ["message", "approval.pending", "approval.resolved", "task.completed"] as const) {
       const spec = PUSH_CATEGORIES[id];
       if (spec.pushType !== "alert") throw new Error(`${id} must remain an alert category`);
       const { alert } = spec;

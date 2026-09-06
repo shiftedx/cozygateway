@@ -26,6 +26,11 @@ import {
   BotChatMessageSchema,
   BotMobileReceiptFrameSchema,
   BotMobileReceiptSchema,
+  BotMobileRequestSchema,
+  BotMobileRequestListSchema,
+  MobileNodeProgressFrameSchema,
+  MOBILE_REQUEST_STATES,
+  MOBILE_REQUEST_TERMINAL_STATES,
   BotMemorySetupRequestSchema,
   BotChatResetFrameSchema,
   BotChatResetResponseSchema,
@@ -919,7 +924,7 @@ describe("capability advertisement", () => {
     // originals, tombstoned deletion, supersession, and an independent delivery lifecycle.
     // Capability 66 adds the typed scoped-approval block, payload-hash binding, standing once and
     // category grants, the always-require list no grant may cover, and the revocation view.
-    expect(BOTS_CAPABILITY_VERSION).toBe(67);
+    expect(BOTS_CAPABILITY_VERSION).toBe(68);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {
@@ -1062,6 +1067,55 @@ describe("capability advertisement", () => {
     for (const forbidden of ["lease", "deviceId", "result", "latitude", "longitude"]) {
       expect(check(BotMobileReceiptSchema, { ...receipt, [forbidden]: "secret" })).toBe(false);
     }
+  });
+
+  it("closes the capability-68 request lifecycle record and its state vocabulary", () => {
+    const request = {
+      requestId: "request-1",
+      bot: "sage",
+      sessionId: "session-1",
+      turnId: "turn-1",
+      deviceId: "device-1",
+      command: "camera.capture" as const,
+      purpose: "Show me the whiteboard",
+      state: "executing" as const,
+      requestedAt: 100,
+      updatedAt: 120,
+      expiresAt: 220,
+    };
+    expect(check(BotMobileRequestSchema, request)).toBe(true);
+    // No device selected at all is itself the outcome, so the binding is absent rather than blank.
+    const { deviceId: _deviceId, ...unbound } = request;
+    expect(check(BotMobileRequestSchema, { ...unbound, state: "failed" })).toBe(true);
+    expect(check(BotMobileRequestSchema, { ...request, deviceId: "" })).toBe(false);
+    // The state union is closed: an outcome nobody named cannot reach a person as a state.
+    expect(check(BotMobileRequestSchema, { ...request, state: "device_unavailable" })).toBe(false);
+    for (const state of MOBILE_REQUEST_TERMINAL_STATES) {
+      expect(MOBILE_REQUEST_STATES).toContain(state);
+      expect(check(BotMobileRequestSchema, { ...request, state })).toBe(true);
+    }
+    // The two distinct outcomes the roadmap refuses to fold into a generic failure.
+    expect(MOBILE_REQUEST_TERMINAL_STATES).toContain("policy_blocked");
+    expect(MOBILE_REQUEST_TERMINAL_STATES).toContain("foreground_required");
+    // Nothing the phone measured, and no lease, may ride on the record.
+    for (const forbidden of ["lease", "result", "latitude", "longitude"])
+      expect(check(BotMobileRequestSchema, { ...request, [forbidden]: "secret" })).toBe(false);
+    expect(check(BotMobileRequestListSchema, { requests: [request] })).toBe(true);
+  });
+
+  it("closes the capability-68 progress frame to non-terminal stages", () => {
+    const frame = {
+      type: "mobile_node_progress" as const,
+      requestId: "request-1",
+      lease: "a".repeat(43),
+      stage: "consent_presented" as const,
+    };
+    expect(check(MobileNodeProgressFrameSchema, frame)).toBe(true);
+    // A progress frame can never settle a request, so no terminal name is a stage and no result
+    // may ride along with one.
+    for (const stage of ["completed", "denied", "expired", "ok"])
+      expect(check(MobileNodeProgressFrameSchema, { ...frame, stage })).toBe(false);
+    expect(check(MobileNodeProgressFrameSchema, { ...frame, result: { latitude: 1, longitude: 2 } })).toBe(false);
   });
 
   it("accepts a capability-33 create with tool selections, and keeps them optional", () => {

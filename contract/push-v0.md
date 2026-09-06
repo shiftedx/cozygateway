@@ -88,6 +88,7 @@ Registered categories:
 | `approval.pending` | `alert` | `approval.pending` | CozyChat / "Approval requested" | `toolCallId`, required |
 | `approval.resolved` | `alert` | `approval.resolved` | CozyChat / "Approval resolved" | `toolCallId`, required |
 | `mobile.status.wake` | `background` | omitted | none | `mobile.status`, required |
+| `task.completed` | `alert` | `task.completed` | CozyChat / "Task completed" | `taskId`, required |
 
 On APNs an alert category becomes `aps.category` and the collapse id becomes the
 `apns-collapse-id` header; on a webhook both fields are added to the delivered JSON body next to
@@ -174,6 +175,25 @@ category `mobile.status.wake`, collapse id `mobile.status`):
 
 The decrypted plaintext is exactly the object above. It contains no request, lease, agent, chat,
 or device identifiers.
+
+**`kind: "task_completed"`** (a durable Task reached `completed` while the device had no live
+socket; category `task.completed`, collapse id = `taskId`, so a later notification about the same
+Task replaces its own banner rather than stacking a second one):
+
+```json
+{ "kind": "task_completed", "taskId": "string", "threadId": "string", "agentId": "string" }
+```
+
+It carries the identities the deep link needs and NOTHING the Task worked on: no goal, no reply, no
+artifact name. The client opens the Task through `GET /tasks/:taskId`, which it is already
+authenticated for. `threadId` is the namespaced `bot:<name>` for a 1:1 Task, the same shape the approval payloads use,
+because a 1:1 Task's `sessionId` is the harness's own id and means nothing to a client. For a ROOM
+Task it is the room turn's own session, `group:<room>:<member>`, which is the thread id every room
+surface of this gateway already addresses. The gateway sends the push exactly once per Task, on the
+transition that writes capability 64's completion notification record, and never to a device holding
+a live socket. The client half of the deduplication is the client's own and is specified in
+`contract/ext-bots-v1.md` row 68: announce at most once per `taskId`, keyed DURABLY on capability
+64's notification record, because a relaunched app has no memory of what it announced before.
 
 **`kind: "approval_pending"`** (a tool call is waiting on a decision; category
 `approval.pending`, collapse id = `toolCallId`):

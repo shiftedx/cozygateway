@@ -36,6 +36,7 @@ import type {
   BotPendingApproval,
   BotApprovalRepair,
   BotApprovalGrant,
+  BotMobileRequest,
   BotApprovalScope,
   BotRoutine,
   BotModelConfig,
@@ -519,6 +520,7 @@ export class NativeBotDataPlane {
       resolveApproval: (name, toolCallId, decision, deviceId, grantRequest) =>
         this.#resolveApproval(name, toolCallId, decision, deviceId, grantRequest),
       approvalGrants: (name) => this.#approvalGrants(name),
+      mobileRequests: (name, sessionId) => this.#mobileRequests(name, sessionId),
       revokeApprovalGrant: (name, grantId) => this.#revokeApprovalGrant(name, grantId),
       resolveClarify: (name, clarifyId, optionId, deviceId) =>
         this.#resolveClarify(name, clarifyId, optionId, deviceId),
@@ -1885,6 +1887,14 @@ export class NativeBotDataPlane {
     const bot = normalize(name);
     if (!this.#native.has(bot)) return [];
     return this.#storage.approvalGrants(bot, this.#now());
+  }
+
+  /** Capability 68. Scoped to the profile and the conversation: a request another conversation
+   *  opened is absent here, so a wrong-conversation read answers nothing rather than leaking one. */
+  #mobileRequests(name: string, sessionId: string): BotMobileRequest[] {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) return [];
+    return this.#storage.nativeBotMobileRequests(bot, sessionId);
   }
 
   #revokeApprovalGrant(name: string, grantId: string): "revoked" | "unknown" {

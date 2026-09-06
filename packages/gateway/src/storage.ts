@@ -3,11 +3,17 @@ import { Tasks } from "./tasks.ts";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 
+import {
+  MOBILE_REQUEST_STATES,
+  MOBILE_REQUEST_TERMINAL_STATES,
+} from "cozygateway-contract";
 import type {
   AttachmentBlock,
   BotChatAttachment,
   BotChatMessage,
   BotMobileReceipt,
+  BotMobileRequest,
+  MobileRequestState,
   BotApprovalRepair,
   BotApprovalGrant,
   BotApprovalScope,
@@ -114,6 +120,31 @@ export function cozyAppPhysicalId(creatorBot: string, logicalId: string): string
   // nesting a namespace on every refresh. A different creator's prefix never passes this check.
   if (logicalId.startsWith(prefix)) return logicalId;
   return `${prefix}${logicalId.slice(0, 102)}_${digest(logicalId, 8)}`;
+}
+
+/** How long a SETTLED lifecycle record is kept. Documented in contract/ext-bots-v1.md row 68. */
+const MOBILE_REQUEST_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+const MOBILE_REQUEST_TERMINAL_PLACEHOLDERS = MOBILE_REQUEST_TERMINAL_STATES.map(() => "?").join(", ");
+
+const BOT_MOBILE_REQUEST_SELECT = `
+  SELECT request_id AS requestId, bot, session_id AS sessionId, turn_id AS turnId,
+         device_id AS deviceId, command, purpose, state,
+         requested_at AS requestedAt, updated_at AS updatedAt, expires_at AS expiresAt
+  FROM bot_mobile_requests`;
+
+function mobileRequestRow(row: Omit<BotMobileRequest, "deviceId"> & { deviceId: string | null }): BotMobileRequest {
+  const { deviceId, ...rest } = row;
+  return deviceId === null ? rest : { ...rest, deviceId };
+}
+
+/** Lifecycle order. A step that does not move a request forward is dropped rather than applied,
+ *  so a late `routed` cannot un-execute a request and a replay cannot rewind one. */
+function isTerminalMobileRequestState(state: string): boolean {
+  return (MOBILE_REQUEST_TERMINAL_STATES as readonly string[]).includes(state);
+}
+
+function mobileRequestRank(state: MobileRequestState): number {
+  return isTerminalMobileRequestState(state) ? MOBILE_REQUEST_STATES.length : MOBILE_REQUEST_STATES.indexOf(state);
 }
 
 const BOT_MOBILE_RECEIPT_COLUMNS = `
@@ -582,6 +613,27 @@ ${BOT_MOBILE_RECEIPT_COLUMNS}
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bot_mobile_receipts_session
   ON bot_mobile_receipts (bot, session_id, shared_at, request_id);
+-- Capability 68 phone capability request lifecycle. One row per request, bound to the profile,
+-- the conversation, the turn and the ONE paired device it was issued for; the paired device is
+-- this gateway's user identity. The lease, the phone's answer, and anything the phone measured
+-- are not here, exactly as they are not on a receipt.
+CREATE TABLE IF NOT EXISTS bot_mobile_requests (
+  request_id TEXT PRIMARY KEY,
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  device_id TEXT,
+  command TEXT NOT NULL CHECK (command IN (
+    'device.status', 'location.current', 'camera.capture', 'file.pick', 'notification.present'
+  )),
+  purpose TEXT NOT NULL,
+  state TEXT NOT NULL,
+  requested_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_mobile_requests_session
+  ON bot_mobile_requests (bot, session_id, requested_at, request_id);
 -- Binds one committed TURN reply that carried attachments to the delivery id its plugin already
 -- keyed the media lifecycle under (turn:<turnId>). Scheduled deliveries have
 -- attach_scheduled_deliveries for this; a turn had nothing, which is why turn media could never
@@ -4029,7 +4081,7 @@ export class Storage {
       );
       for (const mediaId of scheduledMediaIds)
         deleteUnreferencedMedia.run(outboxAgentId, mediaId, input.bot, input.sessionId, outboxAgentId);
-      for (const table of ["bot_native_messages", "bot_chat_tool_steps", "bot_chat_delegations", "bot_mobile_receipts", "bot_native_interactions", "bot_approval_grants", "bot_native_turn_terminals", "bot_desktop_resume_bindings", "bot_chat_configurations"]) {
+      for (const table of ["bot_native_messages", "bot_chat_tool_steps", "bot_chat_delegations", "bot_mobile_receipts", "bot_mobile_requests", "bot_native_interactions", "bot_approval_grants", "bot_native_turn_terminals", "bot_desktop_resume_bindings", "bot_chat_configurations"]) {
         this.#db.prepare(`DELETE FROM ${table} WHERE bot = ? AND session_id = ?`).run(input.bot, input.sessionId);
       }
       this.#db.prepare("DELETE FROM bot_native_sessions WHERE bot = ? AND session_id = ?").run(input.bot, input.sessionId);
@@ -4199,6 +4251,85 @@ export class Storage {
       );
     if (written.changes !== 1) return undefined;
     return input;
+  }
+
+  /** Capability 68. The typed lifecycle of one request. First write wins on the binding, the state
+   *  only ever moves FORWARD, and the first terminal state is sealed: a later answer for a request
+   *  that already expired, was cancelled, or was refused cannot rewrite the outcome a person was
+   *  already told. */
+  recordBotMobileRequest(input: {
+    requestId: string;
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    deviceId?: string;
+    command: BotMobileRequest["command"];
+    purpose: string;
+    state: MobileRequestState;
+    at: number;
+    expiresAt: number;
+  }): BotMobileRequest | undefined {
+    this.#sweepMobileRequests(input.at);
+    const existing = this.#db
+      .prepare("SELECT state, bot, session_id AS sessionId FROM bot_mobile_requests WHERE request_id = ?")
+      .get(input.requestId) as { state: MobileRequestState; bot: string; sessionId: string } | undefined;
+    if (existing === undefined) {
+      this.#db
+        .prepare(
+          `INSERT INTO bot_mobile_requests
+             (request_id, bot, session_id, turn_id, device_id, command, purpose, state, requested_at, updated_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.requestId, input.bot, input.sessionId, input.turnId, input.deviceId ?? null,
+          input.command, input.purpose, input.state, input.at, input.at, input.expiresAt,
+        );
+      return this.#mobileRequest(input.requestId);
+    }
+    // A record belongs to the conversation and profile that opened it. A later step naming a
+    // different one is a binding violation, not an update.
+    if (existing.bot !== input.bot || existing.sessionId !== input.sessionId) return undefined;
+    if (isTerminalMobileRequestState(existing.state)) return undefined;
+    if (mobileRequestRank(input.state) <= mobileRequestRank(existing.state)) return undefined;
+    this.#db
+      .prepare("UPDATE bot_mobile_requests SET state = ?, updated_at = ? WHERE request_id = ?")
+      .run(input.state, input.at, input.requestId);
+    return this.#mobileRequest(input.requestId);
+  }
+
+  #mobileRequest(requestId: string): BotMobileRequest | undefined {
+    const row = this.#db
+      .prepare(`${BOT_MOBILE_REQUEST_SELECT} WHERE request_id = ?`)
+      .get(requestId) as (Omit<BotMobileRequest, "deviceId"> & { deviceId: string | null }) | undefined;
+    return row === undefined ? undefined : mobileRequestRow(row);
+  }
+
+  /** The reconciliation read a resuming app makes: bounded, live requests first and then the newest
+   *  settled ones. A request that has NOT settled is what the app came to reconcile, so it is never
+   *  crowded out of the window by finished history however long the conversation has been running.
+   *  Scoped to the profile and conversation the request was issued in: another conversation's
+   *  request is absent, not hidden. */
+  nativeBotMobileRequests(bot: string, sessionId: string, limit = 100): BotMobileRequest[] {
+    const rows = this.#db
+      .prepare(
+        `${BOT_MOBILE_REQUEST_SELECT} WHERE bot = ? AND session_id = ?
+         ORDER BY (state IN (${MOBILE_REQUEST_TERMINAL_PLACEHOLDERS})) ASC, requested_at DESC, request_id DESC
+         LIMIT ?`,
+      )
+      .all(bot, sessionId, ...MOBILE_REQUEST_TERMINAL_STATES, limit) as unknown as (Omit<BotMobileRequest, "deviceId"> & { deviceId: string | null })[];
+    return rows.map(mobileRequestRow);
+  }
+
+  /** Settled records are history and stop being useful to reconcile against. Sweeping them on the
+   *  next write keeps the table bounded without a timer; a request nobody settled is never swept,
+   *  because its outcome is still owed to a person. */
+  #sweepMobileRequests(now: number): void {
+    this.#db
+      .prepare(
+        `DELETE FROM bot_mobile_requests
+         WHERE updated_at < ? AND state IN (${MOBILE_REQUEST_TERMINAL_PLACEHOLDERS})`,
+      )
+      .run(now - MOBILE_REQUEST_RETENTION_MS, ...MOBILE_REQUEST_TERMINAL_STATES);
   }
 
   nativeBotMobileReceipts(bot: string, sessionId: string): BotMobileReceipt[] {
@@ -4931,6 +5062,10 @@ export class Storage {
       ["messages", "bot_native_messages", "bot"],
       ["receipts", "bot_message_receipts", "bot"],
       ["mobileReceipts", "bot_mobile_receipts", "bot"],
+      // Capability 68. A lifecycle record names a device, a turn and the purpose a person was
+      // shown. Deleting the bot takes them with it rather than leaving them keyed to an identity
+      // that no longer exists.
+      ["mobileRequests", "bot_mobile_requests", "bot"],
       ["turnMediaDeliveries", "bot_turn_media_deliveries", "bot"],
       ["interactions", "bot_native_interactions", "bot"],
       // Capability 66. A standing approval belongs to the bot it was made for: deleting the bot

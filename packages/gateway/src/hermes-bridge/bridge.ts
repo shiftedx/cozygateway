@@ -1,5 +1,6 @@
 import type {
   BotApprovalGrant,
+  BotMobileRequest,
   BotAttachmentHistoryItem,
   BotCatalog,
   BotCreateRequest,
@@ -358,6 +359,9 @@ export interface BotsSurface extends BotControlSurface {
   approvalGrants?(name: string): BotApprovalGrant[];
   /** Capability 66. Revocation is immediate: the grant leaves every later consult at once. */
   revokeApprovalGrant?(name: string, grantId: string): "revoked" | "unknown";
+  /** Capability 68. The typed lifecycle of the phone capability requests one conversation opened,
+   *  which is what an app resuming from the background reconciles its pending requests against. */
+  mobileRequests?(name: string, sessionId: string): BotMobileRequest[];
   resolveClarify(
     name: string,
     clarifyId: string,

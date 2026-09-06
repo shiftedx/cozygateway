@@ -13,6 +13,7 @@ export const PUSH_CATEGORY_IDS = [
   "approval.pending",
   "approval.resolved",
   "mobile.status.wake",
+  "task.completed",
 ] as const;
 export type PushCategoryId = (typeof PUSH_CATEGORY_IDS)[number];
 
@@ -70,6 +71,14 @@ export const PUSH_CATEGORIES: Readonly<Record<PushCategoryId, PushCategorySpec>>
     id: "mobile.status.wake",
     pushType: "background",
     requiresCollapseId: true,
+  },
+  // One Task, one banner: the collapse id is the task id, so a later notification about the same
+  // Task replaces its own rather than stacking a second one on the lock screen.
+  "task.completed": {
+    id: "task.completed",
+    pushType: "alert",
+    requiresCollapseId: true,
+    alert: { title: "CozyChat", body: "Task completed" },
   },
 };
 

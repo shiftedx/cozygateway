@@ -49,13 +49,31 @@ export interface ApprovalResolvedPushPayload {
 
 export type ApprovalPushPayload = ApprovalPendingPushPayload | ApprovalResolvedPushPayload;
 
+/** Capability 64's Task reached `completed` while this device had no live socket (category
+ *  `task.completed`, collapse id = the task id). It carries the identities the deep link needs and
+ *  nothing else: no goal, no reply, no artifact name, nothing the Task worked on. The client opens
+ *  `GET /tasks/:taskId` for the rest, which it is already authenticated for.
+ *
+ *  It is sent exactly once per Task, gated on capability 64's own completion notification record
+ *  being newly written, so a client that already announced the completion locally off the
+ *  `bot_task_updated` frame is never told a second time. */
+export interface TaskCompletionPushPayload {
+  kind: "task_completed";
+  taskId: string;
+  /** `bot:<name>`, or `group:<room>` for a room Task: the same namespacing the approval payloads
+   *  use, so a client that does not know the namespace cannot mistake it for one of its threads. */
+  threadId: string;
+  agentId: string;
+}
+
 /** Privacy-minimal signal telling an idle phone to reconnect for a retained status request. */
 export interface MobileNodeWakePushPayload {
   kind: "mobile_node_wake";
 }
 
 /** The in-ciphertext notification payload. */
-export type PushPayload = MessagePushPayload | ApprovalPushPayload | MobileNodeWakePushPayload;
+export type PushPayload = MessagePushPayload | ApprovalPushPayload | MobileNodeWakePushPayload
+  | TaskCompletionPushPayload;
 
 /** Contract v1 froze pushKey as ANY minLength-1 string, so the AES key is derived rather
  *  than decoded: HKDF-SHA256(ikm = utf8(pushKey), salt = empty, info = PUSH_HKDF_INFO, 32). */
