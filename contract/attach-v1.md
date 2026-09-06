@@ -172,6 +172,33 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `del
   `GET /bots/approvals` inbox row. Nothing changes for `resolve_approval`: approving is the peer's
   cue to reconnect that one server, and the gateway records nothing about the outcome. A peer
   never puts a URL, header value, env value, or secret in the block.
+- `approval` (capability 66, `com.cozylabs.bots >= 66`) MAY carry `scope`, one typed
+  scoped-approval block: `BotApprovalScopeSchema` on the bots contract (`kind: "scoped_approval"`,
+  `action`, `category`, `system`, `resource`, `change`, `effects[]`, `reason`, `payloadHash`,
+  `expiresAt`, `retry`, `requested`). The field is untyped on this wire for the same reason
+  `repair` is: a schema failure on an event frame closes the attach socket, and the rule for this
+  block is to drop it and keep the approval. The gateway is the sole authority: it validates the
+  closed sets and bounds and refuses any C0/C1 control or Unicode Format (Cf) character, a lone
+  surrogate, or a whitespace-only string; a block that fails is dropped and the approval raised
+  without it, which fails closed, because only a scoped approval can leave a standing grant behind
+  or be covered by one. A valid block is carried byte for byte on `bot_approval_pending`, the
+  durable interaction record, and the `GET /bots/approvals` inbox row. Nothing changes for
+  `resolve_approval`: when a standing grant already covers an ask, the gateway sends the same
+  `resolve_approval` a tapped card sends, and the peer is the one that acts. A grant exists only
+  where a person explicitly asked for one, a `once` grant covers a single later ask, and a person
+  who denies such an ask replaces the gateway's own requested decision, so the peer may receive an
+  approve followed by a deny for one `approvalId`: its existing rule is unchanged, the first
+  TERMINAL wins and the gateway records nothing else. `category` is the PEER's own assertion, and
+  the gateway cannot classify an action at this seam: declaring an always-require category
+  correctly is the raising harness's job, not a guarantee this wire makes. A peer that sends NO
+  block is unchanged and needs no change: where its approval carries the capability-56 `detail`
+  sentence, the gateway derives a binding from that sentence and the rule name so a person can
+  cover a later identical ask with a single-use grant, and where it does not, the ask is simply
+  never covered. A category grant never covers a plain ask, because a plain ask declares no
+  category for the always-require exclusion to read. Neither the
+  event such a peer sends nor the commands it receives differ. A peer never puts a secret,
+  credential, URL, header or env value in the block, and emits it only when the gateway advertised
+  `com.cozylabs.bots >= 66` on `hello_ack`.
 - Capability 51 (`com.cozylabs.bots`). A ROOM member turn may raise `approval`, `clarify` and
   `tool` events, which the gateway previously acknowledged and dropped. Nothing on this wire
   changes: the ids, the statuses, and the `resolve_approval` / `resolve_clarify` commands the

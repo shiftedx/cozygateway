@@ -14,7 +14,8 @@ import {
   ChatBranchListSchema, ChatComputerSchema, ChatProjectListSchema,
   ChatSessionConfigurationSchema,
   ModelProviderConnectionCatalogSchema, ModelProviderConnectionIdSchema,
-  BotApprovalRepairSchema, type BotApprovalRepair, check,
+  BotApprovalRepairSchema, type BotApprovalRepair,
+  BotApprovalScopeSchema, type BotApprovalScope, check,
 } from "cozygateway-contract";
 
 /** Stable attach-v1 data-plane contract. A peer dials /attach/v1 and completes hello negotiation
@@ -461,6 +462,12 @@ const ApprovalEvent = Type.Object({
    *  failure here would close the whole attach socket over one block, when the rule is to drop the
    *  block and keep the approval. `sanitizeApprovalRepair` below is the sole authority. */
   repair: Type.Optional(Type.Unknown()),
+  /** Capability 66. The typed scoped-approval block this approval carries
+   *  (`BotApprovalScopeSchema` on the bots contract). UNTYPED on the wire for the same reason
+   *  `repair` is: a schema failure here would close the whole attach socket over one block, when
+   *  the rule is to drop the block and keep the decision the person is being asked for.
+   *  `sanitizeApprovalScope` below is the sole authority. */
+  scope: Type.Optional(Type.Unknown()),
 });
 /** Capability 56. Matches the C0 and C1 control character ranges (built from character codes
  *  rather than a literal escape, so no NUL or other control byte ever sits in this source file),
@@ -509,6 +516,18 @@ export function sanitizeApprovalDetail(raw: string): string | undefined {
 export function sanitizeApprovalRepair(raw: unknown): BotApprovalRepair | undefined {
   if (!check(BotApprovalRepairSchema, raw)) return undefined;
   const strings = [raw.server, ...raw.impact, ...Object.values(raw.fingerprint)];
+  return strings.some(unusableIdentifier) ? undefined : raw;
+}
+/** Capability 66. Validates a raw `ApprovalEvent.scope` against the closed bots-contract block and
+ *  refuses any C0/C1 control or Unicode Format (Cf) character, lone surrogate, or whitespace-only
+ *  value in any of its strings. All or nothing, exactly as capability 62's repair block is: a valid
+ *  one is returned as sent, byte for byte, and anything else is `undefined`, which the caller reads
+ *  as "keep the approval, carry no scope". Never a reason to refuse the frame or the approval. A
+ *  block that fails leaves the approval a plain one, so no standing grant can ever be made from it
+ *  and every later invocation asks again: failing this validation fails CLOSED. */
+export function sanitizeApprovalScope(raw: unknown): BotApprovalScope | undefined {
+  if (!check(BotApprovalScopeSchema, raw)) return undefined;
+  const strings = [raw.action, raw.system, raw.resource, raw.change, ...raw.effects];
   return strings.some(unusableIdentifier) ? undefined : raw;
 }
 /** Capability 62. A repair-block string the schema accepted but no configured server, tool, or

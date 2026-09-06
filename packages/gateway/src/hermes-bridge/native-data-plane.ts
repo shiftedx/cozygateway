@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
+import { ALWAYS_REQUIRE_APPROVAL_CATEGORIES } from "cozygateway-contract";
 import type {
   AttachmentBlock,
   BotChatAttachment,
@@ -34,6 +35,8 @@ import type {
   BotPendingClarification,
   BotPendingApproval,
   BotApprovalRepair,
+  BotApprovalGrant,
+  BotApprovalScope,
   BotRoutine,
   BotModelConfig,
   BotModelConfigPatch,
@@ -44,7 +47,7 @@ import type {
 import type { AttachV1Ingress } from "../adapters/attach/ingress-v1.ts";
 import { blocksToText } from "../adapters/attach/blocks-to-text.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
-import { sanitizeApprovalDetail, sanitizeApprovalRepair, type AttachV1EventFrame, type AttachV1MobileRequest } from "../adapters/attach/protocol-v1.ts";
+import { sanitizeApprovalDetail, sanitizeApprovalRepair, sanitizeApprovalScope, type AttachV1EventFrame, type AttachV1MobileRequest } from "../adapters/attach/protocol-v1.ts";
 import type { MobileNodeBroker, MobileNodeReceiptInput } from "../mobile-node.ts";
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import type { Storage } from "../storage.ts";
@@ -53,6 +56,7 @@ import { CozyAgentsHarnessModelSettingsAdapter } from "../harness-settings.ts";
 import { ATTACH_MEDIA_TTL_MS } from "./photos.ts";
 import type {
   BotApprovalDecision,
+  BotApprovalDecisionScope,
   BotClarifyResolveOutcome,
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
@@ -159,6 +163,63 @@ export interface NativeBotDataPlaneOptions {
   mobileNode?: MobileNodeBroker;
 }
 
+/** Capability 66. The ceiling on a standing category grant: one day. A person can revoke one at
+ *  any moment, and nothing here extends an existing grant. */
+const APPROVAL_GRANT_MAX_MS = 24 * 60 * 60 * 1_000;
+/** Capability 66. The gateway's own ceiling on a `once` grant, which answers ONE later ask. A once
+ *  grant lives until the ask it answered expires or this bound passes, whichever is sooner: the
+ *  peer's own `expiresAt` can shorten it and can never extend it. Ten minutes is the same bound the
+ *  durable interaction record already falls back to for an approval that names no expiry. */
+const APPROVAL_ONCE_GRANT_MAX_MS = 10 * 60 * 1_000;
+/** Capability 66. The target system a binding DERIVED from a plain approval is recorded under. A
+ *  plain ask names no system, so derived bindings get their own namespace and can never match a
+ *  grant a typed peer made against a real system it named. */
+const PLAIN_APPROVAL_SYSTEM = "attach";
+
+/** Capability 66, for peers that will never send a scope block. A Hermes-shaped approval carries no
+ *  structured arguments on this wire (row 10's ruling: the free-text command and description are
+ *  never forwarded), so the only deterministic content it has is the rule NAME plus the
+ *  capability-56 `detail` sentence the peer sent to say what the ask concretely covers. Where both
+ *  are present and inside the grant row's bounds, they hash into the same payload binding a typed
+ *  ask gets, so a person can cover a later IDENTICAL plain ask with an explicit grant.
+ *
+ *  Where they are not, this returns nothing and the ask is UNCOVERABLE: a rule name alone says what
+ *  kind of thing is being asked and never which one, so binding to it would cover asks the person
+ *  never saw. Nothing about how a plain approval renders or settles changes either way; a grant can
+ *  only exist because a client at 66 asked for one on a card a person read.
+ *
+ *  The derived scope is internal. It is never emitted on a frame, never stored on the interaction
+ *  record, and never sent to a peer: `category` is `other` because a plain ask declares none, which
+ *  is exactly why the always-require exclusion cannot bite here, and `retry` is `unknown` because
+ *  the peer claimed nothing. Once coverage of a plain ask therefore rests on the person's own
+ *  single-use grant, the same task, and the ask's own expiry, not on an idempotency claim. */
+function plainApprovalScope(
+  payload: ApprovalPayload,
+  expiresAt: number | null,
+): BotApprovalScope | undefined {
+  const detail = payload.detail;
+  if (detail === undefined || expiresAt === null) return undefined;
+  // The grant row's own bounds. An ask outside them is uncoverable rather than truncated: a
+  // truncated binding is a wider binding.
+  if (payload.name.length < 1 || payload.name.length > 64 || detail.length > 256) return undefined;
+  return {
+    kind: "scoped_approval",
+    action: payload.name,
+    category: "other",
+    system: PLAIN_APPROVAL_SYSTEM,
+    resource: detail,
+    change: detail,
+    effects: [],
+    reason: "peer_policy",
+    payloadHash: createHash("sha256")
+      .update(`plain\n${payload.name}\n${detail}`)
+      .digest("hex"),
+    expiresAt,
+    retry: "unknown",
+    requested: "once",
+  };
+}
+
 interface ApprovalPayload {
   name: string;
   /** Capability 51. Present when the interaction was raised by a group-room member turn rather
@@ -172,6 +233,13 @@ interface ApprovalPayload {
   /** Capability 62. The validated MCP repair proposal, stored as sent so the live frame, the
    *  rebroadcast on reconnect, and the inbox row all carry the block the peer raised. */
   repair?: BotApprovalRepair;
+  /** Capability 66. The validated scoped-approval block, stored as sent for the same reason: it is
+   *  what a person reads before deciding, and what a decision's standing grant is bounded by. */
+  scope?: BotApprovalScope;
+  /** Capability 66. The standing grant that settled this ask without asking. Persisted so the
+   *  rebroadcast and the inbox row say why a card the person never tapped is already resolving,
+   *  and so a deny on it is read as countermanding the gateway rather than a rival decision. */
+  grantId?: string;
 }
 interface ClarifyPayload {
   prompt: string;
@@ -448,8 +516,10 @@ export class NativeBotDataPlane {
       sendChatAttachment: (name, file, opts) => this.#sendFile(name, file, opts),
       stopChat: (name) => this.#stop(name),
       resetChat: (name) => this.#reset(name),
-      resolveApproval: (name, toolCallId, decision, deviceId) =>
-        this.#resolveApproval(name, toolCallId, decision, deviceId),
+      resolveApproval: (name, toolCallId, decision, deviceId, grantRequest) =>
+        this.#resolveApproval(name, toolCallId, decision, deviceId, grantRequest),
+      approvalGrants: (name) => this.#approvalGrants(name),
+      revokeApprovalGrant: (name, grantId) => this.#revokeApprovalGrant(name, grantId),
       resolveClarify: (name, clarifyId, optionId, deviceId) =>
         this.#resolveClarify(name, clarifyId, optionId, deviceId),
       chatAttachmentInfo: (name, fileId) => this.#attachmentInfo(name, fileId),
@@ -1750,11 +1820,85 @@ export class NativeBotDataPlane {
     return { sessionId, previousSessionId: previous.sessionId };
   }
 
+  /** Capability 66. Does a standing grant already cover this exact proposal, and if it is a
+   *  single-use one, spend it? An always-require category is never consulted at all, and a `once`
+   *  grant is consulted only when the peer called the retry idempotent: a mutation is never
+   *  automatically replayed, and never more than once even then. */
+  #claimGrant(
+    bot: string,
+    sessionId: string,
+    turnId: string,
+    scope: BotApprovalScope,
+    /** True for a binding DERIVED from a plain approval, which carries no idempotency claim to
+     *  read. Its single-use grant, its task and the ask's own expiry are the bound instead. */
+    derived = false,
+  ): string | undefined {
+    if (ALWAYS_REQUIRE_APPROVAL_CATEGORIES.includes(scope.category)) return undefined;
+    const now = this.#now();
+    // The ask's own expiration bounds the consult too: a stale proposal is never covered, however
+    // long the grant behind it still had to run.
+    if (scope.expiresAt <= now) return undefined;
+    return this.#storage.claimApprovalGrant({
+      bot,
+      sessionId,
+      turnId,
+      action: scope.action,
+      category: scope.category,
+      system: scope.system,
+      resource: scope.resource,
+      payloadHash: scope.payloadHash,
+      allowOnce: derived || scope.retry === "idempotent",
+      // A category grant needs a DECLARED category. A derived binding has none, so only the
+      // person's own single-use grant can answer for a plain ask.
+      allowCategory: !derived,
+      now,
+    });
+  }
+
+  /** Capability 66. Settle a covered approval through the ordinary relay: the gateway sends the
+   *  same `resolve_approval` a tapped card sends, and the peer is the one that acts. The bounded
+   *  log line carries ids and the grant, never a payload value. */
+  #honorApprovalGrant(
+    bot: string,
+    sessionId: string,
+    turnId: string,
+    approvalId: string,
+    grantId: string,
+  ): void {
+    const peer = this.#executionPeer(bot, sessionId);
+    if (peer === undefined) return;
+    const requested = this.#ingress.requestNativeApprovalResolution(peer, {
+      threadId: sessionId,
+      turnId,
+      approvalId,
+      decision: "approve",
+    }, bot);
+    if (requested.outcome !== "requested") return;
+    this.#emitApprovalResolutionRequested(bot, sessionId, turnId, approvalId);
+    emitTrace(this.#trace, "approval_grant_honored", {
+      profile: traceId(bot), session: traceId(sessionId), approval: traceId(approvalId),
+      grant: traceId(grantId),
+    });
+  }
+
+  #approvalGrants(name: string): BotApprovalGrant[] {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) return [];
+    return this.#storage.approvalGrants(bot, this.#now());
+  }
+
+  #revokeApprovalGrant(name: string, grantId: string): "revoked" | "unknown" {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) return "unknown";
+    return this.#storage.revokeApprovalGrant(bot, grantId, this.#now()) ? "revoked" : "unknown";
+  }
+
   async #resolveApproval(
     name: string,
     approvalId: string,
     decision: BotApprovalDecision,
-    _deviceId: string,
+    deviceId: string,
+    grantRequest?: BotApprovalDecisionScope,
   ): Promise<BotApprovalResolveOutcome> {
     const bot = normalize(name);
     if (!this.#native.has(bot)) return "unknown";
@@ -1766,14 +1910,44 @@ export class NativeBotDataPlane {
     if (binding === undefined) return "unknown";
     if (binding.status !== "pending")
       return binding.status === "expired" ? "expired" : "not_pending";
+    // Capability 66. The scope block is what a grant is bounded by, so a decision that asks for a
+    // category grant is refused before anything is relayed when there is nothing to bound it by,
+    // or when the category is one no grant may ever cover. The person can still decide this one
+    // invocation: they resend without asking for a grant.
+    const payload = binding.payload as ApprovalPayload;
+    // Capability 66. A plain ask can be bound too, where it carries deterministic content. Where it
+    // does not, `scope` stays undefined and asking for a grant is refused with `scope_required`,
+    // which is what "there is nothing here to bound a grant by" already means.
+    const scope = payload.scope ?? plainApprovalScope(payload, binding.expiresAt);
+    const derived = payload.scope === undefined;
+    if (grantRequest?.grant === "category") {
+      if (scope === undefined || grantRequest.expiresAt === undefined) return "scope_required";
+      // A category is something a peer DECLARES. A plain ask declares none, and the gateway cannot
+      // classify one, so a standing category policy over it would silently pre-approve a
+      // destructive or publishing action nobody categorized. One ask at a time is the only offer.
+      if (derived) return "category_undeclared";
+      if (ALWAYS_REQUIRE_APPROVAL_CATEGORIES.includes(scope.category)) return "category_forbidden";
+      const now = this.#now();
+      // A standing grant is bounded in time by construction: a dead or unbounded expiry is refused
+      // here rather than stored and consulted later.
+      if (grantRequest.expiresAt <= now || grantRequest.expiresAt > now + APPROVAL_GRANT_MAX_MS)
+        return "invalid_grant";
+    }
     const peer = this.#executionPeer(bot, binding.sessionId);
     if (peer === undefined) return "unsupported";
+    // Capability 66. A deny on an ask the GATEWAY settled from a standing grant is the person
+    // countermanding their own policy, not a rival decision, so it replaces the requested marker
+    // instead of colliding with it. Only that case: a decision the gateway did not make still
+    // conflicts exactly as it did before this row.
+    const settledByGrant = payload.grantId;
+    const override = decision === "deny" && settledByGrant !== undefined
+      && binding.requestedDecision === "approve";
     const requested = this.#ingress.requestNativeApprovalResolution(peer, {
       threadId: binding.sessionId,
       turnId: binding.turnId,
       approvalId,
       decision,
-    }, bot);
+    }, bot, override ? { override: true } : undefined);
     if (requested.outcome === "expired") {
       // Capability 51: a room interaction's session is a member thread, never a chat session.
       const room = payloadRoom(binding.payload);
@@ -1782,11 +1956,44 @@ export class NativeBotDataPlane {
       if (room === undefined) this.#state(bot, requested.sessionId, "polling", true);
       return "expired";
     }
-    if (requested.outcome === "requested") {
-      this.#emitApprovalResolutionRequested(bot, binding.sessionId, binding.turnId, approvalId);
-      return "requested";
+    if (requested.outcome === "requested" || requested.outcome === "already_requested") {
+      if (requested.outcome === "requested")
+        this.#emitApprovalResolutionRequested(bot, binding.sessionId, binding.turnId, approvalId);
+      // Capability 66. The standing approval this decision leaves behind. It exists ONLY because a
+      // person explicitly asked for one: a plain approve is one decision on one ask and leaves no
+      // policy at all, which is what a client below 66, and a person simply tapping Approve, send.
+      if (grantRequest?.grant === undefined || decision !== "approve") return "requested";
+      if (scope === undefined) return "scope_required";
+      if (ALWAYS_REQUIRE_APPROVAL_CATEGORIES.includes(scope.category)) return "category_forbidden";
+      if (derived && grantRequest.grant === "category") return "category_undeclared";
+      const category = grantRequest.grant === "category";
+      const now = this.#now();
+      const recorded = this.#storage.recordApprovalGrant({
+        bot,
+        grantId: `grant:${bot}:${approvalId}`,
+        scope: category ? "category" : "once",
+        deviceId,
+        sessionId: binding.sessionId,
+        turnId: category ? null : binding.turnId,
+        approvalId,
+        action: scope.action,
+        category: scope.category,
+        system: scope.system,
+        resource: scope.resource,
+        payloadHash: category ? null : scope.payloadHash,
+        // A category grant runs to the bound the person set. A once grant dies with the ask it
+        // answered or at the gateway's own ceiling, whichever comes first, so the value the peer
+        // chose can only ever shorten it.
+        expiresAt: category
+          ? grantRequest.expiresAt!
+          : Math.min(scope.expiresAt, now + APPROVAL_ONCE_GRANT_MAX_MS),
+        createdAt: now,
+      });
+      // A decision carries at most one standing grant. A second one asking for a different policy
+      // is told nothing was created rather than answered success for a policy change that did not
+      // happen.
+      return recorded ? "requested" : "grant_not_recorded";
     }
-    if (requested.outcome === "already_requested") return "requested";
     if (requested.outcome === "resolution_pending") return "resolution_pending";
     return requested.outcome;
   }
@@ -2885,6 +3092,12 @@ export class NativeBotDataPlane {
     // of a harness and gateway that disagree on the row.
     if (event.repair !== undefined && repair === undefined)
       this.#log(`dropping repair block on approval for "${bot}": failed validation`);
+    // Capability 66. And again for the scoped-approval block. A block that fails validation is
+    // dropped, which leaves a plain approval: no standing grant can be made from it and no consult
+    // can cover it, so failing validation fails closed.
+    const scope = sanitizeApprovalScope(event.scope);
+    if (event.scope !== undefined && scope === undefined)
+      this.#log(`dropping scope block on approval for "${bot}": failed validation`);
     const change = this.#storage.recordNativeInteraction({
       bot,
       kind: "approval",
@@ -2895,6 +3108,7 @@ export class NativeBotDataPlane {
         name: event.name,
         ...(detail === undefined ? {} : { detail }),
         ...(repair === undefined ? {} : { repair }),
+        ...(scope === undefined ? {} : { scope }),
       } satisfies ApprovalPayload,
       status: outcome ?? "pending",
       ...(event.expiresAt === undefined ? {} : { expiresAt: event.expiresAt }),
@@ -2906,6 +3120,21 @@ export class NativeBotDataPlane {
       return true;
     }
     if (outcome === undefined) {
+      // Capability 66. Consult the standing grants BEFORE the card goes out, so the frame says
+      // which grant is settling this ask rather than the app watching a card resolve itself for no
+      // stated reason. Consulting is not executing: the decision still travels as the ordinary
+      // `resolve_approval` the peer performs.
+      // Capability 66. A typed peer's own block, or the binding derived from a plain ask's rule
+      // name and capability-56 sentence. The stored record is the authority on the ask's expiry,
+      // including the persisted fallback a legacy approval gets, so the derived binding reads it
+      // rather than recomputing it.
+      const covering = scope ?? plainApprovalScope(
+        { name: event.name, ...(detail === undefined ? {} : { detail }) },
+        this.#storage.nativeInteraction(bot, "approval", event.approvalId)?.expiresAt ?? null,
+      );
+      const grantId = covering === undefined
+        ? undefined
+        : this.#claimGrant(bot, sessionId, event.turnId, covering, scope === undefined);
       const wire: BotApprovalPendingFrame = {
         type: "bot_approval_pending",
         bot,
@@ -2916,6 +3145,8 @@ export class NativeBotDataPlane {
         updatedAt: this.#now(),
         ...(detail === undefined ? {} : { detail }),
         ...(repair === undefined ? {} : { repair }),
+        ...(scope === undefined ? {} : { scope }),
+        ...(grantId === undefined ? {} : { grantId }),
       };
       this.#broadcast(wire);
       this.#onApproval?.({
@@ -2940,6 +3171,14 @@ export class NativeBotDataPlane {
           updatedAt: this.#now(),
         });
       this.#state(bot, sessionId, "polling", true);
+      // Capability 66. A covered ask is settled from the standing grant through the very same
+      // relay path a tapped card uses; nothing is replayed and nothing is executed here. The grant
+      // is named on the durable record FIRST, so a reconnect between these two lines still shows
+      // the person what settled their card.
+      if (grantId !== undefined) {
+        this.#storage.attachInteractionGrant(bot, event.approvalId, grantId);
+        this.#honorApprovalGrant(bot, sessionId, event.turnId, event.approvalId, grantId);
+      }
     } else {
       this.#clearInteractionTimer("approval", bot, event.approvalId);
       this.#emitApprovalResolved(
@@ -3228,6 +3467,8 @@ export class NativeBotDataPlane {
           ...(payload.room === undefined ? {} : { room: payload.room.name }),
           ...(payload.detail === undefined ? {} : { detail: payload.detail }),
           ...(payload.repair === undefined ? {} : { repair: payload.repair }),
+          ...(payload.scope === undefined ? {} : { scope: payload.scope }),
+          ...(payload.grantId === undefined ? {} : { grantId: payload.grantId }),
         });
       } else {
         const payload = pending.payload as ClarifyPayload;

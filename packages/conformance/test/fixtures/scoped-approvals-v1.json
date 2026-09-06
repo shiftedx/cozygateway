@@ -1,0 +1,227 @@
+{
+  "capability": {
+    "id": "com.cozylabs.bots",
+    "minimumVersion": 66
+  },
+  "note": "Capability 66, contract/ext-bots-v1.md row 66. A typed scope block names what an approval would do and binds it to a payload hash; a standing grant exists only where a person asked for one, and a later invocation is consulted against it, never a replay. A once grant covers at most one later ask. The six always-require categories are covered by no grant, on the peer's own declaration: classifying the action belongs to the harness that raises it. Everything is additive: the pre66 approval and the pre66 decision below are byte identical to the ones a client sent before this row existed.",
+  "alwaysRequire": [
+    "money_movement",
+    "secret_access",
+    "destructive",
+    "lock_or_alarm",
+    "public_publishing",
+    "account_change"
+  ],
+  "pendingFrame": {
+    "type": "bot_approval_pending",
+    "bot": "sage",
+    "sessionId": "session-1",
+    "turnId": "turn-1",
+    "toolCallId": "approval-1",
+    "name": "payments_transfer",
+    "updatedAt": 1800000000000,
+    "scope": {
+      "kind": "scoped_approval",
+      "action": "payments.transfer",
+      "category": "money_movement",
+      "system": "stripe",
+      "resource": "account/acct_1",
+      "change": "send 40.00 USD to vendor acct_2",
+      "effects": [
+        "the balance drops by 40.00 USD",
+        "the vendor is notified"
+      ],
+      "reason": "always_require",
+      "payloadHash": "3b1f0c9d5a2e47b8c6d0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6",
+      "expiresAt": 1800000060000,
+      "retry": "not_idempotent",
+      "requested": "once"
+    }
+  },
+  "pendingFrameHonored": {
+    "type": "bot_approval_pending",
+    "bot": "sage",
+    "sessionId": "session-1",
+    "turnId": "turn-2",
+    "toolCallId": "approval-2",
+    "name": "workspace_write",
+    "updatedAt": 1800000100000,
+    "grantId": "grant:sage:approval-0",
+    "scope": {
+      "kind": "scoped_approval",
+      "action": "workspace.write",
+      "category": "other",
+      "system": "workspace",
+      "resource": "repo/notes.md",
+      "change": "append one line to notes.md",
+      "effects": [
+        "one file changes on disk"
+      ],
+      "reason": "guardrail",
+      "payloadHash": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "expiresAt": 1800000160000,
+      "retry": "idempotent",
+      "requested": "category"
+    }
+  },
+  "pendingFramePre66": {
+    "type": "bot_approval_pending",
+    "bot": "sage",
+    "sessionId": "session-1",
+    "turnId": "turn-3",
+    "toolCallId": "approval-3",
+    "name": "workspace_write",
+    "updatedAt": 1800000200000
+  },
+  "inboxRow": {
+    "bot": "sage",
+    "sessionId": "session-1",
+    "turnId": "turn-1",
+    "toolCallId": "approval-1",
+    "ruleName": "payments_transfer",
+    "createdAt": 1800000000000,
+    "scope": {
+      "kind": "scoped_approval",
+      "action": "payments.transfer",
+      "category": "money_movement",
+      "system": "stripe",
+      "resource": "account/acct_1",
+      "change": "send 40.00 USD to vendor acct_2",
+      "effects": [
+        "the balance drops by 40.00 USD",
+        "the vendor is notified"
+      ],
+      "reason": "always_require",
+      "payloadHash": "3b1f0c9d5a2e47b8c6d0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6",
+      "expiresAt": 1800000060000,
+      "retry": "not_idempotent",
+      "requested": "once"
+    }
+  },
+  "inboxRowPre66": {
+    "bot": "sage",
+    "sessionId": "session-1",
+    "turnId": "turn-3",
+    "toolCallId": "approval-3",
+    "ruleName": "workspace_write",
+    "createdAt": 1800000200000
+  },
+  "decisions": {
+    "pre66": {},
+    "once": {
+      "grant": "once"
+    },
+    "category": {
+      "grant": "category",
+      "expiresAt": 1800003600000
+    },
+    "refused": [
+      {
+        "grant": "forever"
+      },
+      {
+        "grant": "category",
+        "expiresAt": -1
+      },
+      {
+        "grant": "category",
+        "expiresAt": 1800003600000,
+        "reason": "trust me"
+      }
+    ]
+  },
+  "grants": {
+    "grants": [
+      {
+        "grantId": "grant:sage:approval-0",
+        "scope": "category",
+        "action": "workspace.write",
+        "category": "other",
+        "system": "workspace",
+        "resource": "repo/notes.md",
+        "sessionId": "session-1",
+        "expiresAt": 1800003600000,
+        "createdAt": 1800000000000
+      },
+      {
+        "grantId": "grant:sage:approval-4",
+        "scope": "once",
+        "action": "workspace.write",
+        "category": "other",
+        "system": "workspace",
+        "resource": "repo/notes.md",
+        "sessionId": "session-1",
+        "expiresAt": 1800000260000,
+        "createdAt": 1800000200000
+      }
+    ]
+  },
+  "refusedScopes": [
+    {
+      "kind": "scoped_approval",
+      "action": "workspace.write",
+      "category": "vibes",
+      "system": "workspace",
+      "resource": "repo/notes.md",
+      "change": "append one line",
+      "effects": [],
+      "reason": "guardrail",
+      "payloadHash": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "expiresAt": 1800000060000,
+      "retry": "idempotent",
+      "requested": "once"
+    },
+    {
+      "kind": "scoped_approval",
+      "action": "workspace.write",
+      "category": "other",
+      "system": "workspace",
+      "resource": "repo/notes.md",
+      "change": "append one line",
+      "effects": [],
+      "reason": "guardrail",
+      "payloadHash": "NOTAHASH",
+      "expiresAt": 1800000060000,
+      "retry": "idempotent",
+      "requested": "once"
+    },
+    {
+      "kind": "scoped_approval",
+      "action": "workspace.write",
+      "category": "other",
+      "system": "workspace",
+      "resource": "repo/notes.md",
+      "change": "append one line",
+      "effects": [],
+      "reason": "guardrail",
+      "payloadHash": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "expiresAt": 1800000060000,
+      "retry": "sometimes",
+      "requested": "once"
+    },
+    {
+      "kind": "scoped_approval",
+      "action": "workspace.write",
+      "category": "other",
+      "system": "workspace",
+      "resource": "repo/notes.md",
+      "change": "append one line",
+      "effects": [],
+      "reason": "guardrail",
+      "payloadHash": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "expiresAt": 1800000060000,
+      "retry": "idempotent",
+      "requested": "once",
+      "endpoint": "https://payments.example/transfer"
+    }
+  ],
+  "inboxRowCovered": {
+    "bot": "sage",
+    "sessionId": "session-1",
+    "turnId": "turn-2",
+    "toolCallId": "approval-2",
+    "ruleName": "workspace_write",
+    "createdAt": 1800000100000,
+    "grantId": "grant:sage:approval-0"
+  }
+}

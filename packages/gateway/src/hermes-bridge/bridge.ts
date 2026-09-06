@@ -1,4 +1,5 @@
 import type {
+  BotApprovalGrant,
   BotAttachmentHistoryItem,
   BotCatalog,
   BotCreateRequest,
@@ -62,6 +63,7 @@ import {
 import type { GroupMember } from "./group-protocol.ts";
 import type {
   BotApprovalDecision,
+  BotApprovalDecisionScope,
   BotClarifyResolveOutcome,
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
@@ -349,7 +351,13 @@ export interface BotsSurface extends BotControlSurface {
     toolCallId: string,
     decision: BotApprovalDecision,
     deviceId: string,
+    /** Capability 66. Absent is the pre-66 request: this invocation only, no standing grant. */
+    scope?: BotApprovalDecisionScope,
   ): Promise<BotApprovalResolveOutcome>;
+  /** Capability 66. The standing approvals this bot holds that are neither expired nor revoked. */
+  approvalGrants?(name: string): BotApprovalGrant[];
+  /** Capability 66. Revocation is immediate: the grant leaves every later consult at once. */
+  revokeApprovalGrant?(name: string, grantId: string): "revoked" | "unknown";
   resolveClarify(
     name: string,
     clarifyId: string,
