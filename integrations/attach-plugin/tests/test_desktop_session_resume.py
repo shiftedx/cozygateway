@@ -237,6 +237,25 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.confirmations, [("native:sage:1", "desktop-raw", "resume-1")])
         self.assertEqual(adapter._desktop_session_bindings["native:sage:1"], (key, "desktop-tip"))
 
+    async def test_a_multiplexed_gateway_binds_the_key_its_own_seams_derive(self):
+        """On a multiplexed gateway both of Hermes' checks namespace the key by the profile this
+        adapter owns. A binding recorded off the raw runner call would sit on another lane and
+        every turn on this thread would be dropped, which is the incident, moved."""
+        adapter, runner, store, client = self._adapter(
+            rows=("desktop-raw", "desktop-tip"), resolved={"desktop-raw": "desktop-tip"},
+        )
+        adapter._event_session_key = lambda event: (
+            f"agent:sage:cozygateway:dm:{event.source.chat_id}")
+
+        await adapter._handle_desktop_resume_command({
+            "threadId": "native:sage:1", "hermesSessionId": "desktop-raw", "resumeId": "resume-1",
+        })
+
+        key = "agent:sage:cozygateway:dm:native:sage:1"
+        self.assertEqual(store.switches, [(key, "desktop-tip")])
+        self.assertEqual(runner.evicted, [key])
+        self.assertEqual(adapter._desktop_session_bindings["native:sage:1"], (key, "desktop-tip"))
+
     async def test_switches_with_the_real_async_wrapper_and_session_entry_contract(self):
         adapter, runner, store, client = self._adapter(
             rows=("desktop-raw", "desktop-tip"),
@@ -334,10 +353,13 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.confirmations, [])
 
     async def test_following_turn_carries_strict_binding_metadata(self):
-        adapter, _runner, _store, _client = self._adapter()
+        adapter, _runner, store, _client = self._adapter()
         adapter._desktop_session_bindings["native:sage:1"] = (
             "agent:main:cozygateway:dm:native:sage:1", "desktop-tip",
         )
+        # The store still resolves the bound key to the pinned session, which is what the
+        # runner's own strict check requires before it dispatches.
+        store.lookup_session_id = "desktop-tip"
 
         await adapter._handle_turn(TurnFrame(thread_id="native:sage:1", turn_id="turn-1", text="continue"))
 
