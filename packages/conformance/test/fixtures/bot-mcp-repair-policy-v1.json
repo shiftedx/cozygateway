@@ -3,7 +3,7 @@
     "id": "com.cozylabs.bots",
     "minimumVersion": 63
   },
-  "note": "Capability 63, contract/ext-bots-v1.md row 63. The per-server MCP repair policy is READ-ONLY metadata: the harness owns the setting, the gateway relays it on the capability-48 bot_config profile.read, and no request shape carries it. Absent means the peer reported no policy for that server, never approve_once.",
+  "note": "Capability 63, contract/ext-bots-v1.md row 63. The per-server MCP repair policy is READ-ONLY metadata: the harness owns the setting, the gateway relays it on the capability-48 bot_config profile.read, and no request shape carries it. An absent wire field is unprojected or unknown, and the gateway leaves it absent. A known CozyAgents peer may project its effective approve_once default after negotiating 63; approve_once still requires approval.",
   "profileRead": {
     "name": "sage",
     "description": "",

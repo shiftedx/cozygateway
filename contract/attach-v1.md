@@ -249,8 +249,10 @@ Capability 63 (`com.cozylabs.bots >= 63`): a `profile.read` result's `BotProfile
 MAY each carry `repair`, that server's own repair policy on the peer, closed to `approve_once` or
 `auto_refresh`. It is READ-ONLY: `profile.write` carries no such field, its `enabledMcpServers` is a
 list of names, and the gateway never asks a peer to change a policy. A peer emits it only when the
-gateway advertised `com.cozylabs.bots >= 63` on `hello_ack`, and omits it entirely for a server it
-records no policy for, because absence is silence rather than `approve_once`. Unlike the untyped
+gateway advertised `com.cozylabs.bots >= 63` on `hello_ack`. The gateway leaves an absent field
+absent: it can mean an old or Hermes peer, or a policy the peer did not project. A known CozyAgents
+peer may instead project its effective `approve_once` default after negotiating 63. That value means
+the reconnect still asks for approval, not that repair permission was granted. Unlike the untyped
 `repair` on an `approval` event above, this one is inside a published schema on a lane whose results
 are validated whole, so an unknown value makes the `config_result` frame invalid and the ingress
 refuses the frame and closes the socket: the two names are the entire vocabulary.

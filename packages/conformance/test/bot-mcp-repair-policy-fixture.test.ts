@@ -36,8 +36,8 @@ describe("bot MCP repair policy v1 client fixture", () => {
       "auto_refresh",
       undefined,
     ]);
-    // Absent is SILENCE, not a default. The key is missing from the row, so a client that reads it
-    // as `approve_once` is inventing a permission nobody set.
+    // The missing wire key is unprojected or unknown. A client keeps it absent, while a known
+    // CozyAgents peer may project its effective `approve_once` default after negotiating 63.
     const unset = profile.mcpServers[2];
     expect(unset && "repair" in unset).toBe(false);
   });

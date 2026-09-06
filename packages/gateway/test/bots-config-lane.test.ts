@@ -339,9 +339,9 @@ describe("attach-v1 config lane", () => {
     }
   });
 
-  // Absent stays absent. A Hermes-shaped row, a peer below 63, and a peer at 63 that has set no
-  // policy for that server all answer the same way, and none of them is backfilled with a default:
-  // reading silence as `approve_once` would claim a server asks first when nobody said so.
+  // The gateway preserves a missing key. Hermes-shaped and old-peer rows omit it, as does a peer
+  // that does not project a policy. A known CozyAgents peer can instead project its effective
+  // `approve_once` default after negotiating 63, which still requires approval.
   it("leaves the repair policy absent on a server the peer answered without one", async () => {
     const peer = await dial({
       "profile.read": { ...profile, mcpServers: [{ name: "github", installed: true, enabled: true }] },

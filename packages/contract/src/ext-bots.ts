@@ -1086,10 +1086,10 @@ export type BotMcpRepairPolicy = Static<typeof BotMcpRepairPolicySchema>;
  *  writes, nor executes anything from it: it validates the closed union and relays what the peer
  *  answered on the capability-48 `bot_config` `profile.read`.
  *
- *  ABSENT IS SILENCE, NEVER A DEFAULT. A Hermes bot has no such setting, a runtime peer below 63
- *  answers nothing, and a peer at 63 with no policy recorded for that server answers nothing too.
- *  Reading an absent field as `approve_once` would tell a person a server asks first when nobody
- *  said so, so it is never backfilled and a client renders no policy at all when it is missing. */
+ *  AN ABSENT WIRE FIELD IS NOT PROJECTED OR UNKNOWN. Hermes and runtime peers below 63 omit it,
+ *  and this gateway leaves it absent. A known CozyAgents peer may project its effective
+ *  `approve_once` default after negotiating 63, even when the operator omitted that config key.
+ *  `approve_once` still asks for approval; it does not grant repair permission. */
 export const BotMcpServerSchema = Type.Object({
   name: Type.String(),
   installed: Type.Boolean(),
@@ -2666,11 +2666,12 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * `guardrailCeiling`: it validates the closed union and relays the peer's answer. Nothing here
  * performs a repair or mutates a policy.
  *
- * ABSENT IS SILENCE, NEVER `approve_once`. A Hermes bot, a peer below 63, and a peer at 63 with no
- * policy recorded for that server all answer with the field simply missing, and it is never
- * backfilled. An unknown value is not tolerated: the `bot_config` lane's existing convention refuses
- * the whole `config_result` frame, so a client never receives an unvalidated string in the position
- * where it renders a permission.
+ * An absent wire field is not projected or unknown. Hermes and peers below 63 omit it, and this
+ * gateway does not backfill it. A known CozyAgents peer may project its effective `approve_once`
+ * default after negotiating 63 even without an explicit config key; that setting still requires
+ * approval and grants no repair permission. An unknown value is not tolerated: the `bot_config`
+ * lane's existing convention refuses the whole `config_result` frame, so a client never receives
+ * an unvalidated string in the position where it renders a policy.
  *
  * Additive: the field is optional, so a peer and a client below 63 are byte identical to their
  * pre-63 selves. A peer emits `repair` only when the gateway advertised `com.cozylabs.bots >= 63`

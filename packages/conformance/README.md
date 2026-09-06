@@ -38,8 +38,9 @@ MCP repair policy (`contract/ext-bots-v1.md` row 63). The policy rides the capab
 `profile.read`, which needs a runtime peer, so the portable check is the payload itself: the two
 closed names on one profile read, a server row that carries none, the values a decoder must refuse
 instead of passing through as a string, and the profile patch that names MCP servers by name and
-only by name. A client gates the field on `com.cozylabs.bots >= 63` and renders no policy at all
-when the field is absent, because absent means the peer reported none, never `approve_once`.
+only by name. A client gates the field on `com.cozylabs.bots >= 63` and treats an absent field as
+unprojected or unknown. The gateway does not backfill it. A known CozyAgents peer may project its
+effective `approve_once` default after negotiating 63, and that setting still requires approval.
 
 ## The reference Hermes/attach echo peer
 

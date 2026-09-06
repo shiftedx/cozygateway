@@ -913,7 +913,7 @@ describe("capability advertisement", () => {
     // never the approval, when it fails.
     // Capability 63 declares the harness's per-server MCP repair policy on `BotMcpServer.repair`:
     // optional, closed to `approve_once` and `auto_refresh`, READ-ONLY metadata the gateway relays
-    // and never stores, computes, writes, or backfills. Absence is silence, not `approve_once`.
+    // and never stores, computes, writes, or backfills. An absent key is unprojected or unknown.
     expect(BOTS_CAPABILITY_VERSION).toBe(63);
   });
 
