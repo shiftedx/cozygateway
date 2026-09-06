@@ -26,6 +26,19 @@
       "attempt": 1, "state": "acknowledged", "queuedAt": 1600, "deliveredAt": 1600, "acknowledgedAt": 1700
     }
   },
+  "unstated": {
+    "artifactId": "artifact-2", "bot": "sage", "sessionId": "session-1", "createdBy": "sage",
+    "taskId": "task-1", "runId": "run-1", "origin": "declared",
+    "filename": "notes.txt", "mediaType": "text/plain",
+    "sizeBytes": 5, "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "state": "committed", "validation": "verified", "version": 1,
+    "createdAt": 1800, "committedAt": 1900,
+    "location": "/artifacts/artifact-2/content",
+    "delivery": {
+      "deliveryId": "delivery-4", "artifactId": "artifact-2", "attempt": 1,
+      "state": "queued", "queuedAt": 1900
+    }
+  },
   "tombstone": {
     "artifactId": "artifact-0", "bot": "sage", "sessionId": "session-1", "createdBy": "sage",
     "taskId": "task-1", "runId": "run-1",
