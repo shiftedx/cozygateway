@@ -161,15 +161,45 @@ it("routes status through its authenticated origin in background while keeping l
     expect(results(pluginFrames, "backgrounded")[0]).toMatchObject({ status: "ok" });
     expect(appB.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "backgrounded")).toBe(false);
 
+    // Capability 68. A phone that says it is EXECUTING is not sent the request again when it
+    // reconnects: that resend is how one action becomes two. The typed record says where it got to.
+    requestStatus(plugin, turn, "executing");
+    await until(() => appA2.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "executing"));
+    const executing = appA2.frames.find((frame) => frame.type === "mobile_node_request" && frame.requestId === "executing") as Extract<(typeof appA2.frames)[number], { type: "mobile_node_request" }>;
+    // The other device holds the same lease value here only because this test can read it. It is
+    // still not the target, so its report changes nothing.
+    appB.socket.send(JSON.stringify({ type: "mobile_node_progress", requestId: "executing", lease: executing.lease, stage: "executing" }));
+    await pause();
+    expect(await lifecycle(gateway.url, tokenA, turn.threadId, "executing")).toMatchObject({ state: "routed" });
+    appA2.socket.send(JSON.stringify({ type: "mobile_node_progress", requestId: "executing", lease: executing.lease, stage: "executing" }));
+    await pause();
+    expect(await lifecycle(gateway.url, tokenA, turn.threadId, "executing")).toMatchObject({
+      state: "executing", bot: "sage", turnId: turn.turnId, deviceId: appA.ready.deviceId,
+    });
+    appA2.socket.close();
+    await once(appA2.socket, "close");
+    const appA3 = await appSocket(gateway.url, tokenA, sockets);
+    appA3.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status"], foreground: true }));
+    await pause();
+    expect(appA3.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "executing")).toBe(false);
+    expect(results(pluginFrames, "executing")).toEqual([]);
+    appA3.socket.send(JSON.stringify({ type: "mobile_node_result", requestId: "executing", lease: executing.lease, status: "ok", result: phoneStatus }));
+    await settledOnce(pluginFrames, "executing");
+    expect(await lifecycle(gateway.url, tokenA, turn.threadId, "executing")).toMatchObject({ state: "completed" });
+    // Another conversation answers nothing for it.
+    expect(await lifecycle(gateway.url, tokenA, "some-other-conversation", "executing")).toBeUndefined();
+    appA3.socket.send(JSON.stringify({ type: "mobile_node_advertise", commands: ["device.status"], foreground: false }));
+    await pause();
+
     requestStatus(plugin, turn, "cancelled");
-    await until(() => appA2.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "cancelled"));
+    await until(() => appA3.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "cancelled"));
     plugin.send(JSON.stringify({ kind: "mobile_cancel", requestId: "cancelled" }));
     await settledOnce(pluginFrames, "cancelled");
     expect(results(pluginFrames, "cancelled")[0]).toMatchObject({ status: "cancelled" });
-    expect(appA2.frames.some((frame) => frame.type === "mobile_node_cancel" && frame.requestId === "cancelled")).toBe(true);
+    expect(appA3.frames.some((frame) => frame.type === "mobile_node_cancel" && frame.requestId === "cancelled")).toBe(true);
 
     requestStatus(plugin, turn, "stopped");
-    await until(() => appA2.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "stopped"));
+    await until(() => appA3.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "stopped"));
     const stopped = await fetch(`${gateway.url}/bots/sage/chat/stop`, { method: "POST", headers: { authorization: `Bearer ${tokenA}` } });
     expect(stopped.status).toBe(200);
     await settledOnce(pluginFrames, "stopped");
@@ -180,10 +210,10 @@ it("routes status through its authenticated origin in background while keeping l
       plugin.send(JSON.stringify({ kind: "mobile_request", requestId, command: "device.status", threadId: requestId, turnId: "not-the-active-turn", expiresAt: Date.now() + 1_000, purpose: "Report phone readiness" }));
       await settledOnce(pluginFrames, requestId);
       expect(results(pluginFrames, requestId)[0]).toMatchObject({ status: "policy_blocked" });
-      expect(appA2.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === requestId)).toBe(false);
+      expect(appA3.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === requestId)).toBe(false);
     }
 
-    const appRequestsBeforeReconnect = appA2.frames.filter((frame) => frame.type === "mobile_node_request").length;
+    const appRequestsBeforeReconnect = appA3.frames.filter((frame) => frame.type === "mobile_node_request").length;
     plugin.close();
     await once(plugin, "close");
     const replayedFrames: Array<Record<string, any>> = [];
@@ -195,10 +225,10 @@ it("routes status through its authenticated origin in background while keeping l
     await until(() => replayedFrames.some((frame) => frame.kind === "hello_ack"));
     await pause();
     expect(replayedFrames.some((frame) => frame.kind === "mobile_result")).toBe(false);
-    expect(appA2.frames.filter((frame) => frame.type === "mobile_node_request")).toHaveLength(appRequestsBeforeReconnect);
+    expect(appA3.frames.filter((frame) => frame.type === "mobile_node_request")).toHaveLength(appRequestsBeforeReconnect);
 
     pluginReconnect.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "assistant-answer", event: { kind: "commit", threadId: turn.threadId, turnId: turn.turnId, messageId: "ordinary-answer", blocks: [{ type: "paragraph", text: "ordinary assistant response" }] } }));
-    await until(() => appA2.frames.some((frame) => frame.type === "bot_chat" && frame.messages.some((message) => message.id === "ordinary-answer")));
+    await until(() => appA3.frames.some((frame) => frame.type === "bot_chat" && frame.messages.some((message) => message.id === "ordinary-answer")));
     const history = await (await fetch(`${gateway.url}/bots/sage/chat/messages`, { headers: { authorization: `Bearer ${tokenA}` } })).json() as {
       messages: BotChatMessage[];
       mobileReceipts: Array<Record<string, unknown>>;
@@ -355,4 +385,15 @@ async function until(predicate: () => boolean, timeoutMs = 4_000): Promise<void>
 
 async function pause(ms = 25): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Capability 68's reconciliation read, for one request of one conversation. */
+async function lifecycle(url: string, token: string, sessionId: string, requestId: string) {
+  const response = await fetch(
+    `${url}/bots/sage/mobile-requests?sessionId=${encodeURIComponent(sessionId)}`,
+    { headers: { authorization: `Bearer ${token}` } },
+  );
+  expect(response.status).toBe(200);
+  const body = await response.json() as { requests: Record<string, unknown>[] };
+  return body.requests.find((request) => request["requestId"] === requestId);
 }
