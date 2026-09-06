@@ -378,7 +378,7 @@ describe("GatewayInfo.capabilities wiring", () => {
         "com.cozylabs.test": 1,
         "com.cozylabs.some-unrecognized-thing": 7,
         approvals: 1,
-        "com.cozylabs.cozyapps": 1,
+        "com.cozylabs.cozyapps": 2,
         "com.cozylabs.bots": expect.any(Number),
         "com.cozylabs.hermes-desktop-sessions": 4,
         "com.cozylabs.harness-settings": 1,

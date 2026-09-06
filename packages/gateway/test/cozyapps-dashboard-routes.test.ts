@@ -8,8 +8,8 @@ const stores: Storage[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.close(); });
 
 const tree = {
-  root: { id: "root", kind: "stack", children: [{ id: "refresh", kind: "button", label: "Refresh", actionId: "refresh", role: "primary" }] },
-} as const;
+  root: { id: "root", kind: "stack" as const, children: [{ id: "refresh", kind: "button" as const, label: "Refresh", actionId: "refresh", role: "primary" as const }] },
+};
 const document = {
   title: "Market watchlist",
   sections: [{
@@ -71,7 +71,7 @@ describe("cozyapps v2 routes", () => {
     const replay = await write({ expectedRevision: 0, idempotencyKey: "tap-1", type: "string", value: "AAPL" });
     expect(replay.status).toBe(200);
     expect(await replay.json()).toMatchObject({ revision: 1 });
-    expect(await write({ expectedRevision: 1, idempotencyKey: "tap-2", type: "string", value: "MSFT" }).then((r) => r.status)).toBe(200);
+    expect((await write({ expectedRevision: 1, idempotencyKey: "tap-2", type: "string", value: "MSFT" })).status).toBe(200);
     const stale = await write({ expectedRevision: 1, idempotencyKey: "tap-3", type: "string", value: "NVDA" });
     expect(stale.status).toBe(409);
     expect(await stale.json()).toMatchObject({ error: { code: "conflict" }, current: { value: "MSFT", revision: 2 } });
