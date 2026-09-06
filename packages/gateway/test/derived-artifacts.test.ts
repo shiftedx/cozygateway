@@ -185,6 +185,32 @@ describe("derived Artifacts from legacy attachment deliveries", () => {
     expect(storage.artifacts.get("artifact-b")).toMatchObject({ state: "committed" });
   });
 
+  it("records a visible refusal instead of retaining derived bytes over the operator ceiling", async () => {
+    const storage = open();
+    const fixture = plane(storage);
+    storage.artifacts.capacity(PNG.byteLength - 1);
+    seedMedia(storage, "media_chart", 5_000);
+    await deliver(fixture, "answer", ["media_chart"]);
+
+    const [record] = storage.artifacts.list({ bot: "sage" });
+    expect(record).toMatchObject({ origin: "derived", state: "commit_failed", failureReason: "capacity" });
+    expect(record?.location).toBeUndefined();
+    expect(record?.delivery).toBeUndefined();
+    // The refusal changes nothing about the attachment: its bytes keep the retention they had.
+    expect(storage.attachMediaInfo("sage", "media_chart", 4_000)).toBeDefined();
+    expect(storage.pruneExpiredAttachMedia(6_000)).toBe(1);
+
+    // Raising the ceiling is enough: the next delivery of that attachment retains it for real.
+    storage.artifacts.capacity(PNG.byteLength);
+    seedMedia(storage, "media_chart", 9_000);
+    await deliver(fixture, "answer-again", ["media_chart"]);
+    expect(storage.artifacts.list({ bot: "sage" })).toHaveLength(1);
+    expect(storage.artifacts.list({ bot: "sage" })[0]).toMatchObject({
+      origin: "derived", state: "committed", sourceMessageId: "answer-again",
+      delivery: { state: "delivered" },
+    });
+  });
+
   it("lists, downloads, deletes and retains a derived record the way a declared one behaves", async () => {
     const storage = open();
     const fixture = plane(storage);

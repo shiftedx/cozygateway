@@ -1230,6 +1230,10 @@ attachment arrived in no longer removes the bytes and the media staging deadline
 them. An explicitly deleted derived record is never re-derived by a later redelivery or receipt.
 The operator's retained-bytes ceiling counts each stored object ONCE, so a derived record and the
 declaration that upgrades from it, or two records over one object, retain one copy between them.
+The ceiling binds derivation as well: over it, the record is written as `commit_failed` with
+`failureReason: "capacity"` and binds no bytes, so the refusal is visible and the attachment keeps
+exactly the retention it already had. A later delivery of that attachment retries it, so raising
+the ceiling is enough to retain it.
 
 Additive: a client below 65 never calls these routes and its attachment behavior is byte identical
 to its pre-65 self. A client at 65 written before `origin` existed still decodes every record; only

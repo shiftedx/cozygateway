@@ -192,24 +192,35 @@ export class Artifacts {
   derive(input: {
     createdBy: string; bot: string; sessionId: string; sourceMessageId: string; mediaId: string;
     filename: string; mediaType: string; sizeBytes: number;
-  }, at: number): { outcome: "created" | "existing"; record?: Artifact } {
+  }, at: number): { outcome: "created" | "existing" | "refused"; record?: Artifact } {
     const artifactId = derivedArtifactId(input.createdBy, input.mediaId);
     const existing = this.#db.prepare(
       `${SELECT} WHERE created_by = ? AND media_id = ? UNION ALL ${SELECT} WHERE artifact_id = ?`,
     ).get(input.createdBy, input.mediaId, artifactId) as ArtifactRow | undefined;
     // An explicitly deleted record is found by its identity too, so a later receipt or a
     // redelivery never resurrects bytes a person asked the gateway to stop offering.
-    if (existing !== undefined) return { outcome: "existing", record: this.#record(existing) };
+    // A record the store once refused for capacity is retried by a later delivery, so raising the
+    // ceiling is enough to fix it. Anything else that already exists, an explicit deletion
+    // included, is answered as it stands: a receipt or a redelivery never resurrects bytes a
+    // person asked the gateway to stop offering.
+    const retryable = existing !== undefined && existing.origin === "derived"
+      && existing.state === "commit_failed" && existing.artifactId === artifactId;
+    if (existing !== undefined && !retryable) return { outcome: "existing", record: this.#record(existing) };
+    // The operator's ceiling binds a derived record too, because retaining it is what turns a
+    // staged attachment into bytes kept until an explicit deletion. A refusal is recorded rather
+    // than dropped, and the bytes keep the retention they already had.
+    if (!this.#retains(input.createdBy, input.mediaId) && this.#retainedBytes() + input.sizeBytes > this.#capacityBytes) {
+      if (!retryable) this.#insertDerived(artifactId, input, at, "capacity");
+      return { outcome: "refused", record: this.#record(this.#row(artifactId)!) };
+    }
     this.#db.exec("SAVEPOINT artifact_derive");
     try {
-      this.#db.prepare(
-        `INSERT INTO artifacts (artifact_id, bot, session_id, room, task_id, run_id, created_by, filename,
-           media_type, size_bytes, sha256, state, mark, validation, version, supersedes, superseded_by,
-           created_at, committed_at, deleted_at, failure_reason, media_id, origin, source_message_id)
-         VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, '', 'committed', '', 'unvalidated', 1, NULL, NULL,
-           ?, ?, NULL, NULL, ?, 'derived', ?)`,
-      ).run(artifactId, input.bot, input.sessionId, input.createdBy, input.filename, input.mediaType,
-        input.sizeBytes, at, at, input.mediaId, input.sourceMessageId);
+      if (retryable)
+        this.#db.prepare(
+          `UPDATE artifacts SET state = 'committed', failure_reason = NULL, committed_at = ?, media_id = ?,
+             source_message_id = ? WHERE artifact_id = ?`,
+        ).run(at, input.mediaId, input.sourceMessageId, artifactId);
+      else this.#insertDerived(artifactId, input, at);
       // Retained like a committed original: the producer's staging deadline stops applying.
       this.#db.prepare("UPDATE attach_media SET expires_at = NULL WHERE agent_id = ? AND media_id = ?")
         .run(input.createdBy, input.mediaId);
@@ -362,6 +373,26 @@ export class Artifacts {
 
   /** Retained bytes, counted once per stored object. Two records over the same media, a derived
    * one and the declaration that upgraded from it or a second declaration, retain one copy. */
+  /** One INSERT for both outcomes. A refused record binds no bytes and queues no delivery: it
+   * says an attachment arrived and the store would not retain it as an Artifact. */
+  #insertDerived(
+    artifactId: string,
+    input: { createdBy: string; bot: string; sessionId: string; sourceMessageId: string; mediaId: string; filename: string; mediaType: string; sizeBytes: number },
+    at: number,
+    refusal?: ArtifactFailureReason,
+  ): void {
+    this.#db.prepare(
+      `INSERT INTO artifacts (artifact_id, bot, session_id, room, task_id, run_id, created_by, filename,
+         media_type, size_bytes, sha256, state, mark, validation, version, supersedes, superseded_by,
+         created_at, committed_at, deleted_at, failure_reason, media_id, origin, source_message_id)
+       VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, '', ?, '', 'unvalidated', 1, NULL, NULL,
+         ?, ?, NULL, ?, ?, 'derived', ?)`,
+    ).run(artifactId, input.bot, input.sessionId, input.createdBy, input.filename, input.mediaType,
+      input.sizeBytes, refusal === undefined ? "committed" : "commit_failed", at,
+      refusal === undefined ? at : null, refusal ?? null,
+      refusal === undefined ? input.mediaId : null, input.sourceMessageId);
+  }
+
   #retainedBytes(): number {
     return (this.#db.prepare(
       `SELECT COALESCE(SUM(size_bytes), 0) AS bytes FROM
