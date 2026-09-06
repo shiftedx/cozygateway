@@ -1076,7 +1076,7 @@ reduced from the append-only event stream, never independently written. The clos
 reasons, view, command bodies and update frame are defined in `packages/contract/src/tasks.ts`.
 ADR 0004 enumerates 45 distinct reasons; the earlier prose count of 46 was clerical.
 
-Paired-device authenticated routes are `GET /bots/:name/tasks`, `GET /groups/:name/tasks`, and
+Paired-device authenticated routes are `GET /bots/:name/tasks`, `GET /bots/groups/:name/tasks`, and
 `GET /tasks/:taskId`. Lists accept `state`; reads accept an exclusive numeric `cursor` and bounded
 `limit` and return `{ view, events, nextCursor? }`. Five commands are
 `POST /tasks/:taskId/{cancel,pause,resume,retry,scope}`. Every body carries `idempotencyKey`;

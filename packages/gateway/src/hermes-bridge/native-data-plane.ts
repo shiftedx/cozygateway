@@ -994,6 +994,14 @@ export class NativeBotDataPlane {
     }
   }
 
+  taskTurnQueued(peer: string, command: { threadId: string; turnId: string }): void {
+    const bot = this.#storage.chatExecutionById(peer)?.bot ?? normalize(peer);
+    if (!this.handles(bot) || !this.#storage.nativeBotHasSession(bot, command.threadId)) return;
+    this.#scheduleTurnTimeout(bot, command.threadId, command.turnId);
+    this.#seedTurnActivity(bot, command.threadId, command.turnId);
+    this.#state(bot, command.threadId, "polling", true);
+  }
+
   close(): void {
     if (this.#staleTurnSweep !== undefined) clearInterval(this.#staleTurnSweep);
     this.#staleTurnSweep = undefined;
@@ -2926,8 +2934,7 @@ export class NativeBotDataPlane {
         toolCallId: event.approvalId,
         name: event.name,
       });
-      if (event.expiresAt !== undefined)
-        this.#scheduleInteractionExpiry({
+      this.#scheduleInteractionExpiry({
           bot,
           kind: "approval",
           interactionId: event.approvalId,
@@ -2938,7 +2945,7 @@ export class NativeBotDataPlane {
             ...(detail === undefined ? {} : { detail }),
             ...(repair === undefined ? {} : { repair }),
           },
-          expiresAt: event.expiresAt,
+          expiresAt: event.expiresAt ?? null,
           updatedAt: this.#now(),
         });
       this.#state(bot, sessionId, "polling", true);
@@ -3029,15 +3036,14 @@ export class NativeBotDataPlane {
         updatedAt: this.#now(),
       };
       this.#broadcast(pending);
-      if (event.expiresAt !== undefined)
-        this.#scheduleInteractionExpiry({
+      this.#scheduleInteractionExpiry({
           bot,
           kind: "clarify",
           interactionId: event.clarifyId,
           sessionId,
           turnId: event.turnId,
           payload,
-          expiresAt: event.expiresAt,
+          expiresAt: event.expiresAt ?? null,
           updatedAt: this.#now(),
         });
       this.#state(bot, sessionId, "polling", true);
@@ -3133,7 +3139,8 @@ export class NativeBotDataPlane {
     expiresAt: number | null;
     updatedAt: number;
   }): void {
-    if (pending.expiresAt === null) return;
+    const expiresAt = pending.expiresAt ?? this.#storage.nativeInteraction(pending.bot, pending.kind, pending.interactionId)?.expiresAt;
+    if (expiresAt === undefined || expiresAt === null) return;
     const key = `${pending.kind}:${pending.bot}:${pending.interactionId}`;
     const prior = this.#interactionTimers.get(key);
     if (prior !== undefined) clearTimeout(prior);
@@ -3173,7 +3180,7 @@ export class NativeBotDataPlane {
         }
         this.#interactionTimers.delete(key);
       },
-      Math.max(0, pending.expiresAt - this.#now()),
+      Math.max(0, expiresAt - this.#now()),
     );
     timer.unref();
     this.#interactionTimers.set(key, timer);
@@ -3347,6 +3354,7 @@ export class NativeBotDataPlane {
         });
       }
     }
+    const waitingOn = chat.activeTurnId === undefined ? undefined : this.#storage.tasks.waiting(this.#executionPeer(bot, sessionId) ?? bot, chat.activeTurnId);
     return {
       type: "bot_chat_state",
       bot,
@@ -3355,6 +3363,7 @@ export class NativeBotDataPlane {
       running,
       inflight: running,
       ...(state === undefined ? {} : state),
+      ...(waitingOn === undefined ? {} : { waitingOn }),
       updatedAt: this.#now(),
     };
   }

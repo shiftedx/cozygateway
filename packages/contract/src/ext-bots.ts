@@ -13,6 +13,7 @@
  *  Bot Mode chats, their sessions, messages, attachments, and turn state are gateway-owned
  *  attach-v1 projections. Every timestamp on this wire is milliseconds. */
 import { type Static, Type } from "@sinclair/typebox";
+import { TaskWaitingOnSchema } from "./tasks.ts";
 
 import { AttachmentBlockSchema } from "./rich-blocks.ts";
 import { ApprovalOutcomeSchema, GatewayInfoSchema } from "./resources.ts";
@@ -498,6 +499,7 @@ export const BotChatStateFrameSchema = Type.Object({
   /** Gateway-clock time when an offline command entered the durable outbox. The existing gateway
    * turn-timeout bound applies from this instant, then the command is discarded or interrupted. */
   queuedAt: Type.Optional(Type.Integer()),
+  waitingOn: Type.Optional(TaskWaitingOnSchema),
   updatedAt: Type.Integer(),
 });
 export type BotChatStateFrame = Static<typeof BotChatStateFrameSchema>;

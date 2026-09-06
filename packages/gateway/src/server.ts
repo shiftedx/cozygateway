@@ -689,6 +689,8 @@ export async function startGateway(
       // The plugin-facing receipt is the ingress' own business; this is the half the USER sees.
       onScheduledDeliveryFailed: (agentId, failure) =>
         nativeBotPlane?.recordScheduledDeliveryFailure(agentId, failure),
+      onHello: (agentId) => mobileNode?.disconnectAgent(agentId),
+      onTaskTurnQueued: (agentId, command) => nativeBotPlane?.taskTurnQueued(agentId, command),
       onPresence: (agentId, state) => {
         // A chat execution is a transport peer, never another bot in the roster.
         if (storage.chatExecutionById(agentId)) return;
@@ -777,6 +779,7 @@ export async function startGateway(
   // otherwise keep a turn pending forever. Returns whether an attach identity was actually held,
   // which is what the delete response reports as `tokenRevoked`.
   killAttachIdentity = (name: string): boolean => {
+    storage.tasks.ownerDeleted(name, Date.now());
     const revoked = revokeAttachTokens(attachTokens, name);
     attachV1Ingress.disconnectAgent(name);
     allowedCapabilities.delete(name);
@@ -813,6 +816,7 @@ export async function startGateway(
     (event) => liveActivityNotifier.coveredDeviceIdsForChat(event),
   );
   mobileNode = new MobileNodeBroker({
+    taskWait: (wait) => storage.tasks.device(wait),
     route: (deviceId, command) => hub.mobileNodeRoute(deviceId, command),
     wake: (deviceId) => notifier.notifyMobileNodeWake(deviceId),
     send: (deviceId, frame) => hub.sendMobileNodeFrame(deviceId, frame),
@@ -1014,8 +1018,12 @@ export async function startGateway(
       : { approvalLog: options.approvalLog }),
   });
 
+  storage.tasks.runtime((bot) => runtimeBotService?.owns(bot) === true ? runtimeBotService.projection(bot).stage : undefined);
+  storage.tasks.reconcile();
+  if (BOTS_CAPABILITY_VERSION >= 64) storage.tasks.observe((frame) => hub.broadcast(frame));
   const app = createApp({
     storage,
+    flushTaskCommands: () => attachV1Ingress.flushTaskCommands(),
     config,
     gatewayInfo,
     ...(options.notifierLog === undefined ? {} : { pushRelayLog: options.notifierLog }),

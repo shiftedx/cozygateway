@@ -59,3 +59,8 @@ export const TaskListSchema = Type.Object({ tasks: Type.Array(TaskViewSchema) })
 export const TaskCommandSchema = Type.Object({ idempotencyKey: Id });
 export const TaskScopeCommandSchema = Type.Object({ idempotencyKey: Id, goal: Type.String({ minLength: 1, maxLength: 65536 }) });
 export const TaskUpdatedFrameSchema = Type.Object({ type: Type.Literal("bot_task_updated"), event: TaskEventSchema, view: TaskViewSchema });
+
+export const TaskConflictSchema = Type.Object({
+  error: Type.Object({ code: Type.Literal("conflict"), message: Type.String() }),
+  state: TaskStateSchema, view: TaskViewSchema,
+});

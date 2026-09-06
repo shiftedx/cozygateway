@@ -45,3 +45,17 @@ GREEN: durable-tasks now 3 passed: actual outbox admission/ACK/final inbox compl
 Focused regression checkpoint: durable-tasks, task-terminal-immutability, native-bot-data-plane, attach-v1-storage: 4 files, 90 passed. Further atomic native settlement/interaction hooks: durable-tasks plus task-terminal-immutability, 2 files, 11 passed.
 
 SQLite Task admission shares the command transaction; event projection shares inbox admission; notification inserts once with completion. Stored interactions and Task events now share a savepoint. The view derives from events and immutable intent/run references. Slash catalogs are retained and consulted at actual turn admission. Native timeout/silence and room deadline account for suspended wait intervals. These remain an implementation checkpoint: command routes, durable command fencing, complete owner reconciliation, device/child/artifact joins and portable conformance remain.
+
+## Commands and reconciliation implementation checkpoint
+
+Status remains IN_PROGRESS, not release-ready. This checkpoint follows 1453400. It adds authenticated Task read/list/five command routes, durable payload-bound command replay and dispatch intents, existing attach outbox dispatch with predecessor terminal fencing, source-bound device wait callbacks, child settlement joins, and durable owner-absence episodes. Row 64 remains reserved and unadvertised.
+
+Lead rulings applied: legacy missing interaction deadlines receive a persisted 600000ms bound, assigned once; explicit deadlines remain authoritative. Repeated absence uses an internal durable episode identity, making duplicate observations idempotent without collapsing a second loss after proven reattachment. Authenticated current attach peer identity is the available ownership fence. Neither spec generation nor observed generation is represented as Runtime Generation. Proposed ADR clarification: "When a Runtime Generation wire fact is unavailable, reconciliation preserves it as unknown and fences available ownership evidence by the authenticated current attach peer and a durable absence-episode identity. Duplicate observations within an episode are idempotent; a new proven absence after reattachment is a distinct episode."
+
+Focused evidence under explicit Node 24:
+- durable-tasks plus native-bot-data-plane: 2 files, 63 passed, zero failed.
+- durable-tasks plus mobile-node plus attach-v1-ingress: 3 files, 73 passed, zero failed.
+- task-routes: 1 file, 3 passed, zero failed. Uses real pairing, authenticated Hono routes and SQLite storage.
+- Granted gateway typecheck first exposed four unsafe RunRow casts; required-row lookup corrected them. Granted rerun `pnpm --filter cozygateway typecheck` passed. Later route/device/dispatch changes still need integrated typecheck/build.
+
+Remaining acceptance: boot/read/hello expiry and ACK resume reconciliation; retry/pause/cancel predecessor races; room retry/timeout integration; Artifact reference seam; physical restart and command-state matrix coverage; public attach/frame portable conformance; advertise 64 only after final zero-failure gates and independent adversarial review. All evidence is deterministic local integration. Live .121 and hosted CI remain unavailable; no production services touched and no true runtime-generation evidence claimed.
