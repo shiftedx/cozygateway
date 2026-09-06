@@ -2451,7 +2451,7 @@ export class Storage {
       if (command.kind === "turn") {
         const run = this.tasks.run(peer, command.turnId);
         const view = run === undefined ? undefined : this.tasks.read(run.taskId)?.view;
-        if (run === undefined || view === undefined) return false;
+        if (run === undefined || view === undefined || view.state !== "queued" || view.currentRun.runId !== command.turnId || view.pendingIntent?.command === "pause" || view.pendingIntent?.command === "cancel") return false;
         if (view.room !== undefined) {
           const previous = run.predecessorRunId === null ? undefined : this.botGroupTurnForAttach(peer, command.threadId, run.predecessorRunId);
           const room = this.botGroup(view.room);

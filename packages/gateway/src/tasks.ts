@@ -10,6 +10,9 @@ export interface TaskArtifactReference { artifactId: string; status: "pending" |
 /** Initiative 4 binds this to its canonical declaration/commitment reader. No attachment or
  * delivery record is evidence. Missing previously declared references remain unproven. */
 export type TaskArtifactReader = (source: { taskId: string; bot: string; peer: string; sessionId: string; runId: string }) => readonly TaskArtifactReference[];
+export interface TaskRecoveryDecision { taskId: string; runId: string; issuer: string; decisionId: string; reason: string }
+/** Only a trusted canonical operator/policy producer may bind this reader. */
+export type TaskRecoveryDecisionReader = (source: { taskId: string; bot: string; runId: string }) => TaskRecoveryDecision | undefined;
 interface TaskRow { taskId: string; bot: string; sessionId: string; room: string | null; originatingTurnId: string; originatingMessageId: string; goal: string }
 interface RunRow { taskId: string; peer: string; runId: string; sessionId: string; intentRevision: number; predecessorRunId: string | null }
 const TASK_SELECT = "SELECT task_id AS taskId, bot, session_id AS sessionId, room, originating_turn_id AS originatingTurnId, originating_message_id AS originatingMessageId, goal FROM tasks";
@@ -26,6 +29,7 @@ export class Tasks {
   #observer: ((frame: ServerFrame) => void) | undefined;
   #expireInteraction: ((bot: string, kind: "approval" | "clarify", id: string, at: number) => void) | undefined;
   #expireDevice: ((peer: string, runId: string, id: string, at: number) => void) | undefined;
+  #recoveryDecision: TaskRecoveryDecisionReader | undefined;
   #artifacts: TaskArtifactReader | undefined;
   #runtime: ((bot: string) => string | undefined) | undefined;
   constructor(db: DatabaseSync) {
@@ -39,6 +43,7 @@ export class Tasks {
       CREATE TABLE IF NOT EXISTS task_tool_facts (peer TEXT NOT NULL, run_id TEXT NOT NULL, call_id TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY(peer,run_id,call_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_waits (task_id TEXT NOT NULL, run_id TEXT NOT NULL, kind TEXT NOT NULL, record_id TEXT NOT NULL, requested_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, settled_at INTEGER, PRIMARY KEY(task_id,run_id,kind,record_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_absences (task_id TEXT NOT NULL, run_id TEXT NOT NULL, peer TEXT NOT NULL, episode TEXT NOT NULL, absent_at INTEGER NOT NULL, reattached_at INTEGER, PRIMARY KEY(task_id,run_id,episode)) STRICT;
+      CREATE TABLE IF NOT EXISTS task_recovery_decisions (task_id TEXT NOT NULL, issuer TEXT NOT NULL, decision_id TEXT NOT NULL, decision_json TEXT NOT NULL, PRIMARY KEY(task_id,issuer,decision_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_required_artifacts (task_id TEXT NOT NULL, run_id TEXT NOT NULL, artifact_id TEXT NOT NULL, PRIMARY KEY(task_id,run_id,artifact_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_required_batches (task_id TEXT NOT NULL, run_id TEXT NOT NULL, batch_id TEXT NOT NULL, PRIMARY KEY(task_id,run_id,batch_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_commands (task_id TEXT NOT NULL, command_key TEXT NOT NULL, payload_json TEXT NOT NULL, result_json TEXT NOT NULL, PRIMARY KEY(task_id,command_key)) STRICT;
@@ -69,6 +74,8 @@ export class Tasks {
   expireInteractions(expire: (bot: string, kind: "approval" | "clarify", id: string, at: number) => void): void { this.#expireInteraction = expire; }
 
   expireDevices(expire: (peer: string, runId: string, id: string, at: number) => void): void { this.#expireDevice = expire; }
+
+  recoveryDecisions(reader: TaskRecoveryDecisionReader): void { this.#recoveryDecision = reader; }
 
   artifactReferences(reader: TaskArtifactReader): void { this.#artifacts = reader; }
 
@@ -132,6 +139,18 @@ export class Tasks {
         for (const view of this.list()) {
           if (TERMINAL.has(view.state)) continue;
           const run = this.#taskRun(view.taskId, view.currentRun.runId);
+          if (view.state === "blocked" && this.#executionEnded(run.peer, run.runId)) {
+            const decision = this.#recoveryDecision?.({ taskId: view.taskId, bot: view.bot, runId: run.runId });
+            if (decision !== undefined && decision.taskId === view.taskId && decision.runId === run.runId) {
+              if ([decision.issuer, decision.decisionId, decision.reason].some((value) => value.trim().length === 0 || value.length > 65536)) throw new Error("Invalid recovery decision source");
+              const encoded = JSON.stringify(decision);
+              const prior = this.#db.prepare("SELECT decision_json AS json FROM task_recovery_decisions WHERE task_id = ? AND issuer = ? AND decision_id = ?").get(view.taskId, decision.issuer, decision.decisionId) as { json: string } | undefined;
+              if (prior !== undefined && prior.json !== encoded) throw new Error("Conflicting recovery decision identity");
+              this.#db.prepare("INSERT OR IGNORE INTO task_recovery_decisions VALUES (?, ?, ?, ?)").run(view.taskId, decision.issuer, decision.decisionId, encoded);
+              this.append(view.taskId, `recovery:${decision.issuer}:${decision.decisionId}`, "failed", "no_recovery_remaining", "gateway", at, { kind: "run", id: run.runId });
+              continue;
+            }
+          }
           const pending = view.pendingIntent;
           if (pending !== undefined && (pending.command === "cancel" || pending.command === "pause") && this.#executionEnded(run.peer, run.runId)) {
             this.append(view.taskId, `command:${pending.idempotencyKey}:landed`, pending.command === "cancel" ? "cancelled" : "waiting_for_user_input", pending.command === "cancel" ? "user_cancelled" : "user_paused", "user", at, { kind: "run", id: run.runId });
@@ -139,14 +158,19 @@ export class Tasks {
           }
           const transition = [...this.events(view.taskId)].reverse().find((event) => event.from !== event.to);
           const stage = this.#runtime?.(view.bot);
-          if (view.state === "queued" && (stage === "stopped" || stage === "needs_attention")) this.append(view.taskId, `runtime:${run.runId}:${stage}`, stage === "stopped" ? "waiting_for_user_input" : "blocked", stage === "stopped" ? "runtime_stopped" : "runtime_needs_attention", "gateway", at, { kind: "run", id: run.runId });
+          if (view.state === "queued" && (stage === "stopped" || stage === "needs_attention")) this.append(view.taskId, `runtime:${run.runId}:${stage}:${view.lastEvent.seq}`, stage === "stopped" ? "waiting_for_user_input" : "blocked", stage === "stopped" ? "runtime_stopped" : "runtime_needs_attention", "gateway", at, { kind: "run", id: run.runId });
           if (stage === "ready" && (transition?.reason === "runtime_stopped" || transition?.reason === "runtime_needs_attention")) this.append(view.taskId, `runtime:${run.runId}:ready:${transition.seq}`, "queued", "runtime_ready", "gateway", at, { kind: "run", id: run.runId });
           this.#settleRequirements(run, at);
           const live = this.#live.has(run.peer);
           if (live) {
             const absence = this.#db.prepare("SELECT episode FROM task_absences WHERE task_id = ? AND run_id = ? AND reattached_at IS NULL ORDER BY absent_at DESC LIMIT 1").get(view.taskId, run.runId) as { episode: string } | undefined;
             if (absence !== undefined) {
-              if (view.state === "blocked" && transition?.reason === "owner_unreachable") this.append(view.taskId, `owner:${run.runId}:${absence.episode}:reattached`, transition.from ?? "running", "owner_reattached", "gateway", at, { kind: "run", id: run.runId });
+              if (view.state === "blocked" && transition?.reason === "owner_unreachable") {
+                const wait = this.waiting(run.peer, run.runId);
+                const prior = transition.from ?? "running";
+                const restored = WAIT.has(prior) ? wait === undefined ? this.#waitBase(view.taskId, transition.seq) : this.#waitState(wait.kind) : prior;
+                this.append(view.taskId, `owner:${run.runId}:${absence.episode}:reattached`, restored, "owner_reattached", "gateway", at, { kind: "run", id: run.runId });
+              }
               this.#db.prepare("UPDATE task_absences SET reattached_at = ? WHERE task_id = ? AND run_id = ? AND episode = ? AND reattached_at IS NULL").run(at, view.taskId, run.runId, absence.episode);
             }
           } else if (!this.#executionEnded(run.peer, run.runId) && ["running", "verifying", ...WAIT].includes(view.state) && transition?.reason !== "user_paused" && transition?.reason !== "runtime_stopped") {
@@ -231,7 +255,8 @@ export class Tasks {
     for (const row of rows) {
       const command = JSON.parse(row.json) as AttachV1Command;
       const view = this.#read(row.taskId)?.view;
-      if (command.kind !== "interrupt" && (view === undefined || TERMINAL.has(view.state) || (command.kind === "turn" && (view.state === "waiting_for_user_input" || view.pendingIntent?.command === "cancel" || view.pendingIntent?.command === "pause")))) { this.#db.prepare("UPDATE task_dispatches SET dispatched = 2 WHERE id = ?").run(row.id); continue; }
+      if (command.kind !== "interrupt" && (view === undefined || TERMINAL.has(view.state) || (command.kind === "turn" && (view.pendingIntent?.command === "cancel" || view.pendingIntent?.command === "pause" || this.events(row.taskId).filter((event) => event.from !== event.to).at(-1)?.reason === "user_paused")))) { this.#db.prepare("UPDATE task_dispatches SET dispatched = 2 WHERE id = ?").run(row.id); continue; }
+      if (command.kind === "turn" && view?.state !== "queued") continue;
       if (command.kind === "steer" && this.#db.prepare("SELECT 1 FROM attach_command_outbox WHERE agent_id = ? AND json_extract(command_json, '$.kind') = 'turn' AND json_extract(command_json, '$.turnId') = ?").get(row.peer, command.turnId) === undefined) continue;
       if (row.predecessor !== null && !this.#executionEnded(row.peer, row.predecessor)) continue;
       if (send(row.peer, row.id, command)) this.#db.prepare("UPDATE task_dispatches SET dispatched = 1 WHERE id = ?").run(row.id);
@@ -250,7 +275,7 @@ export class Tasks {
     const view = this.#read(task.taskId)?.view;
     if (view === undefined || view.currentRun.runId !== runId || TERMINAL.has(view.state)) return;
     // Harness terminal projection already appended the authoritative outcome at inbox admission.
-    const outcome = this.events(task.taskId).find((event) => event.ref?.id === runId && ["run_completed", "awaiting_children", "awaiting_artifacts", "run_failed", "run_interrupted", "approval_lost", "clarification_lost", "effects_uncertain", "run_timed_out", "user_cancelled"].includes(event.reason));
+    const outcome = this.events(task.taskId).find((event) => event.ref?.id === runId && ["run_completed", "awaiting_children", "awaiting_artifacts", "run_failed", "run_interrupted", "approval_lost", "clarification_lost", "effects_uncertain", "run_timed_out", "user_cancelled", "user_paused"].includes(event.reason));
     if (outcome !== undefined) return;
     this.append(task.taskId, `native:${runId}`, cause === "cancelled" ? "cancelled" : status === "completed" ? "completed" : "blocked", cause === "cancelled" ? "user_cancelled" : status === "completed" ? "run_completed" : status === "timed_out" ? "run_timed_out" : status === "interrupted" ? "run_interrupted" : "run_failed", status === "timed_out" ? "gateway" : "harness", at, { kind: "run", id: runId });
   }
@@ -377,7 +402,8 @@ export class Tasks {
   }
 
   #artifactReferences(run: RunRow): TaskArtifactReference[] {
-    const task = this.#db.prepare(`${TASK_SELECT} WHERE task_id = ?`).get(run.taskId) as TaskRow;
+    const task = this.#db.prepare(`${TASK_SELECT} WHERE task_id = ?`).get(run.taskId) as TaskRow | undefined;
+    if (task === undefined) throw new Error("Artifact reference source has no Task");
     const facts = this.#artifacts?.({ taskId: run.taskId, bot: task.bot, peer: run.peer, sessionId: run.sessionId, runId: run.runId }) ?? [];
     const required = this.#db.prepare("SELECT artifact_id AS artifactId FROM task_required_artifacts WHERE task_id = ? AND run_id = ?").all(run.taskId, run.runId) as unknown as { artifactId: string }[];
     const references = new Map(facts.map((fact) => [fact.artifactId, fact]));
@@ -410,15 +436,22 @@ export class Tasks {
       return;
     }
     const changed = this.#db.prepare("UPDATE task_waits SET settled_at = MIN(?, expires_at) WHERE task_id = ? AND run_id = ? AND kind = ? AND record_id = ? AND settled_at IS NULL").run(at, taskId, runId, kind, id).changes === 1;
-    if (!changed) return;
+    if (!changed || this.#executionEnded(this.#taskRun(taskId, runId).peer, runId)) return;
     const entry = [...this.events(taskId)].reverse().find((event) => event.reason === requested && event.ref?.id === id);
     if (entry === undefined || !WAIT.has(view.state)) return;
     const expired = status === "expired";
     const reason: TaskReason = kind === "approval" ? expired ? "approval_expired" : status === "approved" ? "approval_approved" : "approval_denied" : kind === "clarification" ? expired ? "clarification_expired" : "clarification_answered" : expired ? "device_request_expired" : status === "lost" ? "device_request_lost" : status === "ok" ? "device_answered" : "device_refused";
     const next = this.waiting(this.#taskRun(taskId, runId).peer, runId);
-    const base = [...this.events(taskId)].reverse().find((event) => event.seq <= entry.seq && ["approval_requested", "clarification_requested", "device_requested"].includes(event.reason) && (event.from === "running" || event.from === "verifying"))?.from ?? "running";
-    const restored = next === undefined ? base : next.kind === "approval" ? "waiting_for_approval" : next.kind === "clarification" ? "waiting_for_user_input" : "waiting_for_device";
+    const restored = next === undefined ? this.#waitBase(taskId, entry.seq) : this.#waitState(next.kind);
     this.append(taskId, `wait:${runId}:${kind}:${id}:settled`, restored, reason, expired || status === "lost" ? "gateway" : kind === "device" ? "device" : "user", at, { kind: refKind, id });
+  }
+
+  #waitBase(taskId: string, seq: number): TaskState {
+    return [...this.events(taskId)].reverse().find((event) => event.seq <= seq && ["approval_requested", "clarification_requested", "device_requested"].includes(event.reason) && (event.from === "running" || event.from === "verifying"))?.from ?? "running";
+  }
+
+  #waitState(kind: TaskWaitingOn["kind"]): TaskState {
+    return kind === "approval" ? "waiting_for_approval" : kind === "clarification" ? "waiting_for_user_input" : "waiting_for_device";
   }
 
   waiting(peer: string, runId: string): TaskWaitingOn | undefined {

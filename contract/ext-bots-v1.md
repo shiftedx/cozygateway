@@ -1102,3 +1102,9 @@ explicit declarations and commitment status for that source. At final proof, dec
 identities are retained; a missing later reference is unproven and keeps the Task verifying.
 There is no default commitment reader, and attachments, file IDs and delivery are not substituted
 for commitment evidence. Seam tests exercise this join only, not production Artifact validation.
+
+`no_recovery_remaining` also has no automatic producer. A trusted internal operator/policy reader
+must supply an explicit decision identity, issuer, Task/Run binding and recorded reason. The gateway
+persists that decision before appending `failed`, only from blocked and only after actual execution
+has ended. The reader is absent by default; retry budget exhaustion and timeout do not substitute
+for such a decision. No extra public Task command is introduced.

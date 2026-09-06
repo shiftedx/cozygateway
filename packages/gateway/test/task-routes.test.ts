@@ -43,6 +43,24 @@ describe("authenticated Task public routes", () => {
     expect(await (await request(`/tasks/${taskId}?cursor=1`)).json()).toMatchObject({ events: [{ seq: 2, reason: "scope_changed" }] });
     expect((await request(`/tasks/${taskId}?cursor=-1`)).status).toBe(400);
   });
+  it("rejects whitespace scope as malformed without omitting required conflict fields", async () => {
+    const { request, taskId } = await setup();
+    expect((await request(`/tasks/${taskId}/scope`, { idempotencyKey: "blank", goal: "   " })).status).toBe(400);
+  });
+  it.each(["completed", "failed", "cancelled"] as const)("enforces every terminal command rule for %s", async (state) => {
+    const { storage, request, taskId } = await setup();
+    const run = storage.tasks.read(taskId)!.view.currentRun.runId;
+    const sessionId = storage.tasks.read(taskId)!.view.sessionId;
+    const event = state === "completed" ? { kind: "commit" as const, threadId: sessionId, turnId: run, messageId: "final", blocks: [] } : { kind: state === "cancelled" ? "cancelled" as const : "failed" as const, threadId: sessionId, turnId: run, messageId: "final" };
+    storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event }, 100);
+    if (state === "failed") storage.tasks.recoveryDecisions(() => ({ taskId, runId: run, issuer: "test-policy", decisionId: "decision", reason: "Explicit recovery closure" }));
+    expect(storage.tasks.read(taskId)?.view.state).toBe(state);
+    for (const action of ["cancel", "pause", "resume", "retry", "scope"]) {
+      const response = await request(`/tasks/${taskId}/${action}`, { idempotencyKey: action, ...(action === "scope" ? { goal: "new" } : {}) });
+      expect(response.status).toBe(state === "cancelled" && action === "cancel" ? 200 : 409);
+      if (response.status === 409) expect(await response.json()).toMatchObject({ state, view: { taskId, state } });
+    }
+  });
   it("binds command idempotency to action and payload and refuses invalid command states", async () => {
     const { request, taskId } = await setup();
     const original = await (await request(`/tasks/${taskId}/scope`, { idempotencyKey: "key", goal: "changed" })).json();

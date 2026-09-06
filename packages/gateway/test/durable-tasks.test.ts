@@ -287,6 +287,48 @@ describe("durable Tasks on actual attach storage admission", () => {
     storage.close();
   });
 
+  it.each(["stopped", "needs_attention"])("holds a reserved retry across repeated runtime %s episodes until readiness", (parked) => {
+    const storage = openStorage(":memory:"); storage.tasks.clock(() => 0);
+    let stage = "ready"; storage.tasks.runtime(() => stage);
+    const sessionId = storage.nativeBotChat("sage", 1).sessionId;
+    const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "work" }, 2);
+    storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+    storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "failed", event: { kind: "failed", threadId: sessionId, turnId: "run", messageId: "failure" } }, 4);
+    const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+    storage.tasks.command(taskId, "retry", { idempotencyKey: "retry" }, 5);
+    const sent: string[] = [];
+    for (let episode = 0; episode < 2; episode++) {
+      stage = parked;
+      expect(storage.tasks.read(taskId)?.view.state).toBe(parked === "stopped" ? "waiting_for_user_input" : "blocked");
+      storage.tasks.dispatch((peer, id, frame) => { sent.push(frame.kind); return storage.enqueueTaskCommand(peer, id, frame, 6); });
+      expect(sent).toEqual([]);
+      stage = "ready";
+      expect(storage.tasks.read(taskId)?.view.state).toBe("queued");
+    }
+    storage.tasks.dispatch((peer, id, frame) => { sent.push(frame.kind); return storage.enqueueTaskCommand(peer, id, frame, 7); });
+    expect(sent).toEqual(["turn"]);
+    storage.close();
+  });
+
+  it("accepts no recovery remaining only from a trusted source-bound decision after execution seals", () => {
+    const storage = openStorage(":memory:"); storage.tasks.clock(() => 0);
+    const sessionId = storage.nativeBotChat("sage", 1).sessionId;
+    const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "work" }, 2);
+    storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+    storage.recordNativeBotTerminal({ bot: "sage", sessionId, turnId: "run", status: "timed_out", completedAt: 4 });
+    const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+    expect(storage.tasks.read(taskId)?.view.state).toBe("blocked");
+    storage.tasks.recoveryDecisions(() => ({ taskId, runId: "run", issuer: "trusted-policy", decisionId: "decision", reason: "Operator closed permitted recovery" }));
+    expect(storage.tasks.read(taskId)?.view.state).toBe("blocked");
+    storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "failed", event: { kind: "failed", threadId: sessionId, turnId: "run", messageId: "failure" } }, 5);
+    storage.tasks.recoveryDecisions(() => ({ taskId: "foreign", runId: "run", issuer: "trusted-policy", decisionId: "decision", reason: "Other Task decision" }));
+    expect(storage.tasks.read(taskId)?.view.state).toBe("blocked");
+    storage.tasks.recoveryDecisions(() => ({ taskId, runId: "run", issuer: "trusted-policy", decisionId: "decision", reason: "Operator closed permitted recovery" }));
+    expect(storage.tasks.read(taskId)?.view.state).toBe("failed");
+    expect(storage.tasks.read(taskId)?.events.filter((event) => event.reason === "no_recovery_remaining")).toHaveLength(1);
+    storage.close();
+  });
+
   it("joins explicitly declared Artifact references through the future commitment reader seam", () => {
     const storage = openStorage(":memory:");
     storage.tasks.clock(() => 0);
@@ -315,7 +357,7 @@ describe("durable Tasks on actual attach storage admission", () => {
     const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "work" }, 2);
     storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
     const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
-    const child = { kind: "delegation" as const, threadId: sessionId, turnId: "run", batchId: "batch", childId: "child", index: 0, count: 1, status: "running" as const };
+    const child = { kind: "delegation" as const, threadId: sessionId, turnId: "run", batchId: "batch", childId: "child", index: 0, count: 1, lastActiveAt: 4, status: "running" as const };
     storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "child", event: child }, 4);
     storage.acceptAttachEvent("sage", { kind: "event", sequence: 2, eventId: "final", event: { kind: "commit", threadId: sessionId, turnId: "run", messageId: "reply", blocks: [] } }, 5);
     expect(storage.tasks.read(taskId)?.view.state).toBe("verifying");

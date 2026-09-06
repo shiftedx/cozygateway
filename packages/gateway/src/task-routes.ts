@@ -28,6 +28,7 @@ export function registerTaskRoutes(app: Hono<Env>, auth: MiddlewareHandler<Env>,
       let body: unknown;
       try { body = await c.req.json(); } catch { return c.json({ error: { code: "invalid_request", message: "invalid Task command" } }, 400); }
       if (!check(action === "scope" ? TaskScopeCommandSchema : TaskCommandSchema, body)) return c.json({ error: { code: "invalid_request", message: "invalid Task command" } }, 400);
+      if ("goal" in body && typeof body.goal === "string" && body.goal.trim().length === 0) return c.json({ error: { code: "invalid_request", message: "Task goal must contain text" } }, 400);
       const taskId = c.req.param("taskId");
       if (storage.tasks.read(taskId) === undefined) return c.json({ error: { code: "not_found", message: "Task not found" } }, 404);
       const result = storage.tasks.command(taskId, action, body, now());
