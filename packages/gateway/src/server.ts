@@ -689,22 +689,32 @@ export async function startGateway(
         }
         // The peer echoes the appId the `cozyapp_action` command carried, exactly as it does on
         // `cozyapp_action_status`, so this id is already the stored one and is not namespaced again.
+        //
+        // THIS BRANCH ALWAYS APPLIES. A no-op is not a failure here, and unlike the v1 status event
+        // a no-op is the ORDINARY case: the gateway already stamped `delivered` when this peer
+        // acked the command, so the peer's own `running` can never change anything. Returning
+        // false would retry the event and then dead-letter it, head-of-line blocking every later
+        // event from this bot. A duplicate terminal, a terminal on an already settled action, and
+        // a receipt naming an action this bot does not own are no-ops on the same rule: nothing is
+        // written, and the stream keeps moving.
         if (frame.event.kind === "cozyapp_action_receipt") {
           const appId = frame.event.appId;
           try {
             if (frame.event.data !== undefined) assertValidCozyAppData(frame.event.data);
-          } catch { return true; }
-          const settled = frame.event.status === "running"
-            ? storage.markCozyAppActionDelivered(frame.event.actionRequestId, Date.now())
+          } catch {
+            return true;
+          }
+          const changed = frame.event.status === "running"
+            ? storage.markCozyAppActionDelivered(frame.event.actionRequestId, agentId, Date.now())
             : storage.settleCozyAppAction({
                 id: frame.event.actionRequestId, appId, creatorBot: agentId, actionId: frame.event.actionId,
                 status: frame.event.status, now: Date.now(),
                 ...(frame.event.data === undefined ? {} : { data: frame.event.data }),
               });
-          if (settled && frame.event.status !== "running")
+          if (changed && frame.event.status !== "running")
             nativeBotPlane?.clearCozyAppActionOrigin(agentId, frame.event.appId, frame.event.actionRequestId);
-          if (settled) hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() });
-          return settled;
+          if (changed) hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() });
+          return true;
         }
         if (frame.event.kind === "cozyapp_action_status") {
           if (storage.settleCozyAppAction({ id: frame.event.actionRequestId, appId: frame.event.appId, creatorBot: agentId, actionId: frame.event.actionId, status: frame.event.status, now: Date.now() })) {
@@ -724,9 +734,9 @@ export async function startGateway(
       },
       // Capability row 67. The peer taking the command off the wire is the public receipt's
       // `running`, derived for every peer including one that stays at cozyapps 1.
-      onCommandDelivered: (_agentId, commandId) => {
+      onCommandDelivered: (agentId, commandId) => {
         if (commandId.startsWith("cozyapp-action:")
-          && storage.markCozyAppActionDelivered(commandId.slice("cozyapp-action:".length), Date.now()))
+          && storage.markCozyAppActionDelivered(commandId.slice("cozyapp-action:".length), agentId, Date.now()))
           hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() });
       },
       onMobileRequest: (agentId, frame) => nativeBotPlane?.mobileRequest(agentId, frame),

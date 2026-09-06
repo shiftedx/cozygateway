@@ -39,13 +39,18 @@ cozyapps 1, keeps v1 behavior unchanged, and still gets everything the gateway d
 
 `GET /cozyapps/:id/values` returns `{values}`. `PUT /cozyapps/:id/values/:valueId` accepts
 `{expectedRevision, idempotencyKey, type, value}` and returns the stored
-`{appId, valueId, type, value, revision, updatedAt}`. `type` is a product field type only:
+`{appId, valueId, type, value, revision, updatedAt}`. `valueId` is the same bounded id shape as every other opaque id here and is validated before any
+storage access. `type` is a product field type only:
 `string`, `number`, `boolean`, `date` (epoch milliseconds) or `selection`. Nested JSON, secret
 material, permissions and a bot-authored validation language are not representable, and a value
 that is not what its declared type admits is `400 invalid_request`. A value carries its OWN
 revision, independent of the app tree's. `expectedRevision: 0` means the writer observed no value;
-a stale write is `409 conflict` carrying `current`. Replaying the idempotency key that last wrote
-a value returns that prior result and writes nothing a second time. THIS IS THE ONLY WRITE PATH: a
+a stale write is `409 conflict` carrying `current`. The idempotency key is BOUND TO ITS PAYLOAD: it stands for one write of one value id at one
+observed revision with one value, so replaying it returns that prior result and writes nothing a
+second time, and reusing it for a different write is `409 conflict` rather than a success carrying
+the old value. An app holds at most 64 saved values; a new value past that is
+`400 invalid_request`, which is also what keeps the bounded `values` array on the action command
+inside its own schema. Editing an existing value at the ceiling still works. THIS IS THE ONLY WRITE PATH: a
 saved value is written by the user action, and no attach frame reaches it. A bot READS values,
 which ride to it on the action command below.
 
@@ -64,7 +69,15 @@ MODEL OUTPUT ARE NEVER A COMPLETED ACTION: only the peer's own terminal event se
 
 `data` is the source-attributed current-data snapshot, a map of value reference to
 `{source, asOf, value, state}` where `state` is `fresh`, `stale` or `error`. It is written by the
-bot over attach and by nothing else.
+bot over attach and by nothing else. Its keys are CLOSED on the same bounded reference a component
+uses, so no URL, path or unbounded string can occupy the position a client renders by, and it is
+bounded to <=64 entries and <=16KiB serialized.
+
+A receipt reaches a terminal only from the peer's own event, with one pre-existing v1 exception
+this version does not change: when the gateway cannot queue the command to the peer at all, it
+settles that action `failed` itself, because an action nobody can be given has no peer to report
+it. A peer's own `running` receipt on an action the gateway already moved is applied as a no-op
+and acknowledged; it is never a projection failure.
 
 ### The document envelope
 

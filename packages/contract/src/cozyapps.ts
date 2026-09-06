@@ -88,6 +88,7 @@ export const COZYAPP_MAX_SECTION_COMPONENTS = 24;
 export const COZYAPP_MAX_DOCUMENT_COMPONENTS = 100;
 export const COZYAPP_MAX_DOCUMENT_BYTES = 32 * 1024;
 export const COZYAPP_MAX_DATA_ENTRIES = 64;
+export const COZYAPP_MAX_DATA_BYTES = 16 * 1024;
 export const COZYAPP_MAX_VALUES = 64;
 export const COZYAPP_MAX_VALUE_REVISIONS = 32;
 /** This gateway serves one person. The envelope still carries an owner because the product
@@ -115,6 +116,9 @@ export const CozyAppValueSchema = Type.Object({
   revision: Type.Integer({ minimum: 1 }), updatedAt: Type.Integer({ minimum: 0 }),
 }, { additionalProperties: false });
 export type CozyAppValue = Static<typeof CozyAppValueSchema>;
+/** The published id shape a saved value's own id must have, exported so a surface that takes the
+ *  id from a path can hold it to exactly what the stored record declares. */
+export const CozyAppValueIdSchema = Id;
 export const CozyAppValuesSchema = Type.Object({ values: Type.Array(CozyAppValueSchema, { maxItems: COZYAPP_MAX_VALUES }) }, { additionalProperties: false });
 /** `expectedRevision: 0` means the writer observed no value at all, so a first write and a stale
  *  overwrite are the same check. The idempotency key makes a retried tap one write. */
@@ -152,7 +156,11 @@ export const CozyAppDataPointSchema = Type.Object({
   state: Type.Union(COZYAPP_DATA_STATES.map((name) => Type.Literal(name))),
 }, { additionalProperties: false });
 export type CozyAppDataPoint = Static<typeof CozyAppDataPointSchema>;
-export const CozyAppDataSchema = Type.Record(ValueRef, CozyAppDataPointSchema);
+/** Closed on the SAME bounded reference a component reads by. TypeBox emits a `patternProperties`
+ *  object, so `additionalProperties: false` is what actually refuses a key outside the pattern: a
+ *  URL, a path, or anything else cannot occupy the position a client renders as a label. The
+ *  pattern carries no length, so the assert below bounds the key too. */
+export const CozyAppDataSchema = Type.Record(ValueRef, CozyAppDataPointSchema, { additionalProperties: false });
 export type CozyAppData = Static<typeof CozyAppDataSchema>;
 
 /** The small versioned envelope. It exists because a phone cannot persist a remote bot's work; it
@@ -250,7 +258,10 @@ export function assertValidCozyAppDocument(value: unknown): CozyAppDocument {
   return document;
 }
 
-/** The bot-written snapshot. Bounded entry count is the one ceiling the schema cannot express. */
+const VALUE_REF_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
+
+/** The bot-written snapshot. Entry count, key length and serialized size are the three ceilings the
+ *  schema cannot express, and a bot writes this, so all three are enforced before it is stored. */
 export function assertValidCozyAppData(value: unknown): CozyAppData {
   const error = Value.Errors(CozyAppDataSchema, value).First();
   if (error !== undefined) throw new ContractViolation(`${error.message} at ${error.path || "/"}`, error.path);
@@ -259,8 +270,12 @@ export function assertValidCozyAppData(value: unknown): CozyAppData {
   if (entries.length > COZYAPP_MAX_DATA_ENTRIES)
     throw new ContractViolation("data exceeds maximum entries at /", "/");
   for (const [ref, point] of entries) {
+    if (ref.length > 128 || !VALUE_REF_PATTERN.test(ref))
+      throw new ContractViolation(`data key is not a value reference at /${ref.slice(0, 32)}`, "/");
     assertPlainText(point.source, `/${ref}/source`);
     if (typeof point.value === "string") assertPlainText(point.value, `/${ref}/value`);
   }
+  if (Buffer.byteLength(JSON.stringify(data), "utf8") > COZYAPP_MAX_DATA_BYTES)
+    throw new ContractViolation("data exceeds maximum serialized size at /", "/");
   return data;
 }

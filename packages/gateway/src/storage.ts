@@ -38,6 +38,7 @@ import type {
 } from "cozygateway-contract";
 import {
   COZYAPP_DASHBOARD_OWNER,
+  COZYAPP_MAX_VALUES,
   cozyAppReceiptStatus,
   cozyAppValueOfType,
 } from "cozygateway-contract";
@@ -689,6 +690,10 @@ CREATE TABLE IF NOT EXISTS cozy_app_values (
   value_json TEXT NOT NULL,
   revision INTEGER NOT NULL,
   idempotency_key TEXT NOT NULL,
+  -- The key alone is a latch, not idempotency. This is a digest of the exact write the key stood
+  -- for: value id, the revision the writer observed, the declared type and the value. A repeat of
+  -- the key with a different write is a conflict rather than a silent replay of the old value.
+  request_hash TEXT NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (app_id, value_id)
 ) STRICT, WITHOUT ROWID;
@@ -2018,9 +2023,10 @@ export class Storage {
 
   /** The command reached the peer that will run it, which is the public receipt's `running`. It is
    *  the ONLY thing the gateway can say on its own: HTTP acceptance is `queued`, and the terminal
-   *  is the peer's own event. A settled action is never reopened. */
-  markCozyAppActionDelivered(id: string, now: number): boolean {
-    return this.#db.prepare("UPDATE cozy_app_actions SET status = 'delivered', updated_at = ? WHERE id = ? AND status = 'requested'").run(now, id).changes === 1;
+   *  is the peer's own event. A settled action is never reopened. Scoped by the owning bot, as
+   *  every other action mutation is, so one attached bot cannot move another bot's action. */
+  markCozyAppActionDelivered(id: string, creatorBot: string, now: number): boolean {
+    return this.#db.prepare("UPDATE cozy_app_actions SET status = 'delivered', updated_at = ? WHERE id = ? AND creator_bot = ? AND status = 'requested'").run(now, id, creatorBot).changes === 1;
   }
 
   /** `data` is the bot's source-attributed snapshot and arrives only on the peer's own terminal
@@ -2054,25 +2060,36 @@ export class Storage {
   /** The saved editable input. Written by the user action and by nothing else: no attach frame
    *  reaches this table. The observed revision is the whole conflict check, and the idempotency
    *  key makes a retried tap replay its own result rather than write a second time. */
-  writeCozyAppValue(input: { appId: string; valueId: string; type: CozyAppValueType; value: CozyAppValueLiteral; expectedRevision: number; idempotencyKey: string; now: number }): { outcome: "written" | "replayed" | "conflict" | "invalid_type" | "not_found"; value?: CozyAppValue } {
+  writeCozyAppValue(input: { appId: string; valueId: string; type: CozyAppValueType; value: CozyAppValueLiteral; expectedRevision: number; idempotencyKey: string; now: number }): { outcome: "written" | "replayed" | "conflict" | "invalid_type" | "limit_exceeded" | "not_found"; value?: CozyAppValue } {
     if (!cozyAppValueOfType(input.type, input.value)) return { outcome: "invalid_type" };
     if (this.#db.prepare("SELECT 1 FROM cozy_apps WHERE id = ?").get(input.appId) === undefined) return { outcome: "not_found" };
+    // The key stands for ONE write, not for a value id: same key, different write is a conflict.
+    const requestHash = createHash("sha256")
+      .update(JSON.stringify([input.valueId, input.expectedRevision, input.type, input.value]))
+      .digest("hex");
     const read = (): CozyAppValue | undefined => this.cozyAppValues(input.appId).find((entry) => entry.valueId === input.valueId);
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const current = read();
       if (current !== undefined) {
-        const key = this.#db.prepare("SELECT idempotency_key AS key FROM cozy_app_values WHERE app_id = ? AND value_id = ?").get(input.appId, input.valueId) as { key: string } | undefined;
-        if (key?.key === input.idempotencyKey) { this.#db.exec("COMMIT"); return { outcome: "replayed", value: current }; }
+        const stored = this.#db.prepare("SELECT idempotency_key AS key, request_hash AS hash FROM cozy_app_values WHERE app_id = ? AND value_id = ?").get(input.appId, input.valueId) as { key: string; hash: string } | undefined;
+        if (stored?.key === input.idempotencyKey) {
+          this.#db.exec("COMMIT");
+          return stored.hash === requestHash ? { outcome: "replayed", value: current } : { outcome: "conflict", value: current };
+        }
         if (current.revision !== input.expectedRevision) { this.#db.exec("COMMIT"); return { outcome: "conflict", value: current }; }
-      } else if (input.expectedRevision !== 0) {
-        this.#db.exec("COMMIT");
-        return { outcome: "conflict" };
+      } else {
+        if (input.expectedRevision !== 0) { this.#db.exec("COMMIT"); return { outcome: "conflict" }; }
+        // Capability row 67. The ceiling is on how many values one app holds, so editing an
+        // existing value at the ceiling still works; only a NEW one past it is refused. The cap is
+        // enforced here because the action command carries these values on a bounded array.
+        const held = Number((this.#db.prepare("SELECT COUNT(*) AS held FROM cozy_app_values WHERE app_id = ?").get(input.appId) as { held: number }).held);
+        if (held >= COZYAPP_MAX_VALUES) { this.#db.exec("COMMIT"); return { outcome: "limit_exceeded" }; }
       }
       const revision = (current?.revision ?? 0) + 1;
-      this.#db.prepare(`INSERT INTO cozy_app_values (app_id, value_id, type, value_json, revision, idempotency_key, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(app_id, value_id) DO UPDATE SET type = excluded.type, value_json = excluded.value_json, revision = excluded.revision, idempotency_key = excluded.idempotency_key, updated_at = excluded.updated_at`)
-        .run(input.appId, input.valueId, input.type, JSON.stringify(input.value), revision, input.idempotencyKey, input.now);
+      this.#db.prepare(`INSERT INTO cozy_app_values (app_id, value_id, type, value_json, revision, idempotency_key, request_hash, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(app_id, value_id) DO UPDATE SET type = excluded.type, value_json = excluded.value_json, revision = excluded.revision, idempotency_key = excluded.idempotency_key, request_hash = excluded.request_hash, updated_at = excluded.updated_at`)
+        .run(input.appId, input.valueId, input.type, JSON.stringify(input.value), revision, input.idempotencyKey, requestHash, input.now);
       this.#db.exec("COMMIT");
       return { outcome: "written", value: { appId: input.appId, valueId: input.valueId, type: input.type, value: input.value, revision, updatedAt: input.now } };
     } catch (error) {

@@ -114,7 +114,7 @@ describe("cozyapps v2 routes", () => {
     expect(accepted.status).toBe(202);
     const receipts = await (await device("/cozyapps/sage:market/receipts")).json() as { receipts: Array<Record<string, unknown>> };
     expect(receipts.receipts[0]).toMatchObject({ status: "queued", appRevision: 1, valueRevisions: [{ valueId: "ticker", revision: 2 }] });
-    storage.markCozyAppActionDelivered(receipts.receipts[0]!["id"] as string, 150);
+    storage.markCozyAppActionDelivered(receipts.receipts[0]!["id"] as string, "sage", 150);
     expect(((await (await device("/cozyapps/sage:market/receipts")).json()) as { receipts: Array<{ status: string }> }).receipts[0]?.status).toBe("running");
   });
 
@@ -128,5 +128,34 @@ describe("cozyapps v2 routes", () => {
       ["/cozyapps/sage:market/receipts", {}],
     ] as Array<[string, RequestInit]>)
       expect((await app.request(path, init)).status, path).toBe(401);
+  });
+});
+
+/** Fix round 1, review r0 findings I1, I3 and I4 at the route seam. */
+describe("cozyapps v2 route hardening", () => {
+  it("refuses a valueId that is not the published id shape, before it reaches storage", async () => {
+    const { device, storage } = await setup();
+    const body = JSON.stringify({ expectedRevision: 0, idempotencyKey: "tap-1", type: "string", value: "x" });
+    for (const valueId of [`${"a".repeat(200)} <script>`, "a b", "a/b", "a".repeat(129)])
+      expect((await device(`/cozyapps/sage:market/values/${encodeURIComponent(valueId)}`, { method: "PUT", headers: JSON_HEADERS, body })).status, valueId.slice(0, 20)).toBe(400);
+    expect(storage.cozyAppValues("sage:market")).toHaveLength(0);
+  });
+
+  it("answers 409 when a spent idempotency key comes back with a different payload", async () => {
+    const { device } = await setup();
+    const write = (body: object) => device("/cozyapps/sage:market/values/ticker", { method: "PUT", headers: JSON_HEADERS, body: JSON.stringify(body) });
+    expect((await write({ expectedRevision: 0, idempotencyKey: "k1", type: "string", value: "AAPL" })).status).toBe(200);
+    const reused = await write({ expectedRevision: 1, idempotencyKey: "k1", type: "string", value: "MSFT" });
+    expect(reused.status).toBe(409);
+    expect(await reused.json()).toMatchObject({ error: { code: "conflict" }, current: { value: "AAPL", revision: 1 } });
+  });
+
+  it("refuses the value past the ceiling with a bounded error and stores nothing", async () => {
+    const { device, storage } = await setup();
+    for (let index = 0; index < 64; index += 1)
+      expect((await device(`/cozyapps/sage:market/values/v${index}`, { method: "PUT", headers: JSON_HEADERS, body: JSON.stringify({ expectedRevision: 0, idempotencyKey: `k${index}`, type: "number", value: index }) })).status).toBe(200);
+    const refused = await device("/cozyapps/sage:market/values/v64", { method: "PUT", headers: JSON_HEADERS, body: JSON.stringify({ expectedRevision: 0, idempotencyKey: "k64", type: "number", value: 64 }) });
+    expect(refused.status).toBe(400);
+    expect(storage.cozyAppValues("sage:market")).toHaveLength(64);
   });
 });

@@ -35,6 +35,7 @@ import {
   CozyAppReplaceTreeRequestSchema,
   CozyAppActionRequestSchema,
   CozyAppValueWriteRequestSchema,
+  CozyAppValueIdSchema,
   CozyAppDashboardWriteRequestSchema,
   assertValidCozyAppTree,
   assertValidCozyAppDocument,
@@ -1318,9 +1319,14 @@ export function createApp(deps: AppDeps): Hono<Env> {
   app.put("/cozyapps/:id/values/:valueId", requireDevice, async (c) => {
     try {
       const input = assertValid(CozyAppValueWriteRequestSchema, await c.req.json());
-      const result = deps.storage.writeCozyAppValue({ appId: c.req.param("id"), valueId: c.req.param("valueId"), type: input.type, value: input.value, expectedRevision: input.expectedRevision, idempotencyKey: input.idempotencyKey, now: deps.now() });
+      // The value id comes off the PATH, so it is validated here against the same published id
+      // shape the stored record uses. Otherwise a read could serve a body the gateway's own
+      // schema refuses. Checked before any storage access.
+      const valueId = assertValid(CozyAppValueIdSchema, c.req.param("valueId"));
+      const result = deps.storage.writeCozyAppValue({ appId: c.req.param("id"), valueId, type: input.type, value: input.value, expectedRevision: input.expectedRevision, idempotencyKey: input.idempotencyKey, now: deps.now() });
       if (result.outcome === "not_found") return c.json(errorBody("not_found", "cozy app not found"), 404);
       if (result.outcome === "invalid_type") return c.json(errorBody("invalid_request", "value is not of its declared type"), 400);
+      if (result.outcome === "limit_exceeded") return c.json(errorBody("invalid_request", "cozy app holds the maximum number of saved values"), 400);
       if (result.outcome === "conflict") return c.json({ error: { code: "conflict", message: "cozy app value changed; refresh and retry" }, ...(result.value === undefined ? {} : { current: result.value }) }, 409);
       if (result.outcome === "written") deps.cozyAppsChanged?.();
       return c.json(result.value!);

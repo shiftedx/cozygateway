@@ -347,3 +347,115 @@ with the additive `started_at` column named as the upgrade path in code and abov
 
 After the renumber: `pnpm -r typecheck` Done on all four packages; contract 200 passed, gateway
 1495 passed with 2 skipped, conformance 99 passed with 19 skipped, zero failures.
+
+## Fix round 1 (independent review r0)
+
+One reproduced Critical and five Important findings, all fixed with red-then-green at the seam each
+one lives on. The contract text was corrected in the same pass wherever it asserted something the
+code did not enforce.
+
+**C1, a peer's own `running` receipt declined projection and dead-lettered the bot's stream.**
+`packages/gateway/src/server.ts` `cozyapp_action_receipt` now ALWAYS returns applied. A no-op is the
+ordinary case here, not a failure: the gateway stamps `delivered` on the command ack, so the peer's
+own `running` can never change anything, and returning false retried the event and then dead
+lettered it. A duplicate terminal, a terminal on an already settled action, and a receipt naming an
+action this bot does not own are no-ops on the same rule. `markCozyAppActionDelivered` is called
+with the peer's identity, so a no-op there is also not a failure.
+
+**I1, the value idempotency key was a last-key latch, not idempotency.** `cozy_app_values` gains
+`request_hash`, a sha256 of `[valueId, expectedRevision, type, value]`. Same key with the same
+payload is `replayed` with the recorded result; SAME KEY WITH A DIFFERENT PAYLOAD IS `409 conflict`
+carrying the current value, instead of a 200 that dropped the write and returned the old value. A
+spent key replayed after an intervening write now fails the revision check and conflicts.
+
+**I2, the snapshot's keys were unvalidated and `data` had no byte bound.** `CozyAppDataSchema` is
+`Type.Record(ValueRef, ..., { additionalProperties: false })`, which is what actually refuses a key
+outside the pattern under TypeBox's `patternProperties`. `assertValidCozyAppData` additionally
+bounds key length (the pattern carries none) and the serialized size at the new
+`COZYAPP_MAX_DATA_BYTES` of 16KiB, beside the existing 64-entry ceiling.
+
+**I3, `valueId` came off the path unvalidated.** The route validates it against the exported
+`CozyAppValueIdSchema` before any storage access, so a read can no longer serve a body the
+gateway's own schema refuses.
+
+**I4, `COZYAPP_MAX_VALUES` was declared and never enforced.** `writeCozyAppValue` refuses a NEW
+value past 64 with `limit_exceeded`, mapped to `400 invalid_request`; editing an existing value at
+the ceiling still works. This is what keeps the bounded `values` array on `cozyapp_action` inside
+its own schema, and the attach test asserts the emitted frame against `AttachV1CommandFrameSchema`
+at the ceiling rather than trusting the arithmetic.
+
+**I5, `markCozyAppActionDelivered` was scoped by action id alone.** It now takes the owning bot and
+predicates on `creator_bot`, as `settleCozyAppAction` beside it does, so one attached bot cannot
+move another bot's action to `running`.
+
+Contract text brought back into agreement in `contract/ext-cozyapps-v1.md`: the snapshot's closed
+keys and its two ceilings, the payload-bound idempotency key and its 409, the 64-value ceiling, the
+validated `valueId`, the no-op `running` receipt, and the one pre-existing v1 exception to "only
+the peer's own terminal event settles one" (an action the gateway cannot queue at all is settled
+`failed` with no peer, which is review finding M4).
+
+### Covering tests
+
+| Finding | File | Test |
+| --- | --- | --- |
+| C1 | `packages/gateway/test/cozyapps-dashboard-attach-v1-e2e.test.ts` | applies a peer running receipt as a no-op and keeps its later durable events flowing |
+| I1 | `packages/gateway/test/cozyapps-dashboard-records.test.ts` | binds an idempotency key to its payload and refuses the same key for a different write |
+| I1 | `packages/gateway/test/cozyapps-dashboard-routes.test.ts` | answers 409 when a spent idempotency key comes back with a different payload |
+| I2 | `packages/contract/test/cozyapps-dashboard.test.ts` | refuses a key that is not the same bounded reference a component uses; refuses more entries than the ceiling and more bytes than the ceiling |
+| I3 | `packages/gateway/test/cozyapps-dashboard-routes.test.ts` | refuses a valueId that is not the published id shape, before it reaches storage |
+| I4 | `packages/gateway/test/cozyapps-dashboard-records.test.ts` | enforces the saved value ceiling instead of letting an over-cap array reach the wire |
+| I4 | `packages/gateway/test/cozyapps-dashboard-routes.test.ts` | refuses the value past the ceiling with a bounded error and stores nothing |
+| I4 | `packages/gateway/test/cozyapps-dashboard-attach-v1-e2e.test.ts` | never emits an action command whose values exceed the protocol schema |
+| I5 | `packages/gateway/test/cozyapps-dashboard-records.test.ts` | lets a bot move only its own action to running |
+
+### RED then GREEN, fix round 1
+
+RED, with the fixes not yet written:
+
+```
+packages/contract $ npx vitest run test/cozyapps-dashboard.test.ts
+      Tests  2 failed | 9 passed (11)
+
+packages/gateway $ npx vitest run test/cozyapps-dashboard-records.test.ts \
+    test/cozyapps-dashboard-routes.test.ts test/cozyapps-dashboard-attach-v1-e2e.test.ts
+      Tests  7 failed | 18 passed (25)
+```
+
+The C1 case failed by timeout after 5 seconds waiting for the peer's next durable event, which is
+the head-of-line block itself.
+
+GREEN:
+
+```
+$ pnpm -r typecheck
+packages/contract typecheck: Done
+packages/relay typecheck: Done
+packages/gateway typecheck: Done
+packages/conformance typecheck: Done
+
+packages/contract $ npx vitest run
+ Test Files  20 passed (20)
+      Tests  203 passed (203)
+
+packages/conformance $ npx vitest run
+ Test Files  10 passed (10)
+      Tests  99 passed | 19 skipped (118)
+
+packages/gateway $ npx vitest run test/cozyapps-dashboard-records.test.ts \
+    test/cozyapps-dashboard-routes.test.ts test/cozyapps-dashboard-attach-v1-e2e.test.ts \
+    test/cozyapps-attach-v1-e2e.test.ts test/storage.test.ts test/server.test.ts \
+    test/attach-v1-ingress.test.ts test/attach-capability-completeness.test.ts \
+    test/resources-routes.test.ts
+ Test Files  9 passed (9)
+      Tests  135 passed (135)
+```
+
+The full suite is the lead's batch gate and was not run this round, per the standing ruling.
+
+### Not addressed this round
+
+The review's five Minor findings were not in the fix list and are untouched, except M4, which the
+contract text now states correctly. M1 (the bot lane computes `expectedRevision` immediately before
+its own write, so two frames from one bot race last-write-wins), M2 (a saved string value skips
+`assertPlainText`), M3 (the `forbidden` outcome is unreachable from HTTP), and M5 (the receipt read
+truncates at 1000 with no cursor) remain open for the lead to schedule.

@@ -3,6 +3,7 @@ import {
   COZYAPPS_CAPABILITY_VERSION,
   COZYAPP_DATA_STATES,
   COZYAPP_DOCUMENT_VERSION,
+  COZYAPP_MAX_DATA_BYTES,
   COZYAPP_MAX_DOCUMENT_BYTES,
   COZYAPP_RECEIPT_STATES,
   COZYAPP_VALUE_TYPES,
@@ -10,9 +11,11 @@ import {
   CozyAppActionSchema,
   CozyAppDashboardSchema,
   CozyAppDashboardWriteRequestSchema,
+  CozyAppDataSchema,
   CozyAppDocumentSchema,
   CozyAppValueSchema,
   CozyAppValueWriteRequestSchema,
+  assertValidCozyAppData,
   assertValidCozyAppDocument,
   check,
   cozyAppReceiptStatus,
@@ -119,5 +122,34 @@ describe("cozyapps v2 dashboard records", () => {
     expect(check(CozyAppActionSchema, v1)).toBe(true);
     expect(check(CozyAppActionSchema, { ...v1, status: "queued" })).toBe(false);
     expect(check(CozyAppActionSchema, { ...v1, appRevision: 4 })).toBe(false);
+  });
+});
+
+/** Fix round 1, review r0 finding I2. The snapshot a client reads by key had unvalidated keys and
+ *  no byte ceiling, which made the contract's own "no URL can occupy a reference" claim false of
+ *  the half a bot writes. */
+describe("cozyapps v2 snapshot data bounds", () => {
+  const point = { source: "quotes.example", asOf: 1, value: "1", state: "fresh" as const };
+
+  it("accepts a bounded identifier key and the point shape it names", () => {
+    expect(assertValidCozyAppData({ "quote.value": point })).toEqual({ "quote.value": point });
+    expect(check(CozyAppDataSchema, { "quote.value": point })).toBe(true);
+  });
+
+  it("refuses a key that is not the same bounded reference a component uses", () => {
+    for (const key of ["javascript:alert(1)", "a/b", "https://attacker.example/x", ".leading", "", "a".repeat(129)])
+      expect(() => assertValidCozyAppData({ [key]: point }), JSON.stringify(key.slice(0, 40))).toThrow();
+    expect(check(CozyAppDataSchema, { "javascript:alert(1)": point })).toBe(false);
+    expect(check(CozyAppDataSchema, { "a/b": point })).toBe(false);
+  });
+
+  it("refuses more entries than the ceiling and more bytes than the ceiling", () => {
+    const many = Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`k${index}`, point]));
+    expect(() => assertValidCozyAppData(many)).toThrow(/entries/);
+    const heavy = Object.fromEntries(Array.from({ length: 16 }, (_, index) => [
+      `k${index}`, { ...point, source: "s".repeat(120), value: "v".repeat(2_048) },
+    ]));
+    expect(JSON.stringify(heavy).length).toBeGreaterThan(COZYAPP_MAX_DATA_BYTES);
+    expect(() => assertValidCozyAppData(heavy)).toThrow(/size/);
   });
 });

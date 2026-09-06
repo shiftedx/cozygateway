@@ -117,7 +117,7 @@ describe("cozyapps v2 action receipts", () => {
     expect(storage.cozyAppReceipts(appId)[0]).toMatchObject({
       id: "action-1", status: "queued", appRevision: 1, valueRevisions: [{ valueId: "ticker", revision: 2 }],
     });
-    expect(storage.markCozyAppActionDelivered("action-1", 210)).toBe(true);
+    expect(storage.markCozyAppActionDelivered("action-1", "sage", 210)).toBe(true);
     expect(storage.cozyAppReceipts(appId)[0]).toMatchObject({ status: "running" });
     expect(storage.settleCozyAppAction({ id: "action-1", appId, creatorBot: "sage", actionId: "refresh", status: "completed", now: 220 })).toBe(true);
     expect(storage.cozyAppReceipts(appId)[0]).toMatchObject({ status: "completed" });
@@ -143,8 +143,8 @@ describe("cozyapps v2 action receipts", () => {
     const appId = seed(first);
     for (const [id, key] of [["queued-1", "k1"], ["running-1", "k2"], ["completed-1", "k3"], ["failed-1", "k4"]] as const)
       first.createCozyAppAction({ id, appId, creatorBot: "sage", actionId: "refresh", idempotencyKey: key, now: 200 });
-    first.markCozyAppActionDelivered("running-1", 205);
-    first.markCozyAppActionDelivered("completed-1", 205);
+    first.markCozyAppActionDelivered("running-1", "sage", 205);
+    first.markCozyAppActionDelivered("completed-1", "sage", 205);
     first.settleCozyAppAction({ id: "completed-1", appId, creatorBot: "sage", actionId: "refresh", status: "completed", now: 210 });
     first.settleCozyAppAction({ id: "failed-1", appId, creatorBot: "sage", actionId: "refresh", status: "failed", now: 210 });
     first.close();
@@ -156,7 +156,7 @@ describe("cozyapps v2 action receipts", () => {
     });
     // A terminal is written once. A duplicate settle after restart changes nothing and says so.
     expect(second.settleCozyAppAction({ id: "completed-1", appId, creatorBot: "sage", actionId: "refresh", status: "failed", now: 300 })).toBe(false);
-    expect(second.markCozyAppActionDelivered("completed-1", 300)).toBe(false);
+    expect(second.markCozyAppActionDelivered("completed-1", "sage", 300)).toBe(false);
     expect(second.cozyAppReceipts(appId).find((receipt) => receipt.id === "completed-1")?.status).toBe("completed");
   });
 });
@@ -178,5 +178,50 @@ describe("cozyapps v2 record cleanup", () => {
     expect(storage.cozyAppValues(second)).toHaveLength(0);
     expect(storage.cozyAppDashboard(second)).toBeUndefined();
     expect(storage.cozyApp(second)).toBeUndefined();
+  });
+});
+
+/** Fix round 1, review r0 findings I1, I4 and I5 at the storage seam. */
+describe("cozyapps v2 record hardening", () => {
+  it("binds an idempotency key to its payload and refuses the same key for a different write", () => {
+    const storage = open();
+    const appId = seed(storage);
+    expect(storage.writeCozyAppValue({ appId, valueId: "ticker", type: "string", value: "AAPL", expectedRevision: 0, idempotencyKey: "k1", now: 200 }).outcome).toBe("written");
+    // A true replay: same key, same observed revision, same value.
+    const replay = storage.writeCozyAppValue({ appId, valueId: "ticker", type: "string", value: "AAPL", expectedRevision: 0, idempotencyKey: "k1", now: 300 });
+    expect(replay.outcome).toBe("replayed");
+    expect(replay.value).toMatchObject({ value: "AAPL", revision: 1 });
+    // The same key with a DIFFERENT payload is a conflict, never a silent 200 carrying the old value.
+    const reused = storage.writeCozyAppValue({ appId, valueId: "ticker", type: "string", value: "MSFT", expectedRevision: 1, idempotencyKey: "k1", now: 310 });
+    expect(reused.outcome).toBe("conflict");
+    expect(reused.value).toMatchObject({ value: "AAPL", revision: 1 });
+    expect(storage.cozyAppValues(appId)[0]).toMatchObject({ value: "AAPL", revision: 1 });
+    // A replay of a spent key after an intervening write no longer writes: its observed revision
+    // is stale, so the revision check is what answers.
+    expect(storage.writeCozyAppValue({ appId, valueId: "ticker", type: "string", value: "MSFT", expectedRevision: 1, idempotencyKey: "k2", now: 320 }).outcome).toBe("written");
+    expect(storage.writeCozyAppValue({ appId, valueId: "ticker", type: "string", value: "AAPL", expectedRevision: 0, idempotencyKey: "k1", now: 330 }).outcome).toBe("conflict");
+    expect(storage.cozyAppValues(appId)[0]).toMatchObject({ value: "MSFT", revision: 2 });
+  });
+
+  it("enforces the saved value ceiling instead of letting an over-cap array reach the wire", () => {
+    const storage = open();
+    const appId = seed(storage);
+    for (let index = 0; index < 64; index += 1)
+      expect(storage.writeCozyAppValue({ appId, valueId: `v${index}`, type: "number", value: index, expectedRevision: 0, idempotencyKey: `k${index}`, now: 200 }).outcome).toBe("written");
+    expect(storage.writeCozyAppValue({ appId, valueId: "v64", type: "number", value: 64, expectedRevision: 0, idempotencyKey: "k64", now: 200 }).outcome).toBe("limit_exceeded");
+    expect(storage.cozyAppValues(appId)).toHaveLength(64);
+    // An existing value is still writable at the ceiling: the cap is on how many exist, not on edits.
+    expect(storage.writeCozyAppValue({ appId, valueId: "v0", type: "number", value: 99, expectedRevision: 1, idempotencyKey: "k0b", now: 210 }).outcome).toBe("written");
+  });
+
+  it("lets a bot move only its own action to running", () => {
+    const storage = open();
+    const mine = seed(storage, "sage:market");
+    storage.upsertCozyApp({ id: "luna:other", name: "Other", creatorBot: "luna", tree, now: 100 });
+    storage.createCozyAppAction({ id: "action-1", appId: mine, creatorBot: "sage", actionId: "refresh", idempotencyKey: "tap-1", now: 200 });
+    expect(storage.markCozyAppActionDelivered("action-1", "luna", 210)).toBe(false);
+    expect(storage.cozyAppReceipts(mine)[0]?.status).toBe("queued");
+    expect(storage.markCozyAppActionDelivered("action-1", "sage", 210)).toBe(true);
+    expect(storage.cozyAppReceipts(mine)[0]?.status).toBe("running");
   });
 });

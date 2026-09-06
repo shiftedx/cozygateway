@@ -3,6 +3,9 @@ import { once } from "node:events";
 import { WebSocket } from "ws";
 import { afterEach, expect, it } from "vitest";
 
+import { COZYAPP_MAX_VALUES, check } from "cozygateway-contract";
+
+import { AttachV1CommandFrameSchema } from "../src/adapters/attach/protocol-v1.ts";
 import { startGateway, type RunningGateway } from "../src/server.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
 
@@ -155,3 +158,81 @@ async function until(predicate: () => boolean | Promise<boolean>, timeoutMs = 4_
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
+
+/** Fix round 1, review r0 finding C1. The gateway stamps `delivered` on the command ack, so the
+ *  peer's own `running` receipt always arrives on an action that is already there. That no-op must
+ *  be applied and acked, never declined: a declined durable event retries and then dead-letters,
+ *  head-of-line blocking every later event from that bot. */
+it("applies a peer running receipt as a no-op and keeps its later durable events flowing", async () => {
+  const { gateway, plugin, frames, auth, appId } = await harness(["cozyapps", "cozyapps_dashboard"]);
+  const accepted = await fetch(`${gateway.url}/cozyapps/${appId}/actions`, {
+    method: "POST", headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ idempotencyKey: "tap-1", actionId: "refresh" }),
+  });
+  const requested = await accepted.json() as { id: string };
+  await until(() => frames.some((frame) => frame.kind === "command" && frame.command?.kind === "cozyapp_action"));
+  const command = frames.find((frame) => frame.kind === "command" && frame.command?.kind === "cozyapp_action");
+  plugin.send(JSON.stringify({ kind: "ack", channel: "command", sequence: command.sequence, id: command.commandId }));
+  const receipts = async () => ((await (await fetch(`${gateway.url}/cozyapps/${appId}/receipts`, { headers: auth })).json()) as { receipts: Array<{ status: string }> }).receipts;
+  await until(async () => (await receipts())[0]?.status === "running");
+
+  // The peer now says so itself, on an action the gateway already moved. Applied and acked.
+  plugin.send(JSON.stringify({
+    kind: "event", sequence: 2, eventId: "receipt-running",
+    event: { kind: "cozyapp_action_receipt", appId, actionId: "refresh", actionRequestId: requested.id, status: "running" },
+  }));
+  await until(() => frames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 2));
+  expect(frames.find((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 2)).not.toHaveProperty("discarded");
+  expect((await receipts())[0]?.status).toBe("running");
+
+  // A duplicate terminal, and a terminal receipt for an action this bot does not own, are no-ops
+  // on the same rule rather than retryable failures.
+  plugin.send(JSON.stringify({
+    kind: "event", sequence: 3, eventId: "receipt-done",
+    event: { kind: "cozyapp_action_receipt", appId, actionId: "refresh", actionRequestId: requested.id, status: "completed" },
+  }));
+  plugin.send(JSON.stringify({
+    kind: "event", sequence: 4, eventId: "receipt-dupe",
+    event: { kind: "cozyapp_action_receipt", appId, actionId: "refresh", actionRequestId: requested.id, status: "failed" },
+  }));
+  plugin.send(JSON.stringify({
+    kind: "event", sequence: 5, eventId: "receipt-foreign",
+    event: { kind: "cozyapp_action_receipt", appId, actionId: "refresh", actionRequestId: "not-an-action-here", status: "running" },
+  }));
+
+  // THE PROOF: the peer's next durable event still applies promptly, so nothing head-of-line blocked.
+  plugin.send(JSON.stringify({
+    kind: "event", sequence: 6, eventId: "dash-after",
+    event: { kind: "cozyapp_dashboard_upsert", appId: "market", documentVersion: 1, document },
+  }));
+  await until(async () => (await fetch(`${gateway.url}/cozyapps/${appId}/dashboard`, { headers: auth })).status === 200, 5_000);
+  expect((await receipts())[0]?.status).toBe("completed");
+});
+
+/** Fix round 1, review r0 finding I4. The saved values ride on a bounded array, so the ceiling on
+ *  how many an app holds is what keeps the gateway from emitting a command its own protocol schema
+ *  refuses. This asserts the emitted frame against that schema, at the ceiling. */
+it("never emits an action command whose values exceed the protocol schema", async () => {
+  const { gateway, plugin, frames, auth, appId } = await harness(["cozyapps", "cozyapps_dashboard"]);
+  for (let index = 0; index < COZYAPP_MAX_VALUES; index += 1) {
+    const written = await fetch(`${gateway.url}/cozyapps/${appId}/values/v${index}`, {
+      method: "PUT", headers: { ...auth, "content-type": "application/json" },
+      body: JSON.stringify({ expectedRevision: 0, idempotencyKey: `k${index}`, type: "number", value: index }),
+    });
+    expect(written.status).toBe(200);
+  }
+  const over = await fetch(`${gateway.url}/cozyapps/${appId}/values/spill`, {
+    method: "PUT", headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ expectedRevision: 0, idempotencyKey: "spill", type: "number", value: 1 }),
+  });
+  expect(over.status).toBe(400);
+
+  await fetch(`${gateway.url}/cozyapps/${appId}/actions`, {
+    method: "POST", headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ idempotencyKey: "tap-1", actionId: "refresh" }),
+  });
+  await until(() => frames.some((frame) => frame.kind === "command" && frame.command?.kind === "cozyapp_action"));
+  const command = frames.find((frame) => frame.kind === "command" && frame.command?.kind === "cozyapp_action");
+  expect(command.command.values).toHaveLength(COZYAPP_MAX_VALUES);
+  expect(check(AttachV1CommandFrameSchema, command)).toBe(true);
+});
