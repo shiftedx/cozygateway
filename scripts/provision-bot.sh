@@ -161,23 +161,23 @@ PY
 # a profile that names neither key never emits a single draft frame and the
 # phone only ever receives the finished message.
 #
-# Structural, like the plugins.enabled read above: a grep cannot tell an absent
-# key from one an operator deliberately set to false, and only the absent ones
-# may be written.
+# Structural, not a grep: only a parse can tell an absent key from one an
+# operator deliberately set to false, and only the absent ones may be written.
+# PyYAML does that when the interpreter has it, which the Hermes venv always
+# does because Hermes itself depends on it. It is NOT a requirement: a host
+# whose python has no PyYAML (a hosted CI runner, a plain system python) falls
+# back to a conservative stdlib probe that answers only when the file is simple
+# enough to be certain, and otherwise says the keys are present so nothing is
+# written.
 streaming_keys_absent() {
   "$PYTHON" - --streaming-keys "$1" <<'PY'
+import re
 import sys
-try:
-    import yaml
-except ImportError:
-    sys.exit(2)
 from pathlib import Path
 
-path = Path(sys.argv[2]) / "config.yaml"
-try:
-    data = yaml.safe_load(path.read_text()) or {}
-except Exception:
-    sys.exit(1)
+WANTED = (("display", "streaming"), ("display", "platforms", "cozygateway", "streaming"))
+KEY = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z0-9_][A-Za-z0-9_.\-]*):(?P<rest>[ \t].*|)$")
+BLOCK_SCALAR = re.compile(r"^[|>][0-9+-]*$")
 
 
 def block(parent, key):
@@ -185,13 +185,120 @@ def block(parent, key):
     return value if isinstance(value, dict) else {}
 
 
-display = block(data, "display")
-platform = block(block(display, "platforms"), "cozygateway")
-# None is ABSENT. An explicit false is an operator turning streaming off and is never touched.
-if display.get("streaming") is None:
-    print("display.streaming")
-if platform.get("streaming") is None:
-    print("display.platforms.cozygateway.streaming")
+def absent_with_yaml(text, yaml):
+    data = yaml.safe_load(text) or {}
+    display = block(data, "display")
+    platform = block(block(display, "platforms"), "cozygateway")
+    absent = []
+    if display.get("streaming") is None:
+        absent.append("display.streaming")
+    if platform.get("streaming") is None:
+        absent.append("display.platforms.cozygateway.streaming")
+    return absent
+
+
+def on_the_way(path):
+    """True when `path` is a prefix of a key this probe is looking for, so an
+    unjudgeable line there could hide one."""
+    return any(wanted[: len(path)] == path for wanted in WANTED)
+
+
+def absent_without_yaml(text):
+    """Conservative block-mapping probe for a host with no PyYAML.
+
+    Returns the wanted keys this file certainly does not carry, or None when it
+    uses something this probe cannot judge WHERE ONE OF THOSE KEYS COULD BE (a
+    flow mapping, an anchor, a merge key, a sequence, a line it cannot parse),
+    or anywhere at all for a tab or a second document. None means "assume they
+    are present", so the caller writes nothing: the only safe way to be unsure
+    about somebody's config file. Everything outside `display` is skipped rather
+    than judged, since nothing there can carry these keys.
+    """
+    stack = []
+    present = set()
+    seen_top = set()
+    inside_block_scalar_at = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        leading = line[: len(line) - len(line.lstrip())]
+        indent = len(leading)
+        if inside_block_scalar_at is not None:
+            # A block scalar's body is text, not structure: skip it wholesale
+            # rather than read a line of prose as a key.
+            if indent > inside_block_scalar_at:
+                continue
+            inside_block_scalar_at = None
+        if "\t" in leading:
+            return None
+        if stripped.startswith("---") or stripped.startswith("..."):
+            return None
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        path = tuple(key for _, key in stack)
+        if stripped.startswith("-"):
+            # A sequence where one of the wanted keys would be a mapping.
+            if on_the_way(path):
+                return None
+            continue
+        match = KEY.match(line)
+        if match is None:
+            if on_the_way(path):
+                return None
+            continue
+        key = match.group("key")
+        value = match.group("rest").strip()
+        if value.startswith("#"):
+            value = ""
+        here = path + (key,)
+        if BLOCK_SCALAR.match(value):
+            if on_the_way(here):
+                return None
+            inside_block_scalar_at = indent
+            continue
+        if value in ("{}", "[]"):
+            value = "empty"
+        elif value[:1] in ("{", "[", "&", "*") or key == "<<":
+            if on_the_way(here):
+                return None
+            value = "unjudged"
+        if indent == 0:
+            if key in seen_top:
+                return None
+            seen_top.add(key)
+        if here in WANTED and value != "":
+            present.add(here)
+        if value == "":
+            stack.append((indent, key))
+    return [".".join(name) for name in WANTED if name not in present]
+
+
+def main():
+    path = Path(sys.argv[2]) / "config.yaml"
+    try:
+        text = path.read_text()
+    except Exception:
+        sys.exit(1)
+    try:
+        import yaml
+    except ImportError:
+        yaml = None
+    if yaml is None:
+        absent = absent_without_yaml(text)
+        if absent is None:
+            return
+    else:
+        try:
+            absent = absent_with_yaml(text, yaml)
+        except Exception:
+            sys.exit(1)
+    for name in absent:
+        print(name)
+
+
+main()
 PY
 }
 
@@ -281,7 +388,6 @@ ensure_streaming_config() {
   local profile="$1" dir="$2" keys key rc=0
   STREAMING_CONFIG_CHANGED=0
   keys="$(streaming_keys_absent "$dir")" || rc=$?
-  [ "$rc" != 2 ] || die "no PyYAML available to $PYTHON, cannot read profile config safely"
   if [ "$rc" != 0 ]; then
     warn "[$profile] could not read config.yaml, leaving streaming settings alone"
     return 0

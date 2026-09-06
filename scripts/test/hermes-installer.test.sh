@@ -97,25 +97,22 @@ display:
     cozygateway:
       streaming: false
 PROFILE_YAML
-# The installer reads that config STRUCTURALLY, which needs PyYAML: in
-# production Hermes' own venv python supplies it, so the fixture puts a
-# delegating one exactly where the installer looks. HOME is handed back because
-# several cases below fake it, and a faked HOME can hide a user site-packages.
-real_home_for_yaml="$HOME"
-yaml_python=""
-for candidate in /usr/bin/python3 "$(command -v python3 || true)"; do
-  [ -n "$candidate" ] || continue
-  if "$candidate" -c 'import yaml' >/dev/null 2>&1; then yaml_python="$candidate"; break; fi
-done
-if [ -z "$yaml_python" ]; then
-  printf 'FAIL  no python3 with PyYAML on this host, and the installer needs one to read profile config\n' >&2
+# The installer reads that config structurally, and PyYAML is NOT a requirement
+# for it: with PyYAML it gets the exact answer, without it a conservative stdlib
+# probe answers and it writes nothing where it cannot be certain. A hosted
+# runner has a python3 with no PyYAML, so the interpreter the fixture puts where
+# the installer looks runs `python3 -S`, which skips site-packages and therefore
+# cannot import PyYAML on ANY host. This suite always exercises that path.
+command -v python3 >/dev/null 2>&1 || { printf 'FAIL  python3 is required to run these tests\n' >&2; exit 1; }
+if python3 -S -c 'import yaml' >/dev/null 2>&1; then
+  printf 'FAIL  python3 -S can still import yaml, so this suite cannot prove the no-PyYAML path\n' >&2
   exit 1
 fi
 mkdir -p "$tmp/hermes/hermes-agent/venv/bin"
-cat > "$tmp/hermes/hermes-agent/venv/bin/python" <<PYTHON_DELEGATE
+cat > "$tmp/hermes/hermes-agent/venv/bin/python" <<'PYTHON_NO_SITE'
 #!/bin/sh
-exec env HOME="$real_home_for_yaml" "$yaml_python" "\$@"
-PYTHON_DELEGATE
+exec python3 -S "$@"
+PYTHON_NO_SITE
 chmod 700 "$tmp/hermes/hermes-agent/venv/bin/python"
 credential_marker="$tmp/dashboard-credential-was-evaluated"
 # shellcheck disable=SC2016
@@ -456,7 +453,10 @@ grep -Fq 'Profiles: default active ops' <<<"$all_profiles_output"
 # carried these keys is reachable and mute until the installer repairs it.
 expect_contains "$all_profiles_output" 'streaming is already decided in config.yaml for Hermes profile active'
 expect_contains "$all_profiles_output" 'streaming is already decided in config.yaml for Hermes profile ops'
-printf '{}\n' > "$tmp/hermes/profiles/ops/config.yaml"
+# A profile from before the seed carried the display keys. A plain block
+# mapping, which is what Hermes writes and what the reader can judge with or
+# without PyYAML.
+printf 'model: test/model\n' > "$tmp/hermes/profiles/ops/config.yaml"
 mute_profile_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --profiles all --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-scoped" 2>&1)"
 expect_contains "$mute_profile_output" 'set display.streaming to true for Hermes profile ops'
 expect_contains "$mute_profile_output" 'set display.platforms.cozygateway.streaming to true for Hermes profile ops'
@@ -670,7 +670,10 @@ esac
 # reopen the interactive picker. Its stdin is the curl pipe in production, so
 # invoking `hermes model` here would make the documented one-line command fail
 # even though no model choice is needed.
-printf '{}\n' > "$tmp/hermes/profiles/ops/config.yaml"
+# A profile from before the seed carried the display keys. A plain block
+# mapping, which is what Hermes writes and what the reader can judge with or
+# without PyYAML.
+printf 'model: test/model\n' > "$tmp/hermes/profiles/ops/config.yaml"
 if ! configured_rerun_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/configured-rerun-commands" COZYGATEWAY_TEST_MODEL_DECLINE=1 COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"; then
   printf 'configured rerun failed:\n%s\n' "$configured_rerun_output" >&2; exit 1
 fi
