@@ -381,3 +381,64 @@ $ pnpm -r typecheck
 The shared resolution path in `storage.ts` is touched by the `override` flag, so the gateway package
 suite was run whole (1473 passed, up 6 from 1467 with the new cases). Full `pnpm -r test` still not
 run: the lead owns that gate. `.121` and hosted CI remain UNKNOWN.
+
+### Fix round 1 addendum: plain approvals are bound too
+
+Kyle's ruling: Hermes peers get no code changes, and the gateway derives as much benefit for them as
+it can. Head after this addendum: `ef441c6`, pushed.
+
+**What a plain ask has to bind on.** Nothing. On this wire an `ApprovalEvent` carries no structured
+arguments at all: row 10's ruling is that the free-text `command` and `description` Hermes sends are
+never forwarded, and `BotApprovalPendingFrame` deliberately has no `argSummary` member. The only
+deterministic content a plain ask has is its rule NAME plus the capability-56 `detail` sentence the
+peer sent to say what the ask concretely covers, both of which are already validated and already
+carried. `plainApprovalScope` hashes those two into the same payload binding a typed ask gets
+(`sha256("plain\n<name>\n<detail>")`) and fills the rest of the binding from them: `action` is the
+rule name, `resource` is the sentence, and `system` is the constant `attach`, its own namespace, so a
+derived binding can never match a grant a typed peer made against a real system it named.
+
+**Uncoverable asks, named.** A plain ask with no `detail`, a rule name outside the grant row's 1 to
+64 bound, or a sentence longer than the row's 256, has nothing that identifies ONE ask rather than a
+KIND of ask. Binding to a bare rule name would cover asks a person never saw, so such an ask is
+uncoverable: asking for a grant on it answers `409 approval_scope_required`, and no later ask is ever
+covered. Truncating to fit was rejected: a truncated binding is a wider binding.
+
+**Nothing changes below 66.** The derived scope is internal. It is never emitted on a frame, never
+stored on the interaction record, and never sent to a peer, so a plain approval's frame, durable
+payload, inbox row and settlement are byte identical to their pre-66 selves, which the second test
+below pins. A grant can only exist because a client at 66 asked for one, so a deployment with no
+66 client behaves exactly as before.
+
+**What it honestly cannot promise**, now stated in row 66 and the attach bullet: a plain ask declares
+no category, so the gateway records `other` and the always-require exclusion cannot bite on it; and
+it claims no idempotency, so once coverage of a plain ask rests on the person's own single-use grant,
+the same task and the ask's own expiry rather than on a peer claim (`#claimGrant` takes an explicit
+`derived` flag rather than reading a `retry` nobody set).
+
+Covering tests, `packages/gateway/test/native-bot-scoped-approvals.test.ts`:
+"covers a later identical plain approval from a grant a person made on the plain card" (a once grant
+covers exactly one, then a category grant covers repeatedly, then a different sentence is not
+covered) and "refuses to cover a plain approval that carries no deterministic content" (both grant
+kinds refused with `scope_required`, no grant recorded, no later coverage, and the card's key set
+still the pre-66 one).
+
+```
+RED  $ cd packages/gateway && npx vitest run test/native-bot-scoped-approvals.test.ts
+     × covers a later identical plain approval from a grant a person made on the plain card
+       AssertionError: expected 'scope_required' to be 'requested'
+     Test Files  1 failed (1)
+          Tests  1 failed | 16 passed (17)
+
+GREEN $ cd packages/gateway && npx vitest run test/native-bot-scoped-approvals.test.ts
+     Test Files  1 passed (1)
+          Tests  17 passed (17)
+
+$ cd packages/gateway     && npx vitest run   Test Files 132 passed | 1 skipped (133)
+                                              Tests 1475 passed | 2 skipped (1477)
+$ cd packages/contract    && npx vitest run   Test Files 19 passed (19)   Tests 192 passed (192)
+$ cd packages/conformance && npx vitest run   Test Files 9 passed (9)     Tests 92 passed | 19 skipped (111)
+$ pnpm -r typecheck                           contract, relay, gateway, conformance: Done
+```
+
+The uncoverable test passed RED as well as GREEN: nothing was coverable before the change, so it is
+the guard that the derivation did not widen anything, not a case the change made pass.
