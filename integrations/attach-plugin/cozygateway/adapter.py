@@ -105,6 +105,16 @@ TOOL_CALL_ID_KEY = "tool_call_id"  # harness-defined identifier
 # role-authorized to pass the harness's per-message authorization gate.
 INBOUND_USER = "user"
 
+# Capability 69's closed refusal reason: work handed to this peer for a turn it does not hold.
+# It covers both refusals here, since a turn whose strict session binding this process can no
+# longer resolve is a turn it cannot hold either.
+#
+# A refusal that never reaches the gateway is worse than a visible failure: the gateway keeps the
+# turn running to its cap, the person's next message arrives as a steer on that turn, and a plugin
+# that no longer holds it answers as a fresh inbound whose events are declined as orphaned. The
+# reason is what lets the gateway promote that steer instead of guessing from free text.
+UNKNOWN_TURN_REASON = "unknown_turn"
+
 
 def _truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"} if value else False
@@ -801,9 +811,9 @@ def _profile_from_hermes_home() -> str:
     """The profile this process IS, when nothing configured it.
 
     Neither `plugins.entries.cozygateway.config.profile` nor `HERMES_PROFILE` is set in a normal
-    per-profile install, so the adapter used to hold an empty profile and stamp nothing on the
-    inbound source. The live-turn gate then read an empty profile and refused every phone-node
-    call with `profile_mismatch` (observed 2026-08-26). A per-profile Hermes runs with
+    per-profile install, so the adapter used to hold an empty profile while the live-turn gate
+    demanded a non-empty one, and every phone-node call was refused with `profile_mismatch`
+    (observed 2026-08-26). A per-profile Hermes runs with
     `HERMES_HOME=<...>/profiles/<name>`, so the process already knows its own name; deriving it
     here means a new bot needs no extra configuration to use its phone as a node.
 
@@ -932,6 +942,11 @@ class AttachAdapter:
         # unbounded-duration redelivery guarantee for bounded memory over a
         # long-lived process.
         self._seen_turns: OrderedDict[Tuple[str, str], None] = OrderedDict()
+        # Turns this process actually terminalized (a commit, failed, cancelled or interrupted
+        # frame went out for them), oldest first and bounded like ``_seen_turns``. Arrival is not
+        # a terminal: a turn that reached this process and then died without one must still be
+        # answered, so only this record exempts a late interrupt from its typed refusal.
+        self._sealed_turns: OrderedDict[Tuple[str, str], None] = OrderedDict()
         self._seen_turns_max: int = _env_int("COZYGATEWAY_SEEN_TURNS_MAX", 512)
         # Per-turn accumulated text (the last full flush) and tool-chip tracker.
         self._turn_text: Dict[str, str] = {}
@@ -1069,6 +1084,7 @@ class AttachAdapter:
             # later frame for it) must still find it here.
             logger.debug("attach: command turn seal failed", exc_info=True)
             return
+        self._mark_sealed(chat_id, turn_id)
         self._cleanup_turn(chat_id, turn_id)
 
     def _stage_response_media(self, turn_id: str, response: str) -> None:
@@ -1205,6 +1221,11 @@ class AttachAdapter:
                 on_cozyapp_action=self._on_cozyapp_action_command,
                 on_ready=self._on_transport_ready,
                 commands=hermes_gateway_commands(),
+                # Capability 69. Only the resident adapter declares: it is the process that
+                # actually carries turns. The one-shot proactive client below carries none and
+                # deliberately declares nothing, because an empty declaration from it would tell
+                # the gateway that this profile holds no turns at all.
+                active_turns=self._active_turn_ids,
             )
         )
         try:
@@ -1461,12 +1482,29 @@ class AttachAdapter:
             message_id=message_id,
             role_authorized=True,
         )
-        # A single-profile gateway has no profile route to stamp on the source.
-        # Bind the adapter's loader-owned profile without overriding an explicit
-        # route; _cozy_mobile still requires exact equality and fails closed.
-        if not getattr(source, "profile", None) and self._profile:
-            source.profile = self._profile
+        # Deliberately unstamped: ``build_source`` already carries a real multiplex route when
+        # ``gateway.profile_routes`` resolves one, and nothing else may add a profile here.
+        # Hermes derives the session key of an internally routed turn twice -- the adapter seam
+        # namespaces it by ``source.profile``, the runner seam does not -- and drops the turn
+        # when either disagrees with the strict binding recorded in ``_desktop_session_bindings``.
+        # Stamping the loader-owned profile made the two derivations disagree and dropped every
+        # turn on a resumed desktop thread. The live-turn profile gate reads the same route
+        # through ``_session_profile_route`` instead, so it stays exact and fail-closed.
         return source
+
+    def _session_profile_route(self) -> str:
+        """The profile Hermes will carry in this adapter's live-turn session context.
+
+        A single-profile gateway resolves no profile route, so its turns carry no profile and
+        this is ``""``. A multiplexed gateway stamps the route in ``build_source``, so the live
+        turn carries a name and the gate demands this adapter's own. With no runner to describe
+        the process shape (an isolated unit context), keep demanding the adapter's own profile
+        rather than relaxing the gate on a topology this plugin cannot see.
+        """
+        config = getattr(getattr(self, "gateway_runner", None), "config", None)
+        if config is None or getattr(config, "multiplex_profiles", False):
+            return self._profile or ""
+        return ""
 
     @staticmethod
     def _sync_session_db(runner: Any, store: Any = None) -> Any:
@@ -1500,7 +1538,9 @@ class AttachAdapter:
         if spool is None or runner is None or store is None:
             return
         try:
-            session_key = runner._session_key_for_source(source)
+            session_key = self._dispatch_session_key(source)
+            if not session_key:
+                return
             entry = await store.lookup_by_session_key(session_key)
             session_id = getattr(entry, "session_id", None)
             if not isinstance(session_id, str) or not session_id:
@@ -2102,6 +2142,13 @@ class AttachAdapter:
             media_types=media_types,
             metadata=metadata,
         )
+        if binding is not None and not await self._binding_dispatchable(binding, event):
+            # Hermes would drop this turn inside one of its two strict checks and say nothing,
+            # so the gateway would hold it until its cap. Refuse it out loud instead.
+            logger.warning("attach: refusing turn %s; its desktop session binding no longer holds", turn.turn_id)
+            await self._safe_failed(turn.thread_id, turn.turn_id, reason=UNKNOWN_TURN_REASON)
+            self._cleanup_turn(turn.thread_id, turn.turn_id)
+            return
         # Session sync supports serialized handoff, not concurrent two-writer merges.  Keep this
         # guard across the entire injected turn and baseline before releasing it, so a poller can
         # never reflect the phone's own rows back while this lane is being written.
@@ -2207,7 +2254,11 @@ class AttachAdapter:
             return
         try:
             source = self._inbound_source(thread_id)
-            session_key = runner._session_key_for_source(source)
+            # The key both of Hermes' strict checks will derive for this thread, in whichever
+            # topology this process runs; see _dispatch_session_key.
+            session_key = self._dispatch_session_key(source)
+            if not session_key:
+                return
             if runner._is_session_running(session_key):
                 return
             # Hermes has changed the async wrapper's private field spelling across releases. The
@@ -2275,6 +2326,8 @@ class AttachAdapter:
         """
         from gateway.platforms.base import MessageEvent  # harness-defined identifier
 
+        if not await self._holds_turn(frame.thread_id, frame.turn_id):
+            return
         # See _inbound_source for why turn/steer/interrupt share one source builder.
         source = self._inbound_source(frame.thread_id)
         # A distinct message_id for the injected message; the running turn's reply anchor is left
@@ -2322,6 +2375,8 @@ class AttachAdapter:
         """
         from gateway.platforms.base import MessageEvent  # harness-defined identifier
 
+        if not await self._holds_turn(frame.thread_id, frame.turn_id, quiet_when_sealed_here=True):
+            return
         # See _inbound_source for why turn/steer/interrupt share one source builder.
         source = self._inbound_source(frame.thread_id)
         # A slash command, not a turn: the injected text must be exactly "/stop" (the harness
@@ -2334,6 +2389,30 @@ class AttachAdapter:
         except Exception:  # noqa: BLE001 - an interrupt must never crash the drain loop
             logger.debug("attach: interrupt injection raised", exc_info=True)
         await self._seal_interrupted(frame.thread_id, frame.turn_id)
+
+    async def _holds_turn(self, thread_id: str, turn_id: str, *, quiet_when_sealed_here: bool = False) -> bool:
+        """True when ``turn_id`` is this process's running turn on ``thread_id``.
+
+        A steer or an interrupt only means anything against the turn it names. When this plugin
+        does not hold that turn -- it restarted, or the turn was already sealed -- injecting the
+        steer text anyway starts a fresh reply whose draft and commit events the gateway declines
+        as orphaned, and the person's words are lost with them. Answer the frame on its own turn
+        id instead, so the gateway can settle that turn and carry the text forward.
+
+        ``quiet_when_sealed_here`` is the interrupt's one exemption: a turn this process ran and
+        already TERMINALIZED lost a harmless race, it carries no text to preserve, and a failed
+        terminal on it would only contradict the reply it already delivered. The exemption keys on
+        a terminal actually sent, never on arrival: a turn that reached this process and then died
+        without one is precisely the silence this exists to remove.
+        """
+        if self._active_turn.get(thread_id) == turn_id:
+            return True
+        if quiet_when_sealed_here and (thread_id, turn_id) in self._sealed_turns:
+            logger.debug("attach: interrupt for turn %s arrived after it was sealed here", turn_id)
+            return False
+        logger.warning("attach: refusing a frame for turn %s; this process does not hold it", turn_id)
+        await self._safe_failed(thread_id, turn_id, reason=UNKNOWN_TURN_REASON)
+        return False
 
     async def _seal_interrupted(self, thread_id: str, turn_id: str) -> None:
         """Emit the ``interrupted`` terminal for ``turn_id`` unless something else sealed it."""
@@ -2348,6 +2427,7 @@ class AttachAdapter:
         except Exception:  # noqa: BLE001 - the drain loop outlives one failed frame
             logger.debug("attach: interrupted frame emit failed", exc_info=True)
             return
+        self._mark_sealed(thread_id, turn_id)
         self._cleanup_turn(thread_id, turn_id)
 
     def _on_approval_command(self, command: Dict[str, Any]) -> None:
@@ -3043,6 +3123,10 @@ class AttachAdapter:
             await self._safe_failed(chat_id, turn_id, "turn error")
             return SendResult(success=False, error=str(exc))
         finally:
+            if not keep_active:
+                # Every path that reaches here with the turn closed has put a terminal on the
+                # wire (a commit, or the failed one of the two error paths above).
+                self._mark_sealed(chat_id, turn_id)
             self._cleanup_turn(chat_id, turn_id, keep_active=keep_active)
         result = SendResult(success=True, message_id=turn_id)
         if media_result is not None:
@@ -3252,15 +3336,118 @@ class AttachAdapter:
             result["accepted_pending"] = False
         return result
 
-    async def _safe_failed(self, chat_id: str, turn_id: str, message: str) -> None:
-        """Emit a ``failed`` frame, swallowing any error (best-effort teardown)."""
+    def _dispatch_session_key(self, source: Any) -> Optional[str]:
+        """The session key Hermes itself will resolve for a turn injected on ``source``.
+
+        The adapter seam is the derivation to follow, because it is the one that reads the same
+        order Hermes uses at dispatch in BOTH topologies: an explicit route on the source, then
+        this adapter's owner profile (set only on a multiplexed gateway), then the session store's
+        resolver. On a single-profile install that yields the shared ``agent:main`` lane; on a
+        multiplexed one it yields ``agent:<owner profile>``, which is also what the runner derives
+        there because the profile message handler stamps the source before it. Recording a binding
+        off the raw runner call instead would put it on the wrong lane in the multiplexed case and
+        move the very drop this fix removed.
+
+        Falls back to the runner seam when the harness exposes no adapter seam (older Hermes, unit
+        fakes), and returns None when neither is reachable.
+        """
+        derive_event_key = getattr(self, "_event_session_key", None)
+        if callable(derive_event_key):
+            try:
+                from gateway.platforms.base import MessageEvent  # harness-defined identifier
+
+                key = derive_event_key(MessageEvent(text="", source=source))
+                if isinstance(key, str) and key:
+                    return key
+            except Exception:  # noqa: BLE001 - fall through to the runner seam
+                logger.debug("attach: adapter session key derivation unavailable", exc_info=True)
+        derive_source_key = getattr(getattr(self, "gateway_runner", None), "_session_key_for_source", None)
+        if callable(derive_source_key):
+            try:
+                key = derive_source_key(source)
+                if isinstance(key, str) and key:
+                    return key
+            except Exception:  # noqa: BLE001 - nothing left to derive with
+                logger.debug("attach: runner session key derivation unavailable", exc_info=True)
+        return None
+
+    async def _binding_dispatchable(self, binding: Tuple[str, str], event: Any) -> bool:
+        """True when Hermes will still accept ``event`` against its strict binding.
+
+        Both of Hermes' strict checks return silently on a mismatch, which leaves the gateway
+        holding a running turn nobody will ever answer. So run them here first, on the frame that
+        is about to be dispatched: the adapter seam's key must equal the bound key, and the bound
+        key must still resolve to the pinned session (a ``/new``, a compaction retip or an
+        eviction moves it). Only a proven mismatch refuses the turn; an unreachable seam or a
+        raising lookup leaves the turn exactly as it was before this check existed.
+        """
+        session_key, pinned = binding
+        derive_event_key = getattr(self, "_event_session_key", None)
+        if callable(derive_event_key):
+            try:
+                derived = derive_event_key(event)
+            except Exception:  # noqa: BLE001 - an underivable key is not proof of a stale binding
+                logger.debug("attach: could not derive the adapter session key", exc_info=True)
+                derived = None
+            if isinstance(derived, str) and derived and derived != session_key:
+                logger.warning("attach: bound session key is not the one this adapter derives")
+                return False
+        lookup = getattr(getattr(getattr(self, "gateway_runner", None), "async_session_store", None),
+                         "lookup_by_session_key", None)
+        if not callable(lookup):
+            return True
+        try:
+            entry = await lookup(session_key)
+        except Exception:  # noqa: BLE001 - an unanswerable store is not proof of a stale binding
+            logger.debug("attach: could not resolve the bound session key", exc_info=True)
+            return True
+        if entry is None or getattr(entry, "session_id", None) != pinned:
+            logger.warning("attach: pinned session for the bound key is no longer the current one")
+            return False
+        return True
+
+    async def _safe_failed(
+        self, chat_id: str, turn_id: str, message: Optional[str] = None, *,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Emit a ``failed`` frame, swallowing any error (best-effort teardown).
+
+        ``reason`` is the capability 69 refusal vocabulary; the client drops it again unless the
+        gateway advertised that capability, and a transport that predates the argument entirely
+        never sees it.
+        """
         client = self._client
         if client is None:
             return
         try:
-            await client.send_failed(chat_id, turn_id, message)
+            if reason is not None and self._accepts_reason(client.send_failed):
+                await client.send_failed(chat_id, turn_id, message, reason=reason)
+            else:
+                await client.send_failed(chat_id, turn_id, message)
         except Exception:  # noqa: BLE001 - already failing; nothing more to do
             logger.debug("attach: failed frame emit failed", exc_info=True)
+            return
+        self._mark_sealed(chat_id, turn_id)
+
+    @staticmethod
+    def _accepts_reason(send_failed: Any) -> bool:
+        """True when this transport's ``send_failed`` takes the capability 69 ``reason``."""
+        try:
+            return "reason" in inspect.signature(send_failed).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def _active_turn_ids(self) -> List[str]:
+        """The turn ids this process still carries, for the hello declaration (capability 69)."""
+        return list(dict.fromkeys(self._active_turn.values()))
+
+    def _mark_sealed(self, chat_id: str, turn_id: str) -> None:
+        """Record that a terminal frame for this turn actually went out from this process."""
+        key = (chat_id, turn_id)
+        self._sealed_turns.pop(key, None)
+        self._sealed_turns[key] = None
+        while len(self._sealed_turns) > self._seen_turns_max:
+            self._sealed_turns.popitem(last=False)
 
     def _cleanup_turn(self, chat_id: str, turn_id: str, keep_active: bool = False) -> None:
         """Drop the per-MESSAGE state a reply leaves behind, and by default the turn with it.
@@ -3861,7 +4048,13 @@ def _resolve_live_origin() -> Optional[Tuple[Any, str, str, str]]:
         _log_mobile_policy_block("active_adapter_count", adapter_count=len(adapters))
         return None
     origin_adapter = adapters[0]
-    if not (profile and profile == getattr(origin_adapter, "_profile", None)):
+    # Exact equality against the route this adapter's own turns carry: "" for a single-profile
+    # process (whose inbound source is deliberately unstamped so one session key serves both of
+    # Hermes' derivations), its own profile name for a multiplexed one. A foreign or absent
+    # route never matches, so the gate stays closed.
+    route = getattr(origin_adapter, "_session_profile_route", None)
+    expected_profile = route() if callable(route) else (getattr(origin_adapter, "_profile", "") or "")
+    if (profile or "") != expected_profile:
         _log_mobile_policy_block(
             "profile_mismatch", profile_present=bool(profile), profile_match=False
         )
@@ -3872,7 +4065,9 @@ def _resolve_live_origin() -> Optional[Tuple[Any, str, str, str]]:
             "turn_message_mismatch", message_present=bool(message_id), message_match=False
         )
         return None
-    return origin_adapter, chat_id, turn_id, profile
+    # The lease that callers re-check after an await compares adapters to this value, so hold
+    # the adapter's own identity: a single-profile process carries no route to compare against.
+    return origin_adapter, chat_id, turn_id, getattr(origin_adapter, "_profile", "") or ""
 
 
 _SEND_MEDIA_CAPTION_MAX = 4096
@@ -4208,7 +4403,7 @@ async def _cozy_mobile(request: Any, location: bool = False, media: bool = False
     after_adapters = [
         adapter for adapter in _active_adapters_snapshot()
         if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
-        and getattr(adapter, "_profile", None) == profile
+        and (getattr(adapter, "_profile", "") or "") == profile
     ]
     if len(after_adapters) != 1 or after_adapters[0] is not origin_adapter:
         _log_mobile_policy_block("origin_turn_changed_after_request")
@@ -4229,7 +4424,7 @@ async def _cozy_mobile(request: Any, location: bool = False, media: bool = False
         final_adapters = [
             adapter for adapter in _active_adapters_snapshot()
             if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
-            and getattr(adapter, "_profile", None) == profile
+            and (getattr(adapter, "_profile", "") or "") == profile
         ]
         if len(final_adapters) != 1 or final_adapters[0] is not origin_adapter:
             _log_mobile_policy_block("origin_turn_changed_after_artifact_download")

@@ -105,6 +105,64 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("mobile_location", self.socket.sent[0]["capabilities"])
         self.assertEqual(self.socket.sent[0]["commands"], self.client._config.commands)
 
+    async def test_hello_declares_the_turns_this_process_still_carries(self):
+        """Capability 69: ids only, and an empty array is a real declaration."""
+        self.client._config.active_turns = lambda: ["turn-a", "turn-b"]
+        await self.client.connect()
+        self.assertEqual(self.socket.sent[0]["activeTurns"], ["turn-a", "turn-b"])
+
+    async def test_hello_declares_an_empty_array_when_this_process_carries_none(self):
+        self.client._config.active_turns = lambda: []
+        await self.client.connect()
+        self.assertEqual(self.socket.sent[0]["activeTurns"], [])
+
+    async def test_hello_bounds_the_declaration_at_the_contract_cap(self):
+        self.client._config.active_turns = lambda: [f"turn-{index}" for index in range(300)]
+        await self.client.connect()
+        self.assertEqual(len(self.socket.sent[0]["activeTurns"]), 256)
+
+    async def test_a_refusal_carries_the_typed_reason_once_the_gateway_runs_69(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({
+            "kind": "hello_ack", "capabilities": ["draft"],
+            "resume": {"eventSequence": 0, "commandSequence": 0},
+            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
+            "extensions": {"com.cozylabs.bots": 69},
+        }))
+
+        await self.client.send_failed("thread", "turn", reason="unknown_turn")
+
+        event = self.spool.pending_events(10, 100_000)[0]["event"]
+        self.assertEqual(event["reason"], "unknown_turn")
+        self.assertNotIn("message", event)
+
+    async def test_a_refusal_below_69_is_byte_identical_to_its_pre_69_self(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({
+            "kind": "hello_ack", "capabilities": ["draft"],
+            "resume": {"eventSequence": 0, "commandSequence": 0},
+            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
+            "extensions": {"com.cozylabs.bots": 68},
+        }))
+
+        await self.client.send_failed("thread", "turn", reason="unknown_turn")
+
+        event = self.spool.pending_events(10, 100_000)[0]["event"]
+        self.assertNotIn("reason", event)
+
+    async def test_an_unadvertised_extension_is_read_as_below_69(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({
+            "kind": "hello_ack", "capabilities": ["draft"],
+            "resume": {"eventSequence": 0, "commandSequence": 0},
+            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
+        }))
+
+        await self.client.send_failed("thread", "turn", reason="unknown_turn")
+
+        event = self.spool.pending_events(10, 100_000)[0]["event"]
+        self.assertNotIn("reason", event)
+
     async def test_hello_carries_an_explicit_empty_catalog_to_clear_stale_discovery(self):
         await self.client.connect()
         self.assertEqual(self.socket.sent[0]["commands"], [])

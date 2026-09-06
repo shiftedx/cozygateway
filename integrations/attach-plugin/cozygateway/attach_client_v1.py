@@ -75,6 +75,15 @@ HELLO_ACK_TIMEOUT_SECONDS = 5
 # The single hello shape. One version, one capability set, no negotiated subset: a gateway that
 # cannot accept this refuses the socket, which is the only honest outcome for a capability loss.
 HELLO_VERSION = 2
+# The vendor extension whose version the gateway advertises on hello_ack, and the version that
+# introduced stale native turn reconciliation (capability 69: hello.activeTurns and the closed
+# failed.reason "unknown_turn"). A gateway below it must see exactly its pre-69 frames.
+BOTS_EXTENSION = "com.cozylabs.bots"
+STALE_TURN_RECONCILIATION_VERSION = 69
+# Closed set of refusal reasons this peer may put on a failed frame.
+FAILED_REASONS = frozenset({"unknown_turn"})
+# The contract's cap on the ids one hello may declare.
+ACTIVE_TURNS_MAX = 256
 HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
     "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "delivery_receipts",
@@ -152,6 +161,9 @@ class AttachV1ClientConfig:
     max_in_flight_events: int = 64
     max_in_flight_bytes: int = 4 * 1024 * 1024
     commands: List[Dict[str, str]] = field(default_factory=list)
+    # Capability 69. The turn ids this process still carries, read at each hello. An empty list is
+    # a real declaration ("I hold none"); leaving this unset declares nothing at all.
+    active_turns: Optional[Callable[[], List[str]]] = None
 
 
 class AttachV1Client:
@@ -168,6 +180,8 @@ class AttachV1Client:
         self._closed = False
         self._negotiated = False
         self._capabilities: set[str] = set()
+        # Vendor extension versions the gateway advertised on hello_ack, per capability id.
+        self._extensions: Dict[str, int] = {}
         self._send_lock = asyncio.Lock()
         self._flow_lock = asyncio.Lock()
         self._max_events = config.max_in_flight_events
@@ -205,6 +219,7 @@ class AttachV1Client:
         self._closed = False
         self._negotiated = False
         self._capabilities.clear()
+        self._extensions.clear()
         self._sent_events.clear()
         self._sent_event_bytes = 0
         self._hello_retried = False
@@ -241,7 +256,33 @@ class AttachV1Client:
             "commands": self._config.commands[:512],
             "telemetry": self._spool.health_snapshot(),
         }
+        # Capability 69. Sent on every hello, including as an empty array, which is the peer's
+        # real "I hold none" answer. It cannot be gated on the acked extension version because
+        # hello precedes hello_ack; the hello schema carries no additionalProperties bound and
+        # attach-v1's forward-compatibility rule has a peer ignore members it does not know, so
+        # a gateway below 69 reads exactly the hello it always read.
+        declared = self._declared_active_turns()
+        if declared is not None:
+            hello["activeTurns"] = declared
         await self._send(hello)
+
+    def _declared_active_turns(self) -> Optional[List[str]]:
+        """The bounded turn-id declaration for this hello, or None when nothing can declare."""
+        provider = self._config.active_turns
+        if provider is None:
+            return None
+        try:
+            turns = provider()
+        except Exception:  # noqa: BLE001 - a hello must not fail on a declaration
+            logger.debug("attach-v1: could not read the active turn declaration", exc_info=True)
+            return None
+        if not isinstance(turns, (list, tuple)):
+            return None
+        return [str(turn) for turn in turns if isinstance(turn, str) and turn][:ACTIVE_TURNS_MAX]
+
+    def extension_version(self, capability: str) -> int:
+        """The version the gateway advertised for one vendor extension, 0 when it advertised none."""
+        return self._extensions.get(capability, 0)
 
     async def request_device_status(self, thread_id: str, turn_id: str, purpose: str) -> MobileDeviceStatusResult:
         """Request one ephemeral status result for this live turn, never via the spool."""
@@ -464,13 +505,27 @@ class AttachV1Client:
             _set_media_positions(event, media_positions)
         await self._queue_event(event)
 
-    async def send_failed(self, thread_id: str, turn_id: str, message: str) -> None:
+    async def send_failed(
+        self, thread_id: str, turn_id: str, message: Optional[str] = None, *,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Seal ``turn_id`` as failed, optionally naming why in the closed capability 69 vocabulary.
+
+        ``reason`` rides only on a gateway that advertised ``com.cozylabs.bots`` at 69 or later,
+        so a gateway below that receives the frame it has always received.
+        """
         self._latest_blocks.pop(turn_id, None)
         self._latest_tools.pop(turn_id, None)
-        await self._queue_event({
+        event: Dict[str, Any] = {
             "kind": "failed", "threadId": thread_id, "turnId": turn_id,
-            "messageId": str(uuid.uuid4()), "message": message[:4096],
-        })
+            "messageId": str(uuid.uuid4()),
+        }
+        if message:
+            event["message"] = message[:4096]
+        if (reason in FAILED_REASONS
+                and self.extension_version(BOTS_EXTENSION) >= STALE_TURN_RECONCILIATION_VERSION):
+            event["reason"] = reason
+        await self._queue_event(event)
 
     async def send_cancelled(self, thread_id: str, turn_id: str) -> None:
         """Seal a turn that ended with nothing to say.
@@ -1030,6 +1085,11 @@ class AttachV1Client:
                     self._spool.reconcile_server_resume(event_sequence, command_sequence)
             offered = frame.get("capabilities")
             self._capabilities = {str(item) for item in offered} if isinstance(offered, list) else set()
+            extensions = frame.get("extensions")
+            self._extensions = {
+                str(key): value for key, value in extensions.items()
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            } if isinstance(extensions, dict) else {}
             self._negotiated = True
             # The negotiated set decides which surfaces work for the life of this connection and is
             # otherwise invisible from the Hermes side, so record it once at handshake time.
