@@ -48,7 +48,7 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("desktop_session_resume"),
   Type.Literal("desktop_session_sync"),
   Type.Literal("cozyapps"),
-  /** Capability row 68, com.cozylabs.cozyapps 2. A separate literal beside `cozyapps` because the
+  /** Capability row 67, com.cozylabs.cozyapps 2. A separate literal beside `cozyapps` because the
    * flat one carries no version, exactly as `memory_ownership` sits beside `memory_management`. A
    * peer that offers only `cozyapps` keeps every v1 behavior and sees no new frame or member. */
   Type.Literal("cozyapps_dashboard"),
@@ -583,7 +583,7 @@ const MediaEvent = Type.Object({ kind: Type.Literal("media"), media: AttachV1Med
 const CozyAppUpsertEvent = Type.Object({ kind: Type.Literal("cozyapp_upsert"), appId: Id, name: Type.String({ minLength: 1, maxLength: 120 }), tree: CozyAppTreeSchema }, { additionalProperties: false });
 /** Terminal proof from the plugin that a distinct app action command ran. */
 const CozyAppActionStatusEvent = Type.Object({ kind: Type.Literal("cozyapp_action_status"), appId: Id, actionId: Id, actionRequestId: Id, status: Type.Union([Type.Literal("completed"), Type.Literal("failed")]) }, { additionalProperties: false });
-/** Capability row 68. The creator publishes the small versioned envelope for its own app. The
+/** Capability row 67. The creator publishes the small versioned envelope for its own app. The
  * gateway validates the document's structure and bounds and never interprets it. `data` is the
  * source-attributed snapshot, and this is the only path that writes one. */
 const CozyAppDashboardUpsertEvent = Type.Object({

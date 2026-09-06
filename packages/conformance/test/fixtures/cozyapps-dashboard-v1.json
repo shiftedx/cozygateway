@@ -4,7 +4,7 @@
     "minimumVersion": 2
   },
   "attachCapability": "cozyapps_dashboard",
-  "note": "com.cozylabs.cozyapps 2, contract/ext-cozyapps-v1.md section CozyApps 2, cross-referenced as row 68 in ext-bots-v1.md. Three additive record kinds: a typed saved input value with its own revision, an action receipt in the four public names with a source-attributed data snapshot, and the small versioned document envelope. Everything a v1 peer or client already had is unchanged: the pre2 app, the pre2 action and the pre2 action request below are byte identical to what they were before this version existed. The gateway validates the document's structure and bounds and never interprets it.",
+  "note": "com.cozylabs.cozyapps 2, contract/ext-cozyapps-v1.md section CozyApps 2, cross-referenced as row 67 in ext-bots-v1.md. Three additive record kinds: a typed saved input value with its own revision, an action receipt in the four public names with a source-attributed data snapshot, and the small versioned document envelope. Everything a v1 peer or client already had is unchanged: the pre2 app, the pre2 action and the pre2 action request below are byte identical to what they were before this version existed. The gateway validates the document's structure and bounds and never interprets it.",
   "valueTypes": ["string", "number", "boolean", "date", "selection"],
   "receiptStates": ["queued", "running", "completed", "failed"],
   "dataStates": ["fresh", "stale", "error"],

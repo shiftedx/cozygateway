@@ -29,7 +29,7 @@ const fixture = JSON.parse(readFileSync(
 )) as Record<string, unknown>;
 
 /** com.cozylabs.cozyapps 2, contract/ext-cozyapps-v1.md section CozyApps 2, cross-referenced as
- *  row 68 in ext-bots-v1.md. A PORTABLE fixture: the records themselves are what a black-box
+ *  row 67 in ext-bots-v1.md. A PORTABLE fixture: the records themselves are what a black-box
  *  client in any language can be held to, and above all the pre-2 payloads that must stay exactly
  *  what they were for a peer and a client that never negotiate the new lane. */
 describe("cozyapps dashboard records client fixture", () => {

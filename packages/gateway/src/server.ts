@@ -668,7 +668,7 @@ export async function startGateway(
             return true;
           }
         }
-        // Capability row 68. The creator publishes the envelope for its own app; the physical id
+        // Capability row 67. The creator publishes the envelope for its own app; the physical id
         // keeps the creator namespacing, so a plugin can write nothing but its own record.
         if (frame.event.kind === "cozyapp_dashboard_upsert") {
           try {
@@ -722,7 +722,7 @@ export async function startGateway(
         if (nativeSink?.handle(agentId, frame) === true) return true;
         return acknowledgeOrphanedAttachEvent(storage, agentId, frame);
       },
-      // Capability row 68. The peer taking the command off the wire is the public receipt's
+      // Capability row 67. The peer taking the command off the wire is the public receipt's
       // `running`, derived for every peer including one that stays at cozyapps 1.
       onCommandDelivered: (_agentId, commandId) => {
         if (commandId.startsWith("cozyapp-action:")

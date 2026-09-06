@@ -1307,7 +1307,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
       return c.json(deps.storage.cozyAppsSnapshot().actions.find((item) => item.id === action.id) ?? action, 202);
     } catch (err) { return c.json(errorBody("invalid_request", err instanceof Error ? err.message : "invalid request"), 400); }
   });
-  // Capability row 68, com.cozylabs.cozyapps 2. Three additive record kinds beside the v1 library.
+  // Capability row 67, com.cozylabs.cozyapps 2. Three additive record kinds beside the v1 library.
   // Every route above is untouched, so a client that never calls these sees the gateway it saw
   // before this row existed.
   app.get("/cozyapps/:id/values", requireDevice, (c) => deps.storage.cozyApp(c.req.param("id")) === undefined

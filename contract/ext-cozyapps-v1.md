@@ -26,7 +26,7 @@ through `cozyapp_upsert`. Gateway bot deletion purges its apps and actions.
 beside the v1 library and changes nothing above. Every v1 route, frame, node and action behavior
 is byte identical for a peer or client that does not negotiate the new attach capability and does
 not call the new routes; `CozyApp` and `CozyAppAction` gain no member, because the shipped client
-decoder refuses an unknown key on both. Cross-referenced as capability row 68 in
+decoder refuses an unknown key on both. Cross-referenced as capability row 67 in
 `ext-bots-v1.md`.
 
 The bot-side half is gated on a new attach-v1 capability literal, `cozyapps_dashboard`, negotiated

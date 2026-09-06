@@ -8,7 +8,7 @@ release; everything older is marked pre-release so installers resolve one "lates
 ## Unreleased
 
 - CozyApps dashboard records (`com.cozylabs.cozyapps` capability 2, cross-referenced as
-  `com.cozylabs.bots` row 68): three durable record kinds beside the v1 library. A saved editable
+  `com.cozylabs.bots` row 67): three durable record kinds beside the v1 library. A saved editable
   input value is typed to product field types only, carries its own revision, and is written by the
   user route and by no bot: a stale write answers `409 conflict` with the current value, and
   replaying an idempotency key returns the prior result without a second write. An action receipt

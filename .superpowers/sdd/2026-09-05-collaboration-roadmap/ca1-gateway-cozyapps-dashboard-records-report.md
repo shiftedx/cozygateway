@@ -71,14 +71,12 @@ The full section is in the file. Its load-bearing sentences:
 > server-owned Bot Routines path stands, and artwork is client-local presentation. Gateway bot
 > deletion purges the new records with the app.
 
-### `contract/ext-bots-v1.md`, row 68
+### `contract/ext-bots-v1.md`, row 67
 
-> | 68 | CozyApps dashboard records: saved editable input values, action receipts with
+> | 67 | CozyApps dashboard records: saved editable input values, action receipts with
 > source-attributed data snapshots, and the small typed document envelope. THIS ROW IS A
 > CROSS-REFERENCE ONLY. It is carried by `com.cozylabs.cozyapps: 2` and the attach-v1
-> `cozyapps_dashboard` capability, not by a `com.cozylabs.bots` version: the bots capability stays
-> at 66 here, because 67 is reserved for device terminal states and a client comparing `>=` must
-> never read a bots version as proof of a row that does not exist yet. See
+> `cozyapps_dashboard` capability, not by a `com.cozylabs.bots` version. See
 > `contract/ext-cozyapps-v1.md`, section CozyApps 2, for the routes, frames, bounds and the
 > derivation a peer at cozyapps 1 gets for free. |
 
@@ -318,7 +316,7 @@ richer receipt event carries, and the saved `values` on the action command.
 
 ## Concerns for the lead
 
-1. **`BOTS_CAPABILITY_VERSION` stays 66.** Row 68 is documented as a cross-reference only. If the
+1. **`BOTS_CAPABILITY_VERSION` stays 66.** Row 67 is documented as a cross-reference only. If the
    lead wants the bots capability advanced to 68, 7a's row 67 has to land first, or the row has to
    be renumbered. Decide before this branch merges alongside 7a.
 2. **The client is not updated.** `CozyAppsContract.swift` still decodes only v1, which is correct
@@ -326,3 +324,26 @@ richer receipt event carries, and the saved `values` on the action command.
    the decoders for the new records.
 3. **`.121` UNKNOWN.** No live model qualification. Reproducible commands for later are the four
    focused suites above, which need no endpoint.
+
+## Renumber (lead ruling, after the first report)
+
+Capability rows advertise monotonically and CA1 lands before 7a, so this packet takes row 67 and
+7a moves to 68. Applied: the cross-reference row in `contract/ext-bots-v1.md` is now 67, the
+extension's status header and its discovery block read 67, `BOTS_CAPABILITY_VERSION` is 67, and
+the three assertion tests that pin it (`packages/contract/test/artifacts.test.ts`,
+`packages/contract/test/ext-bots.test.ts`, `packages/gateway/test/bots-delete-routes.test.ts`)
+were updated with it. Every "row 68" mention in the CHANGELOG, `ext-cozyapps-v1.md`, the
+conformance fixture and its test, the source comments, and this report reads 67. The row text no
+longer says the bots capability stays behind, since it now advances.
+
+The REAL GATING IS UNCHANGED and is what it always was: `com.cozylabs.cozyapps: 2` for the routes
+and the records, and the attach-v1 `cozyapps_dashboard` literal for the bot-side frames and the
+saved values on the action command. A client reads this row's surface off `com.cozylabs.cozyapps`,
+never off the bots version.
+
+Concern 2 stands as the lead accepted it: no fifth internal action state, a peer's explicit
+`running` receipt stamps the existing `delivered`, which already presents as the public `running`,
+with the additive `started_at` column named as the upgrade path in code and above.
+
+After the renumber: `pnpm -r typecheck` Done on all four packages; contract 200 passed, gateway
+1495 passed with 2 skipped, conformance 99 passed with 19 skipped, zero failures.

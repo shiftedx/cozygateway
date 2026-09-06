@@ -82,7 +82,7 @@ export interface AttachV1Events {
   onTaskTurnQueued?(agentId: string, command: Extract<AttachV1Command, { kind: "turn" }>): void;
   onPresence(agentId: string, state: "online" | "degraded" | "absent"): void;
   /** The peer took a command off the wire. Transport-only proof: it says the command reached the
-   * process that will run it, never that the work happened. Capability row 68 uses it to move a
+   * process that will run it, never that the work happened. Capability row 67 uses it to move a
    * CozyApp action receipt to the public `running`, for a v1 peer too. */
   onCommandDelivered?(agentId: string, commandId: string): void;
   onMobileRequest?(agentId: string, frame: AttachV1MobileRequest): void;

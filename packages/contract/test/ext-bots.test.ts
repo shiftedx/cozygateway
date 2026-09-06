@@ -919,7 +919,7 @@ describe("capability advertisement", () => {
     // originals, tombstoned deletion, supersession, and an independent delivery lifecycle.
     // Capability 66 adds the typed scoped-approval block, payload-hash binding, standing once and
     // category grants, the always-require list no grant may cover, and the revocation view.
-    expect(BOTS_CAPABILITY_VERSION).toBe(66);
+    expect(BOTS_CAPABILITY_VERSION).toBe(67);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {

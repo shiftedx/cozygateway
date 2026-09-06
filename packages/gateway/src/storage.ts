@@ -676,7 +676,7 @@ CREATE TABLE IF NOT EXISTS cozy_app_actions (
   updated_at INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX IF NOT EXISTS cozy_app_actions_creator_bot ON cozy_app_actions (creator_bot, updated_at DESC);
--- Capability row 68, com.cozylabs.cozyapps 2. One saved editable input value, keyed by app and
+-- Capability row 67, com.cozylabs.cozyapps 2. One saved editable input value, keyed by app and
 -- value id, with its OWN revision independent of the app tree's. It is written by the user action
 -- and by nothing else: no attach frame reaches this table. The idempotency key stored here is the
 -- last key that wrote this row, so a retried tap replays its own result instead of writing twice.
@@ -2002,7 +2002,7 @@ export class Storage {
 
   deleteCozyApp(id: string): boolean { return this.#db.prepare("DELETE FROM cozy_apps WHERE id = ?").run(id).changes === 1; }
 
-  /** Capability row 68 adds the OPTIONAL binding: which app revision and which saved value
+  /** Capability row 67 adds the OPTIONAL binding: which app revision and which saved value
    *  revisions the person's tap was made against. The returned action is the unchanged v1 payload,
    *  because the shipped client decoder refuses an unknown key on it. */
   createCozyAppAction(input: { id: string; appId: string; creatorBot: string; actionId: string; idempotencyKey: string; now: number; appRevision?: number | undefined; valueRevisions?: ReadonlyArray<{ valueId: string; revision: number }> | undefined }): { action: { id: string; appId: string; creatorBot: string; actionId: string; status: string; createdAt: number; updatedAt: number }; fresh: boolean } {
@@ -5433,7 +5433,7 @@ export function openStorage(dbPath: string): Storage {
       ["author_bot", "ALTER TABLE bot_native_messages ADD COLUMN author_bot TEXT"],
       ["in_reply_to_id", "ALTER TABLE bot_native_messages ADD COLUMN in_reply_to_id TEXT"],
     ]],
-    // Capability row 68. The receipt binding and the bot's source snapshot hang off the action
+    // Capability row 67. The receipt binding and the bot's source snapshot hang off the action
     // row that already exists, so a v1 action written before this row keeps every column it had
     // and reads back as a `queued` receipt carrying no binding, which is exactly what it was.
     ["cozy_app_actions", [
