@@ -249,6 +249,125 @@ describe("a gateway configured with no Hermes endpoint", () => {
     });
     expect(afterRevoke.status).toBe(401);
   });
+
+  /** V1-F1, capabilities 46 and 52. Rooms are gateway-owned attach-v1 conversations, so a room
+   *  whose members are all runtime bots needs no Hermes endpoint at all. Before this test the
+   *  route answered `503 backend_unavailable "cross-endpoint groups are not supported"`, because
+   *  zero endpoints selected the federated control surface and every group method there throws.
+   *
+   *  This is the whole route surface, over the real server: create, list, read, and a message that
+   *  actually fans a member turn out to two attached runtime peers and lands both replies in the
+   *  transcript. */
+  it("creates a room of two runtime bots and fans a member turn out to both", async () => {
+    const l = await live();
+    const runner = await pairRunner(l, "kyle-mbp");
+    const ws = new WebSocket(`${l.gateway.url.replace("http", "ws")}/runner/v1`, {
+      headers: { authorization: `Bearer ${runner.runnerToken}` },
+    });
+    sockets.push(ws);
+    const runnerFrames: Array<{ kind: string; command?: string; payload?: { botId?: string; attachToken?: string } }> = [];
+    ws.on("message", (data) => runnerFrames.push(JSON.parse(String(data)) as { kind: string }));
+    await once(ws, "open");
+    ws.send(
+      JSON.stringify({
+        kind: "hello",
+        version: 1,
+        runnerId: runner.runner.id,
+        name: "kyle-mbp",
+        platform: { os: "darwin", arch: "arm64", release: "24.5.0" },
+        agentVersion: "0.1.0",
+        backends: ["process"],
+      }),
+    );
+    await until(() => runnerFrames.some((frame) => frame.kind === "hello_ack"));
+
+    for (const name of ["sage", "pixel"]) {
+      const created = await l.authed("/bots", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name, runtime: "cozyagents" }),
+      });
+      expect(created.status).toBe(201);
+    }
+    await until(() => ["sage", "pixel"].every((name) =>
+      runnerFrames.some((frame) => frame.command === "create_runtime" && frame.payload?.botId === name)));
+
+    // One real attach-v1 socket per runtime bot, dialed with the credential the runner was handed.
+    const peers = new Map<string, { socket: WebSocket; frames: Array<Record<string, any>> }>();
+    for (const name of ["sage", "pixel"]) {
+      const token = runnerFrames.find(
+        (frame) => frame.command === "create_runtime" && frame.payload?.botId === name,
+      )?.payload?.attachToken;
+      expect(typeof token).toBe("string");
+      const socket = new WebSocket(`${l.gateway.url.replace("http", "ws")}/attach/v1`, {
+        headers: { authorization: `Bearer ${token!}` },
+      });
+      sockets.push(socket);
+      const frames: Array<Record<string, any>> = [];
+      socket.on("message", (data) => frames.push(JSON.parse(String(data)) as Record<string, unknown>));
+      await once(socket, "open");
+      socket.send(JSON.stringify({
+        kind: "hello",
+        version: 2,
+        instanceId: `runtime-${name}`,
+        capabilities: ["draft"],
+        resume: { eventSequence: 0, commandSequence: 0 },
+      }));
+      await until(() => frames.some((frame) => frame["kind"] === "hello_ack"));
+      peers.set(name, { socket, frames });
+    }
+
+    const created = await l.authed("/bots/groups", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Launch", members: ["sage", "pixel"] }),
+    });
+    expect(created.status).toBe(201);
+    expect(await created.json()).toMatchObject({ group: { name: "launch", members: ["sage", "pixel"] } });
+
+    const listed = (await (await l.authed("/bots/groups")).json()) as { groups: Array<{ name: string }> };
+    expect(listed.groups.map((group) => group.name)).toEqual(["launch"]);
+
+    const sent = await l.authed("/bots/groups/launch/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "plan the launch @sage @pixel" }),
+    });
+    expect(sent.status).toBe(202);
+
+    // The fan-out: every member is asked on its own gateway-owned `group:<room>:<member>` thread.
+    for (const [name, peer] of peers) {
+      await until(() => peer.frames.some((frame) =>
+        frame["kind"] === "command" && frame["command"]?.["threadId"] === `group:launch:${name}`));
+      const turn = peer.frames.find((frame) =>
+        frame["kind"] === "command" && frame["command"]?.["threadId"] === `group:launch:${name}`)!;
+      peer.socket.send(JSON.stringify({
+        kind: "event",
+        sequence: 1,
+        eventId: `commit:${name}`,
+        event: {
+          kind: "commit",
+          threadId: turn["command"]["threadId"],
+          turnId: turn["command"]["turnId"],
+          messageId: `reply:${name}`,
+          blocks: [{ type: "paragraph", text: `${name} is ready.` }],
+        },
+      }));
+    }
+
+    await until(() => {
+      const rows = l.gateway.storage.botGroupLog("launch");
+      return rows.filter((row) => row.kind === "member").length >= 2;
+    }, 8_000);
+    const detail = (await (await l.authed("/bots/groups/launch")).json()) as {
+      members: string[];
+      messages: Array<{ from: { kind: string; name: string }; text: string }>;
+    };
+    expect(detail.members).toEqual(["sage", "pixel"]);
+    expect(detail.messages.map((message) => message.text)).toEqual(
+      expect.arrayContaining(["sage is ready.", "pixel is ready."]),
+    );
+  });
 });
 
 /** Pairs one computer over the real `POST /pair {kind: "runner"}` route, which is what a create
