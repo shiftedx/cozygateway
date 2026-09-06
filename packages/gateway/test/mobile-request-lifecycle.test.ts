@@ -212,6 +212,57 @@ describe("capability-68 typed phone capability request lifecycle", () => {
     expect(send).toHaveBeenCalledTimes(1);
   });
 
+  it("does not seal completed when the receipt the answer needs could not be written", () => {
+    const { broker, lifecycle, send, result } = harness({ receipt: () => false });
+    broker.invoke(statusRequest());
+    broker.result("phone-a", {
+      type: "mobile_node_result", requestId: "req-1", lease: lease(send, "req-1"), status: "ok",
+      result: {
+        appState: "background", lowPowerMode: false,
+        capabilities: [
+          { command: "device.status", permission: "not_required" },
+          { command: "location.current", permission: "authorized" },
+          { command: "camera.capture", permission: "authorized" },
+          { command: "file.pick", permission: "not_required" },
+          { command: "notification.present", permission: "not_required" },
+        ],
+      },
+    });
+
+    // The peer is told the request failed, so the person must not read `completed`.
+    expect(result).toHaveBeenCalledWith("sage", expect.objectContaining({ requestId: "req-1", status: "device_unavailable" }));
+    expect(states(lifecycle, "req-1")).toEqual(["requested", "routed", "failed"]);
+  });
+
+  it("calls a failure after the phone already ran the request a failure, not a policy block", () => {
+    const { broker, lifecycle, send } = harness();
+    broker.invoke(statusRequest());
+    // A phone answer the gateway cannot accept arrives AFTER the request was routed and run, so
+    // `policy_blocked`, which means refused before any phone saw it, would be a lie.
+    broker.result("phone-a", {
+      type: "mobile_node_result", requestId: "req-1", lease: lease(send, "req-1"), status: "ok",
+      // An inventory the closed status schema refuses: the gateway cannot accept this answer.
+      result: { appState: "background", lowPowerMode: false, capabilities: [] } as never,
+    });
+
+    expect(states(lifecycle, "req-1").at(-1)).toBe("failed");
+  });
+
+  it("records no terminal for a request the peer is never told about", () => {
+    const { broker, lifecycle, result } = harness();
+    // A one-request ceiling: the second admission is dropped fail-closed and silently, which is
+    // the pre-68 behavior. A durable terminal nobody was told would disagree with the peer.
+    const bounded = new MobileNodeBroker({
+      lifecycle, wake: () => true, route: () => available(), send: () => "sent" as const,
+      result, receipt: () => true, now: () => 1_000, terminalLimit: 1,
+    });
+    bounded.invoke(statusRequest());
+    bounded.invoke(statusRequest({ requestId: "req-2" }));
+
+    expect(states(lifecycle, "req-2")).toEqual([]);
+    expect(result).not.toHaveBeenCalledWith("sage", expect.objectContaining({ requestId: "req-2" }));
+  });
+
   it("keeps the original target when a second device attaches mid-request", () => {
     const { broker, lifecycle, send } = harness();
     broker.invoke(statusRequest());
@@ -255,6 +306,60 @@ describe("capability-68 durable request records", () => {
     store.recordBotMobileRequest({ ...base, state: "completed", at: 1_200 });
 
     expect(store.nativeBotMobileRequests("sage", "thread-1")[0]?.state).toBe("denied");
+    store.close();
+  });
+
+  it("answers the newest requests and a live one whatever its age, past the read bound", () => {
+    const store = storage();
+    // Older than the window, and settled: history, not something to reconcile against.
+    store.recordBotMobileRequest({ ...base, requestId: "ancient", state: "requested", at: 1_000 });
+    store.recordBotMobileRequest({ ...base, requestId: "ancient", state: "denied", at: 1_000 });
+    for (let index = 0; index < 150; index += 1) {
+      const requestId = `req-${String(index).padStart(3, "0")}`;
+      store.recordBotMobileRequest({ ...base, requestId, state: "requested", at: 2_000 + index });
+      store.recordBotMobileRequest({ ...base, requestId, state: "completed", at: 2_000 + index });
+    }
+    // The one the resuming app is actually trying to reconcile, opened before the newest hundred.
+    store.recordBotMobileRequest({ ...base, requestId: "pending", state: "requested", at: 2_010 });
+    store.recordBotMobileRequest({ ...base, requestId: "pending", state: "executing", at: 2_011 });
+
+    const answered = store.nativeBotMobileRequests("sage", "thread-1");
+    expect(answered).toHaveLength(100);
+    // A request that has not settled is never crowded out by finished ones.
+    expect(answered[0]).toMatchObject({ requestId: "pending", state: "executing" });
+    // Newest first among the settled ones, so the window moves with the conversation.
+    expect(answered[1]?.requestId).toBe("req-149");
+    expect(answered.some((request) => request.requestId === "req-000")).toBe(false);
+    store.close();
+  });
+
+  it("sweeps settled records past the retention window and never a live one", () => {
+    const store = storage();
+    const day = 24 * 60 * 60 * 1_000;
+    store.recordBotMobileRequest({ ...base, requestId: "old-settled", state: "requested", at: 1_000 });
+    store.recordBotMobileRequest({ ...base, requestId: "old-settled", state: "completed", at: 1_000 });
+    store.recordBotMobileRequest({ ...base, requestId: "old-live", state: "requested", at: 1_000 });
+
+    store.recordBotMobileRequest({ ...base, requestId: "fresh", state: "requested", at: 1_000 + 31 * day });
+
+    const remaining = store.nativeBotMobileRequests("sage", "thread-1").map((request) => request.requestId);
+    expect(remaining).not.toContain("old-settled");
+    // A request nobody settled is not swept: its outcome is still owed to a person.
+    expect(remaining).toContain("old-live");
+    expect(remaining).toContain("fresh");
+    store.close();
+  });
+
+  it("takes its lifecycle records with the bot they belong to", () => {
+    const store = storage();
+    store.recordBotMobileRequest({ ...base, state: "requested", at: 1_000 });
+    store.recordBotMobileRequest({ ...base, bot: "other", requestId: "req-2", state: "requested", at: 1_000 });
+
+    const purged = store.purgeBot("sage");
+
+    expect(purged["mobileRequests"]).toBe(1);
+    expect(store.nativeBotMobileRequests("sage", "thread-1")).toEqual([]);
+    expect(store.nativeBotMobileRequests("other", "thread-1")).toHaveLength(1);
     store.close();
   });
 
@@ -308,7 +413,7 @@ describe("capability-68 Task completion announcement", () => {
   it("announces once, on the transition that wrote the completion notification record", async () => {
     const store = openStorage(":memory:");
     store.tasks.clock(() => 0);
-    const announced: { taskId: string; bot: string; room?: string }[] = [];
+    const announced: { taskId: string; bot: string; sessionId: string; room?: string }[] = [];
     store.tasks.completions((notice) => announced.push(notice));
     const sessionId = store.nativeBotChat("sage", 1).sessionId;
     const command = store.enqueueAttachCommand(
@@ -330,7 +435,7 @@ describe("capability-68 Task completion announcement", () => {
     store.acceptAttachEvent("sage", final, 5);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-    expect(announced).toEqual([{ taskId, bot: "sage" }]);
+    expect(announced).toEqual([{ taskId, bot: "sage", sessionId }]);
     expect(store.tasks.read(taskId)?.view.notification?.taskId).toBe(taskId);
     store.close();
   });

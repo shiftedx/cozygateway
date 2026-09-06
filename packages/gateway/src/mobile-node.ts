@@ -219,11 +219,9 @@ export class MobileNodeBroker {
     this.#pruneTerminal();
     // `requestId` is a one-shot idempotency key. Never replace a live timer/prompt.
     if (this.#pending.has(input.requestId) || this.#terminal.has(input.requestId)) return;
-    this.#life(input, input.deviceId, "requested");
     if (!input.deviceId) {
       this.#diagnose("no_selected_device", input.command, false, noRoute());
-      this.#life(input, undefined, "failed");
-      this.#terminalize(input.agentId, input.requestId, "device_unavailable", input.expiresAt,
+      this.#refuse(input, undefined, "device_unavailable", "failed",
         failure("routing", "no_selected_device"));
       return;
     }
@@ -231,8 +229,7 @@ export class MobileNodeBroker {
       || input.expiresAt > this.#now() + maxDeadlineMs(input.command)
       || !isPurpose(input.purpose)) {
       this.#diagnose("request_policy_rejected", input.command, true, noRoute());
-      this.#life(input, input.deviceId, "policy_blocked");
-      this.#terminalize(input.agentId, input.requestId, "policy_blocked", input.expiresAt,
+      this.#refuse(input, input.deviceId, "policy_blocked", "policy_blocked",
         failure("policy", "request_policy_rejected"));
       return;
     }
@@ -240,18 +237,20 @@ export class MobileNodeBroker {
     const wakeEligible = input.command === "device.status" && route.status === "selected_socket_unavailable";
     if (route.status !== "available" && !wakeEligible) {
       this.#diagnose(route.status, input.command, true, route);
-      this.#life(input, input.deviceId, "foreground_required");
-      this.#terminalize(input.agentId, input.requestId, "foreground_required", input.expiresAt,
+      this.#refuse(input, input.deviceId, "foreground_required", "foreground_required",
         failure("routing", route.status));
       return;
     }
     // No eviction is safe: a retained unexpired id is the only duplicate-prompt defense.
     // Dropping a new admission while full is intentionally fail-closed and non-durable.
-    if (!this.#canAdmit()) { this.#life(input, input.deviceId, "failed"); return; }
+    // ponytail: the admission ceiling drops the request fail-closed and SILENTLY, which is the
+    // pre-68 behavior; the peer waits out its own deadline. No lifecycle terminal is recorded
+    // either, because a durable outcome nobody was told would disagree with the peer. Upgrade
+    // path: tell the peer here, then this can record the terminal it was told.
+    if (!this.#canAdmit()) return;
     if (requiresForeground(input.command) && route.foreground !== true) {
       this.#diagnose("selected_app_not_foreground", input.command, true, route);
-      this.#life(input, input.deviceId, "foreground_required");
-      this.#terminalize(input.agentId, input.requestId, "foreground_required", input.expiresAt,
+      this.#refuse(input, input.deviceId, "foreground_required", "foreground_required",
         failure("routing", "selected_app_not_foreground"));
       return;
     }
@@ -263,11 +262,11 @@ export class MobileNodeBroker {
     // where the schema's closed key set can still be enforced.
     if (!check(MobileNodeRequestFrameSchema, frame)) {
       this.#diagnose("malformed_request_frame", input.command, true, route);
-      this.#life(input, input.deviceId, "policy_blocked");
-      this.#terminalize(input.agentId, input.requestId, "policy_blocked", input.expiresAt,
+      this.#refuse(input, input.deviceId, "policy_blocked", "policy_blocked",
         failure("dispatch", "malformed_request_frame"));
       return;
     }
+    this.#life(input, input.deviceId, "requested");
     const timer = setTimeout(() => this.#finish(input.requestId, "expired", true), input.expiresAt - this.#now());
     timer.unref();
     this.#taskWait?.({ agentId: input.agentId, threadId: input.threadId, turnId: input.turnId, requestId: input.requestId, expiresAt: input.expiresAt, status: "pending" });
@@ -517,6 +516,21 @@ export class MobileNodeBroker {
     });
   }
 
+  /** A refusal the peer IS told about, and only then a durable record of it: the pair of states a
+   *  person reads is exactly the outcome the peer received. A refusal the ceiling swallows records
+   *  nothing (see the ponytail note in `invoke`). */
+  #refuse(
+    input: MobileNodeInvocation,
+    deviceId: string | undefined,
+    status: Exclude<MobileNodeTerminal, "ok">,
+    state: MobileRequestState,
+    diagnostic: MobileNodeFailureDiagnostic,
+  ): void {
+    if (!this.#terminalize(input.agentId, input.requestId, status, input.expiresAt, diagnostic)) return;
+    this.#life(input, deviceId, "requested");
+    this.#life(input, deviceId, state);
+  }
+
   /** Never throws into the request: a lifecycle record that could not be written must not lose the
    *  phone request it describes, exactly as a failed receipt does not lose one. */
   #life(
@@ -574,12 +588,13 @@ export class MobileNodeBroker {
     diagnostic?: MobileNodeFailureDiagnostic,
   ): boolean {
     const { requestId, bot, threadId, turnId, command, purpose } = pending.frame;
-    this.#life(pending.frame, pending.deviceId,
-      status === "ok" && result !== undefined ? "completed" : terminalState(status));
     if (status === "ok" && result !== undefined) {
       let recorded = false;
       try { recorded = this.#receipt({ requestId, bot, threadId, turnId, command, purpose, sharedDescription: receiptDescription(pending.frame) }); } catch {}
       if (!recorded) {
+        // The peer is about to be told this failed. Sealing `completed` first and compensating
+        // afterwards cannot work: the first terminal is sealed, so the compensation would be
+        // dropped and a person would read an outcome the peer never got.
         this.#life(pending.frame, pending.deviceId, "failed");
         this.#taskWait?.({ agentId: pending.agentId, threadId, turnId, requestId, expiresAt: pending.expiresAt, status: "device_unavailable" });
         this.#diagnose("receipt_persistence_failed", command, true, this.#route(pending.deviceId, command));
@@ -589,6 +604,10 @@ export class MobileNodeBroker {
         return false;
       }
     }
+    // Everything below this point IS the outcome, so it is safe to seal it now. `policy_blocked`
+    // never appears here: this request was already routed to a phone, and a refusal of what came
+    // back is a failure rather than a claim the gateway blocked it before anyone saw it.
+    this.#life(pending.frame, pending.deviceId, settledState(status, result !== undefined));
     this.#taskWait?.({ agentId: pending.agentId, threadId, turnId, requestId, expiresAt: pending.expiresAt, status: status === "ok" && result === undefined ? "device_unavailable" : status });
     if (status === "ok" && result !== undefined)
       this.#result(pending.agentId, pending.command === "device.status"
@@ -617,17 +636,20 @@ export class MobileNodeBroker {
     this.#terminal.set(requestId, until);
   }
 
+  /** Answers whether the peer was actually told, so a caller records the durable terminal only
+   *  when one was delivered. */
   #terminalize(
     agentId: string,
     requestId: string,
     status: Exclude<MobileNodeTerminal, "ok">,
     expiresAt: number,
     diagnostic?: MobileNodeFailureDiagnostic,
-  ): void {
+  ): boolean {
     this.#pruneTerminal();
-    if (this.#pending.has(requestId) || this.#terminal.has(requestId) || !this.#canAdmit()) return;
+    if (this.#pending.has(requestId) || this.#terminal.has(requestId) || !this.#canAdmit()) return false;
     this.#terminal.set(requestId, Math.max(expiresAt, this.#now() + this.#terminalTtlMs));
     this.#result(agentId, { requestId, status, ...diagnostic });
+    return true;
   }
 
   #canAdmit(): boolean {
@@ -655,6 +677,15 @@ function stageRank(stage: MobileNodeProgressStage | undefined): number {
  *  `foreground_required` keep their own names on purpose. */
 function terminalState(status: MobileNodeTerminal): MobileRequestState {
   return status === "ok" || status === "device_unavailable" ? "failed" : status;
+}
+
+/** The outcome of a request that WAS routed to a phone. `policy_blocked` means the gateway refused
+ *  the request before any phone saw it, so it cannot name what happened after one ran it: an
+ *  unusable answer, a failed media validation and a refused store are all failures. The peer's own
+ *  status is unchanged, for wire compatibility; only the state a person reads differs. */
+function settledState(status: MobileNodeTerminal, delivered: boolean): MobileRequestState {
+  if (status === "ok") return delivered ? "completed" : "failed";
+  return status === "policy_blocked" ? "failed" : terminalState(status);
 }
 
 function failure(stage: MobileNodeFailureStage, reason: MobileNodeFailureReason): MobileNodeFailureDiagnostic {

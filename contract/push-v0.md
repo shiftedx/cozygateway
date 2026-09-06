@@ -186,11 +186,14 @@ Task replaces its own banner rather than stacking a second one):
 
 It carries the identities the deep link needs and NOTHING the Task worked on: no goal, no reply, no
 artifact name. The client opens the Task through `GET /tasks/:taskId`, which it is already
-authenticated for. `threadId` is the namespaced `bot:<name>`, or `group:<room>` for a room Task,
-the same shape the approval payloads use. The gateway sends it exactly once per Task, on the
-transition that writes capability 64's completion notification record, and never to a device
-holding a live socket, so a client that already announced the completion from `bot_task_updated`
-is not told a second time.
+authenticated for. `threadId` is the namespaced `bot:<name>` for a 1:1 Task, the same shape the approval payloads use,
+because a 1:1 Task's `sessionId` is the harness's own id and means nothing to a client. For a ROOM
+Task it is the room turn's own session, `group:<room>:<member>`, which is the thread id every room
+surface of this gateway already addresses. The gateway sends the push exactly once per Task, on the
+transition that writes capability 64's completion notification record, and never to a device holding
+a live socket. The client half of the deduplication is the client's own and is specified in
+`contract/ext-bots-v1.md` row 68: announce at most once per `taskId`, keyed DURABLY on capability
+64's notification record, because a relaunched app has no memory of what it announced before.
 
 **`kind: "approval_pending"`** (a tool call is waiting on a decision; category
 `approval.pending`, collapse id = `toolCallId`):

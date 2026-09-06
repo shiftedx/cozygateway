@@ -122,6 +122,10 @@ export function cozyAppPhysicalId(creatorBot: string, logicalId: string): string
   return `${prefix}${logicalId.slice(0, 102)}_${digest(logicalId, 8)}`;
 }
 
+/** How long a SETTLED lifecycle record is kept. Documented in contract/ext-bots-v1.md row 68. */
+const MOBILE_REQUEST_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+const MOBILE_REQUEST_TERMINAL_PLACEHOLDERS = MOBILE_REQUEST_TERMINAL_STATES.map(() => "?").join(", ");
+
 const BOT_MOBILE_REQUEST_SELECT = `
   SELECT request_id AS requestId, bot, session_id AS sessionId, turn_id AS turnId,
          device_id AS deviceId, command, purpose, state,
@@ -4265,6 +4269,7 @@ export class Storage {
     at: number;
     expiresAt: number;
   }): BotMobileRequest | undefined {
+    this.#sweepMobileRequests(input.at);
     const existing = this.#db
       .prepare("SELECT state, bot, session_id AS sessionId FROM bot_mobile_requests WHERE request_id = ?")
       .get(input.requestId) as { state: MobileRequestState; bot: string; sessionId: string } | undefined;
@@ -4299,16 +4304,32 @@ export class Storage {
     return row === undefined ? undefined : mobileRequestRow(row);
   }
 
-  /** The reconciliation read a resuming app makes, newest last, bounded. Scoped to the profile and
-   *  conversation the request was issued in: another conversation's request is absent, not hidden. */
+  /** The reconciliation read a resuming app makes: bounded, live requests first and then the newest
+   *  settled ones. A request that has NOT settled is what the app came to reconcile, so it is never
+   *  crowded out of the window by finished history however long the conversation has been running.
+   *  Scoped to the profile and conversation the request was issued in: another conversation's
+   *  request is absent, not hidden. */
   nativeBotMobileRequests(bot: string, sessionId: string, limit = 100): BotMobileRequest[] {
     const rows = this.#db
       .prepare(
         `${BOT_MOBILE_REQUEST_SELECT} WHERE bot = ? AND session_id = ?
-         ORDER BY requested_at, request_id LIMIT ?`,
+         ORDER BY (state IN (${MOBILE_REQUEST_TERMINAL_PLACEHOLDERS})) ASC, requested_at DESC, request_id DESC
+         LIMIT ?`,
       )
-      .all(bot, sessionId, limit) as unknown as (Omit<BotMobileRequest, "deviceId"> & { deviceId: string | null })[];
+      .all(bot, sessionId, ...MOBILE_REQUEST_TERMINAL_STATES, limit) as unknown as (Omit<BotMobileRequest, "deviceId"> & { deviceId: string | null })[];
     return rows.map(mobileRequestRow);
+  }
+
+  /** Settled records are history and stop being useful to reconcile against. Sweeping them on the
+   *  next write keeps the table bounded without a timer; a request nobody settled is never swept,
+   *  because its outcome is still owed to a person. */
+  #sweepMobileRequests(now: number): void {
+    this.#db
+      .prepare(
+        `DELETE FROM bot_mobile_requests
+         WHERE updated_at < ? AND state IN (${MOBILE_REQUEST_TERMINAL_PLACEHOLDERS})`,
+      )
+      .run(now - MOBILE_REQUEST_RETENTION_MS, ...MOBILE_REQUEST_TERMINAL_STATES);
   }
 
   nativeBotMobileReceipts(bot: string, sessionId: string): BotMobileReceipt[] {
@@ -5041,6 +5062,10 @@ export class Storage {
       ["messages", "bot_native_messages", "bot"],
       ["receipts", "bot_message_receipts", "bot"],
       ["mobileReceipts", "bot_mobile_receipts", "bot"],
+      // Capability 68. A lifecycle record names a device, a turn and the purpose a person was
+      // shown. Deleting the bot takes them with it rather than leaving them keyed to an identity
+      // that no longer exists.
+      ["mobileRequests", "bot_mobile_requests", "bot"],
       ["turnMediaDeliveries", "bot_turn_media_deliveries", "bot"],
       ["interactions", "bot_native_interactions", "bot"],
       // Capability 66. A standing approval belongs to the bot it was made for: deleting the bot

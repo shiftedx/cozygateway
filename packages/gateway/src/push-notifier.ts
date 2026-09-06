@@ -33,6 +33,21 @@ export interface ChatMessagePushEvent {
   preview: string;
 }
 
+/** The identities a completion push carries, from the Task the gateway just settled. A ROOM Task's
+ *  thread is the room turn's own session (`group:<room>:<member>`), which is what every room
+ *  surface in this gateway addresses; a 1:1 Task keeps the namespaced `bot:<name>` the approval
+ *  payloads use, because its session id is the harness's own and means nothing to a client. */
+export function taskCompletionPayload(
+  notice: { taskId: string; bot: string; sessionId: string; room?: string },
+): TaskCompletionPushPayload {
+  return {
+    kind: "task_completed",
+    taskId: notice.taskId,
+    threadId: notice.room === undefined ? `bot:${notice.bot}` : notice.sessionId,
+    agentId: notice.bot,
+  };
+}
+
 /** A stable, opaque APNs coalescing key for one bot chat. Digesting instead of truncating preserves
  *  uniqueness for arbitrary Hermes session ids while staying inside the relay's 64-character and
  *  identifier-only rules. */

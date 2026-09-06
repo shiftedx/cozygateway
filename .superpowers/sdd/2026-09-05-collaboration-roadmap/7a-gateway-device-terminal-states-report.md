@@ -291,3 +291,94 @@ Tests:
    only) and the terminals. Nothing is claimed beyond that.
 4. `.121` and physical-device evidence are UNKNOWN. Everything above is deterministic in-process and
    real-socket evidence on this machine.
+
+---
+
+## Fix round 1
+
+Against review r0. Three Critical and four Important, all addressed. RED captured first for every
+one that has a test seam.
+
+RED (before the fixes), `packages/gateway`:
+
+```
+npx vitest run test/mobile-request-lifecycle.test.ts test/push-notifier.test.ts
+```
+
+```
+ FAIL ... > does not seal completed when the receipt the answer needs could not be written
+ FAIL ... > calls a failure after the phone already ran the request a failure, not a policy block
+ FAIL ... > records no terminal for a request the peer is never told about
+ FAIL ... > answers the newest requests and a live one whatever its age, past the read bound
+ FAIL ... > sweeps settled records past the retention window and never a live one
+ FAIL ... > takes its lifecycle records with the bot they belong to
+ FAIL ... > addresses a room Task by the session the room turn actually runs in
+      Tests  7 failed | 40 passed (47)
+```
+
+GREEN after the fixes, Node 24, foreground, serially:
+
+| command | result |
+| --- | --- |
+| `pnpm -r typecheck` (root) | contract, relay, gateway, conformance Done, 0 errors |
+| `npx vitest run test/mobile-request-lifecycle.test.ts test/push-notifier.test.ts` | **47 passed** |
+| the 15-file focused mobile / task / push / delete set | **154 passed, 2 skipped** |
+| `npx vitest run` in `packages/gateway` | **1527 passed, 2 skipped, 0 failed** |
+| `npx vitest run` in `packages/conformance` | **100 passed, 20 skipped, 0 failed** |
+| `npx vitest run` in `packages/contract` | **205 passed, 0 failed** |
+| `npx vitest run` in `packages/relay` | **161 passed, 0 failed** |
+
+**C1, the read window and retention.** `nativeBotMobileRequests` now orders UNSETTLED requests
+first, then settled ones newest-first, and the contract says so. A conversation past the bound
+always sees the request the app came back to reconcile; the previous ascending order answered with
+the oldest hundred forever. Settled records are swept 30 days after they settled, on the next write
+to the table, and an unsettled record is never swept because its outcome is still owed to a person.
+The window and the sweep are one documented rule in the row 68 section rather than a hidden
+constant. Tests: 150 settled requests plus one live one opened before the newest hundred, asserting
+the live one is first and the oldest are gone; and a retention case asserting the settled old row
+is swept while the unsettled old row and the fresh one stay.
+
+**C2, purge with the bot.** `purgeBot` gained `["mobileRequests", "bot_mobile_requests", "bot"]`,
+so the delete route now reports the count as it does for every other area. The report's earlier
+claim is now true. Test: two bots' records, purge one, assert the count, the emptied read and the
+other bot untouched.
+
+**C3, the receipt failure.** `#settle` no longer writes a terminal before it knows the outcome. The
+receipt is attempted first; only then is the state sealed, `completed` when the receipt was written
+and `failed` when it was not, so the record and the peer's `device_unavailable` agree. The test uses
+the harness `receipt` option the review noticed was unused.
+
+**I1, `policy_blocked` after routing.** A new `settledState` maps a post-routing `policy_blocked`
+(an unusable phone answer, a failed media validation, a refused store) to `failed`. The peer's wire
+status is deliberately unchanged; only the state a person reads differs, and the contract now says
+so in as many words. Test drives an unusable status answer through the broker and asserts `failed`.
+
+**I2, the room push identity.** The payload build moved into an exported `taskCompletionPayload`,
+and a room Task now carries the room turn's own session (`group:<room>:<member>`) rather than the
+invented `group:<room>`. `TaskCompletionNotice` carries `sessionId` for it. `push-v0.md`'s false
+"same shape the approval payloads use" claim is corrected: `bot:<name>` for a 1:1 Task, the room
+session for a room Task, with the reason for each. Test covers both branches directly.
+
+**I3, the client half of the deduplication.** The row 68 section now states the rule 7b must
+implement: announce at most once per `taskId`, keyed DURABLY on capability 64's notification record,
+never on a set that lives for the process, because a phone pushed while backgrounded and then
+relaunched reads a fresh process and would banner the same completion twice. The exact payload
+fields are named there and in `push-v0.md`. The client change itself is 7b's, and until CozyKit
+lands a `task_completed` case in `PushPayload.swift` the payload decodes as unrecognized and the
+banner degrades to the relay's content-free alert with no deep link. That is recorded here so it is
+not mistaken for working.
+
+**I4, a terminal nobody was told.** `#terminalize` now answers whether the peer was actually told,
+and a new `#refuse` records `requested` plus the terminal only when it was. `requested` itself is
+recorded when the request becomes live rather than on entry, so a request dropped at the admission
+ceiling records nothing at all instead of a dangling state, and the ceiling drop carries a
+`ponytail:` comment naming the ceiling and the upgrade path (tell the peer, then record). The
+contract's row 68 section names both uncovered edges (a pre-admission refusal and a ceiling drop)
+and says the durable view holds no record rather than an untrue one. Test asserts a bounded broker
+records nothing and tells the peer nothing for the dropped request.
+
+Minor findings M1 to M6 are not addressed in this round and remain as the review filed them.
+
+Files touched in this round: `packages/gateway/src/{mobile-node,storage,push-notifier,tasks,server}.ts`,
+`packages/gateway/test/{mobile-request-lifecycle,push-notifier}.test.ts`,
+`contract/ext-bots-v1.md`, `contract/push-v0.md`.

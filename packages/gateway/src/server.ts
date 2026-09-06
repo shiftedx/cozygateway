@@ -74,7 +74,7 @@ import type { PairingAttemptLimiter } from "./pairing-admission.ts";
 import { WsHub } from "./ws-hub.ts";
 import { MobileNodeBroker } from "./mobile-node.ts";
 import { TurnRunner } from "./turns.ts";
-import { RelayNotifier, type ChatMessagePushEvent } from "./push-notifier.ts";
+import { RelayNotifier, taskCompletionPayload, type ChatMessagePushEvent } from "./push-notifier.ts";
 import { LiveActivityNotifier } from "./live-activity-notifier.ts";
 import type { ApprovalPushPayload } from "./push-crypto.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
@@ -1093,12 +1093,7 @@ export async function startGateway(
   // got the frame above and is excluded inside the notifier, and the announcement itself fires
   // only on the transition that wrote capability 64's completion notification record.
   storage.tasks.completions((notice) => {
-    notifier.notifyTaskCompletion({
-      kind: "task_completed",
-      taskId: notice.taskId,
-      threadId: notice.room === undefined ? `bot:${notice.bot}` : `group:${notice.room}`,
-      agentId: notice.bot,
-    }, hub.connectedDeviceIds());
+    notifier.notifyTaskCompletion(taskCompletionPayload(notice), hub.connectedDeviceIds());
   });
   const app = createApp({
     storage,

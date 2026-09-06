@@ -3,7 +3,7 @@ import { createDecipheriv, hkdfSync } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import { openStorage } from "../src/storage.ts";
-import { PREVIEW_MAX_CHARS, RelayNotifier, chatMessageCollapseId } from "../src/push-notifier.ts";
+import { PREVIEW_MAX_CHARS, RelayNotifier, chatMessageCollapseId, taskCompletionPayload } from "../src/push-notifier.ts";
 
 function decrypt(pushKey: string, wire: string): { kind?: string; threadId: string; agentName: string; preview: string } {
   const key = Buffer.from(
@@ -514,6 +514,14 @@ describe("RelayNotifier.notifyTaskCompletion", () => {
     expect(body.collapseId).toBe("task_9");
     expect(JSON.parse(JSON.stringify(decrypt("key-1", body.ciphertext)))).toEqual(payload);
     storage.close();
+  });
+
+  it("addresses a room Task by the session the room turn actually runs in", () => {
+    expect(taskCompletionPayload({ taskId: "task_9", bot: "scout", sessionId: "group:studio:scout", room: "studio" }))
+      .toEqual({ kind: "task_completed", taskId: "task_9", threadId: "group:studio:scout", agentId: "scout" });
+    // A 1:1 Task keeps the namespaced bot id the approval payloads use.
+    expect(taskCompletionPayload({ taskId: "task_9", bot: "scout", sessionId: "hermes-session-1" }))
+      .toEqual({ kind: "task_completed", taskId: "task_9", threadId: "bot:scout", agentId: "scout" });
   });
 
   it("does not push to a device whose socket is connected", async () => {

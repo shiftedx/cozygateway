@@ -239,10 +239,14 @@ executing
 completed | denied | failed | expired | cancelled | policy_blocked | foreground_required
 ```
 
-`policy_blocked` means the gateway refused the request before it was ever routed to a phone.
-`foreground_required` means the device or app lifecycle prevented execution. Neither is folded into
-a generic failure, and `failed` is what is left: nothing reached a phone, or the answer could not be
-kept. The closed unions live in `packages/contract/src/ext-bots.ts`
+`policy_blocked` means the gateway refused the request before it was ever routed to a phone, and it
+is used for NOTHING that happens after one was routed: an answer the gateway cannot accept, a media
+validation that fails and a store that refuses the bytes are all `failed`, because the request was
+already routed and run and calling that a policy block would tell a person their own gateway blocked
+work it had in fact dispatched. `foreground_required` means the device or app lifecycle prevented
+execution. Neither is folded into a generic failure, and `failed` is what is left: nothing reached a
+phone, or the answer could not be kept. The peer's own `mobile_result` status is unchanged in every
+one of these cases; only the state a person reads differs. The closed unions live in `packages/contract/src/ext-bots.ts`
 (`MOBILE_REQUEST_STATES`, `MOBILE_REQUEST_TERMINAL_STATES`, `BotMobileRequest`).
 
 BINDING. A record names the profile, the conversation, the turn and the ONE paired device the
@@ -272,9 +276,13 @@ stage: the phone already holds the request, and a second frame is how one consen
 prompts or one action becomes two.
 
 `GET /bots/:name/mobile-requests?sessionId=` is device authenticated and answers
-`{ requests: BotMobileRequest[] }`, the bounded newest-first-hundred records of THAT conversation
-on THAT profile, which is what an app resuming from the background reconciles its pending requests
-against. A missing `sessionId` is `400 invalid_request`: a request belongs to one conversation, so a
+`{ requests: BotMobileRequest[] }`, at most a hundred records of THAT conversation on THAT profile,
+which is what an app resuming from the background reconciles its pending requests against. The
+window is UNSETTLED REQUESTS FIRST and then the newest settled ones: a request the app came back to
+reconcile is never crowded out of the answer by finished history, however long that conversation has
+been running. A settled record is swept 30 days after it settled; an unsettled one is never swept,
+because its outcome is still owed to a person. Deleting the owning Bot takes its records with it,
+and so does deleting the conversation. A missing `sessionId` is `400 invalid_request`: a request belongs to one conversation, so a
 read naming none could only answer for the wrong one. Another conversation's request is absent
 rather than hidden. The record is metadata: no lease, no answer, and nothing the phone measured.
 The capability-39 receipt is unchanged and still written only for a share that happened.
@@ -282,9 +290,29 @@ The capability-39 receipt is unchanged and still written only for a share that h
 The push half of the row is the `task_completed` payload of `contract/push-v0.md`: a backgrounded
 phone learns capability 64's Task finished. It carries the task and conversation identities the
 deep link needs and no user content, and it is sent exactly once per Task, gated on the transition
-that wrote capability 64's own completion notification record, so a client that already announced
-the completion locally from `bot_task_updated` is never told twice. A device holding a live socket
-is excluded from the push, exactly as it is on every other push leg.
+that wrote capability 64's own completion notification record, so the gateway never announces one
+twice. A device holding a live socket is excluded from the push, exactly as it is on every other
+push leg.
+
+THE CLIENT HALF OF THAT DEDUPLICATION IS THE CLIENT'S. The gateway cannot know what a phone already
+put on screen. A client announces a completion at most once per `taskId`, and the deduplication key
+is capability 64's own notification record on the Task view (`notification.taskId`, with
+`notification.createdAt` as the tiebreak), NOT a set that lives for the process: a phone that was
+pushed while backgrounded and then relaunched reads a fresh process, so an in-memory set announces
+the same completion a second time. A client that receives `task_completed` records that `taskId` as
+announced DURABLY, and a local announce for a `taskId` already recorded is suppressed. The push
+carries exactly `kind`, `taskId`, `threadId` and `agentId`; `taskId` is the key, `threadId` is where
+to land, and neither the goal nor any reply text is present, so the deep link opens
+`GET /tasks/:taskId` for anything it needs to render.
+
+TWO EDGES ARE NOT COVERED, deliberately. A request refused before admission binds to no conversation
+the gateway trusts, so it gets the peer's typed `policy_blocked` result and a bounded log line
+rather than a durable record; the conversation a rejected frame CLAIMED is not one the gateway has
+agreed the request belongs to, and writing a row under it would let a peer put records into any
+conversation string. A request dropped at the in-memory admission ceiling is dropped silently and
+fail-closed, which is the pre-68 behavior, and it records no terminal either: a durable outcome the
+peer was never told would disagree with the peer. In both cases the durable view holds no record at
+all rather than a record that says something untrue.
 
 ### Bot Activity composition
 

@@ -10,7 +10,7 @@ export interface TaskArtifactReference { artifactId: string; status: "pending" |
 /** Initiative 4 binds this to its canonical declaration/commitment reader. No attachment or
  * delivery record is evidence. Missing previously declared references remain unproven. */
 export type TaskArtifactReader = (source: { taskId: string; bot: string; peer: string; sessionId: string; runId: string }) => readonly TaskArtifactReference[];
-export interface TaskCompletionNotice { taskId: string; bot: string; room?: string }
+export interface TaskCompletionNotice { taskId: string; bot: string; sessionId: string; room?: string }
 export interface TaskRecoveryDecision { taskId: string; runId: string; issuer: string; decisionId: string; reason: string }
 /** Only a trusted canonical operator/policy producer may bind this reader. */
 export type TaskRecoveryDecisionReader = (source: { taskId: string; bot: string; runId: string }) => TaskRecoveryDecision | undefined;
@@ -523,7 +523,7 @@ export class Tasks {
           const stored = this.#db.prepare("SELECT event_json AS json FROM task_events WHERE task_id = ? AND seq = ?").get(taskId, event.seq) as { json: string } | undefined;
           if (stored?.json !== JSON.stringify(event)) return;
           this.#observer?.({ type: "bot_task_updated", event, view });
-          if (announce) this.#completion?.({ taskId, bot: view.bot, ...(view.room === undefined ? {} : { room: view.room }) });
+          if (announce) this.#completion?.({ taskId, bot: view.bot, sessionId: view.sessionId, ...(view.room === undefined ? {} : { room: view.room }) });
         } catch { /* Socket emission is best effort; the committed stream is the reconnect source. */ }
       });
     }
