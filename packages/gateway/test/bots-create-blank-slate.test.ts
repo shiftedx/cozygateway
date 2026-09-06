@@ -216,6 +216,9 @@ describe("POST /bots seeds a blank slate", () => {
           disabled: [],
           entries: { cozygateway: { allow_tool_override: false } },
         },
+        // Hermes streams only when the profile says so: `StreamingConfig.enabled` is false and
+        // this is the per-platform key the phone turn resolves.
+        display: { streaming: true, platforms: { cozygateway: { streaming: true } } },
       },
     });
     // The whole seed, asserted as one value rather than a hand-picked subset.
@@ -317,6 +320,8 @@ describe("POST /bots seeds the skills OFF-list", () => {
           disabled: [],
           entries: { cozygateway: { allow_tool_override: false } },
         },
+        // Already streaming, so this profile carries the whole seed.
+        display: { streaming: true, platforms: { cozygateway: { streaming: true } } },
       },
     });
     expect((await authed("/bots", post({ name: "night-owl" }))).status).toBe(201);
@@ -419,6 +424,8 @@ describe("idempotency", () => {
           disabled: [],
           entries: { cozygateway: { allow_tool_override: false } },
         },
+        // Already streaming, so this profile carries the whole seed.
+        display: { streaming: true, platforms: { cozygateway: { streaming: true } } },
       },
     });
 
@@ -442,6 +449,7 @@ describe("idempotency", () => {
     expect(plan.config).toEqual({
       platform_toolsets: { cli: ["file", "terminal"] },
       approvals: { mode: "manual" },
+      display: { streaming: true, platforms: { cozygateway: { streaming: true } } },
     });
   });
 });
@@ -483,6 +491,8 @@ describe("the attach-plugin binding", () => {
           disabled: [],
           entries: { cozygateway: { allow_tool_override: true } },
         },
+        // Streaming turned OFF on purpose: an explicit false is a decision, not an absence.
+        display: { streaming: false, platforms: { cozygateway: { streaming: false } } },
       },
       blankSlate: true,
     });
@@ -546,6 +556,61 @@ describe("seedBlankSlateBots: false", () => {
       enabled: ["cozygateway"],
       disabled: [],
       entries: { cozygateway: { allow_tool_override: false } },
+    });
+  });
+});
+
+/** Streaming drafts are the difference between a bot that types in front of you and one that goes
+ *  quiet for a minute and then pastes a wall of text. Hermes' `StreamingConfig.enabled` is false by
+ *  default and `gateway/run_turn_runner.py::_setup_stream_consumer` only asks the runner for deltas
+ *  when the resolved per-platform `streaming` says so, so a profile that names nothing never emits
+ *  a single `draft` frame. The hand-configured profiles say so; the ones the phone created did not,
+ *  which is why they only ever delivered a final message. */
+describe("streaming drafts are on for a phone-created bot", () => {
+  it("writes the display keys the attach plugin's draft surface needs", async () => {
+    const { authed, dashboard } = await setup();
+
+    expect((await authed("/bots", post({ name: "night-owl" }))).status).toBe(201);
+
+    const body = writes(dashboard)[0]?.body as { config: Record<string, unknown> };
+    expect(body.config["display"]).toEqual({
+      streaming: true,
+      platforms: { cozygateway: { streaming: true } },
+    });
+  });
+
+  it("leaves an explicit false exactly as the operator set it", () => {
+    const plan = planBlankSlateSeed({
+      current: {
+        display: { streaming: false, platforms: { cozygateway: { streaming: false } } },
+      },
+      blankSlate: true,
+    });
+    expect(plan.config?.["display"]).toBeUndefined();
+  });
+
+  it("seeds only the half that is missing, and only its own platform", () => {
+    const plan = planBlankSlateSeed({
+      current: {
+        display: { streaming: true, platforms: { telegram: { streaming: false } } },
+      },
+      blankSlate: true,
+    });
+    // telegram is not restated: the deep merge on the other side keeps a platform this patch does
+    // not name, and restating one would be this seed deciding somebody else's platform.
+    expect(plan.config?.["display"]).toEqual({
+      platforms: { cozygateway: { streaming: true } },
+    });
+  });
+
+  it("is written whatever seedBlankSlateBots says, like the plugin binding", async () => {
+    const { authed, dashboard } = await setup({ seedBlankSlateBots: false });
+    expect((await authed("/bots", post({ name: "night-owl" }))).status).toBe(201);
+    const body = writes(dashboard)[0]?.body as { config: Record<string, unknown> };
+    // The flag is toolset policy. How a reply is delivered is not a toolset.
+    expect(body.config["display"]).toEqual({
+      streaming: true,
+      platforms: { cozygateway: { streaming: true } },
     });
   });
 });
