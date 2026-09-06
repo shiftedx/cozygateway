@@ -103,6 +103,7 @@ and does not register `/bots` routes.
 | 61 | Exact runtime recovery: authenticated `POST /bots/:name/runtime/recover` accepts only a gateway-owned runtime bot whose latest `create_runtime` operation is terminal `needs_attention`. It atomically enqueues one fresh operation using the failed operation's exact stored payload, generation, and runner assignment while preserving the Bot identity and attach credential. A replay, concurrent request, nonterminal operation, deleted/config-owned bot, or revoked/mismatched runner is refused. |
 | 62 | An approval can propose an MCP repair: `ApprovalEvent` on attach-v1 gains optional `repair`, one typed block a runtime peer sends when it wants to reconnect an MCP server whose tool list went stale, crashed, refused, or would not re-list, and must ask first. The block is `BotApprovalRepair`: `kind` (`mcp_reconnect`), `server` (the configured MCP server name, 1-64 characters), `impact` (the affected tool names, 0-64 entries of 1-128 characters), `scope` (`server`), `fingerprint` (`{ previous?, current? }`, opaque digests of 1-128 characters), `reason` (`stale_tool`, `relist_failed`, `crashed`, `unauthorized`, from the peer's own health record), and `policy` (`approve_once`: approving reconnects that server once; `auto_refresh`: the operator allowed the peer to refresh that server on its own, it already did, and the proposal is informational). Every set is closed, both objects are closed, and no URL, header value, env value, or secret is ever in `server`, `impact`, or a fingerprint. The gateway treats the block as capability 56 treats `detail`: it validates the sets and bounds and refuses any C0/C1 control or Unicode Format (Cf) character, a lone surrogate, or a whitespace-only value in a string (the bounds count UTF-16 code units, as the schema enforces them), and a block that fails is DROPPED while the approval is kept, never a reason to refuse the frame, with one bounded content-free log line; a valid block is carried byte for byte. `BotApprovalPendingFrame` and the `BotPendingApproval` inbox row gain the same optional `repair`, and the durable interaction record stores it, so the live frame, the rebroadcast on reconnect, and a cold-start `GET /bots/approvals` read all show the block the peer sent. Resolution is the unchanged approve or deny: the peer performs the reconnect on approve, and the gateway records nothing about the outcome beyond the existing settlement. Additive: an approval that is not a repair proposal is byte identical to its pre-62 self on every surface, and a client renders the repair card only on `>= 62`. |
 | 63 | The per-server MCP repair policy, declared before it is emitted: `BotMcpServer` gains optional `repair`, closed to `approve_once` (reconnecting that server asks first, every time) and `auto_refresh` (the operator already allowed the peer to refresh that server on its own, so a reconnect happens without a question). It is the same setting capability 62 reports as `BotApprovalRepair.policy` on one live proposal, read off the server row instead, so a client can say what a reconnect will cost before one is proposed. It rides the existing capability-48 `bot_config` `profile.read` of the runtime peer: no new route, no new lane, no new operation. READ-ONLY METADATA: `BotProfilePatch` does not gain it and never will, `enabledMcpServers` stays a list of NAMES so no request shape can carry a policy, and the setting is changed on the harness rather than through this gateway. The gateway does not store, compute, write, execute, or interpret the value, exactly as it does not for capability 58's `guardrailCeiling`; it validates the closed union and relays what the peer answered. No repair is performed and no policy is mutated here. An absent wire field means the policy was not projected or is unknown, and the gateway never fills it in. Hermes and peers below 63 omit it. A known CozyAgents peer at 63 may project its effective `approve_once` default even when the operator omitted that config key: `approve_once` requires approval and does not grant repair permission. An unknown value is NOT tolerated: it follows the `bot_config` lane's existing convention, the whole `config_result` frame is invalid, the ingress refuses it with one bounded content-free log line and closes the peer's socket, and the read ends `503 backend_unavailable`, so a client never receives an unvalidated string in the position where it renders a policy. Additive: the field is optional, so a peer and a client below 63 are byte identical to their pre-63 selves. EMISSION GATING: a peer emits `repair` only when the gateway advertised `com.cozylabs.bots >= 63` on `hello_ack`, and only with one of the two names; a client renders the policy only on `>= 63`. |
+| 64 (reserved, not advertised until implementation qualifies) | Durable gateway Tasks: ten states, the 45 enumerated ADR 0004 reasons, append-only transitions and accepted intents, existing attach turn identity as Run identity, and full-replace `bot_task_updated` frames. See the Task surface below. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -1066,3 +1067,31 @@ Committed transcript history remains the recovery source after reconnect.
   redacted suffix is discarded at the bridge.
 - A client handles an unknown extension frame or optional field by ignoring it, then re-reads the
   documented REST state when it needs recovery.
+
+
+### Durable Task surface (capability 64)
+
+Task is the durable requested outcome; its Run id is the existing attach turn id. Task state is
+reduced from the append-only event stream, never independently written. The closed states and
+reasons, view, command bodies and update frame are defined in `packages/contract/src/tasks.ts`.
+ADR 0004 enumerates 45 distinct reasons; the earlier prose count of 46 was clerical.
+
+Paired-device authenticated routes are `GET /bots/:name/tasks`, `GET /groups/:name/tasks`, and
+`GET /tasks/:taskId`. Lists accept `state`; reads accept an exclusive numeric `cursor` and bounded
+`limit` and return `{ view, events, nextCursor? }`. Five commands are
+`POST /tasks/:taskId/{cancel,pause,resume,retry,scope}`. Every body carries `idempotencyKey`;
+`scope` also requires nonempty `goal`. An identical replay returns its original accepted view;
+a changed payload under the same key and a command refused in the current state return
+`409 conflict` with that state. Terminal states refuse commands except cancel of cancelled.
+
+`bot_task_updated` carries one appended `event` and a complete replacement `view`. Subscription
+and cold read share the same derivation. Below capability 64 clients retain existing chat behavior.
+Admission includes each direct or room member work-bearing turn, excluding commands declared in
+the peer's slash-command catalog. An absent or unknown optional attach tool `role` means a possible
+effect. The gateway never automatically redispatches acknowledged work. The owner-loss lease is
+120 seconds, provisional until live model qualification resumes.
+
+A first terminal remains immutable for both the Task and row 23. A later acknowledged reply may
+still be delivered idempotently under existing source ownership and explicit-cancel guards;
+reply delivery cannot replace a previously sealed outcome or complete the Task. Journal recovery
+reapplies the authoritative first terminal and clears only its exact stale turn pointer.
