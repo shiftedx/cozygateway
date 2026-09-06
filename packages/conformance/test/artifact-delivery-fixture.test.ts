@@ -6,7 +6,7 @@ import {
 } from "cozygateway-contract";
 
 const fixture = JSON.parse(readFileSync(new URL("./fixtures/artifact-delivery-v1.json", import.meta.url), "utf8")) as
-  { capability: number; artifact: Record<string, unknown>; tombstone: Record<string, unknown> };
+  { capability: number; artifact: Record<string, unknown>; derived: Record<string, unknown>; tombstone: Record<string, unknown> };
 
 /** Portable decoder evidence for row 65. Commitment authority is exercised separately through the
  * authenticated storage, route and delivery tests; this fixture proves only the wire shapes a
@@ -28,6 +28,18 @@ describe("Artifact v1 portable client fixture", () => {
     expect(check(ArtifactSchema, { ...fixture.artifact, state: "published" })).toBe(false);
     expect(check(ArtifactSchema, { ...fixture.artifact, mark: "shared" })).toBe(false);
     expect(check(ArtifactSchema, { ...fixture.artifact, delivery: { ...(fixture.artifact.delivery as object), state: "received" } })).toBe(false);
+  });
+
+  it("decodes a derived record and reads an absent origin as declared", () => {
+    assertValid(ArtifactSchema, fixture.derived);
+    assertValid(ArtifactListSchema, { artifacts: [fixture.artifact, fixture.derived] });
+    expect(fixture.derived).toMatchObject({ origin: "derived", validation: "unvalidated" });
+    // Derived means nothing was declared, so no checksum, mark or Task provenance is claimed.
+    for (const absent of ["sha256", "mark", "taskId", "runId"]) expect(fixture.derived[absent]).toBeUndefined();
+    // Additive on row 65: a record written before `origin` existed still decodes, as declared.
+    const { origin: _origin, ...beforeOrigin } = fixture.artifact;
+    expect(check(ArtifactSchema, beforeOrigin)).toBe(true);
+    expect(check(ArtifactSchema, { ...fixture.derived, origin: "inferred" })).toBe(false);
   });
 
   it("keeps a tombstone truthful without offering deleted bytes or a host path", () => {

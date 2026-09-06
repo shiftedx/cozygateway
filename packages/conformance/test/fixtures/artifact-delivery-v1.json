@@ -14,6 +14,18 @@
       "state": "acknowledged", "queuedAt": 1200, "deliveredAt": 1300, "acknowledgedAt": 1400
     }
   },
+  "derived": {
+    "artifactId": "derived-6dcd4ce23d88e2ee9568ba546c007c63", "bot": "sage", "sessionId": "session-1",
+    "createdBy": "sage", "origin": "derived", "sourceMessageId": "message-7",
+    "filename": "chart.png", "mediaType": "image/png",
+    "sizeBytes": 8, "state": "committed", "validation": "unvalidated", "version": 1,
+    "createdAt": 1600, "committedAt": 1600,
+    "location": "/artifacts/derived-6dcd4ce23d88e2ee9568ba546c007c63/content",
+    "delivery": {
+      "deliveryId": "delivery-3", "artifactId": "derived-6dcd4ce23d88e2ee9568ba546c007c63",
+      "attempt": 1, "state": "acknowledged", "queuedAt": 1600, "deliveredAt": 1600, "acknowledgedAt": 1700
+    }
+  },
   "tombstone": {
     "artifactId": "artifact-0", "bot": "sage", "sessionId": "session-1", "createdBy": "sage",
     "taskId": "task-1", "runId": "run-1",
