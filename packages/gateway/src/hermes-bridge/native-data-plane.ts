@@ -1255,7 +1255,6 @@ export class NativeBotDataPlane {
   }
 
   /** The last resort under "nothing a person said or a bot said disappears": one visible marked
-   * row on the conversation carrying the text that could not be delivered. */  /** The last resort under "nothing a person said or a bot said disappears": one visible marked
    * row on the conversation carrying the text that could not be delivered. */
   #recordFailedSteerDelivery(
     bot: string,

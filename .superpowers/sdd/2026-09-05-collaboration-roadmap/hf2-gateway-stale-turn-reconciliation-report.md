@@ -310,3 +310,26 @@ list. The reconciliation file itself is now 15 tests. Full suite still by the le
 The "Concerns" bullet claiming a restart falls back to a visible failed-delivery row was wrong when
 it was written: after a restart the map was empty and `#promoteSteer` returned before recording
 anything, so the restart case was a silent drop. It is now true, because the steers are durable.
+
+---
+
+# Rebase and two minors, before merge
+
+Rebased onto cozygateway `origin/main` `a376681` (HF1, plugin files only). No conflicts, and no
+content changed by the rebase itself: the six commits replayed unmodified.
+
+Two cheap minors from the re-review, and nothing else:
+
+- `native-data-plane.ts`: removed the duplicated `#recordFailedSteerDelivery` JSDoc line, an
+  artifact of the round 1 re-application. Comment only.
+- `purgeBot`: `bot_native_pending_steers` joins the purge as `pendingSteers`. A pending steer holds
+  a person's own words against a conversation with that bot, so deleting the bot takes them rather
+  than leaving text keyed to an identity that is gone and a promotion that can never run. Seeded
+  and asserted in `bots-delete-routes`, including that the other bot's steer survives untouched.
+
+```
+pnpm -r typecheck                                 contract, relay, gateway, conformance: Done
+packages/gateway  vitest run (23 focused files)   268 passed (268)
+packages/contract vitest run                      207 passed (207)
+packages/conformance vitest run                   108 passed | 20 skipped (128)
+```

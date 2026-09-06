@@ -5211,6 +5211,10 @@ export class Storage {
       // takes its grants with it rather than leaving policy pointing at an identity that is gone.
       ["approvalGrants", "bot_approval_grants", "bot"],
       ["turnTerminals", "bot_native_turn_terminals", "bot"],
+      // Capability 69. A pending steer holds a person's own words against a conversation with
+      // this bot. Deleting the bot takes them with it rather than leaving text keyed to an
+      // identity that no longer exists and a promotion that can never run.
+      ["pendingSteers", "bot_native_pending_steers", "bot"],
       ["attachStream", "attach_streams", "agent_id"],
       ["attachCommands", "attach_command_outbox", "agent_id"],
       ["attachEvents", "attach_event_inbox", "agent_id"],
