@@ -185,7 +185,7 @@ describe("derived Artifacts from legacy attachment deliveries", () => {
     seedMedia(storage, "media_declared");
     storage.artifacts.declare({
       artifactId: "artifact-declared", bot: "sage", sessionId: "session-1", createdBy: "sage",
-      taskId: "task-1", runId: "run-1", filename: "chart.png", mediaType: "image/png",
+      runId: "run-1", filename: "chart.png", mediaType: "image/png",
       sizeBytes: PNG.byteLength, sha256: PNG_SHA, mark: "final",
     }, 50);
     expect(storage.artifacts.commit("sage", "artifact-declared", "media_declared", 60).outcome).toBe("committed");
@@ -201,7 +201,7 @@ describe("derived Artifacts from legacy attachment deliveries", () => {
     expect(derived).toBeDefined();
     storage.artifacts.declare({
       artifactId: "artifact-late", bot: "sage", sessionId: "session-1", createdBy: "sage",
-      taskId: "task-2", runId: "run-2", filename: "chart.png", mediaType: "image/png",
+      runId: "run-2", filename: "chart.png", mediaType: "image/png",
       sizeBytes: PNG.byteLength, sha256: PNG_SHA, mark: "review_copy",
     }, 70);
     const committed = storage.artifacts.commit("sage", "artifact-late", "media_late", 80);
@@ -210,7 +210,7 @@ describe("derived Artifacts from legacy attachment deliveries", () => {
     expect(storage.artifacts.list({ bot: "sage" })).toHaveLength(2);
     expect(committed.record?.artifactId).toBe(derived!.artifactId);
     expect(storage.artifacts.get(derived!.artifactId)).toMatchObject({
-      origin: "declared", sha256: PNG_SHA, mark: "review_copy", taskId: "task-2", runId: "run-2",
+      origin: "declared", sha256: PNG_SHA, mark: "review_copy", runId: "run-2",
       state: "committed", validation: "verified",
     });
     expect(storage.artifacts.get("artifact-late")).toBeUndefined();

@@ -126,7 +126,7 @@ describe("Artifact to Task join by Run identity", () => {
     expect(otherPeer.record?.taskId).toBeUndefined();
 
     // The session must be the Run's own session, not another conversation of the same bot.
-    const elsewhere = storage.nativeBotChat("sage", 100).sessionId;
+    const elsewhere = storage.resetNativeBotChat("sage", 100);
     const wrongSession = storage.artifacts.declare(declaration({ artifactId: "artifact-wrong-session", sessionId: elsewhere, runId: "run-1" }), 100);
     expect(wrongSession.record?.taskId).toBeUndefined();
     expect(storage.tasks.read(sage.taskId)?.view.artifacts).toEqual([]);

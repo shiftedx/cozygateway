@@ -131,11 +131,13 @@ describe("Artifact public routes", () => {
   it("tombstones an explicitly deleted Artifact without exposing its bytes", async () => {
     const { device, declare, upload, peer, sessionId } = await setup();
     await upload("media-1");
+    // A `taskId` a peer states is dropped: the Task is joined from the Run, gateway-side.
     await declare({ ...DECLARATION, sessionId, taskId: "task-1" });
     await peer("/attach/v1/artifacts/artifact-1/commit", { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ mediaId: "media-1" }) });
     expect((await device("/artifacts/artifact-1", { method: "DELETE" })).status).toBe(204);
-    const tombstone = await (await device("/artifacts/artifact-1")).json() as { state: string; taskId: string; location?: string };
-    expect(tombstone).toMatchObject({ state: "deleted", taskId: "task-1", sha256: SHA });
+    const tombstone = await (await device("/artifacts/artifact-1")).json() as { state: string; taskId?: string; location?: string };
+    expect(tombstone).toMatchObject({ state: "deleted", sha256: SHA });
+    expect(tombstone.taskId).toBeUndefined();
     expect(tombstone.location).toBeUndefined();
     expect((await device("/artifacts/artifact-1/content")).status).toBe(410);
     expect((await device("/artifacts/artifact-1", { method: "DELETE" })).status).toBe(404);

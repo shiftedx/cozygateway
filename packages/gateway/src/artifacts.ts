@@ -20,10 +20,16 @@ export const DEFAULT_ARTIFACT_STORE_BYTES = 2_147_483_648;
 
 export interface ArtifactDeclaration {
   artifactId: string; bot: string; sessionId: string; room?: string;
-  taskId?: string; runId?: string; createdBy: string;
+  /** The Run the producer named. The Task is NOT declarable: it is joined from this Run. */
+  runId?: string; createdBy: string;
   filename: string; mediaType: string; sizeBytes: number; sha256: string;
-  mark: ArtifactMark; supersedesArtifactId?: string;
+  /** Absent means the producer did not state one. It is never filed as `draft`. */
+  mark?: ArtifactMark; supersedesArtifactId?: string;
 }
+
+/** Resolves the Task that owns a Run, for the peer that owns the Run. Bound to the durable Task
+ * stream by Storage; absent in a store with no Task authority, where every join is absent. */
+export type ArtifactTaskJoin = (peer: string, runId: string) => { taskId: string; bot: string; sessionId: string } | undefined;
 
 interface ArtifactRow {
   artifactId: string; bot: string; sessionId: string; room: string | null;
@@ -55,6 +61,7 @@ export class Artifacts {
   readonly #db: DatabaseSync;
   #capacityBytes = DEFAULT_ARTIFACT_STORE_BYTES;
   #committed: ((taskId: string, runId: string, at: number) => void) | undefined;
+  #taskOfRun: ArtifactTaskJoin | undefined;
 
   constructor(db: DatabaseSync) {
     this.#db = db;
@@ -93,6 +100,21 @@ export class Artifacts {
    * Task remains derived from its own event stream; this only says when to look again. */
   onCommitment(notify: (taskId: string, runId: string, at: number) => void): void { this.#committed = notify; }
 
+  /** The Task join. No new frame reaches the peer: the producer names the Run it is executing,
+   * which capability 64 already gave it, and the gateway resolves the Task itself. */
+  taskJoin(resolve: ArtifactTaskJoin): void { this.#taskOfRun = resolve; }
+
+  /** The one place a record's Task is decided. Three facts must all hold, and any of them missing
+   * is an absent Task rather than a guess: the Run is one this peer owns, its Task belongs to the
+   * same Bot the record is filed under, and the session is the Run's own. A wrong-bot Run
+   * therefore cannot join another bot's Task, and a Run this gateway never admitted joins nothing. */
+  #join(input: { createdBy: string; bot: string; sessionId: string; runId?: string }): string | null {
+    if (input.runId === undefined) return null;
+    const run = this.#taskOfRun?.(input.createdBy, input.runId);
+    if (run === undefined || run.bot !== input.bot || run.sessionId !== input.sessionId) return null;
+    return run.taskId;
+  }
+
   declare(input: ArtifactDeclaration, at: number): { outcome: "created" | "replayed" | "conflict" | "reserved"; record?: Artifact } {
     // The derived identity space belongs to the gateway. A producer that could claim one of those
     // ids would suppress the record for its own attachment without anyone seeing why.
@@ -115,9 +137,9 @@ export class Artifacts {
          created_at, committed_at, deleted_at, failure_reason, media_id, origin, source_message_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'declared', ?, 'unvalidated', ?, ?, NULL, ?, NULL, NULL, NULL, NULL,
          'declared', NULL)`,
-    ).run(input.artifactId, input.bot, input.sessionId, input.room ?? null, input.taskId ?? null,
+    ).run(input.artifactId, input.bot, input.sessionId, input.room ?? null, this.#join(input),
       input.runId ?? null, input.createdBy, input.filename, input.mediaType, input.sizeBytes,
-      input.sha256, input.mark, version, input.supersedesArtifactId ?? null, at);
+      input.sha256, input.mark ?? "", version, input.supersedesArtifactId ?? null, at);
     return { outcome: "created", record: this.#record(this.#row(input.artifactId)!) };
   }
 
@@ -135,6 +157,16 @@ export class Artifacts {
       return row.mediaId === mediaId
         ? { outcome: "replayed", record: this.#record(row) }
         : { outcome: "conflict", record: this.#record(row) };
+    }
+    // The Task join, recorded here because commitment is when this record becomes a fact about a
+    // Task. It is decided only while it is absent: a join already recorded is the one the record
+    // was declared under, so a replayed commit after a restart re-decides nothing.
+    if (row.taskId === null) {
+      const taskId = this.#join({ createdBy, bot: row.bot, sessionId: row.sessionId, ...(row.runId === null ? {} : { runId: row.runId }) });
+      if (taskId !== null) {
+        this.#db.prepare("UPDATE artifacts SET task_id = ? WHERE artifact_id = ?").run(taskId, artifactId);
+        row.taskId = taskId;
+      }
     }
     const stored = this.#db.prepare("SELECT bytes FROM attach_media WHERE agent_id = ? AND media_id = ?")
       .get(createdBy, mediaId) as { bytes: Uint8Array } | undefined;
@@ -464,10 +496,10 @@ export class Artifacts {
 
   #sameDeclaration(row: ArtifactRow, input: ArtifactDeclaration): boolean {
     return row.createdBy === input.createdBy && row.bot === input.bot && row.sessionId === input.sessionId
-      && row.room === (input.room ?? null) && row.taskId === (input.taskId ?? null)
+      && row.room === (input.room ?? null)
       && row.runId === (input.runId ?? null) && row.filename === input.filename
       && row.mediaType === input.mediaType && row.sizeBytes === input.sizeBytes
-      && row.sha256 === input.sha256 && row.mark === input.mark
+      && row.sha256 === input.sha256 && row.mark === (input.mark ?? "")
       && row.supersedes === (input.supersedesArtifactId ?? null);
   }
 

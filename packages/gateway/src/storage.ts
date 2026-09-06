@@ -1218,6 +1218,9 @@ export class Storage {
     // file id or delivery is ever read as commitment evidence.
     this.artifacts = new Artifacts(db);
     this.tasks.artifactReferences((source) => this.artifacts.taskReferences(source));
+    // The Task id is minted gateway-side and no attach-v1 frame carries it to a peer, so the
+    // gateway resolves the owning Task from the Run identity capability 64 already established.
+    this.artifacts.taskJoin((peer, runId) => this.tasks.taskOfRun(peer, runId));
     this.artifacts.onCommitment((taskId, runId, at) => { this.tasks.artifactsSettled(taskId, runId, at); });
   }
 

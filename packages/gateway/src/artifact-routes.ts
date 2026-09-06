@@ -89,7 +89,10 @@ export function registerArtifactRoutes(
     // an unknown room and a room it does not belong to are the same refusal.
     if (declaration.room !== undefined && !(storage.botGroup(declaration.room)?.members ?? []).includes(bot))
       return c.json({ error: { code: "forbidden", message: "bot is not a member of that room" } }, 403);
-    const result = storage.artifacts.declare({ ...declaration, createdBy: agentId, bot }, now());
+    // `taskId` is dropped rather than stored: a peer cannot know the Task id, and a claim the
+    // gateway did not resolve from the Run is not provenance. The join happens gateway-side.
+    const { taskId: _claimed, ...stated } = declaration;
+    const result = storage.artifacts.declare({ ...stated, createdBy: agentId, bot }, now());
     if (result.outcome === "reserved")
       return invalid(c, "artifact id prefix is reserved for gateway-derived records");
     if (result.outcome === "conflict")

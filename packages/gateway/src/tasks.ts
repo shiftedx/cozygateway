@@ -340,6 +340,17 @@ export class Tasks {
     return this.#db.prepare(`${RUN_SELECT} WHERE peer = ? AND run_id = ?`).get(peer, runId) as RunRow | undefined;
   }
 
+  /** Capability 65's Task join. A Run is the attach turn identity capability 64 already binds to
+   * one Task, one peer and one session, so an Artifact naming its Run needs no Task id on the
+   * wire: the gateway reads the owning Task here. A Run this gateway does not hold for this peer
+   * has no Task, and the caller is expected to record that absence rather than guess. */
+  taskOfRun(peer: string, runId: string): { taskId: string; bot: string; sessionId: string } | undefined {
+    const run = this.run(peer, runId);
+    if (run === undefined) return undefined;
+    const task = this.#db.prepare(`${TASK_SELECT} WHERE task_id = ?`).get(run.taskId) as TaskRow | undefined;
+    return task === undefined ? undefined : { taskId: task.taskId, bot: task.bot, sessionId: run.sessionId };
+  }
+
   acknowledged(peer: string, command: AttachV1Command, at: number): void {
     if (command.kind !== "turn") return;
     const run = this.run(peer, command.turnId);

@@ -7,6 +7,24 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## Unreleased
 
+- Artifacts are joined to their Task by the gateway, from the Run the producer named
+  (`com.cozylabs.bots` row 65, additive). A Task id is minted gateway-side and no attach-v1 frame
+  ever carried it to a peer, so a producer could not state one and its Artifact never reached the
+  Task's reference set. It no longer has to: capability 64 already made the existing attach turn
+  identity the Run identity, so a declaration names its session and its Run and the gateway
+  resolves the owning Task itself, at declaration and again at commitment when the Run only became
+  mappable later. A join is recorded only when the Run belongs to the authenticated peer, its Task
+  belongs to the same Bot the record is filed under, and the session is the Run's own, so a
+  wrong-bot Run cannot join another bot's Task. A Run this gateway cannot map leaves `taskId` off
+  the record while keeping the stated `runId`, which reads as absent Task provenance rather than a
+  guess, and a `taskId` a peer sends is dropped in favor of the gateway's own join. A joined
+  record keeps its Task `verifying` until it commits and appears in the Task view's artifacts.
+- An Artifact `mark` a producer never stated stays unstated (`com.cozylabs.bots` row 65,
+  additive). `mark` is now optional on a declaration and on a record: its three values are the
+  three things a producer can say, and absence is "did not say", never a default of `draft`. A
+  client renders no mark. Peers and clients below 65 are byte identical, and a peer that still
+  sends a mark is stored exactly as before.
+
 - CozyApps dashboard records (`com.cozylabs.cozyapps` capability 2, cross-referenced as
   `com.cozylabs.bots` row 67): three durable record kinds beside the v1 library. A saved editable
   input value is typed to product field types only, carries its own revision, and is written by the
