@@ -184,3 +184,129 @@ Pushed to `origin/codex/hf2-stale-turn-reconciliation`. No merge, tag, release o
   Kyle's bots are protected by the lease and the orphaned-commit rescue rather than by the
   immediate hello seal. That is the intended order: the gateway side had to protect users of any
   peer, including one that is never updated.
+
+---
+
+# Fix round 1
+
+Review `review-r0.md` (REQUEST CHANGES: 2 Critical, 5 Important, 4 Minor). Every item is addressed.
+Commit `dd5d7f3`, plus the contract and conformance follow-up.
+
+## C1: the rescue and the promotion both fired for the same steer
+
+The rescue path returned before the block that cleared the pending steer, and the orphaned commit
+arrives on a DIFFERENT turn id (`<turn>:steer`), so nothing ever cleared it. On an un-updated
+Hermes peer, which is the deployment window this ships into, the person's question was asked and
+billed twice.
+
+A steer is now settled exactly once, and a rescued reply settles every steer still open on that
+CONVERSATION, not just on the turn id the peer happened to invent: the peer demonstrably heard the
+person, so nothing is left for promotion to re-ask. Rescue and promotion are therefore mutually
+exclusive per steer by construction rather than by ordering.
+
+RED (pre-round-1 sources, new assertion first):
+`expected [ { …(4) }, { …(4) } ] to have a length of 1 but got 2` on
+`projects an orphaned commit that carries the bot's own words instead of discarding it`, which is
+the duplicated dispatch. GREEN: one turn, one reply, no open steer.
+
+## C2: a message queued for a sleeping bot was failed the instant the bot returned
+
+Reconciliation sealed any turn a declaration omitted, with no check of whether the peer had ever
+been handed it, and it ran before the outbox flush. A peer that has not received a command cannot
+declare it, so `activeTurns: []` was true and read as loss.
+
+Two changes. `#reconcilableTurns` is now the single filter for reconciliation AND for the lease: a
+turn counts only when `nativeBotTurnDelivery(owner, turnId).acknowledgedAt` is set, so a durably
+queued turn for an absent peer is delivered normally and neither sealed nor leased. And the ingress
+calls `onHello` AFTER `#flush`, so the ordering is unambiguous rather than incidental.
+
+RED: `expected { status: 'failed' } to be undefined` on
+`never seals a turn the peer has not been handed yet, and never promotes one`. GREEN: nothing
+sealed, nothing promoted, one queued turn and one queued steer still waiting.
+
+## I1: the lease could reap a live run
+
+A heartbeat-terminated socket marked every turn lost, and an older peer cannot take one back off
+the lease at hello, so a peer inside one long prefill-bound call faced 120 seconds of frame silence
+rather than 30 minutes. polished-satellite already spends 49 seconds in one such call.
+
+The two situations are now different windows, and which one applies is recorded when ownership is
+lost rather than inferred later:
+
+- `detached`: the peer has no socket. `OWNER_LOSS_LEASE_MS`, 120 seconds, unchanged.
+- `undeclared`: the peer re-attached but could not declare. `UNDECLARED_OWNER_GRACE_MS`, 10
+  minutes, well past any observed prefill stall and still far short of the ceiling.
+
+Any frame resets either window, and neither ever lengthens a window an operator shortened. New
+test: a re-attached older peer, 60 seconds silent, is not reaped, and one `thinking` frame resets
+the window.
+
+## I2 and I3: pending steers are durable, ordered, and never silently dropped
+
+`bot_native_pending_steers` is a durable table keyed by `(bot, messageId)`, carrying the text,
+media, chat context and origin device, with a `settled_at` that is set exactly once. It replaces
+the process-local map entirely.
+
+- several steers on one dead turn are kept in arrival order. The oldest is promoted to the new
+  durable turn; the rest are re-dispatched onto that turn as steers, in order, and stay open there.
+- every path that does not deliver a person's words now records the visible failed-delivery row:
+  no peer, a conversation that moved on, and a refused dispatch alike. Previously only the refused
+  dispatch did.
+- a restart preserves the steers, so the fallback the first report CLAIMED (I3) now actually
+  exists. The report's concern bullet said otherwise and was wrong; it is corrected below.
+
+New tests: two steers promoted in order; a restart that rebuilds the plane on the same store and
+still promotes; a refused dispatch that leaves a `delivery.failed` row carrying the text.
+
+## I4: a promoted turn keeps what the dead turn had
+
+Promotion now carries the dead turn's `chatContext` (workspace and model, remembered when the turn
+was dispatched and persisted on the steer row so a restart keeps it), its origin device for push
+suppression, `recordAcceptedTurn`, and `#sweepStaleDelegations`. It also cancels a steer command
+the peer never took off the wire, so a queued steer cannot arrive after the turn that replaced it,
+and it broadcasts the rebound user row so a live client does not keep it pinned to a dead turn id.
+
+## I5: a bad declaration no longer closes the socket
+
+`hello.activeTurns` is `Type.Unknown()` on the wire, exactly as capability 56's `detail` and 62's
+`repair` are, with `sanitizeActiveTurns` as the sole authority. A declaration that is not an array
+of 1 to 256 character ids, or that carries more than 1024 of them, degrades to "cannot declare"
+with one bounded log line. It is NEVER truncated: a partial declaration would seal turns the peer
+actually holds. Repeated ids collapse, because a repeated id says the same true thing twice.
+
+## Minor items
+
+- `#reconcilableTurns` compares `normalize(owner)` against `normalize(peer)`, so a profile key that
+  is not already lowercase no longer silently disables reconciliation and the lease.
+- the rebound user row is broadcast.
+- `rebindNativeBotMessageTurn` is scoped by `(bot, sessionId, messageId)`.
+- `#sealOwnerLoss` is unchanged in shape; the promotion guard is now explicit about the two reasons
+  it declines and records the words either way.
+
+## Not changed, and why
+
+The reviewer's "cannot verify" note about the Hermes plugin de-duplicating an inbound turn by
+`messageId` stands. Promotion deliberately re-sends the person's ORIGINAL message id, because it is
+the same message; if HF1's plugin dedupes on it, promotion would be a no-op on the peer. That is a
+question for HF1 and is called out here rather than guessed at. The 120 second and 10 minute
+windows remain provisional; .121 is still unavailable.
+
+## Round 1 counts
+
+```
+pnpm -r typecheck                                  contract, relay, gateway, conformance: Done
+packages/gateway  vitest run (23 focused files)    268 passed (268)
+packages/contract vitest run                       207 passed (207)
+packages/conformance vitest run                    108 passed | 20 skipped (128)
+```
+
+The 23 gateway files are the 16 from round 0 plus `attach-v1-storage`, `attach-boot-replay`,
+`attach-deadletter-hygiene`, `attach-v1-captured-session-stress`, `bots-group-turn`,
+`native-group-turn` and `attach-adapter-v1`, which is the set the first report named but did not
+list. The reconciliation file itself is now 15 tests. Full suite still by the lead.
+
+## Correction to the round 0 report
+
+The "Concerns" bullet claiming a restart falls back to a visible failed-delivery row was wrong when
+it was written: after a restart the map was empty and `#promoteSteer` returned before recording
+anything, so the restart case was a silent drop. It is now true, because the steers are durable.

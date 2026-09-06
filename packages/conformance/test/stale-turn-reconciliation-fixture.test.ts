@@ -6,6 +6,7 @@ import { BOTS_CAPABILITY_ID, BOTS_CAPABILITY_VERSION, check } from "cozygateway-
 import {
   AttachV1ClientFrameSchema,
   AttachV1HelloSchema,
+  sanitizeActiveTurns,
   type AttachV1Hello,
 } from "../../gateway/src/adapters/attach/protocol-v1.ts";
 
@@ -43,6 +44,8 @@ describe("stale turn reconciliation v1 peer fixture", () => {
     const one = fixture["helloCarryingOneTurn"] as AttachV1Hello;
     expect(check(AttachV1HelloSchema, none)).toBe(true);
     expect(check(AttachV1HelloSchema, one)).toBe(true);
+    expect(sanitizeActiveTurns(none.activeTurns)).toEqual([]);
+    expect(sanitizeActiveTurns(one.activeTurns)).toEqual(["turn-still-running"]);
     // An EMPTY array is the declaration "I hold none", which is a fact. An ABSENT field is a peer
     // that cannot declare, which is not. A peer must never send one meaning the other.
     expect(none.activeTurns).toEqual([]);
@@ -50,8 +53,23 @@ describe("stale turn reconciliation v1 peer fixture", () => {
     expect((fixture["helloPre69"] as AttachV1Hello).activeTurns).toBeUndefined();
   });
 
-  it("refuses a declaration that repeats a turn id", () => {
-    expect(check(AttachV1HelloSchema, fixture["helloWithDuplicateTurns"])).toBe(false);
+  it("never closes the socket over a bad declaration, and never truncates one", () => {
+    // A malformed declaration is a plugin bug on an OPTIONAL, best-effort field. Refusing the
+    // hello over one would take the profile dark and reconnect-loop, so the frame is accepted and
+    // the gateway sanitizes instead.
+    expect(check(AttachV1HelloSchema, fixture["helloWithDuplicateTurns"])).toBe(true);
+    // A repeated id says the same true thing twice and collapses.
+    expect(sanitizeActiveTurns((fixture["helloWithDuplicateTurns"] as AttachV1Hello).activeTurns))
+      .toEqual(["turn-a"]);
+    // Everything else degrades to "cannot declare", which is the safe reading. It is NEVER
+    // truncated to a shorter list, because a partial declaration would seal turns the peer holds.
+    expect(sanitizeActiveTurns("turn-a")).toBeUndefined();
+    expect(sanitizeActiveTurns(["turn-a", 7])).toBeUndefined();
+    expect(sanitizeActiveTurns([""])).toBeUndefined();
+    expect(sanitizeActiveTurns(Array.from({ length: 1025 }, (_, index) => `turn-${index}`))).toBeUndefined();
+    // And the two real answers survive sanitization unchanged.
+    expect(sanitizeActiveTurns([])).toEqual([]);
+    expect(sanitizeActiveTurns(undefined)).toBeUndefined();
   });
 
   it("carries the typed unknown-turn failure that triggers promotion, and only that reason", () => {
