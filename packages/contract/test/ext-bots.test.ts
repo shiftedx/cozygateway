@@ -917,7 +917,9 @@ describe("capability advertisement", () => {
     // Capability 64 adds durable Task reads, commands and replacement updates.
     // Capability 65 adds durable Artifact records with byte-verified commitment, retained
     // originals, tombstoned deletion, supersession, and an independent delivery lifecycle.
-    expect(BOTS_CAPABILITY_VERSION).toBe(65);
+    // Capability 66 adds the typed scoped-approval block, payload-hash binding, standing once and
+    // category grants, the always-require list no grant may cover, and the revocation view.
+    expect(BOTS_CAPABILITY_VERSION).toBe(66);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {

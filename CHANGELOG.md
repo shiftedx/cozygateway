@@ -7,6 +7,23 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## Unreleased
 
+- Typed scoped approvals (`com.cozylabs.bots` capability 66): an approval may carry one validated
+  block naming the action, its category, the target system and resource, the exact material change,
+  the side effects, why a decision is required, the sha256 hash of the exact payload, the
+  expiration, whether a retry is idempotent, and the scope the peer asked for. A decision may leave
+  a standing grant bound to profile, user, conversation, task, target, payload hash and expiration:
+  `once` covers exactly that payload on that task and only while the retry is idempotent,
+  `category` covers any payload of that action on that resource until it expires or is revoked. A
+  grant is a policy record a later invocation is consulted against, never a replay: a changed
+  material field changes the hash and forces a fresh decision, and an expired grant is dead
+  whatever its scope says. Money movement, secret access or disclosure, destructive actions, locks
+  and alarms, public publishing and broad account changes require a decision on every invocation
+  and can be covered by no grant. `GET /bots/:name/approvals/grants` is the revocation view and
+  `DELETE /bots/:name/approvals/grants/:grantId` ends one immediately. The gateway relays and
+  validates: a covered ask still raises its card, names the grant, and settles through the same
+  `resolve_approval` a tapped card sends. An approval with no block and a decision with no body are
+  byte identical to their pre-66 selves.
+
 - Durable Artifacts and independent delivery (`com.cozylabs.bots` capability 65): a declared Task
   output becomes a gateway-owned record with a stable identity, provenance to its Bot, producing
   peer, session, Task and Run, and byte evidence. Commitment recomputes the SHA-256 and byte count

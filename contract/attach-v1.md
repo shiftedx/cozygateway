@@ -172,6 +172,21 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `del
   `GET /bots/approvals` inbox row. Nothing changes for `resolve_approval`: approving is the peer's
   cue to reconnect that one server, and the gateway records nothing about the outcome. A peer
   never puts a URL, header value, env value, or secret in the block.
+- `approval` (capability 66, `com.cozylabs.bots >= 66`) MAY carry `scope`, one typed
+  scoped-approval block: `BotApprovalScopeSchema` on the bots contract (`kind: "scoped_approval"`,
+  `action`, `category`, `system`, `resource`, `change`, `effects[]`, `reason`, `payloadHash`,
+  `expiresAt`, `retry`, `requested`). The field is untyped on this wire for the same reason
+  `repair` is: a schema failure on an event frame closes the attach socket, and the rule for this
+  block is to drop it and keep the approval. The gateway is the sole authority: it validates the
+  closed sets and bounds and refuses any C0/C1 control or Unicode Format (Cf) character, a lone
+  surrogate, or a whitespace-only string; a block that fails is dropped and the approval raised
+  without it, which fails closed, because only a scoped approval can leave a standing grant behind
+  or be covered by one. A valid block is carried byte for byte on `bot_approval_pending`, the
+  durable interaction record, and the `GET /bots/approvals` inbox row. Nothing changes for
+  `resolve_approval`: when a standing grant already covers an ask, the gateway sends the same
+  `resolve_approval` a tapped card sends, and the peer is the one that acts. A peer never puts a
+  secret, credential, URL, header or env value in the block, and emits it only when the gateway
+  advertised `com.cozylabs.bots >= 66` on `hello_ack`.
 - Capability 51 (`com.cozylabs.bots`). A ROOM member turn may raise `approval`, `clarify` and
   `tool` events, which the gateway previously acknowledged and dropped. Nothing on this wire
   changes: the ids, the statuses, and the `resolve_approval` / `resolve_clarify` commands the

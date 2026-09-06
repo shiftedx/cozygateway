@@ -1,6 +1,6 @@
 # CozyGateway Bot Mode extension (`com.cozylabs.bots`)
 
-Status: v1 extension, capability version 65. This extension is independent of the frozen core
+Status: v1 extension, capability version 66. This extension is independent of the frozen core
 `contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
 recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
 [`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
@@ -31,7 +31,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 65 }
+"capabilities": { "com.cozylabs.bots": 66 }
 ```
 
 Versioned additions are additive and clients compare `>=`, never equality. Explicitly withdrawn or
@@ -105,6 +105,8 @@ and does not register `/bots` routes.
 | 63 | The per-server MCP repair policy, declared before it is emitted: `BotMcpServer` gains optional `repair`, closed to `approve_once` (reconnecting that server asks first, every time) and `auto_refresh` (the operator already allowed the peer to refresh that server on its own, so a reconnect happens without a question). It is the same setting capability 62 reports as `BotApprovalRepair.policy` on one live proposal, read off the server row instead, so a client can say what a reconnect will cost before one is proposed. It rides the existing capability-48 `bot_config` `profile.read` of the runtime peer: no new route, no new lane, no new operation. READ-ONLY METADATA: `BotProfilePatch` does not gain it and never will, `enabledMcpServers` stays a list of NAMES so no request shape can carry a policy, and the setting is changed on the harness rather than through this gateway. The gateway does not store, compute, write, execute, or interpret the value, exactly as it does not for capability 58's `guardrailCeiling`; it validates the closed union and relays what the peer answered. No repair is performed and no policy is mutated here. An absent wire field means the policy was not projected or is unknown, and the gateway never fills it in. Hermes and peers below 63 omit it. A known CozyAgents peer at 63 may project its effective `approve_once` default even when the operator omitted that config key: `approve_once` requires approval and does not grant repair permission. An unknown value is NOT tolerated: it follows the `bot_config` lane's existing convention, the whole `config_result` frame is invalid, the ingress refuses it with one bounded content-free log line and closes the peer's socket, and the read ends `503 backend_unavailable`, so a client never receives an unvalidated string in the position where it renders a policy. Additive: the field is optional, so a peer and a client below 63 are byte identical to their pre-63 selves. EMISSION GATING: a peer emits `repair` only when the gateway advertised `com.cozylabs.bots >= 63` on `hello_ack`, and only with one of the two names; a client renders the policy only on `>= 63`. |
 | 64 | Durable gateway Tasks: ten states, the 45 enumerated ADR 0004 reasons, append-only transitions and accepted intents, existing attach turn identity as Run identity, and full-replace `bot_task_updated` frames. See the Task surface below. |
 | 65 | Durable gateway Artifacts: byte-verified commitment over the bytes the existing attach media route stored, retained originals, explicit deletion with a tombstone, supersession and versions, and a delivery lifecycle with its own identity and retries. See the Artifact surface below. |
+
+| 66 | An approval can name exactly what it would do, and a decision can leave a standing policy: `ApprovalEvent` on attach-v1 gains optional `scope`, one typed block a runtime peer sends alongside an approval it raises. The block is `BotApprovalScope`: `kind` (`scoped_approval`), `action` (the action type, 1-64 characters), `category` (closed: `money_movement`, `secret_access`, `destructive`, `lock_or_alarm`, `public_publishing`, `account_change`, `other`), `system` (the target system, 1-64), `resource` (the target resource, 1-256), `change` (the exact material change in one sentence, 1-400), `effects` (0-16 entries of 1-200 naming what else happens), `reason` (`always_require`, `guardrail`, `peer_policy`, `first_use`), `payloadHash` (lowercase sha256 hex of the exact payload, the BINDING), `expiresAt` (gateway-clock milliseconds), `retry` (`idempotent`, `not_idempotent`, `unknown`) and `requested` (`once`, `category`). Every set is closed, the object is closed, and no secret, credential, URL, header or env value is ever in a string: `change` and `effects` describe an action, they never carry its arguments. The gateway treats the block exactly as capability 62 treats `repair`: it validates the closed sets and bounds and refuses any C0/C1 control or Unicode Format (Cf) character, a lone surrogate, or a whitespace-only value, and a block that fails is DROPPED while the approval is KEPT, with one bounded content-free log line; a valid block is carried byte for byte on `bot_approval_pending`, the durable interaction record, the `GET /bots/approvals` inbox row, and the rebroadcast a reconnecting app gets. Dropping FAILS CLOSED: a plain approval can leave no grant behind and can be covered by none. BINDING AND GRANTS: `POST /bots/:name/approvals/:toolCallId/approve` gains an OPTIONAL `BotApprovalDecisionRequest` body, `{ grant?: "once" | "category", expiresAt? }`. No body is the pre-66 request and reaches the surface unchanged. An approve on a scoped approval records a standing grant bound to profile, user, conversation, task, target, payload hash and expiration: `once` covers exactly that payload on that task and is consulted only when the peer called the retry `idempotent`, so a mutation is never automatically replayed; `category` covers any payload of that action on that resource until `expiresAt` (required, in the future, at most one day away, `400 invalid_request` otherwise) or revocation. A GRANT IS A POLICY RECORD, never a stored payload to replay: a changed material field changes `payloadHash` and no standing approval covers it, and an expired grant is dead whatever its scope says. The six always-require categories are covered by NOTHING: no grant of either kind is recorded for one, none is ever consulted for one, and `grant: "category"` on one is `409 approval_category_forbidden` (`409 approval_scope_required` when the approval carries no block to bound a grant by). When a grant does cover an ask, the gateway still raises the card, names the grant on `bot_approval_pending.grantId`, and settles it through the same `resolve_approval` a tapped card sends: it relays and validates, it never executes. `GET /bots/:name/approvals/grants` is the revocation view (`BotApprovalGrant` rows: the grant id, its scope, the action, category, system, resource, conversation, expiry and creation time, never the deciding device, the payload hash or a payload value), and `DELETE /bots/:name/approvals/grants/:grantId` ends one immediately, `404` for a grant this gateway does not hold. Decision logs and traces carry ids, reason codes and the grant id only. Additive: an approval with no block, and a decision sent with no body, are byte identical to their pre-66 selves on every surface, and a peer emits `scope` only when the gateway advertised `com.cozylabs.bots >= 66` on `hello_ack`; a client renders the card, sends a body, or opens the revocation view only on `>= 66`. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -199,6 +201,18 @@ a second, hand-copied schema.
   session/turn ids, tool-call id, rule display name, and its pending timestamp. It carries no tool
   arguments, commands, descriptions, results, or model reasoning. `BotPendingApprovals` is capped
   at 100 current records and excludes all terminal history.
+- `BotApprovalScope` (capability 66) is the typed block one approval may carry: the action, its
+  category, the target system and resource, the exact material change, the side effects, the reason
+  a decision is required, the sha256 payload hash the binding is made of, the expiration, the retry
+  behaviour, and the scope the peer asked for. It describes an action; it never carries its
+  arguments, and no credential, URL, header or env value belongs in any of its strings.
+- `BotApprovalGrant` (capability 66) is one standing approval as the revocation view renders it:
+  the grant id, whether it covers one payload or a category, the action, category, system,
+  resource, conversation, expiry and creation time. The deciding device, the approval it came from
+  and a `once` grant's payload hash stay in the gateway's own store. `BotApprovalGrants` is capped
+  at 100 live records; expired and revoked grants are absent.
+- `BotApprovalDecisionRequest` (capability 66) is the OPTIONAL approve body. A client below 66
+  sends none, which is one invocation approved and no standing grant.
 - `BotPendingClarification` mirrors that recovery state for one unresolved option card. Its prompt
   and bounded option labels are the same display-safe values already sent in the pending frame.
 - `BotInteractionSettlement` is compact terminal proof for one approval or clarification: stable
@@ -515,6 +529,8 @@ command; it is not an approval or denial result and exposes neither a command id
 Capability 62: a row whose approval is an MCP repair proposal carries the same validated `repair`
 block its `bot_approval_pending` frame did, so an inbox opened cold renders the proposal the live
 app saw; every other row is unchanged.
+Capability 66: a row whose approval carries a scoped-approval block carries the same validated
+`scope` the live frame did, for the same reason; every other row is unchanged.
 
 Clients MUST require capability `>= 27` before showing the global pending-requests menu or using
 this route. A client that renders the requested-versus-terminal lifecycle or submits either native
@@ -748,9 +764,11 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `GET /bots/groups/:group` | — | `BotGroupDetail` | Reads a gateway-owned room. |
 | `DELETE /bots/groups/:group` | — | `204 No Content` | Deletes a gateway-owned room. |
 | `POST /bots/groups/:group/messages` | `BotGroupSendRequest` | `202 { group, message: BotGroupMessage }` | Queues member turns through attach-v1. |
-| `POST /bots/:name/approvals/:toolCallId/approve` | — | `202 { status: "requested" }` | Durably requests a native approval; the terminal event confirms it. |
+| `POST /bots/:name/approvals/:toolCallId/approve` | optional `BotApprovalDecisionRequest` (capability 66) | `202 { status: "requested" }` | Durably requests a native approval; the terminal event confirms it. A body may ask for a standing grant. |
 | `POST /bots/:name/approvals/:toolCallId/deny` | — | `202 { status: "requested" }` | Durably requests a native denial; the terminal event confirms it. |
 | `GET /bots/approvals` | optional `state=pending` | `BotInteractionRecovery` | Bounded pending approvals/clarifications plus confirmed terminal receipts. |
+| `GET /bots/:name/approvals/grants` | — | `BotApprovalGrants` | Capability 66. The standing approvals this bot holds that are neither expired nor revoked. |
+| `DELETE /bots/:name/approvals/grants/:grantId` | — | `200 { status: "revoked" }` | Capability 66. Ends one standing approval immediately; `404` for a grant this gateway does not hold. |
 | `POST /bots/:name/clarifications/:clarifyId` | `BotClarifyResolveRequest` | `202 { outcome: "requested" }` | Durably requests a clarification option; the terminal event confirms it. |
 | `GET /bots/:name/memory` | — | `BotMemoryOverviewResponse` | Profile-local source health/capabilities only; the gateway never opens Hermes files or provider storage. |
 | `PATCH /bots/:name/memory/setup` | `BotMemorySetupRequest` | `BotMemoryOverviewResponse` | Applies the three credential-free Hermes settings through the attached profile and returns a fresh authoritative projection. |
@@ -945,6 +963,9 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
   terminal frame is emitted solely from the later plugin terminal event (or local expiry).
   Capability 62: `bot_approval_pending` may carry `repair`, the validated MCP repair proposal of
   row 62; absent for every approval that is not one.
+  Capability 66: `bot_approval_pending` may carry `scope`, the validated scoped-approval block of
+  row 66, and `grantId`, the standing grant the gateway consulted and is settling the approval
+  from; both are absent for every approval that has neither.
 - `bot_clarify_pending`, `bot_clarify_resolution_requested`, and `bot_clarify_resolved`: durable
   native clarification lifecycle. A
   pending card contains only a display prompt and bounded option ids/labels, never model reasoning.
