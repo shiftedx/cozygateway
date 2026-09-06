@@ -6,6 +6,8 @@ import {
   BotCreateRequestSchema,
   BotChatAttachmentFieldsSchema,
   BotClarifyResolveRequestSchema,
+  BotApprovalDecisionRequestSchema,
+  type BotApprovalDecisionRequest,
   BotChatDisplayedRequestSchema,
   BotChatSendRequestSchema,
   BotFocusRequestSchema,
@@ -147,7 +149,11 @@ function extensionErrorBody(
     // Capability 54. Two different sentences to a person: one says add a computer, the other says
     // pick between the ones you have, so they are two codes rather than one.
     | "no_runner_paired"
-    | "runner_choice_required",
+    | "runner_choice_required"
+    // Capability 66. Two different sentences again: one says this action can never be granted a
+    // category, the other says this approval has nothing to bound a category grant by.
+    | "approval_category_forbidden"
+    | "approval_scope_required",
   message: string,
 ): ErrorBody {
   return { error: { code, message } };
@@ -750,17 +756,69 @@ export function registerBotRoutes(
     async (c: Context<Env>): Promise<Response> => {
       const resolved = canonicalName(c);
       if ("response" in resolved) return resolved.response;
-      const outcome = await chat.resolveApproval(
-        resolved.name,
-        // Read through a generic Context (this handler is shared by two routes), so the param is
-        // typed as possibly absent; the router only reaches here with it present.
-        c.req.param("toolCallId") ?? "",
-        decision,
-        c.get("deviceId"),
-      );
+      // Capability 66. An approve MAY carry a body asking for a standing grant. A client below 66
+      // sends none, which is byte identical to the pre-66 request: this invocation only. A deny
+      // never grants anything, so it keeps reading no body at all.
+      let grantRequest: BotApprovalDecisionRequest | undefined;
+      if (decision === "approve" && c.req.header("content-type")?.includes("application/json") === true) {
+        let body: unknown;
+        try {
+          body = await c.req.json();
+        } catch {
+          return c.json(errorBody("invalid_request", "malformed body"), 400);
+        }
+        try {
+          grantRequest = assertValid(BotApprovalDecisionRequestSchema, body);
+        } catch (err) {
+          return c.json(
+            errorBody("invalid_request", err instanceof Error ? err.message : "malformed body"),
+            400,
+          );
+        }
+        if (grantRequest.expiresAt !== undefined && grantRequest.grant !== "category")
+          return c.json(
+            errorBody("invalid_request", "expiresAt is only meaningful with grant: category"),
+            400,
+          );
+        if (grantRequest.grant === "category" && grantRequest.expiresAt === undefined)
+          return c.json(errorBody("invalid_request", "grant: category requires expiresAt"), 400);
+      }
+      // Read through a generic Context (this handler is shared by two routes), so the param is
+      // typed as possibly absent; the router only reaches here with it present.
+      const toolCallId = c.req.param("toolCallId") ?? "";
+      const deviceId = c.get("deviceId");
+      // A decision that asks for nothing is the pre-66 call, arity included: nothing downstream can
+      // tell a client below 66 from the client that sent this route its first request.
+      const outcome = grantRequest?.grant === undefined
+        ? await chat.resolveApproval(resolved.name, toolCallId, decision, deviceId)
+        : await chat.resolveApproval(resolved.name, toolCallId, decision, deviceId, {
+            grant: grantRequest.grant,
+            ...(grantRequest.expiresAt === undefined ? {} : { expiresAt: grantRequest.expiresAt }),
+          });
       switch (outcome) {
         case "requested":
           return c.json({ status: "requested" }, 202);
+        case "category_forbidden":
+          return c.json(
+            extensionErrorBody(
+              "approval_category_forbidden",
+              "this action requires approval on every invocation and cannot be granted a category",
+            ),
+            409,
+          );
+        case "scope_required":
+          return c.json(
+            extensionErrorBody(
+              "approval_scope_required",
+              "this approval carries no scope block to bound a category grant",
+            ),
+            409,
+          );
+        case "invalid_grant":
+          return c.json(
+            errorBody("invalid_request", "expiresAt must be in the future and at most one day away"),
+            400,
+          );
         case "resolution_pending":
           return c.json(
             errorBody(
@@ -828,6 +886,26 @@ export function registerBotRoutes(
       clarifications: [...(chat.pendingClarifications?.() ?? [])].slice(0, PENDING_APPROVALS_LIMIT),
       settlements: [...(chat.terminalSettlements?.() ?? [])],
     });
+  });
+
+  // Capability 66. The revocation view and its inverse. A standing grant is the only thing a later
+  // invocation is consulted against, so a person must be able to see every one that is live and
+  // end one at will. Neither route touches an approval: revoking removes future coverage and
+  // never changes a decision already made.
+  app.get("/bots/:name/approvals/grants", requireDevice, (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    return c.json({ grants: chat.approvalGrants?.(resolved.name) ?? [] });
+  });
+
+  app.delete("/bots/:name/approvals/grants/:grantId", requireDevice, (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const outcome = chat.revokeApprovalGrant?.(resolved.name, c.req.param("grantId") ?? "")
+      ?? "unknown";
+    if (outcome === "unknown")
+      return c.json(errorBody("not_found", "no such standing approval"), 404);
+    return c.json({ status: "revoked" });
   });
 
   app.post(

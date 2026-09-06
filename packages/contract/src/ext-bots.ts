@@ -808,6 +808,111 @@ export const BotApprovalRepairSchema = Type.Object({
 }, { additionalProperties: false });
 export type BotApprovalRepair = Static<typeof BotApprovalRepairSchema>;
 
+/** Capability 66. What kind of thing an approval is about. The first six names are the
+ *  ALWAYS-REQUIRE list: money movement, secret access or disclosure, destructive actions, locks
+ *  and alarms, public publishing, and broad account changes require a decision on every single
+ *  invocation, and no category grant or convenience policy may cover one. `other` is everything
+ *  else, the only category a person can hand a standing grant. Closed: a name outside this set
+ *  fails the block. */
+export const BotApprovalCategorySchema = Type.Union([
+  Type.Literal("money_movement"), Type.Literal("secret_access"), Type.Literal("destructive"),
+  Type.Literal("lock_or_alarm"), Type.Literal("public_publishing"), Type.Literal("account_change"),
+  Type.Literal("other"),
+]);
+export type BotApprovalCategory = Static<typeof BotApprovalCategorySchema>;
+
+/** Capability 66. The categories no grant may ever cover, from the settled rule. Exported so the
+ *  gateway, a client, and a conformance decoder all read one list rather than three copies. */
+export const ALWAYS_REQUIRE_APPROVAL_CATEGORIES: readonly BotApprovalCategory[] = [
+  "money_movement", "secret_access", "destructive", "lock_or_alarm", "public_publishing",
+  "account_change",
+];
+
+/** Capability 66. The typed scoped-approval block an approval may carry: what the action is,
+ *  which system and resource it targets, the exact material change, its side effects, why a
+ *  decision is required at all, the hash of the exact payload, when the ask expires, whether a
+ *  retry of it is idempotent, and which scope the peer is asking for.
+ *
+ *  The payload hash is the BINDING: a changed material field changes the hash, and a changed hash
+ *  can never be covered by a standing approval. The gateway is the authority on the block, exactly
+ *  as it is on capability 62's `repair`: a block that fails this schema, or carries a C0/C1 control
+ *  or Unicode Format character, a lone surrogate, or a whitespace-only string, is DROPPED while the
+ *  approval it describes is kept. The bounds count UTF-16 code units, as TypeBox enforces them.
+ *  A peer never puts a secret, credential, URL, header or env value in any string here: `change`
+ *  and `effects` describe an action, they do not carry its arguments. */
+export const BotApprovalScopeSchema = Type.Object({
+  kind: Type.Literal("scoped_approval"),
+  /** The action type, the unit a category grant is bounded by (for example `workspace.write`). */
+  action: Type.String({ minLength: 1, maxLength: 64 }),
+  category: BotApprovalCategorySchema,
+  /** The target system the action reaches (for example `workspace`, `github`, `stripe`). */
+  system: Type.String({ minLength: 1, maxLength: 64 }),
+  /** The target resource inside that system. A grant is bounded to this exact resource. */
+  resource: Type.String({ minLength: 1, maxLength: 256 }),
+  /** The exact material change, in one sentence a person can check. */
+  change: Type.String({ minLength: 1, maxLength: 400 }),
+  /** What else happens if it runs. Empty when the peer claims none. */
+  effects: Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 16 }),
+  /** Why a decision is required: the always-require list, the bot's guardrail level, the peer's
+   *  own policy, or the first use of this action on this resource. */
+  reason: Type.Union([
+    Type.Literal("always_require"), Type.Literal("guardrail"),
+    Type.Literal("peer_policy"), Type.Literal("first_use"),
+  ]),
+  /** Lowercase sha256 hex of the exact payload the peer would send. Material fields only: two
+   *  invocations that differ in anything a person would want to re-read differ here. */
+  payloadHash: Type.String({ pattern: "^[0-9a-f]{64}$", minLength: 64, maxLength: 64 }),
+  /** Gateway-clock milliseconds after which this ask, and any grant made from it, is dead. */
+  expiresAt: Type.Integer({ minimum: 0 }),
+  /** Whether repeating the exact payload is safe. Only `idempotent` may be covered by a standing
+   *  once grant; a mutation is never automatically replayed. */
+  retry: Type.Union([
+    Type.Literal("idempotent"), Type.Literal("not_idempotent"), Type.Literal("unknown"),
+  ]),
+  /** The scope the PEER is asking for. The person decides what is actually granted. */
+  requested: Type.Union([Type.Literal("once"), Type.Literal("category")]),
+}, { additionalProperties: false });
+export type BotApprovalScope = Static<typeof BotApprovalScopeSchema>;
+
+/** Capability 66. One standing approval the gateway holds, as the revocation view renders it.
+ *  A grant is a POLICY RECORD a later invocation is consulted against, never a stored payload to
+ *  replay: it carries the action, the category, the target, the conversation it was made in, and
+ *  when it dies. The payload hash of a `once` grant, the deciding device, and the approval it came
+ *  from stay in the gateway's own store; nothing here is a secret payload value. */
+export const BotApprovalGrantSchema = Type.Object({
+  grantId: Type.String({ minLength: 1, maxLength: 256 }),
+  /** `once`: the exact payload and target, retryable only while idempotent. `category`: any
+   *  payload of this action on this resource, until it expires or is revoked. */
+  scope: Type.Union([Type.Literal("once"), Type.Literal("category")]),
+  action: Type.String({ minLength: 1, maxLength: 64 }),
+  category: BotApprovalCategorySchema,
+  system: Type.String({ minLength: 1, maxLength: 64 }),
+  resource: Type.String({ minLength: 1, maxLength: 256 }),
+  sessionId: Type.String({ minLength: 1 }),
+  expiresAt: Type.Integer(),
+  createdAt: Type.Integer(),
+});
+export type BotApprovalGrant = Static<typeof BotApprovalGrantSchema>;
+
+/** Capability 66. Every standing approval for one bot that is neither expired nor revoked. */
+export const BotApprovalGrantsSchema = Type.Object({
+  grants: Type.Array(BotApprovalGrantSchema, { maxItems: 100 }),
+});
+export type BotApprovalGrants = Static<typeof BotApprovalGrantsSchema>;
+
+/** Capability 66. The OPTIONAL body of `POST /bots/:name/approvals/:toolCallId/approve`. A body is
+ *  not required and a client below 66 sends none, which is exactly the pre-66 request: one
+ *  invocation approved, no standing grant asked for. `grant: "category"` asks for a standing
+ *  policy record bounded by the approval's own action and resource and by `expiresAt`, which is
+ *  then required; it is refused for an always-require category. `grant: "once"` is the explicit
+ *  spelling of the default. `expiresAt` is meaningless without `grant: "category"`. */
+export const BotApprovalDecisionRequestSchema = Type.Object({
+  grant: Type.Optional(Type.Union([Type.Literal("once"), Type.Literal("category")])),
+  /** Gateway-clock milliseconds. Required with `grant: "category"`, refused otherwise. */
+  expiresAt: Type.Optional(Type.Integer({ minimum: 0 })),
+}, { additionalProperties: false });
+export type BotApprovalDecisionRequest = Static<typeof BotApprovalDecisionRequestSchema>;
+
 export const BotApprovalPendingFrameSchema = Type.Object({
   type: Type.Literal("bot_approval_pending"),
   bot: Type.String(),
@@ -826,6 +931,13 @@ export const BotApprovalPendingFrameSchema = Type.Object({
   /** Capability 62. The MCP repair proposal this approval asks about, the block the gateway
    *  validated. Absent for every approval that is not a repair proposal. */
   repair: Type.Optional(BotApprovalRepairSchema),
+  /** Capability 66. The validated scoped-approval block this approval carries, byte for byte as
+   *  the peer sent it. Absent for every approval raised without one. */
+  scope: Type.Optional(BotApprovalScopeSchema),
+  /** Capability 66. The standing grant the gateway consulted and is settling this approval from.
+   *  Present ONLY when a grant covered it: the card is still rendered, so the decision is visible
+   *  rather than silent, and the resolution follows on the ordinary resolved frame. */
+  grantId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
 });
 export type BotApprovalPendingFrame = Static<typeof BotApprovalPendingFrameSchema>;
 
@@ -1725,6 +1837,9 @@ export const BotPendingApprovalSchema = Type.Object({
   /** Capability 62. The same validated repair block the pending frame carried, so an inbox read
    *  on a cold start renders the proposal the live frame did. Absent for every other approval. */
   repair: Type.Optional(BotApprovalRepairSchema),
+  /** Capability 66. The same validated scoped-approval block the pending frame carried, so an
+   *  inbox opened cold renders the card the live frame did. Absent for every other approval. */
+  scope: Type.Optional(BotApprovalScopeSchema),
 });
 export type BotPendingApproval = Static<typeof BotPendingApprovalSchema>;
 
@@ -2685,4 +2800,11 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * originals, tombstoned deletion, supersession, and a delivery lifecycle with its own identity
  * and retries. Delivery is separate from Task completion, and the existing attachment surface is
  * unchanged for every client below 65. The shapes live in `artifacts.ts`. */
-export const BOTS_CAPABILITY_VERSION = 65;
+/** Capability 66: typed scoped approvals. `ApprovalEvent` may carry one validated `scope` block
+ * naming the action, the target system and resource, the exact material change, the side effects,
+ * the reason a decision is required, the payload hash, the expiration, the retry behaviour and the
+ * requested scope. A decision may leave a standing grant bound to profile, user, conversation,
+ * task, target, payload hash and expiration; a grant is consulted, never replayed, and the
+ * always-require categories can never be covered by one. Additive: an approval without a block,
+ * and a decision sent with no body, are byte identical to their pre-66 selves. */
+export const BOTS_CAPABILITY_VERSION = 66;

@@ -9,6 +9,8 @@ import type {
   BotChatMessage,
   BotMobileReceipt,
   BotApprovalRepair,
+  BotApprovalGrant,
+  BotApprovalScope,
   BotGroupPendingInteraction,
   BotInteractionSettlement,
   BotPendingClarification,
@@ -595,6 +597,33 @@ CREATE TABLE IF NOT EXISTS bot_native_interactions (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (bot, kind, interaction_id)
 ) STRICT, WITHOUT ROWID;
+-- Capability 66. One standing approval a person left behind, and the ONLY thing a later invocation
+-- is consulted against. It is a policy record, never a stored payload: payload_hash is a digest,
+-- and no argument, command, or secret value is here to replay. A 'once' row covers exactly one
+-- payload on one task; a 'category' row covers any payload of one action on one resource until it
+-- expires or is revoked. expires_at is absolute and never extended, so an expired grant is dead
+-- whatever its scope says, and revoked_at takes a grant out of every consult immediately.
+CREATE TABLE IF NOT EXISTS bot_approval_grants (
+  bot TEXT NOT NULL,
+  grant_id TEXT NOT NULL,
+  scope TEXT NOT NULL CHECK (scope IN ('once', 'category')),
+  -- The device that decided, kept for the decision log and never put on the wire.
+  device_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT,
+  approval_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  category TEXT NOT NULL,
+  system TEXT NOT NULL,
+  resource TEXT NOT NULL,
+  payload_hash TEXT,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  revoked_at INTEGER,
+  PRIMARY KEY (bot, grant_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_approval_grants_target
+  ON bot_approval_grants (bot, session_id, action, system, resource);
 -- Gateway-originated terminal truth complements attach's terminal journal: the wall-clock bound
 -- can settle a durable queued turn before any plugin event exists.
 CREATE TABLE IF NOT EXISTS bot_native_turn_terminals (
@@ -3834,7 +3863,7 @@ export class Storage {
       );
       for (const mediaId of scheduledMediaIds)
         deleteUnreferencedMedia.run(outboxAgentId, mediaId, input.bot, input.sessionId, outboxAgentId);
-      for (const table of ["bot_native_messages", "bot_chat_tool_steps", "bot_chat_delegations", "bot_mobile_receipts", "bot_native_interactions", "bot_native_turn_terminals", "bot_desktop_resume_bindings", "bot_chat_configurations"]) {
+      for (const table of ["bot_native_messages", "bot_chat_tool_steps", "bot_chat_delegations", "bot_mobile_receipts", "bot_native_interactions", "bot_approval_grants", "bot_native_turn_terminals", "bot_desktop_resume_bindings", "bot_chat_configurations"]) {
         this.#db.prepare(`DELETE FROM ${table} WHERE bot = ? AND session_id = ?`).run(input.bot, input.sessionId);
       }
       this.#db.prepare("DELETE FROM bot_native_sessions WHERE bot = ? AND session_id = ?").run(input.bot, input.sessionId);
@@ -4326,6 +4355,7 @@ export class Storage {
     resolutionRequestedAt?: number;
     room?: string;
     repair?: BotApprovalRepair;
+    scope?: BotApprovalScope;
   }> {
     if (bots.length === 0) return [];
     const placeholders = bots.map(() => "?").join(", ");
@@ -4336,6 +4366,7 @@ export class Storage {
                 json_extract(payload_json, '$.name') AS ruleName,
                 json_extract(payload_json, '$.room.name') AS room,
                 json_extract(payload_json, '$.repair') AS repairJson,
+                json_extract(payload_json, '$.scope') AS scopeJson,
                 updated_at AS createdAt,
                 resolution_requested_at AS resolutionRequestedAt
          FROM bot_native_interactions
@@ -4351,10 +4382,11 @@ export class Storage {
         ruleName: string;
         room: string | null;
         repairJson: string | null;
+        scopeJson: string | null;
         createdAt: number;
         resolutionRequestedAt: number | null;
       }>;
-    return rows.map(({ resolutionRequestedAt, room, repairJson, ...row }) => ({
+    return rows.map(({ resolutionRequestedAt, room, repairJson, scopeJson, ...row }) => ({
       ...row,
       ...(resolutionRequestedAt === null ? {} : { resolutionRequestedAt }),
       // Capability 51. A room approval is the same durable row with the room name recorded beside
@@ -4363,7 +4395,106 @@ export class Storage {
       // Capability 62. The repair block was validated on ingest and stored as sent, so the inbox
       // row carries the same object the live frame did; absent for every other approval.
       ...(repairJson === null ? {} : { repair: JSON.parse(repairJson) as BotApprovalRepair }),
+      // Capability 66. Same discipline for the scoped-approval block: validated on ingest, stored
+      // as sent, so a cold inbox read renders the card the live frame did.
+      ...(scopeJson === null ? {} : { scope: JSON.parse(scopeJson) as BotApprovalScope }),
     }));
+  }
+
+  /** Capability 66. Record the standing approval one decision left behind. `grantId` is derived
+   * from the approval it came from, so a retried decision writes the same row rather than a second
+   * grant: first write wins and the returned flag says whether this call created it. */
+  recordApprovalGrant(input: {
+    bot: string;
+    grantId: string;
+    scope: "once" | "category";
+    deviceId: string;
+    sessionId: string;
+    turnId: string | null;
+    approvalId: string;
+    action: string;
+    category: string;
+    system: string;
+    resource: string;
+    payloadHash: string | null;
+    expiresAt: number;
+    createdAt: number;
+  }): boolean {
+    return this.#db
+      .prepare(
+        `INSERT INTO bot_approval_grants
+           (bot, grant_id, scope, device_id, session_id, turn_id, approval_id, action, category,
+            system, resource, payload_hash, expires_at, created_at, revoked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(bot, grant_id) DO NOTHING`,
+      )
+      .run(
+        input.bot, input.grantId, input.scope, input.deviceId, input.sessionId, input.turnId,
+        input.approvalId, input.action, input.category, input.system, input.resource,
+        input.payloadHash, input.expiresAt, input.createdAt,
+      ).changes === 1;
+  }
+
+  /** Capability 66. The revocation view: every standing grant for one bot that is neither expired
+   * nor revoked. The deciding device, the approval it came from, and a `once` grant's payload hash
+   * stay in the store; what a person needs to revoke one is what leaves it. */
+  approvalGrants(bot: string, now: number): BotApprovalGrant[] {
+    return this.#db
+      .prepare(
+        `SELECT grant_id AS grantId, scope, action, category, system, resource,
+                session_id AS sessionId, expires_at AS expiresAt, created_at AS createdAt
+         FROM bot_approval_grants
+         WHERE bot = ? AND revoked_at IS NULL AND expires_at > ?
+         ORDER BY created_at, grant_id
+         LIMIT 100`,
+      )
+      .all(bot, now) as unknown as BotApprovalGrant[];
+  }
+
+  /** Capability 66. Revocation is immediate: the row stays for the decision log and leaves every
+   * consult in the same transaction that marks it. */
+  revokeApprovalGrant(bot: string, grantId: string, now: number): boolean {
+    return this.#db
+      .prepare(
+        `UPDATE bot_approval_grants SET revoked_at = ?
+         WHERE bot = ? AND grant_id = ? AND revoked_at IS NULL`,
+      )
+      .run(now, bot, grantId).changes === 1;
+  }
+
+  /** Capability 66. The consult: does a standing grant already cover this exact proposal? Every
+   * binding field must match, the grant must not have expired or been revoked, and a `once` grant
+   * additionally demands the same task and the same payload hash. The caller never asks for an
+   * always-require category, and `allowOnce` is false unless the peer called the retry idempotent,
+   * so a mutation is never automatically replayed. Returns the grant id, which is what the
+   * decision log and the pending frame name. */
+  standingApprovalGrant(input: {
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    action: string;
+    category: string;
+    system: string;
+    resource: string;
+    payloadHash: string;
+    allowOnce: boolean;
+    now: number;
+  }): string | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT grant_id AS grantId FROM bot_approval_grants
+         WHERE bot = ? AND session_id = ? AND action = ? AND category = ? AND system = ?
+           AND resource = ? AND revoked_at IS NULL AND expires_at > ?
+           AND (scope = 'category'
+                OR (? = 1 AND scope = 'once' AND turn_id = ? AND payload_hash = ?))
+         ORDER BY expires_at DESC, grant_id
+         LIMIT 1`,
+      )
+      .get(
+        input.bot, input.sessionId, input.action, input.category, input.system, input.resource,
+        input.now, input.allowOnce ? 1 : 0, input.turnId, input.payloadHash,
+      ) as { grantId: string } | undefined;
+    return row?.grantId;
   }
 
   /** Capability 51. What a room's members are currently blocked on, read off the same durable
@@ -4573,6 +4704,9 @@ export class Storage {
       ["mobileReceipts", "bot_mobile_receipts", "bot"],
       ["turnMediaDeliveries", "bot_turn_media_deliveries", "bot"],
       ["interactions", "bot_native_interactions", "bot"],
+      // Capability 66. A standing approval belongs to the bot it was made for: deleting the bot
+      // takes its grants with it rather than leaving policy pointing at an identity that is gone.
+      ["approvalGrants", "bot_approval_grants", "bot"],
       ["turnTerminals", "bot_native_turn_terminals", "bot"],
       ["attachStream", "attach_streams", "agent_id"],
       ["attachCommands", "attach_command_outbox", "agent_id"],

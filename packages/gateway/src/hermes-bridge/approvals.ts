@@ -1,8 +1,20 @@
 /** Attach-v1 owns bot approvals. These shared route types remain here to avoid widening the
  * public bots surface with Dashboard implementation details. */
 export type BotApprovalDecision = "approve" | "deny";
+/** Capability 66. A decision may ask for a standing grant. `once` is the pre-66 default and needs
+ * no body at all. `category` asks for a policy record bounded by the approval's own action and
+ * resource and by `expiresAt`. */
+export type BotApprovalDecisionScope = { grant: "once" | "category"; expiresAt?: number };
 export type BotApprovalResolveOutcome =
   | "requested"
+  /** Capability 66. The approval's category is on the always-require list, so no grant may cover
+   *  it. The per-invocation decision is still available: resend without asking for a grant. */
+  | "category_forbidden"
+  /** Capability 66. A category grant was asked for on an approval that carries no scope block,
+   *  so there is nothing to bound it by. */
+  | "scope_required"
+  /** Capability 66. The asked-for grant expiry is in the past or past the ceiling. */
+  | "invalid_grant"
   | "resolution_pending"
   | "unknown"
   | "not_pending"
