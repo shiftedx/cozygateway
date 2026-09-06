@@ -1,0 +1,26 @@
+{
+  "capability": 65,
+  "artifact": {
+    "artifactId": "artifact-1", "bot": "sage", "sessionId": "session-1", "createdBy": "sage",
+    "taskId": "task-1", "runId": "run-1",
+    "filename": "quarterly-report.pdf", "mediaType": "application/pdf",
+    "sizeBytes": 16, "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "state": "committed", "mark": "final", "validation": "verified", "version": 2,
+    "supersedesArtifactId": "artifact-0",
+    "createdAt": 1000, "committedAt": 1200,
+    "location": "/artifacts/artifact-1/content",
+    "delivery": {
+      "deliveryId": "delivery-2", "artifactId": "artifact-1", "attempt": 2,
+      "state": "acknowledged", "queuedAt": 1200, "deliveredAt": 1300, "acknowledgedAt": 1400
+    }
+  },
+  "tombstone": {
+    "artifactId": "artifact-0", "bot": "sage", "sessionId": "session-1", "createdBy": "sage",
+    "taskId": "task-1", "runId": "run-1",
+    "filename": "quarterly-report.pdf", "mediaType": "application/pdf",
+    "sizeBytes": 16, "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "state": "deleted", "mark": "draft", "validation": "verified", "version": 1,
+    "supersededByArtifactId": "artifact-1",
+    "createdAt": 900, "committedAt": 950, "deletedAt": 1500
+  }
+}

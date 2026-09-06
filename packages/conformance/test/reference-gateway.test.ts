@@ -43,6 +43,7 @@ afterAll(async () => {
 
 registerConformanceSuite({
   durableTasks: true,
+  artifactDelivery: true,
   baseUrl: () => reference.gateway?.url ?? "",
   issueSetupCode: () => Promise.resolve(reference.gateway?.issueSetupCode() ?? ""),
   echoAgentId: "conformance-echo",

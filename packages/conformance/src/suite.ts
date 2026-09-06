@@ -56,6 +56,11 @@ import {
 export interface ConformanceEnv {
   /** Enable row 64 Task reads/updates for the reference attach echo peer. */
   durableTasks?: boolean;
+  /** Enable the row 65 Artifact public-route group. A gateway declaring it promises the routes
+   *  exist and are device authenticated; it does NOT have to have produced any Artifact, because
+   *  the portable assertions are about authorization, absent identities, and the older-peer
+   *  attachment behavior that row 65 must not have changed. */
+  artifactDelivery?: boolean;
   /** Base HTTP URL of the gateway under test, no trailing slash. */
   baseUrl: () => string;
   /** Mint a fresh single-use setup code on the gateway under test. */
@@ -282,6 +287,31 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
         expect((await fetch(`${env.baseUrl()}/tasks/${read.view.taskId}`)).status).toBe(401);
         expect((await authFetch(token, `/tasks/${read.view.taskId}/retry`, { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ idempotencyKey: "completed-retry" }) })).status).toBe(409);
       } finally { socket.ws.close(); }
+    });
+  });
+
+  describe.skipIf(env.artifactDelivery !== true)("durable Artifacts capability 65", () => {
+    it("authenticates every Artifact route, hides guessed ids, and leaves attachment behavior unchanged", async () => {
+      const health = assertValid(GatewayInfoSchema, await (await fetch(`${env.baseUrl()}/health`)).json());
+      expect(health.capabilities?.["com.cozylabs.bots"]).toBeGreaterThanOrEqual(65);
+      const bot = encodeURIComponent(env.echoAgentId);
+      const guessed = "conformance-guessed-artifact";
+      for (const path of [`/bots/${bot}/artifacts`, `/artifacts/${guessed}`, `/artifacts/${guessed}/content`])
+        expect((await fetch(`${env.baseUrl()}${path}`)).status).toBe(401);
+
+      const { token } = await pairDevice("Artifact conformance");
+      const listed = await authFetch(token, `/bots/${bot}/artifacts`);
+      expect(listed.status).toBe(200);
+      expect(Array.isArray((await listed.json() as { artifacts: unknown[] }).artifacts)).toBe(true);
+      // A guessed identity is absent, not forbidden, so it cannot be probed for existence.
+      expect((await authFetch(token, `/artifacts/${guessed}`)).status).toBe(404);
+      expect((await authFetch(token, `/artifacts/${guessed}/content`)).status).toBe(404);
+      expect((await authFetch(token, `/artifacts/${guessed}`, { method: "DELETE" })).status).toBe(404);
+      // A client at an older capability keeps the attachment surface it already had: an unknown
+      // file id is still that route's own 404, never an Artifact-shaped answer.
+      const attachment = await authFetch(token, `/bots/${bot}/chat/attachments/${guessed}`);
+      expect(attachment.status).toBe(404);
+      assertValid(ErrorBodySchema, await attachment.json());
     });
   });
 

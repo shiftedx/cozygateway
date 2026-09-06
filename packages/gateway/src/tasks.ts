@@ -113,6 +113,10 @@ export class Tasks {
 
   presence(peer: string, live: boolean, at: number): void {
     if (live) this.#live.add(peer); else this.#live.delete(peer);
+    // A peer's socket can close after the durable store was torn down (shutdown, or a test that
+    // deliberately retains the closed handle). Presence is a projection of durable state, so a
+    // closed store has nothing to project; crashing the process on the way down is not a fence.
+    if (!this.#db.isOpen) return;
     // Mark absence only on a transition. A repeated absent callback cannot renew the lease.
     if (!live) {
       for (const row of this.#db.prepare("SELECT task_id AS taskId FROM tasks").all() as unknown as { taskId: string }[]) {

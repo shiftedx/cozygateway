@@ -915,7 +915,9 @@ describe("capability advertisement", () => {
     // optional, closed to `approve_once` and `auto_refresh`, READ-ONLY metadata the gateway relays
     // and never stores, computes, writes, or backfills. An absent key is unprojected or unknown.
     // Capability 64 adds durable Task reads, commands and replacement updates.
-    expect(BOTS_CAPABILITY_VERSION).toBe(64);
+    // Capability 65 adds durable Artifact records with byte-verified commitment, retained
+    // originals, tombstoned deletion, supersession, and an independent delivery lifecycle.
+    expect(BOTS_CAPABILITY_VERSION).toBe(65);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {

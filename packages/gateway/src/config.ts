@@ -129,6 +129,11 @@ const GatewayConfigSchema = Type.Object({
   staleTurnSweepSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
   staleTurnInterruptGraceSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
   staleTurnCeilingSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
+  /** Capability 65. Operator ceiling, in bytes, on the retained Artifact originals this gateway
+   *  holds. A commit that would exceed it fails visibly with `capacity` on the record rather than
+   *  reclaiming an original: retention is only ended by an explicit deletion. Omitted means no
+   *  ceiling. Config-file only. */
+  artifactStoreBytes: Type.Optional(Type.Integer({ minimum: 1 })),
   /** Capability id -> integer version, surfaced verbatim as GatewayInfo.capabilities (contract
    *  v1.md section 5). Optional; a gateway with nothing to advertise omits it and gets an empty
    *  map (see server.ts). Ids under com.cozylabs.* are vendor extensions. */
