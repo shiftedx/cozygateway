@@ -174,7 +174,7 @@ the previous reader: `FAIL: a carriage return from a Windows interpreter reached
 Every suite below was run twice, once normally and once with `HOME` pointed at an empty directory,
 which hides the user site-packages and makes this machine PyYAML-free like the runner.
 
-- `scripts/test/plugin-rollout.test.sh`: `plugin rollout: ok` both ways, 15 cases (one new).
+- `scripts/test/plugin-rollout.test.sh`: `plugin rollout: ok` both ways, 14 cases (one new).
 - `scripts/test/hermes-installer.test.sh`: `hermes installer dry-run tests passed` both ways,
   `exit=0`, and now zero `FAIL` lines in the output.
 - `scripts/test/bootstrap-transaction.test.sh`: `bootstrap transaction tests passed` both ways
@@ -227,10 +227,59 @@ The reader remains byte identical in all three scripts (same md5 for the extract
 
 Each suite run twice, normally and with `HOME` pointed at an empty directory (no PyYAML anywhere):
 
-- `plugin-rollout.test.sh`: exit 0 both ways, 15 cases, zero `FAIL` lines.
+- `plugin-rollout.test.sh`: exit 0 both ways, 14 cases, zero `FAIL` lines.
 - `hermes-installer.test.sh`: exit 0 both ways, zero `FAIL` lines.
 - `bootstrap-transaction.test.sh`: exit 0 both ways.
 - `pnpm test:installer`: exit 0.
 - `pnpm -r typecheck` under Node 24: 4 of 4 `Done`.
 - Differential against PyYAML: fuzz seed 7, 3243 comparable, 0 unsafe; fuzz seed 4242, 3260
   comparable, 0 unsafe; 64 hand-built shapes, 0 unsafe.
+
+## Fix round 2 (re-review r1)
+
+### C2 (Critical), fixed: a YAML tag in front of a block mapping
+
+`elif value[:1] in ("{", "[", "&", "*"):` did not name `!`. A tagged block (`display: !!map`, or
+`cozygateway: !!map`, with the mapping opening on the lines below) therefore read as an ordinary
+scalar value: no frame was opened, the keys inside were walked past at the wrong path, and the
+probe answered ABSENT where PyYAML answers present. That is C1's overwrite reached through a
+different token. `!` is now in that set in all three scripts, so a tag on the way to a wanted key
+ends the judgement and nothing is written.
+
+A tagged SCALAR (`streaming: !!bool true`) still counts as present, which is what PyYAML reads.
+
+Differential over a matrix of 16 comparable tagged shapes (tag at `display`, at `platforms`, at
+`cozygateway`, and at both, for `!!map`, `!map`-style custom, `!!omap` and `!!set`):
+
+- before: **12 unsafe** (every `!!map` / custom-tag / `!!omap` position, both keys or the platform
+  key depending on where the tag sat)
+- after: **0 unsafe**, every one of them conservative.
+
+The earlier fuzz harnesses do not reach this shape (their generator only ever emits a tag as a leaf
+value, never in front of a block), which is why it took an adversarial read to find. Rerun with
+tags in the value list anyway: seed 7, 2475 comparable, **0 unsafe**; with tags also emitted in
+front of blocks, seed 11, 2172 comparable, **0 unsafe**. The nested-block fuzz from round 1 still
+answers 0 unsafe out of 3243 (seed 7) and 3260 (seed 4242).
+
+RED then GREEN in the suite: `test_streaming_reader_answers_without_pyyaml` gained
+`tagged-display`, `tagged-platform` and `tagged-scalar` fixtures, and the PyYAML agreement loop now
+covers ten shapes. Against the previous reader:
+`FAIL: stdlib probe called a tagged shape absent (tagged-display): display.streaming display.platforms.cozygateway.streaming`.
+
+The reader stays byte identical across the three scripts: md5 `1aa0e9f10180cbfa0371c3888b27ae4d`
+for the extracted body in `provision-bot.sh`, `bot-provisioner-watch.sh` and `agent-install.sh`.
+
+### N1, fixed
+
+This report said "15 cases" for `plugin-rollout.test.sh` in two places; it has 14. Corrected above.
+
+### Tests after fix round 2
+
+Each shell suite run twice, normally and with `HOME` pointed at an empty directory (no PyYAML
+anywhere):
+
+- `plugin-rollout.test.sh`: exit 0 both ways, 14 cases, zero `FAIL` lines.
+- `hermes-installer.test.sh`: exit 0 both ways, zero `FAIL` lines.
+- `bootstrap-transaction.test.sh`: exit 0 both ways.
+- `pnpm test:installer`: exit 0.
+- `pnpm -r typecheck` under Node 24: 4 of 4 `Done`.

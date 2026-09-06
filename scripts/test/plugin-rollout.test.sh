@@ -345,6 +345,17 @@ test_streaming_reader_answers_without_pyyaml() {
   # this one is still repaired.
   printf 'display:\n  streaming:\n  platforms:\n    cozygateway:\n      streaming: true\n' \
     > "$dir/null-value/config.yaml"
+  mkdir -p "$dir/tagged-display" "$dir/tagged-platform" "$dir/tagged-scalar"
+  # A YAML tag in front of a block mapping. The block still opens on the line
+  # BELOW, so a probe that reads the tag as an ordinary value walks straight
+  # past the keys inside it and calls them absent.
+  printf 'display: !!map\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\n' \
+    > "$dir/tagged-display/config.yaml"
+  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway: !!map\n      streaming: true\n' \
+    > "$dir/tagged-platform/config.yaml"
+  # A tagged SCALAR is a value like any other, so both keys are present.
+  printf 'display:\n  streaming: !!bool true\n  platforms:\n    cozygateway:\n      streaming: !!bool false\n' \
+    > "$dir/tagged-scalar/config.yaml"
 
   read_with() {
     PYTHON="$1" bash -c '
@@ -383,6 +394,12 @@ SH
   [ "$answer" = 'display.streaming ' ] \
     || fail "stdlib probe on a key with no value answered: $answer"
 
+  local tagged
+  for tagged in tagged-display tagged-platform tagged-scalar; do
+    answer="$(read_with "$TMP/python3-nosite" "$dir/$tagged" | tr '\n' ' ')"
+    [ -z "$answer" ] || fail "stdlib probe called a tagged shape absent ($tagged): $answer"
+  done
+
   # A Windows interpreter writes CRLF on a text stream. The reader writes bytes
   # so it does not, and the caller strips a carriage return anyway; neither may
   # be dropped, because a "\r" glued to a key name is written into a config file
@@ -405,7 +422,8 @@ SH
     return 0
   fi
   local case_dir
-  for case_dir in mute both off telegram-only nested-block nested-block-top null-value; do
+  for case_dir in mute both off telegram-only nested-block nested-block-top null-value \
+    tagged-display tagged-platform tagged-scalar; do
     [ "$(read_with "$YAML_PYTHON" "$dir/$case_dir" | tr '\n' ' ')" \
       = "$(read_with "$TMP/python3-nosite" "$dir/$case_dir" | tr '\n' ' ')" ] \
       || fail "the two readers disagree on $case_dir"

@@ -166,8 +166,8 @@ def absent_without_yaml(text):
 
     Returns the wanted keys this file certainly does not carry, or None when it
     uses something this probe cannot judge WHERE ONE OF THOSE KEYS COULD BE (a
-    flow mapping, an anchor, a sequence, or any line it cannot parse, which is
-    what a merge key or a quoted key arrives as),
+    flow mapping, an anchor, a tag, a sequence, or any line it cannot parse,
+    which is what a merge key or a quoted key arrives as),
     or anywhere at all for a tab or a second document. None means "assume they
     are present", so the caller writes nothing: the only safe way to be unsure
     about somebody's config file. Everything outside `display` is skipped rather
@@ -226,7 +226,7 @@ def absent_without_yaml(text):
             continue
         if value in ("{}", "[]"):
             value = "empty"
-        elif value[:1] in ("{", "[", "&", "*"):
+        elif value[:1] in ("{", "[", "&", "*", "!"):
             if on_the_way(here):
                 return None
             value = "unjudged"
