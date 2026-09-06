@@ -190,9 +190,13 @@ Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `del
   approve followed by a deny for one `approvalId`: its existing rule is unchanged, the first
   TERMINAL wins and the gateway records nothing else. `category` is the PEER's own assertion, and
   the gateway cannot classify an action at this seam: declaring an always-require category
-  correctly is the raising harness's job, not a guarantee this wire makes. A peer never puts a
-  secret, credential, URL, header or env value in the block, and emits it only when the gateway
-  advertised `com.cozylabs.bots >= 66` on `hello_ack`.
+  correctly is the raising harness's job, not a guarantee this wire makes. A peer that sends NO
+  block is unchanged and needs no change: where its approval carries the capability-56 `detail`
+  sentence, the gateway derives a binding from that sentence and the rule name so a person can
+  cover a later identical ask, and where it does not, the ask is simply never covered. Neither the
+  event such a peer sends nor the commands it receives differ. A peer never puts a secret,
+  credential, URL, header or env value in the block, and emits it only when the gateway advertised
+  `com.cozylabs.bots >= 66` on `hello_ack`.
 - Capability 51 (`com.cozylabs.bots`). A ROOM member turn may raise `approval`, `clarify` and
   `tool` events, which the gateway previously acknowledged and dropped. Nothing on this wire
   changes: the ids, the statuses, and the `resolve_approval` / `resolve_clarify` commands the

@@ -487,4 +487,71 @@ describe("typed scoped approvals (capability 66)", () => {
     expect(harness.resolutions.some((row) => row.approvalId === "approval-1")).toBe(false);
     harness.close();
   });
+
+  it("covers a later identical plain approval from a grant a person made on the plain card", async () => {
+    const harness = await startTurn();
+    const { plane, sessionId, turnId } = harness;
+    // A Hermes-shaped ask: no scope block, but the capability-56 sentence the peer sent names what
+    // it concretely covers, and that plus the rule name is deterministic content.
+    const detail = "opens Chrome with the Work profile";
+
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-1", { detail }));
+    expect(await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1", {
+      grant: "once",
+    })).toBe("requested");
+    const grant = plane.surface().approvalGrants!("sage")[0]!;
+    // Derived bindings live in their own target namespace, so one can never match a grant a typed
+    // peer made against a real system it named.
+    expect(grant).toMatchObject({ scope: "once", action: "workspace_write", system: "attach" });
+
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-2", { detail }));
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-2")).toBe(true);
+    expect(pendingFrames(harness.frames).find((frame) => frame.toolCallId === "approval-2")?.grantId)
+      .toBe("grant:sage:approval-1");
+
+    // Single use, exactly as a typed once grant is.
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-3", { detail }));
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-3")).toBe(false);
+
+    // A category grant made on the same plain card covers every later ask with the same content.
+    await plane.surface().resolveApproval("sage", "approval-3", "approve", "device-1", {
+      grant: "category", expiresAt: 8_000_000,
+    });
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-4", { detail }));
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-4")).toBe(true);
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-5", { detail }));
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-5")).toBe(true);
+
+    // Different content is a different ask: the sentence is part of what was bound.
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-6", {
+      detail: "opens Chrome with the Personal profile",
+    }));
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-6")).toBe(false);
+    harness.close();
+  });
+
+  it("refuses to cover a plain approval that carries no deterministic content", async () => {
+    const harness = await startTurn();
+    const { plane, sessionId, turnId } = harness;
+
+    // A rule name alone says what KIND of thing is being asked, never which one, so binding a
+    // payload hash to it would cover asks a person never saw. There is nothing to bind: no grant.
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-1"));
+    expect(await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1", {
+      grant: "category", expiresAt: 8_000_000,
+    })).toBe("scope_required");
+    expect(await plane.surface().resolveApproval("sage", "approval-1", "approve", "device-1", {
+      grant: "once",
+    })).toBe("scope_required");
+    expect(plane.surface().approvalGrants!("sage")).toEqual([]);
+
+    plane.handle("sage", approvalEvent(sessionId, turnId, "approval-2"));
+    expect(harness.resolutions.some((row) => row.approvalId === "approval-2")).toBe(false);
+    // And the plain card is still the pre-66 card, whatever a person asked for on it.
+    const frame = pendingFrames(harness.frames).find((item) => item.toolCallId === "approval-2")!;
+    expect(Object.keys(frame).sort()).toEqual(
+      ["bot", "sessionId", "toolCallId", "turnId", "type", "name", "updatedAt"].sort(),
+    );
+    harness.close();
+  });
 });

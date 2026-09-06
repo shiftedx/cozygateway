@@ -27,7 +27,10 @@ release; everything older is marked pre-release so installers resolve one "lates
   The gateway relays and validates: a covered ask still raises its card, names the grant on the
   frame, the reconnect rebroadcast and the inbox row, and settles through the same
   `resolve_approval` a tapped card sends, and a person can still deny that one ask or revoke the
-  grant. `category` is the peer's own assertion: classifying an action into the always-require list
+  grant. A plain approval from a peer that sends no block is bound too, from its rule name and its
+  capability-56 sentence, so a person can cover a later identical one; a plain ask carrying neither
+  is never covered. Such a peer needs no change and its approvals render and settle exactly as
+  before. `category` is the peer's own assertion: classifying an action into the always-require list
   belongs to the harness that raises it. An approval with no block and a decision with no body are
   byte identical to their pre-66 selves.
 
