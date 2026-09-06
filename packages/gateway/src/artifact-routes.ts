@@ -90,6 +90,8 @@ export function registerArtifactRoutes(
     if (declaration.room !== undefined && !(storage.botGroup(declaration.room)?.members ?? []).includes(bot))
       return c.json({ error: { code: "forbidden", message: "bot is not a member of that room" } }, 403);
     const result = storage.artifacts.declare({ ...declaration, createdBy: agentId, bot }, now());
+    if (result.outcome === "reserved")
+      return invalid(c, "artifact id prefix is reserved for gateway-derived records");
     if (result.outcome === "conflict")
       return c.json({ error: { code: "conflict", message: "artifact id already names a different declaration" } }, 409);
     return c.json(result.record, result.outcome === "created" ? 201 : 200);

@@ -3357,12 +3357,14 @@ export class Storage {
        WHERE bot = ? AND message_id = ?`,
     );
     const deliveries: Array<{ deliveryId: string; messageId: string }> = [];
+    const displayed: string[] = [];
     let recorded = 0;
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       for (const messageId of new Set(messageIds)) {
         if (insert.run(bot, messageId, at, deviceId, bot, messageId).changes !== 1) continue;
         recorded += 1;
+        displayed.push(messageId);
         const bound = (binding.get(bot, messageId) ?? turnBinding.get(bot, messageId)) as
           { deliveryId: string } | undefined;
         if (bound !== undefined) deliveries.push({ deliveryId: bound.deliveryId, messageId });
@@ -3372,6 +3374,10 @@ export class Storage {
       this.#db.exec("ROLLBACK");
       throw err;
     }
+    // Capability 65. The device reported these rows on screen, which is receipt for any Artifact
+    // the gateway derived from their attachments. It stays outside the receipt transaction: an
+    // acknowledgement that could not be written must never lose the receipt that earned it.
+    for (const messageId of displayed) this.artifacts.acknowledgeMessage(bot, messageId, at);
     return { recorded, deliveries };
   }
 

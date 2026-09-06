@@ -35,6 +35,15 @@ export const ARTIFACT_DELIVERY_STATES = ["queued", "delivered", "acknowledged", 
 export const ArtifactDeliveryStateSchema = Type.Union(ARTIFACT_DELIVERY_STATES.map((value) => Type.Literal(value)));
 export type ArtifactDeliveryState = Static<typeof ArtifactDeliveryStateSchema>;
 
+/** Where the record came from. `declared` is a peer that used the capability 65 producer routes.
+ * `derived` is the gateway's own minimal record for an attachment a peer delivered without ever
+ * declaring one, so a Hermes bot's files are discoverable with no change to the peer. The field is
+ * optional on the wire and a record that omits it reads as `declared`, which is what every record
+ * written before this field existed is. */
+export const ARTIFACT_ORIGINS = ["declared", "derived"] as const;
+export const ArtifactOriginSchema = Type.Union(ARTIFACT_ORIGINS.map((value) => Type.Literal(value)));
+export type ArtifactOrigin = Static<typeof ArtifactOriginSchema>;
+
 export const ARTIFACT_FAILURE_REASONS = ["checksum", "size", "capacity", "missing_bytes"] as const;
 export const ArtifactFailureReasonSchema = Type.Union(ARTIFACT_FAILURE_REASONS.map((value) => Type.Literal(value)));
 export type ArtifactFailureReason = Static<typeof ArtifactFailureReasonSchema>;
@@ -51,8 +60,18 @@ export const ArtifactSchema = Type.Object({
   artifactId: Id, bot: Id, sessionId: Id, room: Type.Optional(Id),
   taskId: Type.Optional(Id), runId: Type.Optional(Id), createdBy: Id,
   filename: Type.String({ minLength: 1, maxLength: 255 }), mediaType: Type.String({ minLength: 1, maxLength: 255 }),
-  sizeBytes: Type.Integer({ minimum: 0 }), sha256: Type.String({ minLength: 64, maxLength: 64 }),
-  state: ArtifactStateSchema, mark: ArtifactMarkSchema, validation: ArtifactValidationSchema,
+  sizeBytes: Type.Integer({ minimum: 0 }),
+  /** The declared digest, proved against the stored bytes by a commit. Absent on a `derived`
+   * record: nothing was declared there, so no checksum may be claimed. */
+  sha256: Type.Optional(Type.String({ minLength: 64, maxLength: 64 })),
+  state: ArtifactStateSchema,
+  /** The producer's own mark. Absent on a `derived` record for the same reason. */
+  mark: Type.Optional(ArtifactMarkSchema),
+  validation: ArtifactValidationSchema,
+  origin: Type.Optional(ArtifactOriginSchema),
+  /** The chat message the attachment was delivered in, on a `derived` record. Discovery still
+   * never needs it; it is the provenance a derived record has instead of a Task. */
+  sourceMessageId: Type.Optional(Id),
   version: Type.Integer({ minimum: 1 }),
   supersedesArtifactId: Type.Optional(Id), supersededByArtifactId: Type.Optional(Id),
   createdAt: At, committedAt: Type.Optional(At), deletedAt: Type.Optional(At),

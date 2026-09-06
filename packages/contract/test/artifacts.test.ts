@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   ARTIFACT_DELIVERY_STATES,
   ARTIFACT_MARKS,
+  ARTIFACT_ORIGINS,
   ARTIFACT_STATES,
   ARTIFACT_VALIDATIONS,
   ArtifactSchema,
@@ -32,6 +33,25 @@ describe("capability 65 Artifact schemas", () => {
     expect(check(ArtifactSchema, { ...record, sha256: "short" })).toBe(false);
     const { sizeBytes: _sizeBytes, ...withoutSize } = record;
     expect(check(ArtifactSchema, withoutSize)).toBe(false);
+  });
+
+  it("carries a closed origin and a derived record's honestly absent fields", () => {
+    expect([...ARTIFACT_ORIGINS]).toEqual(["declared", "derived"]);
+    const declared = {
+      artifactId: "artifact-1", bot: "sage", sessionId: "session-1", createdBy: "sage",
+      filename: "report.pdf", mediaType: "application/pdf", sizeBytes: 9,
+      sha256: "a".repeat(64), state: "committed", mark: "final", validation: "verified",
+      version: 1, createdAt: 10,
+    };
+    // Additive: a record written before `origin` existed still decodes, and reads as declared.
+    expect(check(ArtifactSchema, declared)).toBe(true);
+    expect(check(ArtifactSchema, { ...declared, origin: "declared" })).toBe(true);
+    expect(check(ArtifactSchema, { ...declared, origin: "inferred" })).toBe(false);
+
+    // A derived record names no checksum, no mark and no Task, because none was ever declared.
+    const { sha256: _sha256, mark: _mark, ...derived } = declared;
+    expect(check(ArtifactSchema, { ...derived, origin: "derived", validation: "unvalidated", sourceMessageId: "message-1" })).toBe(true);
+    expect(check(ArtifactSchema, { ...derived, origin: "derived", sourceMessageId: "" })).toBe(false);
   });
 
   it("keeps delivery a separate identity with its own state", () => {

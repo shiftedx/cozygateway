@@ -94,6 +94,35 @@ For token-based Dashboard auth instead, replace the password fields with
 `"tokenEnv": "COZYGATEWAY_HERMES_TOKEN"` and add that variable to the secret file. See
 [`packages/gateway/README.md`](../packages/gateway/README.md) for the control-auth variants.
 
+## Artifact retention and the store ceiling
+
+From capability 65 the gateway keeps a durable Artifact record for every file a bot delivers,
+including files from bots that know nothing about Artifacts: the record points at the bytes the
+gateway already stored, and those bytes are retained until the Artifact is explicitly deleted.
+
+This changes retention for attachments that previously expired. Before 65 a producer could stage an
+attachment with an expiry and the gateway reclaimed it; now a delivered attachment is retained, so a
+bot that sends a screenshot every turn accumulates bytes in the SQLite store instead of
+self-pruning. Deleting the message or the conversation does not reclaim them. Deleting the Artifact
+does, and so does deleting the owning bot.
+
+The store is bounded. `artifactStoreBytes` in the config file is the ceiling, in bytes, on retained
+Artifact originals, and it defaults to 2 GiB when omitted:
+
+```json
+{
+  "name": "cozygateway",
+  "dbPath": "/data/cozygateway.db",
+  "artifactStoreBytes": 5368709120
+}
+```
+
+Over the ceiling nothing is deleted and nothing is silently dropped: the record is written with
+`state: "commit_failed"` and `failureReason: "capacity"`, binds no bytes, and shows up in the bot's
+artifact list, while the attachment keeps exactly the retention it already had. Raising the ceiling
+lets the next delivery of that attachment retain it for real. Size the value against the disk behind
+`dbPath`, and remember each stored object counts once no matter how many records name it.
+
 ## Start and pair
 
 ```sh

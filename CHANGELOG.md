@@ -24,6 +24,20 @@ release; everything older is marked pre-release so installers resolve one "lates
   the flat `cozyapps` literal, so a peer that stays at cozyapps 1, which is every Hermes plugin
   today, keeps v1 behavior byte for byte and still gets derived `queued` and `running` receipts and
   user-written saved values. Bot deletion purges the new records with the app.
+- Artifacts for peers that never declare one (`com.cozylabs.bots` capability 65, additive): an
+  attachment a peer delivers without declaring an Artifact now gets exactly one gateway-derived
+  record over the same stored bytes, so a Hermes bot's files are discoverable, downloadable,
+  deletable and retained with no change to the peer. A record carries a closed `origin`
+  (`declared` or `derived`, optional on the wire and read as `declared` when absent); a derived one
+  names its `sourceMessageId` and omits `sha256`, `mark`, `taskId` and `runId`, because nothing was
+  declared. A capable peer declaring the same media upgrades the existing record in place instead
+  of duplicating it, and the operator's retained-bytes ceiling now counts each stored object once.
+  Operators: retention changes for attachments that used to expire. A delivered attachment's bytes
+  are now kept until the Artifact is explicitly deleted, where before a producer's staging deadline
+  reclaimed them, so a chatty bot's files accumulate instead of self-pruning. The store is bounded
+  by `artifactStoreBytes` in the gateway config, which now defaults to 2 GiB instead of no ceiling;
+  over the ceiling the record is written `commit_failed` with `failureReason: "capacity"` and binds
+  no bytes, so the refusal is visible and the attachment keeps the retention it already had.
 
 - Typed scoped approvals (`com.cozylabs.bots` capability 66): an approval may carry one validated
   block naming the action, its category, the target system and resource, the exact material change,
