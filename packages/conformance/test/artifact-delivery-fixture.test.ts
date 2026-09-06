@@ -64,6 +64,23 @@ describe("Artifact v1 portable client fixture", () => {
     expect(check(ArtifactDeclareRequestSchema, { ...declaration, mark: "shared" })).toBe(false);
   });
 
+  it("decodes the joined and the unresolved shapes of Task provenance", () => {
+    // A joined record: the producer stated the Run, and the gateway's own join named the Task.
+    expect(fixture.artifact).toMatchObject({ runId: "run-1", taskId: "task-1" });
+    // A Run this gateway could not map: the Run stays exactly as stated and no Task is claimed,
+    // which a client must render as unknown provenance rather than as no Run.
+    const { taskId: _taskId, ...unresolved } = fixture.artifact;
+    expect(check(ArtifactSchema, unresolved)).toBe(true);
+    // And a record that named no Run at all keeps both absent.
+    const { runId: _runId, ...runless } = unresolved;
+    expect(check(ArtifactSchema, runless)).toBe(true);
+    // A producer declares its Run, never a Task id it has no way to know.
+    expect(check(ArtifactDeclareRequestSchema, {
+      artifactId: "artifact-3", sessionId: "session-1", runId: "run-1", filename: "notes.txt",
+      mediaType: "text/plain", sizeBytes: 5, sha256: fixture.unstated.sha256, mark: "final",
+    })).toBe(true);
+  });
+
   it("keeps a tombstone truthful without offering deleted bytes or a host path", () => {
     expect(fixture.tombstone).toMatchObject({ state: "deleted", supersededByArtifactId: "artifact-1", version: 1 });
     expect(fixture.tombstone.location).toBeUndefined();
