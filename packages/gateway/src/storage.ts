@@ -2356,10 +2356,14 @@ export class Storage {
   }
 
   timeoutBotGroupTurn(key: string, turnId: string, detail: string, completedAt: number): void {
-    this.#db.prepare(
-      `UPDATE bot_group_turns SET state = 'timeout', detail = ?, completed_at = ?
-       WHERE group_key = ? AND turn_id = ? AND state = 'pending'`,
-    ).run(detail, completedAt, key, turnId);
+    this.tasks.atomic(() => {
+      const changed = this.#db.prepare(
+        `UPDATE bot_group_turns SET state = 'timeout', detail = ?, completed_at = ?
+         WHERE group_key = ? AND turn_id = ? AND state = 'pending'`,
+      ).run(detail, completedAt, key, turnId).changes === 1;
+      const turn = changed ? this.botGroupTurn(key, turnId) : undefined;
+      if (turn !== undefined) this.tasks.nativeTerminal(turn.member, turn.threadId, turnId, "timed_out", completedAt);
+    });
   }
 
   botGroupTurn(key: string, turnId: string): BotGroupTurnRow | undefined {

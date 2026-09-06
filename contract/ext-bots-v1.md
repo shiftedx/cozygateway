@@ -1095,3 +1095,10 @@ A first terminal remains immutable for both the Task and row 23. A later acknowl
 still be delivered idempotently under existing source ownership and explicit-cancel guards;
 reply delivery cannot replace a previously sealed outcome or complete the Task. Journal recovery
 reapplies the authoritative first terminal and clears only its exact stale turn pointer.
+
+Artifact commitment remains owned by initiative 4. The optional source-bound reference reader
+receives Task, Bot, authenticated peer, session and Run identity. It must return only canonical
+explicit declarations and commitment status for that source. At final proof, declared reference
+identities are retained; a missing later reference is unproven and keeps the Task verifying.
+There is no default commitment reader, and attachments, file IDs and delivery are not substituted
+for commitment evidence. Seam tests exercise this join only, not production Artifact validation.

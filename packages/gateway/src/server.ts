@@ -824,6 +824,7 @@ export async function startGateway(
     receipt: (receipt) => nativeBotPlane?.recordMobileReceipt(receipt) !== undefined,
     trace: traceLog,
   });
+  storage.tasks.expireDevices((peer, run, id, at) => mobileNode?.expireRequest(peer, run, id, at));
   nativeBotPlane = new NativeBotDataPlane({
     control: bridge,
     storage,

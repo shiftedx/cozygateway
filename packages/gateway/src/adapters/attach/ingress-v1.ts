@@ -221,6 +221,8 @@ export class AttachV1Ingress implements TurnEndpoint {
     helloTimer.unref();
 
     socket.on("message", (data) => {
+      // A replaced socket may still deliver already-buffered frames before close completes.
+      if (connection.hello && this.#current.get(agentId) !== connection) return;
       const receivedAt = this.#now();
       connection.lastSeenAt = receivedAt;
       connection.heartbeatDegraded = false;
@@ -772,6 +774,7 @@ export class AttachV1Ingress implements TurnEndpoint {
   }
 
   #refreshDegraded(agentId: string, connection: Connection): void {
+    if (this.#current.get(agentId) !== connection) return;
     const degraded = connection.heartbeatDegraded || this.#pluginBacklogStalled(connection, this.#now());
     if (connection.degraded === degraded) return;
     connection.degraded = degraded;

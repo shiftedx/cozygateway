@@ -3152,7 +3152,7 @@ export class NativeBotDataPlane {
     const prior = this.#interactionTimers.get(key);
     if (prior !== undefined) clearTimeout(prior);
     const timer = setTimeout(
-      () => this.#expireInteraction(pending.bot, pending.kind, pending.interactionId, this.#now()),
+      () => this.#expireInteraction(pending.bot, pending.kind, pending.interactionId, Math.max(expiresAt, this.#now())),
       Math.max(0, expiresAt - this.#now()),
     );
     timer.unref();

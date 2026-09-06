@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
+import { MobileNodeBroker } from "../src/mobile-node.ts";
 import { NativeBotDataPlane } from "../src/hermes-bridge/native-data-plane.ts";
 import type { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
@@ -109,6 +110,33 @@ describe("durable Tasks on actual attach storage admission", () => {
     storage.close();
   });
 
+  it("settles the real mobile broker's due wait before a Task read, once", () => {
+    const storage = openStorage(":memory:");
+    let now = 0; storage.tasks.clock(() => now);
+    const sessionId = storage.nativeBotChat("sage", 1).sessionId;
+    const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "work" }, 2);
+    storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+    const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+    const result = vi.fn();
+    const broker = new MobileNodeBroker({
+      route: () => ({ status: "available", selectedSocketPresent: true, selectedSocketOpen: true, commandAdvertised: true, connectedSocketCount: 1, foreground: true }),
+      send: () => true, result, receipt: () => true, now: () => now, taskWait: (wait) => storage.tasks.device(wait, now),
+    });
+    storage.tasks.expireDevices((peer, run, id, at) => broker.expireRequest(peer, run, id, at));
+    try {
+      now = 10;
+      broker.invoke({ requestId: "device", agentId: "sage", bot: "sage", threadId: sessionId, turnId: "run", deviceId: "phone", command: "device.status", purpose: "Check readiness", expiresAt: 100 });
+      expect(storage.tasks.read(taskId)?.view).toMatchObject({ state: "waiting_for_device", waitingOn: { id: "device" } });
+      now = 120;
+      expect(storage.tasks.read(taskId)?.view.state).toBe("running");
+      expect(result).toHaveBeenCalledTimes(1);
+      expect(result).toHaveBeenCalledWith("sage", expect.objectContaining({ requestId: "device", status: "expired" }));
+      storage.tasks.read(taskId);
+      expect(result).toHaveBeenCalledTimes(1);
+      expect(storage.tasks.suspended("sage", "run", 0, now)).toBe(90);
+    } finally { broker.close(); storage.close(); }
+  });
+
   it("assigns a missing legacy wait expiry once and never renews it on duplicate admission", () => {
     const storage = openStorage(":memory:");
     storage.tasks.clock(() => 0);
@@ -166,6 +194,32 @@ describe("durable Tasks on actual attach storage admission", () => {
     storage.close();
   });
 
+  it("starts the provisional owner lease at gateway boot without duplicating an absence episode", () => {
+    vi.useFakeTimers(); vi.setSystemTime(0);
+    const root = join(process.cwd(), "../../benchmark-runs/2b-durable-task");
+    mkdirSync(root, { recursive: true });
+    const directory = mkdtempSync(join(root, "lease-restart-"));
+    const path = join(directory, "gateway.sqlite");
+    let storage = openStorage(path);
+    try {
+      const sessionId = storage.nativeBotChat("sage", 1).sessionId;
+      const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "work" }, 2);
+      storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+      storage.tasks.presence("sage", false, 10);
+      const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+      storage.close(); vi.setSystemTime(200000);
+      storage = openStorage(path);
+      expect(storage.tasks.read(taskId)?.view.state).toBe("running");
+      vi.setSystemTime(320000);
+      expect(storage.tasks.read(taskId)?.view.state).toBe("blocked");
+      storage.close(); vi.setSystemTime(500000);
+      storage = openStorage(path);
+      expect(storage.tasks.read(taskId)?.events.filter((event) => event.reason === "owner_unreachable")).toHaveLength(1);
+      storage.tasks.hello("sage", 500000);
+      expect(storage.tasks.read(taskId)?.view.state).toBe("running");
+    } finally { storage.close(); rmSync(directory, { recursive: true }); vi.useRealTimers(); }
+  });
+
   it("persists pause intent on a spooled unacked turn, then interrupts on ack and lands paused only on its terminal", () => {
     const storage = openStorage(":memory:");
     storage.tasks.clock(() => 0);
@@ -207,6 +261,50 @@ describe("durable Tasks on actual attach storage admission", () => {
     expect(storage.tasks.read(taskId)?.view).toMatchObject({ state: "cancelled", currentRun: { runId: nextRun } });
     storage.tasks.dispatch((_peer, _id, command) => { sent.push(command.kind); return true; });
     expect(sent).toEqual(["interrupt"]);
+    storage.close();
+  });
+
+  it("projects a room member turn timeout and fences its retry until the actual attach seal", () => {
+    const storage = openStorage(":memory:");
+    storage.tasks.clock(() => 0);
+    storage.createBotGroup({ key: "room", name: "Room", members: ["sage"], createdAt: 1 });
+    const threadId = storage.ensureBotGroupThread("room", "sage");
+    storage.beginBotGroupTurn({ key: "room", turnId: "run", member: "sage", agentId: "sage", threadId, messageId: "user", epoch: 0, watermark: 0, createdAt: 2 });
+    const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId, turnId: "run", messageId: "user", text: "work" }, 2);
+    storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+    const taskId = storage.tasks.list({ room: "room" })[0]!.taskId;
+    storage.timeoutBotGroupTurn("room", "run", "deadline", 100);
+    expect(storage.tasks.read(taskId)?.view).toMatchObject({ state: "blocked", room: "room", lastEvent: { reason: "run_timed_out" } });
+    const retry = storage.tasks.command(taskId, "retry", { idempotencyKey: "retry" }, 101);
+    const sent: string[] = [];
+    storage.tasks.dispatch((peer, id, frame) => { sent.push(frame.kind); return storage.enqueueTaskCommand(peer, id, frame, 102); });
+    expect(sent).toEqual(["interrupt"]);
+    storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "stop", event: { kind: "interrupted", threadId, turnId: "run", messageId: "stop" } }, 103);
+    storage.tasks.dispatch((peer, id, frame) => { sent.push(frame.kind); return storage.enqueueTaskCommand(peer, id, frame, 104); });
+    expect(sent).toEqual(["interrupt", "turn"]);
+    expect(storage.botGroupTurn("room", retry.view!.currentRun.runId)).toMatchObject({ state: "pending", member: "sage", threadId });
+    expect(storage.tasks.list({ room: "room" })).toHaveLength(1);
+    storage.close();
+  });
+
+  it("joins explicitly declared Artifact references through the future commitment reader seam", () => {
+    const storage = openStorage(":memory:");
+    storage.tasks.clock(() => 0);
+    const sessionId = storage.nativeBotChat("sage", 1).sessionId;
+    const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "work" }, 2);
+    storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+    const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+    const reader = vi.fn(() => [{ artifactId: "declared", status: "pending" as const }]);
+    storage.tasks.artifactReferences(reader);
+    storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: sessionId, turnId: "run", messageId: "reply", blocks: [] } }, 4);
+    expect(storage.tasks.read(taskId)?.view).toMatchObject({ state: "verifying", artifacts: [{ artifactId: "declared" }] });
+    expect(reader).toHaveBeenCalledWith({ taskId, bot: "sage", peer: "sage", sessionId, runId: "run" });
+    storage.tasks.artifactReferences(() => []);
+    expect(storage.tasks.read(taskId)?.view.state).toBe("verifying");
+    storage.tasks.artifactReferences(() => [{ artifactId: "declared", status: "committed" }]);
+    expect(storage.tasks.read(taskId)?.view).toMatchObject({ state: "completed", notification: { taskId } });
+    storage.tasks.artifactReferences(() => [{ artifactId: "declared", status: "failed" }]);
+    expect(storage.tasks.read(taskId)?.view.state).toBe("completed");
     storage.close();
   });
 

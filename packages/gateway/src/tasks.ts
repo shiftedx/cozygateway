@@ -6,6 +6,10 @@ import type { AttachV1Command, AttachV1EventFrame } from "./adapters/attach/prot
 const TERMINAL = new Set<TaskState>(["completed", "failed", "cancelled"]);
 const LIVE_CHILD = new Set(["queued", "starting", "running", "stalling"]);
 const WAIT = new Set<TaskState>(["waiting_for_approval", "waiting_for_user_input", "waiting_for_device"]);
+export interface TaskArtifactReference { artifactId: string; status: "pending" | "committed" | "failed" }
+/** Initiative 4 binds this to its canonical declaration/commitment reader. No attachment or
+ * delivery record is evidence. Missing previously declared references remain unproven. */
+export type TaskArtifactReader = (source: { taskId: string; bot: string; peer: string; sessionId: string; runId: string }) => readonly TaskArtifactReference[];
 interface TaskRow { taskId: string; bot: string; sessionId: string; room: string | null; originatingTurnId: string; originatingMessageId: string; goal: string }
 interface RunRow { taskId: string; peer: string; runId: string; sessionId: string; intentRevision: number; predecessorRunId: string | null }
 const TASK_SELECT = "SELECT task_id AS taskId, bot, session_id AS sessionId, room, originating_turn_id AS originatingTurnId, originating_message_id AS originatingMessageId, goal FROM tasks";
@@ -21,6 +25,8 @@ export class Tasks {
   #reconciling = false;
   #observer: ((frame: ServerFrame) => void) | undefined;
   #expireInteraction: ((bot: string, kind: "approval" | "clarify", id: string, at: number) => void) | undefined;
+  #expireDevice: ((peer: string, runId: string, id: string, at: number) => void) | undefined;
+  #artifacts: TaskArtifactReader | undefined;
   #runtime: ((bot: string) => string | undefined) | undefined;
   constructor(db: DatabaseSync) {
     this.#db = db;
@@ -33,6 +39,7 @@ export class Tasks {
       CREATE TABLE IF NOT EXISTS task_tool_facts (peer TEXT NOT NULL, run_id TEXT NOT NULL, call_id TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY(peer,run_id,call_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_waits (task_id TEXT NOT NULL, run_id TEXT NOT NULL, kind TEXT NOT NULL, record_id TEXT NOT NULL, requested_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, settled_at INTEGER, PRIMARY KEY(task_id,run_id,kind,record_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_absences (task_id TEXT NOT NULL, run_id TEXT NOT NULL, peer TEXT NOT NULL, episode TEXT NOT NULL, absent_at INTEGER NOT NULL, reattached_at INTEGER, PRIMARY KEY(task_id,run_id,episode)) STRICT;
+      CREATE TABLE IF NOT EXISTS task_required_artifacts (task_id TEXT NOT NULL, run_id TEXT NOT NULL, artifact_id TEXT NOT NULL, PRIMARY KEY(task_id,run_id,artifact_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_required_batches (task_id TEXT NOT NULL, run_id TEXT NOT NULL, batch_id TEXT NOT NULL, PRIMARY KEY(task_id,run_id,batch_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_commands (task_id TEXT NOT NULL, command_key TEXT NOT NULL, payload_json TEXT NOT NULL, result_json TEXT NOT NULL, PRIMARY KEY(task_id,command_key)) STRICT;
       CREATE TABLE IF NOT EXISTS task_dispatches (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, peer TEXT NOT NULL, command_json TEXT NOT NULL, predecessor_run_id TEXT, dispatched INTEGER NOT NULL DEFAULT 0) STRICT;
@@ -51,9 +58,19 @@ export class Tasks {
       AND json_extract(frame_json, '$.event.turnId') = bot_native_interactions.turn_id
       AND COALESCE(json_extract(frame_json, '$.event.approvalId'), json_extract(frame_json, '$.event.clarifyId')) = bot_native_interactions.interaction_id
     ), updated_at) + 600000 WHERE expires_at IS NULL AND status = 'pending'`);
+    // Presence absence time is unknowable across process loss. Preserve the episode identity,
+    // but start its provisional lease at this boot unless its loss was already projected.
+    for (const row of db.prepare("SELECT task_id AS taskId FROM tasks").all() as unknown as { taskId: string }[]) {
+      const view = this.#read(row.taskId)?.view;
+      if (view !== undefined && ["running", "verifying", ...WAIT].includes(view.state)) db.prepare("UPDATE task_absences SET absent_at = ? WHERE task_id = ? AND run_id = ? AND reattached_at IS NULL").run(this.#bootAt, row.taskId, view.currentRun.runId);
+    }
   }
 
   expireInteractions(expire: (bot: string, kind: "approval" | "clarify", id: string, at: number) => void): void { this.#expireInteraction = expire; }
+
+  expireDevices(expire: (peer: string, runId: string, id: string, at: number) => void): void { this.#expireDevice = expire; }
+
+  artifactReferences(reader: TaskArtifactReader): void { this.#artifacts = reader; }
 
   runtime(reader: (bot: string) => string | undefined): void { this.#runtime = reader; }
 
@@ -106,6 +123,12 @@ export class Tasks {
       this.atomic(() => {
         const due = this.#db.prepare("SELECT bot, kind, interaction_id AS id FROM bot_native_interactions WHERE status = 'pending' AND expires_at <= ?").all(at) as unknown as { bot: string; kind: "approval" | "clarify"; id: string }[];
         for (const interaction of due) this.#expireInteraction?.(interaction.bot, interaction.kind, interaction.id, at);
+        const devices = this.#db.prepare("SELECT task_id AS taskId, run_id AS runId, record_id AS id, expires_at AS expiresAt FROM task_waits WHERE kind = 'device' AND settled_at IS NULL AND expires_at <= ?").all(at) as unknown as { taskId: string; runId: string; id: string; expiresAt: number }[];
+        for (const device of devices) {
+          const run = this.#taskRun(device.taskId, device.runId);
+          this.#expireDevice?.(run.peer, run.runId, device.id, at);
+          this.wait(device.taskId, run.runId, "device", device.id, device.expiresAt, "expired", at);
+        }
         for (const view of this.list()) {
           if (TERMINAL.has(view.state)) continue;
           const run = this.#taskRun(view.taskId, view.currentRun.runId);
@@ -118,7 +141,7 @@ export class Tasks {
           const stage = this.#runtime?.(view.bot);
           if (view.state === "queued" && (stage === "stopped" || stage === "needs_attention")) this.append(view.taskId, `runtime:${run.runId}:${stage}`, stage === "stopped" ? "waiting_for_user_input" : "blocked", stage === "stopped" ? "runtime_stopped" : "runtime_needs_attention", "gateway", at, { kind: "run", id: run.runId });
           if (stage === "ready" && (transition?.reason === "runtime_stopped" || transition?.reason === "runtime_needs_attention")) this.append(view.taskId, `runtime:${run.runId}:ready:${transition.seq}`, "queued", "runtime_ready", "gateway", at, { kind: "run", id: run.runId });
-          this.#settleChildren(run, at);
+          this.#settleRequirements(run, at);
           const live = this.#live.has(run.peer);
           if (live) {
             const absence = this.#db.prepare("SELECT episode FROM task_absences WHERE task_id = ? AND run_id = ? AND reattached_at IS NULL ORDER BY absent_at DESC LIMIT 1").get(view.taskId, run.runId) as { episode: string } | undefined;
@@ -295,14 +318,17 @@ export class Tasks {
       return;
     }
     if (event.kind === "delegation") {
-      this.#settleChildren(run, at);
+      this.#settleRequirements(run, at);
       return;
     }
     if (event.kind === "commit" && event.continues !== true) {
       const children = this.#children(run);
       const batches = new Set(children.filter((child) => LIVE_CHILD.has(child.status) || children.filter((sibling) => sibling.batchId === child.batchId).length < child.count).map((child) => child.batchId));
       for (const batch of batches) this.#db.prepare("INSERT OR IGNORE INTO task_required_batches VALUES (?, ?, ?)").run(run.taskId, run.runId, batch);
+      const artifacts = this.#artifactReferences(run);
+      for (const artifact of artifacts) this.#db.prepare("INSERT OR IGNORE INTO task_required_artifacts VALUES (?, ?, ?)").run(run.taskId, run.runId, artifact.artifactId);
       if (batches.size > 0) { this.append(run.taskId, source, "verifying", "awaiting_children", "gateway", at, { kind: "run", id: run.runId }); return; }
+      if (artifacts.some((artifact) => artifact.status !== "committed")) { this.append(run.taskId, source, "verifying", "awaiting_artifacts", "gateway", at, { kind: "run", id: run.runId }); this.#settleRequirements(run, at); return; }
       this.append(run.taskId, source, "completed", "run_completed", "harness", at, { kind: "run", id: run.runId });
     } else if (event.kind === "failed" || event.kind === "interrupted" || event.kind === "cancelled") {
       if ((event.kind === "interrupted" || event.kind === "cancelled") && view.pendingIntent !== undefined && view.pendingIntent.command !== "retry") {
@@ -333,16 +359,30 @@ export class Tasks {
     return [...children.values()];
   }
 
-  #settleChildren(run: RunRow, at: number): void {
+  #settleRequirements(run: RunRow, at: number): void {
     const required = this.#db.prepare("SELECT batch_id AS batchId FROM task_required_batches WHERE task_id = ? AND run_id = ?").all(run.taskId, run.runId) as unknown as { batchId: string }[];
-    if (required.length === 0) return;
+    const artifacts = this.#artifactReferences(run);
+    if (required.length === 0 && artifacts.length === 0) return;
+    const proof = this.events(run.taskId).some((event) => event.ref?.id === run.runId && ["awaiting_children", "awaiting_artifacts"].includes(event.reason));
+    if (!proof) return;
     const view = this.#read(run.taskId)?.view;
     if (view?.state !== "verifying" || view.currentRun.runId !== run.runId) return;
     const children = this.#children(run).filter((child) => required.some((batch) => batch.batchId === child.batchId));
     const failed = children.find((child) => ["failed", "interrupted", "stalled", "unknown"].includes(child.status));
     if (failed !== undefined) {
       this.append(run.taskId, `children:${run.runId}:failed`, "blocked", failed.status === "unknown" ? "child_unknown" : "child_failed", "gateway", at, { kind: "child", id: `${failed.batchId}/${failed.childId}` });
-    } else if (children.length > 0 && children.every((child) => !LIVE_CHILD.has(child.status) && children.filter((sibling) => sibling.batchId === child.batchId).length >= child.count)) this.append(run.taskId, `children:${run.runId}:settled`, "completed", "terminal_proof_recorded", "gateway", at, { kind: "run", id: run.runId });
+    } else if (artifacts.some((artifact) => artifact.status === "failed")) {
+      this.append(run.taskId, `artifacts:${run.runId}:failed`, "blocked", "artifact_commit_failed", "gateway", at, { kind: "artifact", id: artifacts.find((artifact) => artifact.status === "failed")!.artifactId });
+    } else if ((required.length === 0 || (children.length > 0 && children.every((child) => !LIVE_CHILD.has(child.status) && children.filter((sibling) => sibling.batchId === child.batchId).length >= child.count))) && artifacts.every((artifact) => artifact.status === "committed")) this.append(run.taskId, `children:${run.runId}:settled`, "completed", "terminal_proof_recorded", "gateway", at, { kind: "run", id: run.runId });
+  }
+
+  #artifactReferences(run: RunRow): TaskArtifactReference[] {
+    const task = this.#db.prepare(`${TASK_SELECT} WHERE task_id = ?`).get(run.taskId) as TaskRow;
+    const facts = this.#artifacts?.({ taskId: run.taskId, bot: task.bot, peer: run.peer, sessionId: run.sessionId, runId: run.runId }) ?? [];
+    const required = this.#db.prepare("SELECT artifact_id AS artifactId FROM task_required_artifacts WHERE task_id = ? AND run_id = ?").all(run.taskId, run.runId) as unknown as { artifactId: string }[];
+    const references = new Map(facts.map((fact) => [fact.artifactId, fact]));
+    for (const { artifactId } of required) if (!references.has(artifactId)) references.set(artifactId, { artifactId, status: "pending" });
+    return [...references.values()];
   }
 
   device(input: { agentId: string; threadId: string; turnId: string; requestId: string; expiresAt: number; status: string }, at = this.#clock()): void {
@@ -448,7 +488,7 @@ export class Tasks {
       currentRun: { runId, intentRevision: run.intentRevision, ...(run.predecessorRunId === null ? {} : { predecessorRunId: run.predecessorRunId }) },
       ...(waitingOn === undefined ? {} : { waitingOn }),
       ...(pendingIntent === undefined ? {} : { pendingIntent }),
-      automaticRetryCount: events.filter((event) => event.reason === "auto_retry").length, automaticRetryBudget: 1, children: this.#children(run).map(({ count: _count, ...child }) => child), artifacts: [], ...(notification === undefined ? {} : { notification }),
+      automaticRetryCount: events.filter((event) => event.reason === "auto_retry").length, automaticRetryBudget: 1, children: this.#children(run).map(({ count: _count, ...child }) => child), artifacts: this.#artifactReferences(run).map(({ artifactId }) => ({ artifactId })), ...(notification === undefined ? {} : { notification }),
     };
     const page = events.filter((event) => event.seq > cursor).slice(0, Math.max(1, Math.min(500, limit)));
     const tail = page.at(-1)?.seq;

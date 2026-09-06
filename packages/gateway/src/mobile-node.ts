@@ -379,6 +379,11 @@ export class MobileNodeBroker {
     }
   }
 
+  expireRequest(agentId: string, turnId: string, requestId: string, at: number): void {
+    const pending = this.#pending.get(requestId);
+    if (pending?.agentId === agentId && pending.frame.turnId === turnId && pending.expiresAt <= at) this.#finish(requestId, "expired", true);
+  }
+
   disconnectAgent(agentId: string): void {
     for (const [requestId, pending] of this.#pending) {
       if (pending.agentId === agentId) this.#finish(requestId, "cancelled", true);

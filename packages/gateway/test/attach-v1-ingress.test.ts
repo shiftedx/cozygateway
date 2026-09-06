@@ -144,6 +144,26 @@ describe("attach-v1 ingress", () => {
     return { ws, frames };
   }
 
+  it("ignores delayed frames and close from a superseded authenticated socket", async () => {
+    const originalClose = WebSocket.prototype.close;
+    const delayedClose = vi.spyOn(WebSocket.prototype, "close").mockImplementation(function (this: WebSocket, code, reason) {
+      if (code !== 4000) originalClose.call(this, code, reason);
+    });
+    const old = await dial();
+    const current = await dial();
+    try {
+      const before = accepted.length;
+      old.ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "stale", event: { kind: "commit", threadId: "session", turnId: "old", messageId: "reply", blocks: [] } }));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(accepted).toHaveLength(before);
+      current.ws.close();
+      await until(() => presence.at(-1) === "absent");
+      old.ws.send(JSON.stringify({ kind: "heartbeat", sentAt: clock }));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(presence.at(-1)).toBe("absent");
+    } finally { delayedClose.mockRestore(); old.ws.close(); current.ws.close(); }
+  });
+
   async function rejectedUpgrade(token = "secret"): Promise<number> {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, { headers: { authorization: `Bearer ${token}` } });
     return await new Promise<number>((resolve, reject) => {
