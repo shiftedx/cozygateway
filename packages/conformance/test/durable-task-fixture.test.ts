@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { assertValid, check, TASK_REASONS, TASK_STATES, TaskEventSchema, TaskViewSchema, TaskReadSchema, TaskUpdatedFrameSchema } from "cozygateway-contract";
+import { BOTS_CAPABILITY_VERSION, assertValid, check, TASK_REASONS, TASK_STATES, TaskEventSchema, TaskViewSchema, TaskReadSchema, TaskUpdatedFrameSchema } from "cozygateway-contract";
 
 const fixture = JSON.parse(readFileSync(new URL("./fixtures/durable-task-v1.json", import.meta.url), "utf8")) as { capability: number; event: Record<string, unknown>; view: Record<string, unknown> };
 
@@ -9,6 +9,7 @@ const fixture = JSON.parse(readFileSync(new URL("./fixtures/durable-task-v1.json
 describe("durable Task v1 portable client fixture", () => {
   it("pins row 64 and keeps read and full replacement frame shapes consistent", () => {
     expect(fixture.capability).toBe(64);
+    expect(BOTS_CAPABILITY_VERSION).toBeGreaterThanOrEqual(64);
     assertValid(TaskEventSchema, fixture.event);
     assertValid(TaskViewSchema, fixture.view);
     assertValid(TaskReadSchema, { view: fixture.view, events: [fixture.event] });

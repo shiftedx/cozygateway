@@ -17,6 +17,7 @@ import {
   type Message,
   type ServerFrame,
   type Thread,
+  TaskListSchema, TaskReadSchema, TaskUpdatedFrameSchema,
   APPROVALS_CAPABILITY_ID,
   APPROVALS_CAPABILITY_VERSION,
   AgentSchema,
@@ -53,6 +54,8 @@ import {
 
 /** Everything the suite needs to reach one gateway under test. A host supplies these. */
 export interface ConformanceEnv {
+  /** Enable row 64 Task reads/updates for the reference attach echo peer. */
+  durableTasks?: boolean;
   /** Base HTTP URL of the gateway under test, no trailing slash. */
   baseUrl: () => string;
   /** Mint a fresh single-use setup code on the gateway under test. */
@@ -254,6 +257,33 @@ export function registerConformanceSuite(env: ConformanceEnv): void {
   }
 
   // =====================================================================================
+
+  describe.skipIf(env.durableTasks !== true)("durable Tasks capability 64", () => {
+    it("advertises and decodes the same completed Task over authenticated HTTP and its replacement frame", async () => {
+      const { token } = await pairDevice("Task conformance");
+      const socket = await authedSocket(token);
+      try {
+        const health = assertValid(GatewayInfoSchema, await (await fetch(`${env.baseUrl()}/health`)).json());
+        expect(health.capabilities?.["com.cozylabs.bots"]).toBeGreaterThanOrEqual(64);
+        const thread = await createThread(token, "Task conformance");
+        await sendMessage(token, thread.id, "Prove durable Task conformance");
+        await waitForMessageCount(token, thread.id, 2);
+        await waitFor(socket, () => socket.frames.some((frame) => frame.type === "bot_task_updated" && frame.view.sessionId === thread.id && frame.view.state === "completed"), "completed Task replacement");
+        const replacement = socket.frames.findLast((frame) => frame.type === "bot_task_updated" && frame.view.sessionId === thread.id);
+        const decoded = assertValid(TaskUpdatedFrameSchema, replacement);
+        const response = await authFetch(token, `/tasks/${decoded.view.taskId}`);
+        expect(response.status).toBe(200);
+        const read = assertValid(TaskReadSchema, await response.json());
+        expect(read.view).toEqual(decoded.view);
+        expect(read.events.map((event) => event.seq)).toEqual(read.events.map((_event, index) => index + 1));
+        expect(read.view.notification?.taskId).toBe(read.view.taskId);
+        const list = assertValid(TaskListSchema, await (await authFetch(token, `/bots/${encodeURIComponent(env.echoAgentId)}/tasks`)).json());
+        expect(list.tasks.some((task) => task.taskId === read.view.taskId)).toBe(true);
+        expect((await fetch(`${env.baseUrl()}/tasks/${read.view.taskId}`)).status).toBe(401);
+        expect((await authFetch(token, `/tasks/${read.view.taskId}/retry`, { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ idempotencyKey: "completed-retry" }) })).status).toBe(409);
+      } finally { socket.ws.close(); }
+    });
+  });
 
   describe("cozygateway wire contract v1 conformance", () => {
     // Spec section 1 / 5: GET /health is unauthenticated and returns GatewayInfo.

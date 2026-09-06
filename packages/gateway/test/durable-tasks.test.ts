@@ -329,6 +329,76 @@ describe("durable Tasks on actual attach storage admission", () => {
     storage.close();
   });
 
+  it("excludes only catalog-declared slash commands at actual turn admission", () => {
+    const storage = openStorage(":memory:"); storage.tasks.clock(() => 0);
+    const threadId = storage.nativeBotChat("sage", 1).sessionId;
+    storage.tasks.declareSlashCommands("sage", ["help"]);
+    for (const [turnId, text] of [["slash", "/help details"], ["work", "/helpful work"], ["unknown", "/unknown work"]]) storage.enqueueAttachCommand("sage", turnId!, { kind: "turn", threadId, turnId: turnId!, messageId: turnId!, text: text! }, 2);
+    expect(storage.tasks.list({ bot: "sage" }).map((view) => view.originatingTurnId).sort()).toEqual(["unknown", "work"]);
+    storage.close();
+  });
+
+  it("retries exactly one discarded unacknowledged command and never retries an acknowledged turn automatically", () => {
+    const storage = openStorage(":memory:"); storage.tasks.clock(() => 0);
+    const threadId = storage.nativeBotChat("sage", 1).sessionId;
+    const first = storage.enqueueAttachCommand("sage", "first", { kind: "turn", threadId, turnId: "run", messageId: "user", text: "work" }, 2);
+    const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+    storage.cancelAttachCommand("sage", first.sequence, first.commandId, "unacknowledged deadline", 3);
+    expect(storage.tasks.read(taskId)?.view).toMatchObject({ state: "queued", automaticRetryCount: 1 });
+    storage.tasks.dispatch((peer, id, frame) => storage.enqueueTaskCommand(peer, id, frame, 4));
+    const next = storage.pendingAttachCommands("sage", first.sequence, 10).find((frame) => frame.command.kind === "turn")!;
+    storage.cancelAttachCommand("sage", next.sequence, next.commandId, "unacknowledged deadline", 5);
+    expect(storage.tasks.read(taskId)?.view).toMatchObject({ state: "blocked", automaticRetryCount: 1 });
+    const acked = storage.enqueueAttachCommand("sage", "acked", { kind: "turn", threadId, turnId: "acked-run", messageId: "other", text: "other work" }, 6);
+    storage.ackAttachCommand("sage", acked.sequence, acked.commandId, 7);
+    storage.cancelAttachCommand("sage", acked.sequence, acked.commandId, "deadline", 8);
+    expect(storage.tasks.list({ bot: "sage" }).find((view) => view.currentRun.runId === "acked-run")).toMatchObject({ state: "running", automaticRetryCount: 0 });
+    storage.close();
+  });
+
+  it("uses source-bound unknown tool roles as possible effects and preserves the current Run", () => {
+    const storage = openStorage(":memory:"); storage.tasks.clock(() => 0);
+    const threadId = storage.nativeBotChat("sage", 1).sessionId;
+    const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId, turnId: "run", messageId: "user", text: "work" }, 2);
+    storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+    const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+    const tool = (sequence: number, role: "investigation" | "verification" | undefined, status: "running" | "error" = "running", callId = String(sequence)) => ({ kind: "event" as const, sequence, eventId: String(sequence), event: { kind: "tool" as const, threadId, turnId: "run", callId, name: "tool", status, ...(role === undefined ? {} : { role }) } });
+    storage.acceptAttachEvent("sage", tool(1, "investigation"), 4);
+    storage.acceptAttachEvent("sage", tool(2, "verification"), 5);
+    expect(storage.tasks.read(taskId)?.view.state).toBe("running");
+    storage.acceptAttachEvent("sage", tool(3, undefined), 6);
+    storage.acceptAttachEvent("sage", tool(4, "verification"), 7);
+    expect(storage.tasks.read(taskId)?.view.state).toBe("verifying");
+    storage.acceptAttachEvent("sage", tool(5, "verification", "error", "4"), 8);
+    expect(storage.tasks.read(taskId)?.view.state).toBe("running");
+    storage.tasks.ownerDeleted("foreign", 9);
+    expect(storage.tasks.read(taskId)?.view.state).toBe("running");
+    storage.tasks.ownerDeleted("sage", 10);
+    expect(storage.tasks.read(taskId)?.view).toMatchObject({ state: "cancelled", lastEvent: { reason: "owner_deleted" } });
+    storage.close();
+  });
+
+  it("rebuilds accepted pause intent and payload-bound command replay after physical restart", () => {
+    const root = join(process.cwd(), "../../benchmark-runs/2b-durable-task"); mkdirSync(root, { recursive: true });
+    const directory = mkdtempSync(join(root, "intent-restart-")); const path = join(directory, "gateway.sqlite");
+    let storage = openStorage(path); storage.tasks.clock(() => 0);
+    try {
+      const threadId = storage.nativeBotChat("sage", 1).sessionId;
+      const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId, turnId: "run", messageId: "user", text: "work" }, 2);
+      const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+      storage.tasks.command(taskId, "scope", { idempotencyKey: "scope", goal: "revised" }, 3);
+      const accepted = storage.tasks.command(taskId, "pause", { idempotencyKey: "pause" }, 4);
+      storage.close(); storage = openStorage(path); storage.tasks.clock(() => 0);
+      expect(storage.tasks.read(taskId)?.view).toMatchObject({ state: "queued", goal: "revised", intentRevision: 2, pendingIntent: { command: "pause" } });
+      expect(storage.tasks.command(taskId, "pause", { idempotencyKey: "pause" }, 5)).toEqual(accepted);
+      expect(storage.tasks.command(taskId, "cancel", { idempotencyKey: "pause" }, 5).outcome).toBe("conflict");
+      storage.ackAttachCommand("sage", command.sequence, command.commandId, 6);
+      const effects: string[] = []; storage.tasks.dispatch((_peer, _id, frame) => { effects.push(frame.kind); return true; });
+      expect(effects).toContain("interrupt");
+      expect(storage.tasks.read(taskId)?.events.filter((event) => event.reason === "pause_requested")).toHaveLength(1);
+    } finally { storage.close(); rmSync(directory, { recursive: true }); }
+  });
+
   it("joins explicitly declared Artifact references through the future commitment reader seam", () => {
     const storage = openStorage(":memory:");
     storage.tasks.clock(() => 0);

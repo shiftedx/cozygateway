@@ -1021,7 +1021,7 @@ export async function startGateway(
 
   storage.tasks.runtime((bot) => runtimeBotService?.owns(bot) === true ? runtimeBotService.projection(bot).stage : undefined);
   storage.tasks.reconcile();
-  if (BOTS_CAPABILITY_VERSION >= 64) storage.tasks.observe((frame) => hub.broadcast(frame));
+  storage.tasks.observe((frame) => hub.broadcast(frame), BOTS_CAPABILITY_VERSION);
   const app = createApp({
     storage,
     flushTaskCommands: () => attachV1Ingress.flushTaskCommands(),

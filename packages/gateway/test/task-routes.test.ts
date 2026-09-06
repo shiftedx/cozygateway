@@ -61,6 +61,42 @@ describe("authenticated Task public routes", () => {
       if (response.status === 409) expect(await response.json()).toMatchObject({ state, view: { taskId, state } });
     }
   });
+  it.each(["queued", "running", "verifying", "approval", "clarification", "device", "blocked", "paused"] as const)("enforces the nonterminal command class %s", async (state) => {
+    for (const action of ["cancel", "pause", "resume", "retry", "scope"] as const) {
+      const { storage, request, taskId } = await setup();
+      const view = storage.tasks.read(taskId)!.view;
+      const threadId = view.sessionId; const turnId = view.currentRun.runId;
+      const command = storage.pendingAttachCommands("sage", 0, 10)[0]!;
+      if (state !== "queued") storage.ackAttachCommand("sage", command.sequence, command.commandId, 100);
+      if (state === "verifying") {
+        storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "mutation", event: { kind: "tool", threadId, turnId, callId: "mutation", name: "write", status: "running", role: "mutation" } }, 100);
+        storage.acceptAttachEvent("sage", { kind: "event", sequence: 2, eventId: "verification", event: { kind: "tool", threadId, turnId, callId: "verification", name: "check", status: "running", role: "verification" } }, 100);
+      }
+      if (state === "approval" || state === "clarification") storage.recordNativeInteraction({ bot: "sage", kind: state === "approval" ? "approval" : "clarify", interactionId: "wait", sessionId: threadId, turnId, status: "pending", expiresAt: 1000, payload: {}, updatedAt: 100 });
+      if (state === "device") storage.tasks.device({ agentId: "sage", threadId, turnId, requestId: "wait", expiresAt: 1000, status: "pending" }, 100);
+      if (state === "blocked") storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "failure", event: { kind: "failed", threadId, turnId, messageId: "failure" } }, 100);
+      if (state === "paused") {
+        storage.tasks.command(taskId, "pause", { idempotencyKey: "initial-pause" }, 100);
+        storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "pause", event: { kind: "interrupted", threadId, turnId, messageId: "pause" } }, 100);
+      }
+      const allowed = action === "cancel" || action === "scope" || (action === "pause" && ["queued", "running", "verifying", "approval", "device"].includes(state)) || (action === "resume" && state === "paused") || (action === "retry" && state === "blocked");
+      const response = await request(`/tasks/${taskId}/${action}`, { idempotencyKey: action, ...(action === "scope" ? { goal: "changed" } : {}) });
+      expect(response.status, `${state}/${action}`).toBe(allowed ? 200 : 409);
+      if (!allowed) expect(await response.json()).toMatchObject({ error: { code: "conflict" }, view: { taskId } });
+    }
+  });
+  it("omits Task update observation below the server capability floor", async () => {
+    const { storage, request, taskId } = await setup();
+    const frames: unknown[] = [];
+    storage.tasks.observe((frame) => frames.push(frame), 63);
+    await request(`/tasks/${taskId}/scope`, { idempotencyKey: "old", goal: "first" });
+    await Promise.resolve();
+    expect(frames).toEqual([]);
+    storage.tasks.observe((frame) => frames.push(frame), 64);
+    await request(`/tasks/${taskId}/scope`, { idempotencyKey: "new", goal: "second" });
+    await Promise.resolve();
+    expect(frames).toHaveLength(1);
+  });
   it("binds command idempotency to action and payload and refuses invalid command states", async () => {
     const { request, taskId } = await setup();
     const original = await (await request(`/tasks/${taskId}/scope`, { idempotencyKey: "key", goal: "changed" })).json();

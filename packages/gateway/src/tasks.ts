@@ -85,7 +85,7 @@ export class Tasks {
     this.atomic(() => { for (const view of this.list({ bot })) if (!TERMINAL.has(view.state)) this.append(view.taskId, `owner-deleted:${bot}`, "cancelled", "owner_deleted", "gateway", at, { kind: "run", id: view.currentRun.runId }); });
   }
 
-  observe(observer: (frame: ServerFrame) => void): void { this.#observer = observer; }
+  observe(observer: (frame: ServerFrame) => void, capabilityVersion = 64): void { this.#observer = capabilityVersion >= 64 ? observer : undefined; }
 
   clock(now: () => number): void { this.#clock = now; this.#bootAt = now(); }
 
@@ -427,7 +427,7 @@ export class Tasks {
 
   wait(taskId: string, runId: string, kind: TaskWaitingOn["kind"], id: string, expiresAt: number, status: string, at: number): void {
     const view = this.#read(taskId)?.view;
-    if (view === undefined || view.currentRun.runId !== runId || TERMINAL.has(view.state)) return;
+    if (view === undefined || view.currentRun.runId !== runId || (TERMINAL.has(view.state) && status === "pending")) return;
     const refKind = kind === "device" ? "deviceRequest" : kind;
     const requested: TaskReason = kind === "approval" ? "approval_requested" : kind === "clarification" ? "clarification_requested" : "device_requested";
     if (status === "pending") {
@@ -436,7 +436,7 @@ export class Tasks {
       return;
     }
     const changed = this.#db.prepare("UPDATE task_waits SET settled_at = MIN(?, expires_at) WHERE task_id = ? AND run_id = ? AND kind = ? AND record_id = ? AND settled_at IS NULL").run(at, taskId, runId, kind, id).changes === 1;
-    if (!changed || this.#executionEnded(this.#taskRun(taskId, runId).peer, runId)) return;
+    if (!changed || TERMINAL.has(view.state) || this.#executionEnded(this.#taskRun(taskId, runId).peer, runId)) return;
     const entry = [...this.events(taskId)].reverse().find((event) => event.reason === requested && event.ref?.id === id);
     if (entry === undefined || !WAIT.has(view.state)) return;
     const expired = status === "expired";
@@ -519,8 +519,8 @@ export class Tasks {
       at: [...events].reverse().find((event) => event.from !== event.to)?.at ?? lastEvent.at, lastEvent,
       canProceedAlone: ["queued", "running", "verifying"].includes(lastEvent.to),
       currentRun: { runId, intentRevision: run.intentRevision, ...(run.predecessorRunId === null ? {} : { predecessorRunId: run.predecessorRunId }) },
-      ...(waitingOn === undefined ? {} : { waitingOn }),
-      ...(pendingIntent === undefined ? {} : { pendingIntent }),
+      ...(waitingOn === undefined || TERMINAL.has(lastEvent.to) ? {} : { waitingOn }),
+      ...(pendingIntent === undefined || TERMINAL.has(lastEvent.to) ? {} : { pendingIntent }),
       automaticRetryCount: events.filter((event) => event.reason === "auto_retry").length, automaticRetryBudget: 1, children: this.#children(run).map(({ count: _count, ...child }) => child), artifacts: this.#artifactReferences(run).map(({ artifactId }) => ({ artifactId })), ...(notification === undefined ? {} : { notification }),
     };
     const page = events.filter((event) => event.seq > cursor).slice(0, Math.max(1, Math.min(500, limit)));
