@@ -29,6 +29,8 @@ import {
   COZYAPPS_CAPABILITY_ID,
   COZYAPPS_CAPABILITY_VERSION,
   assertValidCozyAppTree,
+  assertValidCozyAppDocument,
+  assertValidCozyAppData,
   type GatewayInfo,
   type ServerFrame,
 } from "cozygateway-contract";
@@ -647,6 +649,7 @@ export async function startGateway(
         if (!("threadId" in frame.event))
           return (
             frame.event.kind === "presence" || frame.event.kind === "media" || frame.event.kind === "cozyapp_upsert" || frame.event.kind === "cozyapp_action_status"
+            || frame.event.kind === "cozyapp_dashboard_upsert" || frame.event.kind === "cozyapp_action_receipt"
           );
         const thread = storage.threadById(frame.event.threadId);
         return thread !== undefined && thread.agentId === agentId;
@@ -665,6 +668,54 @@ export async function startGateway(
             return true;
           }
         }
+        // Capability row 67. The creator publishes the envelope for its own app; the physical id
+        // keeps the creator namespacing, so a plugin can write nothing but its own record.
+        if (frame.event.kind === "cozyapp_dashboard_upsert") {
+          try {
+            assertValidCozyAppDocument(frame.event.document);
+            if (frame.event.data !== undefined) assertValidCozyAppData(frame.event.data);
+            const appId = cozyAppPhysicalId(agentId, frame.event.appId);
+            const result = storage.writeCozyAppDashboard({
+              appId, creatorBot: agentId, documentVersion: frame.event.documentVersion, document: frame.event.document,
+              expectedRevision: storage.cozyAppDashboard(appId)?.revision ?? 0, now: Date.now(),
+              ...(frame.event.data === undefined ? {} : { data: frame.event.data }),
+            });
+            if (result.outcome === "written") hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() });
+          } catch {
+            // An out-of-bounds or unknown document is refused at validation and stored nowhere.
+            // One bad event must not dead-letter and block that bot's whole stream.
+          }
+          return true;
+        }
+        // The peer echoes the appId the `cozyapp_action` command carried, exactly as it does on
+        // `cozyapp_action_status`, so this id is already the stored one and is not namespaced again.
+        //
+        // THIS BRANCH ALWAYS APPLIES. A no-op is not a failure here, and unlike the v1 status event
+        // a no-op is the ORDINARY case: the gateway already stamped `delivered` when this peer
+        // acked the command, so the peer's own `running` can never change anything. Returning
+        // false would retry the event and then dead-letter it, head-of-line blocking every later
+        // event from this bot. A duplicate terminal, a terminal on an already settled action, and
+        // a receipt naming an action this bot does not own are no-ops on the same rule: nothing is
+        // written, and the stream keeps moving.
+        if (frame.event.kind === "cozyapp_action_receipt") {
+          const appId = frame.event.appId;
+          try {
+            if (frame.event.data !== undefined) assertValidCozyAppData(frame.event.data);
+          } catch {
+            return true;
+          }
+          const changed = frame.event.status === "running"
+            ? storage.markCozyAppActionDelivered(frame.event.actionRequestId, agentId, Date.now())
+            : storage.settleCozyAppAction({
+                id: frame.event.actionRequestId, appId, creatorBot: agentId, actionId: frame.event.actionId,
+                status: frame.event.status, now: Date.now(),
+                ...(frame.event.data === undefined ? {} : { data: frame.event.data }),
+              });
+          if (changed && frame.event.status !== "running")
+            nativeBotPlane?.clearCozyAppActionOrigin(agentId, frame.event.appId, frame.event.actionRequestId);
+          if (changed) hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() });
+          return true;
+        }
         if (frame.event.kind === "cozyapp_action_status") {
           if (storage.settleCozyAppAction({ id: frame.event.actionRequestId, appId: frame.event.appId, creatorBot: agentId, actionId: frame.event.actionId, status: frame.event.status, now: Date.now() })) {
             nativeBotPlane?.clearCozyAppActionOrigin(agentId, frame.event.appId, frame.event.actionRequestId);
@@ -680,6 +731,13 @@ export async function startGateway(
           return true;
         if (nativeSink?.handle(agentId, frame) === true) return true;
         return acknowledgeOrphanedAttachEvent(storage, agentId, frame);
+      },
+      // Capability row 67. The peer taking the command off the wire is the public receipt's
+      // `running`, derived for every peer including one that stays at cozyapps 1.
+      onCommandDelivered: (agentId, commandId) => {
+        if (commandId.startsWith("cozyapp-action:")
+          && storage.markCozyAppActionDelivered(commandId.slice("cozyapp-action:".length), agentId, Date.now()))
+          hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() });
       },
       onMobileRequest: (agentId, frame) => nativeBotPlane?.mobileRequest(agentId, frame),
       onMobileCancel: (agentId, frame) => mobileNode?.cancelRequest(agentId, frame.requestId),
@@ -1058,7 +1116,10 @@ export async function startGateway(
       storage.runtimeBot(agentId) !== undefined || storage.chatExecutionById(agentId)?.stage === "ready" || allowedAttachMedia(config, agentId),
     sendCozyAppAction: (action, deviceId) => {
       if (!nativeBotPlane?.registerCozyAppActionOrigin(action.creatorBot, action.appId, action.id, deviceId, Math.max(30_000, config.turnTimeoutSeconds * 1000))) return false;
-      const queued = attachV1Ingress.sendCozyAppAction(action.creatorBot, { appId: action.appId, actionId: action.actionId, actionRequestId: action.id });
+      const queued = attachV1Ingress.sendCozyAppAction(action.creatorBot, {
+        appId: action.appId, actionId: action.actionId, actionRequestId: action.id,
+        values: storage.cozyAppValues(action.appId).map((value) => ({ valueId: value.valueId, type: value.type, value: value.value, revision: value.revision })),
+      });
       if (!queued) nativeBotPlane.clearCozyAppActionOrigin(action.creatorBot, action.appId, action.id);
       return queued;
     },

@@ -4,6 +4,8 @@ import {
   BotMemoryItemsResponseSchema, BotMemoryOverviewResponseSchema, BotMemoryWriteResponseSchema,
   BotMemoryDeleteResponseSchema, BotMemorySetupRequestSchema, MobileNodeGatewayStatusResultSchema, MobileNodePurposeSchema, MobileNodeMediaDescriptorSchema,
   type MobileNodeGatewayStatusResult,
+  CozyAppDataSchema,
+  CozyAppDocumentSchema,
   CozyAppTreeSchema,
   BotProfileSchema, BotProfilePatchSchema, BotProfileConfigureResponseSchema,
   BotModelConfigSchema, BotModelConfigPatchSchema,
@@ -46,6 +48,10 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("desktop_session_resume"),
   Type.Literal("desktop_session_sync"),
   Type.Literal("cozyapps"),
+  /** Capability row 67, com.cozylabs.cozyapps 2. A separate literal beside `cozyapps` because the
+   * flat one carries no version, exactly as `memory_ownership` sits beside `memory_management`. A
+   * peer that offers only `cozyapps` keeps every v1 behavior and sees no new frame or member. */
+  Type.Literal("cozyapps_dashboard"),
   Type.Literal("bot_config"),
   /** Session-scoped execution configuration travels on the same bounded request/reply frame
    * family as bot_config, but is negotiated independently so a runtime never claims profile
@@ -313,7 +319,18 @@ const DeliveryReceiptCommand = Type.Object({
   reason: Type.Optional(Type.String({ maxLength: 256 })),
 });
 /** App actions are a separate durable lane, never synthetic chat text. */
-const CozyAppActionCommand = Type.Object({ kind: Type.Literal("cozyapp_action"), appId: Id, actionId: Id, actionRequestId: Id });
+/** `values` is the saved input the person had chosen when they tapped, so the peer can act on it.
+ * It is READ-ONLY for the peer: a value is written by the user route and by nothing else. It is
+ * present only for a peer that negotiated `cozyapps_dashboard`, so a v1 peer's command is byte
+ * identical to its pre-2 self. */
+const CozyAppActionCommand = Type.Object({
+  kind: Type.Literal("cozyapp_action"), appId: Id, actionId: Id, actionRequestId: Id,
+  values: Type.Optional(Type.Array(Type.Object({
+    valueId: Id, type: Type.Union(["string", "number", "boolean", "date", "selection"].map((name) => Type.Literal(name))),
+    value: Type.Union([Type.String({ maxLength: 512 }), Type.Number(), Type.Boolean()]),
+    revision: Type.Integer({ minimum: 1 }),
+  }, { additionalProperties: false }), { maxItems: 64 })),
+});
 
 /** Capability-free transport tombstone. It advances the durable command sequence without
  * invoking a Hermes action when a command queued while disconnected is no longer supported by
@@ -566,6 +583,22 @@ const MediaEvent = Type.Object({ kind: Type.Literal("media"), media: AttachV1Med
 const CozyAppUpsertEvent = Type.Object({ kind: Type.Literal("cozyapp_upsert"), appId: Id, name: Type.String({ minLength: 1, maxLength: 120 }), tree: CozyAppTreeSchema }, { additionalProperties: false });
 /** Terminal proof from the plugin that a distinct app action command ran. */
 const CozyAppActionStatusEvent = Type.Object({ kind: Type.Literal("cozyapp_action_status"), appId: Id, actionId: Id, actionRequestId: Id, status: Type.Union([Type.Literal("completed"), Type.Literal("failed")]) }, { additionalProperties: false });
+/** Capability row 67. The creator publishes the small versioned envelope for its own app. The
+ * gateway validates the document's structure and bounds and never interprets it. `data` is the
+ * source-attributed snapshot, and this is the only path that writes one. */
+const CozyAppDashboardUpsertEvent = Type.Object({
+  kind: Type.Literal("cozyapp_dashboard_upsert"), appId: Id,
+  documentVersion: Type.Integer({ minimum: 1 }), document: CozyAppDocumentSchema,
+  data: Type.Optional(CozyAppDataSchema),
+}, { additionalProperties: false });
+/** The richer receipt beside `cozyapp_action_status`: the same terminal proof, plus the peer's own
+ * `running` and the source-attributed snapshot it read. HTTP acceptance and model output are
+ * never a completed action, which is why only this event and its v1 sibling can settle one. */
+const CozyAppActionReceiptEvent = Type.Object({
+  kind: Type.Literal("cozyapp_action_receipt"), appId: Id, actionId: Id, actionRequestId: Id,
+  status: Type.Union([Type.Literal("running"), Type.Literal("completed"), Type.Literal("failed")]),
+  data: Type.Optional(CozyAppDataSchema),
+}, { additionalProperties: false });
 const PresenceEvent = Type.Object({
   kind: Type.Literal("presence"), state: Type.Union([Type.Literal("online"), Type.Literal("degraded"), Type.Literal("absent")]),
 });
@@ -699,7 +732,7 @@ export type AttachV1MobileResultInput =
 export const AttachV1EventSchema = Type.Union([
   DraftEvent, CommitEvent, FailedEvent, CancelledEvent, InterruptedEvent, ToolEvent, DelegationEvent,
   ThinkingEvent,
-  ApprovalEvent, ClarifyEvent, ScheduledEvent, ScheduledCanonicalHomeEvent, MediaEvent, CozyAppUpsertEvent, CozyAppActionStatusEvent, PresenceEvent,
+  ApprovalEvent, ClarifyEvent, ScheduledEvent, ScheduledCanonicalHomeEvent, MediaEvent, CozyAppUpsertEvent, CozyAppActionStatusEvent, CozyAppDashboardUpsertEvent, CozyAppActionReceiptEvent, PresenceEvent,
   DesktopSessionResumedEvent, DesktopSessionMessageEvent,
 ]);
 export type AttachV1Event = Static<typeof AttachV1EventSchema>;

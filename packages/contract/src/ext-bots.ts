@@ -2811,4 +2811,4 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * task, target, payload hash and expiration; a grant is consulted, never replayed, and the
  * always-require categories can never be covered by one. Additive: an approval without a block,
  * and a decision sent with no body, are byte identical to their pre-66 selves. */
-export const BOTS_CAPABILITY_VERSION = 66;
+export const BOTS_CAPABILITY_VERSION = 67;

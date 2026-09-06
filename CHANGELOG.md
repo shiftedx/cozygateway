@@ -7,6 +7,24 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## Unreleased
 
+- CozyApps dashboard records (`com.cozylabs.cozyapps` capability 2, cross-referenced as
+  `com.cozylabs.bots` row 67): three durable record kinds beside the v1 library. A saved editable
+  input value is typed to product field types only, carries its own revision, and is written by the
+  user route and by no bot: a stale write answers `409 conflict` with the current value, and
+  replaying an idempotency key returns the prior result without a second write. An action receipt
+  presents the four public names `queued`, `running`, `completed` and `failed`, derived from the
+  unchanged internal states rather than a parallel table, and can be bound to the app revision and
+  the value revisions the tap was made against. Its source-attributed data snapshot, naming source,
+  as-of, value and freshness, is written by the bot over attach and by nothing else: HTTP
+  acceptance and model output are never a completed action. A small versioned envelope carries a
+  bounded typed document of sections of closed component kinds with semantic references and labels,
+  and no colour, font, coordinate, HTML, script, URL scheme, permission or executable tool is
+  representable in it; the gateway validates structure and bounds and never interprets the
+  document. The bot-side half is gated on a new attach-v1 `cozyapps_dashboard` capability beside
+  the flat `cozyapps` literal, so a peer that stays at cozyapps 1, which is every Hermes plugin
+  today, keeps v1 behavior byte for byte and still gets derived `queued` and `running` receipts and
+  user-written saved values. Bot deletion purges the new records with the app.
+
 - Typed scoped approvals (`com.cozylabs.bots` capability 66): an approval may carry one validated
   block naming the action, its category, the target system and resource, the exact material change,
   the side effects, why a decision is required, the sha256 hash of the exact payload, the

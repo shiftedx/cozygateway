@@ -62,7 +62,7 @@ export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
  *  capability; it does NOT prove the list is complete, so adding one to the schema and forgetting
  *  it here type-checks cleanly and silently refuses the surface at negotiation. A test compares
  *  this list against the schema for exactly that reason. */
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "memory_ownership", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "bot_config", "chat_configuration", "provider_connections", "bot_history", "session_deletion"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "memory_ownership", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "cozyapps_dashboard", "bot_config", "chat_configuration", "provider_connections", "bot_history", "session_deletion"] as const satisfies readonly AttachV1Capability[];
 
 /** Why a memory request did or did not reach the attached plugin. */
 export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
@@ -81,6 +81,10 @@ export interface AttachV1Events {
   onHello?(agentId: string): void;
   onTaskTurnQueued?(agentId: string, command: Extract<AttachV1Command, { kind: "turn" }>): void;
   onPresence(agentId: string, state: "online" | "degraded" | "absent"): void;
+  /** The peer took a command off the wire. Transport-only proof: it says the command reached the
+   * process that will run it, never that the work happened. Capability row 67 uses it to move a
+   * CozyApp action receipt to the public `running`, for a v1 peer too. */
+  onCommandDelivered?(agentId: string, commandId: string): void;
   onMobileRequest?(agentId: string, frame: AttachV1MobileRequest): void;
   onMobileCancel?(agentId: string, frame: AttachV1MobileCancel): void;
   onMemoryResult?(agentId: string, frame: AttachV1MemoryResult): void;
@@ -368,6 +372,7 @@ export class AttachV1Ingress implements TurnEndpoint {
           connection.sentCommandBytes -= sent.bytes;
           connection.commandCursor = this.#storage.attachCommandCursor(agentId);
           this.flushTaskCommands();
+          this.#events.onCommandDelivered?.(agentId, sent.commandId);
           this.#traceAttach("attach_command_ack", agentId, { commandCursor: connection.commandCursor });
           this.#flush(agentId, connection.commandCursor);
         }
@@ -589,8 +594,18 @@ export class AttachV1Ingress implements TurnEndpoint {
   sendNativeInterrupt(agentId: string, input: { threadId: string; turnId: string }): boolean {
     return this.#enqueue(agentId, { kind: "interrupt", ...input });
   }
-  sendCozyAppAction(agentId: string, input: { appId: string; actionId: string; actionRequestId: string }): boolean {
-    return this.#enqueue(agentId, { kind: "cozyapp_action", ...input }, `cozyapp-action:${input.actionRequestId}`);
+  /** The saved values ride along only for a peer that negotiated `cozyapps_dashboard`. A peer at
+   *  cozyapps 1 gets the pre-2 command with no new member on it, which is what Kyle's live Hermes
+   *  bots receive: they do not change, and the action still runs. */
+  sendCozyAppAction(agentId: string, input: { appId: string; actionId: string; actionRequestId: string; values?: ReadonlyArray<{ valueId: string; type: "string" | "number" | "boolean" | "date" | "selection"; value: string | number | boolean; revision: number }> | undefined }): boolean {
+    const { values, ...action } = input;
+    const dashboard = this.#current.get(agentId)?.capabilities.has("cozyapps_dashboard") === true
+      && this.#allowed(agentId).includes("cozyapps_dashboard");
+    return this.#enqueue(
+      agentId,
+      { kind: "cozyapp_action", ...action, ...(dashboard && values !== undefined && values.length > 0 ? { values: [...values] } : {}) },
+      `cozyapp-action:${input.actionRequestId}`,
+    );
   }
 
   /** Enqueue an explicit desktop adoption. The idempotency key is the gateway-owned resume id;
@@ -994,6 +1009,8 @@ function eventCapabilities(frame: AttachV1EventFrame): AttachV1Capability[] {
     case "desktop_session_resumed": return ["desktop_session_resume"];
     case "cozyapp_upsert": return ["cozyapps"];
     case "cozyapp_action_status": return ["cozyapps"];
+    case "cozyapp_dashboard_upsert": return ["cozyapps", "cozyapps_dashboard"];
+    case "cozyapp_action_receipt": return ["cozyapps", "cozyapps_dashboard"];
     case "commit": return ["draft", ...(frame.event.mediaIds?.length ? ["media" as const] : [])];
     default: return ["draft"];
   }
@@ -1006,7 +1023,7 @@ function commandCapabilities(command: AttachV1Command): AttachV1Capability[] {
   if (command.kind === "resolve_clarify") return ["clarify"];
   if (command.kind === "desktop_session_resume") return ["desktop_session_resume"];
   if (command.kind === "session_deleted") return ["session_deletion"];
-  if (command.kind === "cozyapp_action") return ["cozyapps"];
+  if (command.kind === "cozyapp_action") return command.values === undefined ? ["cozyapps"] : ["cozyapps", "cozyapps_dashboard"];
   if (command.kind === "turn" && (command.mediaIds?.length ?? 0) > 0) return ["draft", "media"];
   return ["draft"];
 }
