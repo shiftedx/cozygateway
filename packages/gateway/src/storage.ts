@@ -1,3 +1,4 @@
+import { Artifacts } from "./artifacts.ts";
 import { Tasks } from "./tasks.ts";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
@@ -1066,11 +1067,27 @@ export class GatewayMaintenanceOperationConflict extends Error {
 export class Storage {
   readonly #db: DatabaseSync;
   readonly tasks: Tasks;
+  readonly artifacts: Artifacts;
 
   constructor(db: DatabaseSync) {
     this.#db = db;
     this.tasks = new Tasks(db);
     this.tasks.expireInteractions((bot, kind, id, at) => { this.expireNativeInteractionIfDue(bot, kind, id, at); });
+    // Capability 65 is the canonical producer capability 64 left absent by default. Only explicit
+    // source-bound declarations and their real commitment status cross this join; no attachment,
+    // file id or delivery is ever read as commitment evidence.
+    this.artifacts = new Artifacts(db);
+    this.tasks.artifactReferences((source) => this.artifacts.taskReferences(source));
+    this.artifacts.onCommitment((taskId, runId, at) => { this.tasks.artifactsSettled(taskId, runId, at); });
+  }
+
+  /** Explicit deletion is the one authority that removes a retained original. The bytes go through
+   * the existing unreferenced-media rule, so an object still reachable as a durable attachment
+   * stays reachable and only the Artifact stops offering it. */
+  deleteArtifact(artifactId: string, at: number): "deleted" | "absent" {
+    const forgotten = this.artifacts.forget(artifactId, at);
+    if (forgotten.media !== undefined) this.deleteUnreferencedAttachMedia(forgotten.media.agentId, forgotten.media.mediaId);
+    return forgotten.outcome;
   }
 
   createSetupCode(code: string, expiresAt: number, kind: SetupCodeKind = "device"): void {
@@ -3311,7 +3328,11 @@ export class Storage {
   pruneExpiredAttachMedia(now: number): number {
     return Number(
       this.#db
-        .prepare("DELETE FROM attach_media WHERE expires_at IS NOT NULL AND expires_at <= ?")
+        .prepare(
+          `DELETE FROM attach_media WHERE expires_at IS NOT NULL AND expires_at <= ?
+             AND NOT EXISTS (SELECT 1 FROM artifacts
+               WHERE artifacts.created_by = attach_media.agent_id AND artifacts.media_id = attach_media.media_id)`,
+        )
         .run(now)
         .changes,
     );
@@ -3335,9 +3356,12 @@ export class Storage {
            OR EXISTS (
              SELECT 1 FROM bot_native_messages AS message, json_each(message.attachments_json) AS attachment
              WHERE message.bot = ? AND json_extract(attachment.value, '$.fileId') = ?
+           )
+           OR EXISTS (
+             SELECT 1 FROM artifacts WHERE created_by = ? AND media_id = ?
            )`,
       )
-      .get(agentId, mediaId, agentId, mediaId) !== undefined;
+      .get(agentId, mediaId, agentId, mediaId, agentId, mediaId) !== undefined;
     if (referenced) return "referenced";
     this.#db
       .prepare("DELETE FROM attach_media WHERE agent_id = ? AND media_id = ?")
@@ -3790,6 +3814,9 @@ export class Storage {
          ) AND NOT EXISTS (
            SELECT 1 FROM attach_event_inbox AS inbox, json_each(inbox.frame_json, '$.event.mediaIds') AS media
            WHERE inbox.agent_id = ? AND media.value = attach_media.media_id
+         ) AND NOT EXISTS (
+           SELECT 1 FROM artifacts WHERE artifacts.created_by = attach_media.agent_id
+             AND artifacts.media_id = attach_media.media_id
          )`,
       ).run(outboxAgentId, input.bot, input.sessionId, input.bot, input.sessionId, outboxAgentId);
       const deleteUnreferencedMedia = this.#db.prepare(
@@ -3800,6 +3827,9 @@ export class Storage {
          ) AND NOT EXISTS (
            SELECT 1 FROM attach_event_inbox AS inbox, json_each(inbox.frame_json, '$.event.mediaIds') AS media
            WHERE inbox.agent_id = ? AND media.value = attach_media.media_id
+         ) AND NOT EXISTS (
+           SELECT 1 FROM artifacts WHERE artifacts.created_by = attach_media.agent_id
+             AND artifacts.media_id = attach_media.media_id
          )`,
       );
       for (const mediaId of scheduledMediaIds)
@@ -4562,6 +4592,16 @@ export class Storage {
     const purged: Record<string, number> = {};
     this.#db.exec("BEGIN IMMEDIATE");
     try {
+      // Capability 65. Deleting the owner is an explicit deletion, so its Artifact records and
+      // their deliveries go with the bytes rather than becoming records pointing at nothing.
+      // Deliveries first: they reference the record they belong to.
+      for (const [area, statement] of [
+        ["artifactDeliveries", "DELETE FROM artifact_deliveries WHERE artifact_id IN (SELECT artifact_id FROM artifacts WHERE bot = ?)"],
+        ["artifacts", "DELETE FROM artifacts WHERE bot = ?"],
+      ] as const) {
+        const changes = Number(this.#db.prepare(statement).run(bot).changes);
+        if (changes > 0) purged[area] = changes;
+      }
       for (const [area, table, column] of areas) {
         const changes = Number(
           this.#db.prepare(`DELETE FROM ${table} WHERE ${column} = ?`).run(bot).changes,

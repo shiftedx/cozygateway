@@ -79,6 +79,15 @@ export class Tasks {
 
   artifactReferences(reader: TaskArtifactReader): void { this.#artifacts = reader; }
 
+  /** Capability 65: the canonical Artifact producer says a declared reference moved. The Task is
+   * still derived from its own append-only stream; this only re-runs the settlement that already
+   * exists, so an Artifact never writes a Task state itself. */
+  artifactsSettled(taskId: string, runId: string, at = this.#clock()): void {
+    const run = this.#db.prepare(`${RUN_SELECT} WHERE task_id = ? AND run_id = ?`).get(taskId, runId) as RunRow | undefined;
+    if (run === undefined) return;
+    this.atomic(() => this.#settleRequirements(run, at));
+  }
+
   runtime(reader: (bot: string) => string | undefined): void { this.#runtime = reader; }
 
   ownerDeleted(bot: string, at: number): void {
