@@ -5,6 +5,9 @@ import {
   MobileNodePhoneStatusResultSchema,
   MobileNodeRequestFrameSchema,
   type MobileNodeCancelFrame,
+  type MobileNodeProgressFrame,
+  type MobileNodeProgressStage,
+  type MobileRequestState,
   type MobileNodeGatewayStatusResult,
   type MobileNodePhoneStatusResult,
   type MobileNodeRequestFrame,
@@ -41,8 +44,28 @@ export interface MobileNodeReceiptInput {
   sharedDescription: "Device status" | "Approximate location" | "Camera photo" | "Camera video" | "Selected photo" | "Selected file" | "Notification action";
 }
 
+/** Capability 68. One typed step of one request's lifecycle. It carries the binding (profile,
+ *  conversation, turn, the one target device, and through that device the person it is paired to)
+ *  and never the lease, the phone's answer, or anything the phone measured. */
+export interface MobileNodeLifecycleEvent {
+  requestId: string;
+  bot: string;
+  sessionId: string;
+  turnId: string;
+  /** Absent only when no device was selected, which is itself the outcome. */
+  deviceId?: string;
+  command: MobileNodeCommand;
+  purpose: string;
+  state: MobileRequestState;
+  at: number;
+  expiresAt: number;
+}
+
 interface Pending {
   deviceId: string;
+  /** The furthest stage the TARGET device reported for this request. Undefined means the phone has
+   *  said nothing since the frame went out, which is every phone below mobile-node 6. */
+  stage?: MobileNodeProgressStage;
   agentId: string;
   turnId: string;
   command: MobileNodeCommand;
@@ -159,6 +182,7 @@ export class MobileNodeBroker {
   readonly #send: (deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean | MobileNodeSendOutcome;
   readonly #result: (agentId: string, frame: MobileNodeResult) => void;
   readonly #receipt: (receipt: MobileNodeReceiptInput) => boolean;
+  readonly #lifecycle: ((event: MobileNodeLifecycleEvent) => void) | undefined;
   readonly #now: () => number;
   readonly #taskWait: ((wait: MobileTaskWait) => void) | undefined;
   readonly #trace: TraceLog | undefined;
@@ -172,6 +196,7 @@ export class MobileNodeBroker {
     send: (deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean | MobileNodeSendOutcome;
     result: (agentId: string, frame: MobileNodeResult) => void;
     receipt: (receipt: MobileNodeReceiptInput) => boolean;
+    lifecycle?: (event: MobileNodeLifecycleEvent) => void;
     trace?: TraceLog;
     now?: () => number;
     terminalTtlMs?: number;
@@ -183,6 +208,7 @@ export class MobileNodeBroker {
     this.#send = deps.send;
     this.#result = deps.result;
     this.#receipt = deps.receipt;
+    this.#lifecycle = deps.lifecycle;
     this.#now = deps.now ?? Date.now;
     this.#trace = deps.trace;
     this.#terminalTtlMs = deps.terminalTtlMs ?? TERMINAL_TTL_MS;
@@ -193,8 +219,10 @@ export class MobileNodeBroker {
     this.#pruneTerminal();
     // `requestId` is a one-shot idempotency key. Never replace a live timer/prompt.
     if (this.#pending.has(input.requestId) || this.#terminal.has(input.requestId)) return;
+    this.#life(input, input.deviceId, "requested");
     if (!input.deviceId) {
       this.#diagnose("no_selected_device", input.command, false, noRoute());
+      this.#life(input, undefined, "failed");
       this.#terminalize(input.agentId, input.requestId, "device_unavailable", input.expiresAt,
         failure("routing", "no_selected_device"));
       return;
@@ -203,6 +231,7 @@ export class MobileNodeBroker {
       || input.expiresAt > this.#now() + maxDeadlineMs(input.command)
       || !isPurpose(input.purpose)) {
       this.#diagnose("request_policy_rejected", input.command, true, noRoute());
+      this.#life(input, input.deviceId, "policy_blocked");
       this.#terminalize(input.agentId, input.requestId, "policy_blocked", input.expiresAt,
         failure("policy", "request_policy_rejected"));
       return;
@@ -211,15 +240,17 @@ export class MobileNodeBroker {
     const wakeEligible = input.command === "device.status" && route.status === "selected_socket_unavailable";
     if (route.status !== "available" && !wakeEligible) {
       this.#diagnose(route.status, input.command, true, route);
+      this.#life(input, input.deviceId, "foreground_required");
       this.#terminalize(input.agentId, input.requestId, "foreground_required", input.expiresAt,
         failure("routing", route.status));
       return;
     }
     // No eviction is safe: a retained unexpired id is the only duplicate-prompt defense.
     // Dropping a new admission while full is intentionally fail-closed and non-durable.
-    if (!this.#canAdmit()) return;
+    if (!this.#canAdmit()) { this.#life(input, input.deviceId, "failed"); return; }
     if (requiresForeground(input.command) && route.foreground !== true) {
       this.#diagnose("selected_app_not_foreground", input.command, true, route);
+      this.#life(input, input.deviceId, "foreground_required");
       this.#terminalize(input.agentId, input.requestId, "foreground_required", input.expiresAt,
         failure("routing", "selected_app_not_foreground"));
       return;
@@ -232,6 +263,7 @@ export class MobileNodeBroker {
     // where the schema's closed key set can still be enforced.
     if (!check(MobileNodeRequestFrameSchema, frame)) {
       this.#diagnose("malformed_request_frame", input.command, true, route);
+      this.#life(input, input.deviceId, "policy_blocked");
       this.#terminalize(input.agentId, input.requestId, "policy_blocked", input.expiresAt,
         failure("dispatch", "malformed_request_frame"));
       return;
@@ -262,6 +294,7 @@ export class MobileNodeBroker {
     }
     const normalizedSend = normalizeSendOutcome(sendOutcome);
     if (normalizedSend === "sent") {
+      this.#life(input, input.deviceId, "routed");
       emitTrace(this.#trace, "mobile_node_dispatch", {
         command: input.command,
         selectedSocketPresent: route.selectedSocketPresent,
@@ -336,6 +369,29 @@ export class MobileNodeBroker {
     this.#settle(pending, frame.status);
   }
 
+  /** Capability 68. The target phone reporting one NON-TERMINAL stage of a request it holds. It
+   *  can never settle a request and never carries a payload: it moves the typed lifecycle forward
+   *  so a resuming app can see where a request actually got to, and it tells this gateway the
+   *  phone already has the frame, which is what makes the reconnect below safe. */
+  progress(deviceId: string, frame: MobileNodeProgressFrame): void {
+    const pending = this.#pending.get(frame.requestId);
+    if (pending === undefined || pending.frame.lease !== frame.lease) {
+      this.#diagnose("lease_mismatch", "unknown", false, noRoute());
+      return;
+    }
+    if (pending.deviceId !== deviceId) {
+      this.#diagnose("cross_device_result", pending.command, true, this.#route(deviceId, pending.command));
+      return;
+    }
+    if (pending.expiresAt <= this.#now()) {
+      this.#finish(frame.requestId, "expired", true);
+      return;
+    }
+    if (stageRank(frame.stage) <= stageRank(pending.stage)) return;
+    pending.stage = frame.stage;
+    this.#life(pending.frame, pending.deviceId, frame.stage);
+  }
+
   cancelTurn(agentId: string, turnId: string): void {
     for (const pending of this.#pending.values()) {
       if (pending.agentId === agentId && pending.turnId === turnId)
@@ -362,6 +418,10 @@ export class MobileNodeBroker {
         this.#finish(pending.frame.requestId, "expired", true);
         continue;
       }
+      // The phone told us it holds this request (capability 68). Sending the frame again is how a
+      // reconnect turns one consent into two prompts, or one action into two. A phone that reports
+      // nothing, which is every phone below mobile-node 6, still gets the resend it always got.
+      if (pending.stage !== undefined) continue;
       const route = this.#route(deviceId, pending.command);
       if (route.status !== "available" || (requiresForeground(pending.command) && route.foreground !== true)) continue;
       try {
@@ -412,6 +472,9 @@ export class MobileNodeBroker {
       this.#finish(requestId, "foreground_required", true);
       return undefined;
     }
+    // Derived, with no phone change: an upload claiming the lease IS the phone executing.
+    pending.stage = "executing";
+    this.#life(pending.frame, pending.deviceId, "executing");
     this.#consume(requestId, pending);
     return { agentId: pending.agentId, command: pending.command, pending };
   }
@@ -454,6 +517,24 @@ export class MobileNodeBroker {
     });
   }
 
+  /** Never throws into the request: a lifecycle record that could not be written must not lose the
+   *  phone request it describes, exactly as a failed receipt does not lose one. */
+  #life(
+    request: { requestId: string; bot: string; threadId: string; turnId: string; command: MobileNodeCommand; purpose: string; expiresAt: number },
+    deviceId: string | undefined,
+    state: MobileRequestState,
+  ): void {
+    if (this.#lifecycle === undefined) return;
+    try {
+      this.#lifecycle({
+        requestId: request.requestId, bot: request.bot, sessionId: request.threadId,
+        turnId: request.turnId, ...(deviceId === undefined ? {} : { deviceId }),
+        command: request.command, purpose: request.purpose, state,
+        at: this.#now(), expiresAt: request.expiresAt,
+      });
+    } catch {}
+  }
+
   #consume(requestId: string, pending: Pending): void {
     this.#pending.delete(requestId);
     clearTimeout(pending.timer);
@@ -493,10 +574,13 @@ export class MobileNodeBroker {
     diagnostic?: MobileNodeFailureDiagnostic,
   ): boolean {
     const { requestId, bot, threadId, turnId, command, purpose } = pending.frame;
+    this.#life(pending.frame, pending.deviceId,
+      status === "ok" && result !== undefined ? "completed" : terminalState(status));
     if (status === "ok" && result !== undefined) {
       let recorded = false;
       try { recorded = this.#receipt({ requestId, bot, threadId, turnId, command, purpose, sharedDescription: receiptDescription(pending.frame) }); } catch {}
       if (!recorded) {
+        this.#life(pending.frame, pending.deviceId, "failed");
         this.#taskWait?.({ agentId: pending.agentId, threadId, turnId, requestId, expiresAt: pending.expiresAt, status: "device_unavailable" });
         this.#diagnose("receipt_persistence_failed", command, true, this.#route(pending.deviceId, command));
         this.#result(pending.agentId, {
@@ -556,6 +640,21 @@ export class MobileNodeBroker {
       if (until <= now) this.#terminal.delete(requestId);
     }
   }
+}
+
+function stageRank(stage: MobileNodeProgressStage | undefined): number {
+  return stage === undefined ? 0
+    : stage === "device_received" ? 1
+    : stage === "consent_presented" ? 2
+    : stage === "approved" ? 3
+    : 4;
+}
+
+/** The typed outcome a person reads. `device_unavailable` is the one internal status with no
+ *  user-facing name of its own: nothing reached a phone, which is a failure. `policy_blocked` and
+ *  `foreground_required` keep their own names on purpose. */
+function terminalState(status: MobileNodeTerminal): MobileRequestState {
+  return status === "ok" || status === "device_unavailable" ? "failed" : status;
 }
 
 function failure(stage: MobileNodeFailureStage, reason: MobileNodeFailureReason): MobileNodeFailureDiagnostic {

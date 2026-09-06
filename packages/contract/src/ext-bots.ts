@@ -448,6 +448,45 @@ export const BotMobileReceiptSchema = Type.Object({
 }, { additionalProperties: false });
 export type BotMobileReceipt = Static<typeof BotMobileReceiptSchema>;
 
+/** Capability 68. The typed lifecycle of ONE phone capability request, bound to the exact
+ *  profile, conversation, turn, paired device and (through that device, the gateway's only user
+ *  identity) the person who owns it. The record is metadata: the lease, the phone's answer, and
+ *  any coordinate, frame or file it carried are never on it. Every request reaches exactly one
+ *  terminal state; `policy_blocked` (refused before it was ever routed to a phone) and
+ *  `foreground_required` (the device or app lifecycle prevented execution) are outcomes of their
+ *  own rather than a generic failure. */
+export const MOBILE_REQUEST_STATES = [
+  "requested", "routed", "device_received", "consent_presented", "approved", "executing",
+  "completed", "denied", "failed", "expired", "cancelled", "policy_blocked", "foreground_required",
+] as const;
+export const MOBILE_REQUEST_TERMINAL_STATES = [
+  "completed", "denied", "failed", "expired", "cancelled", "policy_blocked", "foreground_required",
+] as const;
+export const MobileRequestStateSchema = Type.Union(MOBILE_REQUEST_STATES.map((state) => Type.Literal(state)));
+export type MobileRequestState = Static<typeof MobileRequestStateSchema>;
+export type MobileRequestTerminalState = (typeof MOBILE_REQUEST_TERMINAL_STATES)[number];
+
+export const BotMobileRequestSchema = Type.Object({
+  requestId: Type.String({ minLength: 1, maxLength: 256 }),
+  bot: Type.String({ minLength: 1, maxLength: 128 }),
+  sessionId: Type.String({ minLength: 1, maxLength: 256 }),
+  turnId: Type.String({ minLength: 1, maxLength: 256 }),
+  /** The one device this request was issued for. A second device attaching never becomes the
+   *  target, and an answer from any other device is refused rather than applied. */
+  deviceId: Type.String({ minLength: 1, maxLength: 256 }),
+  command: BotMobileReceiptSchema.properties.command,
+  purpose: BotMobileReceiptSchema.properties.purpose,
+  state: MobileRequestStateSchema,
+  requestedAt: Type.Integer({ minimum: 0 }),
+  updatedAt: Type.Integer({ minimum: 0 }),
+  expiresAt: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotMobileRequest = Static<typeof BotMobileRequestSchema>;
+
+export const BotMobileRequestListSchema = Type.Object({
+  requests: Type.Array(BotMobileRequestSchema),
+}, { additionalProperties: false });
+
 export const BotMobileReceiptFrameSchema = Type.Object({
   type: Type.Literal("bot_mobile_receipt"),
   ...BotMobileReceiptSchema.properties,
@@ -2197,9 +2236,12 @@ export const AGENT_INBOX_CAPABILITY_ID = "com.cozylabs.agent-inbox";
  *  5: the phone can also capture a photo or a short video, hand over a file the person picked,
  *     and present an actionable notification. Each still requires its own lease and writes a
  *     receipt, and each byte payload rides the existing attachment upload rather than the
- *     ephemeral result frame. */
+ *     ephemeral result frame.
+ *  6: the phone may report a non-terminal lifecycle stage of a request it holds
+ *     (`mobile_node_progress`). It is optional in the strongest sense: a phone that never sends
+ *     one behaves exactly as it did at 5, and the gateway simply knows less about that request. */
 export const MOBILE_NODE_CAPABILITY_ID = "com.cozylabs.mobile-node";
-export const MOBILE_NODE_CAPABILITY_VERSION = 5;
+export const MOBILE_NODE_CAPABILITY_VERSION = 6;
 /** Capability 30: a bounded, source-labelled projection of memory owned by the
  * attached Hermes profile.  `attributes` deliberately does not exist: every
  * field a client can render is named and bounded here, and a capability flag
@@ -2811,4 +2853,13 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * task, target, payload hash and expiration; a grant is consulted, never replayed, and the
  * always-require categories can never be covered by one. Additive: an approval without a block,
  * and a decision sent with no body, are byte identical to their pre-66 selves. */
-export const BOTS_CAPABILITY_VERSION = 67;
+/** Capability 68: every phone capability request has a typed lifecycle and exactly one typed
+ * terminal state, bound to profile, conversation, turn, paired device and the person that device
+ * belongs to. `GET /bots/:name/mobile-requests` is the reconciliation read a resuming app uses;
+ * `policy_blocked` and `foreground_required` are outcomes of their own. Peers send nothing new:
+ * the lifecycle is derived from the routing, lease, media and settlement the gateway already
+ * owns, so a Hermes peer gets it without a line of change. The push side of the same row is the
+ * `task_completed` payload of `contract/push-v0.md`, deduplicated against capability 64's own
+ * completion notification record. Additive: a client that never reads the route and a phone that
+ * never sends `mobile_node_progress` are byte identical to their pre-68 selves. */
+export const BOTS_CAPABILITY_VERSION = 68;

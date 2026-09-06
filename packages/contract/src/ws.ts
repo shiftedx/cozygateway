@@ -134,7 +134,21 @@ export const MobileNodeResultFrameSchema = Type.Union([
 ]);
 export type MobileNodeResultFrame = Static<typeof MobileNodeResultFrameSchema>;
 
-export const ClientFrameSchema = Type.Union([AuthFrameSchema, SyncFrameSchema, MobileNodeAdvertiseFrameSchema, MobileNodeResultFrameSchema]);
+/** Capability 68 (mobile-node 6). One NON-TERMINAL lifecycle stage of a request the phone already
+ *  holds. It is not a result and can never settle a request: the gateway records the stage against
+ *  the pending lease and nothing else. A phone below mobile-node 6 sends none, which is exactly the
+ *  pre-68 wire, and the gateway then knows only `requested` and `routed` for that request. */
+export const MOBILE_NODE_PROGRESS_STAGES = ["device_received", "consent_presented", "approved", "executing"] as const;
+export type MobileNodeProgressStage = (typeof MOBILE_NODE_PROGRESS_STAGES)[number];
+export const MobileNodeProgressFrameSchema = Type.Object({
+  type: Type.Literal("mobile_node_progress"),
+  requestId: Type.String({ minLength: 1, maxLength: 256 }),
+  lease: MobileNodeLeaseSchema,
+  stage: Type.Union(MOBILE_NODE_PROGRESS_STAGES.map((stage) => Type.Literal(stage))),
+}, { additionalProperties: false });
+export type MobileNodeProgressFrame = Static<typeof MobileNodeProgressFrameSchema>;
+
+export const ClientFrameSchema = Type.Union([AuthFrameSchema, SyncFrameSchema, MobileNodeAdvertiseFrameSchema, MobileNodeResultFrameSchema, MobileNodeProgressFrameSchema]);
 export type ClientFrame = Static<typeof ClientFrameSchema>;
 
 export const ReadyFrameSchema = Type.Object({
