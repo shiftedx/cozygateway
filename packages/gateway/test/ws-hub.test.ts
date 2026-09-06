@@ -373,7 +373,8 @@ describe("per-device presence", () => {
     await until(() => seen.some((frame) => frame.type === "ready"));
     expect(hub.isDeviceConnected("d1")).toBe(true);
 
-    await until(() => !hub.isDeviceConnected("d1"), 500);
+    // Server presence removal and the client's close event cross separate event-loop turns.
+    await until(() => !hub.isDeviceConnected("d1") && ws.readyState === WebSocket.CLOSED, 500);
     expect(ws.readyState).toBe(WebSocket.CLOSED);
   });
 });

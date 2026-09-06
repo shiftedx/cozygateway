@@ -91,7 +91,7 @@ function New-FakeHermes {
     $body = @"
 @echo off
 echo hermes:%*>>"$EventLog"
-if "%1"=="model" (
+if "%1"=="-p" if "%2"=="default" if "%3"=="model" (
   exit /b 0
 )
 if "%1"=="--version" (
@@ -107,7 +107,7 @@ if "%1"=="update" (
   if not "%COZYGATEWAY_TEST_HERMES_UPDATED_FILE%"=="" type nul >"%COZYGATEWAY_TEST_HERMES_UPDATED_FILE%"
   exit /b 0
 )
-if "%1"=="status" (
+if "%1"=="-p" if "%2"=="default" if "%3"=="status" (
   if "%COZYGATEWAY_TEST_MODEL_INCOMPLETE%"=="1" (
     echo   Model:        ^(not set^)
     echo   Provider:     Auto
@@ -144,7 +144,7 @@ public static class $className {
             if (Environment.GetEnvironmentVariable("COZYGATEWAY_TEST_HERMES_UPDATE_FAIL") == "1") return 17;
             string updatedFile = Environment.GetEnvironmentVariable("COZYGATEWAY_TEST_HERMES_UPDATED_FILE");
             if (!String.IsNullOrWhiteSpace(updatedFile)) File.WriteAllText(updatedFile, "updated");
-        } else if (args.Length > 0 && args[0] == "status") {
+        } else if (args.Length == 3 && args[0] == "-p" && args[1] == "default" && args[2] == "status") {
             if (Environment.GetEnvironmentVariable("COZYGATEWAY_TEST_MODEL_INCOMPLETE") == "1") {
                 Console.WriteLine("  Model:        (not set)");
                 Console.WriteLine("  Provider:     Auto");
@@ -688,8 +688,8 @@ try {
     }
     Assert-True ($result.ExitCode -eq 0) "existing-Hermes bootstrap failed: $($result.Output)"
     $events = Get-Content -LiteralPath $eventLog
-    $modelIndex = [Array]::IndexOf($events, 'hermes:model')
-    $statusIndex = [Array]::IndexOf($events, 'hermes:status')
+    $modelIndex = [Array]::IndexOf($events, 'hermes:-p default model')
+    $statusIndex = [Array]::IndexOf($events, 'hermes:-p default status')
     $bashIndex = ($events | Select-String '^bash:' | Select-Object -First 1).LineNumber - 1
     Assert-True ($modelIndex -eq -1) 'bootstrap must skip hermes model when a provider and model are already configured'
     Assert-True ($statusIndex -ge 0) 'bootstrap must inspect the existing Hermes provider and model'
@@ -842,7 +842,7 @@ if (`$env:COZYGATEWAY_POWERSHELL -cne 'preexisting-powershell-value') { exit 32 
     Assert-True ($uninstall.ExitCode -eq 0) "bootstrap uninstall failed: $($uninstall.Output)"
     $uninstalledPath = Get-Content -LiteralPath $uninstallPathLog -Raw
     Assert-True (-not ($uninstalledPath -match [regex]::Escape($managedBin))) 'uninstall must remove the managed command directory from the user PATH'
-    Assert-True (-not ((Get-Content -LiteralPath $eventLog -Raw) -match 'hermes:model')) 'uninstall must not open Hermes model selection'
+    Assert-True (-not ((Get-Content -LiteralPath $eventLog -Raw) -match 'hermes:-p default model')) 'uninstall must not open Hermes model selection'
 
     $dryUninstallPathLog = Join-Path $temp 'dry-uninstall-user-path.txt'
     Remove-Item -LiteralPath $eventLog -Force
@@ -892,7 +892,7 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     # for the Hermes bootstrap this case is about.
     $missing = Invoke-Bootstrap $installer @{
         'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
-        'LOCALAPPDATA' = $missingRoot
+        'HERMES_HOME' = (Join-Path $missingRoot 'hermes')
         'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
         'COZYGATEWAY_HOME' = (Join-Path $temp 'Fresh Cozy Gateway')
         'COZYGATEWAY_GIT_BASH' = $fakeBash
@@ -901,7 +901,7 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     } @('-Harness', 'hermes')
     Assert-True ($missing.ExitCode -eq 0) "missing-Hermes bootstrap failed: $($missing.Output)"
     Assert-True ($missing.Output -match 'Hermes Agent is not installed') 'missing Hermes must invoke the official installer path'
-    Assert-True ((Get-Content -LiteralPath $eventLog -Raw) -match [regex]::Escape("bash-hermes:$missingNativeHermes")) 'fresh-install handoff must expose native Hermes when it exists only under LOCALAPPDATA'
+    Assert-True ((Get-Content -LiteralPath $eventLog -Raw) -match [regex]::Escape("bash-hermes:$missingNativeHermes")) 'fresh-install handoff must expose native Hermes in the requested home'
 
     Remove-Item -LiteralPath $eventLog -Force
     $incomplete = Invoke-Bootstrap $installer @{
@@ -915,7 +915,7 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     Assert-True ($incomplete.ExitCode -ne 0) 'missing provider evidence must fail before CozyGateway handoff'
     Assert-True ($incomplete.Output -match 'active provider and model') 'model/provider failure must be actionable'
     $incompleteEvents = Get-Content -LiteralPath $eventLog
-    Assert-True (($incompleteEvents -join "`n") -match '(?m)^hermes:model$') 'incomplete Hermes setup must open model selection'
+    Assert-True (($incompleteEvents -join "`n") -match '(?m)^hermes:-p default model$') 'incomplete Hermes setup must open model selection'
     Assert-True (-not (($incompleteEvents -join "`n") -match '^bash:')) 'incomplete Hermes model selection must not invoke Bash'
 
     $agentInstallerPath = Join-Path $repoRoot 'scripts\agent-install.sh'

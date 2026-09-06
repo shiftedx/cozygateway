@@ -296,7 +296,7 @@ using System;
 public static class $className {
     public static void Main(string[] args) {
         if (args[0] == "--version") Console.WriteLine("Hermes Agent v0.21.0");
-        else if (args[0] == "status") Console.WriteLine("Model: fixture-model\nProvider: fixture-provider");
+        else if (args.Length == 3 && args[0] == "-p" && args[1] == "default" && args[2] == "status") Console.WriteLine("Model: fixture-model\nProvider: fixture-provider");
         else if (args[0] == "-p") Console.WriteLine(@"$dualConfig");
     }
 }
