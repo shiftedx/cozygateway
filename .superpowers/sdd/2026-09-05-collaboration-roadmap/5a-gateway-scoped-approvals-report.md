@@ -1,0 +1,256 @@
+# 5a: gateway typed scoped approvals with payload binding and category policy
+
+Packet 5a, capability row 66. Worktree `<repos>/worktrees/5a-gateway-scoped-approvals`, branch
+`codex/5a-gateway-scoped-approvals`.
+
+## Heads
+
+- Base (reviewed 4a head, PR #370, merge pending): `bada668` "Redact the worktree path in the 4a report"
+- `835a13a` Typed scoped approvals with payload binding and category policy (capability 66)
+- `e6e9efa` Contract row 66, portable conformance fixture and changelog for scoped approvals
+- (this report is the third commit on the branch)
+
+Node 24.19.0 (`/opt/homebrew/opt/node@24/bin`), pnpm 10.30.1.
+
+## What was built
+
+One additive contract row, no second authority. The existing `ApprovalEvent` gains one typed block
+and the existing approve route gains one optional body; everything else is the approval path that
+was already there.
+
+1. **`BotApprovalScope`** (contract): the typed block an approval may carry. `kind`
+   (`scoped_approval`), `action`, `category`, `system`, `resource`, `change`, `effects[]`, `reason`,
+   `payloadHash` (lowercase sha256 hex), `expiresAt`, `retry`, `requested`. Every set closed, the
+   object closed, every string bounded.
+2. **`sanitizeApprovalScope`** (attach protocol): the sole authority, modelled exactly on capability
+   62's `sanitizeApprovalRepair`. Schema plus the C0/C1, Unicode Format, lone-surrogate and
+   whitespace-only refusal. All or nothing: a failing block is DROPPED and the approval KEPT, which
+   fails closed because only a scoped approval can leave or be covered by a grant.
+3. **Carried surfaces**: `bot_approval_pending`, the durable interaction payload, the
+   `GET /bots/approvals` inbox row, and the reconnect rebroadcast all carry the validated block byte
+   for byte, exactly as `repair` is carried.
+4. **Binding and grants**: new `bot_approval_grants` table. A `once` grant binds bot (profile),
+   deciding device (user), session (conversation), turn (task), system plus resource (target),
+   payload hash, and expiration. A `category` grant binds the same minus turn and payload hash, with
+   a person-set expiry capped at one day. `grant_id` is derived from the approval, so a retried
+   decision writes no second grant.
+5. **Consult, never replay**: on a pending scoped approval the gateway asks
+   `Storage.standingApprovalGrant`. A `once` grant matches only the same task and the same payload
+   hash, and only when the peer called the retry `idempotent`. A `category` grant matches any
+   payload of the same action on the same resource. A changed material field changes the hash and
+   nothing covers it; an expired or revoked grant matches nothing; the ask's own `expiresAt` bounds
+   the consult too.
+6. **Always-require list**: `ALWAYS_REQUIRE_APPROVAL_CATEGORIES` = money_movement, secret_access,
+   destructive, lock_or_alarm, public_publishing, account_change. No grant of either kind is ever
+   RECORDED for one, none is ever CONSULTED for one, and an explicit `grant: "category"` on one is
+   `409 approval_category_forbidden`. The per-invocation decision still works.
+7. **Relay, not execute**: a covered ask still raises its card, names the grant on
+   `bot_approval_pending.grantId`, and settles through the same `resolve_approval` a tapped card
+   sends. The peer performs the action; the gateway records nothing about the outcome beyond the
+   existing settlement.
+8. **Revocation view**: `GET /bots/:name/approvals/grants` and
+   `DELETE /bots/:name/approvals/grants/:grantId`. Rows carry no payload hash, no deciding device,
+   no payload value. Revocation is immediate: the row leaves every later consult in the same
+   statement that marks it.
+9. **Decision log**: one bounded content-free log line for a dropped block, and one
+   `approval_grant_honored` trace carrying hashed profile, session, approval and grant ids only.
+
+## Contract row 66 (contract/ext-bots-v1.md)
+
+Status header and the discovery example moved from 65 to 66, and this row was added to the history
+table:
+
+> | 66 | An approval can name exactly what it would do, and a decision can leave a standing policy:
+> `ApprovalEvent` on attach-v1 gains optional `scope`, one typed block a runtime peer sends
+> alongside an approval it raises. The block is `BotApprovalScope`: `kind` (`scoped_approval`),
+> `action` (the action type, 1-64 characters), `category` (closed: `money_movement`,
+> `secret_access`, `destructive`, `lock_or_alarm`, `public_publishing`, `account_change`, `other`),
+> `system` (the target system, 1-64), `resource` (the target resource, 1-256), `change` (the exact
+> material change in one sentence, 1-400), `effects` (0-16 entries of 1-200 naming what else
+> happens), `reason` (`always_require`, `guardrail`, `peer_policy`, `first_use`), `payloadHash`
+> (lowercase sha256 hex of the exact payload, the BINDING), `expiresAt` (gateway-clock
+> milliseconds), `retry` (`idempotent`, `not_idempotent`, `unknown`) and `requested` (`once`,
+> `category`). Every set is closed, the object is closed, and no secret, credential, URL, header or
+> env value is ever in a string: `change` and `effects` describe an action, they never carry its
+> arguments. The gateway treats the block exactly as capability 62 treats `repair`: it validates the
+> closed sets and bounds and refuses any C0/C1 control or Unicode Format (Cf) character, a lone
+> surrogate, or a whitespace-only value, and a block that fails is DROPPED while the approval is
+> KEPT, with one bounded content-free log line; a valid block is carried byte for byte on
+> `bot_approval_pending`, the durable interaction record, the `GET /bots/approvals` inbox row, and
+> the rebroadcast a reconnecting app gets. Dropping FAILS CLOSED: a plain approval can leave no
+> grant behind and can be covered by none. BINDING AND GRANTS:
+> `POST /bots/:name/approvals/:toolCallId/approve` gains an OPTIONAL `BotApprovalDecisionRequest`
+> body, `{ grant?: "once" | "category", expiresAt? }`. No body is the pre-66 request and reaches the
+> surface unchanged. An approve on a scoped approval records a standing grant bound to profile,
+> user, conversation, task, target, payload hash and expiration: `once` covers exactly that payload
+> on that task and is consulted only when the peer called the retry `idempotent`, so a mutation is
+> never automatically replayed; `category` covers any payload of that action on that resource until
+> `expiresAt` (required, in the future, at most one day away, `400 invalid_request` otherwise) or
+> revocation. A GRANT IS A POLICY RECORD, never a stored payload to replay: a changed material field
+> changes `payloadHash` and no standing approval covers it, and an expired grant is dead whatever
+> its scope says. The six always-require categories are covered by NOTHING: no grant of either kind
+> is recorded for one, none is ever consulted for one, and `grant: "category"` on one is
+> `409 approval_category_forbidden` (`409 approval_scope_required` when the approval carries no
+> block to bound a grant by). When a grant does cover an ask, the gateway still raises the card,
+> names the grant on `bot_approval_pending.grantId`, and settles it through the same
+> `resolve_approval` a tapped card sends: it relays and validates, it never executes.
+> `GET /bots/:name/approvals/grants` is the revocation view (`BotApprovalGrant` rows: the grant id,
+> its scope, the action, category, system, resource, conversation, expiry and creation time, never
+> the deciding device, the payload hash or a payload value), and
+> `DELETE /bots/:name/approvals/grants/:grantId` ends one immediately, `404` for a grant this
+> gateway does not hold. Decision logs and traces carry ids, reason codes and the grant id only.
+> Additive: an approval with no block, and a decision sent with no body, are byte identical to their
+> pre-66 selves on every surface, and a peer emits `scope` only when the gateway advertised
+> `com.cozylabs.bots >= 66` on `hello_ack`; a client renders the card, sends a body, or opens the
+> revocation view only on `>= 66`. |
+
+`contract/attach-v1.md` gained the matching `approval` bullet beside the capability-56 `detail` and
+capability-62 `repair` bullets.
+
+## RED then GREEN
+
+RED, before any implementation existed, with the seam test written first
+(`packages/gateway/test/native-bot-scoped-approvals.test.ts`):
+
+```
+$ cd packages/gateway && npx vitest run test/native-bot-scoped-approvals.test.ts
+ FAIL  test/native-bot-scoped-approvals.test.ts
+ AssertionError: expected undefined to be '{"kind":"scoped_approval",...}'    (block not carried)
+ AssertionError: expected 'requested' to be 'category_forbidden'              (no always-require rule)
+ TypeError: plane.surface(...).approvalGrants is not a function               (no grant store)
+ Test Files  1 failed (1)
+      Tests  6 failed | 4 passed (10)
+```
+
+(The four that "passed" red were the drop-the-invalid-block and pre-66-byte-identity cases, which
+pass vacuously while the field does not exist; they are the guards that must stay green afterwards.)
+
+GREEN, same command after implementation:
+
+```
+$ cd packages/gateway && npx vitest run test/native-bot-scoped-approvals.test.ts
+ ✓ test/native-bot-scoped-approvals.test.ts (10 tests) 40ms
+ Test Files  1 passed (1)
+      Tests  10 passed (10)
+```
+
+Focused approval seam, live and route, including the capability-56/62 neighbours that must not move:
+
+```
+$ cd packages/gateway && npx vitest run test/bots-approval-grants-routes.test.ts \
+    test/native-bot-scoped-approvals.test.ts test/native-bot-approval-repair.test.ts \
+    test/bots-pending-approvals-routes.test.ts test/approvals.test.ts
+ Test Files  5 passed (5)
+      Tests  37 passed (37)
+```
+
+Package suites for every package touched (Kyle's ruling for this run: focused tests plus
+`pnpm -r typecheck`, no full `pnpm -r test`):
+
+```
+$ cd packages/contract    && npx vitest run    Test Files 19 passed (19)   Tests 192 passed (192)
+$ cd packages/gateway     && npx vitest run    Test Files 132 passed | 1 skipped (133)
+                                               Tests 1467 passed | 2 skipped (1469)
+$ cd packages/conformance && npx vitest run    Test Files 9 passed (9)
+                                               Tests 92 passed | 19 skipped (111)
+$ pnpm -r typecheck
+  packages/contract typecheck: Done
+  packages/relay typecheck: Done
+  packages/gateway typecheck: Done
+  packages/conformance typecheck: Done
+```
+
+(The gateway and conformance typechecks need `packages/contract` and `packages/gateway` built
+first; `pnpm build` was run in each before the workspace typecheck.)
+
+## Evidence per completion-criterion item
+
+| Criterion | Evidence |
+| --- | --- |
+| Payload-hash mismatch forces re-approval | `native-bot-scoped-approvals.test.ts` "honors a standing once grant for the same payload hash and refuses a changed one": approval-2 (same hash) is relayed, approval-3 (changed `change`, changed hash) is not. |
+| Expired approval replay is refused | Same file, "refuses to replay an expired grant regardless of category policy": grant expires at 2000, clock moved to 3000, the identical ask is not covered. `Storage.standingApprovalGrant` also filters `expires_at > ?`. |
+| Category approval bounded by scope and expiry, honored only within bounds | Same file, "honors a category grant across payloads inside its bounds and never outside them": a different payload on the same resource is covered, a different resource is not. A `grant: "category"` whose `expiresAt` is past or beyond the one-day ceiling is `400` (route test). |
+| Always-require list blocks a category grant | Same file, "blocks a category grant over an always-require action and never consults one": `category_forbidden`, then a plain approve leaves zero grants, then the identical later ask is not covered. Route mapping to `409 approval_category_forbidden` in `bots-approval-grants-routes.test.ts`. |
+| Revocation removes a standing category grant immediately | Same file, "removes a standing category grant the moment it is revoked": revoke, view empty, the next matching ask is not covered. Route `DELETE` coverage in the route test. |
+| Portable route conformance: peers below 66 byte identical | `packages/conformance/test/scoped-approvals-fixture.test.ts` "keeps a peer and a client below 66 byte identical to their pre-66 selves" pins the pre-66 pending frame keys, the pre-66 inbox row keys and the empty decision body. Gateway side: "leaves an approval without a block byte identical to its pre-66 self" pins the frame, the durable payload and the inbox row; `bots-approval-grants-routes.test.ts` pins that a body-less approve reaches the surface with the pre-66 ARITY, and that a deny never reads a body. `native-bot-approval-repair.test.ts` (capability 62) still passes unchanged. |
+| Node 24 build/typecheck/tests | Counts above, Node 24.19.0. Full `pnpm -r test` deliberately NOT run: the lead runs the batched heavy gate. |
+| .121 and hosted billing | UNKNOWN. No live model qualification and no hosted CI run was attempted; nothing in this packet needs a model. Reproduction later: point a CozyAgents peer at `http://192.168.99.121:1234/v1` (`qwen3.8-27b-nvfp4`), have it raise a scoped approval, and check the card, the grant and the revocation view. |
+
+## Files changed
+
+Source:
+- `packages/contract/src/ext-bots.ts`: `BotApprovalCategorySchema`, `ALWAYS_REQUIRE_APPROVAL_CATEGORIES`, `BotApprovalScopeSchema`, `BotApprovalGrantSchema`, `BotApprovalGrantsSchema`, `BotApprovalDecisionRequestSchema`; optional `scope` and `grantId` on `BotApprovalPendingFrameSchema`; optional `scope` on `BotPendingApprovalSchema`; `BOTS_CAPABILITY_VERSION` 65 to 66.
+- `packages/gateway/src/adapters/attach/protocol-v1.ts`: `ApprovalEvent.scope` (untyped on the wire, as `repair` is) and `sanitizeApprovalScope`.
+- `packages/gateway/src/storage.ts`: `bot_approval_grants` table and index; `recordApprovalGrant`, `approvalGrants`, `revokeApprovalGrant`, `standingApprovalGrant`; `scope` projected on `pendingNativeApprovals`; grants added to the session-delete and `purgeBot` sweeps.
+- `packages/gateway/src/hermes-bridge/native-data-plane.ts`: scope validation and storage on ingest, the consult, `#honorApprovalGrant`, grant recording on a fresh approve, `#approvalGrants`, `#revokeApprovalGrant`, `APPROVAL_GRANT_MAX_MS`.
+- `packages/gateway/src/hermes-bridge/approvals.ts`: `BotApprovalDecisionScope`, outcomes `category_forbidden`, `scope_required`, `invalid_grant`.
+- `packages/gateway/src/hermes-bridge/bridge.ts`: `BotsSurface.resolveApproval` optional fifth argument, optional `approvalGrants` and `revokeApprovalGrant`.
+- `packages/gateway/src/hermes-bridge/routes.ts`: optional approve body, the two new extension error codes, the two grant routes.
+
+Docs: `contract/ext-bots-v1.md`, `contract/attach-v1.md`, `CHANGELOG.md`.
+
+Tests: `packages/gateway/test/native-bot-scoped-approvals.test.ts` (new, 10),
+`packages/gateway/test/bots-approval-grants-routes.test.ts` (new, 7),
+`packages/conformance/test/scoped-approvals-fixture.test.ts` plus
+`packages/conformance/test/fixtures/scoped-approvals-v1.json` (new, 8),
+`packages/contract/test/bots-approvals.test.ts` (6 added, 2 key lists extended),
+version pins moved to 66 in `packages/contract/test/ext-bots.test.ts`,
+`packages/contract/test/artifacts.test.ts`, `packages/gateway/test/bots-delete-routes.test.ts`.
+
+## Self-review findings
+
+- The first draft passed a fifth argument (`undefined`) to `chat.resolveApproval` on every
+  body-less approve, which broke the existing capability-27 route test. That test was right: a
+  pre-66 request must reach the surface unchanged down to the arity. The route now branches, and the
+  route test pins it.
+- A NUL byte was written literally into the new test file, breaking the "no control byte in this
+  source" habit the capability-56 code documents. It is now the same `u0000` escape the repair test
+  uses.
+- `BotApprovalGrantSchema` is an open object like every other contract object, so an extra
+  `payloadHash` or `deviceId` VALIDATES. The contract test therefore asserts the schema's property
+  list rather than pretending validation forbids it, which is the stronger claim: the shape names no
+  member a payload value could ride out on.
+- A dropped scope block leaves a plain approval, which can neither leave nor be covered by a grant.
+  That is the fail-closed direction and it is now stated in the code, the row and the attach bullet.
+- `sanitizeApprovalScope` refuses control characters in `change` and `effects` rather than stripping
+  them the way capability 56 strips `detail`. That is deliberate: unlike `detail`, this block decides
+  policy, so a malformed one should not be half-shown. The cost is that one bad character in the
+  description sentence costs the whole card; the approval itself always survives.
+
+## Ponytail: what was skipped
+
+- No resource PREFIX or wildcard scoping. A category grant is bounded to the exact resource the
+  approval named. Add prefix scope when a real client asks for "any file under this directory", and
+  put the matching rule in the contract row before the code.
+- No grant list on the interaction inbox and no per-grant usage counter. A person sees which grant
+  settled an ask on the frame and can list and revoke; counting how often a grant fired is a
+  reporting feature, not a safety one.
+- No cross-conversation grants. Every grant is bound to the conversation it was made in, which is
+  the safest reading of the binding rule; widening it is a decision, not a refactor.
+
+## Concerns
+
+1. **Honoring is a real behaviour change, gated on the block.** The gateway now relays an approve on
+   its own when a standing grant covers the ask. That is what "a category approval is honored within
+   its bounds" has to mean to be testable, and it stays a relay (the peer acts, the card is still
+   raised and names the grant). It is invisible to a peer below 66 because such a peer sends no
+   block. If the lead reads the settled ruling as "the gateway may only ANSWER a consult and never
+   relay a decision", the change is small: drop `#honorApprovalGrant` and keep `grantId` on the
+   frame as an advisory the client acts on.
+2. **`retry: "idempotent"` is the peer's own claim.** A `once` grant is only ever consulted on that
+   claim. It is bounded by the same turn, the same target, the same payload hash and the ask's own
+   expiry, so a lying peer buys itself a repeat of one identical idempotent call inside one turn,
+   never a mutation and never a second target. Named here rather than hidden.
+3. **A second decision on the same approval cannot upgrade a once grant to a category grant.** The
+   grant id is derived from the approval, so the first fresh admission wins and a later
+   `grant: "category"` on the same approval returns `already_requested` with no new record. A person
+   who wants a category grant asks for one on the decision they make; there is no upgrade path yet.
+4. **Grants are not swept.** An expired grant stays in the table (invisible to every read and every
+   consult) until its bot is deleted or its session is deleted. That is the same posture the
+   terminal interaction rows had before their trim; a retention sweep is worth adding if this table
+   turns out to grow.
+5. **Two route-table cells use the em-dash placeholder** the rest of that table already uses for an
+   empty request cell. Prose everywhere in this packet has none; changing the glyph on two rows would
+   have made the table inconsistent with its other forty.
+6. **UNKNOWN**: no `.121` qualification and no hosted CI. Deterministic fixtures, the seam tests and
+   the portable conformance fixture are the qualification for this packet.
