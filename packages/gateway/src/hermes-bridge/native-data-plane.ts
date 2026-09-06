@@ -1520,6 +1520,11 @@ export class NativeBotDataPlane {
         phase: "failed",
         status: event.kind === "failed" ? "failed" : "interrupted",
         ...(event.kind === "cancelled" ? { cause: "cancelled" as const } : {}),
+        // Only publish a known, safe cause. Runtime diagnostics may contain private paths or
+        // provider details. Match the known runtime message without forwarding raw diagnostics.
+        ...(event.kind === "failed" && (
+          event.message === "No verifier is configured for this workspace; the last verification attempt reported not_configured."
+        ) ? { cause: "verification_unavailable" as const } : {}),
       });
       return true;
     }
@@ -2372,7 +2377,8 @@ export class NativeBotDataPlane {
       sessionId,
       turnId,
       status: terminal.status as "completed" | "failed" | "interrupted" | "timed_out",
-      ...(terminal.cause === "cancelled" ? { cause: "cancelled" as const } : {}),
+      ...((terminal.cause === "cancelled" || terminal.cause === "verification_unavailable")
+        ? { cause: terminal.cause } : {}),
       completedAt: this.#now(),
     });
     emitTrace(this.#trace, "native_turn_transition", {

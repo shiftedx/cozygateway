@@ -720,6 +720,39 @@ describe("attach-v1 native Bot Mode plane", () => {
     },
   );
 
+  it.each([
+    { message: "No verifier is configured for this workspace; the last verification attempt reported not_configured.", cause: "verification_unavailable" },
+    { message: "private provider diagnostic", cause: undefined },
+  ])("preserves a safe terminal cause in live state and reopened history: $cause", async ({ message, cause }) => {
+    const path = join(mkdtempSync(join(tmpdir(), "native-failure-cause-")), "gateway.sqlite");
+    let storage = openStorage(path);
+    const frames: ServerFrame[] = [];
+    const makePlane = () => new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"], chatSuggestion: "", broadcast: frame => frames.push(frame), now: () => 100,
+    });
+    let plane = makePlane();
+    const chat = storage.nativeBotChat("sage", 1);
+    storage.enqueueAttachCommand("sage", "turn", {
+      kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "Make a PDF",
+    } as never, 1);
+    storage.setNativeBotTurn("sage", chat.sessionId, "turn", 1);
+    plane.handle("sage", { kind: "event", sequence: 1, eventId: "failed", event: {
+      kind: "failed", threadId: chat.sessionId, turnId: "turn", messageId: "failed:user", message,
+    } });
+    const live = frames.findLast(frame => frame.type === "bot_chat_state");
+    expect(live).toMatchObject({ phase: "failed", status: "failed", running: false });
+    expect(live && "cause" in live ? live.cause : undefined).toBe(cause);
+    expect(JSON.stringify(live)).not.toContain(message);
+    plane.close(); storage.close();
+    storage = openStorage(path); plane = makePlane();
+    const history = await plane.surface().chatHistory("sage");
+    expect(history).toMatchObject({ status: "failed", running: false });
+    expect(history.cause).toBe(cause);
+    expect(JSON.stringify(history)).not.toContain(message);
+    plane.close(); storage.close();
+  });
+
   it("reconstructs an active turn and its running tool after a gateway restart", async () => {
     const path = join(mkdtempSync(join(tmpdir(), "native-tools-restart-")), "gateway.sqlite");
     let storage = openStorage(path);
