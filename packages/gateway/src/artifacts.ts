@@ -119,15 +119,17 @@ export class Artifacts {
     }
     const stored = this.#db.prepare("SELECT bytes FROM attach_media WHERE agent_id = ? AND media_id = ?")
       .get(createdBy, mediaId) as { bytes: Uint8Array } | undefined;
-    if (stored === undefined) return { outcome: "missing_bytes", record: this.#fail(artifactId, "missing_bytes", at) };
+    // The validation status says what the bytes proved, not why the commit failed: absent bytes
+    // were never compared, and a store that is full has already compared them successfully.
+    if (stored === undefined) return { outcome: "missing_bytes", record: this.#fail(artifactId, "missing_bytes", "unvalidated", at) };
     if (createHash("sha256").update(stored.bytes).digest("hex") !== row.sha256)
-      return { outcome: "mismatch", record: this.#fail(artifactId, "checksum", at) };
+      return { outcome: "mismatch", record: this.#fail(artifactId, "checksum", "mismatch", at) };
     if (stored.bytes.byteLength !== row.sizeBytes)
-      return { outcome: "mismatch", record: this.#fail(artifactId, "size", at) };
+      return { outcome: "mismatch", record: this.#fail(artifactId, "size", "mismatch", at) };
     const retained = this.#db.prepare("SELECT COALESCE(SUM(size_bytes), 0) AS bytes FROM artifacts WHERE state = 'committed'")
       .get() as { bytes: number };
     if (retained.bytes + row.sizeBytes > this.#capacityBytes)
-      return { outcome: "capacity", record: this.#fail(artifactId, "capacity", at) };
+      return { outcome: "capacity", record: this.#fail(artifactId, "capacity", "verified", at) };
 
     this.#db.exec("SAVEPOINT artifact_commit");
     try {
@@ -277,10 +279,10 @@ export class Artifacts {
     ).run(deliveryId, artifactId, attempt, at);
   }
 
-  #fail(artifactId: string, reason: ArtifactFailureReason, at: number): Artifact {
+  #fail(artifactId: string, reason: ArtifactFailureReason, validation: Artifact["validation"], at: number): Artifact {
     this.#db.prepare(
-      "UPDATE artifacts SET state = 'commit_failed', validation = 'mismatch', failure_reason = ?, committed_at = NULL WHERE artifact_id = ?",
-    ).run(reason, artifactId);
+      "UPDATE artifacts SET state = 'commit_failed', validation = ?, failure_reason = ?, committed_at = NULL WHERE artifact_id = ?",
+    ).run(validation, reason, artifactId);
     const row = this.#row(artifactId)!;
     this.#notify(row, at);
     return this.#record(row);

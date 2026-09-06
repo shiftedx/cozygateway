@@ -1124,7 +1124,10 @@ size and the digest. Commitment then recomputes the SHA-256 and the byte count o
 bytes and requires both to equal the declaration. Metadata alone is never validation: a digest
 mismatch, a size mismatch, absent bytes, or an exceeded operator capacity all record
 `commit_failed` with the reason on the record, visibly, rather than silently dropping either the
-declaration or the bytes.
+declaration or the bytes. `validation` says what the bytes proved rather than why the commit
+failed: `mismatch` only for a digest or size mismatch, `unvalidated` when the bytes were never
+there to compare, and `verified` for a capacity refusal, where the bytes did match and the store
+refused to retain them.
 
 Producer routes use the attach bearer and are scoped to the authenticated identity, so a foreign
 or guessed id is the same `404` an absent one gets: `POST /attach/v1/artifacts` declares,

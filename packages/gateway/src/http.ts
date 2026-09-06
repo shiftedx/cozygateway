@@ -1674,17 +1674,14 @@ export function createApp(deps: AppDeps): Hono<Env> {
 
   registerTaskRoutes(app, requireDevice, deps.storage, deps.now, deps.flushTaskCommands ?? (() => {}));
 
-  // Capability 65. The producer half only exists where an attach identity can authenticate; the
-  // device half is always registered, so a gateway with no attach peers still lists and serves
-  // whatever Artifacts it already holds.
-  registerArtifactRoutes(app, requireDevice, deps.storage, deps.now,
-    deps.attachTokens === undefined || deps.attachTokens.size === 0
-      ? undefined
-      : {
-        auth: requireAttach,
-        agentOf: attachAgent,
-        botOf: (agentId) => deps.storage.chatExecutionById(agentId)?.bot ?? agentId,
-      });
+  // Capability 65. Both halves are registered unconditionally, because /health advertises 65
+  // unconditionally: a gateway with no attach peer configured must refuse a producer request with
+  // the 401 its own middleware answers, never with a 404 that says the surface does not exist.
+  registerArtifactRoutes(app, requireDevice, deps.storage, deps.now, {
+    auth: requireAttach,
+    agentOf: attachAgent,
+    botOf: (agentId) => deps.storage.chatExecutionById(agentId)?.bot ?? agentId,
+  });
 
   // Vendor extension, registered last so it cannot shadow a core route (contract/ext-bots-v1.md).
   if (deps.bots !== undefined) {

@@ -33,7 +33,14 @@ async function setup() {
     headers: { "content-type": "application/pdf", "x-attach-filename": "report.pdf", "x-attach-sha256": SHA },
   }, token);
   const declare = (body: object, token = "peer-secret") => peer("/attach/v1/artifacts", { method: "POST", headers: JSON_HEADERS, body: JSON.stringify(body) }, token);
-  return { storage, app, device, peer, upload, declare, sessionId, setNow: (value: number) => { now = value; } };
+  const peerless = createApp({
+    storage: openStorage(":memory:"), config: { name: "test", port: 0, dbPath: ":memory:", turnTimeoutSeconds: 0 },
+    gatewayInfo: { name: "test", version: "test", contract: "v1", capabilities: { "com.cozylabs.bots": 65 } },
+    presenceOf: () => "online", submitUserMessage: () => { throw new Error("not used"); },
+    interruptThread: () => "idle", resolveApproval: async () => "unknown", onDeviceRevoked: () => {},
+    now: () => now,
+  });
+  return { storage, app, device, peer, upload, declare, sessionId, peerless, setNow: (value: number) => { now = value; } };
 }
 
 const DECLARATION = {
@@ -145,6 +152,48 @@ describe("Artifact public routes", () => {
     expect(await (await device("/artifacts/artifact-1")).json()).toMatchObject({ version: 1, supersededByArtifactId: "artifact-2" });
     expect(await (await device("/artifacts/artifact-2")).json()).toMatchObject({ version: 2, supersedesArtifactId: "artifact-1" });
     expect(await (await device("/artifacts/artifact-1/latest")).json()).toMatchObject({ artifactId: "artifact-2", version: 2 });
+  });
+
+  it("serves a filename carrying header control characters through the shared sanitizer", async () => {
+    const { device, declare, peer, upload, sessionId } = await setup();
+    await upload("media-1");
+    // A producer-supplied filename is display metadata. A CR or LF in it must not be able to
+    // build a header, and must not make the artifact permanently undownloadable either.
+    expect((await declare({ ...DECLARATION, sessionId, filename: "a\r\nX-Evil: 1.pdf" })).status).toBe(201);
+    await peer("/attach/v1/artifacts/artifact-1/commit", { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ mediaId: "media-1" }) });
+    const content = await device("/artifacts/artifact-1/content");
+    expect(content.status).toBe(200);
+    const disposition = content.headers.get("content-disposition") ?? "";
+    expect(disposition).not.toMatch(/[\r\n]/);
+    expect(disposition).toContain("filename*=UTF-8''");
+    expect(content.headers.get("x-evil")).toBeNull();
+    expect(new Uint8Array(await content.arrayBuffer())).toEqual(BYTES);
+  });
+
+  it("refuses a room the producing bot is not a member of", async () => {
+    const { device, declare, storage, sessionId } = await setup();
+    storage.createBotGroup({ key: "room-1", name: "Room One", members: ["luna"], createdAt: 100 });
+    // `sage` is authenticated but is not in room-1, so it cannot inject a record into the list a
+    // paired device browses for that room.
+    const refused = await declare({ ...DECLARATION, sessionId, room: "room-1" });
+    expect(refused.status).toBe(403);
+    expect(await (await device("/bots/groups/room-1/artifacts")).json()).toEqual({ artifacts: [] });
+    expect((await declare({ ...DECLARATION, sessionId, room: "room-unknown" })).status).toBe(403);
+
+    storage.createBotGroup({ key: "room-2", name: "Room Two", members: ["sage"], createdAt: 100 });
+    expect((await declare({ ...DECLARATION, artifactId: "artifact-room", sessionId, room: "room-2" })).status).toBe(201);
+    const listed = await (await device("/bots/groups/room-2/artifacts")).json() as { artifacts: { artifactId: string }[] };
+    expect(listed.artifacts.map((record) => record.artifactId)).toEqual(["artifact-room"]);
+  });
+
+  it("registers the producer half on a gateway that has no attach peer configured", async () => {
+    const { peerless } = await setup();
+    // /health advertises 65 unconditionally, so the producer routes must exist unconditionally
+    // too: an unauthenticated caller is refused by the route, not by its absence.
+    for (const path of ["/attach/v1/artifacts", "/attach/v1/artifacts/artifact-1/commit", "/attach/v1/artifacts/artifact-1/deliveries"])
+      expect((await peerless.request(path, { method: "POST", headers: JSON_HEADERS, body: "{}" })).status).toBe(401);
+    expect((await peerless.request("/attach/v1/artifacts/artifact-1")).status).toBe(401);
+    expect((await peerless.request("/attach/v1/artifacts", { method: "POST", headers: { ...JSON_HEADERS, authorization: "Bearer nope" }, body: "{}" })).status).toBe(401);
   });
 
   it("rejects malformed producer bodies at the boundary", async () => {

@@ -3,6 +3,7 @@ import {
   ArtifactCommitRequestSchema, ArtifactDeclareRequestSchema, ArtifactDeliverySettleRequestSchema,
   check, type ArtifactDeclareRequest,
 } from "cozygateway-contract";
+import { attachmentDisposition } from "./hermes-bridge/documents.ts";
 import type { Storage } from "./storage.ts";
 
 type Env = { Variables: { deviceId: string } };
@@ -62,7 +63,10 @@ export function registerArtifactRoutes(
         "content-length": String(bytes.byteLength),
         "cache-control": "private, max-age=86400",
         "x-content-type-options": "nosniff",
-        "content-disposition": `attachment; filename="${original.filename.replaceAll(/["\\]/g, "")}"`,
+        // The one sanitizer every other download route in this gateway uses. A producer-supplied
+        // filename is display metadata: it never builds a header of its own, and a name this
+        // encoder cannot represent falls back rather than making the artifact undownloadable.
+        "content-disposition": attachmentDisposition(original.filename),
       },
     });
   });
@@ -79,7 +83,13 @@ export function registerArtifactRoutes(
     const declaration = body as ArtifactDeclareRequest;
     if (!ID.test(declaration.artifactId)) return invalid(c, "invalid artifact id");
     const agentId = agentOf(c);
-    const result = storage.artifacts.declare({ ...declaration, createdBy: agentId, bot: botOf(agentId) }, now());
+    const bot = botOf(agentId);
+    // `bot` and `createdBy` come from the authenticated identity, so `room` is the one identity a
+    // producer supplies. A bot may only file a record against a room it is actually a member of;
+    // an unknown room and a room it does not belong to are the same refusal.
+    if (declaration.room !== undefined && !(storage.botGroup(declaration.room)?.members ?? []).includes(bot))
+      return c.json({ error: { code: "forbidden", message: "bot is not a member of that room" } }, 403);
+    const result = storage.artifacts.declare({ ...declaration, createdBy: agentId, bot }, now());
     if (result.outcome === "conflict")
       return c.json({ error: { code: "conflict", message: "artifact id already names a different declaration" } }, 409);
     return c.json(result.record, result.outcome === "created" ? 201 : 200);

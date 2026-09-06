@@ -73,14 +73,16 @@ describe("durable Artifact records", () => {
     const storage = open();
     storage.artifacts.declare(declaration({ artifactId: "artifact-missing" }), 100);
     expect(storage.artifacts.commit("sage", "artifact-missing", "media-absent", 110).outcome).toBe("missing_bytes");
-    expect(storage.artifacts.get("artifact-missing")).toMatchObject({ state: "commit_failed", failureReason: "missing_bytes" });
+    // Nothing was compared, so nothing may claim the bytes failed verification.
+    expect(storage.artifacts.get("artifact-missing")).toMatchObject({ state: "commit_failed", failureReason: "missing_bytes", validation: "unvalidated" });
 
     upload(storage, "sage", "media-1");
     storage.artifacts.capacity(BYTES.byteLength - 1);
     storage.artifacts.declare(declaration(), 100);
     expect(storage.artifacts.commit("sage", "artifact-1", "media-1", 110).outcome).toBe("capacity");
     // Visible, not silent: the record says why, and the original bytes are still served.
-    expect(storage.artifacts.get("artifact-1")).toMatchObject({ state: "commit_failed", failureReason: "capacity" });
+    // The bytes did verify; the store refused to retain them, which is a different fact.
+    expect(storage.artifacts.get("artifact-1")).toMatchObject({ state: "commit_failed", failureReason: "capacity", validation: "verified" });
     expect(storage.attachMediaInfo("sage", "media-1", 200)).toBeDefined();
   });
 

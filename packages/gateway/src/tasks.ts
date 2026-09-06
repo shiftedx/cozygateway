@@ -103,7 +103,16 @@ export class Tasks {
     return this.#read(taskId, cursor, limit);
   }
 
+  /** The attach ingress retains its Storage handle across teardown: a peer socket close, a hello,
+   * a catalog declaration, the heartbeat tick's reconcile, and the command flush that tick
+   * performs can all arrive after the durable store is gone. Every one of them funnels through
+   * this guard, because a closed store has nothing to project and crashing the process on the way
+   * down is not a fence. Admission paths are deliberately NOT guarded: they run inside a
+   * transaction on an open store or not at all. */
+  #closed(): boolean { return !this.#db.isOpen; }
+
   hello(peer: string, at: number): void {
+    if (this.#closed()) return;
     this.presence(peer, true, at);
     for (const view of this.list()) {
       const run = this.#taskRun(view.taskId, view.currentRun.runId);
@@ -112,11 +121,8 @@ export class Tasks {
   }
 
   presence(peer: string, live: boolean, at: number): void {
+    if (this.#closed()) return;
     if (live) this.#live.add(peer); else this.#live.delete(peer);
-    // A peer's socket can close after the durable store was torn down (shutdown, or a test that
-    // deliberately retains the closed handle). Presence is a projection of durable state, so a
-    // closed store has nothing to project; crashing the process on the way down is not a fence.
-    if (!this.#db.isOpen) return;
     // Mark absence only on a transition. A repeated absent callback cannot renew the lease.
     if (!live) {
       for (const row of this.#db.prepare("SELECT task_id AS taskId FROM tasks").all() as unknown as { taskId: string }[]) {
@@ -137,7 +143,7 @@ export class Tasks {
   }
 
   reconcile(at = this.#clock()): void {
-    if (this.#reconciling) return;
+    if (this.#closed() || this.#reconciling) return;
     this.#reconciling = true;
     try {
       this.atomic(() => {
@@ -264,6 +270,7 @@ export class Tasks {
   }
 
   dispatch(send: (peer: string, id: string, command: AttachV1Command) => boolean): void {
+    if (this.#closed()) return;
     const rows = this.#db.prepare("SELECT id, task_id AS taskId, peer, command_json AS json, predecessor_run_id AS predecessor FROM task_dispatches WHERE dispatched = 0 ORDER BY rowid").all() as unknown as { id: string; taskId: string; peer: string; json: string; predecessor: string | null }[];
     for (const row of rows) {
       const command = JSON.parse(row.json) as AttachV1Command;
@@ -294,6 +301,7 @@ export class Tasks {
   }
 
   declareSlashCommands(peer: string, commands: readonly string[]): void {
+    if (this.#closed()) return;
     this.#db.prepare("INSERT INTO task_slash_catalogs VALUES (?, ?) ON CONFLICT(peer) DO UPDATE SET commands_json = excluded.commands_json").run(peer, JSON.stringify(commands));
   }
 
