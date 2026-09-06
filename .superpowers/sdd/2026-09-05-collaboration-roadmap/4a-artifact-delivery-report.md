@@ -177,3 +177,86 @@ untouched and was not exercised beyond its typecheck.
   traffic to observe yet.
 - `pnpm -r test` was not run for this packet per the lead's ruling; the relay package has only its
   typecheck as evidence here.
+
+## Fix round 1 (review r0)
+
+Head after this round: `32b3c2c` "Fix round 1: disposition sanitizer, room membership, closed-store
+guard", on `codex/4a-artifact-delivery`, pushed. Node 24 (`PATH=/opt/homebrew/opt/node@24/bin:$PATH`)
+for every command. M1, M3, M4, M5 and M6 were deferred by the lead and are untouched.
+
+### I1, filename in `Content-Disposition`
+
+`packages/gateway/src/artifact-routes.ts` now builds the header with `attachmentDisposition()` from
+`hermes-bridge/documents.ts`, the same helper the four other download routes use. It strips control
+characters, reduces to an ASCII `filename`, and emits the RFC 5987 `filename*`, so a name that
+cannot be represented degrades rather than making the artifact permanently undownloadable.
+
+### I2, producer-supplied `room`
+
+`POST /attach/v1/artifacts` refuses a `room` whose membership does not contain the authenticated
+bot. `bot` and `createdBy` were already derived server-side; `room` was the one identity a peer
+supplied. An unknown room and a room the bot does not belong to are the same `403`, so neither can
+be probed. Membership is read from the existing `storage.botGroup(key).members`, no new authority.
+
+### I3, closed-store crash, at the root
+
+The guard now lives in one place, `Tasks.#closed()`, and every ingress-facing entry point the
+attach ingress reaches after teardown funnels through it: `hello`, `presence`, `reconcile`,
+`dispatch` and `declareSlashCommands`. That is all five seams the review named, including the
+`reconcile` and command flush that the still-armed heartbeat tick performs. The `presence` guard
+now runs BEFORE the in-memory `#live` set is touched, so the in-memory view cannot advance past a
+skipped durable projection. Admission paths are deliberately not guarded: they run inside a
+transaction on an open store or not at all.
+
+### M2, truthful `validation`
+
+`validation` now says what the bytes proved rather than why the commit failed: `mismatch` only for
+a digest or size mismatch, `unvalidated` when the bytes were never there to compare
+(`missing_bytes`), and `verified` for a `capacity` refusal, where the bytes did match and the store
+refused to retain them. `failureReason` still carries why. The closed contract set is unchanged, so
+this needed no additive row edit; the contract row prose records the mapping.
+
+### M7, producer routes registered unconditionally
+
+`http.ts` registers both halves unconditionally, because `/health` advertises 65 unconditionally. A
+gateway with no attach peer configured now answers a producer request with the `401` its own
+middleware returns, never a `404` that says the surface does not exist.
+
+### Red then green
+
+RED, three route findings (`scratchpad/4a/logs/r1-red-routes.log`):
+
+```
+PATH=/opt/homebrew/opt/node@24/bin:$PATH pnpm --filter cozygateway exec vitest run test/artifact-routes.test.ts
+Tests  3 failed | 7 passed (10)
+  expected 500 to be 200   (I1: the download threw on a CR/LF filename)
+  expected 201 to be 403   (I2: a non-member room was accepted)
+  expected 404 to be 401   (M7: the producer routes were absent)
+```
+
+RED, the closed-store regression (`scratchpad/4a/logs/r1-red-tasks.log`):
+
+```
+PATH=/opt/homebrew/opt/node@24/bin:$PATH pnpm --filter cozygateway exec vitest run test/tasks-closed-store.test.ts
+Tests  2 failed (2)
+  expected [Function] to not throw an error but 'Error: database is not open' was thrown   (x2)
+```
+
+GREEN, covering test files:
+
+| Command | Result |
+| --- | --- |
+| `pnpm --filter cozygateway exec vitest run test/artifact-routes.test.ts test/artifacts.test.ts test/tasks-closed-store.test.ts` | 3 files, 23 passed, exit 0 |
+| `pnpm --filter cozygateway exec vitest run` over the 18 files touching Tasks, attach ingress, rooms, storage and the new routes (`test/artifacts`, `test/artifact-routes`, `test/tasks-closed-store`, `test/durable-tasks`, `test/task-routes`, `test/task-public-ingress`, `test/task-terminal-immutability`, `test/attach-v1-ingress`, `test/attach-v1-media`, `test/attach-v1-storage`, `test/native-bot-data-plane`, `test/bots-rooms-interactions`, `test/bots-group-protocol`, `test/native-group-turn`, `test/server`, `test/documents`, `test/bots-attachments-routes`, `test/storage`) | 18 files passed, 302 passed, exit 0 |
+| `pnpm --filter cozygateway-contract exec vitest run test/artifacts.test.ts test/ext-bots.test.ts` | 2 files, 87 passed, exit 0 |
+| `pnpm --filter cozygateway-conformance exec vitest run` | 8 files, 84 passed / 19 skipped, exit 0 |
+| `pnpm -r typecheck` | exit 0, all four packages Done |
+
+New covering tests: `packages/gateway/test/artifact-routes.test.ts` gains "serves a filename
+carrying header control characters through the shared sanitizer" (I1), "refuses a room the
+producing bot is not a member of" (I2, both the refusal and a member room accepted and listed), and
+"registers the producer half on a gateway that has no attach peer configured" (M7).
+`packages/gateway/test/tasks-closed-store.test.ts` is new and covers I3: all five entry points on a
+closed store, and the still-armed heartbeat tick advanced under fake timers so a throw lands in the
+test body rather than as an uncaught exception. `packages/gateway/test/artifacts.test.ts` pins the
+M2 statuses. Full `pnpm -r test` not run, per the standing ruling.
