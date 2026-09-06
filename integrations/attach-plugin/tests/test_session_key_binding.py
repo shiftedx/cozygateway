@@ -13,6 +13,7 @@ its own loader-owned profile on the synthetic inbound source of a single-profile
 fakes pin that: they model the two derivations, not a Hermes install.
 """
 
+import asyncio
 import sys
 import types
 import unittest
@@ -27,7 +28,7 @@ if "websockets.exceptions" not in sys.modules:
 
 import cozygateway.adapter as adapter_module
 from cozygateway.adapter import AttachAdapter
-from cozygateway.attach_client import TurnFrame
+from cozygateway.attach_client import InterruptFrame, SteerFrame, TurnFrame
 
 THREAD = "native:sage:1"
 RUNNER_KEY = f"agent:main:cozygateway:dm:{THREAD}"
@@ -43,6 +44,20 @@ class _MessageEvent:
         self.metadata = metadata or {}
 
 
+class _Client:
+    """Only the terminal frames this file is about."""
+
+    def __init__(self):
+        self.failed = []
+        self.interrupted = []
+
+    async def send_failed(self, thread_id, turn_id, message):
+        self.failed.append((thread_id, turn_id, message))
+
+    async def send_interrupted(self, thread_id, turn_id):
+        self.interrupted.append((thread_id, turn_id))
+
+
 class _Runner:
     """The runner seam: profile-agnostic, exactly like a single-profile install."""
 
@@ -54,7 +69,9 @@ class _Runner:
         return f"agent:main:cozygateway:dm:{source.chat_id}"
 
 
-class SessionKeyBindingTests(unittest.IsolatedAsyncioTestCase):
+class _BindingHarness(unittest.IsolatedAsyncioTestCase):
+    """Shared fakes: the two derivations, plus a client that records terminal frames."""
+
     _MODULE_KEYS = ("gateway", "gateway.platforms", "gateway.platforms.base")
 
     def setUp(self):
@@ -83,6 +100,9 @@ class SessionKeyBindingTests(unittest.IsolatedAsyncioTestCase):
         adapter._profile = "polished-satellite"
         adapter.gateway_runner = _Runner()
         adapter.build_source = lambda **kwargs: types.SimpleNamespace(**kwargs)
+        adapter._client = _Client()
+        adapter._interrupt_seal_grace = 0.0
+        adapter._interrupt_sleep = lambda _seconds: asyncio.sleep(0)
         adapter.delivered = []
         adapter.dropped = []
 
@@ -100,6 +120,8 @@ class SessionKeyBindingTests(unittest.IsolatedAsyncioTestCase):
         adapter.handle_message = handle_message
         return adapter
 
+
+class SessionKeyBindingTests(_BindingHarness):
     async def test_a_turn_on_a_strictly_bound_thread_is_not_dropped(self):
         """The reported break: the binding is recorded with the runner key, and the adapter
         derivation must agree with it or every turn on that thread is dropped."""
@@ -138,6 +160,67 @@ class SessionKeyBindingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.dropped, [])
         self.assertEqual(len(adapter.delivered), 1)
         self.assertEqual(adapter.delivered[0].metadata, {})
+
+
+class RefusedFrameTerminalTests(_BindingHarness):
+    """No frame the plugin declines to dispatch may end in silence.
+
+    A silently dropped turn left the gateway holding a running turn for its full cap, and the
+    person's next message then arrived as a steer on a turn no restarted plugin held. Answering
+    it as a fresh inbound produced draft and commit events on ``<turn>:steer`` that the gateway
+    declined as orphaned, so the reply never reached the phone.
+    """
+
+    async def test_a_turn_whose_binding_no_longer_derives_is_failed_not_dropped(self):
+        adapter = self._adapter()
+        adapter._desktop_session_bindings[THREAD] = (
+            "agent:polished-satellite:cozygateway:dm:" + THREAD, "desktop-tip")
+
+        await adapter._handle_turn(TurnFrame(thread_id=THREAD, turn_id="turn-1", text="hi"))
+
+        self.assertEqual(adapter.delivered, [])
+        self.assertEqual(adapter.dropped, [])
+        self.assertEqual(adapter._client.failed, [
+            (THREAD, "turn-1", adapter_module.STALE_SESSION_BINDING_FAILURE)])
+        self.assertEqual(adapter._active_turn, {})
+
+    async def test_a_steer_for_a_turn_this_plugin_does_not_hold_is_failed(self):
+        adapter = self._adapter()
+
+        await adapter._handle_steer(SteerFrame(thread_id=THREAD, turn_id="turn-1", text="and now"))
+
+        self.assertEqual(adapter.delivered, [])
+        self.assertEqual(adapter._client.failed, [
+            (THREAD, "turn-1", adapter_module.UNKNOWN_TURN_FAILURE)])
+
+    async def test_a_steer_for_the_running_turn_is_still_injected(self):
+        adapter = self._adapter()
+        adapter._active_turn[THREAD] = "turn-1"
+
+        await adapter._handle_steer(SteerFrame(thread_id=THREAD, turn_id="turn-1", text="and now"))
+
+        self.assertEqual(adapter._client.failed, [])
+        self.assertEqual([event.message_id for event in adapter.delivered], ["turn-1:steer"])
+
+    async def test_an_interrupt_for_a_turn_this_plugin_does_not_hold_is_failed(self):
+        adapter = self._adapter()
+
+        await adapter._handle_interrupt(InterruptFrame(thread_id=THREAD, turn_id="turn-1"))
+
+        self.assertEqual(adapter.delivered, [])
+        self.assertEqual(adapter._client.interrupted, [])
+        self.assertEqual(adapter._client.failed, [
+            (THREAD, "turn-1", adapter_module.UNKNOWN_TURN_FAILURE)])
+
+    async def test_an_interrupt_for_the_running_turn_still_stops_and_seals(self):
+        adapter = self._adapter()
+        adapter._active_turn[THREAD] = "turn-1"
+
+        await adapter._handle_interrupt(InterruptFrame(thread_id=THREAD, turn_id="turn-1"))
+
+        self.assertEqual([event.text for event in adapter.delivered], ["/stop"])
+        self.assertEqual(adapter._client.failed, [])
+        self.assertEqual(adapter._client.interrupted, [(THREAD, "turn-1")])
 
 
 class SessionProfileRouteTests(unittest.IsolatedAsyncioTestCase):
