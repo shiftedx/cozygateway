@@ -1090,9 +1090,10 @@ Committed transcript history remains the recovery source after reconnect.
   room membership is resolved against gateway config as well as `profiles.list`, so a bot the
   roster is listing is never refused as "not a bot on this gateway", and a room whose members are
   all runtime bots is created and run without the Hermes Dashboard being consulted at all, on a
-  gateway with no `hermesEndpoints` entry at all as readily as on one that has them (capability
-  52): a room is gateway-owned, so the absence of an endpoint is never a reason to refuse one.
-  Only a room whose membership genuinely spans two Hermes endpoints is refused. The
+  gateway with no `hermesEndpoints` entry as well as on one with a single plain endpoint
+  (capability 52): a room is gateway-owned, so the absence of an endpoint is never a reason to
+  refuse one. A gateway with two or more endpoints, or a single `namespace: true` endpoint,
+  still refuses every room with 503 until rooms learn to span endpoints. The
   member turn is unchanged in every other respect: the same attach-v1 `turn` command on the same
   gateway-owned `group:<room>:<member>` thread, the same rounds, the same transcript. A member's
   display name and handle in the room come from its roster row, which for a runtime bot is the
