@@ -101,3 +101,83 @@ reads the file back after a write.
 - The tests deliberately cannot exercise the PyYAML branch on a runner without PyYAML. That branch
   is unchanged from the merged ST1 work and is what every real install uses; the suite reports when
   it could not run rather than counting it as covered.
+
+## Fix round 1 (the three Windows-runner failures on PR #381)
+
+Run 34037156600 got past the PyYAML preflight and then printed three `FAIL` lines. Only one of
+them actually failed the job: the log's single `##[error] Process completed with exit code 1`
+follows the streaming assertion at line 461. The other two are lines the suite prints and carries
+on past, which is why the job was green with them before. All three are addressed.
+
+### 1. `bootstrap recovery cannot restart an unsupported service platform`
+
+Not ST1's, and not a test-guard question: `scripts/install.sh` has said this since cbc0129 and
+neither ST1 (bbbd5fb8) nor ST1-F1 touched that file (`git diff 9698186e..bbbd5fb8 -- scripts/`
+lists five files, install.sh is not one). `bootstrap_service_platform` knew only `Darwin` and
+`Linux`, so on Git Bash (`uname -s` is `MINGW64_NT-...`) it died. The callers tolerate the failure,
+so the run continues, which is exactly why this could sit in a green job printing a scary line.
+
+Reproduced locally by putting a fake `uname` that answers `MINGW64_NT-10.0-22631` ahead of PATH and
+running `scripts/install.sh` against a scratch home: `FAIL  bootstrap recovery cannot restart an
+unsupported service platform`, twice.
+
+Fixed in the product, because the guard was answering the wrong question. Git Bash IS a supported
+host for this half of the install and has no POSIX service at all: persistence on Windows is the
+current-user Scheduled Task the Windows bootstrap owns, which this script must never touch. So
+`MINGW*|MSYS*|CYGWIN*|Windows*` is now the `Windows` platform, its service registration path is
+empty (which every reader already treats as "nothing registered", so the transaction records
+`service:absent:-`), and `restart_existing_owned_service`,
+`remove_new_owned_service_registration` and `bootstrap_service_is_owned_or_absent` return early
+instead of falling through to the systemd branch. Same fake-uname run after the fix: zero
+occurrences of that message.
+
+RED then GREEN: a new case at the end of `scripts/test/bootstrap-transaction.test.sh` (which
+sources install.sh's helpers directly) sets `COZYGATEWAY_SERVICE_PLATFORM=MINGW64_NT-10.0-22631`
+and asserts the platform, the empty path, the recorded absence and the no-op restart. Against the
+previous install.sh: `FAIL  bootstrap recovery cannot restart an unsupported service platform`
+then `FAIL: Git Bash is not recognised as a service platform`. After:
+`bootstrap transaction tests passed`.
+
+### 2. `line 403 exited 137: ... COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION=cozygateway.mjs`
+
+Not a failure at all: that run is killed on purpose, mid-promotion, to prove the bootstrap
+transaction recovers. The suite's own ERR trap printed it as a failure, and the same line prints on
+a fully green macOS run (it is in the round-0 log of this packet, above a `hermes installer dry-run
+tests passed`). Pre-existing, and a false alarm that costs a reader a round of chasing.
+
+Fixed in the test: the ERR trap is lifted for exactly that command and restored straight after.
+Written out inline rather than as a helper pair, because bash restores an ERR trap when a function
+that changed it returns, so a helper clears nothing (verified before relying on it). A green
+installer run now prints zero `FAIL` lines, where it printed one before.
+
+### 3. `expected output to contain: set display.streaming to true for Hermes profile ops`
+
+The real bug in our code, and the only one that failed the job. The runner's log shows the answer
+in the wrapping: `DRY   set display.streaming` then a new line beginning ` to true for Hermes
+profile ops`. A Windows interpreter translates `\n` into CRLF on a text stream, so every key the
+reader printed reached the shell with a carriage return glued to it. The installer would have gone
+on to run `hermes config set "display.streaming<CR>" true`, writing a key nobody can read back.
+
+Not the interpreter selection, not `python3 -S`, not the stdlib probe, not path handling: those all
+worked, as the same log shows (`streaming is already decided` for the two profiles that carry the
+keys, and both keys named for the profile that does not).
+
+Fixed twice over: the reader writes its answer through `sys.stdout.buffer` as bytes, which no
+interpreter newline convention can touch, and each caller pipes the read through `tr -d '\r'` (all
+three scripts run under `pipefail`, so a failing read still surfaces). RED then GREEN: the reader
+case in `plugin-rollout.test.sh` gained an interpreter that ends every line the Windows way. Against
+the previous reader: `FAIL: a carriage return from a Windows interpreter reached the caller`. After:
+`plugin rollout: ok`.
+
+### Tests
+
+Every suite below was run twice, once normally and once with `HOME` pointed at an empty directory,
+which hides the user site-packages and makes this machine PyYAML-free like the runner.
+
+- `scripts/test/plugin-rollout.test.sh`: `plugin rollout: ok` both ways, 15 cases (one new).
+- `scripts/test/hermes-installer.test.sh`: `hermes installer dry-run tests passed` both ways,
+  `exit=0`, and now zero `FAIL` lines in the output.
+- `scripts/test/bootstrap-transaction.test.sh`: `bootstrap transaction tests passed` both ways
+  (one new case).
+- `pnpm test:installer`, the whole chain: `exit=0`.
+- `pnpm -r typecheck` under Node 24: 4 of 4 projects `Done`.
