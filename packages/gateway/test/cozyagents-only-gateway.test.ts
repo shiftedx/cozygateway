@@ -249,7 +249,206 @@ describe("a gateway configured with no Hermes endpoint", () => {
     });
     expect(afterRevoke.status).toBe(401);
   });
+
+  /** V1-F1, capabilities 46 and 52. Rooms are gateway-owned attach-v1 conversations, so a room
+   *  whose members are all runtime bots needs no Hermes endpoint at all. Before this test the
+   *  route answered `503 backend_unavailable "cross-endpoint groups are not supported"`, because
+   *  zero endpoints selected the federated control surface and every group method there throws.
+   *
+   *  The whole room surface, over the real server: create, list, read, a message that actually fans
+   *  a member turn out to two attached runtime peers, and the Task each of those turns registers. */
+  it("creates a room of two runtime bots and fans a member turn out to both", async () => {
+    const l = await live();
+    const peers = await roomOfTwoRuntimeBots(l);
+
+    const created = await l.authed("/bots/groups", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Launch", members: ["sage", "pixel"] }),
+    });
+    expect(created.status).toBe(201);
+    expect(await created.json()).toMatchObject({ group: { name: "Launch", members: ["sage", "pixel"] } });
+
+    const listed = (await (await l.authed("/bots/groups")).json()) as { groups: Array<{ name: string }> };
+    expect(listed.groups.map((group) => group.name)).toEqual(["Launch"]);
+
+    const sent = await l.authed("/bots/groups/launch/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "plan the launch @sage @pixel" }),
+    });
+    expect(sent.status).toBe(202);
+
+    // The fan-out: every member is asked on its own gateway-owned `group:<room>:<member>` thread.
+    for (const [name, peer] of peers) {
+      const turn = await roomTurn(peer, name);
+      peer.socket.send(JSON.stringify({
+        kind: "event",
+        sequence: 1,
+        eventId: `commit:${name}`,
+        event: {
+          kind: "commit",
+          threadId: turn.threadId,
+          turnId: turn.turnId,
+          messageId: `reply:${name}`,
+          blocks: [{ type: "paragraph", text: `${name} is ready.` }],
+        },
+      }));
+    }
+
+    await until(() => l.gateway.storage.botGroupLog("launch").filter((row) => row.kind === "member").length >= 2);
+    const detail = (await (await l.authed("/bots/groups/launch")).json()) as {
+      members: string[];
+      messages: Array<{ from: { kind: string; name: string }; text: string }>;
+    };
+    expect(detail.members).toEqual(["sage", "pixel"]);
+    expect(detail.messages.map((message) => message.text)).toEqual(
+      expect.arrayContaining(["sage is ready.", "pixel is ready."]),
+    );
+
+    // Room Tasks: a member turn registers a Task scoped to the room, and the room's Task view is
+    // reachable on this gateway like any other.
+    const tasks = (await (await l.authed("/bots/groups/launch/tasks")).json()) as {
+      tasks: Array<{ bot: string; room?: string }>;
+    };
+    expect([...new Set(tasks.tasks.map((task) => task.bot))].sort()).toEqual(["pixel", "sage"]);
+    for (const task of tasks.tasks) expect(task.room).toBe("launch");
+  });
+
+  /** Capability 51 on the same gateway: a room member turn can ASK. The approval and its
+   *  resolution ride the ordinary interaction inbox and the unchanged 1:1 resolve route, both of
+   *  which were dead here before, because the room event hooks and the interaction deadline wheel
+   *  were wired only when the control surface happened to be a `HermesBridge`. */
+  it("carries a room turn's approval to the inbox and resolves it, with no Hermes endpoint", async () => {
+    const l = await live();
+    const peers = await roomOfTwoRuntimeBots(l);
+    await l.authed("/bots/groups", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Launch", members: ["sage", "pixel"] }),
+    });
+    await l.authed("/bots/groups/launch/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "ship it @sage" }),
+    });
+
+    const sage = peers.get("sage")!;
+    const turn = await roomTurn(sage, "sage");
+    sage.socket.send(JSON.stringify({
+      kind: "event",
+      sequence: 1,
+      eventId: "approval-event",
+      event: {
+        kind: "approval",
+        threadId: turn.threadId,
+        turnId: turn.turnId,
+        approvalId: "approval-1",
+        callId: "call-1",
+        name: "terminal:rm",
+        status: "pending",
+      },
+    }));
+
+    // The room says what it is blocked on, which is the badge a client renders.
+    await until(() => {
+      const groups = l.gateway.storage.botGroups();
+      return groups.length === 1 && l.gateway.storage.pendingNativeApprovals(["sage"], 10).length === 1;
+    });
+    const blocked = (await (await l.authed("/bots/groups/launch")).json()) as {
+      pendingInteractions?: Array<{ member: string; kind: string; id: string }>;
+    };
+    expect(blocked.pendingInteractions).toEqual([
+      { member: "sage", kind: "approval", id: "approval-1", turnId: turn.turnId },
+    ]);
+
+    // The unchanged 1:1 route resolves it, and the peer that asked gets the command.
+    const approved = await l.authed("/bots/sage/approvals/approval-1/approve", { method: "POST" });
+    expect(approved.status).toBe(202);
+    await until(() => sage.frames.some((frame) =>
+      frame["kind"] === "command" && frame["command"]?.["kind"] === "resolve_approval"));
+    const resolution = sage.frames.find((frame) =>
+      frame["kind"] === "command" && frame["command"]?.["kind"] === "resolve_approval")!;
+    expect(resolution["command"]).toMatchObject({
+      threadId: `group:launch:sage`,
+      turnId: turn.turnId,
+      approvalId: "approval-1",
+      decision: "approve",
+    });
+  });
+
 });
+
+interface RoomPeer {
+  socket: WebSocket;
+  frames: Array<Record<string, any>>;
+}
+
+/** Two runtime bots on one paired computer, each with a live attach-v1 socket dialed with the
+ *  credential the runner was handed in its `create_runtime` command. This is the whole population
+ *  of a CozyAgents-only gateway: no Hermes profile exists anywhere in it. */
+async function roomOfTwoRuntimeBots(l: Live): Promise<Map<string, RoomPeer>> {
+  const runner = await pairRunner(l, "kyle-mbp");
+  const ws = new WebSocket(`${l.gateway.url.replace("http", "ws")}/runner/v1`, {
+    headers: { authorization: `Bearer ${runner.runnerToken}` },
+  });
+  sockets.push(ws);
+  const runnerFrames: Array<{ kind: string; command?: string; payload?: { botId?: string; attachToken?: string } }> = [];
+  ws.on("message", (data) => runnerFrames.push(JSON.parse(String(data)) as { kind: string }));
+  await once(ws, "open");
+  ws.send(JSON.stringify({
+    kind: "hello",
+    version: 1,
+    runnerId: runner.runner.id,
+    name: "kyle-mbp",
+    platform: { os: "darwin", arch: "arm64", release: "24.5.0" },
+    agentVersion: "0.1.0",
+    backends: ["process"],
+  }));
+  await until(() => runnerFrames.some((frame) => frame.kind === "hello_ack"));
+
+  const peers = new Map<string, RoomPeer>();
+  for (const name of ["sage", "pixel"]) {
+    const created = await l.authed("/bots", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name, runtime: "cozyagents" }),
+    });
+    expect(created.status).toBe(201);
+    await until(() => runnerFrames.some(
+      (frame) => frame.command === "create_runtime" && frame.payload?.botId === name));
+    const token = runnerFrames.find(
+      (frame) => frame.command === "create_runtime" && frame.payload?.botId === name,
+    )?.payload?.attachToken;
+    expect(typeof token).toBe("string");
+    const socket = new WebSocket(`${l.gateway.url.replace("http", "ws")}/attach/v1`, {
+      headers: { authorization: `Bearer ${token!}` },
+    });
+    sockets.push(socket);
+    const frames: Array<Record<string, any>> = [];
+    socket.on("message", (data) => frames.push(JSON.parse(String(data)) as Record<string, unknown>));
+    await once(socket, "open");
+    socket.send(JSON.stringify({
+      kind: "hello",
+      version: 2,
+      instanceId: `runtime-${name}`,
+      capabilities: ["draft", "tools", "approvals", "clarify"],
+      resume: { eventSequence: 0, commandSequence: 0 },
+    }));
+    await until(() => frames.some((frame) => frame["kind"] === "hello_ack"));
+    peers.set(name, { socket, frames });
+  }
+  return peers;
+}
+
+/** The member turn a room dispatched to one peer, on its gateway-owned room thread. */
+async function roomTurn(peer: RoomPeer, name: string): Promise<{ threadId: string; turnId: string }> {
+  const isTurn = (frame: Record<string, any>): boolean =>
+    frame["kind"] === "command" && frame["command"]?.["threadId"] === `group:launch:${name}`;
+  await until(() => peer.frames.some(isTurn));
+  const command = peer.frames.find(isTurn)!["command"] as { threadId: string; turnId: string };
+  return { threadId: command.threadId, turnId: command.turnId };
+}
 
 /** Pairs one computer over the real `POST /pair {kind: "runner"}` route, which is what a create
  *  needs from capability 54 onward. */

@@ -34,7 +34,7 @@ function repairFromText(text: string | undefined): unknown {
   }
 }
 
-class AttachPeer {
+export class AttachPeer {
   #socket: WebSocket | undefined;
   #eventSequence = 0;
   #pending = new Map<string, Command>();

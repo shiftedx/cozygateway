@@ -8,6 +8,7 @@ import type {
 import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
 import type { BotControlSurface, BotFocusScreen, BotRoutineList, BotRosterView } from "./bridge.ts";
+import type { GatewayRoomHost } from "./group-rooms.ts";
 import type { ProfileConfigureResult } from "./profile.ts";
 import type { RoutineWriteResult } from "./routines.ts";
 
@@ -63,9 +64,15 @@ export class FederatedBotControlSurface implements BotControlSurface {
   readonly #members: Map<string, FederationMember>;
   readonly #broadcast?: (view: BotRosterView) => void;
   #overlay: ((bots: readonly BotSummary[]) => BotSummary[]) | undefined;
-  constructor(members: FederationMember[], broadcast?: (view: BotRosterView) => void) {
+  /** Rooms, when this surface is standing in for a gateway that has no Hermes endpoint at all
+   *  (finding V1-F1). A room is gateway-owned, so the absence of an endpoint is not a reason to
+   *  refuse one; genuinely cross-endpoint membership still is, and that case leaves this undefined
+   *  and keeps the refusal below. */
+  readonly #rooms: GatewayRoomHost | undefined;
+  constructor(members: FederationMember[], broadcast?: (view: BotRosterView) => void, rooms?: GatewayRoomHost) {
     this.#members = new Map(members.map((member) => [member.id, member]));
     this.#broadcast = broadcast;
+    this.#rooms = rooms;
   }
   #route(name: string): { member: FederationMember; profile: string } {
     const parsed = splitFederatedBotName(name);
@@ -129,9 +136,13 @@ export class FederatedBotControlSurface implements BotControlSurface {
   async patchRoutine(name: string, id: string, patch: BotRoutinePatch): Promise<RoutineWriteResult> { const r = this.#route(name); return r.member.bridge.patchRoutine(r.profile, id, patch); }
   async deleteRoutine(name: string, id: string): Promise<void> { const r = this.#route(name); return r.member.bridge.deleteRoutine(r.profile, id); }
   setFocus(deviceId: string, screen: BotFocusScreen | null): void { for (const member of this.#members.values()) member.bridge.setFocus(deviceId, screen); }
-  groups(): BotGroup[] { return []; }
-  createGroup(_name: string, _members: string[]): Promise<BotGroup> { throw new BackendUnavailable("cross-endpoint groups are not supported"); }
-  deleteGroup(_name: string): void { throw new BackendUnavailable("cross-endpoint groups are not supported"); }
-  groupDetail(_name: string): BotGroupDetail { throw new BackendUnavailable("cross-endpoint groups are not supported"); }
-  sendGroupMessage(_name: string, _text: string, _opts?: { clientId?: string }): BotGroupMessage { throw new BackendUnavailable("cross-endpoint groups are not supported"); }
+  #hostedRooms(): GatewayRoomHost {
+    if (this.#rooms === undefined) throw new BackendUnavailable("cross-endpoint groups are not supported");
+    return this.#rooms;
+  }
+  groups(): BotGroup[] { return this.#rooms?.groups() ?? []; }
+  createGroup(name: string, members: string[]): Promise<BotGroup> { return this.#hostedRooms().createGroup(name, members); }
+  deleteGroup(name: string): void { this.#hostedRooms().deleteGroup(name); }
+  groupDetail(name: string): BotGroupDetail { return this.#hostedRooms().groupDetail(name); }
+  sendGroupMessage(name: string, text: string, opts?: { clientId?: string }): BotGroupMessage { return this.#hostedRooms().sendGroupMessage(name, text, opts ?? {}); }
 }
