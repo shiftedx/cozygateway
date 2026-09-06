@@ -216,6 +216,9 @@ export class Artifacts {
       .get(deliveryId, artifactId) as DeliveryRow | undefined;
     if (delivery === undefined) return { outcome: "not_found" };
     if (delivery.state === state) return { outcome: "replayed", record: this.#record(row) };
+    // States never regress. A client that downloaded the bytes before the producer's report
+    // arrived has already proved the delivery, so that late report is a replay, not a conflict.
+    if (state === "delivered" && delivery.state === "acknowledged") return { outcome: "replayed", record: this.#record(row) };
     if (delivery.state !== "queued") return { outcome: "conflict", record: this.#record(row) };
     if (state === "delivered")
       this.#db.prepare("UPDATE artifact_deliveries SET state = 'delivered', delivered_at = ? WHERE delivery_id = ?").run(at, deliveryId);

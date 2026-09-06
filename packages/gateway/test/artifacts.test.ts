@@ -147,6 +147,11 @@ describe("durable Artifact records", () => {
     expect(storage.artifacts.acknowledge("artifact-1", 146)).toBe(false);
     expect(storage.artifacts.retryDelivery("sage", "artifact-1", "delivery-2", 150).outcome).toBe("conflict");
     expect(storage.artifacts.settleDelivery("other-bot", "artifact-1", first, "failed", 150).outcome).toBe("not_found");
+    // A producer report that arrives after the client already downloaded is a replay, and a
+    // failure can never un-deliver an acknowledged attempt.
+    expect(storage.artifacts.settleDelivery("sage", "artifact-1", first, "delivered", 160).outcome).toBe("replayed");
+    expect(storage.artifacts.settleDelivery("sage", "artifact-1", first, "failed", 160).outcome).toBe("conflict");
+    expect(storage.artifacts.get("artifact-1")?.delivery).toMatchObject({ state: "acknowledged", deliveredAt: 130, acknowledgedAt: 145 });
     expect(storage.artifacts.settleDelivery("sage", "artifact-1", "delivery-guessed", "failed", 150).outcome).toBe("not_found");
   });
 

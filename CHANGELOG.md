@@ -7,6 +7,15 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## Unreleased
 
+- Durable Artifacts and independent delivery (`com.cozylabs.bots` capability 65): a declared Task
+  output becomes a gateway-owned record with a stable identity, provenance to its Bot, producing
+  peer, session, Task and Run, and byte evidence. Commitment recomputes the SHA-256 and byte count
+  over the bytes the existing attach media route already stored, so metadata alone commits nothing
+  and a mismatch, absent bytes or an exceeded `artifactStoreBytes` ceiling is recorded visibly.
+  Originals are retained until an explicit deletion, which leaves a truthful tombstone while the
+  bytes stop being reachable. Delivery is a separate object with its own identity and retries, so a
+  failed delivery leaves a completed Task completed. Capability 65 is also the canonical Artifact
+  commitment producer capability 64 declared and left absent.
 - The per-server MCP repair policy is declared before it is emitted (`com.cozylabs.bots` capability
   63): `BotMcpServer` gains optional `repair`, closed to `approve_once` or `auto_refresh`, carried
   on the existing capability-48 `bot_config` `profile.read`. It is read-only metadata the gateway

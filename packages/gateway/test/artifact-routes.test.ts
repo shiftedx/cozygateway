@@ -73,6 +73,11 @@ describe("Artifact public routes", () => {
     expect(content.headers.get("content-disposition")).toContain("report.pdf");
     expect(content.headers.get("x-content-type-options")).toBe("nosniff");
     expect(new Uint8Array(await content.arrayBuffer())).toEqual(BYTES);
+    // The reference a large-file alternate delivery hands out is this gateway-relative location,
+    // never a host path and never a credential.
+    const record = await (await device("/artifacts/artifact-2")).json() as { location: string };
+    expect(record.location).toBe("/artifacts/artifact-2/content");
+    expect(JSON.stringify(record)).not.toMatch(/\/Users\/|\/home\/|Bearer |peer-secret/);
     // Download by an authenticated client is the acknowledgement, and repeating it updates once.
     const acknowledged = await (await device("/artifacts/artifact-2")).json() as { delivery: { state: string; acknowledgedAt: number } };
     expect(acknowledged.delivery).toMatchObject({ state: "acknowledged", acknowledgedAt: 100 });
