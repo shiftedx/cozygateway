@@ -483,6 +483,7 @@ export async function startGateway(
   const hub = new WsHub({
     storage, gatewayInfo, now: () => Date.now(), trace: traceLog,
     onMobileResult: (deviceId, frame) => mobileNode?.result(deviceId, frame),
+    onMobileProgress: (deviceId, frame) => mobileNode?.progress(deviceId, frame),
     onDeviceDisconnect: (deviceId) => mobileNode?.disconnectDevice(deviceId),
     onMobileAvailable: (deviceId) => mobileNode?.reconnectDevice(deviceId),
   });
@@ -881,6 +882,10 @@ export async function startGateway(
     send: (deviceId, frame) => hub.sendMobileNodeFrame(deviceId, frame),
     result: (agentId, frame) => { attachV1Ingress.sendMobileResult(agentId, frame); },
     receipt: (receipt) => nativeBotPlane?.recordMobileReceipt(receipt) !== undefined,
+    // Capability 68. The typed lifecycle is written from what the gateway already owns: its own
+    // routing decision, its lease, the media claim and the settlement. No peer sends a step, so a
+    // Hermes peer gets the whole lifecycle without a line of change.
+    lifecycle: (event) => { storage.recordBotMobileRequest(event); },
     trace: traceLog,
   });
   storage.tasks.expireDevices((peer, run, id, at) => mobileNode?.expireRequest(peer, run, id, at));
@@ -1084,6 +1089,17 @@ export async function startGateway(
   // an operator who sets nothing gets the conservative default rather than an unbounded store.
   storage.artifacts.capacity(config.artifactStoreBytes ?? DEFAULT_ARTIFACT_STORE_BYTES);
   storage.tasks.observe((frame) => hub.broadcast(frame), BOTS_CAPABILITY_VERSION);
+  // Capability 68: a backgrounded phone learns its Task finished. A device holding a live socket
+  // got the frame above and is excluded inside the notifier, and the announcement itself fires
+  // only on the transition that wrote capability 64's completion notification record.
+  storage.tasks.completions((notice) => {
+    notifier.notifyTaskCompletion({
+      kind: "task_completed",
+      taskId: notice.taskId,
+      threadId: notice.room === undefined ? `bot:${notice.bot}` : `group:${notice.room}`,
+      agentId: notice.bot,
+    }, hub.connectedDeviceIds());
+  });
   const app = createApp({
     storage,
     flushTaskCommands: () => attachV1Ingress.flushTaskCommands(),

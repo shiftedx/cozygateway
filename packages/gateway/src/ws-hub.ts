@@ -7,6 +7,7 @@ import {
   type GatewayInfo,
   type MobileNodeRequestFrame,
   type MobileNodeCancelFrame,
+  type MobileNodeProgressFrame,
   type MobileNodeResultFrame,
   type ServerFrame,
   ClientFrameSchema,
@@ -56,6 +57,7 @@ export class WsHub {
   readonly #wss: WebSocketServer;
   readonly #trace: TraceLog | undefined;
   readonly #onMobileResult: ((deviceId: string, frame: MobileNodeResultFrame) => void) | undefined;
+  readonly #onMobileProgress: ((deviceId: string, frame: MobileNodeProgressFrame) => void) | undefined;
   readonly #onDeviceDisconnect: ((deviceId: string) => void) | undefined;
   readonly #onMobileAvailable: ((deviceId: string) => void) | undefined;
   readonly #pendingConnections: PendingWebsocketLimiter;
@@ -68,6 +70,7 @@ export class WsHub {
     heartbeatMs?: number;
     trace?: TraceLog;
     onMobileResult?: (deviceId: string, frame: MobileNodeResultFrame) => void;
+    onMobileProgress?: (deviceId: string, frame: MobileNodeProgressFrame) => void;
     onDeviceDisconnect?: (deviceId: string) => void;
     onMobileAvailable?: (deviceId: string) => void;
     /** Test seam; production keeps a bounded unauthenticated handshake pool. */
@@ -79,6 +82,7 @@ export class WsHub {
     this.#authTimeoutMs = deps.authTimeoutMs ?? 10_000;
     this.#trace = deps.trace;
     this.#onMobileResult = deps.onMobileResult;
+    this.#onMobileProgress = deps.onMobileProgress;
     this.#onDeviceDisconnect = deps.onDeviceDisconnect;
     this.#onMobileAvailable = deps.onMobileAvailable;
     this.#pendingConnections = new PendingWebsocketLimiter(deps.maxPendingConnections ?? PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS);
@@ -216,6 +220,13 @@ export class WsHub {
       if (frame.type === "mobile_node_result") {
         if (this.#mobileNodes.get(client.deviceId) === client)
           this.#onMobileResult?.(client.deviceId, frame);
+        return;
+      }
+      // Capability 68. Same selected-socket rule the result above follows: only the socket this
+      // device's requests were routed to can say anything about one.
+      if (frame.type === "mobile_node_progress") {
+        if (this.#mobileNodes.get(client.deviceId) === client)
+          this.#onMobileProgress?.(client.deviceId, frame);
         return;
       }
 

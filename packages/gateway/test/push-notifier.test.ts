@@ -489,3 +489,52 @@ describe("RelayNotifier.notifyApproval", () => {
     storage.close();
   });
 });
+
+/** Capability 68's push leg (contract/push-v0.md, `task_completed`). A backgrounded phone learns a
+ *  Task finished. It carries the deep link's identities and nothing the Task worked on, and a
+ *  device holding a live socket already announced from `bot_task_updated`, so it is not told twice. */
+describe("RelayNotifier.notifyTaskCompletion", () => {
+  const registration = { deviceId: "d1", pushId: "p1", relayUrl: "http://relay.test", pushKey: "key-1" };
+  const payload = {
+    kind: "task_completed" as const,
+    taskId: "task_9",
+    threadId: "bot:scout",
+    agentId: "scout",
+  };
+
+  it("sends the payload under its category, collapsed on the task id, with no user content", async () => {
+    const storage = seeded([registration]);
+    const { impl, sent } = fetchStub(() => 202);
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notifyTaskCompletion(payload, new Set());
+    await settle();
+
+    expect(sent).toHaveLength(1);
+    const body = sent[0]!.body as unknown as { category: string; collapseId: string; ciphertext: string };
+    expect(body.category).toBe("task.completed");
+    expect(body.collapseId).toBe("task_9");
+    expect(JSON.parse(JSON.stringify(decrypt("key-1", body.ciphertext)))).toEqual(payload);
+    storage.close();
+  });
+
+  it("does not push to a device whose socket is connected", async () => {
+    const storage = seeded([registration]);
+    const { impl, sent } = fetchStub(() => 202);
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} })
+      .notifyTaskCompletion(payload, new Set(["d1"]));
+    await settle();
+    expect(sent).toEqual([]);
+    storage.close();
+  });
+
+  it("refuses a task id that cannot be a collapse id rather than truncating it", async () => {
+    const storage = seeded([registration]);
+    const { impl, sent } = fetchStub(() => 202);
+    const log: string[] = [];
+    new RelayNotifier({ storage, fetchImpl: impl, log: (line) => log.push(line) })
+      .notifyTaskCompletion({ ...payload, taskId: "task with spaces" }, new Set());
+    await settle();
+    expect(sent).toEqual([]);
+    expect(log[0]).toMatch(/collapse id/);
+    storage.close();
+  });
+});

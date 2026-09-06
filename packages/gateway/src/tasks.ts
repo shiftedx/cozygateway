@@ -10,6 +10,7 @@ export interface TaskArtifactReference { artifactId: string; status: "pending" |
 /** Initiative 4 binds this to its canonical declaration/commitment reader. No attachment or
  * delivery record is evidence. Missing previously declared references remain unproven. */
 export type TaskArtifactReader = (source: { taskId: string; bot: string; peer: string; sessionId: string; runId: string }) => readonly TaskArtifactReference[];
+export interface TaskCompletionNotice { taskId: string; bot: string; room?: string }
 export interface TaskRecoveryDecision { taskId: string; runId: string; issuer: string; decisionId: string; reason: string }
 /** Only a trusted canonical operator/policy producer may bind this reader. */
 export type TaskRecoveryDecisionReader = (source: { taskId: string; bot: string; runId: string }) => TaskRecoveryDecision | undefined;
@@ -27,6 +28,7 @@ export class Tasks {
   #bootAt = Date.now();
   #reconciling = false;
   #observer: ((frame: ServerFrame) => void) | undefined;
+  #completion: ((notice: TaskCompletionNotice) => void) | undefined;
   #expireInteraction: ((bot: string, kind: "approval" | "clarify", id: string, at: number) => void) | undefined;
   #expireDevice: ((peer: string, runId: string, id: string, at: number) => void) | undefined;
   #recoveryDecision: TaskRecoveryDecisionReader | undefined;
@@ -93,6 +95,11 @@ export class Tasks {
   ownerDeleted(bot: string, at: number): void {
     this.atomic(() => { for (const view of this.list({ bot })) if (!TERMINAL.has(view.state)) this.append(view.taskId, `owner-deleted:${bot}`, "cancelled", "owner_deleted", "gateway", at, { kind: "run", id: view.currentRun.runId }); });
   }
+
+  /** Capability 68's push leg. Called at most once per Task, in the same guarded post-commit step
+   * the update frame goes out on, and only when this transition wrote the completion notification
+   * record capability 64 already keeps. */
+  completions(notify: (notice: TaskCompletionNotice) => void): void { this.#completion = notify; }
 
   observe(observer: (frame: ServerFrame) => void, capabilityVersion = 64): void { this.#observer = capabilityVersion >= 64 ? observer : undefined; }
 
@@ -504,13 +511,19 @@ export class Tasks {
     const event: TaskEvent = { taskId, seq: (last?.seq ?? 0) + 1, at, from: last?.to ?? null, to, reason, actor, ...(ref === undefined ? {} : { ref }) };
     assertValid(TaskEventSchema, event);
     this.#db.prepare("INSERT INTO task_events VALUES (?, ?, ?, ?)").run(taskId, event.seq, source, JSON.stringify(event));
-    if (to === "completed") this.#db.prepare("INSERT OR IGNORE INTO task_completion_notifications VALUES (?, ?)").run(taskId, at);
-    if (this.#observer !== undefined) {
+    // The completion notification record is written once, and whether it was written HERE is the
+    // deduplication key for the out-of-band announcement below: a replayed or reapplied terminal
+    // finds the row already there and announces nothing.
+    const announce = to === "completed"
+      && this.#db.prepare("INSERT OR IGNORE INTO task_completion_notifications VALUES (?, ?)").run(taskId, at).changes === 1;
+    if (this.#observer !== undefined || announce) {
       const view = this.#read(taskId)!.view;
       queueMicrotask(() => {
         try {
           const stored = this.#db.prepare("SELECT event_json AS json FROM task_events WHERE task_id = ? AND seq = ?").get(taskId, event.seq) as { json: string } | undefined;
-          if (stored?.json === JSON.stringify(event)) this.#observer?.({ type: "bot_task_updated", event, view });
+          if (stored?.json !== JSON.stringify(event)) return;
+          this.#observer?.({ type: "bot_task_updated", event, view });
+          if (announce) this.#completion?.({ taskId, bot: view.bot, ...(view.room === undefined ? {} : { room: view.room }) });
         } catch { /* Socket emission is best effort; the committed stream is the reconnect source. */ }
       });
     }

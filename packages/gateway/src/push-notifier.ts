@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 import type { Storage, PushRegistrationRow } from "./storage.ts";
 import type { Notifier } from "./turns.ts";
-import { encryptPushPayload, type ApprovalPushPayload, type PushPayload } from "./push-crypto.ts";
+import { encryptPushPayload, type ApprovalPushPayload, type PushPayload, type TaskCompletionPushPayload } from "./push-crypto.ts";
 import { emitTrace, traceId, type TraceLog } from "./trace.ts";
 
 export const PREVIEW_MAX_CHARS = 200;
@@ -17,6 +17,7 @@ const APPROVAL_CATEGORY = {
 } as const;
 
 const CHAT_MESSAGE_CATEGORY = "message";
+const TASK_COMPLETED_CATEGORY = "task.completed";
 const MOBILE_NODE_WAKE_ROUTING = {
   category: "mobile.status.wake",
   collapseId: "mobile.status",
@@ -199,6 +200,31 @@ export class RelayNotifier implements Notifier {
       void this.#send(registration, payload, { category, collapseId }).catch((err: unknown) => {
         this.#log(
           `push: approval notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  }
+
+  /** A Task finished while the phone was backgrounded. Same fire-and-forget contract and the same
+   *  targeting rule as every leg above: a device holding a live socket already got the
+   *  `bot_task_updated` frame and announced from it, so it is excluded rather than told twice. The
+   *  other half of that deduplication is the caller's: this is invoked only when capability 64's
+   *  completion notification record was newly written for the Task, which happens once. */
+  notifyTaskCompletion(payload: TaskCompletionPushPayload, connectedDeviceIds: ReadonlySet<string>): void {
+    const collapseId = payload.taskId;
+    if (!COLLAPSE_ID_RE.test(collapseId)) {
+      // Refused rather than truncated, for the reason the approval leg gives: two ids sharing a
+      // 64-byte prefix would collapse into one notification.
+      this.#log(`push: task completion not sent: its taskId cannot be a collapse id (contract/push-v0.md)`);
+      return;
+    }
+    const registrations = this.#registrations();
+    if (registrations === undefined) return;
+    const targets = registrations.filter((registration) => !connectedDeviceIds.has(registration.deviceId));
+    for (const registration of targets) {
+      void this.#send(registration, payload, { category: TASK_COMPLETED_CATEGORY, collapseId }).catch((err: unknown) => {
+        this.#log(
+          `push: task completion notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`,
         );
       });
     }

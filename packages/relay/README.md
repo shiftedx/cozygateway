@@ -112,6 +112,8 @@ shipped before. Registered categories:
 | `message` | `alert` | `message` | CozyChat / "New message" | digest of bot name + canonical chat session, required |
 | `approval.pending` | `alert` | `approval.pending` | CozyChat / "Approval requested" | `toolCallId`, required |
 | `approval.resolved` | `alert` | `approval.resolved` | CozyChat / "Approval resolved" | `toolCallId`, required |
+| `mobile.status.wake` | `background` | omitted | none | `mobile.status`, required |
+| `task.completed` | `alert` | `task.completed` | CozyChat / "Task completed" | `taskId`, required |
 
 On APNs the category becomes `aps.category` and the collapse id becomes the
 `apns-collapse-id` header. On a webhook the same two fields are added to the delivered
@@ -146,6 +148,8 @@ AES-256-GCM construction, see `contract/push-v0.md`), because it is the same env
 
     { "kind": "approval_resolved", "threadId": "...", "agentId": "...", "turnId": "...",
       "toolCallId": "...", "outcome": "approved" | "denied" | "expired" }
+
+    { "kind": "task_completed", "taskId": "...", "threadId": "...", "agentId": "..." }
 
 `argSummary` is **key names and type tags only** (`{ "command": "string" }`), never a raw
 argument value. The proposal's `collabId` maps to cozygateway's `threadId` (contract v1

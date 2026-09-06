@@ -38,7 +38,7 @@ function harness(options: {
   now?: () => number;
 } = {}) {
   const lifecycle = vi.fn<(event: MobileNodeLifecycleEvent) => void>();
-  const send = vi.fn(() => "sent" as const);
+  const send = vi.fn((_deviceId: string, _frame: unknown) => "sent" as const);
   const result = vi.fn();
   const broker = new MobileNodeBroker({
     lifecycle,
@@ -52,9 +52,9 @@ function harness(options: {
   return { broker, lifecycle, send, result };
 }
 
-function states(lifecycle: { mock: { calls: [MobileNodeLifecycleEvent][] } }, requestId: string): string[] {
+function states(lifecycle: { mock: { calls: unknown[][] } }, requestId: string): string[] {
   return lifecycle.mock.calls
-    .map(([event]) => event)
+    .map((call) => call[0] as MobileNodeLifecycleEvent)
     .filter((event) => event.requestId === requestId)
     .map((event) => event.state);
 }
@@ -213,7 +213,7 @@ describe("capability-68 typed phone capability request lifecycle", () => {
 
     expect(send.mock.calls.length).toBe(dispatched);
     expect(send.mock.calls.every((call) => call[0] === "phone-a")).toBe(true);
-    expect(lifecycle.mock.calls.every(([event]) => event.deviceId !== "phone-b")).toBe(true);
+    expect(lifecycle.mock.calls.every((call) => (call[0] as MobileNodeLifecycleEvent).deviceId !== "phone-b")).toBe(true);
   });
 });
 
@@ -290,5 +290,40 @@ describe("capability-68 reconciliation route", () => {
   it("requires the conversation the request is scoped to", async () => {
     const response = await mount({ mobileRequests: vi.fn(() => []) }).request("/bots/sage/mobile-requests");
     expect(response.status).toBe(400);
+  });
+});
+
+/** The push half of row 68: a backgrounded phone learns a Task finished. The announcement is
+ *  deduplicated against capability 64's own completion notification record, so a reapplied or
+ *  replayed terminal announces nothing a second time. */
+describe("capability-68 Task completion announcement", () => {
+  it("announces once, on the transition that wrote the completion notification record", async () => {
+    const store = openStorage(":memory:");
+    store.tasks.clock(() => 0);
+    const announced: { taskId: string; bot: string; room?: string }[] = [];
+    store.tasks.completions((notice) => announced.push(notice));
+    const sessionId = store.nativeBotChat("sage", 1).sessionId;
+    const command = store.enqueueAttachCommand(
+      "sage", "command",
+      { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "Check the build" },
+      2,
+    );
+    store.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+    const taskId = store.tasks.list({ bot: "sage" })[0]!.taskId;
+    const final = {
+      kind: "event" as const, sequence: 1, eventId: "final",
+      event: {
+        kind: "commit" as const, threadId: sessionId, turnId: "run", messageId: "reply",
+        blocks: [{ type: "paragraph" as const, text: "Verified" }],
+      },
+    };
+    store.acceptAttachEvent("sage", final, 4);
+    // The same terminal, replayed: the record is already there, so nothing is announced again.
+    store.acceptAttachEvent("sage", final, 5);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(announced).toEqual([{ taskId, bot: "sage" }]);
+    expect(store.tasks.read(taskId)?.view.notification?.taskId).toBe(taskId);
+    store.close();
   });
 });

@@ -31,7 +31,7 @@ does not connect to Hermes or attach-v1.
 ## Discovery and capability history
 
 ```
-"capabilities": { "com.cozylabs.bots": 67 }
+"capabilities": { "com.cozylabs.bots": 68 }
 ```
 
 Versioned additions are additive and clients compare `>=`, never equality. Explicitly withdrawn or
@@ -107,6 +107,7 @@ and does not register `/bots` routes.
 | 65 | Durable gateway Artifacts: byte-verified commitment over the bytes the existing attach media route stored, retained originals, explicit deletion with a tombstone, supersession and versions, a delivery lifecycle with its own identity and retries, and the gateway's own `derived` records for attachments a peer delivered without declaring one. See the Artifact surface below. |
 | 66 | An approval can name exactly what it would do, and a decision can leave a standing policy: `ApprovalEvent` on attach-v1 gains optional `scope`, one typed block a runtime peer sends alongside an approval it raises. The block is `BotApprovalScope`: `kind` (`scoped_approval`), `action` (the action type, 1-64 characters), `category` (closed: `money_movement`, `secret_access`, `destructive`, `lock_or_alarm`, `public_publishing`, `account_change`, `other`), `system` (the target system, 1-64), `resource` (the target resource, 1-256), `change` (the exact material change in one sentence, 1-400), `effects` (0-16 entries of 1-200 naming what else happens), `reason` (`always_require`, `guardrail`, `peer_policy`, `first_use`), `payloadHash` (lowercase sha256 hex of the exact payload, the BINDING), `expiresAt` (gateway-clock milliseconds), `retry` (`idempotent`, `not_idempotent`, `unknown`) and `requested` (`once`, `category`). Every set is closed, the object is closed, and no secret, credential, URL, header or env value is ever in a string: `change` and `effects` describe an action, they never carry its arguments. The gateway treats the block exactly as capability 62 treats `repair`: it validates the closed sets and bounds and refuses any C0/C1 control or Unicode Format (Cf) character, a lone surrogate, or a whitespace-only value, and a block that fails is DROPPED while the approval is KEPT, with one bounded content-free log line; a valid block is carried byte for byte on `bot_approval_pending`, the durable interaction record, the `GET /bots/approvals` inbox row, and the rebroadcast a reconnecting app gets. Dropping FAILS CLOSED: a plain approval can leave no grant behind and can be covered by none. BINDING AND GRANTS: `POST /bots/:name/approvals/:toolCallId/approve` gains an OPTIONAL `BotApprovalDecisionRequest` body, `{ grant?: "once" | "category", expiresAt? }`. No body is the pre-66 request and reaches the surface unchanged. A STANDING GRANT EXISTS ONLY WHERE A PERSON ASKED FOR ONE: a body-less approve, which is what every client below 66 sends and what tapping Approve sends, is one decision on one ask and records no policy at all. `grant: "once"` records a grant bound to profile, user, conversation, task, target, payload hash and expiration that covers AT MOST ONE later ask, is consulted only when the peer called the retry `idempotent`, and dies at the raising ask's own `expiresAt` or ten minutes from the decision, whichever is sooner, so the value the peer chose can only shorten it and never extend it. `grant: "category"` records a grant covering any payload of that action on that resource until `expiresAt` (required, in the future, at most one day away, `400 invalid_request` otherwise) or revocation. A decision carries at most one grant: a second decision asking for a different one is `409 approval_grant_not_recorded`, which says the decision stands and the policy was not created, because reporting success for a policy change that did not happen is worse than refusing it. A PLAIN APPROVAL CAN BE BOUND TOO, so a peer that will never send a block still benefits without changing: where a plain ask carries deterministic content, which on this wire is the rule NAME plus the capability-56 `detail` sentence naming what it concretely covers, the gateway hashes those into the same payload binding a typed ask gets, under its own target system `attach` so a derived binding can never match a grant a typed peer made against a system it named, and an explicit `once` grant then covers a later IDENTICAL plain ask under the same expiry and single-use rules. ONLY a once grant: a category grant requires a DECLARED category and never covers a plain ask, at the consult and at creation both, because a plain ask declares none and the always-require exclusion therefore cannot bite on it, so a standing category policy over one would silently pre-approve a destructive or publishing action nobody classified. Asking for a category grant on such an ask is `409 approval_category_undeclared`, which says one decision at a time is what is on offer, and no category grant matching a derived binding by any other route can answer for it either. Where a plain ask has no such content, a rule name alone being a KIND of ask rather than one ask, it is UNCOVERABLE: asking for a grant on it is `409 approval_scope_required` and no later ask is ever covered. The derived binding is internal: it is never emitted on a frame, never stored on the record, and never sent to a peer, a plain approval renders and settles exactly as it did before 66, and only a client at 66 can create the grant that covers one. The gateway records `other` on a grant derived from a plain ask, which is a placeholder for undeclared and never a claim that the action is harmless, which is exactly why a category grant is refused over one. A plain ask also claims no idempotency, so once coverage of it rests on the person's own single-use grant, the same task and the ask's own expiry rather than on a claim. A GRANT IS A POLICY RECORD, never a stored payload to replay: a changed material field changes `payloadHash` and no standing approval covers it, and an expired grant is dead whatever its scope says. The six always-require categories are covered by no grant: none is recorded for one, none is ever consulted for one, and `grant: "category"` on one is `409 approval_category_forbidden` (`409 approval_scope_required` when the approval carries no block to bound a grant by). THE TRUST BOUNDARY IS EXPLICIT: `category` is ASSERTED BY THE PEER, and the gateway has no way to classify an action at this seam, so the guarantee is only that a category the peer declared always-require is never covered by a grant. Classifying the action correctly belongs to the harness that raises it (packet 5b); the `change` sentence on the card is the person's own independent check, and it is why the card is rendered even when a grant covers the ask. When a grant does cover an ask, the gateway still raises the card, names the grant on `bot_approval_pending.grantId` AND on the durable record, and settles it through the same `resolve_approval` a tapped card sends: it relays and validates, it never executes. Because the grant is on the record, the rebroadcast on reconnect and the `BotPendingApproval` inbox row carry `grantId` too, so a person who was not watching still learns which standing approval answered for them, and can `DELETE` that grant or DENY that one ask: a deny on an ask the gateway settled from a grant REPLACES the gateway's requested decision rather than colliding with it (`409 approval_resolution_pending` still answers a second decision the gateway did not make). The first TERMINAL is untouched: this replaces a requested marker, and the peer's terminal remains the only proof either way. `GET /bots/:name/approvals/grants` is the revocation view (`BotApprovalGrant` rows: the grant id, its scope, the action, category, system, resource, conversation, expiry and creation time, never the deciding device, the payload hash or a payload value), and `DELETE /bots/:name/approvals/grants/:grantId` ends one immediately, `404` for a grant this gateway does not hold. The view is the newest 100 live grants for that bot, and IT IS THE SAME BOUNDED WINDOW THE CONSULT READS: a grant outside the window is consulted by nothing, so every grant that can answer for a person is a grant that person can see and revoke. A spent `once` grant, an expired grant and a revoked grant are all dead and appear in neither. Decision logs and traces carry ids, reason codes and the grant id only. Additive: an approval with no block, and a decision sent with no body, are byte identical to their pre-66 selves on every surface, and a peer emits `scope` only when the gateway advertised `com.cozylabs.bots >= 66` on `hello_ack`; a client renders the card, sends a body, or opens the revocation view only on `>= 66`. |
 | 67 | CozyApps dashboard records: saved editable input values, action receipts with source-attributed data snapshots, and the small typed document envelope. The RECORDS THEMSELVES are gated by `com.cozylabs.cozyapps: 2` and, on the bot side, by the attach-v1 `cozyapps_dashboard` capability; this bots row is the cross-reference that numbers them, and a client reads the routes and frames off `com.cozylabs.cozyapps` rather than off this version. See `contract/ext-cozyapps-v1.md`, section CozyApps 2, for the routes, frames, bounds and the derivation a peer at cozyapps 1 gets for free. Additive: every v1 route, frame, node and action behavior is byte identical for a peer and a client that negotiate neither, and no member is added to `CozyApp` or `CozyAppAction`. |
+| 68 | Typed phone capability request lifecycle: every phone capability request carries one typed state and ends in exactly one typed terminal state, bound to the profile, conversation, turn, paired device and the person that device is paired to. `GET /bots/:name/mobile-requests?sessionId=` is the reconciliation read. `policy_blocked` and `foreground_required` are outcomes of their own. The row also adds the `task_completed` push payload for capability 64. See the phone capability request lifecycle below. |
 
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
@@ -223,6 +224,67 @@ a second, hand-copied schema.
   bot/session/turn/interaction identifiers, the terminal outcome, optional selected option id, and
   gateway settlement time. It never includes an approval decision command, tool arguments/results,
   or an option label. The gateway retains only the newest 100 terminal receipts per bot.
+
+### Phone capability request lifecycle (capability 68)
+
+Every phone capability request has one typed state and reaches exactly one typed terminal state:
+
+```text
+requested
+routed
+device_received
+consent_presented
+approved
+executing
+completed | denied | failed | expired | cancelled | policy_blocked | foreground_required
+```
+
+`policy_blocked` means the gateway refused the request before it was ever routed to a phone.
+`foreground_required` means the device or app lifecycle prevented execution. Neither is folded into
+a generic failure, and `failed` is what is left: nothing reached a phone, or the answer could not be
+kept. The closed unions live in `packages/contract/src/ext-bots.ts`
+(`MOBILE_REQUEST_STATES`, `MOBILE_REQUEST_TERMINAL_STATES`, `BotMobileRequest`).
+
+BINDING. A record names the profile, the conversation, the turn and the ONE paired device the
+request was issued for. That device is also the user identity this gateway holds, because a paired
+device belongs to exactly one person's gateway. A result or a progress report from any other device
+is refused and logged rather than applied, and the request stays pending for the device it was
+issued to. A second device attaching, or the target reconnecting, never moves the target: the
+device selected at admission is the only device that answer can come from.
+
+STATE ONLY MOVES FORWARD, and the first terminal is sealed. A later answer for a request that
+already expired, was cancelled, or was refused cannot rewrite the outcome a person was already
+told, exactly as capability 64's first terminal is immutable.
+
+DERIVED, NOT REPORTED. `requested`, `routed` and the terminal states are the gateway's own routing
+decision, its lease, its media claim and its settlement, so a Hermes peer and any attach peer get
+the whole lifecycle without sending or receiving anything new; peers below 68 are byte identical.
+The four middle stages are the phone's own facts. A phone at `com.cozylabs.mobile-node >= 6` may
+report one with the `mobile_node_progress` client frame (contract v1.md, Mobile Node extension); a
+phone below it reports none, behaves exactly as it did at 5, and its requests simply carry less
+detail. `executing` is also derived with no phone change at all: a media upload claiming the lease
+IS the phone executing.
+
+NO DUPLICATE EXECUTION. When a device reconnects with a request still live, the gateway re-sends
+the original frame under the ORIGINAL request id and lease exactly as it always has, so a phone
+that never received it still gets it once. It does NOT re-send once that phone has reported a
+stage: the phone already holds the request, and a second frame is how one consent becomes two
+prompts or one action becomes two.
+
+`GET /bots/:name/mobile-requests?sessionId=` is device authenticated and answers
+`{ requests: BotMobileRequest[] }`, the bounded newest-first-hundred records of THAT conversation
+on THAT profile, which is what an app resuming from the background reconciles its pending requests
+against. A missing `sessionId` is `400 invalid_request`: a request belongs to one conversation, so a
+read naming none could only answer for the wrong one. Another conversation's request is absent
+rather than hidden. The record is metadata: no lease, no answer, and nothing the phone measured.
+The capability-39 receipt is unchanged and still written only for a share that happened.
+
+The push half of the row is the `task_completed` payload of `contract/push-v0.md`: a backgrounded
+phone learns capability 64's Task finished. It carries the task and conversation identities the
+deep link needs and no user content, and it is sent exactly once per Task, gated on the transition
+that wrote capability 64's own completion notification record, so a client that already announced
+the completion locally from `bot_task_updated` is never told twice. A device holding a live socket
+is excluded from the push, exactly as it is on every other push leg.
 
 ### Bot Activity composition
 

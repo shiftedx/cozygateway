@@ -472,8 +472,9 @@ export const BotMobileRequestSchema = Type.Object({
   sessionId: Type.String({ minLength: 1, maxLength: 256 }),
   turnId: Type.String({ minLength: 1, maxLength: 256 }),
   /** The one device this request was issued for. A second device attaching never becomes the
-   *  target, and an answer from any other device is refused rather than applied. */
-  deviceId: Type.String({ minLength: 1, maxLength: 256 }),
+   *  target, and an answer from any other device is refused rather than applied. Absent only when
+   *  no device was selected at all, which is itself the outcome the record carries. */
+  deviceId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
   command: BotMobileReceiptSchema.properties.command,
   purpose: BotMobileReceiptSchema.properties.purpose,
   state: MobileRequestStateSchema,

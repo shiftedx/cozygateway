@@ -88,6 +88,7 @@ Registered categories:
 | `approval.pending` | `alert` | `approval.pending` | CozyChat / "Approval requested" | `toolCallId`, required |
 | `approval.resolved` | `alert` | `approval.resolved` | CozyChat / "Approval resolved" | `toolCallId`, required |
 | `mobile.status.wake` | `background` | omitted | none | `mobile.status`, required |
+| `task.completed` | `alert` | `task.completed` | CozyChat / "Task completed" | `taskId`, required |
 
 On APNs an alert category becomes `aps.category` and the collapse id becomes the
 `apns-collapse-id` header; on a webhook both fields are added to the delivered JSON body next to
@@ -174,6 +175,22 @@ category `mobile.status.wake`, collapse id `mobile.status`):
 
 The decrypted plaintext is exactly the object above. It contains no request, lease, agent, chat,
 or device identifiers.
+
+**`kind: "task_completed"`** (a durable Task reached `completed` while the device had no live
+socket; category `task.completed`, collapse id = `taskId`, so a later notification about the same
+Task replaces its own banner rather than stacking a second one):
+
+```json
+{ "kind": "task_completed", "taskId": "string", "threadId": "string", "agentId": "string" }
+```
+
+It carries the identities the deep link needs and NOTHING the Task worked on: no goal, no reply, no
+artifact name. The client opens the Task through `GET /tasks/:taskId`, which it is already
+authenticated for. `threadId` is the namespaced `bot:<name>`, or `group:<room>` for a room Task,
+the same shape the approval payloads use. The gateway sends it exactly once per Task, on the
+transition that writes capability 64's completion notification record, and never to a device
+holding a live socket, so a client that already announced the completion from `bot_task_updated`
+is not told a second time.
 
 **`kind: "approval_pending"`** (a tool call is waiting on a decision; category
 `approval.pending`, collapse id = `toolCallId`):
