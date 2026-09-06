@@ -151,6 +151,50 @@ sys.exit(0 if "cozygateway" in enabled else 1)
 PY
 }
 
+# The display keys Hermes reads before it will stream a reply, printed one per
+# line when the profile does not carry them.
+#
+# Hermes' own default is silence: `StreamingConfig.enabled` is false
+# (gateway/config.py) and `_setup_stream_consumer` asks the runner for stream
+# deltas only when `display.platforms.<platform>.streaming` resolves true for
+# the turn's platform. `cozygateway` has no per-platform default of its own, so
+# a profile that names neither key never emits a single draft frame and the
+# phone only ever receives the finished message.
+#
+# Structural, like the plugins.enabled read above: a grep cannot tell an absent
+# key from one an operator deliberately set to false, and only the absent ones
+# may be written.
+streaming_keys_absent() {
+  "$PYTHON" - --streaming-keys "$1" <<'PY'
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(2)
+from pathlib import Path
+
+path = Path(sys.argv[2]) / "config.yaml"
+try:
+    data = yaml.safe_load(path.read_text()) or {}
+except Exception:
+    sys.exit(1)
+
+
+def block(parent, key):
+    value = parent.get(key) if isinstance(parent, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+display = block(data, "display")
+platform = block(block(display, "platforms"), "cozygateway")
+# None is ABSENT. An explicit false is an operator turning streaming off and is never touched.
+if display.get("streaming") is None:
+    print("display.streaming")
+if platform.get("streaming") is None:
+    print("display.platforms.cozygateway.streaming")
+PY
+}
+
 # Reads one key out of an env file without ever echoing another one.
 env_value() {
   local file="$1" key="$2"
@@ -223,6 +267,33 @@ plugin_content_matches_source() {
   done <<EOF
 $source_files
 EOF
+}
+
+# Turns streaming on for a profile that never had it, and says nothing when it
+# already does. The write goes through Hermes' own `config set` rather than a
+# YAML rewrite here, so the file keeps whatever shape Hermes gives it and this
+# script never has to own a config writer.
+#
+# Set for the immediately following ensure_service call: Hermes reads config.yaml
+# at gateway start, so a repaired profile streams only after one restart.
+STREAMING_CONFIG_CHANGED=0
+ensure_streaming_config() {
+  local profile="$1" dir="$2" keys key rc=0
+  STREAMING_CONFIG_CHANGED=0
+  keys="$(streaming_keys_absent "$dir")" || rc=$?
+  [ "$rc" != 2 ] || die "no PyYAML available to $PYTHON, cannot read profile config safely"
+  if [ "$rc" != 0 ]; then
+    warn "[$profile] could not read config.yaml, leaving streaming settings alone"
+    return 0
+  fi
+  if [ -z "$keys" ]; then say "  streaming already decided in config.yaml"; return 0; fi
+  for key in $keys; do
+    if [ "$DRY_RUN" = 1 ]; then say "  DRY  set $key=true"; continue; fi
+    "$HERMES_BIN" -p "$profile" config set "$key" true >/dev/null \
+      || die "[$profile] could not set $key"
+    say "  $key set to true"
+  done
+  [ "$DRY_RUN" = 1 ] || STREAMING_CONFIG_CHANGED=1
 }
 
 # Set by sync_plugin for the immediately following ensure_service call. A
@@ -404,23 +475,23 @@ recreate_box_gateway() {
 #   and the attach never came up. So the load is asserted here rather than
 #   assumed from the installer's exit code.
 ensure_service() {
-  local profile="$1" restart_for_plugin="${2:-0}"
+  local profile="$1" restart_for_change="${2:-0}"
   local label="ai.hermes.gateway-$profile"
   local plist="$HOME/Library/LaunchAgents/$label.plist"
 
   if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
-    if [ "$restart_for_plugin" = 1 ]; then
+    if [ "$restart_for_change" = 1 ]; then
       if [ "$DRY_RUN" = 1 ]; then
-        say "  DRY  restart loaded service $label for changed plugin"
+        say "  DRY  restart loaded service $label for changed plugin or config"
         return 0
       fi
       launchctl kickstart -k "gui/$(id -u)/$label" \
-        || die "[$profile] could not restart loaded $label after plugin sync"
+        || die "[$profile] could not restart loaded $label after the change"
       launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 \
-        || die "[$profile] $label is not loaded after plugin restart"
-      say "  service $label restarted for changed plugin"
+        || die "[$profile] $label is not loaded after the restart"
+      say "  service $label restarted for changed plugin or config"
     else
-      say "  service $label already loaded (plugin unchanged)"
+      say "  service $label already loaded (nothing changed)"
     fi
     return 0
   fi
@@ -541,10 +612,13 @@ for profile in "${PROFILES[@]}"; do
   set_env_line "$env_file" COZYGATEWAY_SPOOL_PATH \
     "$profile_dir/plugin-data/cozygateway/attach-v1.sqlite"
   inherit_chat_registry "$env_file"
+  ensure_streaming_config "$profile" "$profile_dir"
   ensure_box_env_line "$env_name" "$token"
   ensure_box_config_entry "$profile" "$env_name"
   recreate_box_gateway
-  ensure_service "$profile" "$PLUGIN_SYNC_CHANGED"
+  restart_needed=0
+  { [ "$PLUGIN_SYNC_CHANGED" = 1 ] || [ "$STREAMING_CONFIG_CHANGED" = 1 ]; } && restart_needed=1
+  ensure_service "$profile" "$restart_needed"
   verify_attached "$profile" || overall_rc=1
 done
 
