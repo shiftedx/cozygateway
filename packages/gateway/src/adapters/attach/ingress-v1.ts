@@ -273,6 +273,7 @@ export class AttachV1Ingress implements TurnEndpoint {
           connection.telemetry = this.#recordTelemetry(agentId, frame.telemetry, receivedAt);
         if (frame.commands !== undefined) {
           this.#commandCatalogs.set(agentId, [...frame.commands]);
+          this.#storage.tasks.declareSlashCommands(agentId, frame.commands.map((command) => command.name));
         }
         connection.maxInFlightEvents = Math.min(frame.limits?.maxInFlightEvents ?? ATTACH_V1_MAX_IN_FLIGHT_EVENTS, ATTACH_V1_MAX_IN_FLIGHT_EVENTS);
         connection.maxInFlightBytes = Math.min(frame.limits?.maxInFlightBytes ?? ATTACH_V1_MAX_IN_FLIGHT_BYTES, ATTACH_V1_MAX_IN_FLIGHT_BYTES);

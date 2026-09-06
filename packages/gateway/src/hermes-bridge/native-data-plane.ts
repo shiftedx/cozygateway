@@ -2645,9 +2645,11 @@ export class NativeBotDataPlane {
     if (delivery === undefined) return;
     this.#clearTurnTimeout(bot, sessionId, turnId);
     const key = this.#nativeTurnKey(bot, sessionId, turnId);
+    const waiting = this.#storage.tasks.waiting(peer ?? bot, turnId);
+    const suspended = this.#storage.tasks.suspended(peer ?? bot, turnId, delivery.queuedAt, this.#now());
     const timer = setTimeout(
       () => this.#timeoutTurn(bot, sessionId, turnId),
-      Math.max(0, delivery.queuedAt + this.#turnTimeoutMs - this.#now()),
+      Math.max(1, (waiting?.expiresAt ?? 0) - this.#now(), delivery.queuedAt + this.#turnTimeoutMs + suspended - this.#now()),
     );
     timer.unref();
     this.#turnTimers.set(key, timer);
@@ -2660,6 +2662,12 @@ export class NativeBotDataPlane {
     const peer = this.#executionPeer(bot, sessionId);
     const delivery = peer === undefined ? undefined : this.#storage.nativeBotTurnDelivery(peer, turnId);
     if (delivery === undefined) return;
+    const waiting = this.#storage.tasks.waiting(peer ?? bot, turnId);
+    const suspended = this.#storage.tasks.suspended(peer ?? bot, turnId, delivery.queuedAt, this.#now());
+    if ((waiting !== undefined && waiting.expiresAt > this.#now()) || (this.#turnTimeoutMs > 0 && this.#now() < delivery.queuedAt + this.#turnTimeoutMs + suspended)) {
+      this.#scheduleTurnTimeout(bot, sessionId, turnId);
+      return;
+    }
     if (delivery.acknowledgedAt === null) {
       this.#storage.cancelAttachCommand(
         peer ?? bot,
@@ -2727,7 +2735,11 @@ export class NativeBotDataPlane {
       const key = this.#nativeTurnKey(bot, chat.sessionId, turnId);
       live.add(key);
       this.#seedTurnActivity(bot, chat.sessionId, turnId);
-      const silentFor = now - (this.#turnActivity.get(key) ?? now);
+      const peer = this.#executionPeer(bot, chat.sessionId) ?? bot;
+      const waiting = this.#storage.tasks.waiting(peer, turnId);
+      if (waiting !== undefined && waiting.expiresAt > now) continue;
+      const lastActive = this.#turnActivity.get(key) ?? now;
+      const silentFor = now - lastActive - this.#storage.tasks.suspended(peer, turnId, lastActive, now);
       const acked = this.#interruptAcked.get(key);
       if (
         acked !== undefined &&

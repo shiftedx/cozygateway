@@ -1,3 +1,4 @@
+import { Tasks } from "./tasks.ts";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 
@@ -1064,9 +1065,11 @@ export class GatewayMaintenanceOperationConflict extends Error {
 
 export class Storage {
   readonly #db: DatabaseSync;
+  readonly tasks: Tasks;
 
   constructor(db: DatabaseSync) {
     this.#db = db;
+    this.tasks = new Tasks(db);
   }
 
   createSetupCode(code: string, expiresAt: number, kind: SetupCodeKind = "device"): void {
@@ -2429,6 +2432,7 @@ export class Storage {
       this.#db
         .prepare("UPDATE attach_streams SET next_command_sequence = ?, updated_at = ? WHERE agent_id = ?")
         .run(stream.sequence + 1, createdAt, agentId);
+      this.tasks.admit(agentId, command, createdAt);
       this.#db.exec("COMMIT");
       return { kind: "command", sequence: stream.sequence, commandId, command };
     } catch (err) {
@@ -2534,12 +2538,14 @@ export class Storage {
   }
 
   ackAttachCommand(agentId: string, sequence: number, commandId: string, ackedAt: number): boolean {
-    return this.#db
-      .prepare(
-        `UPDATE attach_command_outbox SET acked_at = COALESCE(acked_at, ?)
-         WHERE agent_id = ? AND sequence = ? AND command_id = ?`,
-      )
-      .run(ackedAt, agentId, sequence, commandId).changes === 1;
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#db.prepare("SELECT command_json AS json, cancelled_at AS cancelledAt FROM attach_command_outbox WHERE agent_id = ? AND sequence = ? AND command_id = ?").get(agentId, sequence, commandId) as { json: string; cancelledAt: number | null } | undefined;
+      const changed = this.#db.prepare("UPDATE attach_command_outbox SET acked_at = COALESCE(acked_at, ?) WHERE agent_id = ? AND sequence = ? AND command_id = ?").run(ackedAt, agentId, sequence, commandId).changes === 1;
+      if (row !== undefined && row.cancelledAt === null) this.tasks.acknowledged(agentId, JSON.parse(row.json) as AttachV1Command, ackedAt);
+      this.#db.exec("COMMIT");
+      return changed;
+    } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
   }
 
   /** Reconciles a plugin's durable cursors after an ACK was lost or the gateway was reprovisioned.
@@ -2846,6 +2852,7 @@ export class Storage {
       this.#db
         .prepare("UPDATE attach_streams SET last_event_sequence = ?, updated_at = ? WHERE agent_id = ?")
         .run(frame.sequence, receivedAt, agentId);
+      if (disposition === "accepted") this.tasks.event(agentId, frame, receivedAt);
       this.#db.exec("COMMIT");
       return { status: disposition, acknowledgedSequence: frame.sequence };
     } catch (err) {
@@ -3001,6 +3008,7 @@ export class Storage {
     cause?: "cancelled";
     completedAt: number;
   }): void {
+    this.tasks.atomic(() => {
     this.#db
       .prepare(
         `INSERT INTO bot_native_turn_terminals
@@ -3016,6 +3024,8 @@ export class Storage {
         input.cause ?? null,
         input.completedAt,
       );
+    this.tasks.nativeTerminal(input.bot, input.sessionId, input.turnId, input.status, input.completedAt, input.cause);
+    });
   }
 
   nativeBotTurnTerminal(bot: string, sessionId: string, turnId: string): {
@@ -4043,6 +4053,7 @@ export class Storage {
     expiresAt?: number;
     updatedAt: number;
   }): "inserted" | "updated" | "duplicate" | "conflict" {
+    return this.tasks.atomic(() => {
     const prior = this.nativeInteraction(input.bot, input.kind, input.interactionId);
     if (prior === undefined) {
       this.#db
@@ -4054,6 +4065,7 @@ export class Storage {
         )
         .run(input.bot, input.kind, input.interactionId, input.sessionId, input.turnId, JSON.stringify(input.payload), input.status, input.selectedOptionId ?? null, input.expiresAt ?? null, input.updatedAt);
       if (input.status !== "pending") this.#trimTerminalNativeInteractions(input.bot);
+      this.tasks.interaction(input.bot, input.kind, input.interactionId);
       return "inserted";
     }
     if (prior.status !== "pending") return "duplicate";
@@ -4067,7 +4079,9 @@ export class Storage {
       )
       .run(input.status, input.selectedOptionId ?? null, input.updatedAt, input.bot, input.kind, input.interactionId);
     this.#trimTerminalNativeInteractions(input.bot);
+    this.tasks.interaction(input.bot, input.kind, input.interactionId);
     return "updated";
+    });
   }
 
   resolveNativeInteraction(
@@ -4078,14 +4092,16 @@ export class Storage {
     updatedAt: number,
     selectedOptionId?: string,
   ): boolean {
+    return this.tasks.atomic(() => {
     const resolved = this.#db
       .prepare(
         `UPDATE bot_native_interactions SET status = ?, selected_option_id = ?, updated_at = ?
          WHERE bot = ? AND kind = ? AND interaction_id = ? AND status = 'pending'`,
       )
       .run(status, selectedOptionId ?? null, updatedAt, bot, kind, interactionId).changes === 1;
-    if (resolved) this.#trimTerminalNativeInteractions(bot);
+    if (resolved) { this.#trimTerminalNativeInteractions(bot); this.tasks.interaction(bot, kind, interactionId); }
     return resolved;
+    });
   }
 
   nativeInteraction(

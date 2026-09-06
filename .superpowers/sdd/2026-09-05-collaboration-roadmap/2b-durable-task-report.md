@@ -35,3 +35,13 @@ Only production callers of `recordNativeBotTerminal` are native data plane norma
 
 RED: task-terminal-immutability focused run, 8 tests: 1 failed and 7 passed. An interim `continues:true` commit incorrectly caused the next verification event to return `ignored_terminal`.
 GREEN: `pnpm --filter cozygateway exec vitest run test/task-terminal-immutability.test.ts test/attach-v1-storage.test.ts`, 2 files, 31 passed. The added test closes and reopens SQLite after the interim commit, replays it as a duplicate, admits subsequent Verification and final commit, then refuses a later conflicting terminal. Storage now seals only final commits.
+
+## Durable ingress and waits checkpoint
+
+Rebased only Task commits onto merged capability63 main dc47146, conflict-free. Current Task contract remains unadvertised.
+
+RED: new `test/durable-tasks.test.ts` first failed because actual `enqueueAttachCommand` had no Task projection. Subsequent tests failed because a stored pending approval did not project a wait, then because the real native timeout fired during its approval.
+GREEN: durable-tasks now 3 passed: actual outbox admission/ACK/final inbox completion, source-bound stored approval settlement, and fake-clock real native timeout suspended from 10 through 100 and firing at 140 after its original 50ms active budget. No executor/model simulation claimed as live evidence.
+Focused regression checkpoint: durable-tasks, task-terminal-immutability, native-bot-data-plane, attach-v1-storage: 4 files, 90 passed. Further atomic native settlement/interaction hooks: durable-tasks plus task-terminal-immutability, 2 files, 11 passed.
+
+SQLite Task admission shares the command transaction; event projection shares inbox admission; notification inserts once with completion. Stored interactions and Task events now share a savepoint. The view derives from events and immutable intent/run references. Slash catalogs are retained and consulted at actual turn admission. Native timeout/silence and room deadline account for suspended wait intervals. These remain an implementation checkpoint: command routes, durable command fencing, complete owner reconciliation, device/child/artifact joins and portable conformance remain.
