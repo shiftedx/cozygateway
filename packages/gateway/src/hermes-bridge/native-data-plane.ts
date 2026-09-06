@@ -164,6 +164,12 @@ export interface NativeBotDataPlaneOptions {
   mobileNode?: MobileNodeBroker;
 }
 
+/** Capability 69. ADR 0004's provisional owner-loss lease, the same 120 seconds a Task gets. It
+ *  is the WHOLE silent-reap window for a native turn whose peer is disconnected or has re-attached
+ *  without carrying it: the long ceiling below is only trustworthy while the peer is attached and
+ *  still says the turn is running. Provisional, and re-evaluated with measured findings. */
+const OWNER_LOSS_LEASE_MS = 120_000;
+
 /** Capability 66. The ceiling on a standing category grant: one day. A person can revoke one at
  *  any moment, and nothing here extends an existing grant. */
 const APPROVAL_GRANT_MAX_MS = 24 * 60 * 60 * 1_000;
@@ -412,6 +418,19 @@ export class NativeBotDataPlane {
   readonly #turnActivity = new Map<string, number>();
   /** When an interrupt for this turn was accepted by the plugin. */
   readonly #interruptAcked = new Map<string, number>();
+  /** Capability 69. When the gateway last learned that no peer is carrying this turn: the peer
+   *  went absent, or it re-attached without declaring the turn active. Present means the turn is
+   *  on the owner-loss lease instead of the long silence ceiling; any frame on the turn, or a
+   *  hello that declares it active, is proof of ownership and removes it. */
+  readonly #turnOwnerLost = new Map<string, number>();
+  /** Capability 69. The steer whose words are still unanswered on this turn, kept only from the
+   *  moment the steer is dispatched until the peer produces its first frame for that turn. It is
+   *  what promotion re-sends when the turn turns out to be dead, so a person's message is never
+   *  attributed to a turn nothing owns.
+   *  ponytail: process-local. A gateway restart between a steer and its owner-loss seal loses the
+   *  promotion and falls back to the visible failed-delivery row, which still preserves the text.
+   *  Persist it beside the turn command when a durable steer command lands. */
+  readonly #pendingSteers = new Map<string, { messageId: string; text: string; mediaIds?: string[] }>();
   #staleTurnSweep: ReturnType<typeof setInterval> | undefined;
 
   constructor(opts: NativeBotDataPlaneOptions) {
@@ -1046,15 +1065,132 @@ export class NativeBotDataPlane {
   }
 
   handleAttachPresence(bot: string, state: "online" | "degraded" | "absent"): void {
-    const execution = this.#storage.chatExecutionById(bot);
-    const key = execution?.stage === "ready" ? execution.bot : normalize(bot);
-    if (!this.handles(key)) return;
+    const key = this.#peerBot(bot);
+    if (key === undefined) return;
     this.#attachPresence.set(key, state);
+    // Capability 69. A peer with no socket is carrying nothing, so every turn it owed is on the
+    // owner-loss lease from this moment. A reconnect that declares the turn active takes it back
+    // off the lease; nothing else does.
+    if (state === "absent")
+      for (const turn of this.#storage.nativeBotActiveTurns(key))
+        this.#markOwnerLost(key, turn.sessionId, turn.turnId);
     const chat = this.#storage.nativeBotChat(key, this.#now());
     if (chat.activeTurnId !== undefined) {
       this.#flushLiveTurn(this.#nativeTurnKey(key, chat.sessionId, chat.activeTurnId));
       this.#state(key, chat.sessionId, "polling", true);
     }
+  }
+
+  /** Capability 69. Reconcile this profile's nonterminal native turns the moment its peer
+   * re-attaches, which is the earliest instant anyone can know a turn was lost.
+   *
+   * `activeTurns` is the peer's own declaration. A turn it names is alive and keeps the long
+   * window. A turn it does NOT name, when it declared at all, is sealed here rather than after
+   * twenty minutes of silence, and any steer still waiting on it is promoted to a new durable
+   * turn. A peer that declared nothing cannot be read either way, so its turns go on the
+   * owner-loss lease: a short grace in which one frame from the peer is enough to keep the turn,
+   * and no frame at all ends it. */
+  handleAttachHello(peer: string, activeTurns?: readonly string[]): void {
+    const bot = this.#peerBot(peer);
+    if (bot === undefined) return;
+    const declared = activeTurns === undefined ? undefined : new Set(activeTurns);
+    for (const turn of this.#storage.nativeBotActiveTurns(bot)) {
+      const key = this.#nativeTurnKey(bot, turn.sessionId, turn.turnId);
+      if (declared === undefined) {
+        this.#markOwnerLost(bot, turn.sessionId, turn.turnId);
+        continue;
+      }
+      if (declared.has(turn.turnId)) {
+        // The peer still carries it. Never sealed by reconciliation, and back on the long window.
+        this.#turnOwnerLost.delete(key);
+        this.#turnActivity.set(key, this.#now());
+        continue;
+      }
+      this.#log(
+        `sealing stale turn ${turn.turnId} for ${bot}: the re-attached peer does not carry it`,
+      );
+      this.#sealOwnerLoss(bot, turn.sessionId, turn.turnId);
+    }
+  }
+
+  /** The profile behind an attach identity, which is either the profile itself or a chat
+   * execution bound to one. `undefined` for an identity this plane does not serve. */
+  #peerBot(peer: string): string | undefined {
+    const execution = this.#storage.chatExecutionById(peer);
+    const bot = execution?.stage === "ready" ? execution.bot : normalize(peer);
+    return this.handles(bot) ? bot : undefined;
+  }
+
+  #markOwnerLost(bot: string, sessionId: string, turnId: string): void {
+    const key = this.#nativeTurnKey(bot, sessionId, turnId);
+    this.#turnOwnerLost.set(key, this.#now());
+    this.#seedTurnActivity(bot, sessionId, turnId);
+  }
+
+  /** Capability 69. End one turn nobody owns, and rescue what the person said on it. The seal is
+   * the ORDINARY terminal path, so the app learns about it through the same turn transition every
+   * other ending uses; only the reason in the log and the promotion that follows are new. */
+  #sealOwnerLoss(bot: string, sessionId: string, turnId: string): void {
+    this.#finish(bot, sessionId, turnId, { phase: "failed", status: "failed" });
+    this.#promoteSteer(bot, sessionId, turnId);
+  }
+
+  /** Capability 69. A steer that was never answered because its target turn was already dead
+   * becomes a NEW durable turn carrying the same text and media: the app sees an ordinary new
+   * turn, and the user row that was committed against the dead turn moves onto the live one so
+   * the reply answers the question that was actually asked.
+   *
+   * When the turn cannot be dispatched at all, the words are still not lost: a visible failed
+   * delivery preserving them is recorded on the conversation instead. */
+  #promoteSteer(bot: string, sessionId: string, deadTurnId: string): void {
+    const pending = this.#pendingSteers.get(this.#nativeTurnKey(bot, sessionId, deadTurnId));
+    if (pending === undefined) return;
+    this.#pendingSteers.delete(this.#nativeTurnKey(bot, sessionId, deadTurnId));
+    const now = this.#now();
+    const chat = this.#storage.nativeBotChat(bot, now);
+    // Something else is already running on this conversation: it will carry the person's message
+    // forward on its own, and a second turn would answer it twice.
+    if (chat.sessionId !== sessionId || chat.activeTurnId !== undefined) return;
+    const peer = this.#executionPeer(bot, sessionId);
+    const turnId = randomUUID();
+    const accepted = peer !== undefined && this.#ingress.sendNativeTurn(peer, {
+      threadId: sessionId,
+      turnId,
+      messageId: pending.messageId,
+      text: pending.text,
+      ...(pending.mediaIds === undefined ? {} : { mediaIds: pending.mediaIds }),
+    });
+    if (!accepted) {
+      this.#recordFailedSteerDelivery(bot, sessionId, pending);
+      return;
+    }
+    this.#log(`promoted an unanswered steer on ${deadTurnId} for ${bot} to durable turn ${turnId}`);
+    this.#storage.rebindNativeBotMessageTurn(bot, pending.messageId, turnId);
+    this.#storage.setNativeBotTurn(bot, sessionId, turnId, now);
+    this.#scheduleTurnTimeout(bot, sessionId, turnId);
+    this.#seedTurnActivity(bot, sessionId, turnId);
+    this.#state(bot, sessionId, "polling", true);
+  }
+
+  /** The last resort under "nothing a person said or a bot said disappears": one visible marked
+   * row on the conversation carrying the text that could not be delivered. */
+  #recordFailedSteerDelivery(
+    bot: string,
+    sessionId: string,
+    pending: { messageId: string; text: string },
+  ): void {
+    const at = this.#now();
+    const message = this.#storage.appendNativeBotMessage({
+      bot,
+      sessionId,
+      messageId: `steer-undelivered:${pending.messageId}`,
+      role: "system",
+      authorBot: bot,
+      marker: DELIVERY_FAILED_MARKER,
+      text: `This message could not be delivered and was not answered: ${pending.text.slice(0, 2048)}`,
+      at,
+    });
+    this.#broadcast({ type: "bot_chat", bot, sessionId, messages: [message], updatedAt: at });
   }
 
   taskTurnQueued(peer: string, command: { threadId: string; turnId: string }): void {
@@ -1070,6 +1206,8 @@ export class NativeBotDataPlane {
     this.#staleTurnSweep = undefined;
     this.#turnActivity.clear();
     this.#interruptAcked.clear();
+    this.#turnOwnerLost.clear();
+    this.#pendingSteers.clear();
     for (const timer of this.#interactionTimers.values()) clearTimeout(timer);
     this.#interactionTimers.clear();
     for (const timer of this.#turnTimers.values()) clearTimeout(timer);
@@ -1197,6 +1335,20 @@ export class NativeBotDataPlane {
         return true;
       }
       if (command === undefined || command.threadId !== sessionId) {
+        // Capability 69. A commit carrying words is the bot ANSWERING A PERSON, and the turn id it
+        // arrived on is bookkeeping. A restarted peer that read a steer as a fresh inbound message
+        // replies on a turn id this gateway never issued, and declining it here is how a reply
+        // vanished in the live incident. Project it as an ordinary reply bound to no turn, exactly
+        // as a scheduled delivery is: nothing a bot said is discarded for want of a turn command.
+        if (command === undefined && event.kind === "commit"
+          && (blocksToText(event.blocks).trim().length > 0 || (event.mediaIds?.length ?? 0) > 0)) {
+          this.#log(
+            `native commit for "${key}" on unknown turn ${event.turnId} projected as an untethered reply`,
+          );
+          return this.#commit(
+            key, sessionId, event.messageId, event.blocks, event.mediaIds, event.mediaPositions,
+          );
+        }
         // This is a known native session, so no other projection will claim the event; the
         // declined guard is the whole diagnosis and must not die silent (issue #193).
         this.#log(
@@ -1208,6 +1360,14 @@ export class NativeBotDataPlane {
       // steps, drafts, and since #189 interim commits), which is exactly what makes total silence
       // a safe staleness signal rather than a race against slow work.
       this.#turnActivity.set(this.#nativeTurnKey(key, sessionId, event.turnId), this.#now());
+      // Capability 69. The same proof answers the owner question: a peer that is emitting frames
+      // for this turn is carrying it, whatever a hello or a dropped socket suggested. The one
+      // exception is the typed unknown-turn failure, which is the peer saying the opposite, so it
+      // must not clear the steer it is about to have promoted.
+      if (!(event.kind === "failed" && event.reason === "unknown_turn")) {
+        this.#turnOwnerLost.delete(this.#nativeTurnKey(key, sessionId, event.turnId));
+        this.#pendingSteers.delete(this.#nativeTurnKey(key, sessionId, event.turnId));
+      }
     }
     if (event.kind === "draft") {
       const seq = (this.#draftSeq.get(event.turnId) ?? 0) + 1;
@@ -1256,6 +1416,13 @@ export class NativeBotDataPlane {
             status: "completed",
           }),
       );
+    }
+    if (event.kind === "failed" && event.reason === "unknown_turn") {
+      // Capability 69. The peer holds no such turn, so this is owner loss reported rather than
+      // inferred: seal it now and promote whatever the person said on it.
+      this.#log(`sealing turn ${event.turnId} for ${key}: the peer reports it as an unknown turn`);
+      this.#sealOwnerLoss(key, sessionId, event.turnId);
+      return true;
     }
     if (
       event.kind === "failed" ||
@@ -1634,6 +1801,11 @@ export class NativeBotDataPlane {
       this.#scheduleTurnTimeout(bot, chat.sessionId, turnId);
       this.#seedTurnActivity(bot, chat.sessionId, turnId);
       this.#sweepStaleDelegations(bot, chat.sessionId, turnId);
+    } else {
+      // Capability 69. A steer is the one send with no turn of its own to fall back on: if the
+      // peer never had this turn, nothing else would ever answer these words. Remember them until
+      // the peer's next frame on the turn proves it is alive, and promote them if it never comes.
+      this.#pendingSteers.set(this.#nativeTurnKey(bot, chat.sessionId, turnId), { messageId, text });
     }
     this.#broadcastMessage(bot, chat.sessionId, message, now);
     if (chat.activeTurnId === undefined)
@@ -2115,6 +2287,7 @@ export class NativeBotDataPlane {
     this.#tracedTurnStates.delete(this.#nativeTurnKey(bot, sessionId, turnId));
     this.#turnActivity.delete(this.#nativeTurnKey(bot, sessionId, turnId));
     this.#interruptAcked.delete(this.#nativeTurnKey(bot, sessionId, turnId));
+    this.#turnOwnerLost.delete(this.#nativeTurnKey(bot, sessionId, turnId));
     this.#stopStaleTurnSweepWhenIdle();
     this.#expireTurnInteractions(bot, sessionId, turnId);
     this.#sealTools(
@@ -2965,6 +3138,21 @@ export class NativeBotDataPlane {
       if (waiting !== undefined && waiting.expiresAt > now) continue;
       const lastActive = this.#turnActivity.get(key) ?? now;
       const silentFor = now - lastActive - this.#storage.tasks.suspended(peer, turnId, lastActive, now);
+      // Capability 69. Nobody is carrying this turn: the peer is gone, or it re-attached without
+      // it and could not say either way. Bound the silence to the provisional owner-loss lease
+      // rather than the long ceiling, and never lengthen a window an operator already shortened.
+      const ownerLostAt = this.#turnOwnerLost.get(key);
+      if (ownerLostAt !== undefined && this.#staleTurnCeilingMs > 0) {
+        const lease = Math.min(OWNER_LOSS_LEASE_MS, this.#staleTurnCeilingMs);
+        const since = Math.max(lastActive, ownerLostAt);
+        if (now - since - this.#storage.tasks.suspended(peer, turnId, since, now) >= lease) {
+          this.#log(
+            `reaping unowned turn ${turnId} for ${bot}: no peer has carried it for ${now - ownerLostAt}ms`,
+          );
+          this.#sealOwnerLoss(bot, chat.sessionId, turnId);
+          continue;
+        }
+      }
       const acked = this.#interruptAcked.get(key);
       if (
         acked !== undefined &&
@@ -2987,7 +3175,7 @@ export class NativeBotDataPlane {
     }
     // A turn can also leave through /new, which discards it without a terminal. Anything no
     // longer the active turn is bookkeeping this sweep should not carry (or watch) any further.
-    for (const map of [this.#turnActivity, this.#interruptAcked])
+    for (const map of [this.#turnActivity, this.#interruptAcked, this.#turnOwnerLost, this.#pendingSteers])
       for (const key of map.keys()) if (!live.has(key)) map.delete(key);
     this.#stopStaleTurnSweepWhenIdle();
   }

@@ -4125,6 +4125,28 @@ export class Storage {
       .run(turnId ?? null, now, bot, sessionId);
   }
 
+  /** Capability 69. Every nonterminal native turn this profile is still carrying, across all of
+   * its local sessions and not just the canonical chat, so hello reconciliation can answer the
+   * only question that matters at a re-attach: what does this gateway think is running? */
+  nativeBotActiveTurns(bot: string): { sessionId: string; turnId: string }[] {
+    return this.#db
+      .prepare(
+        `SELECT session_id AS sessionId, active_turn_id AS turnId FROM bot_native_sessions
+         WHERE bot = ? AND active_turn_id IS NOT NULL`,
+      )
+      .all(bot) as unknown as { sessionId: string; turnId: string }[];
+  }
+
+  /** Capability 69. Move one user row onto the turn that will actually answer it. The only caller
+   * is steer promotion: the person's message was committed against a turn the peer had already
+   * lost, and the promoted turn is the one that answers it, so the causation link
+   * (`BotChatMessage.inReplyToId`) has to follow rather than dangle on a dead id. */
+  rebindNativeBotMessageTurn(bot: string, messageId: string, turnId: string): void {
+    this.#db
+      .prepare("UPDATE bot_native_messages SET turn_id = ? WHERE bot = ? AND message_id = ?")
+      .run(turnId, bot, messageId);
+  }
+
   clearNativeBotTurn(bot: string, sessionId: string, turnId: string, now: number): boolean {
     const cleared = this.#db
       .prepare(

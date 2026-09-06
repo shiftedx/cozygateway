@@ -107,6 +107,14 @@ export const AttachV1HelloSchema = Type.Object({
   limits: Type.Optional(AttachV1LimitsSchema),
   commands: Type.Optional(AttachV1CommandCatalogSchema),
   telemetry: Type.Optional(AttachV1TelemetrySchema),
+  /** Capability 69. The turn ids this peer STILL CARRIES as running, declared at the moment it
+   *  re-attaches. It is the one fact only the peer holds: a gateway turn is durable, so a peer
+   *  that restarted, crashed, or dropped a turn internally leaves the gateway believing work is
+   *  running that no process owns, and the next thing the person says goes out as a steer on a
+   *  dead turn. An EMPTY ARRAY is a real declaration ("I hold none"); ABSENT is a peer that
+   *  cannot declare, which the gateway reads as unknown and bounds by the owner-loss lease
+   *  rather than by the long silence ceiling. Ids only: no text, thread, media or tool detail. */
+  activeTurns: Type.Optional(Type.Array(Id, { maxItems: 256, uniqueItems: true })),
 });
 export type AttachV1Hello = Static<typeof AttachV1HelloSchema>;
 
@@ -382,6 +390,12 @@ const CommitEvent = Type.Object({
 const FailedEvent = Type.Object({
   kind: Type.Literal("failed"), threadId: Id, turnId: Id, messageId: Id,
   message: Type.Optional(Type.String({ maxLength: 4096 })),
+  /** Capability 69. A CLOSED reason, present only for the one failure the gateway can repair
+   *  rather than merely report: `unknown_turn` says the peer was handed a steer (or any work) for
+   *  a turn it does not hold, so the turn is over and the person's words are still unanswered.
+   *  The gateway seals that turn for owner loss and promotes the steer into a new durable turn.
+   *  Absent on every other failure and on every peer below 69, which stay byte identical. */
+  reason: Type.Optional(Type.Union([Type.Literal("unknown_turn")])),
 });
 const CancelledEvent = Type.Object({ kind: Type.Literal("cancelled"), threadId: Id, turnId: Id, messageId: Id });
 const InterruptedEvent = Type.Object({ kind: Type.Literal("interrupted"), threadId: Id, turnId: Id, messageId: Id });
