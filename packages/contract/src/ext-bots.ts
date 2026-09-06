@@ -13,6 +13,7 @@
  *  Bot Mode chats, their sessions, messages, attachments, and turn state are gateway-owned
  *  attach-v1 projections. Every timestamp on this wire is milliseconds. */
 import { type Static, Type } from "@sinclair/typebox";
+import { TaskWaitingOnSchema } from "./tasks.ts";
 
 import { AttachmentBlockSchema } from "./rich-blocks.ts";
 import { ApprovalOutcomeSchema, GatewayInfoSchema } from "./resources.ts";
@@ -498,6 +499,7 @@ export const BotChatStateFrameSchema = Type.Object({
   /** Gateway-clock time when an offline command entered the durable outbox. The existing gateway
    * turn-timeout bound applies from this instant, then the command is discarded or interrupted. */
   queuedAt: Type.Optional(Type.Integer()),
+  waitingOn: Type.Optional(TaskWaitingOnSchema),
   updatedAt: Type.Integer(),
 });
 export type BotChatStateFrame = Static<typeof BotChatStateFrameSchema>;
@@ -2676,4 +2678,7 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * Additive: the field is optional, so a peer and a client below 63 are byte identical to their
  * pre-63 selves. A peer emits `repair` only when the gateway advertised `com.cozylabs.bots >= 63`
  * on `hello_ack`; a client renders the policy only on `>= 63`. */
-export const BOTS_CAPABILITY_VERSION = 63;
+/** Capability 64: durable gateway Task projection, append-only stream, authenticated commands
+ * and full replacement updates. Run identity remains the attach turn. Optional unknown tool
+ * roles fail closed as possible effects. Earlier clients ignore additive frames. */
+export const BOTS_CAPABILITY_VERSION = 64;

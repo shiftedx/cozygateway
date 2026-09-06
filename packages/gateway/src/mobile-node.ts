@@ -147,6 +147,8 @@ function maxDeadlineMs(command: MobileNodeCommand): number {
     : INTERACTION_DEADLINE_MS;
 }
 
+export interface MobileTaskWait { agentId: string; threadId: string; turnId: string; requestId: string; expiresAt: number; status: string }
+
 /** Origin-bound ephemeral requests; status may run in background, location may not. */
 export class MobileNodeBroker {
   readonly #pending = new Map<string, Pending>();
@@ -158,11 +160,13 @@ export class MobileNodeBroker {
   readonly #result: (agentId: string, frame: MobileNodeResult) => void;
   readonly #receipt: (receipt: MobileNodeReceiptInput) => boolean;
   readonly #now: () => number;
+  readonly #taskWait: ((wait: MobileTaskWait) => void) | undefined;
   readonly #trace: TraceLog | undefined;
   readonly #terminalTtlMs: number;
   readonly #terminalLimit: number;
 
   constructor(deps: {
+    taskWait?: (wait: MobileTaskWait) => void;
     route: (deviceId: string, command: MobileNodeCommand) => MobileNodeRoute;
     wake?: (deviceId: string) => boolean;
     send: (deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean | MobileNodeSendOutcome;
@@ -174,6 +178,7 @@ export class MobileNodeBroker {
     terminalLimit?: number;
   }) {
     this.#route = deps.route;
+    this.#taskWait = deps.taskWait;
     this.#wake = deps.wake;
     this.#send = deps.send;
     this.#result = deps.result;
@@ -233,6 +238,7 @@ export class MobileNodeBroker {
     }
     const timer = setTimeout(() => this.#finish(input.requestId, "expired", true), input.expiresAt - this.#now());
     timer.unref();
+    this.#taskWait?.({ agentId: input.agentId, threadId: input.threadId, turnId: input.turnId, requestId: input.requestId, expiresAt: input.expiresAt, status: "pending" });
     this.#pending.set(input.requestId, { deviceId: input.deviceId, agentId: input.agentId, turnId: input.turnId, command: input.command, expiresAt: input.expiresAt, frame, timer });
     if (wakeEligible) {
       let scheduled = false;
@@ -373,6 +379,11 @@ export class MobileNodeBroker {
     }
   }
 
+  expireRequest(agentId: string, turnId: string, requestId: string, at: number): void {
+    const pending = this.#pending.get(requestId);
+    if (pending?.agentId === agentId && pending.frame.turnId === turnId && pending.expiresAt <= at) this.#finish(requestId, "expired", true);
+  }
+
   disconnectAgent(agentId: string): void {
     for (const [requestId, pending] of this.#pending) {
       if (pending.agentId === agentId) this.#finish(requestId, "cancelled", true);
@@ -486,6 +497,7 @@ export class MobileNodeBroker {
       let recorded = false;
       try { recorded = this.#receipt({ requestId, bot, threadId, turnId, command, purpose, sharedDescription: receiptDescription(pending.frame) }); } catch {}
       if (!recorded) {
+        this.#taskWait?.({ agentId: pending.agentId, threadId, turnId, requestId, expiresAt: pending.expiresAt, status: "device_unavailable" });
         this.#diagnose("receipt_persistence_failed", command, true, this.#route(pending.deviceId, command));
         this.#result(pending.agentId, {
           requestId, status: "device_unavailable", ...failure("receipt", "receipt_persistence_failed"),
@@ -493,6 +505,7 @@ export class MobileNodeBroker {
         return false;
       }
     }
+    this.#taskWait?.({ agentId: pending.agentId, threadId, turnId, requestId, expiresAt: pending.expiresAt, status: status === "ok" && result === undefined ? "device_unavailable" : status });
     if (status === "ok" && result !== undefined)
       this.#result(pending.agentId, pending.command === "device.status"
         ? {

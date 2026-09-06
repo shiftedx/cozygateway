@@ -42,6 +42,7 @@ afterAll(async () => {
 });
 
 registerConformanceSuite({
+  durableTasks: true,
   baseUrl: () => reference.gateway?.url ?? "",
   issueSetupCode: () => Promise.resolve(reference.gateway?.issueSetupCode() ?? ""),
   echoAgentId: "conformance-echo",

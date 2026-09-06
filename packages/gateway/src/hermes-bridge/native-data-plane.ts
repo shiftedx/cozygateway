@@ -363,6 +363,7 @@ export class NativeBotDataPlane {
     this.#onChatMessage = opts.onChatMessage;
     this.#onApproval = opts.onApproval;
     this.#now = opts.now ?? Date.now;
+    this.#storage.tasks.expireInteractions((bot, kind, id, at) => this.#expireInteraction(bot, kind, id, at));
     this.#turnTimeoutMs = opts.turnTimeoutMs ?? 0;
     this.#staleTurnSweepMs = opts.staleTurnSweepMs ?? 60_000;
     this.#staleTurnInterruptGraceMs = opts.staleTurnInterruptGraceMs ?? 120_000;
@@ -534,24 +535,14 @@ export class NativeBotDataPlane {
     // A cold restart schedules already-due expiry timers with a zero delay. That is still one
     // event-loop turn too late for a user who opens the inbox or taps a push immediately, so settle
     // those durable rows synchronously before projecting the snapshot.
-    for (const due of this.#storage.dueNativeApprovalIds([...this.#native], this.#now())) {
-      // Capability 51. Read the room BEFORE the expiry, so the terminal frame can name the room a
-      // member turn raised it in.
-      const room = payloadRoom(this.#storage.nativeInteraction(due.bot, "approval", due.interactionId)?.payload);
-      const expired = this.#storage.expireNativeApprovalIfDue(due.bot, due.interactionId, this.#now());
-      if (expired === undefined) continue;
-      this.#clearInteractionTimer("approval", due.bot, due.interactionId);
-      this.#emitApprovalResolved(due.bot, expired.sessionId, expired.turnId, due.interactionId, "expired", room);
-      // A room interaction's `sessionId` is the gateway-owned member thread, which is not a chat
-      // session, so nudging chat state for it would describe a chat that does not exist.
-      if (room === undefined) this.#state(due.bot, expired.sessionId, "polling", true);
-    }
+    this.#expireDueInteractions();
     // Storage also receives the configured set: a durable row from a removed/reconfigured profile
     // is intentionally invisible because its existing action route correctly rejects that bot.
     return this.#storage.pendingNativeApprovals([...this.#native], 100);
   }
 
   #pendingClarifications(): BotPendingClarification[] {
+    this.#expireDueInteractions();
     return this.#storage.pendingNativeClarifications([...this.#native], 100);
   }
 
@@ -994,6 +985,14 @@ export class NativeBotDataPlane {
     }
   }
 
+  taskTurnQueued(peer: string, command: { threadId: string; turnId: string }): void {
+    const bot = this.#storage.chatExecutionById(peer)?.bot ?? normalize(peer);
+    if (!this.handles(bot) || !this.#storage.nativeBotHasSession(bot, command.threadId)) return;
+    this.#scheduleTurnTimeout(bot, command.threadId, command.turnId);
+    this.#seedTurnActivity(bot, command.threadId, command.turnId);
+    this.#state(bot, command.threadId, "polling", true);
+  }
+
   close(): void {
     if (this.#staleTurnSweep !== undefined) clearInterval(this.#staleTurnSweep);
     this.#staleTurnSweep = undefined;
@@ -1103,15 +1102,9 @@ export class NativeBotDataPlane {
         if (event.kind === "delegation")
           return this.#delegation(key, sessionId, event, false);
         const delivery = this.#storage.nativeBotTurnDelivery(peer, event.turnId);
-        // An acknowledged Hermes turn may finish after something else sealed it: the local
-        // response deadline, the stale-turn reaper, or the plugin's own interrupt seal. The
-        // durable reply is still authoritative -- it is the one thing the user was waiting for,
-        // and this used to honor it only past a `timed_out` seal, so a commit landing after any
-        // other provisional terminal was acknowledged and silently dropped (issue #193). The
-        // projection is idempotent by messageId, so an at-least-once retry is safe.
-        // The one exception is an explicit user cancel (`cause: "cancelled"`): the user said
-        // stop and the plugin witnessed it, so a late reply stays suppressed. Every other seal
-        // is a provisional gateway guess that the durable reply outranks.
+        // Reply delivery survives gateway deadlines and journal-before-apply crashes. The first
+        // terminal remains authoritative: a late answer cannot rewrite Run or Task outcome.
+        // Explicit user cancellation suppresses late delivery as before.
         if (
           event.kind === "commit" &&
           command?.threadId === sessionId &&
@@ -1123,15 +1116,9 @@ export class NativeBotDataPlane {
             key, sessionId, event.messageId, event.blocks, event.mediaIds, event.mediaPositions,
             event.turnId,
           );
-          if (committed && event.continues !== true && terminal.status !== "completed") {
-            this.#storage.recordNativeBotTerminal({
-              bot: key, sessionId, turnId: event.turnId,
-              status: "completed", completedAt: this.#now(),
-            });
-            // The provisional seal may have left the durable pointer standing (a crash between
-            // journal and apply does exactly that); settle it with the same guarded clear.
-            this.#storage.clearNativeBotTurn(key, sessionId, event.turnId, this.#now());
-            this.#state(key, sessionId, "complete", false, { status: "completed" });
+          if (committed && event.continues !== true) {
+            const cleared = this.#storage.clearNativeBotTurn(key, sessionId, event.turnId, this.#now());
+            if (cleared) this.#state(key, sessionId, terminal.status === "completed" ? "complete" : "failed", false, terminal);
           }
           return committed;
         }
@@ -2657,9 +2644,11 @@ export class NativeBotDataPlane {
     if (delivery === undefined) return;
     this.#clearTurnTimeout(bot, sessionId, turnId);
     const key = this.#nativeTurnKey(bot, sessionId, turnId);
+    const waiting = this.#storage.tasks.waiting(peer ?? bot, turnId);
+    const suspended = this.#storage.tasks.suspended(peer ?? bot, turnId, delivery.queuedAt, this.#now());
     const timer = setTimeout(
       () => this.#timeoutTurn(bot, sessionId, turnId),
-      Math.max(0, delivery.queuedAt + this.#turnTimeoutMs - this.#now()),
+      Math.max(1, (waiting?.expiresAt ?? 0) - this.#now(), delivery.queuedAt + this.#turnTimeoutMs + suspended - this.#now()),
     );
     timer.unref();
     this.#turnTimers.set(key, timer);
@@ -2672,6 +2661,12 @@ export class NativeBotDataPlane {
     const peer = this.#executionPeer(bot, sessionId);
     const delivery = peer === undefined ? undefined : this.#storage.nativeBotTurnDelivery(peer, turnId);
     if (delivery === undefined) return;
+    const waiting = this.#storage.tasks.waiting(peer ?? bot, turnId);
+    const suspended = this.#storage.tasks.suspended(peer ?? bot, turnId, delivery.queuedAt, this.#now());
+    if ((waiting !== undefined && waiting.expiresAt > this.#now()) || (this.#turnTimeoutMs > 0 && this.#now() < delivery.queuedAt + this.#turnTimeoutMs + suspended)) {
+      this.#scheduleTurnTimeout(bot, sessionId, turnId);
+      return;
+    }
     if (delivery.acknowledgedAt === null) {
       this.#storage.cancelAttachCommand(
         peer ?? bot,
@@ -2739,7 +2734,11 @@ export class NativeBotDataPlane {
       const key = this.#nativeTurnKey(bot, chat.sessionId, turnId);
       live.add(key);
       this.#seedTurnActivity(bot, chat.sessionId, turnId);
-      const silentFor = now - (this.#turnActivity.get(key) ?? now);
+      const peer = this.#executionPeer(bot, chat.sessionId) ?? bot;
+      const waiting = this.#storage.tasks.waiting(peer, turnId);
+      if (waiting !== undefined && waiting.expiresAt > now) continue;
+      const lastActive = this.#turnActivity.get(key) ?? now;
+      const silentFor = now - lastActive - this.#storage.tasks.suspended(peer, turnId, lastActive, now);
       const acked = this.#interruptAcked.get(key);
       if (
         acked !== undefined &&
@@ -2926,8 +2925,7 @@ export class NativeBotDataPlane {
         toolCallId: event.approvalId,
         name: event.name,
       });
-      if (event.expiresAt !== undefined)
-        this.#scheduleInteractionExpiry({
+      this.#scheduleInteractionExpiry({
           bot,
           kind: "approval",
           interactionId: event.approvalId,
@@ -2938,7 +2936,7 @@ export class NativeBotDataPlane {
             ...(detail === undefined ? {} : { detail }),
             ...(repair === undefined ? {} : { repair }),
           },
-          expiresAt: event.expiresAt,
+          expiresAt: event.expiresAt ?? null,
           updatedAt: this.#now(),
         });
       this.#state(bot, sessionId, "polling", true);
@@ -3029,15 +3027,14 @@ export class NativeBotDataPlane {
         updatedAt: this.#now(),
       };
       this.#broadcast(pending);
-      if (event.expiresAt !== undefined)
-        this.#scheduleInteractionExpiry({
+      this.#scheduleInteractionExpiry({
           bot,
           kind: "clarify",
           interactionId: event.clarifyId,
           sessionId,
           turnId: event.turnId,
           payload,
-          expiresAt: event.expiresAt,
+          expiresAt: event.expiresAt ?? null,
           updatedAt: this.#now(),
         });
       this.#state(bot, sessionId, "polling", true);
@@ -3123,6 +3120,22 @@ export class NativeBotDataPlane {
     this.#broadcast(wire);
   }
 
+  #expireDueInteractions(): void {
+    for (const bot of this.#native) for (const pending of this.#storage.pendingNativeInteractions(bot)) {
+      if (pending.expiresAt !== null && pending.expiresAt <= this.#now()) this.#expireInteraction(bot, pending.kind, pending.interactionId, this.#now());
+    }
+  }
+
+  #expireInteraction(bot: string, kind: "approval" | "clarify", id: string, at: number): void {
+    const room = payloadRoom(this.#storage.nativeInteraction(bot, kind, id)?.payload);
+    const expired = this.#storage.expireNativeInteractionIfDue(bot, kind, id, at);
+    if (expired === undefined) return;
+    this.#clearInteractionTimer(kind, bot, id);
+    if (kind === "approval") this.#emitApprovalResolved(bot, expired.sessionId, expired.turnId, id, "expired", room);
+    else this.#broadcast({ type: "bot_clarify_resolved", bot, sessionId: expired.sessionId, turnId: expired.turnId, clarifyId: id, outcome: "expired", updatedAt: at, ...(room === undefined ? {} : { room }) });
+    if (room === undefined) this.#state(bot, expired.sessionId, "polling", true);
+  }
+
   #scheduleInteractionExpiry(pending: {
     bot: string;
     kind: "approval" | "clarify";
@@ -3133,47 +3146,14 @@ export class NativeBotDataPlane {
     expiresAt: number | null;
     updatedAt: number;
   }): void {
-    if (pending.expiresAt === null) return;
+    const expiresAt = pending.expiresAt ?? this.#storage.nativeInteraction(pending.bot, pending.kind, pending.interactionId)?.expiresAt;
+    if (expiresAt === undefined || expiresAt === null) return;
     const key = `${pending.kind}:${pending.bot}:${pending.interactionId}`;
     const prior = this.#interactionTimers.get(key);
     if (prior !== undefined) clearTimeout(prior);
     const timer = setTimeout(
-      () => {
-        if (
-          !this.#storage.resolveNativeInteraction(
-            pending.bot,
-            pending.kind,
-            pending.interactionId,
-            "expired",
-            this.#now(),
-          )
-        )
-          return;
-        const room = payloadRoom(pending.payload);
-        if (pending.kind === "approval") {
-          this.#emitApprovalResolved(
-            pending.bot,
-            pending.sessionId,
-            pending.turnId,
-            pending.interactionId,
-            "expired",
-            room,
-          );
-        } else {
-          this.#broadcast({
-            type: "bot_clarify_resolved",
-            bot: pending.bot,
-            sessionId: pending.sessionId,
-            turnId: pending.turnId,
-            clarifyId: pending.interactionId,
-            outcome: "expired",
-            updatedAt: this.#now(),
-            ...(room === undefined ? {} : { room }),
-          });
-        }
-        this.#interactionTimers.delete(key);
-      },
-      Math.max(0, pending.expiresAt - this.#now()),
+      () => this.#expireInteraction(pending.bot, pending.kind, pending.interactionId, Math.max(expiresAt, this.#now())),
+      Math.max(0, expiresAt - this.#now()),
     );
     timer.unref();
     this.#interactionTimers.set(key, timer);
@@ -3347,6 +3327,7 @@ export class NativeBotDataPlane {
         });
       }
     }
+    const waitingOn = chat.activeTurnId === undefined ? undefined : this.#storage.tasks.waiting(this.#executionPeer(bot, sessionId) ?? bot, chat.activeTurnId);
     return {
       type: "bot_chat_state",
       bot,
@@ -3355,6 +3336,7 @@ export class NativeBotDataPlane {
       running,
       inflight: running,
       ...(state === undefined ? {} : state),
+      ...(waitingOn === undefined ? {} : { waitingOn }),
       updatedAt: this.#now(),
     };
   }

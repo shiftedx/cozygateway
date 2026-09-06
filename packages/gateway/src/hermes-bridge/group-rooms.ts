@@ -803,7 +803,7 @@ export class GroupRooms {
           return result;
         }
       }
-      if (this.#now() >= deadline) {
+      if (this.#now() >= deadline + (row === undefined ? 0 : this.#storage.tasks.suspended(row.agentId, turnId, deadline - timeoutMs, this.#now()))) {
         const detail = `no reply within ${Math.round(timeoutMs / 1000)}s`;
         this.#storage.timeoutBotGroupTurn(key, turnId, detail, this.#now());
         // The member stopped mid-sentence. Nothing is coming to close its bubble, so the gateway

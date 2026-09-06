@@ -395,6 +395,7 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
       clarifyId: "clarify-1",
       prompt: "Which environment?",
       options: [{ id: "staging", label: "Staging" }, { id: "prod", label: "Production" }],
+      expiresAt: NOW + 600000,
       room: "Launch",
     }]);
     const pending = h.frames.find((frame) => frame.type === "bot_clarify_pending") as BotClarifyPendingFrame;

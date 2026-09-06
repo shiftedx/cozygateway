@@ -21,3 +21,4 @@ export * from "./hermes-session-management.ts";
 export * from "./cozyapps.ts";
 export * from "./chat-configuration.ts";
 export * from "./provider-connections.ts";
+export * from "./tasks.ts";

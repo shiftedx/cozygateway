@@ -192,7 +192,7 @@ describe("boot replay of journaled-unapplied attach events (issue #193)", () => 
       });
       expect(projected).toBe(true);
       expect(storage.nativeBotMessages("sage", sessionId).filter((message) => message.id === "late-answer")).toHaveLength(1);
-      expect(storage.nativeBotTurnTerminal("sage", sessionId, turnId)).toMatchObject({ status: "completed" });
+      expect(storage.nativeBotTurnTerminal("sage", sessionId, turnId)).toMatchObject({ status: "interrupted" });
       expect(frames.some((frame) => frame.type === "bot_chat" && frame.messages.some((message) => message.id === "late-answer"))).toBe(true);
       plane.close();
     } finally {

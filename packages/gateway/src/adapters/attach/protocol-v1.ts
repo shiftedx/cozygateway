@@ -370,6 +370,7 @@ const InterruptedEvent = Type.Object({ kind: Type.Literal("interrupted"), thread
 const ToolEvent = Type.Object({
   kind: Type.Literal("tool"), threadId: Id, turnId: Id, callId: Id, name: Type.String({ minLength: 1, maxLength: 128 }),
   status: Type.Union([Type.Literal("running"), Type.Literal("ok"), Type.Literal("error")]),
+  role: Type.Optional(Type.Union([Type.Literal("investigation"), Type.Literal("mutation"), Type.Literal("verification"), Type.Literal("unknown")])),
   detail: Type.Optional(Type.String({ maxLength: 1024 })),
 });
 /** Closed status vocabulary for one delegated child. `queued|starting|running|stalling` are

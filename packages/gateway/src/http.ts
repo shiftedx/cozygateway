@@ -1,3 +1,4 @@
+import { registerTaskRoutes } from "./task-routes.ts";
 import { createHash, randomUUID } from "node:crypto";
 
 import { Hono } from "hono";
@@ -186,6 +187,7 @@ function configuredOrigin(config: GatewayConfig): string {
 
 export interface AppDeps {
   storage: Storage;
+  flushTaskCommands?: () => void;
   /** Test-only override for the gateway-wide `/pair` bucket. Production leaves this absent and
    *  builds its limiter from `now`; a long-lived black-box harness supplies one with virtual time. */
   pairingAdmission?: PairingAttemptLimiter;
@@ -1668,6 +1670,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
     requestLiveActivityDeletionDrain();
     return c.body(null, 204);
   });
+
+  registerTaskRoutes(app, requireDevice, deps.storage, deps.now, deps.flushTaskCommands ?? (() => {}));
 
   // Vendor extension, registered last so it cannot shadow a core route (contract/ext-bots-v1.md).
   if (deps.bots !== undefined) {

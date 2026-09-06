@@ -4,6 +4,7 @@
  *  client frames with an `error` frame. */
 import { type Static, Type } from "@sinclair/typebox";
 
+import { TaskUpdatedFrameSchema } from "./tasks.ts";
 import { RichBlockSchema } from "./rich-blocks.ts";
 import {
   BotApprovalPendingFrameSchema,
@@ -247,6 +248,7 @@ export const MobileNodeCancelFrameSchema = Type.Object({
 export type MobileNodeCancelFrame = Static<typeof MobileNodeCancelFrameSchema>;
 
 export const ServerFrameSchema = Type.Union([
+  TaskUpdatedFrameSchema,
   ReadyFrameSchema,
   SyncedFrameSchema,
   CommittedFrameSchema,

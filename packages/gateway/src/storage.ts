@@ -1,3 +1,4 @@
+import { Tasks } from "./tasks.ts";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 
@@ -1064,9 +1065,12 @@ export class GatewayMaintenanceOperationConflict extends Error {
 
 export class Storage {
   readonly #db: DatabaseSync;
+  readonly tasks: Tasks;
 
   constructor(db: DatabaseSync) {
     this.#db = db;
+    this.tasks = new Tasks(db);
+    this.tasks.expireInteractions((bot, kind, id, at) => { this.expireNativeInteractionIfDue(bot, kind, id, at); });
   }
 
   createSetupCode(code: string, expiresAt: number, kind: SetupCodeKind = "device"): void {
@@ -2304,13 +2308,13 @@ export class Storage {
   }
 
   beginBotGroupTurn(turn: Omit<BotGroupTurnRow, "state" | "createdAt" | "completedAt" | "consumedAt" | "text" | "detail"> & { createdAt: number }): boolean {
-    this.#db.exec("BEGIN IMMEDIATE");
+    this.#db.exec("SAVEPOINT group_turn");
     try {
       const active = this.#db.prepare(
         "SELECT 1 FROM bot_group_turns WHERE group_key = ? AND state = 'pending' LIMIT 1",
       ).get(turn.key);
       if (active !== undefined) {
-        this.#db.exec("COMMIT");
+        this.#db.exec("RELEASE group_turn");
         return false;
       }
       this.#db.prepare(
@@ -2320,10 +2324,10 @@ export class Storage {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
       ).run(turn.key, turn.turnId, turn.member, turn.agentId, turn.threadId, turn.messageId, turn.epoch, turn.watermark,
         turn.cause?.kind ?? null, turn.cause?.seq ?? null, turn.createdAt);
-      this.#db.exec("COMMIT");
+      this.#db.exec("RELEASE group_turn");
       return true;
     } catch (err) {
-      this.#db.exec("ROLLBACK");
+      this.#db.exec("ROLLBACK TO group_turn; RELEASE group_turn");
       throw err;
     }
   }
@@ -2352,10 +2356,14 @@ export class Storage {
   }
 
   timeoutBotGroupTurn(key: string, turnId: string, detail: string, completedAt: number): void {
-    this.#db.prepare(
-      `UPDATE bot_group_turns SET state = 'timeout', detail = ?, completed_at = ?
-       WHERE group_key = ? AND turn_id = ? AND state = 'pending'`,
-    ).run(detail, completedAt, key, turnId);
+    this.tasks.atomic(() => {
+      const changed = this.#db.prepare(
+        `UPDATE bot_group_turns SET state = 'timeout', detail = ?, completed_at = ?
+         WHERE group_key = ? AND turn_id = ? AND state = 'pending'`,
+      ).run(detail, completedAt, key, turnId).changes === 1;
+      const turn = changed ? this.botGroupTurn(key, turnId) : undefined;
+      if (turn !== undefined) this.tasks.nativeTerminal(turn.member, turn.threadId, turnId, "timed_out", completedAt);
+    });
   }
 
   botGroupTurn(key: string, turnId: string): BotGroupTurnRow | undefined {
@@ -2398,7 +2406,7 @@ export class Storage {
     command: AttachV1Command,
     createdAt: number,
   ): AttachV1CommandFrame {
-    this.#db.exec("BEGIN IMMEDIATE");
+    this.#db.exec("SAVEPOINT attach_enqueue");
     try {
       const prior = this.#db
         .prepare(
@@ -2407,7 +2415,7 @@ export class Storage {
         )
         .get(agentId, commandId) as { sequence: number; commandJson: string } | undefined;
       if (prior !== undefined) {
-        this.#db.exec("COMMIT");
+        this.#db.exec("RELEASE attach_enqueue");
         return { kind: "command", sequence: prior.sequence, commandId, command: JSON.parse(prior.commandJson) as AttachV1Command };
       }
       this.#db
@@ -2429,12 +2437,36 @@ export class Storage {
       this.#db
         .prepare("UPDATE attach_streams SET next_command_sequence = ?, updated_at = ? WHERE agent_id = ?")
         .run(stream.sequence + 1, createdAt, agentId);
-      this.#db.exec("COMMIT");
+      this.tasks.admit(agentId, command, createdAt);
+      this.#db.exec("RELEASE attach_enqueue");
       return { kind: "command", sequence: stream.sequence, commandId, command };
     } catch (err) {
-      this.#db.exec("ROLLBACK");
+      this.#db.exec("ROLLBACK TO attach_enqueue; RELEASE attach_enqueue");
       throw err;
     }
+  }
+
+  enqueueTaskCommand(peer: string, commandId: string, command: AttachV1Command, at: number): boolean {
+    return this.tasks.atomic(() => {
+      if (command.kind === "turn") {
+        const run = this.tasks.run(peer, command.turnId);
+        const view = run === undefined ? undefined : this.tasks.read(run.taskId)?.view;
+        if (run === undefined || view === undefined || view.state !== "queued" || view.currentRun.runId !== command.turnId || view.pendingIntent?.command === "pause" || view.pendingIntent?.command === "cancel") return false;
+        if (view.room !== undefined) {
+          const previous = run.predecessorRunId === null ? undefined : this.botGroupTurnForAttach(peer, command.threadId, run.predecessorRunId);
+          const room = this.botGroup(view.room);
+          if (previous === undefined || room === undefined || !room.members.includes(view.bot)) return false;
+          if (this.botGroupTurnForAttach(peer, command.threadId, command.turnId) === undefined && !this.beginBotGroupTurn({ key: room.key, turnId: command.turnId, member: view.bot, agentId: peer, threadId: command.threadId, messageId: command.messageId, epoch: room.epoch, watermark: previous.watermark, ...(previous.cause === undefined ? {} : { cause: previous.cause }), createdAt: at })) return false;
+        } else if (this.nativeBotHasSession(view.bot, command.threadId)) {
+          const state = this.nativeChatConfiguration(view.bot, command.threadId);
+          if (state?.activeTurnId !== undefined && state.activeTurnId !== command.turnId) return false;
+          this.setNativeBotTurn(view.bot, command.threadId, command.turnId, at);
+          this.appendNativeBotMessage({ bot: view.bot, sessionId: command.threadId, messageId: command.messageId, role: "user", text: command.text, turnId: command.turnId, at });
+        } else if (this.threadById(command.threadId)?.agentId !== peer) return false;
+      }
+      this.enqueueAttachCommand(peer, commandId, command, at);
+      return true;
+    });
   }
 
   pendingAttachCommands(agentId: string, afterSequence: number, limit: number): AttachV1CommandFrame[] {
@@ -2465,6 +2497,8 @@ export class Storage {
   }
 
   cancelAttachCommand(agentId: string, sequence: number, commandId: string, reason: string, cancelledAt: number): AttachV1CommandFrame | undefined {
+    return this.tasks.atomic(() => {
+    const prior = this.#db.prepare("SELECT command_json AS json FROM attach_command_outbox WHERE agent_id = ? AND sequence = ? AND command_id = ? AND acked_at IS NULL AND cancelled_at IS NULL").get(agentId, sequence, commandId) as { json: string } | undefined;
     this.#db
       .prepare(
         `UPDATE attach_command_outbox
@@ -2472,7 +2506,9 @@ export class Storage {
          WHERE agent_id = ? AND sequence = ? AND command_id = ? AND acked_at IS NULL`,
       )
       .run(cancelledAt, reason.slice(0, 512), agentId, sequence, commandId);
+    if (prior !== undefined) this.tasks.discarded(agentId, JSON.parse(prior.json) as AttachV1Command, cancelledAt);
     return this.pendingAttachCommands(agentId, sequence - 1, 1)[0];
+    });
   }
 
   /** An unsupported negotiated capability turns a queued native resolution into a transport
@@ -2534,12 +2570,14 @@ export class Storage {
   }
 
   ackAttachCommand(agentId: string, sequence: number, commandId: string, ackedAt: number): boolean {
-    return this.#db
-      .prepare(
-        `UPDATE attach_command_outbox SET acked_at = COALESCE(acked_at, ?)
-         WHERE agent_id = ? AND sequence = ? AND command_id = ?`,
-      )
-      .run(ackedAt, agentId, sequence, commandId).changes === 1;
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#db.prepare("SELECT command_json AS json, cancelled_at AS cancelledAt FROM attach_command_outbox WHERE agent_id = ? AND sequence = ? AND command_id = ?").get(agentId, sequence, commandId) as { json: string; cancelledAt: number | null } | undefined;
+      const changed = this.#db.prepare("UPDATE attach_command_outbox SET acked_at = COALESCE(acked_at, ?) WHERE agent_id = ? AND sequence = ? AND command_id = ?").run(ackedAt, agentId, sequence, commandId).changes === 1;
+      if (row !== undefined && row.cancelledAt === null) this.tasks.acknowledged(agentId, JSON.parse(row.json) as AttachV1Command, ackedAt);
+      this.#db.exec("COMMIT");
+      return changed;
+    } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
   }
 
   /** Reconciles a plugin's durable cursors after an ACK was lost or the gateway was reprovisioned.
@@ -2581,13 +2619,12 @@ export class Storage {
       )
       .get(agentId, agentId) as { sequence: number };
     if (commandThrough > row.sequence) return false;
-    this.#db
-      .prepare(
-        `UPDATE attach_command_outbox SET acked_at = COALESCE(acked_at, ?)
-         WHERE agent_id = ? AND sequence <= ?`,
-      )
-      .run(reconciledAt, agentId, commandThrough);
-    return true;
+    return this.tasks.atomic(() => {
+      const admitted = this.#db.prepare("SELECT command_json AS json FROM attach_command_outbox WHERE agent_id = ? AND sequence <= ? AND acked_at IS NULL AND cancelled_at IS NULL ORDER BY sequence").all(agentId, commandThrough) as unknown as { json: string }[];
+      this.#db.prepare("UPDATE attach_command_outbox SET acked_at = COALESCE(acked_at, ?) WHERE agent_id = ? AND sequence <= ?").run(reconciledAt, agentId, commandThrough);
+      for (const command of admitted) this.tasks.acknowledged(agentId, JSON.parse(command.json) as AttachV1Command, reconciledAt);
+      return true;
+    });
   }
 
   attachCommandCursor(agentId: string): number {
@@ -2767,7 +2804,7 @@ export class Storage {
       if (discardReason !== undefined) return quarantine(discardReason);
       const event = frame.event;
       const turnId = "turnId" in event ? event.turnId : undefined;
-      const terminal = event.kind === "commit" || event.kind === "failed" || event.kind === "cancelled" || event.kind === "interrupted";
+      const terminal = (event.kind === "commit" && event.continues !== true) || event.kind === "failed" || event.kind === "cancelled" || event.kind === "interrupted";
       const sealed = turnId === undefined
         ? undefined
         : (this.#db.prepare("SELECT event_id AS eventId FROM attach_turn_terminals WHERE agent_id = ? AND turn_id = ?").get(agentId, turnId) as { eventId: string } | undefined);
@@ -2846,6 +2883,7 @@ export class Storage {
       this.#db
         .prepare("UPDATE attach_streams SET last_event_sequence = ?, updated_at = ? WHERE agent_id = ?")
         .run(frame.sequence, receivedAt, agentId);
+      if (disposition === "accepted") this.tasks.event(agentId, frame, receivedAt);
       this.#db.exec("COMMIT");
       return { status: disposition, acknowledgedSequence: frame.sequence };
     } catch (err) {
@@ -3001,18 +3039,13 @@ export class Storage {
     cause?: "cancelled";
     completedAt: number;
   }): void {
+    this.tasks.atomic(() => {
     this.#db
       .prepare(
         `INSERT INTO bot_native_turn_terminals
            (bot, session_id, turn_id, status, cause, completed_at)
          VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(bot, turn_id) DO UPDATE SET
-           session_id = excluded.session_id,
-           status = excluded.status,
-           cause = excluded.cause,
-           completed_at = excluded.completed_at
-         WHERE bot_native_turn_terminals.status != 'completed'
-           AND excluded.status = 'completed'`,
+         ON CONFLICT(bot, turn_id) DO NOTHING`,
       )
       .run(
         input.bot,
@@ -3022,6 +3055,8 @@ export class Storage {
         input.cause ?? null,
         input.completedAt,
       );
+    this.tasks.nativeTerminal(input.bot, input.sessionId, input.turnId, input.status, input.completedAt, input.cause);
+    });
   }
 
   nativeBotTurnTerminal(bot: string, sessionId: string, turnId: string): {
@@ -4049,6 +4084,7 @@ export class Storage {
     expiresAt?: number;
     updatedAt: number;
   }): "inserted" | "updated" | "duplicate" | "conflict" {
+    return this.tasks.atomic(() => {
     const prior = this.nativeInteraction(input.bot, input.kind, input.interactionId);
     if (prior === undefined) {
       this.#db
@@ -4058,8 +4094,9 @@ export class Storage {
               selected_option_id, expires_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(input.bot, input.kind, input.interactionId, input.sessionId, input.turnId, JSON.stringify(input.payload), input.status, input.selectedOptionId ?? null, input.expiresAt ?? null, input.updatedAt);
+        .run(input.bot, input.kind, input.interactionId, input.sessionId, input.turnId, JSON.stringify(input.payload), input.status, input.selectedOptionId ?? null, input.expiresAt ?? input.updatedAt + 600_000, input.updatedAt);
       if (input.status !== "pending") this.#trimTerminalNativeInteractions(input.bot);
+      this.tasks.interaction(input.bot, input.kind, input.interactionId);
       return "inserted";
     }
     if (prior.status !== "pending") return "duplicate";
@@ -4073,7 +4110,9 @@ export class Storage {
       )
       .run(input.status, input.selectedOptionId ?? null, input.updatedAt, input.bot, input.kind, input.interactionId);
     this.#trimTerminalNativeInteractions(input.bot);
+    this.tasks.interaction(input.bot, input.kind, input.interactionId);
     return "updated";
+    });
   }
 
   resolveNativeInteraction(
@@ -4084,14 +4123,16 @@ export class Storage {
     updatedAt: number,
     selectedOptionId?: string,
   ): boolean {
+    return this.tasks.atomic(() => {
     const resolved = this.#db
       .prepare(
         `UPDATE bot_native_interactions SET status = ?, selected_option_id = ?, updated_at = ?
          WHERE bot = ? AND kind = ? AND interaction_id = ? AND status = 'pending'`,
       )
       .run(status, selectedOptionId ?? null, updatedAt, bot, kind, interactionId).changes === 1;
-    if (resolved) this.#trimTerminalNativeInteractions(bot);
+    if (resolved) { this.#trimTerminalNativeInteractions(bot); this.tasks.interaction(bot, kind, interactionId); }
     return resolved;
+    });
   }
 
   nativeInteraction(
@@ -4167,6 +4208,7 @@ export class Storage {
           )
           .run(input.requestedAt, input.bot, input.kind, input.interactionId, input.requestedAt);
         this.#trimTerminalNativeInteractions(input.bot);
+        this.tasks.interaction(input.bot, input.kind, input.interactionId);
         this.#db.exec("COMMIT");
         return { outcome: "expired", sessionId: row.sessionId, turnId: row.turnId };
       }
@@ -4410,6 +4452,7 @@ export class Storage {
     interactionId: string,
     now: number,
   ): { sessionId: string; turnId: string } | undefined {
+    return this.tasks.atomic(() => {
     const row = this.#db
       .prepare(
         `SELECT session_id AS sessionId, turn_id AS turnId
@@ -4426,8 +4469,9 @@ export class Storage {
            AND status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?`,
       )
       .run(now, bot, kind, interactionId, now).changes === 1;
-    if (changed) this.#trimTerminalNativeInteractions(bot);
+    if (changed) { this.#trimTerminalNativeInteractions(bot); this.tasks.interaction(bot, kind, interactionId); }
     return changed ? row : undefined;
+    });
   }
 
   /** Due active-profile approval ids. Callers settle each through the conditional method above,

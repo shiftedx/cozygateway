@@ -78,6 +78,8 @@ export interface AttachV1Events {
   onEvent(agentId: string, frame: AttachV1EventFrame): boolean;
   /** Authorization/canonical-target check performed before inbox admission. */
   canAcceptEvent?(agentId: string, frame: AttachV1EventFrame): boolean;
+  onHello?(agentId: string): void;
+  onTaskTurnQueued?(agentId: string, command: Extract<AttachV1Command, { kind: "turn" }>): void;
   onPresence(agentId: string, state: "online" | "degraded" | "absent"): void;
   onMobileRequest?(agentId: string, frame: AttachV1MobileRequest): void;
   onMobileCancel?(agentId: string, frame: AttachV1MobileCancel): void;
@@ -219,6 +221,8 @@ export class AttachV1Ingress implements TurnEndpoint {
     helloTimer.unref();
 
     socket.on("message", (data) => {
+      // A replaced socket may still deliver already-buffered frames before close completes.
+      if (connection.hello && this.#current.get(agentId) !== connection) return;
       const receivedAt = this.#now();
       connection.lastSeenAt = receivedAt;
       connection.heartbeatDegraded = false;
@@ -273,6 +277,7 @@ export class AttachV1Ingress implements TurnEndpoint {
           connection.telemetry = this.#recordTelemetry(agentId, frame.telemetry, receivedAt);
         if (frame.commands !== undefined) {
           this.#commandCatalogs.set(agentId, [...frame.commands]);
+          this.#storage.tasks.declareSlashCommands(agentId, frame.commands.map((command) => command.name));
         }
         connection.maxInFlightEvents = Math.min(frame.limits?.maxInFlightEvents ?? ATTACH_V1_MAX_IN_FLIGHT_EVENTS, ATTACH_V1_MAX_IN_FLIGHT_EVENTS);
         connection.maxInFlightBytes = Math.min(frame.limits?.maxInFlightBytes ?? ATTACH_V1_MAX_IN_FLIGHT_BYTES, ATTACH_V1_MAX_IN_FLIGHT_BYTES);
@@ -296,6 +301,9 @@ export class AttachV1Ingress implements TurnEndpoint {
           extensions: { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION },
         });
         this.#presence(agentId, "online");
+        this.#storage.tasks.hello(agentId, receivedAt);
+        this.#events.onHello?.(agentId);
+        this.flushTaskCommands();
         this.#refreshDegraded(agentId, connection);
         this.#flush(agentId, connection.commandCursor);
         return;
@@ -359,6 +367,7 @@ export class AttachV1Ingress implements TurnEndpoint {
           connection.sentCommands.delete(frame.sequence);
           connection.sentCommandBytes -= sent.bytes;
           connection.commandCursor = this.#storage.attachCommandCursor(agentId);
+          this.flushTaskCommands();
           this.#traceAttach("attach_command_ack", agentId, { commandCursor: connection.commandCursor });
           this.#flush(agentId, connection.commandCursor);
         }
@@ -393,6 +402,7 @@ export class AttachV1Ingress implements TurnEndpoint {
       }
       if (admission.status === "accepted") {
         this.#projectPending(agentId);
+        this.flushTaskCommands();
       }
       if (admission.status === "discarded" && frame.event.kind === "scheduled") {
         this.#deliveryFailed(agentId, {
@@ -461,6 +471,18 @@ export class AttachV1Ingress implements TurnEndpoint {
       connection.sentCommandBytes += bytes;
       connection.sendCursor = frame.sequence;
     }
+  }
+
+  flushTaskCommands(): void {
+    this.#storage.tasks.dispatch((peer, id, command) => {
+      if (!this.canQueue(peer) || !commandCapabilities(command).every((capability) => this.#allowed(peer).includes(capability))) return false;
+      const connection = this.#current.get(peer);
+      if (connection?.hello === true && !commandCapabilities(command).every((capability) => connection.capabilities.has(capability))) return false;
+      if (!this.#storage.enqueueTaskCommand(peer, id, command, this.#now())) return false;
+      if (command.kind === "turn") this.#events.onTaskTurnQueued?.(peer, command);
+      this.#flush(peer, connection?.commandCursor ?? 0);
+      return true;
+    });
   }
 
   #enqueue(agentId: string, command: AttachV1Command, commandId: string = randomUUID()): boolean {
@@ -752,6 +774,7 @@ export class AttachV1Ingress implements TurnEndpoint {
   }
 
   #refreshDegraded(agentId: string, connection: Connection): void {
+    if (this.#current.get(agentId) !== connection) return;
     const degraded = connection.heartbeatDegraded || this.#pluginBacklogStalled(connection, this.#now());
     if (connection.degraded === degraded) return;
     connection.degraded = degraded;
@@ -819,6 +842,7 @@ export class AttachV1Ingress implements TurnEndpoint {
       const timer = setTimeout(() => {
         this.#projectionTimers.delete(agentId);
         this.#projectPending(agentId);
+        this.flushTaskCommands();
       }, delay);
       timer.unref();
       this.#projectionTimers.set(agentId, timer);
@@ -827,6 +851,8 @@ export class AttachV1Ingress implements TurnEndpoint {
   }
 
   #tick(): void {
+    this.#storage.tasks.reconcile(this.#now());
+    this.flushTaskCommands();
     const now = this.#now();
     for (const [agentId, connection] of this.#current) {
       const age = now - connection.lastSeenAt;
@@ -841,6 +867,7 @@ export class AttachV1Ingress implements TurnEndpoint {
   }
 
   #presence(agentId: string, state: "online" | "degraded" | "absent"): void {
+    this.#storage.tasks.presence(agentId, state !== "absent", this.#now());
     this.#events.onPresence(agentId, state);
     this.#traceAttach("attach_presence", agentId, { state });
   }

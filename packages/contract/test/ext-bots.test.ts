@@ -914,7 +914,8 @@ describe("capability advertisement", () => {
     // Capability 63 declares the harness's per-server MCP repair policy on `BotMcpServer.repair`:
     // optional, closed to `approve_once` and `auto_refresh`, READ-ONLY metadata the gateway relays
     // and never stores, computes, writes, or backfills. An absent key is unprojected or unknown.
-    expect(BOTS_CAPABILITY_VERSION).toBe(63);
+    // Capability 64 adds durable Task reads, commands and replacement updates.
+    expect(BOTS_CAPABILITY_VERSION).toBe(64);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {
