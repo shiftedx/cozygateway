@@ -254,3 +254,130 @@ version pins moved to 66 in `packages/contract/test/ext-bots.test.ts`,
    have made the table inconsistent with its other forty.
 6. **UNKNOWN**: no `.121` qualification and no hosted CI. Deterministic fixtures, the seam tests and
    the portable conformance fixture are the qualification for this packet.
+
+## Fix round 1
+
+Review: `review-r0.md` (independent, Opus 5 high). Spec compliance PASS; blocking C1, I1, I2, I3,
+plus I4 as a docs correction. Head after this round: `1d88538`, pushed. The lead settled report
+concern 1: auto-answering a covered CATEGORY grant is the roadmap's "no prompt, covered by user
+policy" level, stays relay-only, and is kept.
+
+### C1: a plain approve created a standing grant nobody asked for
+
+`native-data-plane.ts` recorded a grant whenever the decision was an approve on a scoped approval,
+consulting `grantRequest` only for WHICH KIND. A body-less approve, which is every client below 66
+and every plain tap of Approve, therefore wrote an unlimited-use standing policy whose expiry came
+straight from the peer's block.
+
+Now: no grant is recorded unless `grantRequest.grant` is present. A `once` grant is single use, and
+the claim and the spend are one transaction (`Storage.claimApprovalGrant`), so two asks arriving
+together cannot both take it. Its expiry is `min(scope.expiresAt, now + APPROVAL_ONCE_GRANT_MAX_MS)`
+with the ceiling at ten minutes, the same bound the durable interaction record already falls back
+to, so a peer value can only shorten it. A spent grant is dead: absent from the view and from every
+later consult.
+
+### I1: a duplicate decision reported success for a policy it did not create
+
+The `already_requested` branch returned before the grant block, so a person tapping Approve and then
+choosing a category policy got `202 requested` and nothing. Now both the `requested` and
+`already_requested` branches run one shared recording path: the grant the person asked for is
+created if the decision carries none, and a second, different one answers the new outcome
+`grant_not_recorded`, which the route renders as `409 approval_grant_not_recorded` saying the
+decision stands and the policy was not created.
+
+### I2: an auto-approved ask was un-deniable and lost its reason on reconnect
+
+`grantId` is now persisted on the durable interaction payload (`Storage.attachInteractionGrant`,
+written BEFORE the relay so a reconnect in between still shows it), projected on
+`BotPendingApproval.grantId` and re-emitted on the reconnect rebroadcast. A deny on an ask the
+gateway settled from a grant now REPLACES the gateway's own requested marker instead of returning
+`409 approval_resolution_pending`: `requestNativeInteractionResolution` takes an `override` flag,
+used only when the payload names a covering grant and the standing requested decision is the
+gateway's approve, and the replacement command carries its own outbox id. A second decision the
+gateway did not make still conflicts exactly as before, and the first TERMINAL is untouched, because
+this replaces a requested marker and the peer's terminal remains the only proof.
+
+### I3: a grant could decide while being invisible
+
+`approvalGrants` and the consult now read ONE bounded window (`LIVE_APPROVAL_GRANT` plus
+`APPROVAL_GRANT_WINDOW`, newest first): a grant outside the view is consulted by nothing. Revoked,
+spent and expired grants are dead in both.
+
+### I4 and M4: contract prose
+
+Row 66 and the attach bullet now say that `category` is ASSERTED BY THE PEER, that the gateway
+cannot classify an action at this seam, and that the guarantee is only that a peer-declared
+always-require category is never covered by a grant, with classification owned by the raising
+harness (packet 5b) and the `change` sentence as the person's independent check. The row also now
+states the explicit-grant rule, the once-grant bounds, the duplicate-decision answer, the persisted
+`grantId` and the deny path, and the shared window. M4 fixed: the row 66 line was separated from the
+capability table by blank lines and rendered as a paragraph of pipes; it is contiguous again.
+
+Not taken in this round, unchanged from the review's own triage: M1 (peer strings in the grant row,
+the same posture as rows 56 and 62), M3 (a decision body without `application/json` is ignored,
+which now yields no grant at all rather than a wrong one), M5 (the two em-dash placeholder cells,
+lead's call), M6 (the two expirations, now bounded by C1's ceiling). M2 is closed: the expired-grant
+test carries a second case with a FRESH ask over an expired grant, which reaches the storage filter.
+
+### Covering tests
+
+- `packages/gateway/test/native-bot-scoped-approvals.test.ts` (15 tests): "records no standing grant
+  for a plain approve, so the next identical ask asks again" (C1), "covers exactly one later ask
+  with an explicit once grant, and asks again after that" (C1), "bounds a once grant by the ask and
+  by its own ceiling, never by the value the peer chose" (C1), "creates the grant a duplicate
+  decision asks for, and never reports one it did not create" (I1), "says what covered an
+  auto-approved ask on the rebroadcast and the inbox, and lets the person deny it" (I2), "keeps
+  every grant that can auto-approve inside the view a person can revoke from" (I3, at the 101st
+  grant), "refuses to replay an expired grant regardless of category policy" (now with the fresh-ask
+  case, M2).
+- `packages/gateway/test/bots-approval-grants-routes.test.ts` (8 tests): "answers 409 rather than
+  success when the decision stands but the grant was not created" (I1 at the route).
+- `packages/contract/test/bots-approvals.test.ts`: `grantId` on the inbox row shape and its position
+  in the pinned key list.
+- `packages/conformance/test/scoped-approvals-fixture.test.ts` plus its fixture: `inboxRowCovered`
+  proves the attribution survives to a cold inbox read (I2) and the always-require case is restated
+  as a peer assertion (I4).
+
+### Commands and counts
+
+RED, with the new cases written before any of the fixes:
+
+```
+$ cd packages/gateway && npx vitest run test/native-bot-scoped-approvals.test.ts
+ × records no standing grant for a plain approve, so the next identical ask asks again
+ × covers exactly one later ask with an explicit once grant, and asks again after that
+ × bounds a once grant by the ask and by its own ceiling, never by the value the peer chose
+ × creates the grant a duplicate decision asks for, and never reports one it did not create
+ × says what covered an auto-approved ask on the rebroadcast and the inbox, and lets the person deny it
+ × keeps every grant that can auto-approve inside the view a person can revoke from
+ Test Files  1 failed (1)
+      Tests  6 failed | 9 passed (15)
+```
+
+GREEN:
+
+```
+$ cd packages/gateway && npx vitest run test/native-bot-scoped-approvals.test.ts
+ Test Files  1 passed (1)
+      Tests  15 passed (15)
+
+$ cd packages/gateway && npx vitest run test/bots-approval-grants-routes.test.ts \
+    test/native-bot-scoped-approvals.test.ts test/native-bot-approval-repair.test.ts \
+    test/native-bot-approval-detail.test.ts test/bots-pending-approvals-routes.test.ts \
+    test/approvals.test.ts test/attach-v1-storage.test.ts test/attach-v1-ingress.test.ts \
+    test/attach-v1-protocol.test.ts test/bots-rooms-interactions.test.ts \
+    test/bots-delete-routes.test.ts test/native-bot-data-plane.test.ts
+ Test Files  12 passed (12)
+      Tests  211 passed (211)
+
+$ cd packages/contract    && npx vitest run   Test Files 19 passed (19)   Tests 192 passed (192)
+$ cd packages/conformance && npx vitest run   Test Files 9 passed (9)     Tests 92 passed | 19 skipped (111)
+$ cd packages/gateway     && npx vitest run   Test Files 132 passed | 1 skipped (133)
+                                              Tests 1473 passed | 2 skipped (1475)
+$ pnpm -r typecheck
+  contract, relay, gateway, conformance: Done
+```
+
+The shared resolution path in `storage.ts` is touched by the `override` flag, so the gateway package
+suite was run whole (1473 passed, up 6 from 1467 with the new cases). Full `pnpm -r test` still not
+run: the lead owns that gate. `.121` and hosted CI remain UNKNOWN.
