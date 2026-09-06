@@ -62,7 +62,7 @@ and does not register `/bots` routes.
 | 20 | Audio/video attachment playback with byte ranges. |
 | 21 | Redacted tool-step details. |
 | 22 | Durable native clarification events and resolution. |
-| 23 | Exact native turn status/cause and durable queued-at metadata. |
+| 23 | Exact native turn status/cause and durable queued-at metadata. `cause: "verification_unavailable"` identifies a failed turn whose workspace checker is not configured; it is preserved in live state and history. Unknown failures carry no invented connectivity cause, and raw runtime diagnostics are not forwarded. |
 | 24 | Common document attachment sends and file downloads. |
 | 25 | Profile-local discovery of Hermes gateway-safe, plugin, and installed skill commands. |
 | 26 | Searchable aggregate history of agent-sent attachments across native sessions. |

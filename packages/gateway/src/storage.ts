@@ -3317,7 +3317,7 @@ export class Storage {
     sessionId: string;
     turnId: string;
     status: "completed" | "failed" | "interrupted" | "timed_out";
-    cause?: "cancelled";
+    cause?: "cancelled" | "verification_unavailable";
     completedAt: number;
   }): void {
     this.tasks.atomic(() => {
@@ -3342,7 +3342,7 @@ export class Storage {
 
   nativeBotTurnTerminal(bot: string, sessionId: string, turnId: string): {
     status: "completed" | "failed" | "interrupted" | "timed_out";
-    cause?: "cancelled";
+    cause?: "cancelled" | "verification_unavailable";
   } | undefined {
     const row = this.#db
       .prepare(
@@ -3351,7 +3351,7 @@ export class Storage {
       )
       .get(bot, sessionId, turnId) as {
         status: "completed" | "failed" | "interrupted" | "timed_out";
-        cause: "cancelled" | null;
+        cause: "cancelled" | "verification_unavailable" | null;
       } | undefined;
     return row === undefined
       ? undefined
@@ -3362,7 +3362,7 @@ export class Storage {
    * event exists. */
   nativeBotLastTerminal(agentId: string, sessionId: string): {
     status: "completed" | "failed" | "interrupted" | "timed_out";
-    cause?: "cancelled";
+    cause?: "cancelled" | "verification_unavailable";
   } | undefined {
     const row = this.#db
       .prepare(
@@ -3371,7 +3371,7 @@ export class Storage {
       )
       .get(agentId, sessionId) as {
       status: "completed" | "failed" | "interrupted" | "timed_out";
-      cause: "cancelled" | null;
+      cause: "cancelled" | "verification_unavailable" | null;
     } | undefined;
     return row === undefined
       ? undefined

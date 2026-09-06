@@ -514,6 +514,7 @@ export const BotChatStateCauseSchema = Type.Union([
   Type.Literal("attach_degraded"),
   Type.Literal("attach_lost"),
   Type.Literal("cancelled"),
+  Type.Literal("verification_unavailable"),
 ]);
 export type BotChatStateCause = Static<typeof BotChatStateCauseSchema>;
 
