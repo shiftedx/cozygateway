@@ -73,7 +73,8 @@ it("admits public direct chat through authenticated attach, then exposes one com
     const pausing = incoming.filter((frame) => frame.kind === "command" && frame.command.kind === "turn").at(-1);
     if (pausing?.kind !== "command" || pausing.command.kind !== "turn") throw new Error("missing second turn");
     peer.send(JSON.stringify({ kind: "ack", channel: "command", sequence: pausing.sequence, id: pausing.commandId }));
-    const pauseTask = storage.tasks.list({ bot: "sage" }).find((view) => view.currentRun.runId === pausing.command.turnId)!;
+    const pauseRunId = pausing.command.turnId;
+    const pauseTask = storage.tasks.list({ bot: "sage" }).find((view) => view.currentRun.runId === pauseRunId)!;
     await until(() => storage.tasks.read(pauseTask.taskId)?.view.state === "running");
     peer.send(JSON.stringify({ kind: "event", sequence: 3, eventId: "approval", event: { kind: "approval", threadId: pausing.command.threadId, turnId: pausing.command.turnId, approvalId: "approval", callId: "call", name: "write", status: "pending", expiresAt: Date.now() + 60000 } }));
     await until(() => storage.tasks.read(pauseTask.taskId)?.view.state === "waiting_for_approval");
