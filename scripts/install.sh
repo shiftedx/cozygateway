@@ -64,6 +64,9 @@ bootstrap_service_registration_path() {
   case "$(bootstrap_service_platform)" in
     Darwin) printf '%s/Library/LaunchAgents/ai.cozylabs.cozygateway.plist' "$HOME" ;;
     Linux) printf '%s/systemd/user/cozygateway.service' "${XDG_CONFIG_HOME:-$HOME/.config}" ;;
+    # Windows: no path at all, which every reader below already treats as
+    # "nothing registered" and therefore nothing to snapshot or restore.
+    Windows) ;;
   esac
 }
 bootstrap_snapshot_file() {
@@ -242,8 +245,18 @@ begin_bootstrap_transaction() {
 }
 bootstrap_xml_unescape() { printf '%s' "$1" | sed 's/&lt;/</g; s/&gt;/>/g; s/&amp;/\&/g'; }
 bootstrap_wrapper_path() { printf '%s/local/run-gateway.sh' "$HOME_DIR"; }
+# Git Bash is a supported host for this half of the install, and it has no POSIX
+# service: persistence on Windows is the current-user Scheduled Task the Windows
+# bootstrap owns, which this script must never touch. Naming that platform is
+# what lets the transaction record "no service registration" instead of dying
+# with a FAIL line on a run that then carries on regardless.
 bootstrap_service_platform() {
-  case "${COZYGATEWAY_SERVICE_PLATFORM:-$(uname -s)}" in Darwin) printf 'Darwin\n' ;; Linux) printf 'Linux\n' ;; *) die "bootstrap recovery cannot restart an unsupported service platform" ;; esac
+  case "${COZYGATEWAY_SERVICE_PLATFORM:-$(uname -s)}" in
+    Darwin) printf 'Darwin\n' ;;
+    Linux) printf 'Linux\n' ;;
+    MINGW*|MSYS*|CYGWIN*|Windows*) printf 'Windows\n' ;;
+    *) die "bootstrap recovery cannot restart an unsupported service platform" ;;
+  esac
 }
 bootstrap_wrapper_exec_line_is_owned() {
   local wrapper="$1" line
@@ -270,12 +283,14 @@ bootstrap_service_is_owned_or_absent() {
   local path="$1" platform
   [ ! -e "$path" ] && return 0
   platform="$(bootstrap_service_platform)"
+  [ "$platform" = Windows ] && return 0
   if [ "$platform" = Darwin ]; then bootstrap_launchd_service_is_owned "$path"; else bootstrap_systemd_service_is_owned "$path"; fi
 }
 remove_new_owned_service_registration() {
   local platform target
   [ "$current_service_present" = 1 ] || return 0
   platform="$(bootstrap_service_platform)"
+  [ "$platform" = Windows ] && return 0
   if [ "$platform" = Darwin ]; then
     target="gui/$(id -u)/ai.cozylabs.cozygateway"
     launchctl bootout "$target" >/dev/null 2>&1 || true
@@ -287,6 +302,7 @@ remove_new_owned_service_registration() {
 restart_existing_owned_service() {
   local platform plist unit target
   platform="$(bootstrap_service_platform)"
+  [ "$platform" = Windows ] && return 0
   if [ "$platform" = Darwin ]; then
     plist="$(bootstrap_service_registration_path)"; [ ! -e "$plist" ] && return 0
     bootstrap_launchd_service_is_owned "$plist" || return 1; target="gui/$(id -u)/ai.cozylabs.cozygateway"

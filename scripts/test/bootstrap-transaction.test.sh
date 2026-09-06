@@ -244,4 +244,27 @@ for redirect in destination snapshot; do
   expect_contents "$asset_dir/cozygateway.mjs" 'fresh:cozygateway.mjs'
 done
 
+# Git Bash is a supported host for this half of the install and has no POSIX
+# service: persistence on Windows is the Scheduled Task the Windows bootstrap
+# owns. The transaction must record that as "nothing registered" and leave the
+# restart and removal paths alone, rather than die on an unsupported platform
+# and print a FAIL line on a run that carries on anyway.
+reset_fixture
+(
+  export COZYGATEWAY_SERVICE_PLATFORM=MINGW64_NT-10.0-22631
+  [ "$(bootstrap_service_platform)" = Windows ] \
+    || fail "Git Bash is not recognised as a service platform"
+  [ -z "$(bootstrap_service_registration_path)" ] \
+    || fail 'Git Bash was given a POSIX service registration path'
+  bootstrap_service_is_owned_or_absent "$(bootstrap_service_registration_path)" \
+    || fail 'an absent Windows service registration was not treated as absent'
+  mkdir -p "$backup_dir"
+  : > "$backup_dir/inventory"
+  bootstrap_snapshot_service_registration "$(bootstrap_service_registration_path)" "$backup_dir" "$backup_dir/inventory"
+  grep -Fqx 'service:absent:-' "$backup_dir/inventory" \
+    || fail 'the Windows transaction did not record an absent service registration'
+  PATH="$fake_bin:$PATH" COZYGATEWAY_TEST_SERVICE_LOG="$manager_log" restart_existing_owned_service \
+    || fail 'restarting a service on Windows must be a no-op, not a failure'
+)
+
 printf 'bootstrap transaction tests passed\n'

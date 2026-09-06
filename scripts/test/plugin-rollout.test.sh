@@ -11,19 +11,24 @@ trap 'rm -rf "$TMP"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_contains() { grep -Fq -- "$2" "$1" || fail "expected $1 to contain: $2"; }
 
-# The scripts under test read a profile's config.yaml STRUCTURALLY, which needs
-# PyYAML, exactly as they do in production (there Hermes' own venv python
-# supplies it). Find an interpreter that has it now, before any test fakes HOME
-# and PATH out from under it, and fail loudly rather than let an unavailable
-# parser read as a pass.
-REAL_HOME="$HOME"
+# The scripts under test read a profile's config.yaml structurally, and PyYAML
+# is NOT a requirement for that: with it they get the exact answer, without it
+# they fall back to a conservative stdlib probe. A hosted runner (and plenty of
+# user machines) has a python3 with no PyYAML, so these cases run the reader
+# under `python3 -S`, which skips site-packages and therefore CANNOT import
+# PyYAML on any host. That makes the no-PyYAML path the one this suite always
+# exercises, rather than whatever the machine happens to have installed.
+command -v python3 >/dev/null 2>&1 || fail 'python3 is required to run these tests'
+if python3 -S -c 'import yaml' >/dev/null 2>&1; then
+  fail 'python3 -S can still import yaml, so this suite cannot prove the no-PyYAML path'
+fi
+# Set only for the cases that also want the PyYAML answer, and empty when this
+# host has no PyYAML at all: those cases then report that they could not run it.
 YAML_PYTHON=""
 for candidate in /usr/bin/python3 "$(command -v python3 || true)"; do
   [ -n "$candidate" ] || continue
   if "$candidate" -c 'import yaml' >/dev/null 2>&1; then YAML_PYTHON="$candidate"; break; fi
 done
-[ -n "$YAML_PYTHON" ] || fail 'no python3 with PyYAML on this host, and the provisioner needs one to read profile config'
-export COZY_TEST_YAML_PYTHON="$YAML_PYTHON" COZY_TEST_YAML_HOME="$REAL_HOME"
 
 make_fake_bin() {
   local bin="$1"
@@ -59,21 +64,19 @@ printf '%s\n' "$*" >> "${COZY_TEST_HERMES_LOG:-/dev/null}"
 if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "set" ]; then
   [ -n "${COZY_TEST_HERMES_WRITER_FAILS:-}" ] && exit 1
   [ -n "${COZY_TEST_HERMES_NOOP_WRITER:-}" ] && exit 0
-  env HOME="$COZY_TEST_YAML_HOME" "$COZY_TEST_YAML_PYTHON" - \
-    "$COZY_TEST_HERMES_HOME/profiles/$2/config.yaml" "$5" "$6" <<'PY'
-import sys
-import yaml
-
-path, key, value = sys.argv[1:4]
-data = yaml.safe_load(open(path).read()) or {}
-node = data
-parts = key.split(".")
-for part in parts[:-1]:
-    node = node.setdefault(part, {})
-node[parts[-1]] = value == "true"
-with open(path, "w") as handle:
-    yaml.safe_dump(data, handle, sort_keys=False)
-PY
+  [ "$6" = true ] || exit 2
+  dir="$COZY_TEST_HERMES_HOME/profiles/$2"
+  : > "$dir/.wrote-$5"
+  # Rewrite the display block from the keys written so far. Only these two keys
+  # are ever set here, so a real YAML writer (and a YAML library) is not needed
+  # to prove the caller reads the file back.
+  awk '/^display:/ { skip = 1; next } skip && ($0 ~ /^[ \t]/ || $0 == "") { next } { skip = 0; print }' \
+    "$dir/config.yaml" > "$dir/config.yaml.tmp"
+  printf 'display:\n' >> "$dir/config.yaml.tmp"
+  [ -f "$dir/.wrote-display.streaming" ] && printf '  streaming: true\n' >> "$dir/config.yaml.tmp"
+  [ -f "$dir/.wrote-display.platforms.cozygateway.streaming" ] \
+    && printf '  platforms:\n    cozygateway:\n      streaming: true\n' >> "$dir/config.yaml.tmp"
+  mv "$dir/config.yaml.tmp" "$dir/config.yaml"
 fi
 exit 0
 SH
@@ -123,11 +126,11 @@ make_fake_python() {
   mkdir -p "$hermes/hermes-agent/venv/bin"
   cat > "$hermes/hermes-agent/venv/bin/python" <<SH
 #!/bin/sh
-# The streaming-key read is a REAL structural read, delegated to the
-# PyYAML-capable interpreter found above, so "absent" and "explicitly false"
-# are told apart here exactly as they are in production.
+# The streaming-key read is a REAL structural read. \`python3 -S\` skips
+# site-packages, so PyYAML is guaranteed absent and the reader's stdlib probe is
+# what answers, which is the shape a hosted runner has.
 if [ "\$2" = "--streaming-keys" ]; then
-  exec env HOME="\$COZY_TEST_YAML_HOME" "\$COZY_TEST_YAML_PYTHON" "\$@"
+  exec python3 -S "\$@"
 fi
 if [ "\$1" = "-" ] && [ "\$2" = "$hermes" ]; then
   printf '%s\\n' '$profiles'
@@ -318,6 +321,115 @@ SH
   assert_contains "$output" 'did not report all configured profiles online'
 }
 
+# The reader itself, both ways round. PyYAML gives the exact answer; a host
+# without it (a hosted CI runner, a plain system python) falls back to a stdlib
+# probe, and the two must agree on every config an ordinary profile has. Where
+# the probe cannot be certain it must answer "nothing absent", so the caller
+# writes nothing.
+test_streaming_reader_answers_without_pyyaml() {
+  local dir="$TMP/reader" answer
+  mkdir -p "$dir/mute" "$dir/both" "$dir/off" "$dir/telegram-only" "$dir/unjudgeable"
+  printf 'plugins:\n  enabled:\n    - cozygateway\n' > "$dir/mute/config.yaml"
+  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\n' > "$dir/both/config.yaml"
+  printf 'display:\n  streaming: false\n  platforms:\n    cozygateway:\n      streaming: false\n' > "$dir/off/config.yaml"
+  printf 'display:\n  streaming: true\n  platforms:\n    telegram:\n      streaming: false\n  runtime_footer:\n    fields:\n      - model\n' > "$dir/telegram-only/config.yaml"
+  printf 'display: {streaming: true}\n' > "$dir/unjudgeable/config.yaml"
+  mkdir -p "$dir/nested-block" "$dir/nested-block-top" "$dir/null-value"
+  # An operator who tuned streaming as a BLOCK. PyYAML reads a mapping, which is
+  # not absence, and writing `true` over it would throw their settings away.
+  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming:\n        enabled: true\n        min_interval_ms: 400\n' \
+    > "$dir/nested-block/config.yaml"
+  printf 'display:\n  streaming:\n    a: b\n  platforms:\n    cozygateway:\n      streaming: true\n' \
+    > "$dir/nested-block-top/config.yaml"
+  # A key with nothing under it at all IS absent, the way PyYAML reads it, so
+  # this one is still repaired.
+  printf 'display:\n  streaming:\n  platforms:\n    cozygateway:\n      streaming: true\n' \
+    > "$dir/null-value/config.yaml"
+  mkdir -p "$dir/tagged-display" "$dir/tagged-platform" "$dir/tagged-scalar"
+  # A YAML tag in front of a block mapping. The block still opens on the line
+  # BELOW, so a probe that reads the tag as an ordinary value walks straight
+  # past the keys inside it and calls them absent.
+  printf 'display: !!map\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\n' \
+    > "$dir/tagged-display/config.yaml"
+  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway: !!map\n      streaming: true\n' \
+    > "$dir/tagged-platform/config.yaml"
+  # A tagged SCALAR is a value like any other, so both keys are present.
+  printf 'display:\n  streaming: !!bool true\n  platforms:\n    cozygateway:\n      streaming: !!bool false\n' \
+    > "$dir/tagged-scalar/config.yaml"
+
+  read_with() {
+    PYTHON="$1" bash -c '
+      eval "$(sed -n "/^streaming_keys_absent()/,/^}/p" "$1")"
+      streaming_keys_absent "$2"
+    ' _ "$ROOT/scripts/provision-bot.sh" "$2"
+  }
+
+  # Without PyYAML, guaranteed: -S skips site-packages.
+  cat > "$TMP/python3-nosite" <<'SH'
+#!/bin/sh
+exec python3 -S "$@"
+SH
+  chmod +x "$TMP/python3-nosite"
+
+  answer="$(read_with "$TMP/python3-nosite" "$dir/mute" | tr '\n' ' ')"
+  [ "$answer" = 'display.streaming display.platforms.cozygateway.streaming ' ] \
+    || fail "stdlib probe on a mute profile answered: $answer"
+  answer="$(read_with "$TMP/python3-nosite" "$dir/both" | tr '\n' ' ')"
+  [ -z "$answer" ] || fail "stdlib probe on a streaming profile answered: $answer"
+  answer="$(read_with "$TMP/python3-nosite" "$dir/off" | tr '\n' ' ')"
+  [ -z "$answer" ] || fail "stdlib probe treated an explicit false as absent: $answer"
+  answer="$(read_with "$TMP/python3-nosite" "$dir/telegram-only" | tr '\n' ' ')"
+  [ "$answer" = 'display.platforms.cozygateway.streaming ' ] \
+    || fail "stdlib probe beside another platform answered: $answer"
+  # A flow mapping is not something this probe judges, so it says nothing is
+  # absent and the caller leaves the file alone.
+  answer="$(read_with "$TMP/python3-nosite" "$dir/unjudgeable" | tr '\n' ' ')"
+  [ -z "$answer" ] || fail "stdlib probe judged a flow mapping it cannot read: $answer"
+
+  answer="$(read_with "$TMP/python3-nosite" "$dir/nested-block" | tr '\n' ' ')"
+  [ -z "$answer" ] || fail "stdlib probe called a nested block absent: $answer"
+  answer="$(read_with "$TMP/python3-nosite" "$dir/nested-block-top" | tr '\n' ' ')"
+  [ -z "$answer" ] || fail "stdlib probe called a nested block absent: $answer"
+  answer="$(read_with "$TMP/python3-nosite" "$dir/null-value" | tr '\n' ' ')"
+  [ "$answer" = 'display.streaming ' ] \
+    || fail "stdlib probe on a key with no value answered: $answer"
+
+  local tagged
+  for tagged in tagged-display tagged-platform tagged-scalar; do
+    answer="$(read_with "$TMP/python3-nosite" "$dir/$tagged" | tr '\n' ' ')"
+    [ -z "$answer" ] || fail "stdlib probe called a tagged shape absent ($tagged): $answer"
+  done
+
+  # A Windows interpreter writes CRLF on a text stream. The reader writes bytes
+  # so it does not, and the caller strips a carriage return anyway; neither may
+  # be dropped, because a "\r" glued to a key name is written into a config file
+  # as part of the key. Emulated with an interpreter that ends every line the
+  # Windows way.
+  cat > "$TMP/python3-crlf" <<'SH'
+#!/bin/sh
+python3 -S "$@" | sed 's/$/\r/'
+SH
+  chmod +x "$TMP/python3-crlf"
+  answer="$(read_with "$TMP/python3-crlf" "$dir/mute")"
+  case "$answer" in
+    *$'\r'*) fail 'a carriage return from a Windows interpreter reached the caller' ;;
+  esac
+  [ "$(printf '%s' "$answer" | tr '\n' ' ')" = 'display.streaming display.platforms.cozygateway.streaming' ] \
+    || fail "the CRLF interpreter answered: $answer"
+
+  if [ -z "$YAML_PYTHON" ]; then
+    printf 'note: no PyYAML on this host, so the agreement half of the reader case did not run\n'
+    return 0
+  fi
+  local case_dir
+  for case_dir in mute both off telegram-only nested-block nested-block-top null-value \
+    tagged-display tagged-platform tagged-scalar; do
+    [ "$(read_with "$YAML_PYTHON" "$dir/$case_dir" | tr '\n' ' ')" \
+      = "$(read_with "$TMP/python3-nosite" "$dir/$case_dir" | tr '\n' ' ')" ] \
+      || fail "the two readers disagree on $case_dir"
+  done
+}
+
 # Streaming is off in Hermes by default (`StreamingConfig.enabled` is false and
 # `_setup_stream_consumer` resolves the per-platform `display` key), so a
 # profile created before the seed wrote those keys is fully wired and still
@@ -466,6 +578,7 @@ YAML
 }
 
 test_watcher_repairs_content_drift
+test_streaming_reader_answers_without_pyyaml
 test_watcher_picks_up_a_wired_profile_that_cannot_stream
 test_provisioner_turns_streaming_on_and_restarts_once
 test_provisioner_leaves_streaming_turned_off_on_purpose
