@@ -5,6 +5,19 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## Unreleased
+
+- Rooms work on a gateway that has no Hermes endpoint. A room is a gateway-owned attach-v1
+  conversation, and capability 46 already made a runtime bot a full member, but with zero
+  `hermesEndpoints` the control surface was the federated one, whose group methods refuse every
+  call as `cross-endpoint groups are not supported`: `POST /bots/groups` answered 503 and a
+  CozyAgents-only deployment, the product's default path, could not hold a room at all. The
+  gateway now owns its rooms directly in that configuration, answering membership from its own
+  runtime bots, and the room event hooks and interaction deadlines are wired there too, so a room
+  turn's approvals and its Tasks behave as they do beside a Hermes endpoint. A room spanning two
+  Hermes endpoints is still refused, which is what that refusal was written for, and a mixed or
+  Hermes-only room is unchanged. No wire change: no route, frame or capability row moved.
+
 ## 0.7.5 (2026-09-06): durable Tasks and Artifacts, scoped approvals, dashboard records
 
 - An approval can propose an MCP repair (`com.cozylabs.bots` capability 62, #366): `ApprovalEvent`
