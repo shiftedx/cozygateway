@@ -122,7 +122,11 @@ class _Runner:
         self.released = []
 
     def _session_key_for_source(self, source):
-        return f"agent:{source.profile}:cozygateway:dm:{source.chat_id}"
+        # Hermes' own runner key is not namespaced by profile in a single-profile install, and
+        # the plugin leaves the synthetic source unstamped so the adapter seam derives the same
+        # key. Modelling that here keeps the recorded binding on the lane both checks demand.
+        assert not getattr(source, "profile", None), "the inbound source must carry no profile"
+        return f"agent:main:cozygateway:dm:{source.chat_id}"
 
     def _is_session_running(self, _key):
         return self.running
@@ -225,7 +229,7 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
             "threadId": "native:sage:1", "hermesSessionId": "desktop-raw", "resumeId": "resume-1",
         })
 
-        key = "agent:sage:cozygateway:dm:native:sage:1"
+        key = "agent:main:cozygateway:dm:native:sage:1"
         self.assertEqual(store.session_db.lookups, ["desktop-raw", "desktop-tip"])
         self.assertEqual(store.switches, [(key, "desktop-tip")])
         self.assertEqual(runner.evicted, [key])
@@ -247,7 +251,7 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
             "threadId": "native:sage:1", "hermesSessionId": "desktop-raw", "resumeId": "resume-1",
         })
 
-        key = "agent:sage:cozygateway:dm:native:sage:1"
+        key = "agent:main:cozygateway:dm:native:sage:1"
         self.assertEqual(store.switches, [(key, "desktop-tip")])
         self.assertEqual(runner.evicted, [key])
         self.assertEqual(client.confirmations, [("native:sage:1", "desktop-raw", "resume-1")])
@@ -306,7 +310,7 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
                 })
 
                 self.assertEqual(store.switches, [
-                    (f"agent:sage:cozygateway:dm:native:sage:{origin}", "desktop-raw")
+                    (f"agent:main:cozygateway:dm:native:sage:{origin}", "desktop-raw")
                 ])
                 self.assertEqual(client.confirmations, [
                     (f"native:sage:{origin}", "desktop-raw", f"resume-{origin}")
@@ -325,14 +329,14 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
         await mismatched._handle_desktop_resume_command({
             "threadId": "native:sage:1", "hermesSessionId": "desktop-raw", "resumeId": "resume-mismatch",
         })
-        self.assertEqual(store.switches, [("agent:sage:cozygateway:dm:native:sage:1", "desktop-raw")])
+        self.assertEqual(store.switches, [("agent:main:cozygateway:dm:native:sage:1", "desktop-raw")])
         self.assertEqual(runner.evicted, [])
         self.assertEqual(client.confirmations, [])
 
     async def test_following_turn_carries_strict_binding_metadata(self):
         adapter, _runner, _store, _client = self._adapter()
         adapter._desktop_session_bindings["native:sage:1"] = (
-            "agent:sage:cozygateway:dm:native:sage:1", "desktop-tip",
+            "agent:main:cozygateway:dm:native:sage:1", "desktop-tip",
         )
 
         await adapter._handle_turn(TurnFrame(thread_id="native:sage:1", turn_id="turn-1", text="continue"))
@@ -341,7 +345,7 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
         event = adapter.injected[0]
         self.assertEqual(event.source.chat_id, "native:sage:1")
         self.assertEqual(event.metadata, {
-            "gateway_session_key": "agent:sage:cozygateway:dm:native:sage:1",
+            "gateway_session_key": "agent:main:cozygateway:dm:native:sage:1",
             "gateway_session_id": "desktop-tip",
             "gateway_session_strict": True,
         })
@@ -446,7 +450,7 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
         spool = self._spool()
         self.addCleanup(spool.close)
         adapter._spool = spool
-        key = "agent:sage:cozygateway:dm:native:sage:1"
+        key = "agent:main:cozygateway:dm:native:sage:1"
         adapter._desktop_session_bindings["native:sage:1"] = (key, "desktop-root")
         store.lookup_session_id = "desktop-tip"
         spool.reset_desktop_session_link(

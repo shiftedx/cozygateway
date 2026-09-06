@@ -801,9 +801,9 @@ def _profile_from_hermes_home() -> str:
     """The profile this process IS, when nothing configured it.
 
     Neither `plugins.entries.cozygateway.config.profile` nor `HERMES_PROFILE` is set in a normal
-    per-profile install, so the adapter used to hold an empty profile and stamp nothing on the
-    inbound source. The live-turn gate then read an empty profile and refused every phone-node
-    call with `profile_mismatch` (observed 2026-08-26). A per-profile Hermes runs with
+    per-profile install, so the adapter used to hold an empty profile while the live-turn gate
+    demanded a non-empty one, and every phone-node call was refused with `profile_mismatch`
+    (observed 2026-08-26). A per-profile Hermes runs with
     `HERMES_HOME=<...>/profiles/<name>`, so the process already knows its own name; deriving it
     here means a new bot needs no extra configuration to use its phone as a node.
 
@@ -1461,12 +1461,29 @@ class AttachAdapter:
             message_id=message_id,
             role_authorized=True,
         )
-        # A single-profile gateway has no profile route to stamp on the source.
-        # Bind the adapter's loader-owned profile without overriding an explicit
-        # route; _cozy_mobile still requires exact equality and fails closed.
-        if not getattr(source, "profile", None) and self._profile:
-            source.profile = self._profile
+        # Deliberately unstamped: ``build_source`` already carries a real multiplex route when
+        # ``gateway.profile_routes`` resolves one, and nothing else may add a profile here.
+        # Hermes derives the session key of an internally routed turn twice -- the adapter seam
+        # namespaces it by ``source.profile``, the runner seam does not -- and drops the turn
+        # when either disagrees with the strict binding recorded in ``_desktop_session_bindings``.
+        # Stamping the loader-owned profile made the two derivations disagree and dropped every
+        # turn on a resumed desktop thread. The live-turn profile gate reads the same route
+        # through ``_session_profile_route`` instead, so it stays exact and fail-closed.
         return source
+
+    def _session_profile_route(self) -> str:
+        """The profile Hermes will carry in this adapter's live-turn session context.
+
+        A single-profile gateway resolves no profile route, so its turns carry no profile and
+        this is ``""``. A multiplexed gateway stamps the route in ``build_source``, so the live
+        turn carries a name and the gate demands this adapter's own. With no runner to describe
+        the process shape (an isolated unit context), keep demanding the adapter's own profile
+        rather than relaxing the gate on a topology this plugin cannot see.
+        """
+        config = getattr(getattr(self, "gateway_runner", None), "config", None)
+        if config is None or getattr(config, "multiplex_profiles", False):
+            return self._profile or ""
+        return ""
 
     @staticmethod
     def _sync_session_db(runner: Any, store: Any = None) -> Any:
@@ -3861,7 +3878,13 @@ def _resolve_live_origin() -> Optional[Tuple[Any, str, str, str]]:
         _log_mobile_policy_block("active_adapter_count", adapter_count=len(adapters))
         return None
     origin_adapter = adapters[0]
-    if not (profile and profile == getattr(origin_adapter, "_profile", None)):
+    # Exact equality against the route this adapter's own turns carry: "" for a single-profile
+    # process (whose inbound source is deliberately unstamped so one session key serves both of
+    # Hermes' derivations), its own profile name for a multiplexed one. A foreign or absent
+    # route never matches, so the gate stays closed.
+    route = getattr(origin_adapter, "_session_profile_route", None)
+    expected_profile = route() if callable(route) else (getattr(origin_adapter, "_profile", "") or "")
+    if (profile or "") != expected_profile:
         _log_mobile_policy_block(
             "profile_mismatch", profile_present=bool(profile), profile_match=False
         )
@@ -3872,7 +3895,9 @@ def _resolve_live_origin() -> Optional[Tuple[Any, str, str, str]]:
             "turn_message_mismatch", message_present=bool(message_id), message_match=False
         )
         return None
-    return origin_adapter, chat_id, turn_id, profile
+    # The lease that callers re-check after an await compares adapters to this value, so hold
+    # the adapter's own identity: a single-profile process carries no route to compare against.
+    return origin_adapter, chat_id, turn_id, getattr(origin_adapter, "_profile", "") or ""
 
 
 _SEND_MEDIA_CAPTION_MAX = 4096
@@ -4208,7 +4233,7 @@ async def _cozy_mobile(request: Any, location: bool = False, media: bool = False
     after_adapters = [
         adapter for adapter in _active_adapters_snapshot()
         if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
-        and getattr(adapter, "_profile", None) == profile
+        and (getattr(adapter, "_profile", "") or "") == profile
     ]
     if len(after_adapters) != 1 or after_adapters[0] is not origin_adapter:
         _log_mobile_policy_block("origin_turn_changed_after_request")
@@ -4229,7 +4254,7 @@ async def _cozy_mobile(request: Any, location: bool = False, media: bool = False
         final_adapters = [
             adapter for adapter in _active_adapters_snapshot()
             if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
-            and getattr(adapter, "_profile", None) == profile
+            and (getattr(adapter, "_profile", "") or "") == profile
         ]
         if len(final_adapters) != 1 or final_adapters[0] is not origin_adapter:
             _log_mobile_policy_block("origin_turn_changed_after_artifact_download")

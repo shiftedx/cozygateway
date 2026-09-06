@@ -180,8 +180,10 @@ class DispatchInjectionTests(unittest.IsolatedAsyncioTestCase):
                 "user_name": INBOUND_USER,
                 "user_id": INBOUND_USER,
                 "role_authorized": True,
-                "profile": "profile-1",
         }
+        # No profile is stamped here: a stamped source makes Hermes' adapter-level session key
+        # profile-namespaced while its runner-level key is not, and a thread carrying a strict
+        # desktop binding then has every turn dropped on the mismatch.
         self.assertEqual(sources[0], {**common, "message_id": "turn-1"})
         self.assertEqual(sources[1], {**common, "message_id": None})
         self.assertEqual(sources[2], {**common, "message_id": None})
