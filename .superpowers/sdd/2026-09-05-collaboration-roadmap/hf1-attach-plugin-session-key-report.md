@@ -174,3 +174,74 @@ restarts that profile's loaded service (`launchctl kickstart -k ai.hermes.gatewa
 
 So installing this fix restarts every live profile once, not only the two broken bots. Each restart
 drops in flight turns on that profile. Kyle decides when to run it.
+
+## Fix round 1
+
+Review r0 approved the core fix with no Critical and three Important findings; HF2 then defined
+the capability 69 wire. All three findings are fixed, and the two free-text refusal constants are
+gone.
+
+**I1, the pre-dispatch check could not see either real drop path.** `_binding_still_derives` is
+replaced by `_binding_dispatchable(binding, event)`, which runs Hermes' own two strict checks on
+the frame about to be dispatched: the adapter seam's `self._event_session_key(event)` must equal
+the bound key, and `async_session_store.lookup_by_session_key(bound key).session_id` must still be
+the pinned id. A `/new`, a compaction retip or an eviction now produces a terminal in milliseconds
+instead of a turn the gateway holds to its cap. Only a proven mismatch refuses: an unreachable
+seam, an absent store or a raising lookup leaves the turn exactly as it was before the check
+existed.
+
+**I2, the multiplexed case.** New `_dispatch_session_key(source)` derives through the adapter seam,
+which is the derivation Hermes follows at dispatch in both topologies (explicit route, then this
+adapter's owner profile, then the store resolver), falling back to the runner seam when no adapter
+seam exists. `_handle_desktop_resume_command` and `_baseline_mobile_mirror_link` both use it, so a
+multiplexed gateway records the binding on the `agent:<owner profile>` lane its seams derive rather
+than on the shared lane. Tested in both directions, including at the resume-command level.
+
+**I3, the interrupt exemption keyed on arrival.** New bounded `_sealed_turns`, written by
+`_mark_sealed` at the four places a terminal actually goes out (the command seal, the interrupt
+seal, the reply path's commit or failed, and `_safe_failed`). The exemption reads that set, so a
+turn that arrived and then died without a terminal now gets the typed refusal, and only a turn this
+process really sealed is answered with silence.
+
+**Row 69 adoption.** `failed.reason` is the closed `"unknown_turn"`, attached by
+`AttachV1Client.send_failed` only when `hello_ack.extensions["com.cozylabs.bots"] >= 69`; below
+that the frame is the one a pre-69 gateway has always received. Both refusals use it: a turn whose
+strict binding this process cannot resolve is a turn it does not hold, and `unknown_turn` is the
+only member of the closed set. `hello` carries `activeTurns` on every hello, including the empty
+array, which the contract defines as a real declaration.
+
+`activeTurns` is sent unconditionally rather than gated on the acked version, because hello
+precedes `hello_ack` and the version is not knowable at that moment. That is safe here:
+`AttachV1HelloSchema` (`packages/gateway/src/adapters/attach/protocol-v1.ts`) declares no
+`additionalProperties: false`, validation goes through `assertValid` which uses TypeBox
+`Value.Errors` and ignores unknown members, and `contract/attach-v1.md` states the
+forward-compatibility rule for unknown members. So a gateway below 69 accepts and ignores the
+field, and its behavior is byte identical. Only the resident adapter declares: the one-shot
+proactive media client carries no turns, and an empty declaration from it would tell the gateway
+this profile holds none at all, which under row 69 would seal the resident process's live turns.
+
+RED for round 1, both files:
+
+    <hermes venv>/bin/python -m unittest tests.test_session_key_binding tests.test_attach_client_v1
+    Ran 26 tests - FAILED (failures=8, errors=7)
+
+GREEN after the fixes, whole suite:
+
+    <hermes venv>/bin/python -m unittest discover -s tests
+    Ran 558 tests in 27.3s - OK (skipped=1)
+
+Files touched in this round: `integrations/attach-plugin/cozygateway/adapter.py`,
+`integrations/attach-plugin/cozygateway/attach_client_v1.py`,
+`integrations/attach-plugin/tests/test_session_key_binding.py`,
+`integrations/attach-plugin/tests/test_attach_client_v1.py`,
+`integrations/attach-plugin/tests/test_desktop_session_resume.py` (its fake store now resolves the
+bound key to the pinned session, which is what Hermes requires before it dispatches).
+
+Commits: `60dd2a9` (red), `ca3ce64` (green).
+
+Not addressed, deliberately: the review's Minor findings. M1 (an empty `HERMES_SESSION_PROFILE`
+collapses Docker terminal containers onto one slot) needs a look at the live profiles before
+anything is changed, and reading them was out of scope. M2 (two `failed` frames for one turn) is
+narrowed by the sealed record but not closed, since the second frame is what the gateway's own
+`native-sink` deduplication should refuse. M3 (a distinct log reason for the fail-closed profile
+route) and M4 (the typed reason) are covered or minor; M4 landed here.
