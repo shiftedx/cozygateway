@@ -180,7 +180,7 @@ packet added 6 gateway tests, 1 contract test and 1 conformance test, so the bas
 
 ## Fix round 1 (review r0)
 
-Head after this round: `<pending>` on `codex/4d-legacy-attachment-artifacts`, pushed. Node 24 for
+Head after this round: `27df8f9` on `codex/4d-legacy-attachment-artifacts`, pushed. Node 24 for
 every command. The three items the lead deferred (orphan `commit_failed` row after a capacity
 refusal that a declaration later wins, the schema not expressing the `sha256` / `mark` pairing, and
 no `room` on derived records) are untouched.
