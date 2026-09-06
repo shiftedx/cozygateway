@@ -116,6 +116,9 @@ class DispatchInjectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_interrupt_injects_native_stop_command(self):
         adapter = self._make_adapter()
+        # Both frames name the turn this process is running: one it does not hold is answered
+        # with a typed failure on that turn id rather than injected.
+        adapter._active_turn["chat-1"] = "turn-1"
         await adapter._handle_interrupt(InterruptFrame(thread_id="chat-1", turn_id="turn-1"))
         self.assertEqual(len(adapter.injected), 1)
         event = adapter.injected[0]
@@ -134,6 +137,7 @@ class DispatchInjectionTests(unittest.IsolatedAsyncioTestCase):
         # The steer counterpart shares the fake build_source/handle_message shape;
         # the interrupt test above mirrors it exactly but sends "/stop" and no anchor.
         adapter = self._make_adapter()
+        adapter._active_turn["chat-1"] = "turn-1"
         await adapter._handle_steer(
             SteerFrame(thread_id="chat-1", turn_id="turn-1", text="keep going")
         )
@@ -152,6 +156,7 @@ class DispatchInjectionTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("handle_message exploded")
 
         adapter.handle_message = _boom  # type: ignore[attr-defined]
+        adapter._active_turn["chat-1"] = "turn-1"
         # A failed inject must degrade to a best-effort no-op, not crash the drain loop.
         await adapter._handle_interrupt(InterruptFrame(thread_id="chat-1", turn_id="turn-1"))
 

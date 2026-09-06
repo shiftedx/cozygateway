@@ -212,6 +212,26 @@ class RefusedFrameTerminalTests(_BindingHarness):
         self.assertEqual(adapter._client.failed, [
             (THREAD, "turn-1", adapter_module.UNKNOWN_TURN_FAILURE)])
 
+    async def test_a_steer_for_a_turn_sealed_here_is_still_failed_so_the_text_survives(self):
+        adapter = self._adapter()
+        adapter._seen_turns[(THREAD, "turn-1")] = None  # this process ran it, then sealed it
+
+        await adapter._handle_steer(SteerFrame(thread_id=THREAD, turn_id="turn-1", text="and now"))
+
+        self.assertEqual(adapter.delivered, [])
+        self.assertEqual(adapter._client.failed, [
+            (THREAD, "turn-1", adapter_module.UNKNOWN_TURN_FAILURE)])
+
+    async def test_an_interrupt_that_lost_the_race_with_its_own_seal_stays_quiet(self):
+        adapter = self._adapter()
+        adapter._seen_turns[(THREAD, "turn-1")] = None
+
+        await adapter._handle_interrupt(InterruptFrame(thread_id=THREAD, turn_id="turn-1"))
+
+        self.assertEqual(adapter.delivered, [])
+        self.assertEqual(adapter._client.failed, [])
+        self.assertEqual(adapter._client.interrupted, [])
+
     async def test_an_interrupt_for_the_running_turn_still_stops_and_seals(self):
         adapter = self._adapter()
         adapter._active_turn[THREAD] = "turn-1"
