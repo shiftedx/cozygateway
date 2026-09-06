@@ -1,3 +1,5 @@
+> Current status: local qualification PASS on ced0ccf, rebased onto main766b04c with identical reviewed patches. Independent review PASSdab850b. Node24 build/typecheck/full suite passed: contract181, relay161, gateway1378+2skip, conformance76+17skip,1796passed total and19skipped, zero failures. Earlier phase evidence below is historical. Harness emission consumer remains a separate required follow-up.
+
 # 3b-policy-contract report
 
 Packet: contract the read-only MCP repair policy projection.
