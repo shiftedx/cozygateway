@@ -38,7 +38,12 @@ export const CozyAppSummarySchema = Type.Omit(CozyAppSchema, ["tree"]);
 export type CozyAppSummary = Static<typeof CozyAppSummarySchema>;
 export const CozyAppRenameRequestSchema = Type.Object({ name: Type.String({ minLength: 1, maxLength: 120 }) }, { additionalProperties: false });
 export const CozyAppUpsertRequestSchema = Type.Object({ id: Type.Optional(Id), name: Type.String({ minLength: 1, maxLength: 120 }), tree: CozyAppTreeSchema }, { additionalProperties: false });
-export const CozyAppActionRequestSchema = Type.Object({ idempotencyKey: Id, actionId: Id }, { additionalProperties: false });
+export const CozyAppActionRequestSchema = Type.Object({
+  idempotencyKey: Id, actionId: Id,
+  /** Capability 2 binding. Optional, so a client below it sends exactly the pre-2 body. */
+  appRevision: Type.Optional(Type.Integer({ minimum: 1 })),
+  valueRevisions: Type.Optional(Type.Array(Type.Object({ valueId: Id, revision: Type.Integer({ minimum: 1 }) }, { additionalProperties: false }), { maxItems: 32 })),
+}, { additionalProperties: false });
 /** User-initiated Foundation Models layout regeneration. The creator and name never cross this boundary. */
 export const CozyAppReplaceTreeRequestSchema = Type.Object({ expectedRevision: Type.Integer({ minimum: 1 }), tree: CozyAppTreeSchema }, { additionalProperties: false });
 export const CozyAppActionSchema = Type.Object({ id: Id, appId: Id, creatorBot: BotId, actionId: Id, status: Type.Union([Type.Literal("requested"), Type.Literal("delivered"), Type.Literal("completed"), Type.Literal("failed")]), createdAt: Type.Integer({ minimum: 0 }), updatedAt: Type.Integer({ minimum: 0 }) }, { additionalProperties: false });

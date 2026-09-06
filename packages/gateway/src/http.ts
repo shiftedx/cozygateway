@@ -34,7 +34,10 @@ import {
   CozyAppRenameRequestSchema,
   CozyAppReplaceTreeRequestSchema,
   CozyAppActionRequestSchema,
+  CozyAppValueWriteRequestSchema,
+  CozyAppDashboardWriteRequestSchema,
   assertValidCozyAppTree,
+  assertValidCozyAppDocument,
   ModelProviderFieldUpdateSchema,
   ModelProviderOAuthCodeSchema,
   GatewayMaintenanceRestartRequestSchema,
@@ -1297,13 +1300,54 @@ export function createApp(deps: AppDeps): Hono<Env> {
       if (app === undefined) return c.json(errorBody("not_found", "cozy app not found"), 404);
       const hasAction = (node: any): boolean => (node.kind === "button" && node.actionId === input.actionId) || (node.children ?? []).some(hasAction);
       if (input.actionId !== "refresh" && !hasAction(app.tree.root)) return c.json(errorBody("invalid_request", "cozy app action not found"), 400);
-      const { action, fresh } = deps.storage.createCozyAppAction({ id: randomUUID(), appId: app.id, creatorBot: app.creatorBot, actionId: input.actionId, idempotencyKey: input.idempotencyKey, now: deps.now() });
+      const { action, fresh } = deps.storage.createCozyAppAction({ id: randomUUID(), appId: app.id, creatorBot: app.creatorBot, actionId: input.actionId, idempotencyKey: input.idempotencyKey, now: deps.now(), appRevision: input.appRevision, valueRevisions: input.valueRevisions });
       if (fresh && deps.sendCozyAppAction !== undefined && !deps.sendCozyAppAction(action, c.get("deviceId")))
         deps.storage.settleCozyAppAction({ id: action.id, appId: action.appId, creatorBot: action.creatorBot, actionId: action.actionId, status: "failed", now: deps.now() });
       if (fresh) deps.cozyAppsChanged?.();
       return c.json(deps.storage.cozyAppsSnapshot().actions.find((item) => item.id === action.id) ?? action, 202);
     } catch (err) { return c.json(errorBody("invalid_request", err instanceof Error ? err.message : "invalid request"), 400); }
   });
+  // Capability row 68, com.cozylabs.cozyapps 2. Three additive record kinds beside the v1 library.
+  // Every route above is untouched, so a client that never calls these sees the gateway it saw
+  // before this row existed.
+  app.get("/cozyapps/:id/values", requireDevice, (c) => deps.storage.cozyApp(c.req.param("id")) === undefined
+    ? c.json(errorBody("not_found", "cozy app not found"), 404)
+    : c.json({ values: deps.storage.cozyAppValues(c.req.param("id")) }));
+  // The saved editable input. This is the ONLY write path for a value: it is user-triggered, and
+  // no attach frame reaches the table behind it.
+  app.put("/cozyapps/:id/values/:valueId", requireDevice, async (c) => {
+    try {
+      const input = assertValid(CozyAppValueWriteRequestSchema, await c.req.json());
+      const result = deps.storage.writeCozyAppValue({ appId: c.req.param("id"), valueId: c.req.param("valueId"), type: input.type, value: input.value, expectedRevision: input.expectedRevision, idempotencyKey: input.idempotencyKey, now: deps.now() });
+      if (result.outcome === "not_found") return c.json(errorBody("not_found", "cozy app not found"), 404);
+      if (result.outcome === "invalid_type") return c.json(errorBody("invalid_request", "value is not of its declared type"), 400);
+      if (result.outcome === "conflict") return c.json({ error: { code: "conflict", message: "cozy app value changed; refresh and retry" }, ...(result.value === undefined ? {} : { current: result.value }) }, 409);
+      if (result.outcome === "written") deps.cozyAppsChanged?.();
+      return c.json(result.value!);
+    } catch (err) { return c.json(errorBody("invalid_request", err instanceof Error ? err.message : "invalid request"), 400); }
+  });
+  app.get("/cozyapps/:id/dashboard", requireDevice, (c) => {
+    const dashboard = deps.storage.cozyAppDashboard(c.req.param("id"));
+    return dashboard === undefined ? c.json(errorBody("not_found", "cozy app dashboard not found"), 404) : c.json(dashboard);
+  });
+  // The user-triggered on-device regeneration, the document twin of PUT /cozyapps/:id/tree. It
+  // carries no source data: only the creator bot writes that, over attach.
+  app.put("/cozyapps/:id/dashboard", requireDevice, async (c) => {
+    try {
+      const input = assertValid(CozyAppDashboardWriteRequestSchema, await c.req.json());
+      assertValidCozyAppDocument(input.document);
+      const app = deps.storage.cozyApp(c.req.param("id"));
+      if (app === undefined) return c.json(errorBody("not_found", "cozy app not found"), 404);
+      const result = deps.storage.writeCozyAppDashboard({ appId: app.id, creatorBot: app.creatorBot, documentVersion: input.documentVersion, document: input.document, expectedRevision: input.expectedRevision, now: deps.now() });
+      if (result.outcome === "conflict") return c.json({ error: { code: "conflict", message: "cozy app dashboard changed; refresh and retry" }, ...(result.dashboard === undefined ? {} : { current: result.dashboard }) }, 409);
+      if (result.outcome !== "written") return c.json(errorBody("not_found", "cozy app not found"), 404);
+      deps.cozyAppsChanged?.();
+      return c.json(result.dashboard!);
+    } catch (err) { return c.json(errorBody("invalid_request", err instanceof Error ? err.message : "invalid request"), 400); }
+  });
+  app.get("/cozyapps/:id/receipts", requireDevice, (c) => deps.storage.cozyApp(c.req.param("id")) === undefined
+    ? c.json(errorBody("not_found", "cozy app not found"), 404)
+    : c.json({ receipts: deps.storage.cozyAppReceipts(c.req.param("id")) }));
   app.get("/cozyapps/:id/nodes/:nodeId/image", requireDevice, async (c) => {
     const app = deps.storage.cozyApp(c.req.param("id"));
     const findImage = (node: any): string | undefined => node.id === c.req.param("nodeId") && node.kind === "image" ? node.source : (node.children ?? []).map(findImage).find(Boolean);

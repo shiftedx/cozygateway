@@ -22,12 +22,24 @@ import type {
   MessageRole,
   RichBlock,
   CozyAppTree,
+  CozyAppActionReceipt,
+  CozyAppDashboard,
+  CozyAppData,
+  CozyAppDocument,
+  CozyAppValue,
+  CozyAppValueLiteral,
+  CozyAppValueType,
   GatewayMaintenanceAction,
   GatewayMaintenanceNextAction,
   GatewayMaintenanceOperation,
   GatewayMaintenanceOperationStatus,
   GatewayMaintenanceStep,
   GatewayMaintenanceVersions,
+} from "cozygateway-contract";
+import {
+  COZYAPP_DASHBOARD_OWNER,
+  cozyAppReceiptStatus,
+  cozyAppValueOfType,
 } from "cozygateway-contract";
 import type {
   AttachV1Command,
@@ -664,6 +676,35 @@ CREATE TABLE IF NOT EXISTS cozy_app_actions (
   updated_at INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX IF NOT EXISTS cozy_app_actions_creator_bot ON cozy_app_actions (creator_bot, updated_at DESC);
+-- Capability row 68, com.cozylabs.cozyapps 2. One saved editable input value, keyed by app and
+-- value id, with its OWN revision independent of the app tree's. It is written by the user action
+-- and by nothing else: no attach frame reaches this table. The idempotency key stored here is the
+-- last key that wrote this row, so a retried tap replays its own result instead of writing twice.
+CREATE TABLE IF NOT EXISTS cozy_app_values (
+  app_id TEXT NOT NULL REFERENCES cozy_apps(id) ON DELETE CASCADE,
+  value_id TEXT NOT NULL,
+  type TEXT NOT NULL CHECK (type IN ('string', 'number', 'boolean', 'date', 'selection')),
+  -- A product field value, stored as its JSON literal. Never a nested object: the write path
+  -- refuses anything the declared type does not admit.
+  value_json TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (app_id, value_id)
+) STRICT, WITHOUT ROWID;
+-- The small versioned envelope. The gateway validates the document's structure and bounds before
+-- this row is written and never interprets it. The data column is the source-attributed snapshot and
+-- is only ever written by the creator bot over attach.
+CREATE TABLE IF NOT EXISTS cozy_app_dashboards (
+  app_id TEXT PRIMARY KEY REFERENCES cozy_apps(id) ON DELETE CASCADE,
+  owner TEXT NOT NULL,
+  creator_bot TEXT NOT NULL,
+  document_version INTEGER NOT NULL,
+  document_json TEXT NOT NULL,
+  data_json TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
 -- Capability 49. A Bot the gateway itself owns, created through "POST /bots {runtime}" rather than
 -- declared in the config file, so creating one needs no restart and no operator at a terminal. The
 -- config-file "bots" array remains a bootstrap source and a row here wins on collision. "token" is
@@ -1961,19 +2002,108 @@ export class Storage {
 
   deleteCozyApp(id: string): boolean { return this.#db.prepare("DELETE FROM cozy_apps WHERE id = ?").run(id).changes === 1; }
 
-  createCozyAppAction(input: { id: string; appId: string; creatorBot: string; actionId: string; idempotencyKey: string; now: number }): { action: { id: string; appId: string; creatorBot: string; actionId: string; status: string; createdAt: number; updatedAt: number }; fresh: boolean } {
+  /** Capability row 68 adds the OPTIONAL binding: which app revision and which saved value
+   *  revisions the person's tap was made against. The returned action is the unchanged v1 payload,
+   *  because the shipped client decoder refuses an unknown key on it. */
+  createCozyAppAction(input: { id: string; appId: string; creatorBot: string; actionId: string; idempotencyKey: string; now: number; appRevision?: number | undefined; valueRevisions?: ReadonlyArray<{ valueId: string; revision: number }> | undefined }): { action: { id: string; appId: string; creatorBot: string; actionId: string; status: string; createdAt: number; updatedAt: number }; fresh: boolean } {
     const scopedKey = `${input.appId}:${input.idempotencyKey}`;
     const existing = this.#db.prepare("SELECT id, app_id AS appId, creator_bot AS creatorBot, action_id AS actionId, status, created_at AS createdAt, updated_at AS updatedAt FROM cozy_app_actions WHERE idempotency_key = ?").get(scopedKey) as { id: string; appId: string; creatorBot: string; actionId: string; status: string; createdAt: number; updatedAt: number } | undefined;
     if (existing !== undefined) {
       if (existing.actionId !== input.actionId) throw new Error("idempotency key is already used for another action");
       return { action: existing, fresh: false };
     }
-    this.#db.prepare("INSERT INTO cozy_app_actions (id, app_id, creator_bot, action_id, idempotency_key, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'requested', ?, ?)").run(input.id, input.appId, input.creatorBot, input.actionId, scopedKey, input.now, input.now);
+    this.#db.prepare("INSERT INTO cozy_app_actions (id, app_id, creator_bot, action_id, idempotency_key, status, created_at, updated_at, app_revision, value_revisions_json) VALUES (?, ?, ?, ?, ?, 'requested', ?, ?, ?, ?)").run(input.id, input.appId, input.creatorBot, input.actionId, scopedKey, input.now, input.now, input.appRevision ?? null, input.valueRevisions === undefined ? null : JSON.stringify(input.valueRevisions));
     return { action: { id: input.id, appId: input.appId, creatorBot: input.creatorBot, actionId: input.actionId, status: "requested", createdAt: input.now, updatedAt: input.now }, fresh: true };
   }
 
-  settleCozyAppAction(input: { id: string; appId: string; creatorBot: string; actionId: string; status: "completed" | "failed"; now: number }): boolean {
-    return this.#db.prepare("UPDATE cozy_app_actions SET status = ?, updated_at = ? WHERE id = ? AND app_id = ? AND creator_bot = ? AND action_id = ? AND status IN ('requested', 'delivered')").run(input.status, input.now, input.id, input.appId, input.creatorBot, input.actionId).changes === 1;
+  /** The command reached the peer that will run it, which is the public receipt's `running`. It is
+   *  the ONLY thing the gateway can say on its own: HTTP acceptance is `queued`, and the terminal
+   *  is the peer's own event. A settled action is never reopened. */
+  markCozyAppActionDelivered(id: string, now: number): boolean {
+    return this.#db.prepare("UPDATE cozy_app_actions SET status = 'delivered', updated_at = ? WHERE id = ? AND status = 'requested'").run(now, id).changes === 1;
+  }
+
+  /** `data` is the bot's source-attributed snapshot and arrives only on the peer's own terminal
+   *  event. No HTTP path and no model output writes it. */
+  settleCozyAppAction(input: { id: string; appId: string; creatorBot: string; actionId: string; status: "completed" | "failed"; now: number; data?: CozyAppData | undefined }): boolean {
+    return this.#db.prepare("UPDATE cozy_app_actions SET status = ?, updated_at = ?, data_json = COALESCE(?, data_json) WHERE id = ? AND app_id = ? AND creator_bot = ? AND action_id = ? AND status IN ('requested', 'delivered')").run(input.status, input.now, input.data === undefined ? null : JSON.stringify(input.data), input.id, input.appId, input.creatorBot, input.actionId).changes === 1;
+  }
+
+  /** The durable receipts for one app, newest first, in the plan's four public names. The internal
+   *  `requested`/`delivered` states are mapped rather than duplicated in a parallel table. */
+  cozyAppReceipts(appId: string): CozyAppActionReceipt[] {
+    const rows = this.#db.prepare(`SELECT id, app_id AS appId, creator_bot AS creatorBot, action_id AS actionId, status,
+             app_revision AS appRevision, value_revisions_json AS valueRevisionsJson, data_json AS dataJson,
+             created_at AS createdAt, updated_at AS updatedAt
+      FROM cozy_app_actions WHERE app_id = ? ORDER BY updated_at DESC, id LIMIT 1000`).all(appId) as unknown as Array<{ id: string; appId: string; creatorBot: string; actionId: string; status: "requested" | "delivered" | "completed" | "failed"; appRevision: number | null; valueRevisionsJson: string | null; dataJson: string | null; createdAt: number; updatedAt: number }>;
+    return rows.map((row) => ({
+      id: row.id, appId: row.appId, creatorBot: row.creatorBot, actionId: row.actionId,
+      status: cozyAppReceiptStatus(row.status),
+      ...(row.appRevision === null ? {} : { appRevision: row.appRevision }),
+      ...(row.valueRevisionsJson === null ? {} : { valueRevisions: JSON.parse(row.valueRevisionsJson) as Array<{ valueId: string; revision: number }> }),
+      ...(row.dataJson === null ? {} : { data: JSON.parse(row.dataJson) as CozyAppData }),
+      createdAt: row.createdAt, updatedAt: row.updatedAt,
+    }));
+  }
+
+  cozyAppValues(appId: string): CozyAppValue[] {
+    return (this.#db.prepare("SELECT app_id AS appId, value_id AS valueId, type, value_json AS valueJson, revision, updated_at AS updatedAt FROM cozy_app_values WHERE app_id = ? ORDER BY value_id").all(appId) as unknown as Array<{ appId: string; valueId: string; type: CozyAppValueType; valueJson: string; revision: number; updatedAt: number }>)
+      .map((row) => ({ appId: row.appId, valueId: row.valueId, type: row.type, value: JSON.parse(row.valueJson) as CozyAppValueLiteral, revision: row.revision, updatedAt: row.updatedAt }));
+  }
+
+  /** The saved editable input. Written by the user action and by nothing else: no attach frame
+   *  reaches this table. The observed revision is the whole conflict check, and the idempotency
+   *  key makes a retried tap replay its own result rather than write a second time. */
+  writeCozyAppValue(input: { appId: string; valueId: string; type: CozyAppValueType; value: CozyAppValueLiteral; expectedRevision: number; idempotencyKey: string; now: number }): { outcome: "written" | "replayed" | "conflict" | "invalid_type" | "not_found"; value?: CozyAppValue } {
+    if (!cozyAppValueOfType(input.type, input.value)) return { outcome: "invalid_type" };
+    if (this.#db.prepare("SELECT 1 FROM cozy_apps WHERE id = ?").get(input.appId) === undefined) return { outcome: "not_found" };
+    const read = (): CozyAppValue | undefined => this.cozyAppValues(input.appId).find((entry) => entry.valueId === input.valueId);
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = read();
+      if (current !== undefined) {
+        const key = this.#db.prepare("SELECT idempotency_key AS key FROM cozy_app_values WHERE app_id = ? AND value_id = ?").get(input.appId, input.valueId) as { key: string } | undefined;
+        if (key?.key === input.idempotencyKey) { this.#db.exec("COMMIT"); return { outcome: "replayed", value: current }; }
+        if (current.revision !== input.expectedRevision) { this.#db.exec("COMMIT"); return { outcome: "conflict", value: current }; }
+      } else if (input.expectedRevision !== 0) {
+        this.#db.exec("COMMIT");
+        return { outcome: "conflict" };
+      }
+      const revision = (current?.revision ?? 0) + 1;
+      this.#db.prepare(`INSERT INTO cozy_app_values (app_id, value_id, type, value_json, revision, idempotency_key, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(app_id, value_id) DO UPDATE SET type = excluded.type, value_json = excluded.value_json, revision = excluded.revision, idempotency_key = excluded.idempotency_key, updated_at = excluded.updated_at`)
+        .run(input.appId, input.valueId, input.type, JSON.stringify(input.value), revision, input.idempotencyKey, input.now);
+      this.#db.exec("COMMIT");
+      return { outcome: "written", value: { appId: input.appId, valueId: input.valueId, type: input.type, value: input.value, revision, updatedAt: input.now } };
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  cozyAppDashboard(appId: string): CozyAppDashboard | undefined {
+    const row = this.#db.prepare("SELECT app_id AS id, owner, creator_bot AS creatorBot, document_version AS documentVersion, document_json AS documentJson, data_json AS dataJson, revision, updated_at AS updatedAt FROM cozy_app_dashboards WHERE app_id = ?").get(appId) as { id: string; owner: string; creatorBot: string; documentVersion: number; documentJson: string; dataJson: string; revision: number; updatedAt: number } | undefined;
+    if (row === undefined) return undefined;
+    const { documentJson, dataJson, ...rest } = row;
+    return { ...rest, document: JSON.parse(documentJson) as CozyAppDocument, data: JSON.parse(dataJson) as CozyAppData };
+  }
+
+  /** The envelope's revision is its own, independent of the app tree's. `creatorBot` is pinned by
+   *  the first write and a different bot is refused, so a plugin writes only its own app's record.
+   *  `data` is the bot's source-attributed snapshot: the user regeneration path never sends one,
+   *  and omitting it keeps whatever the bot last observed. */
+  writeCozyAppDashboard(input: { appId: string; creatorBot: string; documentVersion: number; document: CozyAppDocument; expectedRevision: number; now: number; data?: CozyAppData | undefined }): { outcome: "written" | "conflict" | "forbidden" | "not_found"; dashboard?: CozyAppDashboard } {
+    const app = this.#db.prepare("SELECT creator_bot AS creatorBot FROM cozy_apps WHERE id = ?").get(input.appId) as { creatorBot: string } | undefined;
+    if (app === undefined) return { outcome: "not_found" };
+    if (app.creatorBot !== input.creatorBot) return { outcome: "forbidden" };
+    const current = this.cozyAppDashboard(input.appId);
+    if ((current?.revision ?? 0) !== input.expectedRevision) return { outcome: "conflict", ...(current === undefined ? {} : { dashboard: current }) };
+    const revision = (current?.revision ?? 0) + 1;
+    const data = input.data ?? current?.data ?? {};
+    this.#db.prepare(`INSERT INTO cozy_app_dashboards (app_id, owner, creator_bot, document_version, document_json, data_json, revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(app_id) DO UPDATE SET document_version = excluded.document_version, document_json = excluded.document_json, data_json = excluded.data_json, revision = excluded.revision, updated_at = excluded.updated_at`)
+      .run(input.appId, COZYAPP_DASHBOARD_OWNER, input.creatorBot, input.documentVersion, JSON.stringify(input.document), JSON.stringify(data), revision, input.now);
+    return { outcome: "written", dashboard: this.cozyAppDashboard(input.appId)! };
   }
 
   /** Drops every tool step older than the TTL. Returns how many went, so a caller can log it. */
@@ -5302,6 +5432,14 @@ export function openStorage(dbPath: string): Storage {
       ["turn_id", "ALTER TABLE bot_native_messages ADD COLUMN turn_id TEXT"],
       ["author_bot", "ALTER TABLE bot_native_messages ADD COLUMN author_bot TEXT"],
       ["in_reply_to_id", "ALTER TABLE bot_native_messages ADD COLUMN in_reply_to_id TEXT"],
+    ]],
+    // Capability row 68. The receipt binding and the bot's source snapshot hang off the action
+    // row that already exists, so a v1 action written before this row keeps every column it had
+    // and reads back as a `queued` receipt carrying no binding, which is exactly what it was.
+    ["cozy_app_actions", [
+      ["app_revision", "ALTER TABLE cozy_app_actions ADD COLUMN app_revision INTEGER"],
+      ["value_revisions_json", "ALTER TABLE cozy_app_actions ADD COLUMN value_revisions_json TEXT"],
+      ["data_json", "ALTER TABLE cozy_app_actions ADD COLUMN data_json TEXT"],
     ]],
   ] as ReadonlyArray<readonly [string, ReadonlyArray<readonly [string, string]>]>) {
     const present = new Set(
