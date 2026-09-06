@@ -933,13 +933,11 @@ streaming_python() {
   done
   return 1
 }
-ensure_streaming_config() {
-  local profile="$1" home="$2" python keys key rc=0
-  python="$(streaming_python)" || {
-    say "NOTE  no python with PyYAML found, so streaming settings for profile $profile were left alone"
-    return 0
-  }
-  keys="$("$python" - --streaming-keys "$home" <<'PY'
+# Prints the display keys the profile at $2 does not carry, one per line, read
+# with the interpreter named in $1. None is ABSENT; an explicit false is an
+# operator turning streaming off and is never touched.
+streaming_keys_absent() {
+  "$1" - --streaming-keys "$2" <<'PY'
 import sys
 try:
     import yaml
@@ -961,13 +959,19 @@ def block(parent, key):
 
 display = block(data, "display")
 platform = block(block(display, "platforms"), "cozygateway")
-# None is ABSENT. An explicit false is an operator turning streaming off and is never touched.
 if display.get("streaming") is None:
     print("display.streaming")
 if platform.get("streaming") is None:
     print("display.platforms.cozygateway.streaming")
 PY
-)" || rc=$?
+}
+ensure_streaming_config() {
+  local profile="$1" home="$2" python keys key rc=0
+  python="$(streaming_python)" || {
+    say "NOTE  no python with PyYAML found, so streaming settings for profile $profile were left alone"
+    return 0
+  }
+  keys="$(streaming_keys_absent "$python" "$home")" || rc=$?
   if [ "$rc" != 0 ]; then
     say "NOTE  could not read $home/config.yaml, so streaming settings for profile $profile were left alone"
     return 0
@@ -975,12 +979,27 @@ PY
   [ -n "$keys" ] || { say "OK    streaming is already decided in config.yaml for Hermes profile $profile"; return 0; }
   for key in $keys; do
     if [ "$DRY_RUN" = 1 ]; then say "DRY   set $key to true for Hermes profile $profile"; continue; fi
-    "$HERMES_BIN" -p "$profile" config set "$key" true >/dev/null \
-      || die "could not set $key for Hermes profile $profile"
+    # A display default never fails an install: this profile keeps Hermes'
+    # behaviour and every other part of the install carries on.
+    if ! "$HERMES_BIN" -p "$profile" config set "$key" true >/dev/null; then
+      say "NOTE  hermes could not set $key, so streaming settings for profile $profile were left alone"
+      return 0
+    fi
     say "OK    set $key to true for Hermes profile $profile"
   done
+  [ "$DRY_RUN" = 1 ] && return 0
+  # Read the file back before restarting anything. `config set` is not proof of a
+  # write: Hermes' `set_config_value` returns 0 WITHOUT writing on a
+  # package-managed install (`is_managed()`), and a restart on that evidence
+  # would be a restart that changes nothing, every rerun.
+  rc=0
+  keys="$(streaming_keys_absent "$python" "$home")" || rc=$?
+  if [ "$rc" != 0 ] || [ -n "$keys" ]; then
+    say "NOTE  hermes reported success but streaming settings for profile $profile are still absent, so it was not restarted"
+    return 0
+  fi
   # One restart, through the same lifecycle pass a changed plugin uses.
-  [ "$DRY_RUN" = 1 ] || record_profile_change "$profile"
+  record_profile_change "$profile"
 }
 
 # A CozyAgents-only gateway has no Hermes bridge at all: `hermesEndpoints` is absent rather than

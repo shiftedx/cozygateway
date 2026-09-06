@@ -289,11 +289,26 @@ ensure_streaming_config() {
   if [ -z "$keys" ]; then say "  streaming already decided in config.yaml"; return 0; fi
   for key in $keys; do
     if [ "$DRY_RUN" = 1 ]; then say "  DRY  set $key=true"; continue; fi
-    "$HERMES_BIN" -p "$profile" config set "$key" true >/dev/null \
-      || die "[$profile] could not set $key"
+    # A profile whose config cannot be written is one profile with no draft
+    # frames, not a reason to abandon the rest of the sweep.
+    if ! "$HERMES_BIN" -p "$profile" config set "$key" true >/dev/null; then
+      warn "[$profile] hermes could not set $key, leaving streaming off for this profile"
+      return 0
+    fi
     say "  $key set to true"
   done
-  [ "$DRY_RUN" = 1 ] || STREAMING_CONFIG_CHANGED=1
+  [ "$DRY_RUN" = 1 ] && return 0
+  # Read the file back before claiming anything changed. `config set` is not
+  # proof of a write: Hermes' own `set_config_value` returns 0 WITHOUT writing on
+  # a package-managed install (`is_managed()`), and trusting the exit code there
+  # would kickstart this profile on every 30 second tick forever.
+  rc=0
+  keys="$(streaming_keys_absent "$dir")" || rc=$?
+  if [ "$rc" != 0 ] || [ -n "$keys" ]; then
+    warn "[$profile] hermes reported success but ${keys//$'\n'/ } is still absent; leaving streaming off and not restarting"
+    return 0
+  fi
+  STREAMING_CONFIG_CHANGED=1
 }
 
 # Set by sync_plugin for the immediately following ensure_service call. A

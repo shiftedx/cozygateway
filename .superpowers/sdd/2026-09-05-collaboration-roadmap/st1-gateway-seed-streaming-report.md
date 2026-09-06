@@ -166,3 +166,66 @@ later sweep or rerun overrules an explicit value.
 - No live model run: the .121 endpoint is unavailable, so "the phone shows a live draft" is
   UNKNOWN here. What is proven is the config the runner reads, and the plugin's draft surface was
   read, not assumed. The reproducible check is step 4 above plus one phone message.
+
+## Fix round 1 (review r0, both Important findings)
+
+### 1. A write is only believed after the file says so
+
+`config set` exiting 0 is not proof of a write: Hermes'
+`hermes_cli/config.py::set_config_value` starts with `if is_managed(): managed_error(...); return`,
+which prints to stderr and returns WITHOUT writing and WITHOUT a non-zero status. Both repair paths
+now re-run the same structural read after the writes and set the changed flag only when the keys
+are actually present.
+
+- `scripts/provision-bot.sh::ensure_streaming_config`: on a still-absent key it warns
+  `hermes reported success but <keys> is still absent; leaving streaming off and not restarting`
+  and leaves `STREAMING_CONFIG_CHANGED` at 0, so the sweep does not kickstart that profile, this
+  tick or any later one.
+- `scripts/agent-install.sh::ensure_streaming_config`: same read-back, and it does not call
+  `record_profile_change`, so the profile is not restarted. The reader heredoc that had been
+  written twice is now one `streaming_keys_absent <python> <home>` helper called twice.
+
+### 2. A failed write is one mute bot, never a failed install or a dead sweep
+
+Both `die` calls are gone.
+
+- `agent-install.sh` logs `NOTE  hermes could not set <key>, so streaming settings for profile
+  <profile> were left alone` and returns, so the install continues and finishes.
+- `provision-bot.sh` warns `[<profile>] hermes could not set <key>, leaving streaming off for this
+  profile` and returns, so every profile after the failing one is still provisioned. This matches
+  the pre-existing `verify_attached` behaviour, which only marks the run rather than aborting it.
+
+### RED then GREEN for the fixes
+
+`bash scripts/test/plugin-rollout.test.sh`, two new cases (13 total now):
+
+- `test_provisioner_does_not_restart_when_the_write_did_not_land` drives a stubbed no-op writer
+  (`COZY_TEST_HERMES_NOOP_WRITER`: exit 0, write nothing) and asserts both the warning and that no
+  `kickstart -k` was issued. RED against the previous script:
+  `FAIL: expected .../noop.out to contain: is still absent; leaving streaming off and not restarting`
+  (it restarted instead).
+- `test_provisioner_keeps_sweeping_when_a_write_fails` drives a failing writer over two profiles
+  and asserts the warning, that the second profile was still reached (`=== second-wired ===`), and
+  that the run ends `provision-bot: all profiles provisioned`. RED against the previous script:
+  suite `exit=1`, the sweep died at the first profile.
+- The fake `hermes` in that suite now really applies a `config set` (through the same PyYAML
+  interpreter the preflight found), so a writer that wrote and one that only said it did are
+  distinguishable. GREEN: `plugin rollout: ok`, all 13.
+
+`bash scripts/test/hermes-installer.test.sh`: the configured-rerun case now runs against a mute
+`ops` profile whose fake `config set` returns 0 without writing, which is the package-managed
+no-op exactly. RED against the previous script:
+`FAIL  expected output to contain: streaming settings for profile ops are still absent, so it was
+not restarted`, suite `exit=1` (the old code recorded a change and the existing "healthy repair
+must not restart a profile" assertion caught the needless restart). A second new case runs the
+installer with a FAILING `config set` and asserts the install still completes
+(`CozyGateway listens on`), logs the NOTE, and restarts nothing. GREEN:
+`hermes installer dry-run tests passed`, `exit=0`.
+
+Seed tests unchanged and still `Tests 26 passed (26)`; `pnpm -r typecheck` under Node 24: 4 of 4
+`Done`.
+
+Review findings 3 and 4 (Minor) were left as they are: 3 is the pre-existing disagreement about how
+loud a missing PyYAML should be, which this packet did not introduce and should not settle
+one-sidedly; 4 is a wording precision note about `scfg.enabled and scfg.transport != "off"`, which
+does not change any behaviour described here.
