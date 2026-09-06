@@ -323,10 +323,10 @@ describe("a gateway configured with no Hermes endpoint", () => {
       body: JSON.stringify({ name: "Launch", members: ["sage", "pixel"] }),
     });
     expect(created.status).toBe(201);
-    expect(await created.json()).toMatchObject({ group: { name: "launch", members: ["sage", "pixel"] } });
+    expect(await created.json()).toMatchObject({ group: { name: "Launch", members: ["sage", "pixel"] } });
 
     const listed = (await (await l.authed("/bots/groups")).json()) as { groups: Array<{ name: string }> };
-    expect(listed.groups.map((group) => group.name)).toEqual(["launch"]);
+    expect(listed.groups.map((group) => group.name)).toEqual(["Launch"]);
 
     const sent = await l.authed("/bots/groups/launch/messages", {
       method: "POST",

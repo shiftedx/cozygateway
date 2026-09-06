@@ -7,6 +7,7 @@ import type {
   BotGroupMessage,
   BotGroupNote,
   BotGroupPendingInteraction,
+  BotSummary,
   BotToolStep,
   ServerFrame,
 } from "cozygateway-contract";
@@ -14,6 +15,7 @@ import type {
 import type { Storage, BotGroupCause, BotGroupLogRow, BotGroupRow, BotGroupTurnRow } from "../storage.ts";
 import { sanitizeApprovalDetail, sanitizeApprovalRepair, type AttachV1EventFrame, type AttachV1TurnContext } from "../adapters/attach/protocol-v1.ts";
 import { normalizeProfileName } from "./crud.ts";
+import { botDisplayName, botHandle } from "./roster.ts";
 import {
   GROUP_LOG_LIMIT,
   GROUP_MAX_MEMBERS,
@@ -1405,4 +1407,86 @@ function sleep(ms: number): Promise<void> {
     const timer = setTimeout(resolve, ms);
     timer.unref?.();
   });
+}
+
+/** Rooms on a gateway that has NO Hermes endpoint at all (capability 46 and 52, finding V1-F1).
+ *
+ *  A room is a gateway-owned attach-v1 conversation (contract, "Group rooms are gateway-owned
+ *  attach-v1 conversations too"), so nothing about one needs a Dashboard. It needed a HOST though,
+ *  and the only host was `HermesBridge`: with zero endpoints the control surface is the federated
+ *  one, whose group methods refuse every call as cross-endpoint. That refusal is right for a room
+ *  spanning two Hermes endpoints and wrong for the absence of an endpoint, which is what this class
+ *  fixes by owning the same `GroupRooms` the bridge owns.
+ *
+ *  The member callbacks are the Hermes-free half of the bridge's: with no endpoint configured every
+ *  bot on this gateway is a runtime bot, so membership, existence and display identity are answered
+ *  from the runtime set and the roster overlay with no RPC anywhere. */
+export interface GatewayRoomHostOptions {
+  storage: Storage;
+  broadcast: (frame: ServerFrame) => void;
+  now: () => number;
+  /** The gateway's own runtime bots, read live so a bot created from the app joins a room without
+   *  a restart. The only source of membership here: there is no `profiles.list` to ask. */
+  runtimeBotNames: () => ReadonlySet<string>;
+  /** The roster rows a member's display name and handle come from, overlay applied. */
+  rosterBots: () => readonly BotSummary[];
+  escalate?: (event: { group: string; member: string; displayName: string; text: string }) => void;
+}
+
+export class GatewayRoomHost {
+  readonly #rooms: GroupRooms;
+  readonly #runtime: () => ReadonlySet<string>;
+  constructor(opts: GatewayRoomHostOptions) {
+    this.#runtime = opts.runtimeBotNames;
+    this.#rooms = new GroupRooms({
+      storage: opts.storage,
+      broadcast: opts.broadcast,
+      now: opts.now,
+      memberInfo: (name) => {
+        const row = opts.rosterBots().find((bot) => bot.name === name);
+        return {
+          name,
+          handle: row?.handle ?? botHandle(name),
+          displayName: row?.displayName ?? botDisplayName(name, null),
+        };
+      },
+      // A runtime bot is present by construction: its row and its attach identity are this
+      // gateway's own. A name that is not one is not a bot here, and there is nobody else to ask.
+      missingMembers: (names) => Promise.resolve(names.filter((name) => !this.#runtime().has(name))),
+      memberKnown: (name) => this.#runtime().has(name),
+      memberExists: (name) => Promise.resolve(this.#runtime().has(name)),
+      isRuntimeMember: (name) => this.#runtime().has(name),
+      ...(opts.escalate === undefined ? {} : { escalate: opts.escalate }),
+    });
+  }
+  groups(): BotGroup[] {
+    return this.#rooms.list();
+  }
+  createGroup(name: string, members: string[]): Promise<BotGroup> {
+    return this.#rooms.create(name, members);
+  }
+  deleteGroup(name: string): void {
+    this.#rooms.remove(name);
+  }
+  groupDetail(name: string): BotGroupDetail {
+    return this.#rooms.detail(name);
+  }
+  sendGroupMessage(name: string, text: string, opts: { clientId?: string } = {}): BotGroupMessage {
+    return this.#rooms.send(name, text, opts);
+  }
+  setGroupNativeTurns(endpoint: NativeGroupTurnEndpoint): void {
+    this.#rooms.setNativeTurns(endpoint);
+  }
+  setGroupInteractionExpiry(expiry: RoomInteractionExpiry): void {
+    this.#rooms.setInteractionExpiry(expiry);
+  }
+  canAcceptGroupAttachEvent(agentId: string, frame: AttachV1EventFrame): boolean {
+    return this.#rooms.canAcceptAttachEvent(agentId, frame);
+  }
+  handleGroupAttachEvent(agentId: string, frame: AttachV1EventFrame): boolean {
+    return this.#rooms.handleAttachEvent(agentId, frame);
+  }
+  async close(): Promise<void> {
+    await this.#rooms.close();
+  }
 }
