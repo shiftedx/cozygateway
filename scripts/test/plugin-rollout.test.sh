@@ -11,6 +11,20 @@ trap 'rm -rf "$TMP"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_contains() { grep -Fq -- "$2" "$1" || fail "expected $1 to contain: $2"; }
 
+# The scripts under test read a profile's config.yaml STRUCTURALLY, which needs
+# PyYAML, exactly as they do in production (there Hermes' own venv python
+# supplies it). Find an interpreter that has it now, before any test fakes HOME
+# and PATH out from under it, and fail loudly rather than let an unavailable
+# parser read as a pass.
+REAL_HOME="$HOME"
+YAML_PYTHON=""
+for candidate in /usr/bin/python3 "$(command -v python3 || true)"; do
+  [ -n "$candidate" ] || continue
+  if "$candidate" -c 'import yaml' >/dev/null 2>&1; then YAML_PYTHON="$candidate"; break; fi
+done
+[ -n "$YAML_PYTHON" ] || fail 'no python3 with PyYAML on this host, and the provisioner needs one to read profile config'
+export COZY_TEST_YAML_PYTHON="$YAML_PYTHON" COZY_TEST_YAML_HOME="$REAL_HOME"
+
 make_fake_bin() {
   local bin="$1"
   mkdir -p "$bin"
@@ -32,7 +46,47 @@ case "$*" in
 esac
 exit 0
 SH
-  chmod +x "$bin/launchctl" "$bin/ssh"
+  # The provisioner delegates every config write to Hermes' own `config set`, so
+  # the fake records the commands AND applies them: the caller must be able to
+  # tell a writer that wrote from one that only said it did.
+  #
+  #   COZY_TEST_HERMES_NOOP_WRITER: exit 0 and write nothing, which is what real
+  #     Hermes does on a package-managed install (`is_managed()`).
+  #   COZY_TEST_HERMES_WRITER_FAILS: exit 1, a write that could not happen.
+  cat > "$bin/hermes" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "${COZY_TEST_HERMES_LOG:-/dev/null}"
+if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "set" ]; then
+  [ -n "${COZY_TEST_HERMES_WRITER_FAILS:-}" ] && exit 1
+  [ -n "${COZY_TEST_HERMES_NOOP_WRITER:-}" ] && exit 0
+  env HOME="$COZY_TEST_YAML_HOME" "$COZY_TEST_YAML_PYTHON" - \
+    "$COZY_TEST_HERMES_HOME/profiles/$2/config.yaml" "$5" "$6" <<'PY'
+import sys
+import yaml
+
+path, key, value = sys.argv[1:4]
+data = yaml.safe_load(open(path).read()) or {}
+node = data
+parts = key.split(".")
+for part in parts[:-1]:
+    node = node.setdefault(part, {})
+node[parts[-1]] = value == "true"
+with open(path, "w") as handle:
+    yaml.safe_dump(data, handle, sort_keys=False)
+PY
+fi
+exit 0
+SH
+  chmod +x "$bin/launchctl" "$bin/ssh" "$bin/hermes"
+}
+
+# A profile created before the seed wrote the display keys: reachable, and mute.
+make_mute_config() {
+  cat > "$1/config.yaml" <<'YAML'
+plugins:
+  enabled:
+    - cozygateway
+YAML
 }
 
 copy_stale_plugin() {
@@ -49,6 +103,11 @@ make_profile() {
 plugins:
   enabled:
     - cozygateway
+display:
+  streaming: true
+  platforms:
+    cozygateway:
+      streaming: true
 YAML
   cat > "$hermes/profiles/$name/.env" <<EOF
 COZYGATEWAY_TOKEN=test-token
@@ -64,6 +123,12 @@ make_fake_python() {
   mkdir -p "$hermes/hermes-agent/venv/bin"
   cat > "$hermes/hermes-agent/venv/bin/python" <<SH
 #!/bin/sh
+# The streaming-key read is a REAL structural read, delegated to the
+# PyYAML-capable interpreter found above, so "absent" and "explicitly false"
+# are told apart here exactly as they are in production.
+if [ "\$2" = "--streaming-keys" ]; then
+  exec env HOME="\$COZY_TEST_YAML_HOME" "\$COZY_TEST_YAML_PYTHON" "\$@"
+fi
 if [ "\$1" = "-" ] && [ "\$2" = "$hermes" ]; then
   printf '%s\\n' '$profiles'
 fi
@@ -90,6 +155,7 @@ SH
   date +%s > "$TMP/watcher-runtime/cozylabs-bot-provisioner.reconcile"
 
   HOME="$TMP/watcher-home" TMPDIR="$TMP/watcher-runtime" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
     COZY_TEST_LAUNCHCTL_LOG="$TMP/watcher-launchctl" COZY_TEST_SSH_LOG="$TMP/watcher-ssh" \
     COZY_TEST_PROVISION_CALLS="$calls" COZY_PROVISION_COMMAND="$bin/provision" \
     COZY_PROVISIONER_LOCK="$TMP/watcher.lock" COZY_PROVISIONER_RECONCILE_SECONDS=999999 \
@@ -119,6 +185,7 @@ SH
   date +%s > "$TMP/cache-runtime/cozylabs-bot-provisioner.reconcile"
 
   HOME="$TMP/cache-home" TMPDIR="$TMP/cache-runtime" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
     COZY_TEST_LAUNCHCTL_LOG="$TMP/cache-launchctl" COZY_TEST_SSH_LOG="$TMP/cache-ssh" \
     COZY_TEST_PROVISION_CALLS="$calls" COZY_PROVISION_COMMAND="$bin/provision" \
     COZY_PROVISIONER_LOCK="$TMP/cache.lock" COZY_PROVISIONER_RECONCILE_SECONDS=999999 \
@@ -140,6 +207,7 @@ test_provisioner_ignores_checkout_pytest_cache() {
   make_fake_python "$hermes" ''
 
   HOME="$TMP/provision-cache-home" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
     COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/provision-cache-ssh" \
     "$repo/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake current >/dev/null
 
@@ -156,6 +224,7 @@ test_provisioner_restarts_loaded_service_after_sync() {
   copy_stale_plugin "$hermes/profiles/already-wired/plugins/cozygateway"
 
   HOME="$TMP/provision-home" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
     COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/provision-ssh" \
     "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake already-wired >/dev/null
 
@@ -177,6 +246,7 @@ HERMES_CHAT_PROJECTS_JSON=[{"computerId":"hermes:test-mac","projectId":"project"
 EOF
 
   HOME="$TMP/chat-registry-home" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
     COZY_TEST_LAUNCHCTL_LOG="$TMP/chat-registry-launchctl" COZY_TEST_SSH_LOG="$TMP/chat-registry-ssh" \
     "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake newly-created >/dev/null
 
@@ -199,6 +269,7 @@ EOF
   printf 'HERMES_CHAT_COMPUTER_ID=operator-selected\n' >> "$hermes/profiles/operator-owned/.env"
 
   HOME="$TMP/partial-chat-registry-home" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
     COZY_TEST_LAUNCHCTL_LOG="$TMP/partial-chat-registry-launchctl" COZY_TEST_SSH_LOG="$TMP/partial-chat-registry-ssh" \
     "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake operator-owned >/dev/null
 
@@ -217,6 +288,7 @@ test_deploy_discovers_every_opted_in_profile() {
   make_fake_python "$hermes" $'alpha\nbeta'
 
   HOME="$TMP/deploy-home" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
     COZY_TEST_LAUNCHCTL_LOG="$TMP/deploy-launchctl" COZY_TEST_SSH_LOG="$TMP/deploy-ssh" \
     "$ROOT/scripts/deploy-plugin-local.sh" --dry-run --hermes-home "$hermes" > "$output"
 
@@ -238,6 +310,7 @@ SH
   chmod +x "$bin/curl"
 
   if HOME="$TMP/partial-home" PATH="$bin:/usr/bin:/bin" COZY_TEST_READY_COUNTS='8 6' \
+    COZY_TEST_HERMES_HOME="$hermes" \
     COZY_TEST_LAUNCHCTL_LOG="$TMP/partial-launchctl" COZY_TEST_SSH_LOG="$TMP/partial-ssh" \
     "$ROOT/scripts/deploy-plugin-local.sh" --hermes-home "$hermes" --quiet-window 0 --max-wait 0 --ready-timeout 0 > "$output" 2>&1; then
     fail 'deploy accepted six online profiles when eight were configured'
@@ -245,7 +318,159 @@ SH
   assert_contains "$output" 'did not report all configured profiles online'
 }
 
+# Streaming is off in Hermes by default (`StreamingConfig.enabled` is false and
+# `_setup_stream_consumer` resolves the per-platform `display` key), so a
+# profile created before the seed wrote those keys is fully wired and still
+# never emits a draft frame. The sweep is what repairs it without hand edits.
+test_watcher_picks_up_a_wired_profile_that_cannot_stream() {
+  local repo="$TMP/stream-repo" hermes="$TMP/stream-hermes" bin="$TMP/stream-bin" log="$TMP/stream.log" calls="$TMP/stream-calls"
+  mkdir -p "$repo/scripts" "$repo/integrations/attach-plugin"
+  cp "$ROOT/scripts/bot-provisioner-watch.sh" "$repo/scripts/"
+  printf 'name: cozygateway\n' > "$repo/integrations/attach-plugin/plugin.yaml"
+  make_fake_bin "$bin"
+  make_profile "$hermes" silent
+  make_mute_config "$hermes/profiles/silent"
+  mkdir -p "$hermes/profiles/silent/plugins/cozygateway"
+  cp "$repo/integrations/attach-plugin/plugin.yaml" "$hermes/profiles/silent/plugins/cozygateway/plugin.yaml"
+  make_fake_python "$hermes" ''
+  cat > "$bin/provision" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" > "$COZY_TEST_PROVISION_CALLS"
+SH
+  chmod +x "$bin/provision"
+  mkdir -p "$TMP/stream-runtime"
+  date +%s > "$TMP/stream-runtime/cozylabs-bot-provisioner.reconcile"
+
+  HOME="$TMP/stream-home" TMPDIR="$TMP/stream-runtime" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOG="$TMP/stream-launchctl" COZY_TEST_SSH_LOG="$TMP/stream-ssh" \
+    COZY_TEST_PROVISION_CALLS="$calls" COZY_PROVISION_COMMAND="$bin/provision" \
+    COZY_PROVISIONER_LOCK="$TMP/stream.lock" COZY_PROVISIONER_RECONCILE_SECONDS=999999 \
+    "$repo/scripts/bot-provisioner-watch.sh" --dry-run --hermes-home "$hermes" --log "$log"
+
+  assert_contains "$log" 'pending: silent (streaming is off in config.yaml)'
+
+  # And a profile that already carries both keys is steady state, not work.
+  make_profile "$hermes" silent
+  rm -f "$calls" "$log"
+  HOME="$TMP/stream-home" TMPDIR="$TMP/stream-runtime" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOG="$TMP/stream-launchctl" COZY_TEST_SSH_LOG="$TMP/stream-ssh" \
+    COZY_TEST_PROVISION_CALLS="$calls" COZY_PROVISION_COMMAND="$bin/provision" \
+    COZY_PROVISIONER_LOCK="$TMP/stream.lock" COZY_PROVISIONER_RECONCILE_SECONDS=999999 \
+    "$repo/scripts/bot-provisioner-watch.sh" --dry-run --hermes-home "$hermes" --log "$log"
+  [ ! -e "$calls" ] || fail 'watcher re-provisioned a profile that already streams'
+}
+
+test_provisioner_turns_streaming_on_and_restarts_once() {
+  local hermes="$TMP/stream-fix-hermes" bin="$TMP/stream-fix-bin" launch_log="$TMP/stream-fix-launchctl" hermes_log="$TMP/stream-fix-hermes-calls"
+  make_fake_bin "$bin"
+  make_profile "$hermes" silent
+  make_mute_config "$hermes/profiles/silent"
+  make_fake_python "$hermes" ''
+  # Wired and current: only the display keys are missing, so a restart here is
+  # for the config change and nothing else.
+  mkdir -p "$hermes/profiles/silent/plugins"
+  cp -R "$ROOT/integrations/attach-plugin" "$hermes/profiles/silent/plugins/cozygateway"
+
+  HOME="$TMP/stream-fix-home" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/stream-fix-ssh" \
+    COZY_TEST_HERMES_LOG="$hermes_log" \
+    "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake silent >/dev/null
+
+  assert_contains "$hermes_log" '-p silent config set display.streaming true'
+  assert_contains "$hermes_log" '-p silent config set display.platforms.cozygateway.streaming true'
+  # Exactly one restart, not one per key and not one per sweep.
+  local restarts
+  restarts="$(grep -c 'kickstart -k gui/' "$launch_log" || true)"
+  [ "$restarts" = 1 ] || fail "expected exactly one restart after the config repair, got $restarts"
+}
+
+# `config set` exiting 0 is not proof of a write: real Hermes returns 0 without
+# writing on a package-managed install. Trusting the exit code would kickstart
+# this profile on every sweep, forever.
+test_provisioner_does_not_restart_when_the_write_did_not_land() {
+  local hermes="$TMP/noop-hermes" bin="$TMP/noop-bin" launch_log="$TMP/noop-launchctl" output="$TMP/noop.out"
+  make_fake_bin "$bin"
+  make_profile "$hermes" silent
+  make_mute_config "$hermes/profiles/silent"
+  make_fake_python "$hermes" ''
+  mkdir -p "$hermes/profiles/silent/plugins"
+  cp -R "$ROOT/integrations/attach-plugin" "$hermes/profiles/silent/plugins/cozygateway"
+
+  HOME="$TMP/noop-home" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" COZY_TEST_HERMES_NOOP_WRITER=1 \
+    COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/noop-ssh" \
+    "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake silent > "$output" 2>&1
+
+  assert_contains "$output" 'is still absent; leaving streaming off and not restarting'
+  if grep -Fq 'kickstart -k' "$launch_log"; then
+    fail 'provisioner restarted a profile whose config was never actually written'
+  fi
+}
+
+# A write that fails is one mute bot, not a dead sweep: the profiles after it
+# still get provisioned.
+test_provisioner_keeps_sweeping_when_a_write_fails() {
+  local hermes="$TMP/writefail-hermes" bin="$TMP/writefail-bin" output="$TMP/writefail.out"
+  make_fake_bin "$bin"
+  make_profile "$hermes" first-mute
+  make_mute_config "$hermes/profiles/first-mute"
+  make_profile "$hermes" second-wired
+  make_fake_python "$hermes" ''
+  mkdir -p "$hermes/profiles/first-mute/plugins" "$hermes/profiles/second-wired/plugins"
+  cp -R "$ROOT/integrations/attach-plugin" "$hermes/profiles/first-mute/plugins/cozygateway"
+  cp -R "$ROOT/integrations/attach-plugin" "$hermes/profiles/second-wired/plugins/cozygateway"
+
+  HOME="$TMP/writefail-home" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" COZY_TEST_HERMES_WRITER_FAILS=1 \
+    COZY_TEST_LAUNCHCTL_LOG="$TMP/writefail-launchctl" COZY_TEST_SSH_LOG="$TMP/writefail-ssh" \
+    "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake first-mute second-wired > "$output" 2>&1
+
+  assert_contains "$output" 'hermes could not set display.streaming, leaving streaming off for this profile'
+  assert_contains "$output" '=== second-wired ==='
+  assert_contains "$output" 'provision-bot: all profiles provisioned'
+}
+
+test_provisioner_leaves_streaming_turned_off_on_purpose() {
+  local hermes="$TMP/stream-off-hermes" bin="$TMP/stream-off-bin" launch_log="$TMP/stream-off-launchctl" hermes_log="$TMP/stream-off-hermes-calls"
+  make_fake_bin "$bin"
+  make_profile "$hermes" quiet-on-purpose
+  make_fake_python "$hermes" ''
+  mkdir -p "$hermes/profiles/quiet-on-purpose/plugins"
+  cp -R "$ROOT/integrations/attach-plugin" "$hermes/profiles/quiet-on-purpose/plugins/cozygateway"
+  cat > "$hermes/profiles/quiet-on-purpose/config.yaml" <<'YAML'
+plugins:
+  enabled:
+    - cozygateway
+display:
+  streaming: false
+  platforms:
+    cozygateway:
+      streaming: false
+YAML
+
+  HOME="$TMP/stream-off-home" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/stream-off-ssh" \
+    COZY_TEST_HERMES_LOG="$hermes_log" \
+    "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake quiet-on-purpose >/dev/null
+
+  if [ -e "$hermes_log" ] && grep -q 'config set display' "$hermes_log"; then
+    fail 'provisioner overrode a streaming setting the operator turned off'
+  fi
+  if grep -Fq 'kickstart -k' "$launch_log"; then
+    fail 'provisioner restarted a profile it had no reason to change'
+  fi
+}
+
 test_watcher_repairs_content_drift
+test_watcher_picks_up_a_wired_profile_that_cannot_stream
+test_provisioner_turns_streaming_on_and_restarts_once
+test_provisioner_leaves_streaming_turned_off_on_purpose
+test_provisioner_does_not_restart_when_the_write_did_not_land
+test_provisioner_keeps_sweeping_when_a_write_fails
 test_watcher_ignores_checkout_pytest_cache
 test_provisioner_ignores_checkout_pytest_cache
 test_provisioner_restarts_loaded_service_after_sync

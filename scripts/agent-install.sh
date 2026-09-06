@@ -822,8 +822,10 @@ gateway_state() {
   esac
 }
 
-record_plugin_change() { PLUGIN_CHANGED_PROFILES+=("$1"); }
-plugin_changed_for() {
+# Profiles whose Hermes gateway must be restarted before the change takes: a
+# loaded service reads neither new plugin code nor a rewritten config.yaml.
+record_profile_change() { PLUGIN_CHANGED_PROFILES+=("$1"); }
+profile_changed_for() {
   local profile="$1" changed
   for changed in "${PLUGIN_CHANGED_PROFILES[@]:-}"; do
     [ "$changed" = "$profile" ] && return 0
@@ -883,7 +885,7 @@ install_plugin() {
   if [ "$DRY_RUN" = 1 ]; then
     # Dry runs cannot safely extract the supplied archive into the profile, so
     # show the conservative lifecycle plan rather than claim a no-op.
-    record_plugin_change "$profile"
+    record_profile_change "$profile"
     say "DRY   install verified attach plugin into $target for Hermes profile $profile"
     return
   fi
@@ -901,7 +903,7 @@ install_plugin() {
   fi
   mkdir -p "$home/plugins"; rm -rf "$target"; mv "$source" "$target"
   printf 'installed by cozygateway agent-install.sh\n' > "$target/.cozygateway-installer-owned"
-  record_plugin_change "$profile"
+  record_profile_change "$profile"
   rm -rf "$stage"; trap - RETURN
 }
 enable_plugin() {
@@ -909,6 +911,97 @@ enable_plugin() {
   if [ "$DRY_RUN" = 1 ]; then say "DRY   enable verified attach plugin for Hermes profile $profile"; return; fi
   "$HERMES_BIN" -p "$profile" plugins enable cozygateway --no-allow-tool-override >/dev/null
 }
+# Hermes only streams a reply when the profile says so: `StreamingConfig.enabled`
+# is false by default (gateway/config.py) and `_setup_stream_consumer` asks the
+# runner for stream deltas only when `display.platforms.<platform>.streaming`
+# resolves true for the turn's platform. `cozygateway` has no per-platform
+# default of its own, so a profile that names neither key never emits a draft
+# frame and the phone only ever receives the finished message. The gateway's
+# create-time seed writes both keys now; this repairs the profiles that were
+# created before it did, and every hand-made profile this installer adopts.
+#
+# The read is structural (a grep cannot tell an absent key from one an operator
+# deliberately set to false) and the write is Hermes' own `config set`, so this
+# script never owns a YAML writer. A missing parser skips the repair with a note
+# rather than failing an install over a display default.
+streaming_python() {
+  local candidate
+  for candidate in "$HERMES_ROOT/hermes-agent/venv/bin/python" "$(command -v python3 || true)" /usr/bin/python3; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+    "$candidate" -c 'import yaml' >/dev/null 2>&1 || continue
+    printf '%s' "$candidate"; return 0
+  done
+  return 1
+}
+# Prints the display keys the profile at $2 does not carry, one per line, read
+# with the interpreter named in $1. None is ABSENT; an explicit false is an
+# operator turning streaming off and is never touched.
+streaming_keys_absent() {
+  "$1" - --streaming-keys "$2" <<'PY'
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(2)
+from pathlib import Path
+
+path = Path(sys.argv[2]) / "config.yaml"
+try:
+    data = yaml.safe_load(path.read_text()) or {}
+except Exception:
+    sys.exit(1)
+
+
+def block(parent, key):
+    value = parent.get(key) if isinstance(parent, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+display = block(data, "display")
+platform = block(block(display, "platforms"), "cozygateway")
+if display.get("streaming") is None:
+    print("display.streaming")
+if platform.get("streaming") is None:
+    print("display.platforms.cozygateway.streaming")
+PY
+}
+ensure_streaming_config() {
+  local profile="$1" home="$2" python keys key rc=0
+  python="$(streaming_python)" || {
+    say "NOTE  no python with PyYAML found, so streaming settings for profile $profile were left alone"
+    return 0
+  }
+  keys="$(streaming_keys_absent "$python" "$home")" || rc=$?
+  if [ "$rc" != 0 ]; then
+    say "NOTE  could not read $home/config.yaml, so streaming settings for profile $profile were left alone"
+    return 0
+  fi
+  [ -n "$keys" ] || { say "OK    streaming is already decided in config.yaml for Hermes profile $profile"; return 0; }
+  for key in $keys; do
+    if [ "$DRY_RUN" = 1 ]; then say "DRY   set $key to true for Hermes profile $profile"; continue; fi
+    # A display default never fails an install: this profile keeps Hermes'
+    # behaviour and every other part of the install carries on.
+    if ! "$HERMES_BIN" -p "$profile" config set "$key" true >/dev/null; then
+      say "NOTE  hermes could not set $key, so streaming settings for profile $profile were left alone"
+      return 0
+    fi
+    say "OK    set $key to true for Hermes profile $profile"
+  done
+  [ "$DRY_RUN" = 1 ] && return 0
+  # Read the file back before restarting anything. `config set` is not proof of a
+  # write: Hermes' `set_config_value` returns 0 WITHOUT writing on a
+  # package-managed install (`is_managed()`), and a restart on that evidence
+  # would be a restart that changes nothing, every rerun.
+  rc=0
+  keys="$(streaming_keys_absent "$python" "$home")" || rc=$?
+  if [ "$rc" != 0 ] || [ -n "$keys" ]; then
+    say "NOTE  hermes reported success but streaming settings for profile $profile are still absent, so it was not restarted"
+    return 0
+  fi
+  # One restart, through the same lifecycle pass a changed plugin uses.
+  record_profile_change "$profile"
+}
+
 # A CozyAgents-only gateway has no Hermes bridge at all: `hermesEndpoints` is absent rather than
 # empty, and the roster comes from the runtime bots the runner reports.
 write_cozyagents_gateway_config() {
@@ -1066,11 +1159,11 @@ ensure_hermes_gateways() {
     state="$(gateway_state "$profile")"; prior="$(prior_service_action "$profile")"
     case "$state" in
       running)
-        if plugin_changed_for "$profile"; then
+        if profile_changed_for "$profile"; then
           run "$HERMES_BIN" -p "$profile" gateway restart
           say "OK    restarted Hermes gateway service for profile $profile"
         else
-          say "OK    Hermes gateway service for profile $profile is already running with the current attach plugin"
+          say "OK    Hermes gateway service for profile $profile is already running with the current attach plugin and config"
         fi
         action="${prior:-preexisting}"
         ;;
@@ -3089,6 +3182,7 @@ main() {
   # would create an unowned legacy copy and make the next profile fail closed.
   for profile in "${SELECTED[@]}"; do install_plugin "$profile" "$(profile_home "$profile")"; done
   for profile in "${SELECTED[@]}"; do enable_plugin "$profile"; done
+  for profile in "${SELECTED[@]}"; do ensure_streaming_config "$profile" "$(profile_home "$profile")"; done
   write_dashboard_port_state; write_gateway_config; write_cli_wrapper; write_dashboard_owner_helper; is_windows && write_dashboard_elevation_helper; start_dashboard; install_service; wait_gateway_ready
   ensure_hermes_gateways; write_state; wait_attach_ready
   is_windows || install_posix_cli

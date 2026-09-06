@@ -7,6 +7,19 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## Unreleased
 
+- Bots created from the phone stream their reply as they write it. Hermes only asks the runner for
+  stream deltas when the profile says so (`StreamingConfig.enabled` is false by default and the
+  turn resolves `display.platforms.<platform>.streaming`), and a profile the gateway created named
+  neither key, so every phone-created bot went quiet for the length of a turn and then delivered
+  one finished message. The create-time seed now writes `display.streaming: true` and
+  `display.platforms.cozygateway.streaming: true` beside the plugin binding, and profiles created
+  before it did are repaired in place: an installer rerun, and the bot provisioner sweep, write
+  whichever of the two keys is absent through Hermes' own `config set` and restart that profile's
+  gateway exactly once. Only an absent key is written, so a bot an operator set to `false` stays
+  quiet; `docs/agent-install.md` says how to turn the default off. No Hermes change and no wire
+  change: the attach plugin already answers `supports_draft_streaming` for every chat type, so the
+  `draft` frames it now has to send are the ones the app already renders.
+
 - Artifacts are joined to their Task by the gateway, from the Run the producer named
   (`com.cozylabs.bots` row 65, additive). A Task id is minted gateway-side and no attach-v1 frame
   ever carried it to a peer, so a producer could not state one and its Artifact never reached the

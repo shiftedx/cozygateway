@@ -66,6 +66,33 @@ export const ATTACH_PLUGIN_SEED = {
   entries: { [ATTACH_PLUGIN_NAME]: { allow_tool_override: false } },
 } as const;
 
+/** The display keys that make a seeded bot stream its reply as it writes it.
+ *
+ *  Hermes decides per turn in `gateway/run_turn_runner.py::_setup_stream_consumer`: it asks the
+ *  runner for stream deltas only when `display.platforms.<platform>.streaming` resolves true, and
+ *  when that key is absent it falls back to the top-level `streaming.enabled`, whose dataclass
+ *  default (`gateway/config.py::StreamingConfig`) is FALSE. So a profile that names nothing never
+ *  emits a `draft` frame, and the phone only ever receives the finished message. The attach
+ *  plugin is ready for the frames either way: `adapter.py::supports_draft_streaming` answers true
+ *  for every chat type, and its `send_draft` is a full-replace of the turn's live message.
+ *
+ *  Both keys, deliberately:
+ *
+ *  - `display.platforms.cozygateway.streaming` is the one the phone turn resolves, because
+ *    `cozygateway` (the plugin's `PLATFORM_NAME`) has no entry in Hermes'
+ *    `gateway/display_config.py::_PLATFORM_DEFAULTS` and so has no default of its own.
+ *  - `display.streaming` is the CLI display toggle for the same profile. A bot that types in front
+ *    of you on the phone and pastes a wall of text in a terminal on the box is the same bot
+ *    behaving two ways for no reason the user chose.
+ *
+ *  `display.interim_assistant_messages` is deliberately NOT here: Hermes' own
+ *  `hermes_cli/config_defaults.py::DEFAULT_CONFIG` already carries it as true, so seeding it would
+ *  write down a default that is already the default. */
+export const STREAMING_SEED = {
+  streaming: true,
+  platforms: { [ATTACH_PLUGIN_NAME]: { streaming: true } },
+} as const;
+
 /** The complete blank-slate seed, exported as one value so the creation test asserts the whole
  *  shape rather than a hand-picked subset.
  *
@@ -98,6 +125,7 @@ export const BLANK_SLATE_SEED = {
   ),
   approvals: { mode: BLANK_SLATE_APPROVAL_MODE },
   plugins: ATTACH_PLUGIN_SEED,
+  display: STREAMING_SEED,
 } as const;
 
 /** What the creating user explicitly asked this bot to start with, on top of the floor. Absent
@@ -222,6 +250,22 @@ function planAttachPlugin(plugins: Record<string, unknown>): Record<string, unkn
   return patch;
 }
 
+/** The `display` patch a profile needs to stream, or undefined when it already says so.
+ *
+ *  Only ABSENT keys are written. An explicit `false` is an operator saying this bot should not
+ *  stream, and it stays false: that is the documented way to turn this default off. Only the
+ *  plugin's own platform is named, so a `platforms` block carrying telegram or discord keeps it
+ *  through the deep merge on the other side. */
+function planStreamingDisplay(display: Record<string, unknown>): Record<string, unknown> | undefined {
+  const patch: Record<string, unknown> = {};
+  if (display["streaming"] === undefined) patch["streaming"] = true;
+  const platforms = asRecord(display["platforms"]) ?? {};
+  if (asRecord(platforms[ATTACH_PLUGIN_NAME])?.["streaming"] === undefined) {
+    patch["platforms"] = { [ATTACH_PLUGIN_NAME]: { streaming: true } };
+  }
+  return Object.keys(patch).length === 0 ? undefined : patch;
+}
+
 /** Works out the subset of the seed a profile does not already carry.
  *
  *  A key that is already present is somebody's decision -- Hermes', or a user who has since raised
@@ -256,6 +300,11 @@ export function planBlankSlateSeed(input: {
   // Reachability is not a default anyone gets to opt out of by accident.
   const pluginPatch = planAttachPlugin(asRecord(config["plugins"]) ?? {});
   if (pluginPatch !== undefined) patch["plugins"] = pluginPatch;
+
+  // Streaming rides beside the binding and NOT behind `blankSlate` for the same reason: that flag
+  // is toolset policy, and how a reply is delivered to the phone is not a toolset.
+  const displayPatch = planStreamingDisplay(asRecord(config["display"]) ?? {});
+  if (displayPatch !== undefined) patch["display"] = displayPatch;
 
   const requestedToolsets = cleanNames(input.selection?.toolsets);
   const known = input.reportedToolsets;

@@ -102,6 +102,50 @@ sys.exit(0 if "cozygateway" in ((data.get("plugins") or {}).get("enabled") or []
 PY
 }
 
+# The display keys Hermes reads before it will stream a reply, printed one per
+# line when the profile does not carry them.
+#
+# Hermes' own default is silence: `StreamingConfig.enabled` is false
+# (gateway/config.py) and `_setup_stream_consumer` asks the runner for stream
+# deltas only when `display.platforms.<platform>.streaming` resolves true for
+# the turn's platform. `cozygateway` has no per-platform default of its own, so
+# a profile that names neither key never emits a single draft frame and the
+# phone only ever receives the finished message.
+#
+# Structural, like the plugins.enabled read above: a grep cannot tell an absent
+# key from one an operator deliberately set to false, and only the absent ones
+# may be written.
+streaming_keys_absent() {
+  "$PYTHON" - --streaming-keys "$1" <<'PY'
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(2)
+from pathlib import Path
+
+path = Path(sys.argv[2]) / "config.yaml"
+try:
+    data = yaml.safe_load(path.read_text()) or {}
+except Exception:
+    sys.exit(1)
+
+
+def block(parent, key):
+    value = parent.get(key) if isinstance(parent, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+display = block(data, "display")
+platform = block(block(display, "platforms"), "cozygateway")
+# None is ABSENT. An explicit false is an operator turning streaming off and is never touched.
+if display.get("streaming") is None:
+    print("display.streaming")
+if platform.get("streaming") is None:
+    print("display.platforms.cozygateway.streaming")
+PY
+}
+
 # A profile can have all of its wiring while still running an old plugin: the
 # watcher must compare content (not timestamps or merely plugin.yaml's version)
 # so an already-loaded Hermes service is upgraded after every staged release.
@@ -138,6 +182,11 @@ missing_reason() {
     || { printf 'env not scoped to this profile'; return 0; }
   launchctl print "gui/$(id -u)/ai.hermes.gateway-$profile" >/dev/null 2>&1 \
     || { printf 'no launchd gateway service'; return 0; }
+  # Wired but mute: every profile created before the gateway's seed wrote these
+  # keys is fully reachable and still never streams. PyYAML is already proven
+  # available by the opted_in read that got us here.
+  [ -z "$(streaming_keys_absent "$dir")" ] \
+    || { printf 'streaming is off in config.yaml'; return 0; }
   return 1
 }
 

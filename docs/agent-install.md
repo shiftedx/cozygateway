@@ -238,6 +238,40 @@ focused operations directly. Status distinguishes an unreachable gateway from
 an attach connection that needs attention without printing profile identities
 or raw errors.
 
+## Bots stream by default
+
+A bot created from the phone types its answer in front of you rather than going
+quiet and then pasting a finished message. Hermes decides that per profile and
+its own default is off, so the gateway writes two keys into a new profile's
+`config.yaml` when it creates it:
+
+```yaml
+display:
+  streaming: true
+  platforms:
+    cozygateway:
+      streaming: true
+```
+
+`display.platforms.cozygateway.streaming` is the one a phone turn resolves;
+`display.streaming` is the same choice for a terminal session on that profile.
+
+Profiles created before this default existed are repaired in place: an installer
+rerun writes whichever of the two keys is absent, through Hermes' own
+`config set`, and restarts that profile's Hermes gateway once so it takes.
+Nothing else about the profile is touched.
+
+To turn streaming off for one bot, say so explicitly and neither the seed nor a
+later installer rerun will overrule it:
+
+```sh
+hermes -p <profile> config set display.platforms.cozygateway.streaming false
+hermes -p <profile> config set display.streaming false
+hermes -p <profile> gateway restart
+```
+
+An explicit `false` is a decision. Only an ABSENT key is ever written.
+
 On Windows, state is under `%LOCALAPPDATA%\cozygateway`. Persistence uses the
 current-user `CozyGateway` Scheduled Task with a hidden Startup-folder fallback
 when policy blocks task registration. Phone-created bot auto-provisioning is not
