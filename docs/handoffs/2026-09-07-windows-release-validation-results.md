@@ -150,3 +150,13 @@ Private evidence retained under `<logs>`:
 - `help-fix/` contains published reproduction, RED/GREEN regression, build, smoke, Windows bundle and worker-test logs with exit-code sidecars, plus the initial host failures.
 
 The source Windows validation gap now has positive evidence. The published CLI defect and the stated installed-product/session/paired limits prevent an unconditional Windows-qualified claim. At the end of validation, the local fix was ready for integration and a subsequent release decision; no existing release was republished.
+
+## Subsequent integration
+
+The same six-file patch was integrated onto current CozyAgents main `66e14203e6fdcf3dd552da1a2bd842ca1ea9df72` as commit `8dcd6a3c9d87d8504f7751f8475d7cbc2787504e` in [CozyAgents PR #173](https://github.com/shiftedx/cozyagents/pull/173). This fresh integration preserves the original validation commit and evidence above. `npm ci`, `npm run bundle`, the 16 worker tests, and `npm run smoke:bundle` all exited 0 on the integration candidate. Its main bundle SHA-256 remained `335c186b52c0588fa71fcbf182f80bd86b97887ec90cfe9d2cb629b1da0d3fe8`.
+
+Hosted CozyAgents integration CI and security jobs could not start because GitHub reported an account payment or spending-limit restriction. This is an infrastructure limitation, not a failed test assertion. No workflow or billing settings were changed.
+
+CozyAgents PR #173 merged at `2026-09-07T22:47:36Z` as main commit `388764e31d56fd1bbe069cf5ac1c0929a311e255`, using the normal squash merge with no administrator bypass or gate changes. No release was published or replaced.
+
+A subsequent full native `npm run test:windows` on integration commit `8dcd6a3c9d87d8504f7751f8475d7cbc2787504e` exited 1. Its installer suite failed at the checksum-verified private Node staging case: the expected `node/node.exe` was absent when invoked. This later run does not replace the successful original pinned-source lane above, and does not establish full native acceptance for the integrated candidate. The cause remains unqualified in this report; its private log and exit-code sidecar are retained under `<logs>/integration/native-windows.*`.
