@@ -28,5 +28,5 @@ pgrep -f -- "--profile burnerhermes" >/dev/null 2>&1 \
   && pgrep -fl -- "--profile burnerhermes" | sed 's/^/   /' || echo "   no burner Hermes profile gateway"
 lsof -nP -iTCP:"$TB1_DASHBOARD_PORT" -sTCP:LISTEN >/dev/null 2>&1 \
   && echo "   burner dashboard listening on $TB1_DASHBOARD_PORT" || echo "   no burner dashboard"
-[ -n "$(tb1_runner_pids)" ] \
+tb1_runner_running \
   && echo "   burner CozyAgents runner up" || echo "   no burner CozyAgents runner"

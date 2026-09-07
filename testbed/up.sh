@@ -64,13 +64,13 @@ done
 
 echo "==> burner CozyAgents runner"
 if [ -f "$TB1_SCRATCH/cozyagents-home/runner.env" ]; then
-  if [ -z "$(tb1_runner_pids)" ]; then
+  if ! tb1_runner_running; then
     ( cd "$TB1_SCRATCH" && nohup node "$TB1_SCRATCH/cozyagents-bin/cozyagents.mjs" runner \
         --env "$TB1_SCRATCH/cozyagents-home/runner.env" \
         >> "$TB1_SCRATCH/logs/runner-stdout.log" 2>&1 & echo "$!" > "$TB1_SCRATCH/burner-runner.pid" )
     sleep 15
   fi
-  [ -n "$(tb1_runner_pids)" ] || {
+  tb1_runner_running || {
     echo "burner CozyAgents runner never came up (see $TB1_SCRATCH/logs/runner-stdout.log)"
     exit 1
   }

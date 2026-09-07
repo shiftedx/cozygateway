@@ -23,14 +23,19 @@ done
 [ -f "$TB1_SCRATCH/burner-dashboard.pid" ] && kill "$(cat "$TB1_SCRATCH/burner-dashboard.pid")" 2>/dev/null
 
 echo "==> burner CozyAgents runner and its bot children"
-# Anchored to $TB1_SCRATCH (see env.sh's tb1_runner_pids), never the bare
-# `cozyagents-bin/cozyagents.mjs` fragment: that path segment is only this
-# packet's own bundling convention, not a burner-only marker, so an unanchored
-# match could also hit a production runner bundled the same way.
+# The pid file up.sh wrote is the PRIMARY source of truth (see env.sh's
+# tb1_runner_pid_from_file); the anchored sweep below only adds bot children
+# the pid file alone does not track. Both compare a candidate's own command
+# line against the literal $TB1_SCRATCH path with a plain bash glob
+# (tb1_runner_cmd_matches), never a regex, so nothing in $TB1_SCRATCH needs
+# escaping -- never the bare `cozyagents-bin/cozyagents.mjs` fragment alone,
+# which is only this packet's own bundling convention, not a burner-only
+# marker, so an unanchored match could also hit a production runner bundled
+# the same way.
+pid="$(tb1_runner_pid_from_file)" && { echo "  kill $pid (runner, from pid file)"; kill "$pid" 2>/dev/null; }
 for pid in $(tb1_runner_pids); do
   echo "  kill $pid"; kill "$pid" 2>/dev/null
 done
-[ -f "$TB1_SCRATCH/burner-runner.pid" ] && kill "$(cat "$TB1_SCRATCH/burner-runner.pid")" 2>/dev/null
 
 echo "==> burner gateway container"
 docker compose -p "$TB1_COMPOSE_PROJECT" -f "$TB1_COMPOSE_FILE" down

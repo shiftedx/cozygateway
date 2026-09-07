@@ -20,7 +20,7 @@ assert_cold() {
     echo "FAIL  ($label) the burner dashboard is still listening on $TB1_DASHBOARD_PORT" >&2
     exit 1
   fi
-  if [ -n "$(tb1_runner_pids)" ]; then
+  if tb1_runner_running; then
     echo "FAIL  ($label) a burner CozyAgents process is still running" >&2
     exit 1
   fi
