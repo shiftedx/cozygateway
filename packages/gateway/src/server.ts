@@ -80,7 +80,7 @@ import { MobileNodeBroker } from "./mobile-node.ts";
 import { TurnRunner } from "./turns.ts";
 import { RelayNotifier, taskCompletionPayload, type ChatMessagePushEvent } from "./push-notifier.ts";
 import { LiveActivityNotifier } from "./live-activity-notifier.ts";
-import type { ApprovalPushPayload } from "./push-crypto.ts";
+import { roomApprovalPush, type ApprovalPushPayload } from "./push-crypto.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
 import {
   createUpgradeDispatcher,
@@ -555,6 +555,8 @@ export async function startGateway(
       } else {
         hub.broadcast(frame);
         raiseLiveActivityFrame(frame);
+        const roomPush = roomApprovalPush(frame);
+        if (roomPush !== undefined) raiseApprovalPush(roomPush);
       }
     },
     now: () => Date.now(),
@@ -615,6 +617,8 @@ export async function startGateway(
         broadcast: (frame) => {
           hub.broadcast(frame);
           raiseLiveActivityFrame(frame);
+          const roomPush = roomApprovalPush(frame);
+          if (roomPush !== undefined) raiseApprovalPush(roomPush);
         },
         now: () => Date.now(),
         runtimeBotNames: () => nativeBotPlane?.runtimeBotNames() ?? bootRuntimeBotNames,
@@ -1060,7 +1064,7 @@ export async function startGateway(
         event.outcome === undefined
           ? {
               kind: "approval_pending",
-              threadId: `bot:${event.bot}`,
+              threadId: event.room === undefined ? `bot:${event.bot}` : `group:${event.room}`,
               agentId: event.bot,
               turnId: event.turnId,
               toolCallId: event.toolCallId,
@@ -1068,7 +1072,7 @@ export async function startGateway(
             }
           : {
               kind: "approval_resolved",
-              threadId: `bot:${event.bot}`,
+              threadId: event.room === undefined ? `bot:${event.bot}` : `group:${event.room}`,
               agentId: event.bot,
               turnId: event.turnId,
               toolCallId: event.toolCallId,

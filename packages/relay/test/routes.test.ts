@@ -491,6 +491,18 @@ describe("POST /notify, push categories", () => {
     return body.error.code;
   }
 
+  it("accepts urgency only for pending approvals and passes it to transport", async () => {
+    const { app, deliveries } = harness();
+    const pushId = await registeredPushId(app);
+    for (const category of ["message", "approval.resolved", "mobile.status.wake"]) {
+      expect((await notify(app, { pushId, ciphertext: "CIPHER", category, collapseId: "call", interruptionLevel: "time-sensitive" })).status).toBe(400);
+    }
+    expect((await notify(app, { pushId, ciphertext: "CIPHER", category: "approval.pending", collapseId: "call", interruptionLevel: "critical" })).status).toBe(400);
+    expect((await notify(app, { pushId, ciphertext: "CIPHER", category: "approval.pending", collapseId: "call", interruptionLevel: "time-sensitive" })).status).toBe(202);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(deliveries[0]?.options).toEqual({ category: "approval.pending", collapseId: "call", interruptionLevel: "time-sensitive" });
+  });
+
   it("passes an approval.pending category and its collapse id through to the transport", async () => {
     const { app, deliveries } = harness();
     const pushId = await registeredPushId(app);

@@ -90,6 +90,7 @@ export const NotifyRequestSchema = Type.Object(
     })),
     /** Optional routing metadata (issue #19, section 2). Omitted = today's message push. */
     category: Type.Optional(Type.Union(PUSH_CATEGORY_IDS.map((id) => Type.Literal(id)))),
+    interruptionLevel: Type.Optional(Type.Literal("time-sensitive")),
     /** Coalescing key; approvals use `toolCallId`, bot messages use a bot/chat digest. */
     collapseId: Type.Optional(
       Type.String({ minLength: 1, maxLength: COLLAPSE_ID_MAX_LENGTH, pattern: COLLAPSE_ID_PATTERN }),

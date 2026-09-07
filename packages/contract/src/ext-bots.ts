@@ -1024,6 +1024,11 @@ export const BotApprovalPendingFrameSchema = Type.Object({
   updatedAt: Type.Integer(),
   /** Present for an approval raised by a member turn inside a group room. */
   room: Type.Optional(Type.String()),
+  /** Capability 77. The durable room turn's cause, present before its reply is written. */
+  cause: Type.Optional(Type.Object({
+    kind: Type.Union([Type.Literal("user"), Type.Literal("member")]),
+    seq: Type.Integer(),
+  })),
   /** Capability 56. A sanitized, at most 400-character display sentence naming what the approval
    *  concretely covers (for example which Chrome and which profile a browser tool would drive).
    *  Absent when the runtime peer sent none. */
@@ -1813,6 +1818,11 @@ export const BotGroupPendingInteractionSchema = Type.Object({
   id: Type.String({ maxLength: 256 }),
   /** The room member turn that raised it. */
   turnId: Type.String({ maxLength: 256 }),
+  /** Capability 77. The durable room turn's cause, present before its reply is written. */
+  cause: Type.Optional(Type.Object({
+    kind: Type.Union([Type.Literal("user"), Type.Literal("member")]),
+    seq: Type.Integer(),
+  })),
 });
 export type BotGroupPendingInteraction = Static<typeof BotGroupPendingInteractionSchema>;
 
@@ -3003,4 +3013,6 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
 /** Capability 75: read-only observer API, bounded subscriptions and content-free live projections. */
 /** Capability 76: a reply push optionally carries its Task id and suppresses its same-turn
  * completion banner for ten seconds. */
-export const BOTS_CAPABILITY_VERSION = 76;
+/** Capability 77: room pending approvals expose the durable writing turn cause before a reply
+ * exists. Delivery approval pushes alone may request the time-sensitive APNs interruption level. */
+export const BOTS_CAPABILITY_VERSION = 77;

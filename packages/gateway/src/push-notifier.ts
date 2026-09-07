@@ -178,7 +178,7 @@ export class RelayNotifier implements Notifier {
     registration: PushRegistrationRow,
     payload: PushPayload,
     task: { taskId: string; runId: string } | undefined,
-    routing?: { category: string; collapseId: string },
+    routing?: { category: string; collapseId: string; interruptionLevel?: "time-sensitive" },
   ): void {
     if (task === undefined || this.#replyPushes === undefined) {
       void this.#send(registration, payload, routing).catch((err: unknown) => {
@@ -286,7 +286,9 @@ export class RelayNotifier implements Notifier {
     if (targets.length === 0) return;
     const category = APPROVAL_CATEGORY[payload.kind];
     for (const registration of targets) {
-      void this.#send(registration, payload, { category, collapseId }).catch((err: unknown) => {
+      void this.#send(registration, payload, { category, collapseId,
+        ...(payload.kind === "approval_pending" && payload.name === "send_file" ? { interruptionLevel: "time-sensitive" as const } : {}),
+      }).catch((err: unknown) => {
         this.#log(
           `push: approval notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`,
         );
@@ -361,7 +363,7 @@ export class RelayNotifier implements Notifier {
     registration: PushRegistrationRow,
     payload: PushPayload,
     /** Both or neither, per contract/push-v0.md: the relay 400s a body carrying only one. */
-    routing?: { category: string; collapseId: string },
+    routing?: { category: string; collapseId: string; interruptionLevel?: "time-sensitive" },
   ): Promise<"sent" | "skipped" | "not_found"> {
     // Yield one macrotask before the presence recheck. Without this yield the recheck would
     // run in the same synchronous span as notify()'s commit-time snapshot and could never
@@ -390,6 +392,25 @@ export class RelayNotifier implements Notifier {
         }),
         signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
       });
+      // Old strict relays reject the new field before delivery. Only that explicit schema
+      // rejection is safe to retry; uncertain network/server failures may already have delivered.
+      if (res.status === 400 && routing?.interruptionLevel === "time-sensitive") {
+        const rejection: unknown = await res.json().catch(() => undefined);
+        if (typeof rejection === "object" && rejection !== null && "error" in rejection) {
+          const error = rejection.error;
+          if (typeof error === "object" && error !== null && "code" in error && "message" in error
+            && error.code === "invalid_request" && error.message === "malformed notify body") {
+            if (this.#isDeviceConnected?.(registration.deviceId) === true) return "skipped";
+            this.#log("push: relay rejected delivery urgency; retrying once at the ordinary interruption level");
+            res = await this.#fetch(url, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ pushId: registration.pushId, ciphertext, category: routing.category, collapseId: routing.collapseId }),
+              signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
+            });
+          }
+        }
+      }
     } catch (error) {
       emitTrace(this.#trace, "relay_result", { device: traceId(registration.deviceId), result: "network_error" });
       this.#observe?.pushResult(registration.deviceId, "network_error");

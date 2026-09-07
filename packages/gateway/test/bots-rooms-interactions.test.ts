@@ -1,3 +1,4 @@
+import { roomApprovalPush } from "../src/push-crypto.ts";
 import { createServer, type Server } from "node:http";
 import { once } from "node:events";
 
@@ -90,6 +91,7 @@ interface Harness {
   /** Every attach turn command the rooms handed to the transport, in dispatch order. */
   commands: Array<{ agentId: string; threadId: string; turnId: string }>;
   frames: ServerFrame[];
+  pushedApprovals: Array<{ kind: string; room?: string }>;
   /** Pushes one attach event at the room, answering whether the room accepted it. A `false` here
    *  is a DEAD LETTER: the ingress would retry it and then block the member's whole stream. */
   push: (agentId: string, event: Record<string, unknown>) => boolean;
@@ -133,6 +135,7 @@ async function setup(
   // publish to the same hub, so a terminal frame the plane emits for a room interaction lands on
   // the same wire the room's own frames do.
   const frames: ServerFrame[] = [];
+  const pushedApprovals: Array<{ kind: string; room?: string }> = [];
 
   const received = new Map<string, AttachV1ServerFrame[]>();
   const sockets: WebSocket[] = [];
@@ -160,6 +163,7 @@ async function setup(
     nativeBots: runtimeBots,
     chatSuggestion: "",
     broadcast: (frame) => frames.push(frame),
+    onApproval: event => pushedApprovals.push({ kind: event.outcome === undefined ? "approval_pending" : "approval_resolved", ...(event.room === undefined ? {} : { room: event.room }) }),
     now: () => NOW,
     log: () => {},
   });
@@ -173,7 +177,11 @@ async function setup(
   const bridge = new HermesBridge({
     client,
     storage,
-    broadcast: (frame) => frames.push(frame),
+    broadcast: (frame) => {
+      frames.push(frame);
+      const push = roomApprovalPush(frame);
+      if (push !== undefined) pushedApprovals.push({ kind: push.kind, room: "room" in frame ? String(frame.room) : undefined });
+    },
     now: () => NOW,
     logSink: () => {},
     runtimeBotNames: () => runtime,
@@ -215,6 +223,7 @@ async function setup(
     client,
     commands,
     frames,
+    pushedApprovals,
     app,
     received,
     resolutions: (bot) =>
@@ -268,12 +277,14 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
     const pending = h.frames.find((frame) => frame.type === "bot_approval_pending") as BotApprovalPendingFrame;
     expect(pending).toMatchObject({
       bot: "sage", sessionId: "group:launch:sage", turnId: turn.turnId,
-      toolCallId: "approval-1", name: "terminal:rm", room: "Launch",
+      toolCallId: "approval-1", name: "terminal:rm", room: "Launch", cause: { kind: "user", seq: 1 },
     });
+
+    expect(h.storage.botGroupLog("launch").some(row => row.turnId === turn.turnId)).toBe(false);
 
     // The room advertises what it is blocked on, so the rooms list can badge without joining the
     // inbox to a room itself -- and the badge frame reports the round the drive is ACTUALLY on.
-    const blocked = [{ member: "sage", kind: "approval", id: "approval-1", turnId: turn.turnId }];
+    const blocked = [{ member: "sage", kind: "approval", id: "approval-1", turnId: turn.turnId, cause: { kind: "user", seq: 1 } }];
     expect(h.bridge.groups()[0]?.pendingInteractions).toEqual(blocked);
     const state = [...h.frames].reverse().find((frame) => frame.type === "bot_group_state") as BotGroupStateFrame;
     expect(state).toMatchObject({ state: "running", round: 0, pendingInteractions: blocked });
@@ -742,7 +753,7 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
       approvalId: "approval-first", callId: "call-1", name: "terminal:rm", status: "pending",
     });
     expect(h.bridge.groups()[0]?.pendingInteractions).toEqual([
-      { member: first.agentId, kind: "approval", id: "approval-first", turnId: first.turnId },
+      { member: first.agentId, kind: "approval", id: "approval-first", turnId: first.turnId, cause: { kind: "user", seq: 1 } },
     ]);
     expect(await (await h.app.request(`/bots/${first.agentId}/approvals/approval-first/approve`, { method: "POST" })).json())
       .toEqual({ status: "requested" });
@@ -764,7 +775,7 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
       { bot: second.agentId, sessionId: second.threadId, toolCallId: "approval-second", room: "Launch" },
     ]);
     expect(h.bridge.groups()[0]?.pendingInteractions).toEqual([
-      { member: second.agentId, kind: "approval", id: "approval-second", turnId: second.turnId },
+      { member: second.agentId, kind: "approval", id: "approval-second", turnId: second.turnId, cause: { kind: "member", seq: 2 } },
     ]);
     expect(await (await h.app.request(`/bots/${second.agentId}/approvals/approval-second/deny`, { method: "POST" })).json())
       .toEqual({ status: "requested" });
@@ -870,6 +881,10 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
     expect(h.frames.some((frame) =>
       frame.type === "bot_approval_resolved" && frame.outcome === "expired" && frame.room === "Launch",
     )).toBe(true);
+    expect(h.pushedApprovals).toEqual([
+      { kind: "approval_pending", room: "Launch" },
+      { kind: "approval_resolved", room: "Launch" },
+    ]);
     expect(h.bridge.groups()[0]?.pendingInteractions).toBeUndefined();
   });
 
