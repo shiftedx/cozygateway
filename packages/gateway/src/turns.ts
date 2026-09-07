@@ -16,7 +16,7 @@ import { isStopPhrase, stopCandidateFromBlocks } from "./stop-phrase.ts";
 
 export interface Notifier {
   notify(
-    event: { threadId: string; agentName: string; preview: string },
+    event: { threadId: string; agentName: string; preview: string; runId?: string },
     connectedDeviceIds: ReadonlySet<string>,
   ): void;
   /** OPTIONAL, and optional on purpose: `Notifier` is public surface, so a host that supplies its
@@ -440,7 +440,7 @@ export class TurnRunner {
           );
           this.#hub.broadcast({ type: "committed", threadId, seq: message.seq, message });
           this.#notifier.notify(
-            { threadId, agentName, preview: preview(final.blocks) },
+            { threadId, agentName, preview: preview(final.blocks), ...(final.runId === undefined ? {} : { runId: final.runId }) },
             this.#hub.connectedDeviceIds(),
           );
         },

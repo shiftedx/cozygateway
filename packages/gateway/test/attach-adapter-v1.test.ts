@@ -39,7 +39,7 @@ describe("attach-v1 backend adapter", () => {
     await pending;
 
     expect(onDraft).toHaveBeenLastCalledWith({ blocks: [{ type: "paragraph", text: "done" }], toolCalls: [] });
-    expect(onCommit).toHaveBeenCalledWith({ blocks: [{ type: "paragraph", text: "done" }] });
+    expect(onCommit).toHaveBeenCalledWith({ blocks: [{ type: "paragraph", text: "done" }], runId: expect.any(String) });
     expect(onDone).toHaveBeenCalledOnce();
   });
 

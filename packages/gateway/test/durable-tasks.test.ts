@@ -10,7 +10,7 @@ import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 import { openStorage } from "../src/storage.ts";
 
 describe("durable Tasks on actual attach storage admission", () => {
-  it("retains a reply-push marker across restart and only collapses its own Task for ten seconds", () => {
+  it("retains a sent reply marker across restart only for its exact Task Run and device", () => {
     const root = join(process.cwd(), "../../benchmark-runs/f23-reply-push"); mkdirSync(root, { recursive: true });
     const directory = mkdtempSync(join(root, "restart-")); const path = join(directory, "gateway.sqlite");
     let now = 0;
@@ -24,17 +24,39 @@ describe("durable Tasks on actual attach storage admission", () => {
 
       // Completion state is already durable when a quick reply is pushed, so the lookup must not
       // filter terminal Tasks. Its marker must survive the process that writes it.
-      expect(storage.tasks.replyPushTask(sessionId)).toBe(taskId);
-      storage.tasks.noteReplyPush(taskId);
-      expect(storage.tasks.replyPushCollapses(taskId)).toBe(true);
+      const marker = { taskId, runId: "run", deviceId: "d1" };
+      expect(storage.tasks.replyPushTask(sessionId, "run")).toEqual({ taskId, runId: "run" });
+      expect(storage.tasks.replyPushTask(sessionId, "other-run")).toBeUndefined();
+      storage.tasks.noteReplyPush(marker);
+      storage.tasks.markReplyPushSent(marker);
+      expect(storage.tasks.replyPushState(marker)).toBe("sent");
       storage.close();
 
       now = REPLY_PUSH_COLLAPSE_WINDOW_MS - 1;
       storage = openStorage(path); storage.tasks.clock(() => now);
-      expect(storage.tasks.replyPushCollapses(taskId)).toBe(true);
-      expect(storage.tasks.replyPushCollapses("other_task")).toBe(false);
+      expect(storage.tasks.replyPushState(marker)).toBe("sent");
+      expect(storage.tasks.replyPushState({ ...marker, deviceId: "d2" })).toBeUndefined();
+      expect(storage.tasks.replyPushState({ ...marker, runId: "other-run" })).toBeUndefined();
       now += 1;
-      expect(storage.tasks.replyPushCollapses(taskId)).toBe(false);
+      expect(storage.tasks.replyPushState(marker)).toBeUndefined();
+    } finally { storage.close(); rmSync(directory, { recursive: true }); }
+  });
+
+  it("recovers only a scheduled reply for a completed current Run after restart", () => {
+    const root = join(process.cwd(), "../../benchmark-runs/f23-reply-push"); mkdirSync(root, { recursive: true });
+    const directory = mkdtempSync(join(root, "recovery-")); const path = join(directory, "gateway.sqlite");
+    let storage = openStorage(path);
+    try {
+      const sessionId = storage.nativeBotChat("sage", 1).sessionId;
+      const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "work" }, 2);
+      const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+      storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+      storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: sessionId, turnId: "run", messageId: "reply", blocks: [] } }, 4);
+      storage.tasks.noteReplyPush({ taskId, runId: "run", deviceId: "d1" });
+      storage.close();
+
+      storage = openStorage(path);
+      expect(storage.tasks.replyPushRecoveries()).toEqual([expect.objectContaining({ taskId, runId: "run", deviceId: "d1", bot: "sage", sessionId })]);
     } finally { storage.close(); rmSync(directory, { recursive: true }); }
   });
 

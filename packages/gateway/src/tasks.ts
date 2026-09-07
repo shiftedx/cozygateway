@@ -13,7 +13,8 @@ export interface TaskArtifactReference { artifactId: string; status: "pending" |
 /** Initiative 4 binds this to its canonical declaration/commitment reader. No attachment or
  * delivery record is evidence. Missing previously declared references remain unproven. */
 export type TaskArtifactReader = (source: { taskId: string; bot: string; peer: string; sessionId: string; runId: string }) => readonly TaskArtifactReference[];
-export interface TaskCompletionNotice { taskId: string; bot: string; sessionId: string; room?: string }
+export interface TaskCompletionNotice { taskId: string; runId: string; bot: string; sessionId: string; room?: string }
+export interface ReplyPushMarker { taskId: string; runId: string; deviceId: string }
 export interface TaskRecoveryDecision { taskId: string; runId: string; issuer: string; decisionId: string; reason: string }
 /** Only a trusted canonical operator/policy producer may bind this reader. */
 export type TaskRecoveryDecisionReader = (source: { taskId: string; bot: string; runId: string }) => TaskRecoveryDecision | undefined;
@@ -50,7 +51,7 @@ export class Tasks {
       CREATE TABLE IF NOT EXISTS task_intent_revisions (task_id TEXT NOT NULL REFERENCES tasks(task_id), revision INTEGER NOT NULL, goal TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(task_id,revision)) STRICT;
       CREATE TABLE IF NOT EXISTS task_events (task_id TEXT NOT NULL REFERENCES tasks(task_id), seq INTEGER NOT NULL, source_id TEXT NOT NULL, event_json TEXT NOT NULL, PRIMARY KEY(task_id,seq), UNIQUE(task_id,source_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_completion_notifications (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), created_at INTEGER NOT NULL) STRICT;
-      CREATE TABLE IF NOT EXISTS task_reply_pushes (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), pushed_at INTEGER NOT NULL) STRICT;
+      CREATE TABLE IF NOT EXISTS task_reply_pushes (task_id TEXT NOT NULL REFERENCES tasks(task_id), run_id TEXT NOT NULL, device_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('scheduled', 'sent')), pushed_at INTEGER NOT NULL, PRIMARY KEY(task_id, run_id, device_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_tool_facts (peer TEXT NOT NULL, run_id TEXT NOT NULL, call_id TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY(peer,run_id,call_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_waits (task_id TEXT NOT NULL, run_id TEXT NOT NULL, kind TEXT NOT NULL, record_id TEXT NOT NULL, requested_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, settled_at INTEGER, PRIMARY KEY(task_id,run_id,kind,record_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_absences (task_id TEXT NOT NULL, run_id TEXT NOT NULL, peer TEXT NOT NULL, episode TEXT NOT NULL, absent_at INTEGER NOT NULL, reattached_at INTEGER, PRIMARY KEY(task_id,run_id,episode)) STRICT;
@@ -61,6 +62,13 @@ export class Tasks {
       CREATE TABLE IF NOT EXISTS task_dispatches (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, peer TEXT NOT NULL, command_json TEXT NOT NULL, predecessor_run_id TEXT, dispatched INTEGER NOT NULL DEFAULT 0) STRICT;
       CREATE TABLE IF NOT EXISTS task_slash_catalogs (peer TEXT PRIMARY KEY, commands_json TEXT NOT NULL) STRICT;
     `);
+    // Capability 76 was never released with the former task-only marker. Its rows cannot prove
+    // either a Run or a device, so preserving them would recreate the unsafe global suppression.
+    const replyPushColumns = db.prepare("PRAGMA table_info(task_reply_pushes)").all() as unknown as { name: string }[];
+    if (!replyPushColumns.some((column) => column.name === "run_id")) {
+      db.exec("DROP TABLE task_reply_pushes");
+      db.exec("CREATE TABLE task_reply_pushes (task_id TEXT NOT NULL REFERENCES tasks(task_id), run_id TEXT NOT NULL, device_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('scheduled', 'sent')), pushed_at INTEGER NOT NULL, PRIMARY KEY(task_id, run_id, device_id)) STRICT");
+    }
     // Legacy peers omitted deadlines. Preserve a first-seen bound across restart and replay.
     db.exec(`UPDATE bot_native_interactions SET expires_at = COALESCE((
       SELECT MIN(received_at) FROM attach_event_inbox WHERE disposition = 'accepted'
@@ -123,22 +131,43 @@ export class Tasks {
 
   clock(now: () => number): void { this.#clock = now; this.#bootAt = now(); }
 
-  /** The reply notifier resolves a session to the newest Run without assuming whether its Task
-   * has already reached a terminal projection. The terminal append queues its completion callback
-   * before the synchronous reply notifier returns, so filtering completed Tasks here races. */
-  replyPushTask(sessionId: string): string | undefined {
-    return (this.#db.prepare("SELECT task_id AS taskId FROM task_runs WHERE session_id = ? ORDER BY rowid DESC LIMIT 1").get(sessionId) as { taskId: string } | undefined)?.taskId;
+  /** A session can have retry Runs. Callers must supply the attach turn id so an old reply cannot
+   * be attributed to the newest Run for the same Task. */
+  replyPushTask(sessionId: string, runId: string | undefined): { taskId: string; runId: string } | undefined {
+    if (runId === undefined) return undefined;
+    return this.#db.prepare("SELECT task_id AS taskId, run_id AS runId FROM task_runs WHERE session_id = ? AND run_id = ?").get(sessionId, runId) as { taskId: string; runId: string } | undefined;
   }
 
-  /** Written before the fire-and-forget relay send is deferred, so a queued terminal callback in
-   * this process and a later process after restart both observe the same fact. */
-  noteReplyPush(taskId: string, at = this.#clock()): void {
-    this.#db.prepare("INSERT INTO task_reply_pushes (task_id, pushed_at) VALUES (?, ?) ON CONFLICT(task_id) DO UPDATE SET pushed_at = excluded.pushed_at").run(taskId, at);
+  /** Written before the deferred relay send. `scheduled` is deliberately not a durable reason to
+   * suppress after restart: it is a tiny recovery outbox until the relay accepts the reply. */
+  noteReplyPush(marker: ReplyPushMarker, at = this.#clock()): void {
+    this.#db.prepare("INSERT INTO task_reply_pushes VALUES (?, ?, ?, 'scheduled', ?) ON CONFLICT(task_id, run_id, device_id) DO UPDATE SET state = 'scheduled', pushed_at = excluded.pushed_at").run(marker.taskId, marker.runId, marker.deviceId, at);
   }
 
-  replyPushCollapses(taskId: string, at = this.#clock()): boolean {
-    const row = this.#db.prepare("SELECT pushed_at AS pushedAt FROM task_reply_pushes WHERE task_id = ?").get(taskId) as { pushedAt: number } | undefined;
-    return row !== undefined && at >= row.pushedAt && at - row.pushedAt < REPLY_PUSH_COLLAPSE_WINDOW_MS;
+  replyPushState(marker: ReplyPushMarker, at = this.#clock()): "scheduled" | "sent" | undefined {
+    const row = this.#db.prepare("SELECT state, pushed_at AS pushedAt FROM task_reply_pushes WHERE task_id = ? AND run_id = ? AND device_id = ?").get(marker.taskId, marker.runId, marker.deviceId) as { state: "scheduled" | "sent"; pushedAt: number } | undefined;
+    if (row === undefined || at < row.pushedAt) return undefined;
+    if (at - row.pushedAt < REPLY_PUSH_COLLAPSE_WINDOW_MS) return row.state;
+    // A delivered reply only matters for the bounded collapse window. Scheduled entries are an
+    // unsent recovery outbox and must survive until recovery explicitly resolves them.
+    if (row.state === "sent") this.clearReplyPush(marker);
+    return undefined;
+  }
+
+  markReplyPushSent(marker: ReplyPushMarker): void {
+    this.#db.prepare("UPDATE task_reply_pushes SET state = 'sent' WHERE task_id = ? AND run_id = ? AND device_id = ?").run(marker.taskId, marker.runId, marker.deviceId);
+  }
+
+  clearReplyPush(marker: ReplyPushMarker): void {
+    this.#db.prepare("DELETE FROM task_reply_pushes WHERE task_id = ? AND run_id = ? AND device_id = ?").run(marker.taskId, marker.runId, marker.deviceId);
+  }
+
+  /** A process may die between the synchronous marker and the deferred relay request. Only a
+   * completed current Run is recoverable; a retry never inherits an older Run's marker. */
+  replyPushRecoveries(limit = 100): Array<TaskCompletionNotice & { deviceId: string }> {
+    const rows = this.#db.prepare("SELECT p.task_id AS taskId, p.run_id AS runId, p.device_id AS deviceId, t.bot, t.session_id AS sessionId, t.room FROM task_reply_pushes p JOIN task_completion_notifications n ON n.task_id = p.task_id JOIN tasks t ON t.task_id = p.task_id WHERE p.state = 'scheduled' ORDER BY p.pushed_at LIMIT ?").all(limit) as unknown as Array<{ taskId: string; runId: string; deviceId: string; bot: string; sessionId: string; room: string | null }>;
+    return rows.filter((row) => this.#read(row.taskId)?.view.currentRun.runId === row.runId)
+      .map((row) => ({ taskId: row.taskId, runId: row.runId, deviceId: row.deviceId, bot: row.bot, sessionId: row.sessionId, ...(row.room === null ? {} : { room: row.room }) }));
   }
 
   read(taskId: string, cursor = 0, limit = 100): { view: TaskView; events: TaskEvent[]; nextCursor?: number } | undefined {
@@ -592,7 +621,7 @@ export class Tasks {
           const stored = this.#db.prepare("SELECT event_json AS json FROM task_events WHERE task_id = ? AND seq = ?").get(taskId, event.seq) as { json: string } | undefined;
           if (stored?.json !== JSON.stringify(event)) return;
           this.#observer?.({ type: "bot_task_updated", event, view });
-          if (announce) this.#completion?.({ taskId, bot: view.bot, sessionId: view.sessionId, ...(view.room === undefined ? {} : { room: view.room }) });
+          if (announce) this.#completion?.({ taskId, runId: view.currentRun.runId, bot: view.bot, sessionId: view.sessionId, ...(view.room === undefined ? {} : { room: view.room }) });
         } catch { /* Socket emission is best effort; the committed stream is the reconnect source. */ }
       });
     }

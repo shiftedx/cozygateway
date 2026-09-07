@@ -16,17 +16,17 @@ function decrypt(pushKey: string, wire: string): { kind?: string; threadId: stri
   return JSON.parse(plain.toString("utf8")) as { kind?: string; threadId: string; agentName: string; preview: string; taskId?: string };
 }
 
-function replyPushTracker(sessionTasks: Record<string, string>, now: () => number): ReplyPushTracker & { noted: string[] } {
-  const pushedAt = new Map<string, number>();
+function replyPushTracker(sessionTasks: Record<string, { taskId: string; runId: string }>, now: () => number): ReplyPushTracker & { noted: string[] } {
+  const pushedAt = new Map<string, { state: "scheduled" | "sent"; at: number }>();
   const noted: string[] = [];
+  const key = (marker: { taskId: string; runId: string; deviceId: string }) => `${marker.taskId}/${marker.runId}/${marker.deviceId}`;
   return {
     noted,
-    replyPushTask: (sessionId) => sessionTasks[sessionId],
-    noteReplyPush: (taskId) => { noted.push(taskId); pushedAt.set(taskId, now()); },
-    replyPushCollapses: (taskId) => {
-      const at = pushedAt.get(taskId);
-      return at !== undefined && now() >= at && now() - at < 10_000;
-    },
+    replyPushTask: (sessionId, runId) => runId === undefined || sessionTasks[sessionId]?.runId !== runId ? undefined : sessionTasks[sessionId],
+    noteReplyPush: (marker) => { noted.push(key(marker)); pushedAt.set(key(marker), { state: "scheduled", at: now() }); },
+    replyPushState: (marker) => { const entry = pushedAt.get(key(marker)); return entry !== undefined && now() >= entry.at && now() - entry.at < 10_000 ? entry.state : undefined; },
+    markReplyPushSent: (marker) => { const entry = pushedAt.get(key(marker)); if (entry !== undefined) entry.state = "sent"; },
+    clearReplyPush: (marker) => { pushedAt.delete(key(marker)); },
   };
 }
 
@@ -68,14 +68,14 @@ describe("RelayNotifier", () => {
       { deviceId: "d2", pushId: "p2", relayUrl: "http://relay.test", pushKey: "key-2" },
     ]);
     const { impl, sent } = fetchStub(() => 202);
-    const tracker = replyPushTracker({ thread: "task_9" }, () => 0);
+    const tracker = replyPushTracker({ thread: { taskId: "task_9", runId: "run_1" } }, () => 0);
     const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: () => {}, replyPushes: tracker });
 
-    notifier.notify({ threadId: "thread", agentName: "A", preview: "reply" }, new Set());
+    notifier.notify({ threadId: "thread", agentName: "A", preview: "reply", runId: "run_1" }, new Set());
     // This models Tasks.append's already-queued completion callback. The marker must exist before
     // the notifier's deferred relay request gets a chance to run.
-    notifier.notifyTaskCompletion({ kind: "task_completed", taskId: "task_9", threadId: "bot:a", agentId: "a" }, new Set());
-    expect(tracker.noted).toEqual(["task_9"]);
+    notifier.notifyTaskCompletion({ kind: "task_completed", taskId: "task_9", threadId: "bot:a", agentId: "a" }, new Set(), "run_1");
+    expect(tracker.noted).toEqual(["task_9/run_1/d1", "task_9/run_1/d2"]);
     await settle();
 
     expect(sent).toHaveLength(2);
@@ -90,16 +90,16 @@ describe("RelayNotifier", () => {
     const storage = seeded([{ deviceId: "d1", pushId: "p1", relayUrl: "http://relay.test", pushKey: "key-1" }]);
     const { impl, sent } = fetchStub(() => 202);
     let now = 0;
-    const tracker = replyPushTracker({ thread: "task_9", live: "task_live" }, () => now);
+    const tracker = replyPushTracker({ thread: { taskId: "task_9", runId: "run_1" }, live: { taskId: "task_live", runId: "run_live" } }, () => now);
     const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: () => {}, replyPushes: tracker });
 
-    notifier.notify({ threadId: "thread", agentName: "A", preview: "reply" }, new Set());
+    notifier.notify({ threadId: "thread", agentName: "A", preview: "reply", runId: "run_1" }, new Set());
     notifier.notifyTaskCompletion({ kind: "task_completed", taskId: "task_other", threadId: "bot:a", agentId: "a" }, new Set());
     now = 10_000;
-    notifier.notifyTaskCompletion({ kind: "task_completed", taskId: "task_9", threadId: "bot:a", agentId: "a" }, new Set());
-    notifier.notify({ threadId: "live", agentName: "A", preview: "live reply" }, new Set(["d1"]));
+    notifier.notifyTaskCompletion({ kind: "task_completed", taskId: "task_9", threadId: "bot:a", agentId: "a" }, new Set(), "run_1");
+    notifier.notify({ threadId: "live", agentName: "A", preview: "live reply", runId: "run_live" }, new Set(["d1"]));
     notifier.notifyTaskCompletion({ kind: "task_completed", taskId: "task_live", threadId: "bot:a", agentId: "a" }, new Set());
-    expect(tracker.noted).toEqual(["task_9"]);
+    expect(tracker.noted).toEqual(["task_9/run_1/d1"]);
     await settle();
 
     expect(sent).toHaveLength(4);
@@ -110,14 +110,57 @@ describe("RelayNotifier", () => {
   it("does not retract a completion that was already scheduled before its reply", async () => {
     const storage = seeded([{ deviceId: "d1", pushId: "p1", relayUrl: "http://relay.test", pushKey: "key-1" }]);
     const { impl, sent } = fetchStub(() => 202);
-    const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: () => {}, replyPushes: replyPushTracker({ thread: "task_9" }, () => 0) });
+    const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: () => {}, replyPushes: replyPushTracker({ thread: { taskId: "task_9", runId: "run_1" } }, () => 0) });
 
     notifier.notifyTaskCompletion({ kind: "task_completed", taskId: "task_9", threadId: "bot:a", agentId: "a" }, new Set());
-    notifier.notify({ threadId: "thread", agentName: "A", preview: "late reply" }, new Set());
+    notifier.notify({ threadId: "thread", agentName: "A", preview: "late reply", runId: "run_1" }, new Set());
     await settle();
 
     expect(sent).toHaveLength(2);
     expect(sent.map((entry) => decrypt("key-1", entry.body.ciphertext).kind).sort()).toEqual(["message", "task_completed"]);
+    storage.close();
+  });
+
+  it("suppresses only the exact reply-targeted device and Run", async () => {
+    const storage = seeded([
+      { deviceId: "d1", pushId: "p1", relayUrl: "http://relay.test", pushKey: "key-1" },
+      { deviceId: "d2", pushId: "p2", relayUrl: "http://relay.test", pushKey: "key-2" },
+    ]);
+    const { impl, sent } = fetchStub(() => 202);
+    const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: () => {}, replyPushes: replyPushTracker({ thread: { taskId: "task_9", runId: "new" } }, () => 0) });
+
+    // d2 was live for the reply, so it never gets a reply marker. When the Task settles it must
+    // still receive its completion. An old Run id does not resolve to this retry's Task Run.
+    notifier.notify({ threadId: "thread", agentName: "A", preview: "reply", runId: "new" }, new Set(["d2"]));
+    notifier.notifyTaskCompletion({ kind: "task_completed", taskId: "task_9", threadId: "bot:a", agentId: "a" }, new Set(), "new");
+    notifier.notifyTaskCompletion({ kind: "task_completed", taskId: "task_9", threadId: "bot:a", agentId: "a" }, new Set(), "old");
+    await settle();
+
+    expect(sent).toHaveLength(4);
+    expect(sent.map((entry) => [entry.body.pushId, decrypt(entry.body.pushId === "p1" ? "key-1" : "key-2", entry.body.ciphertext).kind])).toEqual([
+      ["p1", "message"], ["p2", "task_completed"], ["p1", "task_completed"], ["p2", "task_completed"],
+    ]);
+    storage.close();
+  });
+
+  it("falls back to the exact device completion when the deferred reply fails", async () => {
+    const storage = seeded([{ deviceId: "d1", pushId: "p1", relayUrl: "http://relay.test", pushKey: "key-1" }]);
+    const sent: Sent[] = [];
+    let attempt = 0;
+    const impl = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      sent.push({ url: "http://relay.test/notify", body: JSON.parse(String(init?.body)) as Sent["body"] });
+      attempt += 1;
+      if (attempt === 1) throw new Error("network down");
+      return new Response(null, { status: 202 });
+    }) as typeof fetch;
+    const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: () => {}, replyPushes: replyPushTracker({ thread: { taskId: "task_9", runId: "run_1" } }, () => 0) });
+
+    notifier.notify({ threadId: "thread", agentName: "A", preview: "reply", runId: "run_1" }, new Set());
+    notifier.notifyTaskCompletion({ kind: "task_completed", taskId: "task_9", threadId: "bot:a", agentId: "a" }, new Set(), "run_1");
+    await settle();
+
+    expect(sent).toHaveLength(2);
+    expect(decrypt("key-1", sent[1]!.body.ciphertext)).toMatchObject({ kind: "task_completed", taskId: "task_9" });
     storage.close();
   });
 

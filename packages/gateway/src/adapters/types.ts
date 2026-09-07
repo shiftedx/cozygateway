@@ -32,7 +32,9 @@ export type ApprovalDecision = "approve" | "deny";
  *  promise instead of calling onCommit/onDone. */
 export interface TurnHandlers {
   onDraft(update: { blocks: RichBlock[]; toolCalls: ToolCall[] }): void;
-  onCommit(final: { blocks: RichBlock[] }): void;
+  /** `runId` is the adapter's durable turn identity when it has one. Attach uses it to bind a
+   * reply push to exactly one Task Run; adapters without that identity omit it. */
+  onCommit(final: { blocks: RichBlock[]; runId?: string }): void;
   onDone(): void;
   /** OPTIONAL, and optional on purpose: `TurnHandlers` is public surface (it is exported from the
    *  package root), so an out-of-tree host that builds its own handlers object keeps compiling.
