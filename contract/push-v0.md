@@ -155,7 +155,7 @@ The same envelope carries every payload; only the plaintext differs.
 **`kind: "message"`** (an agent reply committed while the device had no live socket):
 
 ```json
-{ "kind": "message", "threadId": "string", "agentName": "string", "preview": "string" }
+{ "kind": "message", "threadId": "string", "agentName": "string", "preview": "string", "taskId": "string?" }
 ```
 
 The gateway truncates `preview` to at most 200 characters.
@@ -165,6 +165,11 @@ A receiver MUST treat an ABSENT `kind` as `"message"`: every gateway that shippe
 field emits exactly that payload without it. A gateway at this revision or later always sends
 `"kind": "message"` explicitly, so the discriminator is present in practice and "no kind" only
 ever means "older gateway".
+
+`taskId` is optional (capability 76). When present it identifies the Task for this reply's turn,
+so a client can open the Task directly. The gateway writes a durable marker before it defers the
+relay send and suppresses that Task's queued `task_completed` push for the next ten seconds. It
+does not suppress another Task, and it writes no marker when every registered device is live.
 
 **`kind: "mobile_node_wake"`** (a silent request for the selected idle phone to reconnect;
 category `mobile.status.wake`, collapse id `mobile.status`):

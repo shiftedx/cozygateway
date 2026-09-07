@@ -15,6 +15,9 @@ export interface MessagePushPayload {
   threadId: string;
   agentName: string;
   preview: string;
+  /** Capability 76. Optional for old clients; lets a reply banner open the settled Task without
+   * a second completion banner for the same turn. */
+  taskId?: string;
 }
 
 /** A tool call is waiting on a decision (contract/push-v0.md, category `approval.pending`).

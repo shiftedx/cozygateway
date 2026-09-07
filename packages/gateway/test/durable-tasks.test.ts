@@ -3,12 +3,89 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { MobileNodeBroker } from "../src/mobile-node.ts";
+import { REPLY_PUSH_COLLAPSE_WINDOW_MS } from "../src/tasks.ts";
 import { NativeBotDataPlane } from "../src/hermes-bridge/native-data-plane.ts";
 import type { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 import { openStorage } from "../src/storage.ts";
 
 describe("durable Tasks on actual attach storage admission", () => {
+  it("retains a sent reply marker across restart only for its exact Task Run and device", () => {
+    const root = join(process.cwd(), "../../benchmark-runs/f23-reply-push"); mkdirSync(root, { recursive: true });
+    const directory = mkdtempSync(join(root, "restart-")); const path = join(directory, "gateway.sqlite");
+    let now = 0;
+    let storage = openStorage(path); storage.tasks.clock(() => now);
+    try {
+      const sessionId = storage.nativeBotChat("sage", 1).sessionId;
+      const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "work" }, 2);
+      const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+      storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+      storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: sessionId, turnId: "run", messageId: "reply", blocks: [] } }, 4);
+
+      // Completion state is already durable when a quick reply is pushed, so the lookup must not
+      // filter terminal Tasks. Its marker must survive the process that writes it.
+      const marker = { taskId, runId: "run", deviceId: "d1" };
+      expect(storage.tasks.replyPushTask(sessionId, "run")).toEqual({ taskId, runId: "run" });
+      expect(storage.tasks.replyPushTask(sessionId, "other-run")).toBeUndefined();
+      storage.tasks.noteReplyPush(marker);
+      storage.tasks.markReplyPushSent(marker);
+      expect(storage.tasks.replyPushState(marker)).toBe("sent");
+      storage.close();
+
+      now = REPLY_PUSH_COLLAPSE_WINDOW_MS - 1;
+      storage = openStorage(path); storage.tasks.clock(() => now);
+      expect(storage.tasks.replyPushState(marker)).toBe("sent");
+      expect(storage.tasks.replyPushState({ ...marker, deviceId: "d2" })).toBeUndefined();
+      expect(storage.tasks.replyPushState({ ...marker, runId: "other-run" })).toBeUndefined();
+      now += 1;
+      expect(storage.tasks.replyPushState(marker)).toBeUndefined();
+    } finally { storage.close(); rmSync(directory, { recursive: true }); }
+  });
+
+  it("recovers only a scheduled reply for a completed current Run after restart", () => {
+    const root = join(process.cwd(), "../../benchmark-runs/f23-reply-push"); mkdirSync(root, { recursive: true });
+    const directory = mkdtempSync(join(root, "recovery-")); const path = join(directory, "gateway.sqlite");
+    let storage = openStorage(path);
+    try {
+      const sessionId = storage.nativeBotChat("sage", 1).sessionId;
+      const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "work" }, 2);
+      const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+      storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+      storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: sessionId, turnId: "run", messageId: "reply", blocks: [] } }, 4);
+      storage.tasks.noteReplyPush({ taskId, runId: "run", deviceId: "d1" });
+      storage.close();
+
+      storage = openStorage(path);
+      expect(storage.tasks.replyPushRecoveries()).toEqual([expect.objectContaining({ taskId, runId: "run", deviceId: "d1", bot: "sage", sessionId })]);
+    } finally { storage.close(); rmSync(directory, { recursive: true }); }
+  });
+
+  it("sweeps expired sent reply markers after restart without deleting scheduled recovery", () => {
+    const root = join(process.cwd(), "../../benchmark-runs/f23-reply-push"); mkdirSync(root, { recursive: true });
+    const directory = mkdtempSync(join(root, "expiry-")); const path = join(directory, "gateway.sqlite");
+    let now = 0;
+    let storage = openStorage(path); storage.tasks.clock(() => now);
+    try {
+      const sessionId = storage.nativeBotChat("sage", 1).sessionId;
+      const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "work" }, 2);
+      const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+      storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+      storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: sessionId, turnId: "run", messageId: "reply", blocks: [] } }, 4);
+      storage.tasks.noteReplyPush({ taskId, runId: "run", deviceId: "sent" });
+      storage.tasks.markReplyPushSent({ taskId, runId: "run", deviceId: "sent" });
+      storage.tasks.noteReplyPush({ taskId, runId: "run", deviceId: "scheduled" });
+      storage.close();
+
+      now = REPLY_PUSH_COLLAPSE_WINDOW_MS;
+      storage = openStorage(path); storage.tasks.clock(() => now);
+      storage.tasks.reconcile();
+      const db = new DatabaseSync(path);
+      expect(db.prepare("SELECT device_id AS deviceId, state FROM task_reply_pushes ORDER BY device_id").all())
+        .toEqual([{ deviceId: "scheduled", state: "scheduled" }]);
+      db.close();
+    } finally { storage.close(); rmSync(directory, { recursive: true }); }
+  });
+
   it("creates the Task with a direct turn, starts on ack and completes once on its final proof", () => {
     const storage = openStorage(":memory:");
     storage.tasks.clock(() => 0);

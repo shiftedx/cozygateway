@@ -22,6 +22,13 @@ release; everything older is marked pre-release so installers resolve one "lates
   state, adds wired and other radios, and accepts the app's Cloudflare edge round trip and validated
   colo code on both a receipt and websocket auth. This amends row 73 without a new capability version.
 
+- A fast bot reply and the completion of its same Task no longer raise two push banners
+  (`com.cozylabs.bots` capability 76, F23). A targeted reply push now carries its optional
+  `taskId`, resolved from the newest durable run for that session, and records a synchronous
+  durable marker before the relay send yields. The queued completion callback consults that marker
+  and skips only the same Task for ten seconds. The marker survives a gateway restart, is not
+  written when all registered devices are already live, and cannot suppress a different Task.
+
 - A group room's approval now carries its scoped-approval block, so a room ask can be answered
   with the same scoped decision a 1:1 chat gets (`com.cozylabs.bots` capability 66, F4). The room
   approval handler validated capability 56's `detail` and capability 62's `repair` and silently

@@ -62,7 +62,7 @@ export class AttachNativeSink {
     this.#deps.broadcast({ type: "done", threadId, turnId });
     const agent = this.#deps.storage.agentById(agentId);
     this.#deps.notifier.notify(
-      { threadId, agentName: agent?.name ?? agentId, preview: blocks.map((block) => "text" in block ? block.text : "code" in block ? block.code : "").filter(Boolean).join(" ").slice(0, 240) },
+      { threadId, agentName: agent?.name ?? agentId, preview: blocks.map((block) => "text" in block ? block.text : "code" in block ? block.code : "").filter(Boolean).join(" ").slice(0, 240), runId: turnId },
       this.#deps.connectedDeviceIds(),
     );
     return true;

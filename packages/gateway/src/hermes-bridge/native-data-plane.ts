@@ -143,6 +143,7 @@ export interface NativeBotDataPlaneOptions {
     displayName: string;
     messageId: string;
     chatSessionId: string;
+    turnId?: string;
     preview: string;
   }) => void;
   onApproval?: (event: {
@@ -2836,6 +2837,7 @@ export class NativeBotDataPlane {
       displayName: bot,
       messageId,
       chatSessionId: sessionId,
+      ...(turnId === undefined ? {} : { turnId }),
       preview: text.slice(0, 240),
     });
     return true;

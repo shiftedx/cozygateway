@@ -959,6 +959,7 @@ export async function startGateway(
   };
   const notifier = new RelayNotifier({
     storage,
+    replyPushes: storage.tasks,
     ...(config.pushRelayUrl === undefined
       ? {}
       : { relayBaseUrl: config.pushRelayUrl }),
@@ -1211,8 +1212,12 @@ export async function startGateway(
   // got the frame above and is excluded inside the notifier, and the announcement itself fires
   // only on the transition that wrote capability 64's completion notification record.
   storage.tasks.completions((notice) => {
-    notifier.notifyTaskCompletion(taskCompletionPayload(notice), hub.connectedDeviceIds());
+    notifier.notifyTaskCompletion(taskCompletionPayload(notice), hub.connectedDeviceIds(), notice.runId);
   });
+  // A process can stop after the synchronous reply marker but before its deferred relay request.
+  // Replay only those completed, exact Run/device markers; sent rows are already safe to collapse.
+  for (const notice of storage.tasks.replyPushRecoveries())
+    notifier.recoverTaskCompletion(taskCompletionPayload(notice), notice.runId, notice.deviceId);
   const app = createApp({
     observe,
     observePeerAttached: (bot) => [...attachTokens.values()].some((id) =>

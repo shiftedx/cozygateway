@@ -125,7 +125,7 @@ export function createAttachAdapter(deps: {
     }
     const settled = settle(turnId);
     if (settled === undefined) return;
-    settled.handlers.onCommit({ blocks: latest });
+    settled.handlers.onCommit({ blocks: latest, runId: turnId });
     settled.handlers.onDone();
     settled.resolve();
   };
