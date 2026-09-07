@@ -86,7 +86,7 @@ import { createHermesClient } from "./hermes-bridge/client.ts";
 import { DEFAULT_CHAT_SUGGESTION, parseHermesOptions } from "./hermes-bridge/config.ts";
 import { HermesBridge, type BotsSurface } from "./hermes-bridge/bridge.ts";
 import { FederatedBotControlSurface, endpointStorage } from "./hermes-bridge/federation.ts";
-import { GatewayRoomHost } from "./hermes-bridge/group-rooms.ts";
+import { GatewayRoomHost, type RoomHost } from "./hermes-bridge/group-rooms.ts";
 import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
 import { AttachChatConfigurationDriver, AttachConfigSurface } from "./hermes-bridge/bot-config.ts";
 import { GatewayChatConfiguration, type ChatConfigurationDriver } from "./chat-configuration.ts";
@@ -552,6 +552,12 @@ export async function startGateway(
     // Live, not a boot-time snapshot: a bot created from the app joins a room without a restart.
     // Evaluated per call, and the plane exists long before any room turn is dispatched.
     runtimeBotNames: () => nativeBotPlane?.runtimeBotNames() ?? bootRuntimeBotNames,
+    // F8. A room hosted by this endpoint on a federated gateway is created, addressed and answered
+    // in public `<endpoint>:<profile>` names, because the attach identity a member turn is
+    // dispatched to IS the public name. The prefix is what lets the endpoint's own membership and
+    // roster lookups find the profile behind one. Absent on the un-namespaced endpoint, where the
+    // two names are the same string and nothing changes.
+    ...(endpoint.namespace ? { roomMemberNamespace: endpoint.id! } : {}),
     // Spec section 4's `@user` escalation. The room's own state and frame already went out; this
     // is the leg that reaches a backgrounded phone. The thread id is namespaced `group:<name>`
     // rather than borrowed from a chat thread, so a client that does not know about rooms yet
@@ -567,13 +573,18 @@ export async function startGateway(
     });
     return { endpoint, client, bridge: member };
   });
-  // Capability 46 and 52, finding V1-F1. With no Hermes endpoint at all there is no bridge to own
-  // the gateway's rooms, and the federated surface refuses every group call as cross-endpoint. A
-  // room is a gateway-owned attach-v1 conversation, so the absence of an endpoint is not a reason
-  // to refuse one: this host owns the same rooms a bridge would, answering membership from the
-  // gateway's own runtime bots. Two or more endpoints keep the refusal, which is the case it was
-  // actually written for.
-  const roomHost = bridgeMembers.length === 0
+  // Capability 46 and 52, findings V1-F1 (R1) and F8. The gateway's OWN room host, built for every
+  // shape that goes through the federated control surface: no Hermes endpoint at all, or two or
+  // more, or one namespaced endpoint. A room is a gateway-owned attach-v1 conversation, so it owns
+  // the same rooms a bridge would, answering membership from the gateway's own runtime bots. It
+  // holds the rooms that resolve to NO endpoint (every member a runtime bot); a room whose members
+  // all live on one endpoint is hosted by that endpoint's own bridge, and only a room genuinely
+  // spanning two endpoints is still refused.
+  //
+  // The un-namespaced single-endpoint gateway does not build one: there the bridge itself is the
+  // control surface and owns every room, exactly as before.
+  const federated = bridgeMembers.length !== 1 || bridgeMembers[0]!.endpoint.namespace;
+  const roomHost = federated
     ? new GatewayRoomHost({
         storage,
         broadcast: (frame) => {
@@ -582,9 +593,10 @@ export async function startGateway(
         },
         now: () => Date.now(),
         runtimeBotNames: () => nativeBotPlane?.runtimeBotNames() ?? bootRuntimeBotNames,
-        // The overlay is the only roster a Hermes-free gateway has: there are no cached Hermes rows
-        // underneath it, so the base is empty by construction.
-        rosterBots: () => nativeBotPlane?.rosterBots([]) ?? [],
+        // The roster this host names its members from. With no Hermes endpoint the overlay is the
+        // whole roster: there are no cached Hermes rows underneath it, so the base is empty by
+        // construction. With endpoints, the federated view is the one that speaks public names.
+        rosterBots: () => federation?.roster().bots ?? nativeBotPlane?.rosterBots([]) ?? [],
         escalate: (event) => {
           raisePush({
             threadId: `group:${event.group}`,
@@ -594,7 +606,7 @@ export async function startGateway(
         },
       })
     : undefined;
-  const bridge = bridgeMembers.length === 1 && bridgeMembers[0]!.endpoint.namespace === false
+  const bridge = !federated
     ? bridgeMembers[0]!.bridge
     : (federation = new FederatedBotControlSurface(
         bridgeMembers.map(({ endpoint, bridge: member }) => ({ id: endpoint.id!, bridge: member })),
@@ -608,10 +620,28 @@ export async function startGateway(
           raiseLiveActivityFrame(presence);
         },
         roomHost,
+        // Ownership is resolved from the room's durable membership, once per room.
+        (key) => storage.botGroup(key)?.members,
       ));
-  // Whoever owns this gateway's rooms: the single un-namespaced bridge, or the Hermes-free host
-  // above. Undefined only for a genuinely federated gateway, where rooms stay refused.
-  const rooms = bridge instanceof HermesBridge ? bridge : roomHost;
+  // Every host that can drive a room on this gateway: each endpoint's bridge, plus the gateway's
+  // own host. On a single un-namespaced endpoint that is just the bridge, exactly as before.
+  const roomHosts: RoomHost[] = [
+    ...bridgeMembers.map(({ bridge: member }) => member),
+    ...(roomHost === undefined ? [] : [roomHost]),
+  ];
+  // Which of them owns a given room. The federated surface remembers the answer per room; a single
+  // un-namespaced bridge owns every room on the gateway.
+  const roomHostFor = (key: string): RoomHost | undefined =>
+    federation === undefined ? roomHosts[0] : federation.roomHostFor(key);
+  /** The host holding the room-member turn an attach event names, if any. Routing by room matters
+   *  on a federated gateway: the room rows are shared storage, so every host would recognize the
+   *  turn, and only the one actually driving that room has the waiter to wake. */
+  const roomHostForEvent = (agentId: string, frame: AttachV1EventFrame): RoomHost | undefined => {
+    const event = frame.event;
+    if (!("threadId" in event) || !("turnId" in event)) return undefined;
+    const owned = storage.botGroupTurnForAttach(agentId, event.threadId, event.turnId);
+    return owned === undefined ? undefined : roomHostFor(owned.key);
+  };
   // Every configured Hermes profile has one attach identity shared by the core thread surface and
   // Bot Mode. Token resolution fails closed before the listener opens.
   const nativeBotIds = [
@@ -678,7 +708,7 @@ export async function startGateway(
     events: {
       canAcceptEvent: (agentId, frame) => {
         if (storage.chatExecutionById(agentId)) return nativeBotPlane?.canAccept(agentId, frame) === true;
-        if (rooms?.canAcceptGroupAttachEvent(agentId, frame) === true) return true;
+        if (roomHostForEvent(agentId, frame)?.canAcceptGroupAttachEvent(agentId, frame) === true) return true;
         if (nativeBotPlane?.canAccept(agentId, frame)) return true;
         if (!("threadId" in frame.event))
           return (
@@ -758,7 +788,7 @@ export async function startGateway(
           }
           return false;
         }
-        if (rooms?.handleGroupAttachEvent(agentId, frame) === true) return true;
+        if (roomHostForEvent(agentId, frame)?.handleGroupAttachEvent(agentId, frame) === true) return true;
         if (router.onV1Event(agentId, frame)) return true;
         if (nativeBotPlane?.handle(agentId, frame)) return true;
         if (frame.event.kind === "media" || frame.event.kind === "presence")
@@ -851,7 +881,7 @@ export async function startGateway(
     sendApprovalResolution: (agentId, input) =>
       attachV1Ingress.sendApprovalResolution(agentId, input),
   };
-  rooms?.setGroupNativeTurns({
+  for (const host of roomHosts) host.setGroupNativeTurns({
     canQueue: (agentId) => attachV1Ingress.canQueue(agentId),
     sendNativeTurn: (agentId, input) =>
       attachV1Ingress.sendNativeTurn(agentId, input),
@@ -1002,7 +1032,7 @@ export async function startGateway(
   // Capability 51. A room member turn records ordinary interaction rows, so it borrows the plane's
   // own deadline wheel and turn-settlement rule rather than growing a second copy. Wired here, like
   // the room turn transport above, because the plane is assembled after the bridge that owns rooms.
-  rooms?.setGroupInteractionExpiry(nativePlane.groupInteractions());
+  for (const host of roomHosts) host.setGroupInteractionExpiry(nativePlane.groupInteractions());
   // Capability 49, multi-tenant since 52. The lane is always assembled now: a runner paired through
   // `POST /pair {kind: "runner"}` gets its token at runtime, long after this line ran, so a lane
   // built only for an operator-placed `COZYGATEWAY_RUNNER_TOKEN` would leave a freshly paired

@@ -405,6 +405,18 @@ export interface HermesBridgeOptions {
    *  the runtime set an equal source of that answer, which is also what lets a room made only of
    *  runtime bots run on a gateway whose Hermes is unreachable. */
   runtimeBotNames?: () => ReadonlySet<string>;
+  /** This endpoint's id when the gateway namespaces its bot names, i.e. the `<id>` in the
+   *  `<id>:<profile>` name every app-facing surface uses on a federated gateway (see
+   *  `publicProfileId`). Absent on the one un-namespaced endpoint, where a public bot name and a
+   *  Hermes profile id are the same string.
+   *
+   *  Rooms are the only thing that needs it. A room hosted here on a federated gateway is created,
+   *  addressed and answered in PUBLIC names, because the attach identity a member turn is
+   *  dispatched to is the public name (`publicProfileId` is what registers the token), while
+   *  `profiles.list` and this endpoint's roster cache only ever speak profile ids. Without the
+   *  prefix to strip, every membership check would answer "not a bot on this gateway" for a bot
+   *  the roster is visibly listing. */
+  roomMemberNamespace?: string;
   rosterPollMs?: number;
   routinesPollMs?: number;
   focusTtlMs?: number;
@@ -449,6 +461,7 @@ export class HermesBridge implements BotControlSurface {
   readonly #revokeAttachIdentity: (name: string) => boolean;
   readonly #onProfileChange: ((event: ProfileChangeEvent) => void) | undefined;
   readonly #runtimeBotNames: () => ReadonlySet<string>;
+  readonly #roomNamespace: string | undefined;
   readonly #chains = new Map<string, Promise<unknown>>();
   readonly #routineWatch = new Map<string, number>();
   readonly #lastRoutines = new Map<string, string>();
@@ -484,6 +497,7 @@ export class HermesBridge implements BotControlSurface {
     this.#revokeAttachIdentity = opts.revokeAttachIdentity ?? (() => false);
     this.#onProfileChange = opts.onProfileChange;
     this.#runtimeBotNames = opts.runtimeBotNames ?? ((): ReadonlySet<string> => EMPTY_NAMES);
+    this.#roomNamespace = opts.roomMemberNamespace?.trim().toLowerCase() || undefined;
     this.#log =
       opts.logSink ??
       ((line) => void process.stderr.write(`[hermes-bridge] ${line}\n`));
@@ -500,15 +514,23 @@ export class HermesBridge implements BotControlSurface {
         const runtime = this.#runtimeBotNames();
         const asked = names.filter((name) => !runtime.has(name));
         if (asked.length === 0) return [];
+        // A public name this endpoint cannot own is missing here without asking anyone: on a
+        // federated gateway it belongs to a different endpoint, and this room is not that room.
+        const local = new Map(asked.map((name) => [name, this.#localProfile(name)] as const));
+        const mine = asked.filter((name) => local.get(name) !== undefined);
+        const foreign = asked.filter((name) => local.get(name) === undefined);
+        if (mine.length === 0) return foreign;
         const known = await this.#freshProfileNames();
-        return asked.filter((name) => !known.has(name));
+        return [...foreign, ...mine.filter((name) => !known.has(local.get(name)!))];
       },
       memberKnown: (name) => {
         if (this.#runtimeBotNames().has(name)) return true;
+        const local = this.#localProfile(name);
+        if (local === undefined) return false;
         const bots = this.#storage.botRoster().bots;
         return bots.length === 0
           ? undefined
-          : bots.some((bot) => bot.name === name);
+          : bots.some((bot) => bot.name === local);
       },
       // Capability 51. Only a runtime member's room turn projects approvals, clarifications and
       // tool steps; a Hermes member's room turn keeps dropping them.
@@ -517,8 +539,10 @@ export class HermesBridge implements BotControlSurface {
         // Checked before the round trip for the same reason: `profiles.list` never names a runtime
         // bot, so asking it would answer `false` and retire a perfectly live member.
         if (this.#runtimeBotNames().has(name)) return true;
+        const local = this.#localProfile(name);
+        if (local === undefined) return false;
         try {
-          return (await this.#freshProfileNames()).has(name);
+          return (await this.#freshProfileNames()).has(local);
         } catch {
           return true;
         }
@@ -528,12 +552,24 @@ export class HermesBridge implements BotControlSurface {
         : { escalate: opts.onGroupEscalation }),
     });
   }
+  /** The Hermes profile id behind a PUBLIC room member name, or `undefined` when this endpoint
+   *  cannot own that name at all. Identity on the un-namespaced endpoint; the part after this
+   *  endpoint's prefix on a namespaced one, where a name carrying somebody else's prefix (or no
+   *  prefix, which is how a gateway runtime bot is named) is not a profile here. */
+  #localProfile(name: string): string | undefined {
+    if (this.#roomNamespace === undefined) return name;
+    const prefix = `${this.#roomNamespace}:`;
+    return name.startsWith(prefix) ? name.slice(prefix.length) : undefined;
+  }
   #memberInfo(name: string): GroupMember {
-    const row = this.#rosterRow(name);
+    const local = this.#localProfile(name) ?? name;
+    const row = this.#rosterRow(local);
     return {
       name,
-      handle: row?.handle ?? botHandle(name),
-      displayName: row?.displayName ?? botDisplayName(name, null),
+      // The handle is the address a client @-mentions, so on a namespaced endpoint it is the
+      // public name, not the profile id the roster cache stores its row under.
+      handle: this.#roomNamespace === undefined ? row?.handle ?? botHandle(name) : name,
+      displayName: row?.displayName ?? botDisplayName(local, null),
     };
   }
   /** The roster row a room member is named after. The cached Hermes rows answer for every
