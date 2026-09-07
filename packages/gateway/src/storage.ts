@@ -2079,6 +2079,14 @@ export class Storage {
     }
   }
 
+  /** A relay can finish creating a push id after its local conversation was deleted. */
+  queueLiveActivityRelayDeletion(pushId: string, queuedAt: number): void {
+    this.#db.prepare(
+      `INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+       VALUES (?, ?)`,
+    ).run(pushId, queuedAt);
+  }
+
   liveActivityRelayDeletions(limit: number): string[] {
     return (this.#db.prepare(
       `SELECT push_id AS pushId FROM live_activity_relay_deletion_outbox
