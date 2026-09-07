@@ -429,6 +429,40 @@ SH
   [ "$answer" = 'display.streaming=true streaming.edit_interval=0.05 streaming.buffer_threshold=1 ' ] \
     || fail "stdlib probe on a key with no value answered: $answer"
 
+  # F16 ruling 2. The cadence knobs are TOP-LEVEL: Hermes has no per-platform
+  # override for them, so seeding them on a profile that also runs Telegram or
+  # Discord speeds those bots' edits into their own flood limits. A profile that
+  # serves anything else keeps its cadence and says so; the per-platform display
+  # switches are unaffected. Answered from the env token Hermes itself gates on,
+  # and from a platform plugin sitting in the profile.
+  mkdir -p "$dir/shared-env" "$dir/shared-plugin/plugins/telegramish" "$dir/shared-decided/plugins/telegramish"
+  printf 'plugins:\n  enabled:\n    - cozygateway\n' > "$dir/shared-env/config.yaml"
+  printf 'COZYGATEWAY_TOKEN=x\nTELEGRAM_BOT_TOKEN=abc123\n' > "$dir/shared-env/.env"
+  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\n' \
+    > "$dir/shared-plugin/config.yaml"
+  printf 'name: telegramish\nkind: platform\n' > "$dir/shared-plugin/plugins/telegramish/plugin.yaml"
+  # An empty token assigns nothing, so it is not another platform.
+  mkdir -p "$dir/shared-empty-token"
+  printf 'plugins:\n  enabled:\n    - cozygateway\n' > "$dir/shared-empty-token/config.yaml"
+  printf 'TELEGRAM_BOT_TOKEN=\n' > "$dir/shared-empty-token/.env"
+  # Cadence already decided beside another platform: nothing to say and nothing
+  # to write, so no note either.
+  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  edit_interval: 2.0\n  buffer_threshold: 200\n' \
+    > "$dir/shared-decided/config.yaml"
+  printf 'name: telegramish\nkind: platform\n' > "$dir/shared-decided/plugins/telegramish/plugin.yaml"
+
+  answer="$(read_with "$TMP/python3-nosite" "$dir/shared-env" | tr '\n' ' ')"
+  [ "$answer" = '!another-chat-platform:TELEGRAM_BOT_TOKEN display.streaming=true display.platforms.cozygateway.streaming=true ' ] \
+    || fail "reader beside a Telegram token answered: $answer"
+  answer="$(read_with "$TMP/python3-nosite" "$dir/shared-plugin" | tr '\n' ' ')"
+  [ "$answer" = '!another-chat-platform:telegramish ' ] \
+    || fail "reader beside a platform plugin answered: $answer"
+  answer="$(read_with "$TMP/python3-nosite" "$dir/shared-empty-token" | tr '\n' ' ')"
+  [ "$answer" = 'display.streaming=true display.platforms.cozygateway.streaming=true streaming.edit_interval=0.05 streaming.buffer_threshold=1 ' ] \
+    || fail "reader treated an unset Telegram token as another platform: $answer"
+  answer="$(read_with "$TMP/python3-nosite" "$dir/shared-decided" | tr '\n' ' ')"
+  [ -z "$answer" ] || fail "reader said something about a profile with nothing to repair: $answer"
+
   answer="$(read_with "$TMP/python3-nosite" "$dir/cadence-absent" | tr '\n' ' ')"
   [ "$answer" = 'streaming.edit_interval=0.05 streaming.buffer_threshold=1 ' ] \
     || fail "stdlib probe on a streaming-but-slow profile answered: $answer"
@@ -467,7 +501,8 @@ SH
   fi
   local case_dir
   for case_dir in mute both off telegram-only nested-block nested-block-top null-value \
-    tagged-display tagged-platform tagged-scalar cadence-absent cadence-tuned cadence-partial; do
+    tagged-display tagged-platform tagged-scalar cadence-absent cadence-tuned cadence-partial \
+    shared-env shared-plugin shared-empty-token shared-decided; do
     [ "$(read_with "$YAML_PYTHON" "$dir/$case_dir" | tr '\n' ' ')" \
       = "$(read_with "$TMP/python3-nosite" "$dir/$case_dir" | tr '\n' ' ')" ] \
       || fail "the two readers disagree on $case_dir"
@@ -645,6 +680,49 @@ YAML
   [ "$restarts" = 1 ] || fail "expected no further restart on the second sweep, got $restarts"
 }
 
+# F16 ruling 2, at the sweep. Streaming still gets turned ON for a profile that
+# also serves Telegram; only the profile-wide cadence is left alone, and the
+# profile is not swept again for it.
+test_provisioner_leaves_cadence_alone_beside_another_platform() {
+  local hermes="$TMP/shared-hermes" bin="$TMP/shared-bin" launch_log="$TMP/shared-launchctl" hermes_log="$TMP/shared-hermes-calls" output="$TMP/shared.out"
+  make_fake_bin "$bin"
+  make_profile "$hermes" shared-bot
+  make_mute_config "$hermes/profiles/shared-bot"
+  make_fake_python "$hermes" ''
+  mkdir -p "$hermes/profiles/shared-bot/plugins"
+  cp -R "$ROOT/integrations/attach-plugin" "$hermes/profiles/shared-bot/plugins/cozygateway"
+  printf 'COZYGATEWAY_TOKEN=test-token\nCOZYGATEWAY_SPOOL_PATH=%s\nTELEGRAM_BOT_TOKEN=abc123\n' \
+    "$hermes/profiles/shared-bot/plugin-data/cozygateway/attach-v1.sqlite" \
+    > "$hermes/profiles/shared-bot/.env"
+
+  HOME="$TMP/shared-home" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/shared-ssh" \
+    COZY_TEST_HERMES_LOG="$hermes_log" \
+    "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake shared-bot > "$output" 2>&1
+
+  assert_contains "$hermes_log" '-p shared-bot config set display.streaming true'
+  assert_contains "$output" 'profile also serves TELEGRAM_BOT_TOKEN'
+  if grep -q 'config set streaming' "$hermes_log"; then
+    fail 'provisioner tightened a profile-wide cadence on a profile serving another platform'
+  fi
+  # And a left-alone cadence must never read as pending work: the display keys
+  # landed, so a second sweep writes nothing and restarts nothing.
+  : > "$hermes_log"
+  local restarts_before
+  restarts_before="$(grep -c 'kickstart -k gui/' "$launch_log" || true)"
+  HOME="$TMP/shared-home" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/shared-ssh" \
+    COZY_TEST_HERMES_LOG="$hermes_log" \
+    "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake shared-bot >/dev/null 2>&1
+  if grep -q 'config set' "$hermes_log"; then
+    fail 'provisioner wrote streaming settings a second time on a shared profile'
+  fi
+  [ "$(grep -c 'kickstart -k gui/' "$launch_log" || true)" = "$restarts_before" ] \
+    || fail 'provisioner restarted a shared profile again for a cadence it will never write'
+}
+
 test_provisioner_leaves_streaming_turned_off_on_purpose() {
   local hermes="$TMP/stream-off-hermes" bin="$TMP/stream-off-bin" launch_log="$TMP/stream-off-launchctl" hermes_log="$TMP/stream-off-hermes-calls"
   make_fake_bin "$bin"
@@ -688,6 +766,7 @@ test_streaming_reader_answers_without_pyyaml
 test_watcher_picks_up_a_wired_profile_that_cannot_stream
 test_provisioner_turns_streaming_on_and_restarts_once
 test_provisioner_repairs_cadence_on_an_already_streaming_profile_once
+test_provisioner_leaves_cadence_alone_beside_another_platform
 test_provisioner_leaves_streaming_turned_off_on_purpose
 test_provisioner_does_not_restart_when_the_write_did_not_land
 test_provisioner_keeps_sweeping_when_a_write_fails

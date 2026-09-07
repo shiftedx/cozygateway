@@ -321,8 +321,87 @@ def absent_without_yaml(text):
     ]
 
 
+# Never nerf Hermes. `streaming.edit_interval` and `streaming.buffer_threshold`
+# are TOP-LEVEL keys: Hermes has no per-platform override for either one and no
+# adapter seam for them, so tightening them on a profile that also runs Telegram
+# or Discord pushes those bots' edits at the same rate and straight into their
+# flood limits. A profile that serves anything but cozygateway therefore keeps
+# the cadence its operator has, and is told so. The two `display` switches are
+# unaffected: those ARE per-platform and only ever turn cozygateway on.
+#
+# "Serves anything but cozygateway" is answered two ways, both stdlib and both
+# identical with or without PyYAML so the two reader modes cannot disagree here:
+#
+#   * one of Hermes' first-party platform tokens is set in the profile's `.env`
+#     or the Hermes home's `.env`. `_PLATFORM_ENABLE_ENV_VARS` in
+#     hermes_cli/tools_config.py is that list, and env is where Hermes decides
+#     this, not config.yaml.
+#   * a plugin directory in the profile declares `kind: platform` and is not
+#     this one. Deliberately NOT filtered by `plugins.enabled`: a platform
+#     plugin sitting in the profile is enough to leave an operator's cadence
+#     alone, and reading the enabled list would need a YAML sequence parse the
+#     two modes could answer differently.
+#
+# Unsure reads as "another platform", which is the direction that writes nothing.
+PLATFORM_ENV_VARS = (
+    "TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN",
+    "WHATSAPP_ENABLED", "QQ_APP_ID",
+)
+CADENCE_PREFIX = "streaming."
+
+
+def env_names(path):
+    """Names assigned a non-empty value in a dotenv file; empty when unreadable."""
+    names = set()
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return names
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        if value.strip().strip("\"'"):
+            names.add(name.strip().removeprefix("export").strip())
+    return names
+
+
+def other_chat_platform(profile_dir):
+    """Name of another chat platform this profile serves, or "" when only this one."""
+    homes = [profile_dir]
+    if profile_dir.parent.name == "profiles":
+        homes.append(profile_dir.parent.parent)
+    assigned = set()
+    for home in homes:
+        assigned |= env_names(home / ".env")
+    for name in PLATFORM_ENV_VARS:
+        if name in assigned:
+            return name
+    try:
+        entries = sorted(
+            entry for entry in (profile_dir / "plugins").iterdir() if entry.is_dir())
+    except Exception:
+        entries = []
+    for entry in entries:
+        if entry.name == "cozygateway":
+            continue
+        try:
+            manifest = (entry / "plugin.yaml").read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for raw in manifest.splitlines():
+            line = raw.strip()
+            if not line.startswith("kind:"):
+                continue
+            if line.split(":", 1)[1].strip().strip("\"'") == "platform":
+                return entry.name
+    return ""
+
+
 def main():
-    path = Path(sys.argv[2]) / "config.yaml"
+    profile_dir = Path(sys.argv[2])
+    path = profile_dir / "config.yaml"
     try:
         text = path.read_text(encoding="utf-8")
     except Exception:
@@ -340,6 +419,13 @@ def main():
             absent = absent_with_yaml(text, yaml)
         except Exception:
             sys.exit(1)
+    if any(entry.startswith(CADENCE_PREFIX) for entry in absent):
+        other = other_chat_platform(profile_dir)
+        if other:
+            # A leading "!" marks a line the caller SAYS; it is never a key to write.
+            absent = ["!another-chat-platform:" + other] + [
+                entry for entry in absent if not entry.startswith(CADENCE_PREFIX)
+            ]
     # Written as BYTES on purpose. A Windows interpreter translates "\n" into
     # CRLF on a text stream, and the caller would then carry a "\r" inside every
     # key name it went on to write.
@@ -432,14 +518,27 @@ EOF
 # Set for the immediately following ensure_service call: Hermes reads config.yaml
 # at gateway start, so a repaired profile streams only after one restart.
 STREAMING_CONFIG_CHANGED=0
+# A "!" line from the reader is a note to say, not a key to write. Both reads
+# below drop them, so a profile that keeps its own cadence is not mistaken for a
+# write that failed to land.
+streaming_notes() { printf '%s\n' "$1" | grep '^!' || true; }
+streaming_writes() { printf '%s\n' "$1" | grep -v '^!' || true; }
 ensure_streaming_config() {
-  local profile="$1" dir="$2" keys entry key value rc=0
+  local profile="$1" dir="$2" answer keys note entry key value rc=0
   STREAMING_CONFIG_CHANGED=0
-  keys="$(streaming_keys_absent "$dir")" || rc=$?
+  answer="$(streaming_keys_absent "$dir")" || rc=$?
   if [ "$rc" != 0 ]; then
     warn "[$profile] could not read config.yaml, leaving streaming settings alone"
     return 0
   fi
+  for note in $(streaming_notes "$answer"); do
+    case "$note" in
+      '!another-chat-platform:'*)
+        say "  profile also serves ${note#!another-chat-platform:}; leaving the streaming cadence as the operator set it (edit interval and buffer threshold are profile-wide, not per platform)" ;;
+      *) say "  ${note#!}" ;;
+    esac
+  done
+  keys="$(streaming_writes "$answer")"
   if [ -z "$keys" ]; then say "  streaming already decided in config.yaml"; return 0; fi
   # Each line the reader printed is a key and the value to write for it, so a
   # cadence knob is seeded with its own number rather than a bare true.
@@ -460,7 +559,8 @@ ensure_streaming_config() {
   # a package-managed install (`is_managed()`), and trusting the exit code there
   # would kickstart this profile on every 30 second tick forever.
   rc=0
-  keys="$(streaming_keys_absent "$dir")" || rc=$?
+  answer="$(streaming_keys_absent "$dir")" || rc=$?
+  keys="$(streaming_writes "$answer")"
   if [ "$rc" != 0 ] || [ -n "$keys" ]; then
     warn "[$profile] hermes reported success but ${keys//$'\n'/ } is still absent; leaving streaming off and not restarting"
     return 0

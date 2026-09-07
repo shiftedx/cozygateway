@@ -86,6 +86,26 @@ Dependencies: Python 3.10+ and the `websockets` package.
 - Tool use streams as chips (`running`, then `ok` or `error` with a short detail
   preview) when the harness exposes tool-lifecycle hooks; without them the plugin still
   streams text and simply omits chips.
+- Streaming cadence is Hermes' own draft transport. How often a draft is pushed is the
+  profile's `streaming.edit_interval` and `streaming.buffer_threshold` (top-level keys read
+  by `StreamingConfig.from_dict`); the installer and the provisioner seed `0.05` and `1`
+  so an in-flight reply reaches the app at the stream consumer's own tick instead of
+  Telegram's one-edit-a-second envelope. Those two keys are profile-wide with no
+  per-platform override, so they are seeded ONLY when cozygateway is the one chat platform
+  the profile serves; a profile that also carries a Telegram, Discord, Slack, WhatsApp or
+  QQ token, or another `kind: platform` plugin, keeps whatever cadence its operator set and
+  is told so. The per-platform `display.streaming` switches are seeded either way.
+- The plugin also declares Hermes' native streaming transport
+  (`SUPPORTS_NATIVE_STREAMING`, `supports_native_streaming`, `send_stream_frame`), which
+  pushes every delta with no edit-rate gate at all. **It is off unless
+  `COZYGATEWAY_NATIVE_STREAMING` is set, and it must not be turned on for anyone before a
+  live approval and clarify soak (packet F16b).** On that transport Hermes owns delivery
+  end to end and `_finalize_boundary_stream` closes the stream BEFORE an approval or
+  clarify prompt with the identical `send_stream_frame(..., finalize=True)` it uses for the
+  turn-final one. This platform cannot tell those apart, and a finalize here commits and
+  seals the turn, so a wrong default would seal turns that are about to ask a person a
+  question. The wire is unchanged either way: interim frames are the same drafts and a
+  finalize frame goes through the ordinary terminal send.
 - A turn ends with `done` (the gateway seals the latest draft as the durable reply) or
   `failed` (the gateway records a failed turn the client can retry).
 - The plugin journals events and accepted commands before sending/ACKing, replays after reconnect,

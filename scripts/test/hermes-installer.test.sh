@@ -496,6 +496,21 @@ if grep -Fq 'set display.streaming to true for Hermes profile ops' <<<"$cadence_
   exit 1
 fi
 expect_contains "$cadence_profile_output" 'streaming is already decided in config.yaml for Hermes profile active'
+
+# F16 ruling 2. The cadence knobs are TOP-LEVEL: Hermes has no per-platform
+# override for them, so seeding them on a profile that also runs Telegram would
+# push that bot's edits into its own flood limits. Streaming is still turned ON;
+# only the profile-wide cadence is left as the operator has it, and it says so.
+printf 'model: test/model\n' > "$tmp/hermes/profiles/ops/config.yaml"
+printf 'TELEGRAM_BOT_TOKEN=abc123\n' > "$tmp/hermes/profiles/ops/.env"
+shared_profile_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --profiles all --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-scoped" 2>&1)"
+expect_contains "$shared_profile_output" 'set display.streaming to true for Hermes profile ops'
+expect_contains "$shared_profile_output" 'also serves TELEGRAM_BOT_TOKEN, so its streaming cadence was left as the operator set it'
+if grep -Fq 'set streaming.edit_interval' <<<"$shared_profile_output"; then
+  echo 'installer tightened a profile-wide cadence on a profile serving another platform' >&2
+  exit 1
+fi
+rm -f "$tmp/hermes/profiles/ops/.env"
 cp "$tmp/hermes/config.yaml" "$tmp/hermes/profiles/ops/config.yaml"
 printf 'profiles=../unsafe\n' > "$tmp/gateway-scoped/local/install-state"
 if malformed_scope_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-scoped" 2>&1)"; then

@@ -23,11 +23,16 @@ release; everything older is marked pre-release so installers resolve one "lates
   `streaming.edit_interval: 0.05` and `streaming.buffer_threshold: 1` alongside the two `display`
   streaming switches, and repair a profile that carries the switches but not the cadence. Hermes'
   own defaults there are 0.8 seconds and 24 codepoints, which held the head of every reply back
-  and is the debounce a phone sees as a stalled bubble. The shared reader now answers `key=value`
+  and is the debounce a phone sees as a stalled bubble. Those two keys are profile-wide with no
+  per-platform override, so they are seeded only when cozygateway is the one chat platform the
+  profile serves: a profile carrying a Telegram, Discord, Slack, WhatsApp or QQ token, or another
+  `kind: platform` plugin, keeps the cadence its operator set and is told so, while the
+  per-platform `display` switches are seeded either way. The shared reader now answers `key=value`
   per line so each key is written with its own value, and it still writes nothing where it cannot
   judge a config file. The attach plugin also declares Hermes' native-streaming extension point
   (`SUPPORTS_NATIVE_STREAMING`, `supports_native_streaming`, `send_stream_frame`), off unless
-  `COZYGATEWAY_NATIVE_STREAMING` asks for it: interim frames are the same drafts, a finalize frame
+  `COZYGATEWAY_NATIVE_STREAMING` asks for it and not to be turned on before a live approval and
+  clarify soak: interim frames are the same drafts, a finalize frame
   goes through the existing terminal send, and the wire the app reads is unchanged
   (`bot_chat_delta`). No Hermes source is changed by any of it.
 
