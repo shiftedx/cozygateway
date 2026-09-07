@@ -12,6 +12,10 @@ release; everything older is marked pre-release so installers resolve one "lates
   list-price sheet and local zero rates can be overridden in `observability.prices`. Unknown
   capability names on attach hello are ignored so additive lanes can negotiate safely.
 
+- Add the paired observer read API and bounded live subscriptions (capability 75). Dashboard
+  responses report sample counts and content-free updates; observers never receive chat text,
+  task goals or roster previews. Existing write-scoped app connections keep their frames.
+
 - A group room's approval now carries its scoped-approval block, so a room ask can be answered
   with the same scoped decision a 1:1 chat gets (`com.cozylabs.bots` capability 66, F4). The room
   approval handler validated capability 56's `detail` and capability 62's `repair` and silently

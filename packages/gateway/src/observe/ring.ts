@@ -1,3 +1,4 @@
+import type { ObserveSampleFrame, ObserveEventFrame } from "cozygateway-contract";
 import { performance } from "node:perf_hooks";
 
 import type { ObserveStore, ObserveSummary } from "./store.ts";
@@ -120,6 +121,11 @@ export class ObservationRing {
   readonly #turns = new Map<string, TurnTiming>();
   readonly #peerHeartbeats = new Map<string, number>();
   readonly #folded = new Set<string>();
+  #emitter: ((frame: ObserveSampleFrame | ObserveEventFrame) => void) | undefined;
+
+  bindEmitter(sink: ((frame: ObserveSampleFrame | ObserveEventFrame) => void) | undefined): void {
+    this.#emitter = sink;
+  }
 
   constructor(deps: {
     store: ObserveStore;
@@ -157,23 +163,22 @@ export class ObservationRing {
 
   sample(series: ObserveSeries, subject: string | null, value: number, tag?: ObserveSeriesTag): void {
     if (!this.#enabled) return;
-    this.#store.sample(
-      seriesName(series, tag),
-      subject === null ? null : this.#store.identify(subject),
-      this.#now(),
-      value,
-    );
+    const frame: ObserveSampleFrame = {
+      type: "observe_sample", series: seriesName(series, tag),
+      bot: subject === null ? null : this.identify(subject), at: Math.trunc(this.#now()), value,
+    };
+    if (this.#store.sample(frame.series, frame.bot, frame.at, value)) this.#emitter?.(frame);
   }
 
   event(kind: ObserveEventKind, subject: string | null, ref: string | null, detail?: ObserveDetail): void {
     if (!this.#enabled) return;
-    this.#store.event(
-      kind,
-      this.#now(),
-      subject === null ? null : this.#store.identify(subject),
-      ref === null ? null : this.#store.identify(ref),
-      detail,
-    );
+    const frame: ObserveEventFrame = {
+      type: "observe_event", kind, at: Math.trunc(this.#now()),
+      bot: subject === null ? null : this.identify(subject),
+      ref: ref === null ? null : this.identify(ref),
+      ...(detail === undefined ? {} : { detail: { ...detail } }),
+    };
+    if (this.#store.event(kind, frame.at, frame.bot, frame.ref, detail)) this.#emitter?.(frame);
   }
 
   // hop writers

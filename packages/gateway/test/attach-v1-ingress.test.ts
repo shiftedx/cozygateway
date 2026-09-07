@@ -153,7 +153,7 @@ describe("attach-v1 ingress", () => {
   it("ignores unknown hello capabilities while granting supported ones", async () => {
     const { ws, frames } = await dial(undefined, ["draft", "future.capability", "observation_snapshot"]);
     const ack = frames.find(frame => frame.kind === "hello_ack");
-    expect(ack).toMatchObject({ capabilities: ["draft", "observation_snapshot"], extensions: { [BOTS_CAPABILITY_ID]: 74 } });
+    expect(ack).toMatchObject({ capabilities: ["draft", "observation_snapshot"], extensions: { [BOTS_CAPABILITY_ID]: 75 } });
     expect(ws.readyState).toBe(WebSocket.OPEN);
     ws.close();
   });

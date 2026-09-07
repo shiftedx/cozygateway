@@ -1,3 +1,4 @@
+import { observeRoutes } from "./observe/routes.ts";
 import { registerArtifactRoutes } from "./artifact-routes.ts";
 import { registerTaskRoutes } from "./task-routes.ts";
 import { createHash, randomUUID } from "node:crypto";
@@ -133,6 +134,8 @@ import type { AttachV1MediaDescriptor } from "./adapters/attach/protocol-v1.ts";
 import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 import type { MobileNodeMediaDescriptor } from "./mobile-node.ts";
 import { PAIR_REQUEST_MAX_BYTES, PairingAdmission, readPairBody, type PairingAttemptLimiter } from "./pairing-admission.ts";
+import type { ObservationRing } from "./observe/ring.ts";
+import type { ObserveSnapshotReader } from "./observe/routes.ts";
 
 const LIVE_ACTIVITY_DELETION_DRAIN_LIMIT = 50;
 // The relay is private-network adjacent and its ordinary request deadline is ten seconds. A
@@ -266,6 +269,11 @@ export interface AppDeps {
   hermesGlobalSkillsLog?: (line: string) => void;
   /** Synchronous, aggregate attach-v1 state for operator health routes only. */
   attachHealth?: () => AttachHealthSummary;
+  observeBotForPeer?: (id: string) => string;
+  observeAttachPeers?: () => Array<{ bot: string; peerId: string; online: number; degraded: number; absent: number;
+    queueDepth: number; deadLetters: number; lastContactAt: number | null; pluginOutboxDepth: number | null;
+    pluginOldestEventAgeMs: number | null; pluginLastAckProgressAt: number | null; pluginAckCursor: number | null; pluginCommandInboxDepth: number | null }>;
+
   /** Separate attach-v1 app-action lane; it never injects hidden chat content. */
   sendCozyAppAction?: (action: { id: string; appId: string; creatorBot: string; actionId: string }, deviceId: string) => boolean;
   cozyAppsChanged?: () => void;
@@ -324,6 +332,14 @@ export interface AppDeps {
   /** Capability 52. True when this gateway has no Hermes endpoint at all, which makes the bridge
    *  `absent` on `/health` and `/ready` rather than an offline bridge to alarm on. */
   hermesBridgeAbsent?: boolean;
+  /** Dashboard packet D3 (capability 75). The observation ring the `/observe/api/*` read routes
+   *  answer from. Absent leaves the whole group unregistered, which is the honest answer for a
+   *  gateway with observability off. */
+  observe?: ObservationRing;
+  /** Dashboard packet D3, THE D5 SEAM. Absent makes the CozyAgents panels answer
+   *  `{ available: false, reason: "no_snapshot_lane" }` rather than 404. */
+  observeSnapshots?: ObserveSnapshotReader;
+  observePeerAttached?: (bot: string) => boolean;
   now: () => number;
 }
 
@@ -479,6 +495,12 @@ export function createApp(deps: AppDeps): Hono<Env> {
     // remember it and none of them can forget it.
     await next();
   });
+
+  if (deps.observe?.enabled === true) {
+    for (const route of observeRoutes({ ...deps, observe: deps.observe }).routes) {
+      app.get(route.path, requireDevice, route.handler);
+    }
+  }
 
   const requireAttach = createMiddleware<Env>(async (c, next) => {
     const agentId =

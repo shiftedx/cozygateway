@@ -596,6 +596,11 @@ export class AttachV1Ingress implements TurnEndpoint {
       absent: Math.max(0, agentIds.size - online - degraded),
     };
   }
+  peerHealth(agentId: string) {
+    const connection = this.#current.get(agentId);
+    return { ...this.connectionHealth(new Set([agentId])), ...this.#storage.attachPeerHealth(agentId),
+      lastContactAt: connection?.lastSeenAt ?? null };
+  }
   health(): AttachHealthSummary {
     const durable = this.#storage.attachHealth();
     return {
