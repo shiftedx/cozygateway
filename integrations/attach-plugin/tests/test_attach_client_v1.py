@@ -721,6 +721,37 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await request, {"status": "ok", "result": GATEWAY_STATUS})
         await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": frame["requestId"], "status": "denied"}))
 
+    async def test_a_phone_capability_request_can_target_a_selected_device(self):
+        """Capability 70. The harness may name the phone the person meant; the gateway resolves it
+        against the paired devices and falls back on its own when it is absent."""
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        request = __import__("asyncio").create_task(
+            self.client.request_device_status("thread", "turn", "Report phone readiness", target_device_id="phone-b"),
+        )
+        await __import__("asyncio").sleep(0)
+        frame = self.socket.sent[-1]
+        self.assertEqual(frame["kind"], "mobile_request")
+        self.assertEqual(frame["targetDeviceId"], "phone-b")
+        await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": frame["requestId"], "status": "denied"}))
+        self.assertEqual(await request, {"status": "denied"})
+
+    async def test_a_request_with_no_selection_is_the_pre_row_frame_byte_for_byte(self):
+        """Additive: omitting the hint, and passing one that is not a usable id, both send the
+        frame this plugin sent before row 70, so no peer or gateway behavior changes."""
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        for selection in (None, "", "   ", "x" * 300, 7):
+            with self.subTest(selection=selection):
+                request = __import__("asyncio").create_task(
+                    self.client.request_device_status("thread", "turn", "Report phone readiness", target_device_id=selection),
+                )
+                await __import__("asyncio").sleep(0)
+                frame = self.socket.sent[-1]
+                self.assertNotIn("targetDeviceId", frame)
+                request.cancel()
+                self.assertEqual(await request, {"status": "cancelled"})
+
     async def test_mobile_deadline_fits_gateway_budget_with_subsecond_clock_lead(self):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node", "mobile_location", "mobile_media"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))

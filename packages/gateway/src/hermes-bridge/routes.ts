@@ -6,6 +6,8 @@ import {
   BotCreateRequestSchema,
   BotChatAttachmentFieldsSchema,
   BotClarifyResolveRequestSchema,
+  BotComposerDraftRequestSchema,
+  BotMobilePreferredDeviceRequestSchema,
   BotApprovalDecisionRequestSchema,
   type BotApprovalDecisionRequest,
   BotChatDisplayedRequestSchema,
@@ -930,6 +932,84 @@ export function registerBotRoutes(
     if (sessionId === undefined || sessionId === "")
       return c.json(errorBody("invalid_request", "sessionId is required"), 400);
     return c.json({ requests: chat.mobileRequests?.(resolved.name, sessionId) ?? [] });
+  });
+
+  // Capability 70. The phone this conversation's capability requests should go to. Read at
+  // admission and nowhere else: capability 68's binding is untouched, and a preference written
+  // after a request was admitted changes nothing about that request.
+  app.get("/bots/:name/mobile-requests/preferred-device", requireDevice, (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const sessionId = c.req.query("sessionId");
+    if (sessionId === undefined || sessionId === "")
+      return c.json(errorBody("invalid_request", "sessionId is required"), 400);
+    return c.json(chat.mobilePreferredDevice?.(resolved.name, sessionId) ?? { sessionId });
+  });
+
+  app.put("/bots/:name/mobile-requests/preferred-device", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const sessionId = c.req.query("sessionId");
+    if (sessionId === undefined || sessionId === "")
+      return c.json(errorBody("invalid_request", "sessionId is required"), 400);
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      body = undefined;
+    }
+    let parsed;
+    try {
+      parsed = assertValid(BotMobilePreferredDeviceRequestSchema, body);
+    } catch (err) {
+      if (err instanceof ContractViolation)
+        return c.json(errorBody("invalid_request", "deviceId must name a paired device or be null"), 400);
+      throw err;
+    }
+    // A choice that resolves to nothing at admission time is a routing rule that quietly does not
+    // work, so an unpaired id is refused by name rather than stored.
+    const outcome = chat.setMobilePreferredDevice?.(resolved.name, sessionId, parsed.deviceId) ?? "ok";
+    if (outcome === "unknown_device")
+      return c.json(errorBody("invalid_request", "deviceId names no paired device"), 400);
+    return c.json(chat.mobilePreferredDevice?.(resolved.name, sessionId) ?? { sessionId });
+  });
+
+  // Capability 71. One composer draft per conversation, belonging to the PERSON. It never reaches
+  // a bot, a peer, a runtime or a model: this is composer state handed back to their own devices.
+  app.get("/bots/:name/drafts", requireDevice, (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const sessionId = c.req.query("sessionId");
+    if (sessionId === undefined || sessionId === "")
+      return c.json(errorBody("invalid_request", "sessionId is required"), 400);
+    return c.json(chat.composerDraft?.(resolved.name, sessionId) ?? { sessionId, text: "", updatedAt: 0 });
+  });
+
+  app.put("/bots/:name/drafts", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      body = undefined;
+    }
+    let parsed;
+    try {
+      parsed = assertValid(BotComposerDraftRequestSchema, body);
+    } catch (err) {
+      // Refused rather than truncated: a draft whose end the person cannot see is worse than a
+      // save the composer retries.
+      if (err instanceof ContractViolation)
+        return c.json(errorBody("invalid_request", "sessionId is required and text is at most 8000 characters"), 400);
+      throw err;
+    }
+    if (parsed.sessionId === "")
+      return c.json(errorBody("invalid_request", "sessionId is required"), 400);
+    return c.json(
+      chat.setComposerDraft?.(resolved.name, parsed.sessionId, parsed.text)
+        ?? { sessionId: parsed.sessionId, text: parsed.text, updatedAt: 0 },
+    );
   });
 
   app.delete("/bots/:name/approvals/grants/:grantId", requireDevice, (c) => {

@@ -284,30 +284,30 @@ class AttachV1Client:
         """The version the gateway advertised for one vendor extension, 0 when it advertised none."""
         return self._extensions.get(capability, 0)
 
-    async def request_device_status(self, thread_id: str, turn_id: str, purpose: str) -> MobileDeviceStatusResult:
+    async def request_device_status(self, thread_id: str, turn_id: str, purpose: str, target_device_id: Any = None) -> MobileDeviceStatusResult:
         """Request one ephemeral status result for this live turn, never via the spool."""
         purpose = normalize_location_purpose(purpose)
         if not purpose:
             return {"status": "policy_blocked"}
-        return await self._request_mobile("device.status", thread_id, turn_id, purpose)
+        return await self._request_mobile("device.status", thread_id, turn_id, purpose, target_device_id=target_device_id)
 
-    async def request_location(self, thread_id: str, turn_id: str, purpose: str) -> MobileDeviceStatusResult:
+    async def request_location(self, thread_id: str, turn_id: str, purpose: str, target_device_id: Any = None) -> MobileDeviceStatusResult:
         """Request one approximate foreground location, never via the spool."""
         purpose = normalize_location_purpose(purpose)
         if not purpose:
             return {"status": "policy_blocked"}
-        return await self._request_mobile("location.current", thread_id, turn_id, purpose)
+        return await self._request_mobile("location.current", thread_id, turn_id, purpose, target_device_id=target_device_id)
 
-    async def request_camera(self, thread_id: str, turn_id: str, purpose: str, camera: str, capture: str) -> MobileDeviceStatusResult:
-        return await self._request_mobile("camera.capture", thread_id, turn_id, purpose, {"camera": camera, "capture": capture, "videoDurationSeconds": 10})
+    async def request_camera(self, thread_id: str, turn_id: str, purpose: str, camera: str, capture: str, target_device_id: Any = None) -> MobileDeviceStatusResult:
+        return await self._request_mobile("camera.capture", thread_id, turn_id, purpose, {"camera": camera, "capture": capture, "videoDurationSeconds": 10}, target_device_id=target_device_id)
 
-    async def request_file(self, thread_id: str, turn_id: str, purpose: str, selection: str) -> MobileDeviceStatusResult:
-        return await self._request_mobile("file.pick", thread_id, turn_id, purpose, {"selection": selection})
+    async def request_file(self, thread_id: str, turn_id: str, purpose: str, selection: str, target_device_id: Any = None) -> MobileDeviceStatusResult:
+        return await self._request_mobile("file.pick", thread_id, turn_id, purpose, {"selection": selection}, target_device_id=target_device_id)
 
-    async def present_notification(self, thread_id: str, turn_id: str, purpose: str, title: str, body: str) -> MobileDeviceStatusResult:
-        return await self._request_mobile("notification.present", thread_id, turn_id, purpose, {"title": title, "body": body})
+    async def present_notification(self, thread_id: str, turn_id: str, purpose: str, title: str, body: str, target_device_id: Any = None) -> MobileDeviceStatusResult:
+        return await self._request_mobile("notification.present", thread_id, turn_id, purpose, {"title": title, "body": body}, target_device_id=target_device_id)
 
-    async def _request_mobile(self, command: str, thread_id: str, turn_id: str, purpose: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> MobileDeviceStatusResult:
+    async def _request_mobile(self, command: str, thread_id: str, turn_id: str, purpose: Optional[str] = None, options: Optional[Dict[str, Any]] = None, target_device_id: Any = None) -> MobileDeviceStatusResult:
         required_capability = "mobile_location" if command == "location.current" else "mobile_media" if command in {"camera.capture", "file.pick"} else "mobile_notifications" if command == "notification.present" else "mobile_node"
         if not self._negotiated or required_capability not in self._capabilities:
             return {"status": "device_unavailable"}
@@ -329,6 +329,14 @@ class AttachV1Client:
                 frame["purpose"] = purpose
             if options is not None:
                 frame.update(options)
+            # Capability 70. One optional routing hint naming the phone the person meant, when the
+            # harness already knows it. Anything that is not a usable device id is left off rather
+            # than sent: the gateway would drop it anyway, and an omitted field is the pre-70 frame
+            # byte for byte, so a gateway below 70 sees exactly what it always saw. The gateway
+            # remains the only authority on whether the id names a paired device.
+            selected = _mobile_target_device_id(target_device_id)
+            if selected is not None:
+                frame["targetDeviceId"] = selected
             await self._send(frame)
             return await asyncio.wait_for(asyncio.shield(future), timeout_seconds)
         except asyncio.TimeoutError:
@@ -1403,6 +1411,20 @@ def _is_media(value: Any) -> bool:
 
 def _is_notification(value: Any) -> bool:
     return isinstance(value, dict) and value.get("action") in {"approve", "snooze", "open", "cancel"} and len(value) == 1
+
+
+def _mobile_target_device_id(value: Any) -> Optional[str]:
+    """Capability 70. The one routing hint a `mobile_request` may carry: a paired device id the
+    harness already knows. Anything that is not a plausible id is left off the frame entirely,
+    which is the pre-70 frame byte for byte. Whether the id names a device that is actually paired
+    is the gateway's call, not this plugin's, and never Hermes'.
+    """
+    if not isinstance(value, str):
+        return None
+    device_id = value.strip()
+    if not device_id or len(device_id) > 256 or re.search(r"[\x00-\x1f\x7f-\x9f]", device_id):
+        return None
+    return device_id
 
 
 def normalize_location_purpose(value: Any) -> Optional[str]:

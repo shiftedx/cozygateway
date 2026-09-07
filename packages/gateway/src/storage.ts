@@ -12,6 +12,8 @@ import type {
   BotChatAttachment,
   BotChatMessage,
   BotMobileReceipt,
+  BotComposerDraft,
+  BotMobilePreferredDevice,
   BotMobileRequest,
   MobileRequestState,
   BotApprovalRepair,
@@ -124,6 +126,8 @@ export function cozyAppPhysicalId(creatorBot: string, logicalId: string): string
 
 /** How long a SETTLED lifecycle record is kept. Documented in contract/ext-bots-v1.md row 68. */
 const MOBILE_REQUEST_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+/** Capability 71. An abandoned composer must not hold a person's words forever. */
+const COMPOSER_DRAFT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const MOBILE_REQUEST_TERMINAL_PLACEHOLDERS = MOBILE_REQUEST_TERMINAL_STATES.map(() => "?").join(", ");
 
 const BOT_MOBILE_REQUEST_SELECT = `
@@ -634,6 +638,26 @@ CREATE TABLE IF NOT EXISTS bot_mobile_requests (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bot_mobile_requests_session
   ON bot_mobile_requests (bot, session_id, requested_at, request_id);
+-- Capability 70 the phone this conversation's capability requests should go to. One row per
+-- profile and conversation; the device id is checked against the paired devices on the way in, so
+-- a stored choice always names a device this gateway knows. Read only at admission.
+CREATE TABLE IF NOT EXISTS bot_mobile_preferred_devices (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bot, session_id)
+) STRICT, WITHOUT ROWID;
+-- Capability 71 one composer draft per profile and conversation, belonging to the PERSON and not
+-- to any one of their phones, which is why there is no device column here at all. Only the newest
+-- text is kept: no history, no per-device copy, no merge.
+CREATE TABLE IF NOT EXISTS bot_composer_drafts (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bot, session_id)
+) STRICT, WITHOUT ROWID;
 -- Binds one committed TURN reply that carried attachments to the delivery id its plugin already
 -- keyed the media lifecycle under (turn:<turnId>). Scheduled deliveries have
 -- attach_scheduled_deliveries for this; a turn had nothing, which is why turn media could never
@@ -4104,7 +4128,7 @@ export class Storage {
       );
       for (const mediaId of scheduledMediaIds)
         deleteUnreferencedMedia.run(outboxAgentId, mediaId, input.bot, input.sessionId, outboxAgentId);
-      for (const table of ["bot_native_messages", "bot_chat_tool_steps", "bot_chat_delegations", "bot_mobile_receipts", "bot_mobile_requests", "bot_native_interactions", "bot_approval_grants", "bot_native_turn_terminals", "bot_desktop_resume_bindings", "bot_chat_configurations"]) {
+      for (const table of ["bot_native_messages", "bot_chat_tool_steps", "bot_chat_delegations", "bot_mobile_receipts", "bot_mobile_requests", "bot_native_interactions", "bot_approval_grants", "bot_native_turn_terminals", "bot_desktop_resume_bindings", "bot_chat_configurations", "bot_mobile_preferred_devices", "bot_composer_drafts"]) {
         this.#db.prepare(`DELETE FROM ${table} WHERE bot = ? AND session_id = ?`).run(input.bot, input.sessionId);
       }
       this.#db.prepare("DELETE FROM bot_native_sessions WHERE bot = ? AND session_id = ?").run(input.bot, input.sessionId);
@@ -4469,6 +4493,87 @@ export class Storage {
          WHERE updated_at < ? AND state IN (${MOBILE_REQUEST_TERMINAL_PLACEHOLDERS})`,
       )
       .run(now - MOBILE_REQUEST_RETENTION_MS, ...MOBILE_REQUEST_TERMINAL_STATES);
+  }
+
+  /** Capability 70. The device this conversation's capability requests should go to. The write
+   *  REFUSES an id that names no paired device rather than storing a choice that would resolve to
+   *  nothing at admission time; `null` is the clear. A paired device is this gateway's only user
+   *  identity, so checking pairing here is also the whole authorization check. */
+  setBotMobilePreferredDevice(
+    bot: string, sessionId: string, deviceId: string | null, at: number,
+  ): "ok" | "unknown_device" {
+    if (deviceId === null) {
+      this.#db
+        .prepare("DELETE FROM bot_mobile_preferred_devices WHERE bot = ? AND session_id = ?")
+        .run(bot, sessionId);
+      return "ok";
+    }
+    const paired = this.#db
+      .prepare("SELECT id FROM devices WHERE id = ?")
+      .get(deviceId) as { id: string } | undefined;
+    if (paired === undefined) return "unknown_device";
+    this.#db
+      .prepare(
+        `INSERT INTO bot_mobile_preferred_devices (bot, session_id, device_id, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (bot, session_id) DO UPDATE SET device_id = excluded.device_id,
+           updated_at = excluded.updated_at`,
+      )
+      .run(bot, sessionId, deviceId, at);
+    return "ok";
+  }
+
+  /** A choice whose device has since been unpaired reads as no choice at all, so admission falls
+   *  through to the pre-70 rule instead of resolving to a device that cannot answer. */
+  botMobilePreferredDevice(bot: string, sessionId: string): BotMobilePreferredDevice {
+    const row = this.#db
+      .prepare(
+        `SELECT p.device_id AS deviceId, p.updated_at AS updatedAt, d.name AS deviceName
+         FROM bot_mobile_preferred_devices p
+         JOIN devices d ON d.id = p.device_id
+         WHERE p.bot = ? AND p.session_id = ?`,
+      )
+      .get(bot, sessionId) as { deviceId: string; updatedAt: number; deviceName: string } | undefined;
+    if (row === undefined) return { sessionId };
+    return { sessionId, deviceId: row.deviceId, deviceName: row.deviceName, updatedAt: row.updatedAt };
+  }
+
+  /** Capability 71. Last write wins, and the empty string is the CLEAR a send writes immediately.
+   *  `changed` is false when the text is the one already stored, so a device replaying what it
+   *  already had cannot wake every other paired device with a notification. */
+  setBotComposerDraft(
+    bot: string, sessionId: string, text: string, at: number,
+  ): { draft: BotComposerDraft; changed: boolean } {
+    this.#sweepComposerDrafts(at);
+    const existing = this.#db
+      .prepare("SELECT text FROM bot_composer_drafts WHERE bot = ? AND session_id = ?")
+      .get(bot, sessionId) as { text: string } | undefined;
+    this.#db
+      .prepare(
+        `INSERT INTO bot_composer_drafts (bot, session_id, text, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (bot, session_id) DO UPDATE SET text = excluded.text,
+           updated_at = excluded.updated_at`,
+      )
+      .run(bot, sessionId, text, at);
+    return { draft: { sessionId, text, updatedAt: at }, changed: existing?.text !== text };
+  }
+
+  botComposerDraft(bot: string, sessionId: string): BotComposerDraft {
+    const row = this.#db
+      .prepare("SELECT text, updated_at AS updatedAt FROM bot_composer_drafts WHERE bot = ? AND session_id = ?")
+      .get(bot, sessionId) as { text: string; updatedAt: number } | undefined;
+    return row === undefined
+      ? { sessionId, text: "", updatedAt: 0 }
+      : { sessionId, text: row.text, updatedAt: row.updatedAt };
+  }
+
+  /** Swept on the next write, the way settled request records are, so an abandoned composer needs
+   *  no timer to stop holding text. */
+  #sweepComposerDrafts(now: number): void {
+    this.#db
+      .prepare("DELETE FROM bot_composer_drafts WHERE updated_at < ?")
+      .run(now - COMPOSER_DRAFT_RETENTION_MS);
   }
 
   nativeBotMobileReceipts(bot: string, sessionId: string): BotMobileReceipt[] {
@@ -5205,6 +5310,11 @@ export class Storage {
       // shown. Deleting the bot takes them with it rather than leaving them keyed to an identity
       // that no longer exists.
       ["mobileRequests", "bot_mobile_requests", "bot"],
+      // Capabilities 70 and 71. A preferred device and a draft are both keyed to this bot's
+      // conversation; deleting the bot takes them rather than leaving a person's own words and
+      // their routing choice pointing at an identity that is gone.
+      ["mobilePreferredDevices", "bot_mobile_preferred_devices", "bot"],
+      ["composerDrafts", "bot_composer_drafts", "bot"],
       ["turnMediaDeliveries", "bot_turn_media_deliveries", "bot"],
       ["interactions", "bot_native_interactions", "bot"],
       // Capability 66. A standing approval belongs to the bot it was made for: deleting the bot

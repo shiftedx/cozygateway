@@ -209,7 +209,7 @@ describe("capability-70 explicit device selection", () => {
       body: JSON.stringify({ deviceId: "stranger" }),
     });
     expect(refused.status).toBe(400);
-    expect(await refused.json()).toMatchObject({ error: "invalid_request" });
+    expect(await refused.json()).toMatchObject({ error: { code: "invalid_request" } });
   });
 });
 
@@ -310,6 +310,6 @@ describe("capability-71 composer draft sync", () => {
       body: JSON.stringify({ sessionId: "thread-1", text: "x".repeat(8_001) }),
     });
     expect(overlong.status).toBe(400);
-    expect(await overlong.json()).toMatchObject({ error: "invalid_request" });
+    expect(await overlong.json()).toMatchObject({ error: { code: "invalid_request" } });
   });
 });

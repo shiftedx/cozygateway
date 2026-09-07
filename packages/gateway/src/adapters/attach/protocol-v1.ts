@@ -711,16 +711,29 @@ export type AttachV1HistoryResult = Static<typeof AttachV1HistoryResultSchema>;
 const AttachV1MobileStatusRequestSchema = Type.Object({
   kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("device.status"),
   threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
+  targetDeviceId: Type.Optional(Type.Unknown()),
 }, { additionalProperties: false });
 const AttachV1MobileLocationRequestSchema = Type.Object({
   kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("location.current"),
   threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
+  targetDeviceId: Type.Optional(Type.Unknown()),
 }, { additionalProperties: false });
-const AttachV1MobileCameraRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("camera.capture"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, camera: Type.Union([Type.Literal("front"), Type.Literal("rear")]), capture: Type.Union([Type.Literal("photo"), Type.Literal("video")]), videoDurationSeconds: Type.Literal(10) }, { additionalProperties: false });
-const AttachV1MobileFileRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("file.pick"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, selection: Type.Union([Type.Literal("photo"), Type.Literal("file")]) }, { additionalProperties: false });
-const AttachV1MobileNotificationRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("notification.present"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, title: Type.String({ minLength: 1, maxLength: 80 }), body: Type.String({ minLength: 1, maxLength: 240 }) }, { additionalProperties: false });
+const AttachV1MobileCameraRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("camera.capture"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, camera: Type.Union([Type.Literal("front"), Type.Literal("rear")]), capture: Type.Union([Type.Literal("photo"), Type.Literal("video")]), videoDurationSeconds: Type.Literal(10), targetDeviceId: Type.Optional(Type.Unknown()) }, { additionalProperties: false });
+const AttachV1MobileFileRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("file.pick"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, selection: Type.Union([Type.Literal("photo"), Type.Literal("file")]), targetDeviceId: Type.Optional(Type.Unknown()) }, { additionalProperties: false });
+const AttachV1MobileNotificationRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("notification.present"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, title: Type.String({ minLength: 1, maxLength: 80 }), body: Type.String({ minLength: 1, maxLength: 240 }), targetDeviceId: Type.Optional(Type.Unknown()) }, { additionalProperties: false });
 export const AttachV1MobileRequestSchema = Type.Union([AttachV1MobileStatusRequestSchema, AttachV1MobileLocationRequestSchema, AttachV1MobileCameraRequestSchema, AttachV1MobileFileRequestSchema, AttachV1MobileNotificationRequestSchema]);
 export type AttachV1MobileRequest = Static<typeof AttachV1MobileRequestSchema>;
+/** Capability 70. The sole authority on `mobile_request.targetDeviceId`. UNTYPED on the wire for
+ *  the same reason capability 69's `activeTurns` is: a schema failure here would refuse a phone
+ *  capability request a person is waiting on, or close the socket, over one routing hint. Anything
+ *  malformed or oversized degrades to `undefined`, and the gateway falls back to the conversation's
+ *  stored preferred device and then to the device that opened the turn. Whether the id names a
+ *  device that is actually paired is decided later, at admission, where the pairing is known. */
+export function sanitizeMobileTargetDeviceId(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length < 1 || value.length > 256) return undefined;
+  return value;
+}
+
 export const AttachV1MobileCancelSchema = Type.Object({ kind: Type.Literal("mobile_cancel"), requestId: Id }, { additionalProperties: false });
 export type AttachV1MobileCancel = Static<typeof AttachV1MobileCancelSchema>;
 export const AttachV1MobileFailureStageSchema = Type.Union([

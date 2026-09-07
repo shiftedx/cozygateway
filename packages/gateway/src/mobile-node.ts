@@ -143,6 +143,36 @@ export function emitMobileNodeFailure(
     ...(fields.payloadSchemaValid === undefined ? {} : { payloadSchemaValid: fields.payloadSchemaValid }),
   });
 }
+/** Capability 70 (contract/ext-bots-v1.md row 70). WHERE the one target device comes from, and
+ *  nothing else. Row 68 still owns the binding: this runs ONCE, at admission, and everything after
+ *  it is unchanged, so the target never moves and a second device attaching never becomes one.
+ *
+ *  A hint the peer sent that is malformed, oversized, or names no paired device is DROPPED and
+ *  resolution falls through, exactly as capability 56's `detail` and 62's `repair` are sanitized
+ *  rather than treated as a reason to refuse the frame: a request a person is waiting on must not
+ *  be lost over one routing hint. `droppedHint` is what the caller logs, bounded and content free.
+ *  A stored preference naming a device that is no longer paired is skipped the same way, but it is
+ *  not a dropped hint: the person's own choice simply outlived the phone it named. */
+export type MobileTargetDeviceSource = "hint" | "preference" | "turn_origin" | "none";
+export function resolveMobileTargetDevice(input: {
+  hinted?: string | undefined;
+  preferred?: string | undefined;
+  turnOrigin?: string | undefined;
+  isPaired: (deviceId: string) => boolean;
+}): { deviceId: string | undefined; source: MobileTargetDeviceSource; droppedHint: boolean } {
+  const wellFormed = (value: string | undefined): value is string =>
+    typeof value === "string" && value.length >= 1 && value.length <= 256;
+  const droppedHint = input.hinted !== undefined
+    && !(wellFormed(input.hinted) && input.isPaired(input.hinted));
+  if (wellFormed(input.hinted) && input.isPaired(input.hinted))
+    return { deviceId: input.hinted, source: "hint", droppedHint: false };
+  if (wellFormed(input.preferred) && input.isPaired(input.preferred))
+    return { deviceId: input.preferred, source: "preference", droppedHint };
+  if (wellFormed(input.turnOrigin))
+    return { deviceId: input.turnOrigin, source: "turn_origin", droppedHint };
+  return { deviceId: undefined, source: "none", droppedHint };
+}
+
 interface MobileNodeInvocationBase {
   requestId: string;
   bot: string;
