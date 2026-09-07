@@ -133,6 +133,8 @@ import type { AttachV1MediaDescriptor } from "./adapters/attach/protocol-v1.ts";
 import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 import type { MobileNodeMediaDescriptor } from "./mobile-node.ts";
 import { PAIR_REQUEST_MAX_BYTES, PairingAdmission, readPairBody, type PairingAttemptLimiter } from "./pairing-admission.ts";
+import type { ObservationRing } from "./observe/ring.ts";
+import type { ObserveSnapshotReader } from "./observe/routes.ts";
 
 const LIVE_ACTIVITY_DELETION_DRAIN_LIMIT = 50;
 // The relay is private-network adjacent and its ordinary request deadline is ten seconds. A
@@ -324,6 +326,13 @@ export interface AppDeps {
   /** Capability 52. True when this gateway has no Hermes endpoint at all, which makes the bridge
    *  `absent` on `/health` and `/ready` rather than an offline bridge to alarm on. */
   hermesBridgeAbsent?: boolean;
+  /** Dashboard packet D3 (capability 75). The observation ring the `/observe/api/*` read routes
+   *  answer from. Absent leaves the whole group unregistered, which is the honest answer for a
+   *  gateway with observability off. */
+  observe?: ObservationRing;
+  /** Dashboard packet D3, THE D5 SEAM. Absent makes the CozyAgents panels answer
+   *  `{ available: false, reason: "no_snapshot_lane" }` rather than 404. */
+  observeSnapshots?: ObserveSnapshotReader;
   now: () => number;
 }
 

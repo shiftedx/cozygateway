@@ -38,6 +38,14 @@ import {
   ToolCallSchema,
 } from "./resources.ts";
 import { CozyAppsSnapshotFrameSchema, CozyAppActionFrameSchema } from "./cozyapps.ts";
+import {
+  ObserveChatDeltaFrameSchema,
+  ObserveEventFrameSchema,
+  ObserveGapFrameSchema,
+  ObserveSampleFrameSchema,
+  ObserveSubscribeFrameSchema,
+  ObserveUnsubscribeFrameSchema,
+} from "./observe.ts";
 
 /** `capabilities` (capability 71) is what this client UNDERSTANDS, so the gateway can decline to
  *  send a frame it would only drop. Optional, and its absence is what every client shipped before
@@ -154,7 +162,10 @@ export const MobileNodeProgressFrameSchema = Type.Object({
 }, { additionalProperties: false });
 export type MobileNodeProgressFrame = Static<typeof MobileNodeProgressFrameSchema>;
 
-export const ClientFrameSchema = Type.Union([AuthFrameSchema, SyncFrameSchema, MobileNodeAdvertiseFrameSchema, MobileNodeResultFrameSchema, MobileNodeProgressFrameSchema]);
+/** Capability 75. `observe_subscribe` and `observe_unsubscribe` are READS: they say which frames
+ *  this socket wants and change nothing a bot, a turn or another device can see. They are the only
+ *  frames besides `auth` and `sync` a read-scoped socket may send. */
+export const ClientFrameSchema = Type.Union([AuthFrameSchema, SyncFrameSchema, MobileNodeAdvertiseFrameSchema, MobileNodeResultFrameSchema, MobileNodeProgressFrameSchema, ObserveSubscribeFrameSchema, ObserveUnsubscribeFrameSchema]);
 export type ClientFrame = Static<typeof ClientFrameSchema>;
 
 export const ReadyFrameSchema = Type.Object({
@@ -305,5 +316,10 @@ export const ServerFrameSchema = Type.Union([
   BotThinkingActivityFrameSchema,
   CozyAppsSnapshotFrameSchema,
   CozyAppActionFrameSchema,
+  // Capability 75. Sent only to a subscribed observer; no other client ever receives one.
+  ObserveSampleFrameSchema,
+  ObserveEventFrameSchema,
+  ObserveChatDeltaFrameSchema,
+  ObserveGapFrameSchema,
 ]);
 export type ServerFrame = Static<typeof ServerFrameSchema>;

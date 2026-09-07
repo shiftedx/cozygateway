@@ -14,6 +14,7 @@ import {
   check,
 } from "cozygateway-contract";
 
+import type { ObserveSubscriptionKind } from "cozygateway-contract";
 import type { Storage } from "./storage.ts";
 import type { DeviceScope } from "cozygateway-contract";
 import { hashToken } from "./auth.ts";
@@ -43,6 +44,10 @@ interface Client {
   mobileForeground: boolean;
   /** What this client said it understands on `auth`, or undefined when it said nothing. */
   capabilities?: Record<string, number>;
+  /** Capability 75. Which observation frame kinds this socket asked for, or undefined when it has
+   *  asked for none. Governs ONLY a read-scoped socket: a write-scoped client's frames are exactly
+   *  what they were before this row, and it never receives an `observe_*` frame at all. */
+  observeKinds?: Set<ObserveSubscriptionKind>;
 }
 
 /** Frames a client is sent only when it did not rule itself out. A client that declares a version
@@ -253,7 +258,15 @@ export class WsHub {
       // later is refused for a read token by construction.
       // Fail closed for the same reason the HTTP middleware does: any scope that is not `write`
       // may send `auth` and `sync` and nothing else.
-      if (client.scope !== "write" && frame.type !== "sync") {
+      // Capability 75. `observe_subscribe` and `observe_unsubscribe` are READS: they say which
+      // frames this socket wants and change nothing else, which is why they join `sync` on the
+      // read side of the rule rather than widening what a read token may do.
+      if (
+        client.scope !== "write"
+        && frame.type !== "sync"
+        && frame.type !== "observe_subscribe"
+        && frame.type !== "observe_unsubscribe"
+      ) {
         this.#send(socket, {
           type: "error", code: "scope_read_only", message: "this device token may only read",
         });
@@ -291,6 +304,15 @@ export class WsHub {
       if (frame.type === "mobile_node_progress") {
         if (this.#mobileNodes.get(client.deviceId) === client)
           this.#onMobileProgress?.(client.deviceId, frame);
+        return;
+      }
+
+      if (frame.type === "observe_subscribe") {
+        client.observeKinds = new Set(frame.kinds);
+        return;
+      }
+      if (frame.type === "observe_unsubscribe") {
+        client.observeKinds = undefined;
         return;
       }
 
