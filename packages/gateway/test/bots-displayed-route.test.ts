@@ -39,7 +39,25 @@ describe("capability-31 displayed route", () => {
 
     expect(response.status).toBe(202);
     expect(await response.json()).toEqual({ recorded: 2 });
-    expect(recordDisplayed).toHaveBeenCalledWith("sage", ["m1", "m2"], "device-1");
+    // Capability 73's perceived-latency pair is optional, so a client that reports neither sends
+    // an empty object and the backend sees nothing new.
+    expect(recordDisplayed).toHaveBeenCalledWith("sage", ["m1", "m2"], "device-1", {});
+  });
+
+  it("passes the app's own perceived latency and network path through when a client reports them", async () => {
+    const recordDisplayed = vi.fn(() => ({ recorded: 1 }));
+    const response = await post(harness(recordDisplayed), {
+      messageIds: ["m1"], feltLatencyMs: 1_240, networkPath: "vpn_on",
+    });
+    expect(response.status).toBe(202);
+    expect(recordDisplayed).toHaveBeenCalledWith("sage", ["m1"], "device-1", {
+      feltLatencyMs: 1_240, networkPath: "vpn_on",
+    });
+  });
+
+  it("refuses a network path outside the closed set and a negative perceived latency", async () => {
+    expect((await post(harness(() => ({ recorded: 0 })), { messageIds: ["m1"], networkPath: "carrier_pigeon" })).status).toBe(400);
+    expect((await post(harness(() => ({ recorded: 0 })), { messageIds: ["m1"], feltLatencyMs: -1 })).status).toBe(400);
   });
 
   it("answers zero rather than an error when nothing was new", async () => {

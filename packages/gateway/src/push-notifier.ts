@@ -4,6 +4,7 @@ import type { Storage, PushRegistrationRow } from "./storage.ts";
 import type { Notifier } from "./turns.ts";
 import { encryptPushPayload, type ApprovalPushPayload, type PushPayload, type TaskCompletionPushPayload } from "./push-crypto.ts";
 import { emitTrace, traceId, type TraceLog } from "./trace.ts";
+import type { ObservationRing } from "./observe/ring.ts";
 
 export const PREVIEW_MAX_CHARS = 200;
 const NOTIFY_TIMEOUT_MS = 10_000;
@@ -94,6 +95,9 @@ export interface RelayNotifierDeps {
    *  send actually going out (issue #11). */
   isDeviceConnected?: (deviceId: string) => boolean;
   trace?: TraceLog;
+  /** Dashboard packet D2. Push outcomes as a countable series beside the existing `relay_result`
+   *  trace, not instead of it: the trace is a line an operator tails, this is what a chart reads. */
+  observe?: ObservationRing;
 }
 
 /** Posts encrypted notification payloads to each registered device's relay.
@@ -106,6 +110,7 @@ export class RelayNotifier implements Notifier {
   readonly #log: (message: string) => void;
   readonly #isDeviceConnected: ((deviceId: string) => boolean) | undefined;
   readonly #trace: TraceLog | undefined;
+  readonly #observe: ObservationRing | undefined;
 
   constructor(deps: RelayNotifierDeps) {
     this.#storage = deps.storage;
@@ -114,6 +119,7 @@ export class RelayNotifier implements Notifier {
     this.#log = deps.log ?? ((message: string) => process.stderr.write(`${message}\n`));
     this.#isDeviceConnected = deps.isDeviceConnected;
     this.#trace = deps.trace;
+    this.#observe = deps.observe?.enabled === true ? deps.observe : undefined;
   }
 
   notify(
@@ -289,9 +295,11 @@ export class RelayNotifier implements Notifier {
       });
     } catch (error) {
       emitTrace(this.#trace, "relay_result", { device: traceId(registration.deviceId), result: "network_error" });
+      this.#observe?.pushResult(registration.deviceId, "network_error");
       throw error;
     }
     emitTrace(this.#trace, "relay_result", { device: traceId(registration.deviceId), result: res.ok ? "ok" : res.status === 404 ? "not_found" : "http_error" });
+    this.#observe?.pushResult(registration.deviceId, res.ok ? "ok" : res.status === 404 ? "not_found" : "http_error");
     if (res.status === 404) {
       // The relay no longer knows this id; the registration is dead weight (push-v0). Prune it.
       this.#storage.deletePushRegistration(registration.deviceId);

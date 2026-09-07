@@ -1,4 +1,5 @@
 import { Artifacts } from "./artifacts.ts";
+import { ObserveStore } from "./observe/store.ts";
 import { Tasks } from "./tasks.ts";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
@@ -618,6 +619,14 @@ CREATE TABLE IF NOT EXISTS bot_message_receipts (
   message_id TEXT NOT NULL,
   displayed_at INTEGER NOT NULL,
   device_id TEXT NOT NULL,
+  -- Dashboard packet D2, design section 11 ("Perceived by the person"). What the person actually
+  -- waited, from send tapped to first delta rendered, measured on the PHONE's own clock, plus the
+  -- network path the phone was on. Both are null for every receipt from a client that does not
+  -- report them, which is every client below capability 73 and any client that chooses not to.
+  -- They are stored beside the receipt rather than only folded into the ring so a receipt read
+  -- back later still says what it was, and they are never mixed into a gateway-measured hop.
+  felt_latency_ms INTEGER,
+  network_path TEXT,
   PRIMARY KEY (bot, message_id)
 ) STRICT, WITHOUT ROWID;
 -- Capability 39 phone-sharing receipts. The request id is the idempotency key; the remaining
@@ -857,6 +866,71 @@ CREATE TABLE IF NOT EXISTS runner_operations (
   runner_id TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS runner_operations_bot ON runner_operations (bot, created_at DESC);
+-- The observation ring (dashboard packet D2). Two capped tables holding what the gateway already
+-- measures once per turn, per heartbeat and per sweep and used to throw away. Written only when
+-- config observability.enabled is on, trimmed to observability.retentionDays by the nightly
+-- maintenance pass, and governed by one rule enforced in observe/store.ts rather than at the call
+-- sites: no message text, no transcript, no url, path, query or body, no token. Tool names, reason
+-- codes, hashes, counts and durations only, the same rule the guardrail audit log follows.
+--
+-- The series column carries its qualifier inline (device_rtt_ms|tunnel) because the row shape is four
+-- columns by design and a fifth label column would invite free text into exactly the place the
+-- privacy rule is hardest to police. Both qualifiers are closed enums.
+CREATE TABLE IF NOT EXISTS observe_series (
+  series TEXT NOT NULL,
+  -- The subject of the sample: a bot id, a device id, an agent id, or null for a gateway-wide one.
+  bot TEXT,
+  at INTEGER NOT NULL,
+  value REAL NOT NULL
+) STRICT;
+-- D3 reads one series for one subject over a 1h, 24h or 7d window, and this is that scan.
+CREATE INDEX IF NOT EXISTS observe_series_window ON observe_series (series, bot, at);
+-- The trim deletes by age across every series, which the index above cannot serve.
+CREATE INDEX IF NOT EXISTS observe_series_age ON observe_series (at);
+CREATE TABLE IF NOT EXISTS observe_events (
+  at INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  bot TEXT,
+  -- An id and only an id: a turn id, a grant id, a device id. Never a path or a name a person typed.
+  ref TEXT,
+  detail_json TEXT
+) STRICT;
+CREATE INDEX IF NOT EXISTS observe_events_window ON observe_events (kind, at);
+CREATE INDEX IF NOT EXISTS observe_events_age ON observe_events (at);
+-- Section 12. Lifetime token and cost counters, declared here beside the ring but deliberately
+-- OUTSIDE it: these are summed since the bot was created and the seven day trim never touches
+-- them. D5 owns the producer; the table lives here because it is one storage decision with the
+-- ring it sits next to.
+-- This gateway's identity key. Every id in the ring is stored as a keyed hash rather than raw, so
+-- there is no string a caller can invent that lands in the bot or ref column, only a hash of one.
+-- Per gateway and durable: a bot hashes the same across restarts, so a chart survives one, and
+-- differently on somebody else's gateway, so two exports cannot be joined by guessing a name.
+CREATE TABLE IF NOT EXISTS observe_identity (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  key TEXT NOT NULL
+) STRICT;
+-- Which snapshots have already been folded into the lifetime counters below. Those counters are
+-- additive and are never trimmed, so a snapshot folded twice would inflate a token and cost figure
+-- permanently with nothing able to correct it. The claim and the addition share one transaction.
+-- Bounded the same way the ring is: the nightly pass trims a claim once it is older than the
+-- retention window, and the ring refuses to fold a snapshot that old in the first place, so the two
+-- together hold the no-double-count property for all time without an ever-growing ledger.
+CREATE TABLE IF NOT EXISTS observe_lifetime_folds (
+  snapshot_id TEXT PRIMARY KEY,
+  at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS observe_lifetime_folds_age ON observe_lifetime_folds (at);
+CREATE TABLE IF NOT EXISTS observe_lifetime (
+  bot TEXT NOT NULL,
+  model TEXT NOT NULL,
+  prompt INTEGER NOT NULL,
+  completion INTEGER NOT NULL,
+  cached INTEGER NOT NULL,
+  cost_micros INTEGER NOT NULL,
+  turns INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bot, model)
+) STRICT, WITHOUT ROWID;
 `;
 
 /** Capability 52. Which credential a setup code may mint. A code written before 52 has no kind
@@ -1277,9 +1351,14 @@ export class Storage {
   readonly #db: DatabaseSync;
   readonly tasks: Tasks;
   readonly artifacts: Artifacts;
+  /** Dashboard packet D2's observation ring. A namespace rather than methods on Storage because
+   *  it is a self-contained store with its own privacy rule, and that rule is easier to trust
+   *  when the only way to write a row is through the one class that enforces it. */
+  readonly observe: ObserveStore;
 
   constructor(db: DatabaseSync) {
     this.#db = db;
+    this.observe = new ObserveStore(db);
     this.tasks = new Tasks(db);
     this.tasks.expireInteractions((bot, kind, id, at) => { this.expireNativeInteractionIfDue(bot, kind, id, at); });
     // Capability 65 is the canonical producer capability 64 left absent by default. Only explicit
@@ -3505,12 +3584,18 @@ export class Storage {
     messageIds: readonly string[],
     deviceId: string,
     at: number,
+    /** Capability 73. What the person waited and which network they were on, both measured on the
+     * phone. Stored on the receipt rather than only folded into the observation ring so a receipt
+     * read back later still says what it was, and never mixed into a gateway-measured hop. */
+    perceived?: { feltLatencyMs?: number; networkPath?: string },
   ): { recorded: number; deliveries: Array<{ deliveryId: string; messageId: string }> } {
     const insert = this.#db.prepare(
-      `INSERT OR IGNORE INTO bot_message_receipts (bot, message_id, displayed_at, device_id)
-       SELECT ?, ?, ?, ?
+      `INSERT OR IGNORE INTO bot_message_receipts (bot, message_id, displayed_at, device_id, felt_latency_ms, network_path)
+       SELECT ?, ?, ?, ?, ?, ?
        WHERE EXISTS (SELECT 1 FROM bot_native_messages WHERE bot = ? AND message_id = ?)`,
     );
+    const feltLatencyMs = perceived?.feltLatencyMs ?? null;
+    const networkPath = perceived?.networkPath ?? null;
     const binding = this.#db.prepare(
       `SELECT delivery_id AS deliveryId FROM attach_scheduled_deliveries
        WHERE agent_id = ? AND message_id = ?`,
@@ -3525,7 +3610,7 @@ export class Storage {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       for (const messageId of new Set(messageIds)) {
-        if (insert.run(bot, messageId, at, deviceId, bot, messageId).changes !== 1) continue;
+        if (insert.run(bot, messageId, at, deviceId, feltLatencyMs, networkPath, bot, messageId).changes !== 1) continue;
         recorded += 1;
         displayed.push(messageId);
         const bound = (binding.get(bot, messageId) ?? turnBinding.get(bot, messageId)) as
@@ -3544,13 +3629,18 @@ export class Storage {
     return { recorded, deliveries };
   }
 
-  botMessageReceipt(bot: string, messageId: string): { displayedAt: number; deviceId: string } | undefined {
+  botMessageReceipt(bot: string, messageId: string): {
+    displayedAt: number; deviceId: string; feltLatencyMs: number | null; networkPath: string | null;
+  } | undefined {
     return this.#db
       .prepare(
-        `SELECT displayed_at AS displayedAt, device_id AS deviceId
+        `SELECT displayed_at AS displayedAt, device_id AS deviceId,
+                felt_latency_ms AS feltLatencyMs, network_path AS networkPath
          FROM bot_message_receipts WHERE bot = ? AND message_id = ?`,
       )
-      .get(bot, messageId) as { displayedAt: number; deviceId: string } | undefined;
+      .get(bot, messageId) as {
+        displayedAt: number; deviceId: string; feltLatencyMs: number | null; networkPath: string | null;
+      } | undefined;
   }
 
   /** Read the admitted event's existing durable records; it intentionally performs no projection
@@ -5844,6 +5934,17 @@ export function openStorage(dbPath: string): Storage {
   // adding it nullable is the whole migration. Nothing is backfilled: an operation written before
   // 54 belongs to the account default, and inventing a runner id for it would be a guess this
   // gateway cannot make honestly. Idempotent, so a restarted container runs it harmlessly again.
+  // Dashboard packet D2. An existing database's receipts predate the app-reported perceived
+  // latency and network path. Both are added nullable and nothing is backfilled: a receipt written
+  // before capability 73 carries no measurement, and inventing one would be a guess.
+  {
+    const columns = new Set(
+      (db.prepare("PRAGMA table_info(bot_message_receipts)").all() as unknown as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!columns.has("felt_latency_ms")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN felt_latency_ms INTEGER");
+    if (!columns.has("network_path")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN network_path TEXT");
+  }
   for (const table of ["runtime_bots", "runner_operations"]) {
     const columns = new Set(
       (db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>)

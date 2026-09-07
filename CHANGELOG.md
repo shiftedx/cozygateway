@@ -75,6 +75,58 @@ release; everything older is marked pre-release so installers resolve one "lates
   client and every peer of every backend, Hermes-backed and CozyAgents-backed alike, with zero
   plugin changes.
 
+- Observation ring: the gateway keeps what it already measures, for a week (dashboard packet D2).
+  Every latency, depth and outcome the gateway computes on a turn, a heartbeat or a sweep was
+  thrown away the instant it was used, so nothing could be charted, trended or compared, and the
+  first question anybody asks about a slow reply ("which hop?") had no answer anywhere in the
+  system. Two capped SQLite tables now hold it: `observe_series (series, bot, at, value)` and
+  `observe_events (at, kind, bot, ref, detail_json)`, both trimmed to
+  `observability.retentionDays` (7 by default) by a periodic pass that starts and stops with the
+  process. The same pass ages out the replay ledger behind the lifetime token counters, which is the
+  one table here that would otherwise grow by a row per snapshot forever; a snapshot older than the
+  window is refused on its age instead, so trimming a claim cannot reopen the double count it was
+  preventing. Written from the hooks that already fire: the app websocket heartbeat's ping-to-pong per
+  device tagged `tunnel` or `lan` from the request's origin, the attach heartbeat's request-to-ack
+  per peer, turn admission to dispatch and terminal to broadcast, first delta, turn duration, delta
+  frame count, attach online, queue, dead letter and outbox depths, dead letters, push relay
+  outcomes, and a self-probe that asks its own public hostname for `/ready` every 30 seconds and
+  compares it with the same request over loopback, recording the difference and raising a
+  `tunnel_flap` on a 502 or a timeout. OFF BY DEFAULT: `observability.enabled` is false unless an
+  operator sets it, and off means no writer fires, no timing state is kept, and both tables stay
+  empty. Three rules run through it. ONE CLOCK: every duration is a difference of two monotonic
+  readings taken by this process, never two wall clocks and never two machines. MEASURED, NOT
+  DERIVED: a hop the gateway cannot time is absent rather than inferred and stored beside the ones
+  it did time, and the only subtraction anywhere is the tunnel leg, where both terms are this
+  process's own measurements seconds apart. COUNTS TRAVEL WITH AGGREGATES: the p50 and p95 helpers
+  always return the sample count beside them, because a p95 over four samples is not a p95.
+  PRIVACY, enforced at the writer rather than at the call sites, AS AN ALLOWLIST WITH NO FREE
+  STRING IN IT: every column is a name from a closed enum, a 16 hex keyed identity hash, a number,
+  or, inside `detail_json`, a number, a boolean, a hash or a code from that field's own closed set
+  under a per-kind schema that refuses an unknown key outright. No identifier reaches a row: a bot,
+  device, agent, turn or grant id is hashed with a per-gateway key kept in that gateway's own
+  database, so the same subject hashes the same way across restarts, differently on somebody else's
+  gateway, and never appears as itself. A shape test cannot tell a person's words from a reason
+  code, which is why nothing here tries: a caller that wants a word declares it in an enum, and a
+  caller that wants an identifier stores its hash. A refused row is dropped whole and counted rather
+  than scrubbed in part. Peer-type-agnostic: every writer reads
+  something the gateway already computes for any attached peer, so a Hermes-backed bot gets the
+  full ring with no plugin change and no Hermes fork; the only gaps are the two series the design
+  marks CozyAgents-snapshot-only, which are left as a documented fold-in seam rather than inferred.
+
+- Capability 73, the perceived latency the gateway cannot measure. The one figure that matters most
+  is the one nobody in this system could see: what the person actually waited, from the send being
+  tapped to the first delta appearing. The gateway sees an admission and a frame leaving, not a
+  thumb and a pixel, and it cannot see a VPN at all. `POST /bots/:name/chat/messages/displayed`
+  therefore gains two optional fields, `feltLatencyMs` and `networkPath` (`wifi`, `cellular`,
+  `vpn_on`, `vpn_off`), both measured on the phone, both stored nullable on the receipt row that
+  call already writes, and at most one recorded per request whatever the batch size. Neither is
+  ever added to or subtracted from a gateway-measured hop: two clocks that were never synchronised
+  cannot be differenced, so the perceived figure sits beside the measured ones, and the cost of a
+  VPN is stated as the difference of two medians for the same device with it on and off, each with
+  its own sample count. Additive: no new route, no new frame, nothing a peer of any backend can
+  read or write, and a client below 73 sends neither field and is byte identical to its pre-73
+  self.
+
 - The owner-loss lease no longer reaps a turn whose peer was lost mid model request
   (`com.cozylabs.bots` capability 69, F2). Capability 69 starts a 120 second lease the instant a
   peer's socket closes, and for a peer that was answering heartbeats right up to that instant,

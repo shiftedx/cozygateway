@@ -1566,6 +1566,11 @@ export function registerBotRoutes(
         resolved.name,
         parsed.messageIds,
         c.get("deviceId"),
+        // Capability 73. Both optional and both absent for every client below 73.
+        {
+          ...(parsed.feltLatencyMs === undefined ? {} : { feltLatencyMs: parsed.feltLatencyMs }),
+          ...(parsed.networkPath === undefined ? {} : { networkPath: parsed.networkPath }),
+        },
       );
       return c.json(recorded, 202);
     } catch (err) {

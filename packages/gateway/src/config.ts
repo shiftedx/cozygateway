@@ -155,6 +155,20 @@ const GatewayConfigSchema = Type.Object({
   /** Bots served by a non-Hermes runtime, e.g. CozyAgents. Additive to hermesEndpoints' profiles;
    *  ids share the same collision namespace (see loadConfig). */
   bots: Type.Optional(Type.Array(NativeBotConfigSchema, { maxItems: 64 })),
+  /** Dashboard packet D2. The observation ring: a seven day series and events store fed by the
+   *  timing the gateway already computes on every turn, heartbeat and sweep.
+   *
+   *  OFF BY DEFAULT, and off means off: with `enabled` false no writer fires, no timing state is
+   *  kept in memory, and the two tables stay empty, so a gateway that never turns it on behaves
+   *  exactly as it did before the ring existed. An operator opts in to a store of durations and
+   *  counts about their own machine; nobody opts them in.
+   *
+   *  `retentionDays` bounds the ring rather than the disk: the nightly trim deletes anything
+   *  older. Config-file only, following turnTimeoutSeconds and artifactStoreBytes above. */
+  observability: Type.Optional(Type.Object({
+    enabled: Type.Boolean({ default: false }),
+    retentionDays: Type.Integer({ minimum: 1, maximum: 365, default: 7 }),
+  })),
 });
 export type GatewayConfig = Static<typeof GatewayConfigSchema>;
 
@@ -186,6 +200,17 @@ export function publicProfileId(endpoint: ResolvedHermesEndpoint, profile: strin
  *  this is belt and braces. */
 export function nativeBots(config: GatewayConfig): NativeBotConfig[] {
   return config.bots ?? [];
+}
+
+/** Dashboard packet D2. The observation ring's settings with the omitted case spelled out, so no
+ *  caller has to remember that "no `observability` section" and "`enabled: false`" are the same
+ *  posture. An operator who writes the section but omits a field gets the schema default. */
+export function observability(config: GatewayConfig): { enabled: boolean; retentionDays: number } {
+  const configured = config.observability;
+  return {
+    enabled: configured?.enabled ?? false,
+    retentionDays: configured?.retentionDays ?? 7,
+  };
 }
 
 const LOOPBACK_LISTENERS = new Set(["127.0.0.1", "::1", "localhost"]);

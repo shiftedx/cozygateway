@@ -24,6 +24,8 @@ import {
   type MobileNodeSendOutcome,
 } from "./mobile-node.ts";
 import { emitTrace, traceId, type TraceLog } from "./trace.ts";
+import { monotonicNow, type ObservationRing } from "./observe/ring.ts";
+import { deviceOriginVia, type DeviceOriginVia } from "./observe/origin.ts";
 import {
   PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES,
   PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS,
@@ -82,6 +84,17 @@ export class WsHub {
   readonly #onDeviceDisconnect: ((deviceId: string) => void) | undefined;
   readonly #onMobileAvailable: ((deviceId: string) => void) | undefined;
   readonly #pendingConnections: PendingWebsocketLimiter;
+  /** Dashboard packet D2. The heartbeat already proves a device is alive; these two maps are what
+   *  turn that proof into a measured round trip. They are keyed by socket rather than carried on
+   *  the Client record so the authenticated-client shape is untouched: a device that never
+   *  authenticates is never pinged and never appears here.
+   *
+   *  Monotonic readings only. A ping-to-pong measured across two `Date.now()` calls would report an
+   *  hour when the clock stepped, and the ring would store it as a real network round trip. */
+  readonly #pingSentAt = new WeakMap<WebSocket, number>();
+  readonly #originVia = new WeakMap<WebSocket, DeviceOriginVia>();
+  readonly #observe: ObservationRing | undefined;
+  readonly #publicHost: string | undefined;
 
   constructor(deps: {
     storage: Storage;
@@ -94,6 +107,12 @@ export class WsHub {
     onMobileProgress?: (deviceId: string, frame: MobileNodeProgressFrame) => void;
     onDeviceDisconnect?: (deviceId: string) => void;
     onMobileAvailable?: (deviceId: string) => void;
+    /** Dashboard packet D2. Absent means the observation ring is off, and then the heartbeat does
+     *  exactly what it did before: flip a boolean and ping. */
+    observe?: ObservationRing;
+    /** The operator's advertised public hostname, used only to tell a connection that came through
+     *  the tunnel from one that came straight off the LAN. */
+    publicHost?: string;
     /** Test seam; production keeps a bounded unauthenticated handshake pool. */
     maxPendingConnections?: number;
   }) {
@@ -106,6 +125,8 @@ export class WsHub {
     this.#onMobileProgress = deps.onMobileProgress;
     this.#onDeviceDisconnect = deps.onDeviceDisconnect;
     this.#onMobileAvailable = deps.onMobileAvailable;
+    this.#observe = deps.observe?.enabled === true ? deps.observe : undefined;
+    this.#publicHost = deps.publicHost;
     this.#pendingConnections = new PendingWebsocketLimiter(deps.maxPendingConnections ?? PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS);
     const heartbeatMs = deps.heartbeatMs ?? HEARTBEAT_MS;
     // noServer: true means this WebSocketServer never attaches its own 'upgrade' listener; the
@@ -135,8 +156,12 @@ export class WsHub {
     if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(frame));
   }
 
-  #onConnection(socket: WebSocket, _req?: IncomingMessage, releasePending?: () => void): void {
+  #onConnection(socket: WebSocket, req?: IncomingMessage, releasePending?: () => void): void {
     let client: Client | undefined;
+    // Dashboard packet D2, design section 10. Which path this socket arrived on decides which
+    // distribution its round trips belong to; read once here, because the request is gone by the
+    // time the first pong comes back. Recorded before authentication and used only after it.
+    if (this.#observe !== undefined) this.#originVia.set(socket, deviceOriginVia(req, this.#publicHost));
     // The raw socket reservation is already listening, but release here as well so a WebSocket
     // error or close that races authentication cannot keep its slot until TCP teardown.
     socket.once("close", () => releasePending?.());
@@ -279,7 +304,14 @@ export class WsHub {
     });
 
     socket.on("pong", () => {
-      if (client !== undefined) client.heartbeatAlive = true;
+      if (client === undefined) return;
+      client.heartbeatAlive = true;
+      // Dashboard packet D2. The one hop that includes everything between the person's phone and
+      // this process: their radio, their VPN, the edge, the tunnel and the accept.
+      const sentAt = this.#pingSentAt.get(socket);
+      if (sentAt === undefined || this.#observe === undefined) return;
+      this.#pingSentAt.delete(socket);
+      this.#observe.deviceRtt(client.deviceId, monotonicNow() - sentAt, this.#originVia.get(socket) ?? "lan");
     });
 
     socket.on("close", (code) => {
@@ -312,12 +344,19 @@ export class WsHub {
   #heartbeat(): void {
     for (const client of this.#clients) {
       if (!client.heartbeatAlive) {
+        // Dashboard packet D2. A missed interval is a measured silence, not a round trip, so it
+        // gets its own series rather than a made-up large `device_rtt_ms`.
+        const outstandingSince = this.#pingSentAt.get(client.socket);
+        if (this.#observe !== undefined && outstandingSince !== undefined) {
+          this.#observe.heartbeatGap(client.deviceId, monotonicNow() - outstandingSince);
+        }
         client.socket.terminate();
         continue;
       }
       client.heartbeatAlive = false;
       try {
         client.socket.ping();
+        if (this.#observe !== undefined) this.#pingSentAt.set(client.socket, monotonicNow());
       } catch {
         client.socket.terminate();
       }
