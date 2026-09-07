@@ -377,6 +377,108 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
     expect(payload("approval-plain")).not.toHaveProperty("repair");
   });
 
+  it("capability 66: a room member's approval carries its scope block like a 1:1 approval, and is answerable with the same scoped decision body", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    const scope = {
+      kind: "scoped_approval",
+      action: "workspace.write",
+      category: "other",
+      system: "workspace",
+      resource: "repo/notes.md",
+      change: "append one line to notes.md",
+      effects: ["one file changes on disk"],
+      reason: "guardrail",
+      payloadHash: "a".repeat(64),
+      expiresAt: NOW + 600_000,
+      retry: "idempotent",
+      requested: "once",
+    };
+    const pendingFrame = (toolCallId: string): BotApprovalPendingFrame => h.frames.find(
+      (frame) => frame.type === "bot_approval_pending" && (frame as BotApprovalPendingFrame).toolCallId === toolCallId,
+    ) as BotApprovalPendingFrame;
+    const payload = (toolCallId: string) =>
+      h.storage.nativeInteraction("sage", "approval", toolCallId)?.payload as { scope?: unknown } | undefined;
+    const inboxRow = (toolCallId: string) =>
+      h.storage.pendingNativeApprovals(["sage"], 100).find((row) => row.toolCallId === toolCallId);
+
+    // Valid: byte for byte on the live frame, the durable row and the inbox row, beside the room
+    // name, exactly as row 66 already promises for a 1:1 ask.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-scope", callId: "call-1", name: "workspace_write", status: "pending", scope,
+    })).toBe(true);
+    expect(pendingFrame("approval-scope")).toMatchObject({ bot: "sage", room: "Launch", name: "workspace_write" });
+    expect(JSON.stringify(pendingFrame("approval-scope").scope)).toBe(JSON.stringify(scope));
+    expect(JSON.stringify(payload("approval-scope")?.scope)).toBe(JSON.stringify(scope));
+    expect(inboxRow("approval-scope")).toMatchObject({ room: "Launch" });
+    expect(JSON.stringify(inboxRow("approval-scope")?.scope)).toBe(JSON.stringify(scope));
+
+    // Invalid: dropped, the approval kept, on every surface. Dropping fails closed, so the room
+    // ask is answerable but can leave no standing grant behind.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-scope-bad", callId: "call-2", name: "workspace_write", status: "pending",
+      scope: { ...scope, category: "vandalism" },
+    })).toBe(true);
+    expect(pendingFrame("approval-scope-bad")).toMatchObject({ bot: "sage", room: "Launch" });
+    expect(pendingFrame("approval-scope-bad")).not.toHaveProperty("scope");
+    expect(payload("approval-scope-bad")).not.toHaveProperty("scope");
+    expect(inboxRow("approval-scope-bad")).not.toHaveProperty("scope");
+
+    // Absent: byte identical to a pre-66 room approval. This is every Hermes-raised room approval
+    // that does not classify its call, and it must keep rendering the plain card.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-plain-scope", callId: "call-3", name: "terminal:rm", status: "pending",
+    })).toBe(true);
+    expect(pendingFrame("approval-plain-scope")).not.toHaveProperty("scope");
+    expect(payload("approval-plain-scope")).not.toHaveProperty("scope");
+
+    // The scoped decision body reaches a ROOM approval through the unchanged 1:1 route, and the
+    // standing grant it leaves is visible in the revocation view and endable there.
+    const approved = await h.app.request("/bots/sage/approvals/approval-scope/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: "category", expiresAt: NOW + 3_600_000 }),
+    });
+    expect(approved.status).toBe(202);
+    const grantsRead = await h.app.request("/bots/sage/approvals/grants");
+    expect(grantsRead.status).toBe(200);
+    const { grants } = await grantsRead.json() as { grants: Array<{ grantId: string; scope: string; resource: string }> };
+    expect(grants).toHaveLength(1);
+    expect(grants[0]).toMatchObject({ scope: "category", resource: "repo/notes.md" });
+    const revoked = await h.app.request(`/bots/sage/approvals/grants/${grants[0]!.grantId}`, { method: "DELETE" });
+    expect(revoked.status).toBe(200);
+    expect(((await (await h.app.request("/bots/sage/approvals/grants")).json()) as { grants: unknown[] }).grants)
+      .toHaveLength(0);
+  });
+
+  it("capability 66: the always-require floor holds for a room approval too", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-money", callId: "call-1", name: "pay_invoice", status: "pending",
+      scope: {
+        kind: "scoped_approval", action: "payments.send", category: "money_movement",
+        system: "banking", resource: "invoice/8821", change: "send 40 dollars to the vendor",
+        effects: [], reason: "always_require", payloadHash: "c".repeat(64),
+        expiresAt: NOW + 600_000, retry: "not_idempotent", requested: "once",
+      },
+    })).toBe(true);
+
+    const refused = await h.app.request("/bots/sage/approvals/approval-money/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: "category", expiresAt: NOW + 3_600_000 }),
+    });
+    expect(refused.status).toBe(409);
+    expect((await refused.json() as { error: { code: string } }).error.code).toBe("approval_category_forbidden");
+    expect(((await (await h.app.request("/bots/sage/approvals/grants")).json()) as { grants: unknown[] }).grants)
+      .toHaveLength(0);
+  });
+
   it("lands a runtime member's room clarification in the inbox and resolves it through the unchanged route", async () => {
     const h = await setup();
     const turn = await blockedTurn(h, ["sage", "scout"]);

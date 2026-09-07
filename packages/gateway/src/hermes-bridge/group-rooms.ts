@@ -13,7 +13,7 @@ import type {
 } from "cozygateway-contract";
 
 import type { Storage, BotGroupCause, BotGroupLogRow, BotGroupRow, BotGroupTurnRow } from "../storage.ts";
-import { sanitizeApprovalDetail, sanitizeApprovalRepair, type AttachV1EventFrame, type AttachV1TurnContext } from "../adapters/attach/protocol-v1.ts";
+import { sanitizeApprovalDetail, sanitizeApprovalRepair, sanitizeApprovalScope, type AttachV1EventFrame, type AttachV1TurnContext } from "../adapters/attach/protocol-v1.ts";
 import { normalizeProfileName } from "./crud.ts";
 import { botDisplayName, botHandle } from "./roster.ts";
 import {
@@ -1047,6 +1047,14 @@ export class GroupRooms {
     const repair = sanitizeApprovalRepair(event.repair);
     if (event.repair !== undefined && repair === undefined)
       this.#log(`dropping repair block on room approval for "${turn.member}": failed validation`);
+    // Capability 66. And the scoped-approval block, on the same terms. A room approval is the same
+    // durable row the 1:1 lane writes, so carrying the block here is all it takes for the decision
+    // routes, the optional decision body, the grant rules and the revocation view to answer for a
+    // room ask without knowing a room exists. A block that fails validation is DROPPED and the
+    // approval kept, which fails closed: a plain ask can leave no standing grant behind.
+    const scope = sanitizeApprovalScope(event.scope);
+    if (event.scope !== undefined && scope === undefined)
+      this.#log(`dropping scope block on room approval for "${turn.member}": failed validation`);
     const change = this.#storage.recordNativeInteraction({
       bot: turn.member,
       kind: "approval",
@@ -1058,6 +1066,7 @@ export class GroupRooms {
         room: { key: turn.key, name: room.name },
         ...(detail === undefined ? {} : { detail }),
         ...(repair === undefined ? {} : { repair }),
+        ...(scope === undefined ? {} : { scope }),
       },
       status: outcome ?? "pending",
       ...(event.expiresAt === undefined ? {} : { expiresAt: event.expiresAt }),
@@ -1083,6 +1092,7 @@ export class GroupRooms {
           room: { key: turn.key, name: room.name },
           ...(detail === undefined ? {} : { detail }),
           ...(repair === undefined ? {} : { repair }),
+          ...(scope === undefined ? {} : { scope }),
         },
         expiresAt: event.expiresAt ?? null,
         updatedAt: this.#now(),
@@ -1098,6 +1108,7 @@ export class GroupRooms {
         room: room.name,
         ...(detail === undefined ? {} : { detail }),
         ...(repair === undefined ? {} : { repair }),
+        ...(scope === undefined ? {} : { scope }),
       });
     } else {
       this.#broadcast({
