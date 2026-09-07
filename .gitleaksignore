@@ -3,3 +3,4 @@ b6afb373118fdaf051a3fe8c3781f5bae06261a6:packages/contract/test/ext-bots.test.ts
 bcd39ee6d1b2523119a721218183e6d10cd76730:integrations/attach-plugin/tests/test_thinking_tap.py:stripe-access-token:36
 9cba59cbef46742bd99ef79b328246104ebe1954:packages/conformance/src/suite.ts:generic-api-key:541
 816e51b829cf2ab4b46b2b378a7dc4647160b824:packages/gateway/test/observe-snapshot-lane.test.ts.red:generic-api-key:139
+04ff8f3757efb30f25b56dd63b4744f16d6a61ca:packages/gateway/test/observe-snapshot-lane.test.ts.red:generic-api-key:139
