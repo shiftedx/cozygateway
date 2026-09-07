@@ -14,3 +14,10 @@ then online returned to Live after socket reconnect. Reduced motion suppressed a
 The turn instrument shows ordered reported steps, not a fabricated timeline. Missing internals
 and sparse model samples stay labeled. New optional D3 cost/peer/device comparison fields are
 covered by defensive rendering and must be checked again after the integration rebase.
+
+Parent integration POC, 2026-09-07: rebased over D3 and rebuilt the contract and gateway.
+Started the actual `startGateway` assembly on a disposable localhost port with in-memory storage.
+Browser observer pairing reached `/observe`, authenticated the production websocket and displayed
+`Live · read only`. Changing 24h to 1h refreshed the real projections; a real websocket heartbeat
+produced a device RTT sample. Browser error/warning log was empty. Closed the browser and stopped
+only the temporary gateway process afterward. No production configuration or storage was used.
