@@ -721,6 +721,34 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await request, {"status": "ok", "result": GATEWAY_STATUS})
         await self.client._dispatch_inbound(json.dumps({"kind": "mobile_result", "requestId": frame["requestId"], "status": "denied"}))
 
+    async def test_a_phone_capability_request_never_names_a_target_device(self):
+        """Row 70. WHICH OF A PERSON'S PHONES RINGS IS THE PERSON'S CHOICE, recorded on the
+        gateway. This plugin has no say in it and sends no field for it: every mobile_request
+        frame is the pre-70 frame, and there is no keyword to pass one either."""
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node", "mobile_location", "mobile_media", "mobile_notifications"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))
+        senders = (
+            ("device.status", lambda: self.client.request_device_status("thread", "turn", "Report phone readiness")),
+            ("location.current", lambda: self.client.request_location("thread", "turn", "Find nearby coffee")),
+            ("camera.capture", lambda: self.client.request_camera("thread", "turn", "Show the shelf", "rear", "photo")),
+            ("file.pick", lambda: self.client.request_file("thread", "turn", "Pick the receipt", "file")),
+            ("notification.present", lambda: self.client.present_notification("thread", "turn", "Ask to ship", "Ship it?", "The release is ready")),
+        )
+        for command, send in senders:
+            with self.subTest(command=command):
+                request = __import__("asyncio").create_task(send())
+                await __import__("asyncio").sleep(0)
+                frame = self.socket.sent[-1]
+                self.assertEqual(frame["kind"], "mobile_request")
+                self.assertEqual(frame["command"], command)
+                self.assertNotIn("targetDeviceId", frame)
+                request.cancel()
+                self.assertEqual(await request, {"status": "cancelled"})
+
+        # And no caller can pass one: the keyword does not exist on any of the five.
+        with self.assertRaises(TypeError):
+            await self.client.request_device_status("thread", "turn", "Report phone readiness", target_device_id="phone-b")
+
     async def test_mobile_deadline_fits_gateway_budget_with_subsecond_clock_lead(self):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["mobile_node", "mobile_location", "mobile_media"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))

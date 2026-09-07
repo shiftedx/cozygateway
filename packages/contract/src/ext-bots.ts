@@ -484,6 +484,57 @@ export const BotMobileRequestSchema = Type.Object({
 }, { additionalProperties: false });
 export type BotMobileRequest = Static<typeof BotMobileRequestSchema>;
 
+/** Capability 70. The phone this conversation's capability requests should go to. Everything but
+ *  `sessionId` is absent when the person recorded no choice, which is the pre-70 behavior: the
+ *  device that opened the turn is the target. The record names a paired device and nothing else:
+ *  no person, no token and no address, because a paired device IS this gateway's user identity. */
+export const BotMobilePreferredDeviceSchema = Type.Object({
+  sessionId: Type.String({ minLength: 1, maxLength: 256 }),
+  deviceId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  deviceName: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  updatedAt: Type.Optional(Type.Integer({ minimum: 0 })),
+}, { additionalProperties: false });
+export type BotMobilePreferredDevice = Static<typeof BotMobilePreferredDeviceSchema>;
+
+/** Capability 70. `null` is the clear, and it is the only way to clear: an absent field would be
+ *  indistinguishable from a client that does not know the row. */
+export const BotMobilePreferredDeviceRequestSchema = Type.Object({
+  deviceId: Type.Union([Type.String({ minLength: 1, maxLength: 256 }), Type.Null()]),
+}, { additionalProperties: false });
+export type BotMobilePreferredDeviceRequest = Static<typeof BotMobilePreferredDeviceRequestSchema>;
+
+/** Capability 71. One composer draft for one conversation on one profile, belonging to the person
+ *  rather than to any one of their phones, which is why NO device id appears here or on the write.
+ *  Empty text with a zero `updatedAt` is a conversation that has no draft; empty text with a real
+ *  `updatedAt` is a draft a send CLEARED, which is what stops another device offering to resend.
+ *  `updatedAt` is also the VERSION: it moves strictly forward on every stored change, even across a
+ *  repeated or backwards clock, so two drafts can always be ordered and a client applies only the
+ *  newer one. Without that, a slow write landing after a send's clear would put a sent message back
+ *  on another phone, which is the one thing this row exists to prevent. */
+export const BotComposerDraftSchema = Type.Object({
+  sessionId: Type.String({ minLength: 1, maxLength: 256 }),
+  text: Type.String({ maxLength: 8_000 }),
+  updatedAt: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotComposerDraft = Static<typeof BotComposerDraftSchema>;
+
+/** Capability 71. Refused rather than truncated above the bound: a draft whose end the person
+ *  cannot see is worse than a save the composer retries. */
+export const BotComposerDraftRequestSchema = Type.Object({
+  sessionId: Type.String({ minLength: 1, maxLength: 256 }),
+  text: Type.String({ maxLength: 8_000 }),
+}, { additionalProperties: false });
+export type BotComposerDraftRequest = Static<typeof BotComposerDraftRequestSchema>;
+
+/** Capability 71. A FULL REPLACE of one conversation's draft, never a delta, carrying the empty
+ *  string when a send cleared it. Safe to drop: `GET /bots/:name/drafts` is the recovery read. */
+export const BotDraftUpdatedFrameSchema = Type.Object({
+  type: Type.Literal("bot_draft_updated"),
+  bot: Type.String({ minLength: 1, maxLength: 128 }),
+  ...BotComposerDraftSchema.properties,
+}, { additionalProperties: false });
+export type BotDraftUpdatedFrame = Static<typeof BotDraftUpdatedFrameSchema>;
+
 export const BotMobileRequestListSchema = Type.Object({
   requests: Type.Array(BotMobileRequestSchema),
 }, { additionalProperties: false });
@@ -2875,4 +2926,25 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * orphaned commit carrying words is projected rather than discarded.
  * Additive: no route, frame, field or status value is added, and a peer that sends neither new
  * field, like every client, is byte identical to its pre-69 self. */
-export const BOTS_CAPABILITY_VERSION = 69;
+/** Capability 70: a person chooses which of their paired phones a capability request goes to, per
+ * conversation. `GET`/`PUT /bots/:name/mobile-requests/preferred-device?sessionId=` records the
+ * choice, which is read ONLY at admission and written by a device-authenticated client and by
+ * nothing else. NO PEER HAS ANY INPUT INTO WHICH PHONE RINGS: no frame carries a target device,
+ * and a `mobile_request` that includes one anyway has THAT ONE REQUEST refused, with capability
+ * 68's `policy_blocked` and `request_policy_rejected`, while the socket and everything queued on it
+ * survive: a stale peer must not lose a live conversation over one removed routing hint. One exception, stated as a rule: a CozyApp action is answered on the device that
+ * tapped it and consults no preference, because a tap's answer belongs on the screen that took it. Capability 68's binding is otherwise untouched: the target
+ * never moves, and a second device attaching never becomes one. A stored choice naming a device
+ * that is no longer paired is skipped, and admission falls through to the device that opened the
+ * turn. Additive: every peer is byte identical to its pre-70 self, and a client that writes no
+ * preference gets the pre-70 binding. */
+/** Capability 71: a composer draft follows the person rather than the phone they typed it on.
+ * `GET`/`PUT /bots/:name/drafts?sessionId=` holds one draft per profile and conversation, per
+ * person and never per device, and a successful write broadcasts `bot_draft_updated` to every
+ * paired device. The empty string is the CLEAR, written immediately rather than on the typing
+ * debounce, which is what stops a message sent on one phone still being offered on another. A
+ * draft never reaches a bot, a peer, a runtime or a model, and its text is never logged, traced or
+ * measured; the row does make an unsent draft DURABLE SERVER STATE, dropped with its conversation's
+ * history and swept after thirty days untouched. Additive: a client below 71 keeps its
+ * own per-device draft and every peer of every backend is untouched. */
+export const BOTS_CAPABILITY_VERSION = 71;

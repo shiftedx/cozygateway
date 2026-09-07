@@ -36,6 +36,8 @@ import type {
   BotPendingApproval,
   BotApprovalRepair,
   BotApprovalGrant,
+  BotComposerDraft,
+  BotMobilePreferredDevice,
   BotMobileRequest,
   BotApprovalScope,
   BotRoutine,
@@ -49,7 +51,7 @@ import type { AttachV1Ingress } from "../adapters/attach/ingress-v1.ts";
 import { blocksToText } from "../adapters/attach/blocks-to-text.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
 import { sanitizeApprovalDetail, sanitizeApprovalRepair, sanitizeApprovalScope, type AttachV1EventFrame, type AttachV1MobileRequest } from "../adapters/attach/protocol-v1.ts";
-import type { MobileNodeBroker, MobileNodeReceiptInput } from "../mobile-node.ts";
+import { resolveMobileTargetDevice, type MobileNodeBroker, type MobileNodeReceiptInput } from "../mobile-node.ts";
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import type { Storage } from "../storage.ts";
 import type { GatewayChatConfiguration } from "../chat-configuration.ts";
@@ -583,6 +585,11 @@ export class NativeBotDataPlane {
         this.#resolveApproval(name, toolCallId, decision, deviceId, grantRequest),
       approvalGrants: (name) => this.#approvalGrants(name),
       mobileRequests: (name, sessionId) => this.#mobileRequests(name, sessionId),
+      mobilePreferredDevice: (name, sessionId) => this.#mobilePreferredDevice(name, sessionId),
+      setMobilePreferredDevice: (name, sessionId, deviceId) =>
+        this.#setMobilePreferredDevice(name, sessionId, deviceId),
+      composerDraft: (name, sessionId) => this.#composerDraft(name, sessionId),
+      setComposerDraft: (name, sessionId, text) => this.#setComposerDraft(name, sessionId, text),
       revokeApprovalGrant: (name, grantId) => this.#revokeApprovalGrant(name, grantId),
       resolveClarify: (name, clarifyId, optionId, deviceId) =>
         this.#resolveClarify(name, clarifyId, optionId, deviceId),
@@ -1033,6 +1040,8 @@ export class NativeBotDataPlane {
         return;
       }
       const { kind: _kind, ...request } = frame;
+      // A CozyApp action names the device it came from, which IS the selection: capability 70's
+      // preference never overrides an origin the person just tapped on.
       this.#mobileNode?.invoke({ ...request, bot: key, agentId: peer, deviceId: privateOrigin.deviceId });
       return;
     }
@@ -1045,9 +1054,23 @@ export class NativeBotDataPlane {
     // frame carried it onto the wire, where the app requires an exact key set and silently drops
     // anything carrying an extra one. Strip it here, at the boundary it stops being meaningful.
     const { kind: _kind, ...request } = frame;
-    this.#mobileNode?.invoke({
-      ...request, bot: key, agentId: peer, deviceId: this.#turnOrigins.get(this.#nativeTurnKey(key, frame.threadId, frame.turnId)),
+    // Capability 70. The ONE place the target is chosen, and both sources are the PERSON'S: their
+    // recorded choice for this conversation, then the device that opened the turn. The peer that
+    // sent this frame has no say in it. Row 68's binding is untouched from here on: what this
+    // resolves is what the record carries and the only device an answer may come from.
+    const target = resolveMobileTargetDevice({
+      preferred: this.#storage.botMobilePreferredDevice(key, frame.threadId).deviceId,
+      turnOrigin: this.#turnOrigins.get(this.#nativeTurnKey(key, frame.threadId, frame.turnId)),
+      isPaired: (deviceId) => this.#storage.listDevices().some((device) => device.id === deviceId),
     });
+    this.#mobileNode?.invoke({ ...request, bot: key, agentId: peer, deviceId: target.deviceId });
+  }
+
+  /** Capability 70. Refuse one request the gateway will not route, leaving the connection alone.
+   *  The peer is told through the same typed `policy_blocked` a request refused before any phone
+   *  saw it always gets, which is exactly what this is: nothing was routed, and nothing was asked. */
+  refuseMobileRequest(bot: string, requestId: string): void {
+    this.#mobileNode?.reject(bot, requestId);
   }
 
   registerCozyAppActionOrigin(bot: string, appId: string, actionRequestId: string, deviceId: string, ttlMs: number): boolean {
@@ -2235,6 +2258,52 @@ export class NativeBotDataPlane {
     const bot = normalize(name);
     if (!this.#native.has(bot)) return [];
     return this.#storage.nativeBotMobileRequests(bot, sessionId);
+  }
+
+  /** Capability 70. The person's own choice of which phone this conversation's capability
+   *  requests reach. Stored per profile and conversation, read only at admission. */
+  #mobilePreferredDevice(name: string, sessionId: string): BotMobilePreferredDevice | undefined {
+    const bot = normalize(name);
+    // A bot this plane does not hold is answered with NOTHING rather than an empty preference: a
+    // 200 saying "no choice recorded" for a name that does not exist is an answer about a
+    // conversation nobody has.
+    if (!this.#native.has(bot)) return undefined;
+    return this.#storage.botMobilePreferredDevice(bot, sessionId);
+  }
+
+  #setMobilePreferredDevice(
+    name: string, sessionId: string, deviceId: string | null,
+  ): "ok" | "unknown_device" | "unknown_bot" {
+    const bot = normalize(name);
+    // Telling a person their choice was saved when nothing was written is worse than either a
+    // refusal or a silent failure: the next read will disagree with what they were just told.
+    if (!this.#native.has(bot)) return "unknown_bot";
+    return this.#storage.setBotMobilePreferredDevice(bot, sessionId, deviceId, this.#now());
+  }
+
+  /** Capability 71. Composer state for the PERSON: it rides no attach lane, reaches no peer and
+   *  no model, and carries no device id, because every paired device is the same person. */
+  #composerDraft(name: string, sessionId: string): BotComposerDraft | undefined {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) return undefined;
+    return this.#storage.botComposerDraft(bot, sessionId, this.#now());
+  }
+
+  #setComposerDraft(name: string, sessionId: string, text: string): BotComposerDraft | undefined {
+    const bot = normalize(name);
+    // Echoing the draft back for a bot nobody holds says it was kept when the next read will say
+    // it was not, which is the one answer worse than refusing.
+    if (!this.#native.has(bot)) return undefined;
+    const written = this.#storage.setBotComposerDraft(bot, sessionId, text, this.#now());
+    // A device replaying the text it already had wakes nobody. Everything else, INCLUDING the
+    // empty string a send writes, reaches every other paired device at once: that clear is what
+    // stops a message sent on one phone still being offered for sending on another.
+    if (written.changed) {
+      try {
+        this.#broadcast({ type: "bot_draft_updated", bot, ...written.draft });
+      } catch {}
+    }
+    return written.draft;
   }
 
   #revokeApprovalGrant(name: string, grantId: string): "revoked" | "unknown" {

@@ -329,6 +329,10 @@ class AttachV1Client:
                 frame["purpose"] = purpose
             if options is not None:
                 frame.update(options)
+            # Capability 70 adds NOTHING here on purpose. Which of a person's phones a request
+            # reaches is the person's own choice, recorded on their gateway and read at admission;
+            # this plugin has no say in it and sends no field for it, so the frame below is the
+            # pre-70 frame byte for byte and a gateway that strips such a field never has to.
             await self._send(frame)
             return await asyncio.wait_for(asyncio.shield(future), timeout_seconds)
         except asyncio.TimeoutError:

@@ -35,6 +35,23 @@ interface Client {
   heartbeatAlive: boolean;
   mobileCommands: Set<MobileNodeRequestFrame["command"]>;
   mobileForeground: boolean;
+  /** What this client said it understands on `auth`, or undefined when it said nothing. */
+  capabilities?: Record<string, number>;
+}
+
+/** Frames a client is sent only when it did not rule itself out. A client that declares a version
+ *  BELOW the number here is not sent that frame at all, so "additive" means what it says rather
+ *  than "one extra frame it drops"; a client that declares nothing is sent it and ignores what it
+ *  does not know, which is what every client shipped before the declaration existed does. */
+const CAPABILITY_GATED_FRAMES: Record<string, { capability: string; minimum: number }> = {
+  bot_draft_updated: { capability: "com.cozylabs.bots", minimum: 71 },
+};
+
+function understands(client: Client, frame: ServerFrame): boolean {
+  const gate = CAPABILITY_GATED_FRAMES[frame.type];
+  if (gate === undefined) return true;
+  const declared = client.capabilities?.[gate.capability];
+  return declared === undefined || declared >= gate.minimum;
 }
 
 const HEARTBEAT_MS = 5_000;
@@ -181,7 +198,11 @@ export class WsHub {
         clearTimeout(authTimer);
         releasePending?.();
         this.#storage.touchDevice(device.id, this.#now());
-        client = { socket, deviceId: device.id, heartbeatAlive: true, mobileCommands: new Set(), mobileForeground: false };
+        client = {
+          socket, deviceId: device.id, heartbeatAlive: true, mobileCommands: new Set(),
+          mobileForeground: false,
+          ...(frame.capabilities === undefined ? {} : { capabilities: frame.capabilities }),
+        };
         emitTrace(this.#trace, "app_ws_auth", { connection, device: traceId(device.id) });
         this.#clients.add(client);
         this.#deviceCounts.set(device.id, (this.#deviceCounts.get(device.id) ?? 0) + 1);
@@ -288,7 +309,9 @@ export class WsHub {
   broadcast(frame: ServerFrame): void {
     const payload = JSON.stringify(frame);
     for (const client of this.#clients) {
-      if (client.socket.readyState === WebSocket.OPEN) client.socket.send(payload);
+      if (client.socket.readyState !== WebSocket.OPEN) continue;
+      if (!understands(client, frame)) continue;
+      client.socket.send(payload);
     }
   }
 

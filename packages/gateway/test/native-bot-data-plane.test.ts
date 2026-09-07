@@ -288,6 +288,35 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
+  it("answers a CozyApp action on the device that tapped it, never on the conversation's chosen phone", () => {
+    // Capability 70's stated exception. A CozyApp action names the device the person just tapped,
+    // and the answer to a tap belongs on the screen that took it: sending a camera prompt to a
+    // phone in another room because a chat preference says so would break the interaction the
+    // person is standing in front of. The conversation preference governs the CONVERSATION.
+    const storage = openStorage(":memory:");
+    storage.createDevice({ id: "tablet-b", name: "tablet", tokenHash: "hash-b", createdAt: 1 });
+    const invoked = vi.fn();
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress: {} as AttachV1Ingress,
+      nativeBots: ["cleo"], chatSuggestion: "", broadcast: () => undefined, now: () => 10,
+      mobileNode: { invoke: invoked, reject: vi.fn() } as never,
+    });
+    // A preference recorded against the CozyApp's own thread, which is the only one that could
+    // ever collide with an action origin.
+    storage.setBotMobilePreferredDevice("cleo", "__cozyapp__:app", "tablet-b", 5);
+
+    plane.registerCozyAppActionOrigin("cleo", "app", "action", "origin-device", 30_000);
+    plane.mobileRequest("cleo", { kind: "mobile_request", requestId: "tapped", command: "device.status", threadId: "__cozyapp__:app", turnId: "action", expiresAt: 1_000, purpose: "Refresh app data" });
+
+    expect(invoked).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: "tapped", deviceId: "origin-device",
+    }));
+    plane.close();
+    storage.close();
+  });
+
   it("preserves list items when a native bot reply is committed", async () => {
     const storage = openStorage(":memory:");
     let turnId = "";

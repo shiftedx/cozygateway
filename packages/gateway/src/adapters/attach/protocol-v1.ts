@@ -20,6 +20,7 @@ import {
   BotApprovalScopeSchema, type BotApprovalScope, check,
 } from "cozygateway-contract";
 
+
 /** Stable attach-v1 data-plane contract. A peer dials /attach/v1 and completes hello negotiation
  * before either side accepts application frames. */
 const Id = Type.String({ minLength: 1, maxLength: 256 });
@@ -721,6 +722,38 @@ const AttachV1MobileFileRequestSchema = Type.Object({ kind: Type.Literal("mobile
 const AttachV1MobileNotificationRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("notification.present"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, title: Type.String({ minLength: 1, maxLength: 80 }), body: Type.String({ minLength: 1, maxLength: 240 }) }, { additionalProperties: false });
 export const AttachV1MobileRequestSchema = Type.Union([AttachV1MobileStatusRequestSchema, AttachV1MobileLocationRequestSchema, AttachV1MobileCameraRequestSchema, AttachV1MobileFileRequestSchema, AttachV1MobileNotificationRequestSchema]);
 export type AttachV1MobileRequest = Static<typeof AttachV1MobileRequestSchema>;
+/** Capability 70 adds NO FIELD HERE. Which of a person's phones rings is the person's choice,
+ *  recorded on their gateway and read at admission; no peer names a target device, so none of the
+ *  five request shapes above carries one and none ever will. A frame that includes `targetDeviceId`
+ *  anyway is refused by the closed key set like any other unknown key, with the ingress's ordinary
+ *  refusal naming the field, which is the same answer a peer gets for any other contract skew.
+ *  There is deliberately no sanitizer and no tolerated spelling: a routing rule that can be checked
+ *  by reading the schema is worth more than one that has to be traced through a stripper. */
+
+/** Capability 70. Is this frame a `mobile_request` naming a device, and which request is it?
+ *
+ *  `targetDeviceId` was REMOVED from the five request shapes above, so the closed key set would
+ *  ordinarily refuse a frame carrying one by naming the field and closing the socket, the way every
+ *  other contract skew is refused. That is the wrong trade HERE. A stale peer that still sends the
+ *  field is otherwise healthy and may be holding a live conversation, queued turns and other
+ *  requests; dropping its connection over one field this gateway removed costs a person all of
+ *  that, while refusing the one request costs them only the request that was never going to be
+ *  honoured anyway. Durability of the connection wins over strictness of the key set.
+ *
+ *  Returns the request id to refuse, or `undefined` when this is not that case. A frame with no
+ *  usable request id is NOT claimed: there is nothing to answer per request, so it takes the
+ *  ordinary path and is refused as a malformed frame. */
+export function mobileRequestRefusal(
+  frame: unknown,
+): { requestId: string; field: "targetDeviceId" } | undefined {
+  if (typeof frame !== "object" || frame === null) return undefined;
+  const record = frame as Record<string, unknown>;
+  if (record["kind"] !== "mobile_request" || !("targetDeviceId" in record)) return undefined;
+  const requestId = record["requestId"];
+  if (typeof requestId !== "string" || requestId.length < 1 || requestId.length > 256) return undefined;
+  return { requestId, field: "targetDeviceId" };
+}
+
 export const AttachV1MobileCancelSchema = Type.Object({ kind: Type.Literal("mobile_cancel"), requestId: Id }, { additionalProperties: false });
 export type AttachV1MobileCancel = Static<typeof AttachV1MobileCancelSchema>;
 export const AttachV1MobileFailureStageSchema = Type.Union([

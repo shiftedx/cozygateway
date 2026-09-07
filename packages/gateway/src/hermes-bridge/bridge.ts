@@ -1,5 +1,7 @@
 import type {
   BotApprovalGrant,
+  BotComposerDraft,
+  BotMobilePreferredDevice,
   BotMobileRequest,
   BotAttachmentHistoryItem,
   BotCatalog,
@@ -362,6 +364,19 @@ export interface BotsSurface extends BotControlSurface {
   /** Capability 68. The typed lifecycle of the phone capability requests one conversation opened,
    *  which is what an app resuming from the background reconciles its pending requests against. */
   mobileRequests?(name: string, sessionId: string): BotMobileRequest[];
+  /** Capability 70. The device this conversation's capability requests should go to, read at
+   *  admission and nowhere else. `unknown_device` refuses an id naming no paired device rather
+   *  than storing a choice that would resolve to nothing; `null` clears. */
+  /** `undefined` means this gateway holds no such bot, which is a 404 rather than an answer. */
+  mobilePreferredDevice?(name: string, sessionId: string): BotMobilePreferredDevice | undefined;
+  setMobilePreferredDevice?(
+    name: string, sessionId: string, deviceId: string | null,
+  ): "ok" | "unknown_device" | "unknown_bot";
+  /** Capability 71. One composer draft per conversation, per PERSON and never per device. The
+   *  empty string is the clear a send writes, and the write broadcasts it to every paired
+   *  device unless the text is the one already stored. */
+  composerDraft?(name: string, sessionId: string): BotComposerDraft | undefined;
+  setComposerDraft?(name: string, sessionId: string, text: string): BotComposerDraft | undefined;
   resolveClarify(
     name: string,
     clarifyId: string,

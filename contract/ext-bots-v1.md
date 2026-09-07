@@ -109,7 +109,8 @@ and does not register `/bots` routes.
 | 67 | CozyApps dashboard records: saved editable input values, action receipts with source-attributed data snapshots, and the small typed document envelope. The RECORDS THEMSELVES are gated by `com.cozylabs.cozyapps: 2` and, on the bot side, by the attach-v1 `cozyapps_dashboard` capability; this bots row is the cross-reference that numbers them, and a client reads the routes and frames off `com.cozylabs.cozyapps` rather than off this version. See `contract/ext-cozyapps-v1.md`, section CozyApps 2, for the routes, frames, bounds and the derivation a peer at cozyapps 1 gets for free. Additive: every v1 route, frame, node and action behavior is byte identical for a peer and a client that negotiate neither, and no member is added to `CozyApp` or `CozyAppAction`. |
 | 68 | Typed phone capability request lifecycle: every phone capability request carries one typed state and ends in exactly one typed terminal state, bound to the profile, conversation, turn, paired device and the person that device is paired to. `GET /bots/:name/mobile-requests?sessionId=` is the reconciliation read. `policy_blocked` and `foreground_required` are outcomes of their own. The row also adds the `task_completed` push payload for capability 64. See the phone capability request lifecycle below. |
 | 69 | Stale native turn reconciliation, so a reply is never lost to a turn nobody owns. THE GATEWAY SIDE IS THE FLOOR: it protects users of any peer, including one that never sends a new field. Attach-v1 `hello` gains optional `activeTurns` (turn ids only) and `failed` gains the closed optional `reason: "unknown_turn"`; see `contract/attach-v1.md`. On hello the gateway reconciles this profile's nonterminal native turns, and ONLY THE TURNS THIS PEER ALREADY ACKNOWLEDGED: a command still in the durable outbox is one the peer has never seen, so its absence from a declaration says nothing, and a message queued for a sleeping bot is delivered normally rather than sealed. Reconciliation runs after the outbox flush. A turn the peer DECLARED active is never sealed by reconciliation and keeps the long silence ceiling; a turn it did not name, when it declared at all, is sealed IMMEDIATELY for owner loss rather than after twenty minutes of silence, and the app learns through the existing `bot_chat_state` turn transition (`phase: "failed"`, `status: "failed"`), with no new frame, field or status value. A turn whose peer is DISCONNECTED runs on ADR 0004's provisional 120 second owner-loss lease, the same bound a Task gets. A turn whose peer was lost MID MODEL REQUEST waits one model request out before that lease clock starts: a peer that was answering the attach-v1 heartbeat within 60 seconds of losing its socket had a dispatched, unterminated model request on the turn it was carrying, which is what a peer blocked inside one long synchronous prefill looks like from the gateway, and that 4 minute window is excluded from the lease clock the same way a pending approval or device request already suspends it. The lease itself is unchanged at 120 seconds and the exclusion is bounded and applies ONCE, so a peer that never comes back is still reaped, about 6 minutes after the drop and never past a ceiling an operator shortened. That total is deliberately shorter than the 10 minute grace an attached quiet peer already gets for the same reason. The reading is taken at the instant the socket closes, because a detached peer proves nothing afterwards, and it is taken ONLY for a disconnected peer: the undeclared grace below is not extended by a heartbeat, since an undeclared peer is attached and would otherwise never leave it. This is a GATEWAY-SIDE derivation from the gateway's own delivery record and its own transport: it needs no new frame, field or peer behavior, so it covers a Hermes peer and a CozyAgents peer identically with no plugin change. A turn whose peer re-attached but could not declare runs on a longer 10 minute grace, because an attached peer that is quiet may be inside one long model call and reaping that would end live work; any frame at all resets either window, and neither ever lengthens a window an operator already shortened. A STEER left unanswered on a turn that turns out to be terminal, reaped, or answered `unknown_turn` is PROMOTED: the oldest becomes a new durable turn carrying the same text, media and chat context, the person's own message row moves onto it, and the steers that followed it are re-dispatched onto that turn in the order they were sent. Pending steers are DURABLE, so a gateway restart between a steer and its seal preserves them. Every path that does not deliver a person's words records a visible marked failed-delivery row preserving the text, and each steer is accounted for exactly once, so a steer that was answered or rescued is never also promoted. An ORPHANED COMMIT carrying user-facing text or media, arriving on a turn id this gateway never issued, is projected as an ordinary reply bound to no turn rather than acknowledged and discarded, and it settles every steer still open on that conversation, because the peer demonstrably heard the person. An orphaned frame carrying nothing a person can read is still declined. `activeTurns` is UNVALIDATED on the wire and sanitized by the gateway, the way capability 56's `detail` and 62's `repair` are: a malformed or oversized declaration degrades to "cannot declare" with one bounded log line and is NEVER truncated, because a partial declaration would seal turns the peer holds, and it is never a reason to close the socket. Both windows are provisional and re-evaluated with measured findings. Additive: a peer that sends neither field, and every client, are byte identical to their pre-69 selves, and no route, frame, field or status value is added. |
-
+| 70 | A person chooses which of their phones a capability request goes to, and the choice is remembered per conversation: `GET /bots/:name/mobile-requests/preferred-device?sessionId=` answers `BotMobilePreferredDevice` (`{ sessionId, deviceId?, deviceName?, updatedAt? }`, every field but `sessionId` absent when no choice was made) and `PUT` on the same path with `BotMobilePreferredDeviceRequest` (`{ deviceId }`, closed, where the literal `null` clears the choice) records one. A `sessionId` that is missing or empty is `400 invalid_request` naming the field, exactly as capability 68's reconciliation read requires one, because a preference belongs to one conversation and a write that names none could only bind the wrong one. A `deviceId` that names no device paired to this gateway is `400 invalid_request` naming the field rather than a silently stored choice that would resolve to nothing at admission time, and an unpaired device's id therefore never reaches the routing rule. THE CHOICE IS THE PERSON'S AND ONLY THE PERSON'S: it is written by a device-authenticated client and by nothing else, and NO PEER OF ANY KIND HAS ANY INPUT INTO WHICH PHONE RINGS. There is no field on any frame for one, and a `mobile_request` that carries `targetDeviceId` anyway has THAT ONE REQUEST refused, with capability 68's own `policy_blocked` terminal and the `request_policy_rejected` reason, which is exactly what it is: refused before any phone saw it. THE CONNECTION IS NOT TOUCHED. The ordinary answer to an unknown key on this wire is a named refusal and a closed socket, and that is the wrong trade here: a stale peer that still sends the field is otherwise healthy and may be holding a live conversation, queued turns and other requests, so dropping its socket costs a person all of that while refusing the one request costs them only the request that was never going to be honoured. Durability of the connection outranks strictness of the closed key set for this field. The field is still REMOVED rather than tolerated, because a spelling the gateway quietly accepts and ignores leaves the routing rule unreadable from the schema and lets a peer go on believing it is steering a request; the peer is told, per request, that it is not. The refusal carries one bounded log line naming the removed field and nothing else: the device id the peer tried to name is never logged, because it is the thing being refused rather than something to record. THE CozyApp EXCEPTION, stated because it is a rule and not an accident: a request whose origin is a registered CozyApp action is answered on the DEVICE THAT TAPPED IT and consults no stored preference, because a tap's answer belongs on the screen that took it and sending a camera prompt to a phone in another room would break the interaction the person is standing in front of. The conversation preference governs the conversation. ADMISSION READS THE CHOICE, NOTHING ELSE DOES: capability 68's binding is unchanged in every other respect, and this row only widens WHERE the one target device is resolved from. The order at admission is this conversation's stored preferred device when it names a device still paired to this gateway, then the pre-70 rule, which is the device that opened the turn; a stored choice whose device has since been unpaired is skipped rather than resolved, because a target that cannot answer is worse than the turn origin it displaced. The first of those that resolves is the target and the record's `deviceId`, and FROM THAT MOMENT ROW 68'S RULE IS THE ONLY RULE: the target never moves, a second device attaching mid-request never becomes the target however recently the preference was written, a preference written after admission changes nothing about a request already admitted, and an answer from any other device is refused rather than applied. PEER-TYPE-AGNOSTIC, exactly as row 68's binding is: a Hermes-backed bot's request is admitted against a selected device by the same rule a runtime peer's is, because the binding is keyed to the bot's identity and not to its backend. Additive: the route is new, every response field but `sessionId` is optional, no frame gains a field, every peer of every backend is byte identical to its pre-70 self, a client that never writes a preference gets the pre-70 turn-origin binding, and a client reads or writes the preference only on `>= 70`. |
+| 71 | A composer draft follows the person rather than the phone they typed it on: `GET /bots/:name/drafts?sessionId=` answers `BotComposerDraft` (`{ sessionId, text, updatedAt }`, `text` the empty string and `updatedAt` zero when this conversation has no draft) and `PUT` on the same path with `BotComposerDraftRequest` (`{ sessionId, text }`, closed) records one, where `text` is 0 to 8000 characters and the empty string IS THE CLEAR rather than a stored blank. A missing or empty `sessionId` on either verb is `400 invalid_request` naming the field, and `text` above the bound is `400 invalid_request` naming the field rather than a silent truncation, because a draft the person cannot see the end of is worse than a refused save the composer can retry. THE RECORD IS PER PROFILE AND CONVERSATION AND PER PERSON, NEVER PER DEVICE: every device paired to this gateway is the same person, so a draft written by one is read by all of them and the record carries no device id at all, which is also why one is never accepted on the write. The gateway keeps only the newest text and its `updatedAt` on the gateway's own clock, never a history, never a per-device copy and never a merge: LAST WRITE WINS, and a write whose `text` is identical to the stored one is stored again without a new notification, so a reconnecting device replaying what it already had cannot wake every other device. A successful `PUT` broadcasts `bot_draft_updated` (`{ type, bot, sessionId, text, updatedAt }`) to every paired device, so a draft appears on a second phone while it is being typed rather than only on its next read, and the clear is broadcast by the same frame carrying the empty string. THE CLEAR IS THE NO-DUPLICATE-SEND GUARANTEE AND IT CROSSES DEVICES: a send clears the draft, the clear is written IMMEDIATELY rather than on the typing debounce that carries an ordinary keystroke, and every other paired device drops its copy on the frame, so a message sent on one phone can never still be offered for sending on another. A draft is never sent to a bot, a peer, a runtime or a model: it is composer state this gateway stores for the person and hands back to their own devices, it rides no attach lane and no `bot_config` operation, and NOTHING about a Hermes-backed or runtime-backed bot changes because of it. THIS ROW MAKES AN UNSENT DRAFT DURABLE SERVER STATE, which is stated plainly because it is new: before 71 a person's unsent words never left the phone they were typed on, and after it the gateway holds the newest text of each conversation's draft, in the clear, in its own database, exactly as it holds a conversation's messages. What is stored is the text, the conversation and the timestamp, and nothing else: no device, no author, no history and no earlier version. A draft is dropped when that conversation's own history is, and an untouched draft is swept after thirty days, so an abandoned composer cannot hold text forever. A draft's TEXT is never written to a log, a trace or a metric on any path, and no log line carries its length either; the routes and the frame carry it, and nothing else does. Additive: the route and the frame are both new, a client below 71 keeps its own per-device draft and is byte identical to its pre-71 self, every peer of every backend is untouched, and a client reads, writes or renders a synced draft only on `>= 71`. |
 
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
@@ -314,6 +315,111 @@ conversation string. A request dropped at the in-memory admission ceiling is dro
 fail-closed, which is the pre-68 behavior, and it records no terminal either: a durable outcome the
 peer was never told would disagree with the peer. In both cases the durable view holds no record at
 all rather than a record that says something untrue.
+
+### Choosing the target device (capability 70)
+
+Capability 68 binds a phone capability request to one paired device at admission and never moves
+it. That rule is unchanged. Capability 70 changes only WHERE the device is resolved from, and only
+at admission, so a person with two phones can say which one a request should reach instead of
+having it follow whichever device happened to open the turn.
+
+RESOLUTION ORDER, first that resolves wins:
+
+```text
+1. the conversation's stored preferred device, when it names a device still paired here
+2. the device that opened the turn (the pre-70 rule)
+```
+
+There is no third source, and in particular no peer input. WHICH OF A PERSON'S PHONES RINGS IS THE
+PERSON'S CHOICE. The preference is written by a device-authenticated client, and nothing a bot, a
+harness, a runtime or a Hermes plugin sends can name a target device: no frame carries such a
+field. A `mobile_request` that carries `targetDeviceId` anyway has THAT ONE REQUEST refused, with
+capability 68's own `policy_blocked` terminal and the `request_policy_rejected` reason, which is
+what it is: refused before any phone saw it.
+
+THE SOCKET SURVIVES, and that is a deliberate exception to how this wire answers an unknown key
+everywhere else. A named refusal and a closed connection is the right answer to a contract skew
+that makes a peer's whole understanding suspect. It is the wrong answer to one removed routing
+hint: a peer that still sends it is otherwise healthy and may be carrying a live conversation,
+queued turns and other requests, so closing its socket costs a person all of that, while refusing
+the one request costs them only the request that was never going to be honoured. The peer's next
+valid frame on the same socket is handled normally.
+
+The field is still REMOVED rather than tolerated. A spelling the gateway silently accepts and drops
+is worse than one it refuses on two counts: the routing rule stops being readable from the schema,
+and a peer that thinks it is steering a request keeps thinking so, with nothing anywhere to correct
+it. Refusing per request corrects it, once per request, without costing the connection. One bounded
+log line names the removed field; the device id the peer tried to name is never logged.
+
+ONE EXCEPTION, and it is a rule rather than an oversight: a request whose origin is a registered
+CozyApp action is answered on THE DEVICE THAT TAPPED IT, and consults no stored preference. The
+answer to a tap belongs on the screen that took it; a camera prompt appearing on a phone in another
+room because a chat preference said so would break the interaction the person is standing in front
+of. The conversation's preference governs the CONVERSATION.
+
+A stored choice whose device is no longer paired is SKIPPED rather than resolved, and admission
+falls through to the turn origin: a target that cannot answer is worse than the one it displaced.
+
+`GET /bots/:name/mobile-requests/preferred-device?sessionId=` is device authenticated and answers
+`BotMobilePreferredDevice`, `{ sessionId, deviceId?, deviceName?, updatedAt? }`, with everything but
+`sessionId` absent when this conversation has no choice recorded. `PUT` on the same path takes
+`BotMobilePreferredDeviceRequest`, `{ deviceId }`, closed, where the literal `null` clears the
+choice. A missing or empty `sessionId` is `400 invalid_request` naming the field, for capability
+68's own reason: a preference belongs to one conversation and a write naming none could only bind
+the wrong one. A `deviceId` naming no device paired to this gateway is `400 invalid_request` naming
+the field, because a stored choice that resolves to nothing at admission time is a routing rule that
+quietly does not work. A preference is dropped when the profile or the conversation it names is.
+
+ONCE ADMITTED, ROW 68 IS THE ONLY RULE. The resolved device is the record's `deviceId`, the target
+never moves, a second device attaching mid-request never becomes the target however recently the
+preference was written, a preference written after admission changes nothing about a request already
+admitted, and an answer from any other device is refused and logged rather than applied.
+
+PEER-TYPE-AGNOSTIC, exactly as row 68's binding is. A Hermes-backed bot's request is admitted
+against a selected device by the same rule a runtime peer's is, because the binding is keyed to the
+bot's identity and not to its backend.
+
+### Composer draft sync (capability 71)
+
+A composer draft follows the person, not the phone they typed it on. `GET /bots/:name/drafts?sessionId=`
+is device authenticated and answers `BotComposerDraft`, `{ sessionId, text, updatedAt }`, with `text`
+the empty string and `updatedAt` zero when there is no draft. `PUT` on the same path takes
+`BotComposerDraftRequest`, `{ sessionId, text }`, closed, where `text` is 0 to 8000 characters and
+the empty string IS THE CLEAR rather than a stored blank. A missing or empty `sessionId`, or a `text`
+above the bound, is `400 invalid_request` naming the field; an overlong draft is refused rather than
+truncated, because a draft whose end the person cannot see is worse than a save the composer retries.
+
+PER PERSON, NEVER PER DEVICE. Every device paired to this gateway is the same person, so the record
+carries no device id at all, one is never accepted on the write, and a draft written on one phone is
+read by all of them. The gateway keeps the newest text and its `updatedAt` on its own clock: no
+history, no per-device copy, no merge. LAST WRITE WINS. A write whose text equals the stored text is
+stored again but broadcasts nothing, so a reconnecting device replaying what it already had cannot
+wake every other device.
+
+A successful `PUT` broadcasts `bot_draft_updated`, `{ type, bot, sessionId, text, updatedAt }`, to
+every paired device, so a draft appears on a second phone while it is being typed rather than only
+on its next read. The clear rides the same frame carrying the empty string.
+
+THE CLEAR IS THE NO-DUPLICATE-SEND GUARANTEE, AND IT CROSSES DEVICES. A send clears the draft, the
+clear is written IMMEDIATELY rather than on the typing debounce an ordinary keystroke waits out, and
+every other paired device drops its copy on the frame. A message sent on one phone can never still
+be offered for sending on another.
+
+A draft never reaches a bot, a peer, a runtime or a model. It is composer state this gateway holds
+for the person and hands back to their own devices; it rides no attach lane and no `bot_config`
+operation, and nothing about a Hermes-backed or a runtime-backed bot changes because of it.
+
+AN UNSENT DRAFT BECOMES DURABLE SERVER STATE, and that is stated here plainly because it is new.
+Before 71 a person's unsent words never left the phone they were typed on. After it, the gateway
+holds the newest text of each conversation's draft in the clear, in its own database, exactly as it
+already holds that conversation's messages. WHAT IS STORED is the text, the conversation, the
+profile and one timestamp. WHAT IS NOT is a device, an author, a history, an earlier version, or
+anything a peer could read. A draft is dropped when its conversation's history is, and an untouched
+draft is swept after thirty days, so an abandoned composer cannot hold a person's words forever;
+that sweep runs on the gateway's own periodic retention pass, not only on the next write, so a
+gateway where nobody ever types again forgets on the same schedule as a busy one.
+A DRAFT'S TEXT IS NEVER LOGGED: not in a log line, not in a trace, not in a metric, and not as a
+length either. The two routes and the one frame carry it, and nothing else does.
 
 ### Bot Activity composition
 
@@ -866,6 +972,10 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `GET /bots/approvals` | optional `state=pending` | `BotInteractionRecovery` | Bounded pending approvals/clarifications plus confirmed terminal receipts. |
 | `GET /bots/:name/approvals/grants` | — | `BotApprovalGrants` | Capability 66. The standing approvals this bot holds that are neither expired nor revoked. |
 | `DELETE /bots/:name/approvals/grants/:grantId` | — | `200 { status: "revoked" }` | Capability 66. Ends one standing approval immediately; `404` for a grant this gateway does not hold. |
+| `GET /bots/:name/mobile-requests/preferred-device?sessionId=` | — | `BotMobilePreferredDevice` | Capability 70. The phone this conversation's capability requests should go to; every field but `sessionId` is absent when no choice was recorded. `404 not_found` for a bot this gateway does not hold. |
+| `PUT /bots/:name/mobile-requests/preferred-device?sessionId=` | `BotMobilePreferredDeviceRequest` | `BotMobilePreferredDevice` | Capability 70. Records the choice, or clears it with a `null` `deviceId`. An unpaired `deviceId`, or a missing `sessionId`, is `400 invalid_request` naming the field; a bot this gateway does not hold is `404 not_found`, never a `200` echoing a choice that was not stored. |
+| `GET /bots/:name/drafts?sessionId=` | — | `BotComposerDraft` | Capability 71. This conversation's composer draft for the person, empty text and a zero `updatedAt` when there is none. `404 not_found` for a bot this gateway does not hold. |
+| `PUT /bots/:name/drafts` | `BotComposerDraftRequest` | `BotComposerDraft` | Capability 71. Stores the newest draft, last write wins; the empty string is the clear. `updatedAt` moves strictly forward on every stored change, so it is the version a client orders two drafts by. Broadcasts `bot_draft_updated` unless the text is unchanged. `404 not_found` for a bot this gateway does not hold. |
 | `POST /bots/:name/clarifications/:clarifyId` | `BotClarifyResolveRequest` | `202 { outcome: "requested" }` | Durably requests a clarification option; the terminal event confirms it. |
 | `GET /bots/:name/memory` | — | `BotMemoryOverviewResponse` | Profile-local source health/capabilities only; the gateway never opens Hermes files or provider storage. |
 | `PATCH /bots/:name/memory/setup` | `BotMemorySetupRequest` | `BotMemoryOverviewResponse` | Applies the three credential-free Hermes settings through the attached profile and returns a fresh authoritative projection. |
@@ -1072,6 +1182,20 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
   Capability 51: `bot_group_state` may carry `pendingInteractions`, the same optional pointer array
   `BotGroup` carries, and a frame is emitted when one opens and when one settles so a client can
   badge the room without re-reading it.
+- `bot_draft_updated` (capability 71): the newest composer draft for one conversation on one
+  profile, `{ bot, sessionId, text, updatedAt }`. It is a full replace, never a delta, and the
+  empty string is the CLEAR that stops every other paired device offering a message already sent.
+  It carries no device id, because the draft belongs to the person and not to the phone that typed
+  it, and it is never sent to a peer, a runtime or a model. Safe to drop: the next
+  `GET /bots/:name/drafts?sessionId=` is the recovery read. `updatedAt` is its VERSION and moves
+  strictly forward on every stored change, even when the gateway clock repeats a millisecond or
+  steps backwards, so "which of these two is newer" always has an answer at the one moment it
+  matters: a send's clear racing the keystroke before it. A client applies a draft only when its
+  `updatedAt` is newer than the one it holds. A client may declare `com.cozylabs.bots` on the
+  `auth` frame; one that declares a version below 71 is not sent this frame at all, so a below-71
+  client is byte identical rather than receiving one frame it drops. A client that declares
+  nothing is sent it and ignores it, which is what every client shipped before the declaration
+  existed does.
 
 Frames are independently safe to drop where their schema says they are deltas or snapshots.
 Committed transcript history remains the recovery source after reconnect.

@@ -48,6 +48,36 @@ release; everything older is marked pre-release so installers resolve one "lates
   and stay green. The phone capability request lifecycle group (capability 68) is not enabled for
   this shape: `com.cozylabs.mobile-node` is a Hermes-Dashboard phone bridge capability a
   Hermes-free gateway correctly never advertises, not a suite gap.
+
+- Choosing which phone a capability request reaches, and one composer draft that follows the person
+  (`com.cozylabs.bots` capabilities 70 and 71, F3). Capability 70 adds
+  `GET`/`PUT /bots/:name/mobile-requests/preferred-device?sessionId=`, read at admission and nowhere
+  else. Which of a person's phones rings is the PERSON'S choice: the preference is written by a
+  device-authenticated client, no frame carries a target device, and a `mobile_request` that
+  includes `targetDeviceId` anyway has that one request refused with capability 68's own
+  `policy_blocked` and `request_policy_rejected`, while the socket and everything queued on it
+  survive, because a stale peer must not lose a live conversation over one removed routing hint. The
+  target is the conversation's stored choice when it still names a paired device, then the device
+  that opened the turn; from that moment capability 68's binding is unchanged, so the target never
+  moves and a second device attaching never becomes one. One stated exception: a CozyApp action is
+  answered on the device that tapped it and consults no preference, because a tap's answer belongs
+  on the screen that took it. A read or write naming a bot this gateway does not hold is
+  `404 not_found` rather than a `200` echoing something that was never stored.
+  Capability 71 adds `GET`/`PUT /bots/:name/drafts?sessionId=`
+  and the `bot_draft_updated` frame: one draft per profile and conversation, per person and never
+  per device, last write wins, the empty string is the clear a send writes immediately, and that
+  clear crosses devices, so a message sent on one phone can never still be offered on another. A
+  draft reaches no bot, peer, runtime or model, and its text is never logged, traced or measured;
+  the row does make an unsent draft durable server state, dropped with its conversation's history
+  and swept on the gateway's own periodic retention pass thirty days after it was last touched, so
+  an idle gateway forgets on the same schedule as a busy one. `updatedAt` moves strictly forward on
+  every stored change, so it is the version a client orders two drafts by and a slow write can
+  never put a sent message back on another phone. A client may now declare `com.cozylabs.bots` on
+  the `auth` frame; one declaring a version below 71 is not sent `bot_draft_updated` at all. Both rows are additive: EVERY peer of every backend is
+  byte identical to its pre-70 self, no frame gains a field, and a client that writes neither a
+  preference nor a draft behaves exactly as it did before. The attach plugin is unchanged in
+  behavior and Hermes needs no agent change.
+
 - Rooms on a gateway with two or more Hermes endpoints (`com.cozylabs.bots` capabilities 46 and 52,
   F8): such a gateway refused every room, including one whose members all lived on a single
   endpoint. A room is now hosted by the one host its membership resolves to. Every member on one

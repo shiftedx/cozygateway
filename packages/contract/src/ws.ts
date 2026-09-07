@@ -19,6 +19,7 @@ import {
   BotChatResetFrameSchema,
   BotChatStateFrameSchema,
   BotMobileReceiptFrameSchema,
+  BotDraftUpdatedFrameSchema,
   BotGroupFrameSchema,
   BotGroupStateFrameSchema,
   BotPresenceFrameSchema,
@@ -38,9 +39,14 @@ import {
 } from "./resources.ts";
 import { CozyAppsSnapshotFrameSchema, CozyAppActionFrameSchema } from "./cozyapps.ts";
 
+/** `capabilities` (capability 71) is what this client UNDERSTANDS, so the gateway can decline to
+ *  send a frame it would only drop. Optional, and its absence is what every client shipped before
+ *  it sends: a client that declares nothing is sent everything and ignores what it does not know,
+ *  which is this contract's own standing rule. A client that DOES declare is taken at its word. */
 export const AuthFrameSchema = Type.Object({
   type: Type.Literal("auth"),
   token: Type.String({ minLength: 1 }),
+  capabilities: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 0 }))),
 });
 export type AuthFrame = Static<typeof AuthFrameSchema>;
 
@@ -279,6 +285,7 @@ export const ServerFrameSchema = Type.Union([
   BotRosterFrameSchema,
   BotPresenceFrameSchema,
   BotMobileReceiptFrameSchema,
+  BotDraftUpdatedFrameSchema,
   BotChatFrameSchema,
   BotChatStateFrameSchema,
   BotChatDeltaFrameSchema,

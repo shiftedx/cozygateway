@@ -143,6 +143,32 @@ export function emitMobileNodeFailure(
     ...(fields.payloadSchemaValid === undefined ? {} : { payloadSchemaValid: fields.payloadSchemaValid }),
   });
 }
+/** Capability 70 (contract/ext-bots-v1.md row 70). WHERE the one target device comes from, and
+ *  nothing else. Row 68 still owns the binding: this runs ONCE, at admission, and everything after
+ *  it is unchanged, so the target never moves and a second device attaching never becomes one.
+ *
+ *  THE ONLY TWO SOURCES ARE THE PERSON'S. Their recorded choice for this conversation, then the
+ *  device that opened the turn. A PEER HAS NO INPUT HERE AND THERE IS NO PARAMETER FOR ONE: which
+ *  of somebody's phones rings is theirs to decide, not something a bot or a harness can name, and
+ *  no frame on this wire carries a field for one, so there is nothing to ignore here either.
+ *
+ *  A stored choice naming a device that is no longer paired is skipped rather than resolved,
+ *  because a target that cannot answer is worse than the turn origin it displaced. */
+export type MobileTargetDeviceSource = "preference" | "turn_origin" | "none";
+export function resolveMobileTargetDevice(input: {
+  preferred?: string | undefined;
+  turnOrigin?: string | undefined;
+  isPaired: (deviceId: string) => boolean;
+}): { deviceId: string | undefined; source: MobileTargetDeviceSource } {
+  const wellFormed = (value: string | undefined): value is string =>
+    typeof value === "string" && value.length >= 1 && value.length <= 256;
+  if (wellFormed(input.preferred) && input.isPaired(input.preferred))
+    return { deviceId: input.preferred, source: "preference" };
+  if (wellFormed(input.turnOrigin))
+    return { deviceId: input.turnOrigin, source: "turn_origin" };
+  return { deviceId: undefined, source: "none" };
+}
+
 interface MobileNodeInvocationBase {
   requestId: string;
   bot: string;
