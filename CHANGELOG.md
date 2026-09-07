@@ -7,6 +7,29 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## Unreleased
 
+- A group room's approval now carries its scoped-approval block, so a room ask can be answered
+  with the same scoped decision a 1:1 chat gets (`com.cozylabs.bots` capability 66, F4). The room
+  approval handler validated capability 56's `detail` and capability 62's `repair` and silently
+  dropped capability 66's `scope`, so a covered ask raised on a room turn reached the app as a
+  plain approval: no category, no change sentence, no standing grant to make or revoke. The block
+  is now sanitized once on ingest exactly as the 1:1 lane does, dropped on failure while the
+  approval is kept, and carried byte for byte on the room's `bot_approval_pending` frame, the
+  durable interaction record, the expiry payload, the `GET /bots/approvals` inbox row and the
+  rebroadcast a reconnecting app gets. Nothing else moved: a room approval was already the same
+  durable row the 1:1 lane writes, so the decision routes, the optional decision body, the grant
+  rules, the always-require refusals and the grants view and its `DELETE` already answered for a
+  room approval. A room still does not consult a standing grant before raising a card, which fails
+  closed: every room ask reaches the person. Additive, so a peer that sends no block and a client
+  below 66 are byte identical to their pre-66 selves, and a Hermes-raised room approval keeps
+  rendering the plain card.
+- The attach plugin can send a scope block with an approval it raises (F4). `send_approval` gained
+  an optional `scope` parameter, and the plugin classifies a Hermes tool call into capability 66's
+  closed category set from the tool name and the arguments it already reads for the capability-56
+  detail sentence, so a Hermes-raised approval, in a room or a 1:1 chat, can now carry the block
+  the app needs to offer scoped controls. Omitted when the gateway did not advertise
+  `com.cozylabs.bots >= 66` and when the call cannot be classified, so the plain deny-only card
+  stays exactly what it was.
+
 - The owner-loss lease no longer reaps a turn whose peer was lost mid model request
   (`com.cozylabs.bots` capability 69, F2). Capability 69 starts a 120 second lease the instant a
   peer's socket closes, and for a peer that was answering heartbeats right up to that instant,
