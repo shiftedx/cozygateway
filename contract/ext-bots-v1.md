@@ -326,10 +326,23 @@ having it follow whichever device happened to open the turn.
 RESOLUTION ORDER, first that resolves wins:
 
 ```text
-1. `targetDeviceId` on the attach-v1 `mobile_request` frame, when it names a device paired here
-2. the conversation's stored preferred device, when it names a device paired here
-3. the device that opened the turn (the pre-70 rule)
+1. the conversation's stored preferred device, when it names a device still paired here
+2. the device that opened the turn (the pre-70 rule)
 ```
+
+There is no third source, and in particular no peer input. WHICH OF A PERSON'S PHONES RINGS IS THE
+PERSON'S CHOICE. The preference is written by a device-authenticated client, and nothing a bot, a
+harness, a runtime or a Hermes plugin sends can name a target device: no frame carries such a
+field. A `mobile_request` that carries `targetDeviceId` anyway has that key STRIPPED at the ingress
+boundary, before validation, with one bounded log line naming only the closed command; the request
+is then admitted exactly as if the field had never been there. Stripping rather than refusing is
+deliberate, and it is the same instinct capability 56's `detail` and 62's `repair` follow: the
+closed key set would close the socket and lose a request a person is waiting on over a field that
+means nothing. The id a peer tried to name is NEVER logged, because it is the thing being refused
+rather than something to record.
+
+A stored choice whose device is no longer paired is SKIPPED rather than resolved, and admission
+falls through to the turn origin: a target that cannot answer is worse than the one it displaced.
 
 `GET /bots/:name/mobile-requests/preferred-device?sessionId=` is device authenticated and answers
 `BotMobilePreferredDevice`, `{ sessionId, deviceId?, deviceName?, updatedAt? }`, with everything but
@@ -345,14 +358,6 @@ ONCE ADMITTED, ROW 68 IS THE ONLY RULE. The resolved device is the record's `dev
 never moves, a second device attaching mid-request never becomes the target however recently the
 preference was written, a preference written after admission changes nothing about a request already
 admitted, and an answer from any other device is refused and logged rather than applied.
-
-The attach-v1 `mobile_request` frames gain optional `targetDeviceId` (1 to 256 characters), which a
-peer sends when the harness already knows which phone the person meant. It is UNVALIDATED ON THE
-WIRE and sanitized here, as capability 56's `detail` and 62's `repair` are: a malformed, oversized
-value, or one naming no paired device, is DROPPED with one bounded content-free log line and
-resolution falls through to the next source. It is never a reason to refuse the frame or close the
-socket, because a request a person is waiting on must not be lost over one routing hint. The field
-carries one paired device id and nothing else: no person, no token, no address, nothing measured.
 
 PEER-TYPE-AGNOSTIC, exactly as row 68's binding is. A Hermes-backed bot's request is admitted
 against a selected device by the same rule a runtime peer's is, because the binding is keyed to the
@@ -386,8 +391,17 @@ be offered for sending on another.
 
 A draft never reaches a bot, a peer, a runtime or a model. It is composer state this gateway holds
 for the person and hands back to their own devices; it rides no attach lane and no `bot_config`
-operation, and nothing about a Hermes-backed or a runtime-backed bot changes because of it. A draft
-is dropped when its conversation's history is, and an untouched draft is swept after thirty days.
+operation, and nothing about a Hermes-backed or a runtime-backed bot changes because of it.
+
+AN UNSENT DRAFT BECOMES DURABLE SERVER STATE, and that is stated here plainly because it is new.
+Before 71 a person's unsent words never left the phone they were typed on. After it, the gateway
+holds the newest text of each conversation's draft in the clear, in its own database, exactly as it
+already holds that conversation's messages. WHAT IS STORED is the text, the conversation, the
+profile and one timestamp. WHAT IS NOT is a device, an author, a history, an earlier version, or
+anything a peer could read. A draft is dropped when its conversation's history is, and an untouched
+draft is swept after thirty days, so an abandoned composer cannot hold a person's words forever.
+A DRAFT'S TEXT IS NEVER LOGGED: not in a log line, not in a trace, not in a metric, and not as a
+length either. The two routes and the one frame carry it, and nothing else does.
 
 ### Bot Activity composition
 

@@ -506,13 +506,14 @@ One-shot `location.current` additionally requires negotiated `mobile_location`; 
 { "kind": "mobile_request", "requestId": "...", "command": "location.current", "threadId": "...", "turnId": "...", "expiresAt": 0, "purpose": "Find nearby coffee" }
 ```
 
-Capability 70 (`contract/ext-bots-v1.md` row 70). Every `mobile_request` frame may carry optional
-`targetDeviceId`, a 1 to 256 character paired-device id naming the phone the harness already knows
-the person meant. It is UNVALIDATED ON THE WIRE and sanitized by the gateway the way `detail` and
-`repair` are: a malformed, oversized value, or one naming no device paired to that gateway, is
-DROPPED with one bounded content-free log line and the target falls back to the conversation's
-stored preferred device and then to the device that opened the turn. It is never a reason to refuse
-the frame or close the socket. Omitting it is the pre-70 frame, byte for byte.
+Capability 70 (`contract/ext-bots-v1.md` row 70) adds NOTHING to this frame. WHICH OF A PERSON'S
+PHONES A REQUEST REACHES IS THE PERSON'S CHOICE, recorded on their gateway and read at admission; no
+peer names a target device and no field here carries one. A frame that includes `targetDeviceId`
+anyway has that key STRIPPED at the ingress boundary before validation, with one bounded log line
+naming only the command, and the request is then admitted exactly as if it had never been there.
+Stripping rather than refusing is deliberate: the closed key set would otherwise close the socket
+and lose a request a person is waiting on over a field that means nothing. The id such a frame tried
+to name is never logged.
 
 Every mobile request `purpose` is a trimmed, normalized nonempty string no larger than 160 UTF-8 bytes and contains no
 C0/C1 control characters; invalid input is rejected rather than truncated. Status and location

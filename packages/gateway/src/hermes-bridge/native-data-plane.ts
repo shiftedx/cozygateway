@@ -50,7 +50,7 @@ import type {
 import type { AttachV1Ingress } from "../adapters/attach/ingress-v1.ts";
 import { blocksToText } from "../adapters/attach/blocks-to-text.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
-import { sanitizeApprovalDetail, sanitizeApprovalRepair, sanitizeApprovalScope, sanitizeMobileTargetDeviceId, type AttachV1EventFrame, type AttachV1MobileRequest } from "../adapters/attach/protocol-v1.ts";
+import { sanitizeApprovalDetail, sanitizeApprovalRepair, sanitizeApprovalScope, type AttachV1EventFrame, type AttachV1MobileRequest } from "../adapters/attach/protocol-v1.ts";
 import { resolveMobileTargetDevice, type MobileNodeBroker, type MobileNodeReceiptInput } from "../mobile-node.ts";
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import type { Storage } from "../storage.ts";
@@ -1039,7 +1039,7 @@ export class NativeBotDataPlane {
         this.#mobileNode?.reject(peer, frame.requestId);
         return;
       }
-      const { kind: _kind, targetDeviceId: _hinted, ...request } = frame;
+      const { kind: _kind, ...request } = frame;
       // A CozyApp action names the device it came from, which IS the selection: capability 70's
       // preference never overrides an origin the person just tapped on.
       this.#mobileNode?.invoke({ ...request, bot: key, agentId: peer, deviceId: privateOrigin.deviceId });
@@ -1053,19 +1053,16 @@ export class NativeBotDataPlane {
     // `kind` belongs to the attach envelope, not to the phone frame. Spreading the whole attach
     // frame carried it onto the wire, where the app requires an exact key set and silently drops
     // anything carrying an extra one. Strip it here, at the boundary it stops being meaningful.
-    const { kind: _kind, targetDeviceId: hinted, ...request } = frame;
-    // Capability 70. The ONE place the target is chosen. Row 68's binding is untouched from here
-    // on: what this resolves is what the record carries and the only device an answer may come
-    // from. A hint the peer sent that names no paired device is dropped with one bounded,
-    // content-free line rather than losing a request a person is waiting on.
+    const { kind: _kind, ...request } = frame;
+    // Capability 70. The ONE place the target is chosen, and both sources are the PERSON'S: their
+    // recorded choice for this conversation, then the device that opened the turn. The peer that
+    // sent this frame has no say in it. Row 68's binding is untouched from here on: what this
+    // resolves is what the record carries and the only device an answer may come from.
     const target = resolveMobileTargetDevice({
-      hinted: sanitizeMobileTargetDeviceId(hinted),
       preferred: this.#storage.botMobilePreferredDevice(key, frame.threadId).deviceId,
       turnOrigin: this.#turnOrigins.get(this.#nativeTurnKey(key, frame.threadId, frame.turnId)),
       isPaired: (deviceId) => this.#storage.listDevices().some((device) => device.id === deviceId),
     });
-    if (target.droppedHint)
-      emitTrace(this.#trace, "mobile_target_hint_dropped", { command: frame.command, source: target.source });
     this.#mobileNode?.invoke({ ...request, bot: key, agentId: peer, deviceId: target.deviceId });
   }
 

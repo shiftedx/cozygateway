@@ -2924,17 +2924,22 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * field, like every client, is byte identical to its pre-69 self. */
 /** Capability 70: a person chooses which of their paired phones a capability request goes to, per
  * conversation. `GET`/`PUT /bots/:name/mobile-requests/preferred-device?sessionId=` records the
- * choice, and the attach-v1 `mobile_request` frames may carry an optional `targetDeviceId` hint a
- * harness already knows. Both are read ONLY at admission, and capability 68's binding is otherwise
- * untouched: the target never moves, and a second device attaching never becomes one. An unpaired
- * or malformed hint is dropped and resolution falls through to the stored preference and then to
- * the device that opened the turn. Additive: a peer that sends no hint and a client that writes no
- * preference are byte identical to their pre-70 selves. */
+ * choice, which is read ONLY at admission and written by a device-authenticated client and by
+ * nothing else. NO PEER HAS ANY INPUT INTO WHICH PHONE RINGS: no frame carries a target device,
+ * and a `mobile_request` that includes one anyway has that key stripped at ingress with one
+ * bounded log line rather than being refused, so a request a person is waiting on is never lost
+ * over a field that means nothing. Capability 68's binding is otherwise untouched: the target
+ * never moves, and a second device attaching never becomes one. A stored choice naming a device
+ * that is no longer paired is skipped, and admission falls through to the device that opened the
+ * turn. Additive: every peer is byte identical to its pre-70 self, and a client that writes no
+ * preference gets the pre-70 binding. */
 /** Capability 71: a composer draft follows the person rather than the phone they typed it on.
  * `GET`/`PUT /bots/:name/drafts?sessionId=` holds one draft per profile and conversation, per
  * person and never per device, and a successful write broadcasts `bot_draft_updated` to every
  * paired device. The empty string is the CLEAR, written immediately rather than on the typing
  * debounce, which is what stops a message sent on one phone still being offered on another. A
- * draft never reaches a bot, a peer, a runtime or a model. Additive: a client below 71 keeps its
+ * draft never reaches a bot, a peer, a runtime or a model, and its text is never logged, traced or
+ * measured; the row does make an unsent draft DURABLE SERVER STATE, dropped with its conversation's
+ * history and swept after thirty days untouched. Additive: a client below 71 keeps its
  * own per-device draft and every peer of every backend is untouched. */
 export const BOTS_CAPABILITY_VERSION = 71;

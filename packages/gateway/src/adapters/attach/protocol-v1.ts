@@ -20,6 +20,8 @@ import {
   BotApprovalScopeSchema, type BotApprovalScope, check,
 } from "cozygateway-contract";
 
+import { emitTrace, type TraceLog } from "../../trace.ts";
+
 /** Stable attach-v1 data-plane contract. A peer dials /attach/v1 and completes hello negotiation
  * before either side accepts application frames. */
 const Id = Type.String({ minLength: 1, maxLength: 256 });
@@ -711,28 +713,45 @@ export type AttachV1HistoryResult = Static<typeof AttachV1HistoryResultSchema>;
 const AttachV1MobileStatusRequestSchema = Type.Object({
   kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("device.status"),
   threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
-  targetDeviceId: Type.Optional(Type.Unknown()),
 }, { additionalProperties: false });
 const AttachV1MobileLocationRequestSchema = Type.Object({
   kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("location.current"),
   threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
-  targetDeviceId: Type.Optional(Type.Unknown()),
 }, { additionalProperties: false });
-const AttachV1MobileCameraRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("camera.capture"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, camera: Type.Union([Type.Literal("front"), Type.Literal("rear")]), capture: Type.Union([Type.Literal("photo"), Type.Literal("video")]), videoDurationSeconds: Type.Literal(10), targetDeviceId: Type.Optional(Type.Unknown()) }, { additionalProperties: false });
-const AttachV1MobileFileRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("file.pick"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, selection: Type.Union([Type.Literal("photo"), Type.Literal("file")]), targetDeviceId: Type.Optional(Type.Unknown()) }, { additionalProperties: false });
-const AttachV1MobileNotificationRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("notification.present"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, title: Type.String({ minLength: 1, maxLength: 80 }), body: Type.String({ minLength: 1, maxLength: 240 }), targetDeviceId: Type.Optional(Type.Unknown()) }, { additionalProperties: false });
+const AttachV1MobileCameraRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("camera.capture"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, camera: Type.Union([Type.Literal("front"), Type.Literal("rear")]), capture: Type.Union([Type.Literal("photo"), Type.Literal("video")]), videoDurationSeconds: Type.Literal(10) }, { additionalProperties: false });
+const AttachV1MobileFileRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("file.pick"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, selection: Type.Union([Type.Literal("photo"), Type.Literal("file")]) }, { additionalProperties: false });
+const AttachV1MobileNotificationRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("notification.present"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, title: Type.String({ minLength: 1, maxLength: 80 }), body: Type.String({ minLength: 1, maxLength: 240 }) }, { additionalProperties: false });
 export const AttachV1MobileRequestSchema = Type.Union([AttachV1MobileStatusRequestSchema, AttachV1MobileLocationRequestSchema, AttachV1MobileCameraRequestSchema, AttachV1MobileFileRequestSchema, AttachV1MobileNotificationRequestSchema]);
 export type AttachV1MobileRequest = Static<typeof AttachV1MobileRequestSchema>;
-/** Capability 70. The sole authority on `mobile_request.targetDeviceId`. UNTYPED on the wire for
- *  the same reason capability 69's `activeTurns` is: a schema failure here would refuse a phone
- *  capability request a person is waiting on, or close the socket, over one routing hint. Anything
- *  malformed or oversized degrades to `undefined`, and the gateway falls back to the conversation's
- *  stored preferred device and then to the device that opened the turn. Whether the id names a
- *  device that is actually paired is decided later, at admission, where the pairing is known. */
-export function sanitizeMobileTargetDeviceId(value: unknown): string | undefined {
-  if (typeof value !== "string" || value.length < 1 || value.length > 256) return undefined;
-  return value;
+/** Capability 70. WHICH OF A PERSON'S PHONES RINGS IS THE PERSON'S CHOICE, recorded on the gateway
+ *  and read at admission. A peer has no say in it, so `targetDeviceId` is not part of this wire.
+ *
+ *  A frame that carries one anyway is not REFUSED, because the closed key set would close the
+ *  socket and lose a phone capability request a person is waiting on over a field that means
+ *  nothing. It is STRIPPED here, before validation, with one bounded content-free line, and the
+ *  request is admitted exactly as if it had never been there. The id a peer tried to name is never
+ *  logged: it is the thing being refused, not something to record.
+ *
+ *  Returns the frame unchanged, and writes no line, when there is nothing to strip. */
+export function stripPeerDeviceHint(
+  frame: unknown, trace?: TraceLog,
+): unknown {
+  if (typeof frame !== "object" || frame === null) return frame;
+  const record = frame as Record<string, unknown>;
+  if (record["kind"] !== "mobile_request" || !("targetDeviceId" in record)) return frame;
+  const { targetDeviceId: _ignored, ...rest } = record;
+  emitTrace(trace, "mobile_peer_device_hint_ignored", {
+    command: typeof record["command"] === "string" && MOBILE_HINT_COMMANDS.has(record["command"])
+      ? record["command"]
+      : "unknown",
+  });
+  return rest;
 }
+
+/** The closed command set the ignore line may name, so no peer string reaches a log. */
+const MOBILE_HINT_COMMANDS = new Set([
+  "device.status", "location.current", "camera.capture", "file.pick", "notification.present",
+]);
 
 export const AttachV1MobileCancelSchema = Type.Object({ kind: Type.Literal("mobile_cancel"), requestId: Id }, { additionalProperties: false });
 export type AttachV1MobileCancel = Static<typeof AttachV1MobileCancelSchema>;

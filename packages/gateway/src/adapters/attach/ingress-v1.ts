@@ -26,6 +26,7 @@ import {
   AttachV1MemoryResultSchema,
   AttachV1MobileCancelSchema,
   AttachV1MobileRequestSchema,
+  stripPeerDeviceHint,
   AttachV1MobileResultSchema,
   type AttachV1Capability,
   type AttachV1ClientFrame,
@@ -250,6 +251,11 @@ export class AttachV1Ingress implements TurnEndpoint {
         this.#refuse(agentId, socket, "hello", `unsupported hello version ${helloVersion}, this gateway speaks hello version 2 only`);
         return;
       }
+      // Capability 70. A peer has no say in which of a person's phones rings, so a
+      // `targetDeviceId` is stripped BEFORE validation: leaving it to the closed key set would
+      // close the socket and lose a request a person is waiting on over a field that means
+      // nothing. One bounded line, no value, and the request goes on as if it were never there.
+      decoded = stripPeerDeviceHint(decoded, this.#trace);
       if (!check(AttachV1ClientFrameSchema, decoded)) {
         // A dropped frame used to be invisible on both ends: the peer waits forever for a reply
         // that will never come, and no log says why. Name the offending field and close, so a

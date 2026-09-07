@@ -138,7 +138,7 @@ describe("capability-70 explicit device selection", () => {
     };
     const stripped = stripPeerDeviceHint(frame, (line) => lines.push(line));
 
-    expect("targetDeviceId" in stripped).toBe(false);
+    expect("targetDeviceId" in (stripped as Record<string, unknown>)).toBe(false);
     expect(stripped).toEqual({
       kind: "mobile_request", requestId: "req-1", command: "device.status",
       threadId: "thread-1", turnId: "turn-1", expiresAt: 20_000,
