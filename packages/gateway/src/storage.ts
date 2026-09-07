@@ -912,10 +912,14 @@ CREATE TABLE IF NOT EXISTS observe_identity (
 -- Which snapshots have already been folded into the lifetime counters below. Those counters are
 -- additive and are never trimmed, so a snapshot folded twice would inflate a token and cost figure
 -- permanently with nothing able to correct it. The claim and the addition share one transaction.
+-- Bounded the same way the ring is: the nightly pass trims a claim once it is older than the
+-- retention window, and the ring refuses to fold a snapshot that old in the first place, so the two
+-- together hold the no-double-count property for all time without an ever-growing ledger.
 CREATE TABLE IF NOT EXISTS observe_lifetime_folds (
   snapshot_id TEXT PRIMARY KEY,
   at INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS observe_lifetime_folds_age ON observe_lifetime_folds (at);
 CREATE TABLE IF NOT EXISTS observe_lifetime (
   bot TEXT NOT NULL,
   model TEXT NOT NULL,

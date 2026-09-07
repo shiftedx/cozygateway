@@ -206,7 +206,7 @@ describe("the ring's retention", () => {
     storage.observe.event("turn_terminal", clock - 8 * DAY, id("luna"), id("old-turn"), { status: "completed" });
     storage.observe.event("turn_terminal", clock - 1 * DAY, id("luna"), id("new-turn"), { status: "completed" });
 
-    expect(observe.trim(clock)).toEqual({ series: 1, events: 1, complete: true });
+    expect(observe.trim(clock)).toEqual({ series: 1, events: 1, folds: 0, complete: true });
     const survivors = storage.observe.samples({ series: "turn_ms", from: 0, to: clock + 1 });
     expect(survivors).toHaveLength(1);
     expect(survivors[0]?.value).toBe(200);
@@ -230,17 +230,57 @@ describe("the ring's retention", () => {
 
   it("still trims when the flag was turned off after rows were written", () => {
     storage.observe.sample("turn_ms", id("luna"), clock - 30 * DAY, 100);
-    expect(ring(false, 7).trim(clock)).toEqual({ series: 1, events: 0, complete: true });
+    expect(ring(false, 7).trim(clock)).toEqual({ series: 1, events: 0, folds: 0, complete: true });
   });
 
   it("never trims the lifetime table the ring sits beside", () => {
     const observe = ring();
-    observe.accumulateLifetime({ snapshotId: "s1", bot: "luna", model: "qwen3", prompt: 10, completion: 5, cached: 2, costMicros: 7, turns: 1, at: clock - 400 * DAY });
+    observe.accumulateLifetime({ snapshotId: "s1", bot: "luna", model: "qwen3", prompt: 10, completion: 5, cached: 2, costMicros: 7, turns: 1, at: clock - 6 * DAY });
     observe.accumulateLifetime({ snapshotId: "s2", bot: "luna", model: "qwen3", prompt: 1, completion: 1, cached: 0, costMicros: 1, turns: 1, at: clock });
+    // Every series row those folds wrote ages out; the lifetime counters they fed do not.
     observe.trim(clock);
     expect(storage.observe.lifetime(id("luna"))).toEqual([
       { bot: id("luna"), model: id("qwen3"), prompt: 11, completion: 6, cached: 2, costMicros: 8, turns: 2, updatedAt: clock },
     ]);
+  });
+
+  it("ages the replay ledger out on the ring's own window, batched and counted with the rest", () => {
+    const observe = ring(true, 7);
+    // Inside the window.
+    expect(observe.accumulateLifetime({ snapshotId: "fresh", bot: "luna", model: "qwen3", prompt: 10, completion: 1, cached: 0, costMicros: 1, turns: 1, at: clock - 1 * DAY })).toBe(true);
+    // Written a fortnight ago, which the trim below is about to reach.
+    storage.observe.accumulateLifetime({ snapshotId: id("stale"), bot: id("luna"), model: id("qwen3"), prompt: 5, completion: 1, cached: 0, costMicros: 1, turns: 1, at: clock - 14 * DAY });
+    expect(storage.observe.lifetimeFoldCount()).toBe(2);
+
+    const pass = observe.trim(clock);
+    expect(pass.folds).toBe(1);
+    expect(pass.complete).toBe(true);
+    expect(storage.observe.lifetimeFoldCount()).toBe(1);
+
+    // The claim inside the window survives, so replaying that snapshot is still refused BY THE
+    // LEDGER: the claim is there and the addition is a no-op.
+    expect(observe.accumulateLifetime({ snapshotId: "fresh", bot: "luna", model: "qwen3", prompt: 10, completion: 1, cached: 0, costMicros: 1, turns: 1, at: clock - 1 * DAY })).toBe(false);
+    // The claim outside it is gone, and replaying THAT snapshot is refused BY ITS AGE instead: a
+    // snapshot older than the ring is refused before the ledger is ever consulted, which is what
+    // makes trimming the claim safe rather than a reopened replay.
+    expect(observe.accumulateLifetime({ snapshotId: "stale", bot: "luna", model: "qwen3", prompt: 5, completion: 1, cached: 0, costMicros: 1, turns: 1, at: clock - 14 * DAY })).toBe(false);
+    // Neither refusal touched the counters, and nothing was double counted.
+    expect(storage.observe.lifetime(id("luna"))[0]).toMatchObject({ prompt: 15, turns: 2 });
+    expect(storage.observe.lifetimeFoldCount()).toBe(1);
+  });
+
+  it("bounds the ledger trim the same way and reports an incomplete pass", () => {
+    const observe = ring(true, 7);
+    for (let index = 0; index < 5_050; index += 1) {
+      storage.observe.accumulateLifetime({
+        snapshotId: id(`old-${index}`), bot: id("luna"), model: id("qwen3"),
+        prompt: 1, completion: 0, cached: 0, costMicros: 0, turns: 0, at: clock - 30 * DAY,
+      });
+    }
+    const pass = observe.trim(clock);
+    expect(pass.folds).toBe(5_050);
+    expect(pass.complete).toBe(true);
+    expect(storage.observe.lifetimeFoldCount()).toBe(0);
   });
 });
 
@@ -573,6 +613,16 @@ describe("the fold-in seam D5 calls", () => {
     expect(observe.foldSnapshotIntoSeries("pixel", snapshot)).toEqual({ folded: 4, skipped: 0 });
     expect(storage.observe.summarize({ series: "model_step_ms", bot: id("luna"), from: 0, to: clock + 1 }).count).toBe(3);
     expect(storage.observe.summarize({ series: "model_step_ms", bot: id("pixel"), from: 0, to: clock + 1 }).count).toBe(2);
+  });
+
+  it("refuses a snapshot older than the ring, so trimming its claim can never reopen a replay", () => {
+    const observe = ring(true, 7);
+    const fold = { snapshotId: "ancient", bot: "luna", model: "qwen3", prompt: 100, completion: 20, cached: 5, costMicros: 9, turns: 1, at: clock - 8 * DAY };
+    expect(observe.accumulateLifetime(fold)).toBe(false);
+    expect(storage.observe.lifetime()).toHaveLength(0);
+    expect(storage.observe.lifetimeFoldCount()).toBe(0);
+    // A snapshot that old describes a turn that ended a week ago; no producer still holds one.
+    expect(observe.accumulateLifetime({ ...fold, at: clock - 7 * DAY + 1 })).toBe(true);
   });
 
   it("never adds a replayed snapshot twice to the lifetime counters, which nothing can correct", () => {

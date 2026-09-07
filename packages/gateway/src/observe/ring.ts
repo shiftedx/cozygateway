@@ -358,8 +358,19 @@ export class ObservationRing {
 
   /** Section 12's lifetime counters, outside the ring and never trimmed.
    *
-   *  `snapshotId` is the replay guard, enforced durably by the store: these counters are additive and
-   *  nothing downstream can correct an inflated one. */
+   *  Two guards, because these counters are additive and nothing downstream can correct an inflated
+   *  one, and because neither guard alone holds for all time:
+   *
+   *  1. `snapshotId` is claimed durably in the store's ledger, so a snapshot folded twice, including
+   *     across a restart, adds once.
+   *  2. A snapshot whose own timestamp is older than the retention window is REFUSED OUTRIGHT. The
+   *     ledger is trimmed on the ring's window (it is the one table here that would otherwise grow
+   *     forever, one row per snapshot), and trimming a claim would reopen the replay it was
+   *     preventing. This closes that: past the window there is no claim to check and nothing to
+   *     check it for, because the snapshot is refused on its age instead. A snapshot that old
+   *     describes a turn that ended a week ago and is not something any producer still holds.
+   *
+   *  Returns false for a refusal of either kind, so a caller can tell a replay from an addition. */
   accumulateLifetime(input: {
     snapshotId: string;
     bot: string;
@@ -372,6 +383,7 @@ export class ObservationRing {
     at: number;
   }): boolean {
     if (!this.#enabled) return false;
+    if (this.#now() - input.at > this.#retentionDays * 86_400_000) return false;
     return this.#store.accumulateLifetime({
       ...input,
       snapshotId: this.#store.identify(input.snapshotId),
@@ -429,7 +441,7 @@ export class ObservationRing {
 
   /** The nightly trim. Runs even when the ring is disabled: an operator who turns observability off
    *  should watch the rows it already wrote age out, not keep them forever. */
-  trim(nowMs: number = this.#now()): { series: number; events: number; complete: boolean } {
+  trim(nowMs: number = this.#now()): { series: number; events: number; folds: number; complete: boolean } {
     return this.#store.trim(nowMs - this.#retentionDays * 86_400_000);
   }
 

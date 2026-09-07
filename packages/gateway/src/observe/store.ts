@@ -170,21 +170,32 @@ export class ObserveStore {
     return true;
   }
 
-  /** Deletes everything older than the cutoff from both tables, in bounded batches.
+  /** Deletes everything older than the cutoff from the ring, in bounded batches.
+   *
+   *  Three tables, not two. `observe_lifetime_folds` is the replay ledger behind
+   *  `accumulateLifetime`, and it is the one table here whose rows are neither a measurement nor
+   *  bounded by anything else: left alone it grows by one row per snapshot forever, which is the
+   *  only unbounded thing the packet would have shipped. It ages out on the same window as the ring,
+   *  and the ring refuses to fold a snapshot older than that window at all, so the pair holds the
+   *  no-double-count property for all time without an ever-growing ledger.
    *
    *  Returns the row counts so the maintenance pass can say what it reclaimed rather than only that
-   *  it ran, and `complete` so a caller can tell "nothing left" from "hit the cap, more next hour". */
-  trim(before: number): { series: number; events: number; complete: boolean } {
+   *  it ran, and `complete` so a caller can tell "nothing left" from "hit the cap, more next hour".
+   *  `complete` covers every table: a pass that capped out on any one of them is not complete. */
+  trim(before: number): { series: number; events: number; folds: number; complete: boolean } {
     const cutoff = Math.trunc(before);
     let series = 0;
     let events = 0;
+    let folds = 0;
     let complete = true;
-    for (const [table, add] of [
-      ["observe_series", (rows: number) => { series += rows; }],
-      ["observe_events", (rows: number) => { events += rows; }],
+    for (const [table, key, add] of [
+      ["observe_series", "rowid", (rows: number) => { series += rows; }],
+      ["observe_events", "rowid", (rows: number) => { events += rows; }],
+      // WITHOUT ROWID, so the batch is taken by its primary key instead.
+      ["observe_lifetime_folds", "snapshot_id", (rows: number) => { folds += rows; }],
     ] as const) {
       const statement = this.#db.prepare(
-        `DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE at < ? LIMIT ?)`,
+        `DELETE FROM ${table} WHERE ${key} IN (SELECT ${key} FROM ${table} WHERE at < ? LIMIT ?)`,
       );
       let batches = 0;
       for (;;) {
@@ -198,7 +209,15 @@ export class ObserveStore {
         }
       }
     }
-    return { series, events, complete };
+    return { series, events, folds, complete };
+  }
+
+  /** How many replay claims the ledger currently holds. For the trim's own tests; nothing in the
+   *  gateway reads it. */
+  lifetimeFoldCount(): number {
+    return Number((this.#db
+      .prepare("SELECT COUNT(*) AS n FROM observe_lifetime_folds")
+      .get() as unknown as { n: number }).n);
   }
 
   /** p50, p95 and the sample count over one window, for one series and optionally one bot.

@@ -82,7 +82,10 @@ release; everything older is marked pre-release so installers resolve one "lates
   system. Two capped SQLite tables now hold it: `observe_series (series, bot, at, value)` and
   `observe_events (at, kind, bot, ref, detail_json)`, both trimmed to
   `observability.retentionDays` (7 by default) by a periodic pass that starts and stops with the
-  process. Written from the hooks that already fire: the app websocket heartbeat's ping-to-pong per
+  process. The same pass ages out the replay ledger behind the lifetime token counters, which is the
+  one table here that would otherwise grow by a row per snapshot forever; a snapshot older than the
+  window is refused on its age instead, so trimming a claim cannot reopen the double count it was
+  preventing. Written from the hooks that already fire: the app websocket heartbeat's ping-to-pong per
   device tagged `tunnel` or `lan` from the request's origin, the attach heartbeat's request-to-ack
   per peer, turn admission to dispatch and terminal to broadcast, first delta, turn duration, delta
   frame count, attach online, queue, dead letter and outbox depths, dead letters, push relay
