@@ -70,6 +70,12 @@ export class Tasks {
       db.exec("CREATE TABLE task_reply_pushes (task_id TEXT NOT NULL REFERENCES tasks(task_id), run_id TEXT NOT NULL, device_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('scheduled', 'sent')), pushed_at INTEGER NOT NULL, PRIMARY KEY(task_id, run_id, device_id)) STRICT");
     }
     db.exec("CREATE INDEX IF NOT EXISTS task_reply_pushes_expiry ON task_reply_pushes(state, pushed_at)");
+    // Task reads must not decode a peer's entire event history for every Run. Install before
+    // restoring Tasks below; the partial index also bounds work on existing databases at boot.
+    db.exec(`CREATE INDEX IF NOT EXISTS attach_event_inbox_task_children ON attach_event_inbox (
+      agent_id, json_extract(frame_json, '$.event.threadId'),
+      json_extract(frame_json, '$.event.turnId'), sequence
+    ) WHERE disposition = 'accepted' AND json_extract(frame_json, '$.event.kind') = 'delegation'`);
     // Legacy peers omitted deadlines. Preserve a first-seen bound across restart and replay.
     db.exec(`UPDATE bot_native_interactions SET expires_at = COALESCE((
       SELECT MIN(received_at) FROM attach_event_inbox WHERE disposition = 'accepted'
@@ -493,7 +499,8 @@ export class Tasks {
   }
 
   #children(run: RunRow): Array<TaskView["children"][number] & { count: number }> {
-    const rows = this.#db.prepare("SELECT frame_json AS json FROM attach_event_inbox WHERE agent_id = ? AND disposition = 'accepted' AND json_extract(frame_json, '$.event.kind') = 'delegation' AND json_extract(frame_json, '$.event.threadId') = ? AND json_extract(frame_json, '$.event.turnId') = ? ORDER BY sequence").all(run.peer, run.sessionId, run.runId) as unknown as { json: string }[];
+    // Without statistics SQLite may prefer the peer-only primary key even with this index.
+    const rows = this.#db.prepare("SELECT frame_json AS json FROM attach_event_inbox INDEXED BY attach_event_inbox_task_children WHERE agent_id = ? AND disposition = 'accepted' AND json_extract(frame_json, '$.event.kind') = 'delegation' AND json_extract(frame_json, '$.event.threadId') = ? AND json_extract(frame_json, '$.event.turnId') = ? ORDER BY sequence").all(run.peer, run.sessionId, run.runId) as unknown as { json: string }[];
     const children = new Map<string, TaskView["children"][number] & { count: number }>();
     for (const row of rows) {
       const event = (JSON.parse(row.json) as AttachV1EventFrame).event;
