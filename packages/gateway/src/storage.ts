@@ -868,12 +868,12 @@ CREATE TABLE IF NOT EXISTS runner_operations (
 CREATE INDEX IF NOT EXISTS runner_operations_bot ON runner_operations (bot, created_at DESC);
 -- The observation ring (dashboard packet D2). Two capped tables holding what the gateway already
 -- measures once per turn, per heartbeat and per sweep and used to throw away. Written only when
--- config `observability.enabled` is on, trimmed to `observability.retentionDays` by the nightly
+-- config observability.enabled is on, trimmed to observability.retentionDays by the nightly
 -- maintenance pass, and governed by one rule enforced in observe/store.ts rather than at the call
 -- sites: no message text, no transcript, no url, path, query or body, no token. Tool names, reason
 -- codes, hashes, counts and durations only, the same rule the guardrail audit log follows.
 --
--- `series` carries its qualifier inline (`device_rtt_ms|tunnel`) because the row shape is four
+-- The series column carries its qualifier inline (device_rtt_ms|tunnel) because the row shape is four
 -- columns by design and a fifth label column would invite free text into exactly the place the
 -- privacy rule is hardest to police. Both qualifiers are closed enums.
 CREATE TABLE IF NOT EXISTS observe_series (
