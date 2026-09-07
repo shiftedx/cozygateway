@@ -31,7 +31,14 @@ release; everything older is marked pre-release so installers resolve one "lates
   detail sentence, so a Hermes-raised approval, in a room or a 1:1 chat, can now carry the block
   the app needs to offer scoped controls. Omitted when the gateway did not advertise
   `com.cozylabs.bots >= 66` and when the call cannot be classified, so the plain deny-only card
-  stays exactly what it was.
+  stays exactly what it was. An action the classifier cannot place emits NO block rather than
+  declaring `other`: `other` is the one category a standing category grant can cover, so answering
+  it for an unplaced call would unlock exactly the grant row 66 withholds from a plain ask, and
+  `terminal:rm` places where `terminal:rmdir` and `bank:wire` do not. The `change` sentence is
+  COMPOSED from the action and the resource rather than copied from the harness description, which
+  on the answerable surface carries the call's arguments and absolute paths; an action identity
+  carrying a URL, a path, whitespace or an assignment is refused outright, since the identity is the
+  only thing that reaches a wire string.
 
 - The owner-loss lease no longer reaps a turn whose peer was lost mid model request
   (`com.cozylabs.bots` capability 69, F2). Capability 69 starts a 120 second lease the instant a

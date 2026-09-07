@@ -57,7 +57,7 @@ class ApprovalScopeClassifierTests(unittest.TestCase):
         self.assertEqual(scope["category"], "destructive")
         self.assertEqual(scope["system"], "terminal")
         self.assertEqual(scope["action"], "terminal:rm")
-        self.assertEqual(scope["change"], "delete the build directory")
+        self.assertEqual(scope["change"], "Run terminal:rm on rm in terminal.")
         self.assertEqual(scope["effects"], [])
         self.assertEqual(scope["reason"], "peer_policy")
         self.assertEqual(scope["retry"], "unknown")
@@ -69,7 +69,7 @@ class ApprovalScopeClassifierTests(unittest.TestCase):
             "effects", "reason", "payloadHash", "expiresAt", "retry", "requested",
         })
 
-    def test_every_closed_category_is_reachable_from_a_real_call(self):
+    def test_every_placeable_category_is_reachable_from_a_real_call(self):
         cases = {
             "money_movement": _kwargs(pattern_key="stripe:create_charge", command="charge 40", description="charge the card"),
             "secret_access": _kwargs(pattern_key="keychain:read_secret", command="read", description="read one stored credential"),
@@ -77,13 +77,33 @@ class ApprovalScopeClassifierTests(unittest.TestCase):
             "lock_or_alarm": _kwargs(pattern_key="home:unlock_door", command="unlock", description="unlock the front door"),
             "public_publishing": _kwargs(pattern_key="social:publish_post", command="post", description="publish a post"),
             "account_change": _kwargs(pattern_key="admin:change_account_role", command="promote", description="change an account role"),
-            "other": _kwargs(pattern_key="workspace:write_file", command="write", description="append one line"),
         }
         for expected, payload in cases.items():
             with self.subTest(category=expected):
                 scope = adapter_module.classify_approval_scope(payload, now_ms=NOW_MS)
                 self.assertIsNotNone(scope)
                 self.assertEqual(scope["category"], expected)
+
+    def test_an_action_this_plugin_cannot_place_declares_nothing_rather_than_other(self):
+        """`other` is the ONE category a standing category grant can cover, so it can never be the
+        answer to "I do not know what this is". A plain ask is: it declares no category, the gateway
+        refuses a category grant over it (409 approval_category_undeclared), and only the person's
+        own single-use grant on the derived binding can ever cover one."""
+        for identity in ("terminal:rmdir", "fs:unlink", "terminal:dd", "terminal:chmod",
+                         "k8s:drain_node", "github:force_push", "bank:wire",
+                         "email:sendgrid_dispatch", "workspace:write_file"):
+            with self.subTest(action=identity):
+                self.assertIsNone(adapter_module.classify_approval_scope(
+                    _kwargs(pattern_key=identity), now_ms=NOW_MS))
+
+    def test_no_emitted_block_ever_declares_other(self):
+        for identity in ("stripe:create_charge", "terminal:rm", "home:unlock_door",
+                         "social:publish_post", "admin:change_account_role",
+                         "keychain:read_secret"):
+            scope = adapter_module.classify_approval_scope(_kwargs(pattern_key=identity),
+                                                           now_ms=NOW_MS)
+            self.assertIsNotNone(scope)
+            self.assertNotEqual(scope["category"], "other")
 
     def test_a_call_it_cannot_place_carries_no_block_at_all(self):
         """Fails closed: no block is the plain pre-66 card, which is correct, not degraded."""
@@ -92,10 +112,39 @@ class ApprovalScopeClassifierTests(unittest.TestCase):
         self.assertIsNone(adapter_module.classify_approval_scope(
             _kwargs(pattern_key="", tool_name="", description=""), now_ms=NOW_MS))
 
+    def test_the_change_sentence_is_composed_and_never_the_harness_description(self):
+        """Row 66: `change` and `effects` describe an action, they never carry its arguments.
+
+        Hermes descriptions on the answerable surface DO carry them: the write guard builds
+        "Write to protected agent-instruction file(s): <absolute paths>." So the sentence is
+        composed from the action and the resource this plugin derived, and the harness's own
+        description is never copied onto the wire.
+        """
+        scope = adapter_module.classify_approval_scope(_kwargs(
+            pattern_key="fs:delete_protected",
+            description=("Write to protected agent-instruction file(s): "
+                         "/Users/someone/notes/AGENTS.md, see https://example.invalid/a?token=AKIAsecretvalue"),
+        ), now_ms=NOW_MS)
+        self.assertIsNotNone(scope)
+        for banned in ("AGENTS.md", "https://", "AKIAsecretvalue", "/Users/"):
+            self.assertNotIn(banned, json.dumps(scope))
+        self.assertEqual(scope["change"],
+                         "Run fs:delete_protected on delete_protected in fs.")
+
+    def test_an_action_identity_that_looks_like_an_argument_is_refused_outright(self):
+        """The identity is the only thing that reaches a wire string, so it is the only thing that
+        has to be checked. Anything carrying a URL, a path, a whitespace run or an assignment is not
+        a rule name, and a block built from one could carry a value. No block is the answer."""
+        for identity in ("https://example.invalid/x", "terminal:rm /Users/someone/notes",
+                         "fs:write token=AKIAsecretvalue", "terminal:rm --key=abc"):
+            with self.subTest(action=identity):
+                self.assertIsNone(adapter_module.classify_approval_scope(
+                    _kwargs(pattern_key=identity), now_ms=NOW_MS))
+
     def test_no_wire_string_ever_carries_the_command_or_its_arguments(self):
         secret = "AKIAsecretvalue"
         scope = adapter_module.classify_approval_scope(_kwargs(
-            pattern_key="aws:put_object",
+            pattern_key="s3:publish_object",
             command=f"aws s3 cp ./x s3://bucket --key {secret}",
             description="upload one object",
             arguments={"token": secret, "url": "https://example.invalid/x?token=" + secret},
@@ -116,7 +165,7 @@ class ApprovalScopeClassifierTests(unittest.TestCase):
 
     def test_every_string_stays_inside_the_contract_bounds(self):
         scope = adapter_module.classify_approval_scope(_kwargs(
-            pattern_key="x" * 400, description="d" * 900), now_ms=NOW_MS)
+            pattern_key="publish_" + "x" * 400, description="d" * 900), now_ms=NOW_MS)
         self.assertIsNotNone(scope)
         self.assertLessEqual(len(scope["action"]), 64)
         self.assertLessEqual(len(scope["system"]), 64)

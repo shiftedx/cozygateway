@@ -5324,8 +5324,18 @@ def _approval_action_identity(kwargs: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _approval_category(action: str) -> str:
-    """Place one action identity in capability 66's closed category set."""
+def _approval_category(action: str) -> Optional[str]:
+    """Place one action identity in capability 66's closed category set, or answer ``None``.
+
+    ``None`` means THIS PLUGIN CANNOT SAY, and it is deliberately not `other`. `other` is the one
+    category a standing CATEGORY grant can ever cover, so answering it for an action nobody placed
+    would unlock exactly the grant row 66 withholds from a plain ask, and for the same stated
+    reason: "a standing category policy over one would silently pre-approve a destructive or
+    publishing action nobody classified". `terminal:rm` places; `terminal:rmdir`, `fs:unlink` and
+    `bank:wire` do not, and a card offering "Always allow" over one of those is the failure this
+    guards. An unplaced call emits no block at all, which leaves the plain pre-66 card and the
+    person's own single-use grant on the derived binding as the only coverage there can be.
+    """
     haystack = re.sub(r"[^a-z0-9]+", "_", action.lower())
     tokens = {token for token in haystack.split("_") if token}
     for category, markers in _APPROVAL_CATEGORY_MARKERS:
@@ -5335,7 +5345,18 @@ def _approval_category(action: str) -> str:
             # matched loosely would classify half the catalogue as destructive.
             if marker in tokens or (len(marker) >= 6 and marker in haystack):
                 return category
-    return "other"
+    return None
+
+
+#: An action identity is the ONLY thing that reaches a wire string, so it is the only thing that has
+#: to be checked for one. A rule name has no whitespace, no scheme, no path separator and no
+#: assignment in it; anything that does is carrying a value, and row 66 forbids a URL, a path, a
+#: credential or an env value in any of these strings.
+_UNSAFE_IDENTITY = re.compile(r"[\s=/\\]|://|\.\.")
+
+
+def _is_wire_safe_identity(action: str) -> bool:
+    return not _UNSAFE_IDENTITY.search(action)
 
 
 def _approval_payload_hash(kwargs: Dict[str, Any], action: str) -> str:
@@ -5373,7 +5394,10 @@ def classify_approval_scope(
       every Hermes approval gets today. Failing to classify FAILS CLOSED.
     """
     action_identity = _approval_action_identity(kwargs)
-    if action_identity is None:
+    if action_identity is None or not _is_wire_safe_identity(action_identity):
+        return None
+    category = _approval_category(action_identity)
+    if category is None:
         return None
     system, _, remainder = action_identity.partition(":")
     if not remainder:
@@ -5381,19 +5405,22 @@ def classify_approval_scope(
         # harness itself rather than to a named external system.
         server, sep, tool = action_identity.partition("__")
         system, remainder = (server, tool) if sep else ("hermes", action_identity)
-    description = kwargs.get("description")
-    change = description.strip() if isinstance(description, str) and description.strip() else None
-    if change is None:
-        change = f"run {action_identity}"
+    resource = (remainder or action_identity)
+    # COMPOSED, never copied. Hermes' own description is a fine sentence for a person and a bad one
+    # for this field: on the answerable surface it carries the call's arguments (the write guard
+    # builds "Write to protected agent-instruction file(s): <absolute paths>."), and row 66 says
+    # `change` describes an action and never carries its arguments. So the sentence is built from
+    # the two identifiers this plugin already vouched for and nothing else.
+    change = f"Run {action_identity} on {resource} in {system or 'hermes'}."
     return {
         "kind": "scoped_approval",
         "action": action_identity[:64],
-        "category": _approval_category(action_identity),
+        "category": category,
         "system": (system or "hermes")[:64],
         # The action's own target as this plugin can honestly name it: the operation, not its
         # arguments. A category grant is bounded to it, which is why it must be stable and must
         # never carry a value a person would not want stored in a policy record.
-        "resource": (remainder or action_identity)[:256],
+        "resource": resource[:256],
         "change": change[:400],
         "effects": [],
         # Hermes stopped the call under its own approval policy. This peer does not know whether

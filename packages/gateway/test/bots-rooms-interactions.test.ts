@@ -454,6 +454,44 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
       .toHaveLength(0);
   });
 
+  it("capability 66: an unclassified room ask declares no category, so no category grant covers it", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    // What a Hermes ask the plugin could not place looks like on this wire: a rule name, the
+    // capability-56 sentence, and NO block. The plugin answers no block rather than declaring
+    // `other`, because `other` is the one category a standing category grant can cover.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-unplaced", callId: "call-1", name: "terminal:rmdir", status: "pending",
+      detail: "Would remove the empty build directory.",
+    })).toBe(true);
+    const raised = h.frames.find(
+      (frame) => frame.type === "bot_approval_pending"
+        && (frame as BotApprovalPendingFrame).toolCallId === "approval-unplaced",
+    ) as BotApprovalPendingFrame;
+    expect(raised).toMatchObject({ bot: "sage", room: "Launch" });
+    expect(raised).not.toHaveProperty("scope");
+
+    const refused = await h.app.request("/bots/sage/approvals/approval-unplaced/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: "category", expiresAt: NOW + 3_600_000 }),
+    });
+    expect(refused.status).toBe(409);
+    expect((await refused.json() as { error: { code: string } }).error.code)
+      .toBe("approval_category_undeclared");
+    expect(((await (await h.app.request("/bots/sage/approvals/grants")).json()) as { grants: unknown[] }).grants)
+      .toHaveLength(0);
+
+    // One decision at a time IS on offer, and it is the derived binding that carries it.
+    const once = await h.app.request("/bots/sage/approvals/approval-unplaced/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: "once" }),
+    });
+    expect(once.status).toBe(202);
+  });
+
   it("capability 66: a standing grant covers a later room ask exactly as it covers a 1:1 ask", async () => {
     const h = await setup();
     const turn = await blockedTurn(h, ["sage", "scout"]);
