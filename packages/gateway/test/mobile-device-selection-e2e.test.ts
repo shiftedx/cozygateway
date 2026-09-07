@@ -2,7 +2,8 @@
  *  row: capability 68's binding is keyed to the bot's identity and not to its backend, so device
  *  selection is admitted the same way whatever runs behind the attach socket. The peer here is the
  *  attach lane a Hermes plugin speaks; nothing in Hermes' own agent loop takes part, and the two
- *  frames it sends are the pre-70 frame plus one optional routing hint.
+ *  frame it sends is the pre-70 frame, unchanged: a peer has no say in which of a person's phones
+ *  rings, and a frame that tries to name one is stripped rather than obeyed or refused.
  *
  *  Capability 71 rides along at the end: a draft written by one paired device reaches the other,
  *  and the clear a send writes reaches it too, so nothing is ever offered for sending twice. */
@@ -101,21 +102,35 @@ it("admits a Hermes bot's phone capability request against the selected device",
     const record = await lifecycle(gateway.url, tokenA, turn.threadId, "chosen");
     expect(record).toMatchObject({ deviceId: appB.ready.deviceId });
 
-    // A hint the peer sends wins over the stored choice, and an unpaired one is DROPPED rather
-    // than losing the request: it falls through to the same stored choice.
+    // A PEER CANNOT PICK THE PHONE. A frame naming the other device is admitted against the
+    // person's stored choice all the same: the field is stripped at the boundary, so it steers
+    // nothing, and the request is not lost or the socket closed over it either.
     plugin.send(JSON.stringify({
       kind: "mobile_request", requestId: "hinted", command: "device.status",
       threadId: turn.threadId, turnId: turn.turnId, expiresAt: Date.now() + 1_000,
       purpose: "Report phone readiness", targetDeviceId: appA.ready.deviceId,
     }));
-    await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "hinted"));
+    await until(() => appB.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "hinted"));
+    expect(appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "hinted")).toBe(false);
+    // And the peer is still attached: a hint is ignored, never a reason to close a socket.
+    expect(plugin.readyState).toBe(WebSocket.OPEN);
 
+    // With the choice cleared, the same hint still steers nothing: the target is the device that
+    // opened the turn, which is the pre-70 rule.
+    await fetch(
+      `${gateway.url}/bots/sage/mobile-requests/preferred-device?sessionId=${encodeURIComponent(turn.threadId)}`,
+      {
+        method: "PUT", headers: { authorization: `Bearer ${tokenA}`, "content-type": "application/json" },
+        body: JSON.stringify({ deviceId: null }),
+      },
+    );
     plugin.send(JSON.stringify({
-      kind: "mobile_request", requestId: "stranger", command: "device.status",
+      kind: "mobile_request", requestId: "cleared", command: "device.status",
       threadId: turn.threadId, turnId: turn.turnId, expiresAt: Date.now() + 1_000,
-      purpose: "Report phone readiness", targetDeviceId: "a-phone-paired-to-nobody",
+      purpose: "Report phone readiness", targetDeviceId: appB.ready.deviceId,
     }));
-    await until(() => appB.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "stranger"));
+    await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "cleared"));
+    expect(appB.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "cleared")).toBe(false);
 
     // Capability 71. The draft belongs to the person: device A writes it, device B reads it, and
     // the clear a send writes reaches device B too, so it never offers to resend what was sent.

@@ -27,6 +27,7 @@ import {
   type MobileNodeLifecycleEvent,
   type MobileNodeRoute,
 } from "../src/mobile-node.ts";
+import { stripPeerDeviceHint } from "../src/adapters/attach/protocol-v1.ts";
 import { openStorage } from "../src/storage.ts";
 
 const purpose = "Report phone readiness";
@@ -95,7 +96,7 @@ describe("capability-70 explicit device selection", () => {
     const resolved = resolveMobileTargetDevice({
       preferred: preference.deviceId, turnOrigin: "phone-a", isPaired: paired("phone-a", "phone-b"),
     });
-    expect(resolved).toEqual({ deviceId: "phone-b", source: "preference", droppedHint: false });
+    expect(resolved).toEqual({ deviceId: "phone-b", source: "preference" });
 
     // And the request is admitted against that device.
     const { broker, lifecycle, send } = harness();
@@ -105,29 +106,54 @@ describe("capability-70 explicit device selection", () => {
     store.close();
   });
 
-  it("prefers the peer's own hint, then the stored preference, then the turn origin", () => {
-    const isPaired = paired("phone-a", "phone-b", "phone-c");
-    expect(resolveMobileTargetDevice({
-      hinted: "phone-c", preferred: "phone-b", turnOrigin: "phone-a", isPaired,
-    })).toEqual({ deviceId: "phone-c", source: "hint", droppedHint: false });
+  it("resolves the person's stored choice, then the turn origin, and takes nothing from a peer", () => {
+    const isPaired = paired("phone-a", "phone-b");
+    expect(resolveMobileTargetDevice({ preferred: "phone-b", turnOrigin: "phone-a", isPaired }))
+      .toEqual({ deviceId: "phone-b", source: "preference" });
     expect(resolveMobileTargetDevice({ turnOrigin: "phone-a", isPaired }))
-      .toEqual({ deviceId: "phone-a", source: "turn_origin", droppedHint: false });
+      .toEqual({ deviceId: "phone-a", source: "turn_origin" });
     // Nothing resolves: row 68's own `no_selected_device` outcome, unchanged.
     expect(resolveMobileTargetDevice({ isPaired }))
-      .toEqual({ deviceId: undefined, source: "none", droppedHint: false });
+      .toEqual({ deviceId: undefined, source: "none" });
+    // A stored choice whose device is no longer paired is skipped, not resolved to a phone that
+    // cannot answer.
+    expect(resolveMobileTargetDevice({ preferred: "retired", turnOrigin: "phone-a", isPaired }))
+      .toEqual({ deviceId: "phone-a", source: "turn_origin" });
+    // THERE IS NO PEER INPUT TO GIVE. The resolver takes a stored choice and a turn origin and
+    // nothing else, so no peer can name the phone that rings.
+    expect(Object.keys(resolveMobileTargetDevice({ turnOrigin: "phone-a", isPaired })))
+      .toEqual(["deviceId", "source"]);
   });
 
-  it("drops an unpaired or malformed hint and falls through rather than refusing the request", () => {
-    const isPaired = paired("phone-a");
-    expect(resolveMobileTargetDevice({ hinted: "stranger", turnOrigin: "phone-a", isPaired }))
-      .toEqual({ deviceId: "phone-a", source: "turn_origin", droppedHint: true });
-    expect(resolveMobileTargetDevice({ hinted: "x".repeat(300), turnOrigin: "phone-a", isPaired }))
-      .toEqual({ deviceId: "phone-a", source: "turn_origin", droppedHint: true });
-    expect(resolveMobileTargetDevice({ hinted: "", turnOrigin: "phone-a", isPaired }))
-      .toEqual({ deviceId: "phone-a", source: "turn_origin", droppedHint: true });
-    // A stored preference that no longer names a paired device is skipped the same way.
-    expect(resolveMobileTargetDevice({ preferred: "retired", turnOrigin: "phone-a", isPaired }))
-      .toEqual({ deviceId: "phone-a", source: "turn_origin", droppedHint: false });
+  it("ignores a peer-supplied device hint without refusing the request or closing the socket", () => {
+    // A frame carrying `targetDeviceId` is a peer trying to pick which of a person's phones
+    // rings. The field is not part of this wire: it is stripped at the boundary, said out loud
+    // once, and the request is admitted exactly as if it had never been there. Refusing the frame
+    // would lose a request a person is waiting on over a field that means nothing.
+    const lines: string[] = [];
+    const frame = {
+      kind: "mobile_request", requestId: "req-1", command: "device.status",
+      threadId: "thread-1", turnId: "turn-1", expiresAt: 20_000,
+      purpose: "Report phone readiness", targetDeviceId: "phone-b",
+    };
+    const stripped = stripPeerDeviceHint(frame, (line) => lines.push(line));
+
+    expect("targetDeviceId" in stripped).toBe(false);
+    expect(stripped).toEqual({
+      kind: "mobile_request", requestId: "req-1", command: "device.status",
+      threadId: "thread-1", turnId: "turn-1", expiresAt: 20_000,
+      purpose: "Report phone readiness",
+    });
+    // Said out loud, bounded, and with no value in it: the id a peer tried to name is not logged.
+    const logged = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(logged).toEqual([{ event: "mobile_peer_device_hint_ignored", command: "device.status" }]);
+
+    // An ordinary frame is untouched and costs no line.
+    const quiet: string[] = [];
+    const ordinary = { ...frame, targetDeviceId: undefined };
+    delete (ordinary as Record<string, unknown>)["targetDeviceId"];
+    expect(stripPeerDeviceHint(ordinary, (line) => quiet.push(line))).toBe(ordinary);
+    expect(quiet).toEqual([]);
   });
 
   it("a second device attaching mid-request does not steal an explicitly targeted request", () => {
