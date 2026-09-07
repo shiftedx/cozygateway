@@ -61,6 +61,7 @@ export class RoomEndpointMismatch extends BackendUnavailable {
 /** The gateway itself, as a room owner id. A room whose members are all gateway runtime bots
  *  resolves to no Hermes endpoint at all, and belongs to the Hermes-free host (R1). */
 const GATEWAY_HOST = "";
+const ROOM_HOST_CACHE_CAPACITY = 256;
 
 /** How a host is named in an error. The gateway's own host has no endpoint id to print. */
 function hostLabel(id: string): string {
@@ -107,37 +108,46 @@ export class FederatedBotControlSurface implements BotControlSurface {
    *  Hermes endpoint is not a reason to refuse one; it also owns a room on a federated gateway
    *  whose members are all gateway runtime bots, which likewise resolves to no endpoint. */
   readonly #rooms: GatewayRoomHost | undefined;
-  /** The room's stored membership, by room key. Read only to resolve ownership; `undefined` for a
-   *  room that does not exist. Absent in surface-only tests, where no room can exist either. */
+  /** Immutable room membership, read only to resolve and backfill a legacy NULL owner. */
   readonly #roomMembers: ((key: string) => readonly string[] | undefined) | undefined;
-  /** Which host owns a room, by room key: an endpoint id, or `GATEWAY_HOST`. Resolved ONCE per room
-   *  and then remembered, so a later call routes without re-deriving ownership from membership and
-   *  a live room's host can never flip underneath it.
-   *
-   *  Rebuilt lazily after a restart from the durable membership, which gives the SAME answer, and
-   *  the reason is stronger than the refusal below: the input is immutable. `bot_groups.members_json`
-   *  is written once by `createBotGroup` and there is no statement anywhere that updates it, and
-   *  deleting a member does not touch it either, because `purgeBot` purges that bot's turns and its
-   *  own rows and never `bot_groups` or `bot_group_members`. A room whose member has been deleted
-   *  therefore still names it and still resolves to the same host.
-   *
-   *  The one input that is NOT immutable is the configured endpoint set. An operator who removes an
-   *  endpoint from `hermesEndpoints` leaves that endpoint's rooms resolving to no endpoint at all,
-   *  so they re-derive to the gateway's own host, which cannot answer for their members and retires
-   *  them. That is a degradation of a room whose Hermes is gone, not a flip underneath a live room,
-   *  but it is the caveat on "same answer": same membership, same answer; same config too. */
-  readonly #roomHosts = new Map<string, string>();
+  /** A bounded read-through cache. The durable owner, not this memo, remains the source of truth
+   * across restart and for deleted-room turn tombstones. */
+  readonly #roomHosts = new Map<string, { host: string; lastLookup: number }>();
+  #roomHostTick = 0;
   constructor(
     members: FederationMember[],
     broadcast?: (view: BotRosterView) => void,
     rooms?: GatewayRoomHost,
     roomMembers?: (key: string) => readonly string[] | undefined,
+    roomOwner?: (key: string) => string | undefined,
+    backfillRoomOwner?: (key: string, owner: string) => void,
   ) {
     this.#members = new Map(members.map((member) => [member.id, member]));
     this.#broadcast = broadcast;
     this.#rooms = rooms;
     this.#roomMembers = roomMembers;
+    this.#roomOwner = roomOwner;
+    this.#backfillRoomOwner = backfillRoomOwner;
   }
+  readonly #roomOwner: ((key: string) => string | undefined) | undefined;
+  readonly #backfillRoomOwner: ((key: string, owner: string) => void) | undefined;
+  #cachedHost(key: string): string | undefined {
+    const cached = this.#roomHosts.get(key);
+    if (cached === undefined) return undefined;
+    cached.lastLookup = ++this.#roomHostTick;
+    return cached.host;
+  }
+  #rememberHost(key: string, host: string): void {
+    this.#roomHosts.set(key, { host, lastLookup: ++this.#roomHostTick });
+    if (this.#roomHosts.size <= ROOM_HOST_CACHE_CAPACITY) return;
+    let oldestKey: string | undefined;
+    let oldestLookup = Number.POSITIVE_INFINITY;
+    for (const [candidate, value] of this.#roomHosts) {
+      if (value.lastLookup < oldestLookup) { oldestKey = candidate; oldestLookup = value.lastLookup; }
+    }
+    if (oldestKey !== undefined) this.#roomHosts.delete(oldestKey);
+  }
+  roomHostCacheSizeForTesting(): number { return this.#roomHosts.size; }
   #route(name: string): { member: FederationMember; profile: string } {
     const parsed = splitFederatedBotName(name);
     const member = parsed === undefined ? undefined : this.#members.get(parsed.endpointId);
@@ -229,13 +239,21 @@ export class FederatedBotControlSurface implements BotControlSurface {
     if (member === undefined) throw new BackendUnavailable(CROSS_ENDPOINT_ROOMS);
     return member.bridge;
   }
-  /** The host of an EXISTING room, plus the ownership guard. The remembered host is what routes;
-   *  the membership read only checks that the room has not come to name a bot on another endpoint,
-   *  which is refused by name rather than migrated (F8's ruling). */
+  /** The host of an existing room. A durable owner avoids a membership walk; only a legacy NULL
+   * derives once from immutable membership and backfills. Surface-only tests without storage retain
+   * F8's original membership guard. */
   #hostOf(name: string): RoomHost {
     const key = name.trim().toLowerCase();
+    const remembered = this.#cachedHost(key);
+    // The durable owner backs the cache. Its tombstone is also the sole ownership source after a
+    // room has been deleted, while its attach turn rows still exist.
+    if (remembered !== undefined && this.#roomOwner !== undefined) return this.#hostById(remembered);
+    const owner = this.#roomOwner?.(key);
+    if (owner !== undefined) {
+      this.#rememberHost(key, owner);
+      return this.#hostById(owner);
+    }
     const members = this.#roomMembers?.(key);
-    const remembered = this.#roomHosts.get(key);
     if (members === undefined) {
       // No such room. Hand it to the remembered host, or to the gateway's own, so the caller gets
       // the host's ordinary `GroupNotFound` (404) instead of a 503 about federation.
@@ -244,7 +262,8 @@ export class FederatedBotControlSurface implements BotControlSurface {
     const resolved = this.#resolveHost(members);
     if (remembered === undefined) {
       if ("spans" in resolved) throw new BackendUnavailable(CROSS_ENDPOINT_ROOMS);
-      this.#roomHosts.set(key, resolved.host);
+      this.#backfillRoomOwner?.(key, resolved.host);
+      this.#rememberHost(key, resolved.host);
       return this.#hostById(resolved.host);
     }
     const foreign = "spans" in resolved
@@ -261,17 +280,14 @@ export class FederatedBotControlSurface implements BotControlSurface {
   async createGroup(name: string, members: string[]): Promise<BotGroup> {
     const resolved = this.#resolveHost(members);
     if ("spans" in resolved) throw new BackendUnavailable(CROSS_ENDPOINT_ROOMS);
-    const group = await this.#hostById(resolved.host).createGroup(name, members);
-    this.#roomHosts.set(group.name.trim().toLowerCase(), resolved.host);
+    const group = await this.#hostById(resolved.host).createGroup(name, members, resolved.host);
+    this.#rememberHost(group.name.trim().toLowerCase(), resolved.host);
     return group;
   }
   deleteGroup(name: string): void {
-    // The memo deliberately OUTLIVES the room. `deleteBotGroup` keeps the room's turn rows as
-    // ownership tombstones, because a late terminal event after the DELETE must still be
-    // acknowledged, and the host that should acknowledge it is the one that drove the turn. Dropping
-    // the memo here sent that acknowledgement to the gateway's host instead, which is the same class
-    // of mis-routing this packet exists to remove. A room recreated under the same name overwrites
-    // the entry in `createGroup`, so a stale memo can never outrank a live room.
+    // Storage retains the owner with an existing turn tombstone, so a bounded cache eviction cannot
+    // reroute a late terminal to the gateway host. A recreated live room takes precedence over its
+    // old tombstone in storage.
     this.#hostOf(name).deleteGroup(name);
   }
   groupDetail(name: string): BotGroupDetail { return this.#hostOf(name).groupDetail(name); }
