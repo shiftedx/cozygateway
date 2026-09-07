@@ -622,16 +622,26 @@ export function createApp(deps: AppDeps): Hono<Env> {
       }
     });
     app.post("/gateway/maintenance/restart", requireDevice, async (c) => {
+      let requestId: string | undefined;
       try {
         const input = assertValid(GatewayMaintenanceRestartRequestSchema, await readBody(c));
+        requestId = input.requestId;
         const receipt = await deps.maintenance!.restart(input.requestId);
         deps.observe?.event("maintenance_operation", null, receipt.operationId, { outcome: "ok" });
         return c.json(receipt, 202);
-      } catch (error) { return maintenanceFailure(c, error); }
+      } catch (error) {
+        if (requestId !== undefined) deps.observe?.event("maintenance_operation", null, requestId, {
+          outcome: error instanceof GatewayMaintenanceFailure && error.code === "maintenance_failed"
+            ? "failed" : "skipped",
+        });
+        return maintenanceFailure(c, error);
+      }
     });
     app.post("/gateway/maintenance/update", requireDevice, async (c) => {
+      let requestId: string | undefined;
       try {
         const input = assertValid(GatewayMaintenanceUpdateRequestSchema, await readBody(c));
+        requestId = input.requestId;
         const receipt = await deps.maintenance!.update(
           input.requestId,
           input.expectedCurrentVersion,
@@ -639,7 +649,13 @@ export function createApp(deps: AppDeps): Hono<Env> {
         );
         deps.observe?.event("maintenance_operation", null, receipt.operationId, { outcome: "ok" });
         return c.json(receipt, 202);
-      } catch (error) { return maintenanceFailure(c, error); }
+      } catch (error) {
+        if (requestId !== undefined) deps.observe?.event("maintenance_operation", null, requestId, {
+          outcome: error instanceof GatewayMaintenanceFailure && error.code === "maintenance_failed"
+            ? "failed" : "skipped",
+        });
+        return maintenanceFailure(c, error);
+      }
     });
   }
 

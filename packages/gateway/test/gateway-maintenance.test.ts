@@ -25,6 +25,7 @@ import {
 import { createApp } from "../src/http.ts";
 import { gatewayInfoForConfig } from "../src/server.ts";
 import { openStorage } from "../src/storage.ts";
+import { ObservationRing } from "../src/observe/index.ts";
 
 const TOKEN = "paired-device-token";
 const CONFIG: GatewayConfig = {
@@ -49,6 +50,9 @@ class Supervisor implements GatewayMaintenanceSupervisor {
 
 function appFor(supervisor = new Supervisor()) {
   const storage = openStorage(":memory:");
+  const observe = new ObservationRing({
+    store: storage.observe, options: { enabled: true, retentionDays: 7 }, now: () => 100,
+  });
   storage.createDevice({ id: "device", name: "Phone", tokenHash: hashToken(TOKEN), createdAt: 1 });
   const maintenance = new GatewayMaintenance(
     storage,
@@ -59,7 +63,7 @@ function appFor(supervisor = new Supervisor()) {
     () => ({ harness: "hermes", attach: { configured: 1, online: 1, deadLetters: 0 } }),
   );
   const app = createApp({
-    storage, config: CONFIG, gatewayInfo: { name: "g", version: "0.6.4", contract: "v1" }, maintenance,
+    storage, observe, config: CONFIG, gatewayInfo: { name: "g", version: "0.6.4", contract: "v1" }, maintenance,
     presenceOf: () => "online",
     submitUserMessage: (_threadId: string, blocks: RichBlock[]): Message => ({ threadId: "t", seq: 1, role: "user", blocks, createdAt: 1 }),
     interruptThread: () => "idle", resolveApproval: () => Promise.resolve("unknown" as const), onDeviceRevoked: () => {}, now: () => 100,
@@ -208,6 +212,35 @@ describe("gateway maintenance paired routes", () => {
     expect(stale.status).toBe(409);
     expect((await stale.json())).toMatchObject({ error: { code: "stale_version" } });
     expect(fresh.supervisor.starts).toHaveLength(0);
+  });
+
+  it("records accepted, skipped, and failed maintenance outcomes as hashed ring events", async () => {
+    const accepted = appFor();
+    expect((await accepted.request("/gateway/maintenance/restart", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestId: "accepted-request" }),
+    })).status).toBe(202);
+    const acceptedEvent = accepted.storage.observe.events({ kind: "maintenance_operation", from: 0, to: 101 });
+    expect(acceptedEvent).toHaveLength(1);
+    expect(acceptedEvent[0]?.ref).toMatch(/^[0-9a-f]{16}$/);
+    expect(JSON.parse(acceptedEvent[0]?.detailJson ?? "{}")).toEqual({ outcome: "ok" });
+
+    const skipped = appFor();
+    expect((await skipped.request("/gateway/maintenance/update", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestId: "stale-request", expectedCurrentVersion: "0.0.0", expectedTargetVersion: "0.6.5" }),
+    })).status).toBe(409);
+    const skippedEvent = skipped.storage.observe.events({ kind: "maintenance_operation", from: 0, to: 101 });
+    expect(JSON.parse(skippedEvent[0]?.detailJson ?? "{}")).toEqual({ outcome: "skipped" });
+
+    const failed = appFor();
+    failed.supervisor.hold = Promise.reject(new Error("supervisor handoff failed"));
+    expect((await failed.request("/gateway/maintenance/restart", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestId: "failed-request" }),
+    })).status).toBe(500);
+    const failedEvent = failed.storage.observe.events({ kind: "maintenance_operation", from: 0, to: 101 });
+    expect(JSON.parse(failedEvent[0]?.detailJson ?? "{}")).toEqual({ outcome: "failed" });
   });
 
   it("settles a pre-ACK failure and returns the same authoritative receipt on retry", async () => {

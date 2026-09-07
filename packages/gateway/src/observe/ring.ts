@@ -34,7 +34,8 @@ export type ReceiptNetworkPath = "wifi" | "cellular" | "wired" | "other";
 
 function receiptTag(networkPath: ReceiptNetworkPath | undefined, vpn: boolean | undefined): ObserveSeriesTag | undefined {
   if (networkPath === undefined) return undefined;
-  return vpn === true ? `${networkPath}_vpn` as ObserveSeriesTag : networkPath;
+  if (vpn === undefined) return networkPath;
+  return `${networkPath}_vpn_${vpn ? "on" : "off"}` as ObserveSeriesTag;
 }
 
 /** How many in-flight turns, devices or peers the ring will hold timing state for. A bound rather
@@ -377,6 +378,29 @@ export class ObservationRing {
    * device row: the ring carries numeric measurements and a closed series tag only. */
   edgeRtt(bot: string, milliseconds: number, networkPath?: ReceiptNetworkPath, vpn?: boolean): void {
     this.sample("edge_rtt_ms", bot, milliseconds, receiptTag(networkPath, vpn));
+  }
+
+  /** One bounded marker for one receipt request. The bot is the event subject and the reporting
+   * device is its hashed ref, allowing D3 to form same-device, same-radio VPN comparisons without
+   * retaining either raw identifier. Missing client fields stay absent from `detail_json`. */
+  receiptMeasurement(input: {
+    bot: string;
+    deviceId: string;
+    networkPath?: ReceiptNetworkPath;
+    vpn?: boolean;
+    feltLatencyMs?: number;
+    edgeRttMs?: number;
+    edgeColo?: string;
+  }): void {
+    const detail: ObserveDetail = {
+      ...(input.networkPath === undefined ? {} : { radio: input.networkPath }),
+      ...(input.vpn === undefined ? {} : { vpn: input.vpn }),
+      ...(input.feltLatencyMs === undefined ? {} : { felt_latency_ms: input.feltLatencyMs }),
+      ...(input.edgeRttMs === undefined ? {} : { edge_rtt_ms: input.edgeRttMs }),
+      ...(input.edgeColo === undefined ? {} : { edge_colo: input.edgeColo }),
+    };
+    if (Object.keys(detail).length === 0) return;
+    this.event("receipt_measurement", input.bot, input.deviceId, detail);
   }
 
   /** Section 12's lifetime counters, outside the ring and never trimmed.

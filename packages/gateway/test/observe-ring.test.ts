@@ -38,7 +38,8 @@ afterEach(() => {
 
 const TAG_SUFFIXES = [
   "", "|tunnel", "|lan", "|wifi", "|cellular", "|wired", "|other",
-  "|wifi_vpn", "|cellular_vpn", "|wired_vpn", "|other_vpn",
+  "|wifi_vpn_off", "|cellular_vpn_off", "|wired_vpn_off", "|other_vpn_off",
+  "|wifi_vpn_on", "|cellular_vpn_on", "|wired_vpn_on", "|other_vpn_on",
   "|ok", "|not_found", "|http_error", "|network_error",
 ];
 
@@ -401,11 +402,19 @@ describe("the privacy rule at the writer", () => {
       expect(OBSERVE_EVENT_DETAIL[kind], kind).toBeDefined();
       for (const spec of Object.values(OBSERVE_EVENT_DETAIL[kind])) {
         // No field anywhere may hold a free string.
-        expect(["count", "flag", "hash", "code"]).toContain(spec.kind);
+        expect(["count", "flag", "hash", "colo", "code"]).toContain(spec.kind);
         if (spec.kind === "code") expect(spec.values).toContain("other");
       }
     }
     expect(serializeDetail("turn_terminal", undefined)).toBeNull();
+  });
+
+  it("accepts only the narrow Cloudflare colo shape in receipt detail JSON", () => {
+    expect(serializeDetail("receipt_measurement", { edge_colo: "ORD" }))
+      .toBe('{"edge_colo":"ORD"}');
+    for (const poison of ["ord", "OR", "ORD5", "ORD/secret", "A".repeat(49)]) {
+      expect(serializeDetail("receipt_measurement", { edge_colo: poison })).toBeUndefined();
+    }
   });
 });
 
@@ -428,8 +437,8 @@ describe("p50 and p95 helpers", () => {
     const observe = ring();
     for (const value of [100, 120, 140]) observe.feltLatency("luna", value, "wifi", true);
     for (const value of [40, 50, 60]) observe.feltLatency("luna", value, "wifi", false);
-    const on = observe.summarize({ series: "felt_latency_ms", tag: "wifi_vpn", from: 0, to: clock + 1 });
-    const off = observe.summarize({ series: "felt_latency_ms", tag: "wifi", from: 0, to: clock + 1 });
+    const on = observe.summarize({ series: "felt_latency_ms", tag: "wifi_vpn_on", from: 0, to: clock + 1 });
+    const off = observe.summarize({ series: "felt_latency_ms", tag: "wifi_vpn_off", from: 0, to: clock + 1 });
     expect(on.count).toBe(3);
     expect(off.count).toBe(3);
     expect(on.p50).toBe(120);
@@ -439,8 +448,33 @@ describe("p50 and p95 helpers", () => {
   it("records the app's Cloudflare edge round trip under the same radio and VPN tags", () => {
     const observe = ring();
     observe.edgeRtt("luna", 41, "cellular", true);
-    expect(observe.summarize({ series: "edge_rtt_ms", tag: "cellular_vpn", from: 0, to: clock + 1 }))
+    expect(observe.summarize({ series: "edge_rtt_ms", tag: "cellular_vpn_on", from: 0, to: clock + 1 }))
       .toMatchObject({ count: 1, p50: 41 });
+  });
+
+  it("keeps an unreported VPN state distinct from observed false", () => {
+    const observe = ring();
+    observe.feltLatency("luna", 40, "wifi");
+    observe.feltLatency("luna", 50, "wifi", false);
+    expect(observe.summarize({ series: "felt_latency_ms", tag: "wifi", from: 0, to: clock + 1 }))
+      .toMatchObject({ count: 1, p50: 40 });
+    expect(observe.summarize({ series: "felt_latency_ms", tag: "wifi_vpn_off", from: 0, to: clock + 1 }))
+      .toMatchObject({ count: 1, p50: 50 });
+  });
+
+  it("records one privacy-safe receipt measurement with hashed bot and device identities", () => {
+    const observe = ring();
+    observe.receiptMeasurement({
+      bot: "luna", deviceId: "device-1", networkPath: "wired", vpn: false,
+      feltLatencyMs: 900, edgeRttMs: 41, edgeColo: "ORD",
+    });
+    const events = storage.observe.events({ kind: "receipt_measurement", from: 0, to: clock + 1 });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ bot: id("luna"), ref: id("device-1") });
+    expect(JSON.parse(events[0]?.detailJson ?? "{}"))
+      .toEqual({ radio: "wired", vpn: false, felt_latency_ms: 900, edge_rtt_ms: 41, edge_colo: "ORD" });
+    expect(events[0]?.detailJson).not.toContain("luna");
+    expect(events[0]?.detailJson).not.toContain("device-1");
   });
 
   it("does not read a neighbouring series through the underscore LIKE wildcard", () => {
@@ -654,7 +688,7 @@ describe("the declared vocabulary", () => {
     for (const kind of [
       "turn_terminal", "approval_raised", "approval_resolved", "repair_proposed", "runtime_stage",
       "runner_contact_lost", "runner_contact_regained", "device_paired", "device_revoked",
-      "dead_letter", "tunnel_flap", "maintenance_operation",
+      "dead_letter", "tunnel_flap", "maintenance_operation", "receipt_measurement",
     ]) expect(OBSERVE_EVENT_KINDS as readonly string[]).toContain(kind);
   });
 });

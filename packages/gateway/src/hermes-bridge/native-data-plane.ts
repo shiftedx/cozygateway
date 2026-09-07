@@ -2692,6 +2692,12 @@ export class NativeBotDataPlane {
     if (perceived?.edgeRttMs !== undefined && result.recorded > 0) {
       this.#observe?.edgeRtt(bot, perceived.edgeRttMs, perceived.networkPath, perceived.vpn);
     }
+    // One marker per receipt request, never per message in its batch. It carries the app's numeric
+    // fields beside hashed bot/device identities, which is the only data D3 needs to compare the
+    // same device on the same radio with VPN on and off.
+    if (result.recorded > 0) {
+      this.#observe?.receiptMeasurement({ bot, deviceId, ...perceived });
+    }
     for (const delivery of result.deliveries) {
       this.#ingress.sendDeliveryReceipt(bot, {
         deliveryId: delivery.deliveryId,
