@@ -43,9 +43,8 @@ VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-90}"
 # route, so the script and the API agree on what cannot be deleted.
 RESERVED_NAMES="hermes default test tmp root sudo"
 DRY_RUN=0
-# Set when this run removed a box env line or config entry; the recreate is gated on it.
-BOX_CHANGED=0
 SKIP_VERIFY=0
+ORPHANS_ONLY=0
 PROFILES=()
 
 say()  { printf '%s\n' "$*"; }
@@ -59,17 +58,18 @@ usage: deprovision-bot.sh [options] <profile> [profile ...]
 
 Sweeps every trace a provisioned bot left behind: the per-profile launchd
 service, the profile directory, the box gateway config entry and its token env
-line, then recreates the box gateway and verifies the attach count dropped.
+line, then recreates the box gateway once and verifies the configured count.
 
 Idempotent. Safe to re-run. Refuses reserved profile names.
 
   -n, --dry-run          print every step, change nothing
-  --no-verify            skip the attach-count verification at the end
+  --no-verify            skip the configured-count verification at the end
+  --orphans-only         refuse any profile whose live directory still exists
   --gateway-url URL      gateway base URL (default $GATEWAY_URL)
   --box HOST             ssh target for the gateway box (default $BOX_SSH)
   --box-repo DIR         repo checkout on the box (default $BOX_REPO)
   --hermes-home DIR      hermes home (default \$HERMES_HOME_ROOT or ~/.hermes)
-  --verify-timeout SEC   how long to wait for the count to drop (default $VERIFY_TIMEOUT)
+  --verify-timeout SEC   how long to wait for the final count (default $VERIFY_TIMEOUT)
   --list-configured      print the profile names the box configures, one per line, and exit
   -h, --help             show this help
 USAGE
@@ -79,6 +79,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     -n|--dry-run) DRY_RUN=1; shift ;;
     --no-verify) SKIP_VERIFY=1; shift ;;
+    --orphans-only) ORPHANS_ONLY=1; shift ;;
     --gateway-url) GATEWAY_URL="$2"; shift 2 ;;
     --box) BOX_SSH="$2"; shift 2 ;;
     --box-repo) BOX_REPO="$2"; shift 2 ;;
@@ -93,48 +94,128 @@ while [ "$#" -gt 0 ]; do
 done
 for arg in ${@+"$@"}; do PROFILES+=("$arg"); done
 
-# The reconciliation half of the provisioner sweep needs to know what the BOX still configures,
-# because a bot deleted from the phone takes its profile and its launchd service with it and
-# leaves only a config entry behind. Printing that list is a read, so it takes none of the
-# teardown path below.
-if [ "${LIST_CONFIGURED:-0}" = 1 ]; then
-  have ssh || die "ssh not found on PATH"
-  ssh -o BatchMode=yes "$BOX_SSH" \
-    "python3 - '$BOX_REPO/$BOX_CONFIG_REL'" <<'PY'
-import json, sys
+# Quote each remote argument for the SSH login shell (including custom paths).
+shell_quote() { local value="$1"; value=${value//\'/\'\\\'\'}; printf "'%s'" "$value"; }
+
+# One structural edit for the whole batch. The journal is written BEFORE either
+# file changes and remains until recreate and verification succeed. A later
+# sweep can therefore discover work even after the last config entry is gone.
+box_state() {
+  local action="$1" command arg
+  shift
+  command="python3 - $(shell_quote "$BOX_REPO/$BOX_CONFIG_REL") $(shell_quote "$BOX_REPO/.env") $(shell_quote "$action")"
+  for arg in "$@"; do command="$command $(shell_quote "$arg")"; done
+  ssh -o BatchMode=yes "$BOX_SSH" "$command" <<'PYREMOTE'
+import json, os, re, stat, sys, tempfile
+from pathlib import Path
+
+path, env_path = map(Path, sys.argv[1:3])
+action, names = sys.argv[3], set(sys.argv[4:])
+journal = path.with_name(path.name + ".deprovision-pending.json")
+reserved = {"hermes", "default", "test", "tmp", "root", "sudo"}
+def valid(name):
+    return isinstance(name, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name) and name not in reserved
+def load_unique(p):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate config key")
+            result[key] = value
+        return result
+    return json.loads(p.read_text(), object_pairs_hook=unique)
+def atomic(p, text):
+    mode = stat.S_IMODE(p.stat().st_mode) if p.exists() else 0o600
+    fd, tmp = tempfile.mkstemp(prefix=p.name + ".tmp-", dir=p.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            os.fchmod(handle.fileno(), mode)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, p)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+def save(p, value):
+    atomic(p, json.dumps(value, indent=2) + "\n")
 try:
-    with open(sys.argv[1], encoding="utf-8") as handle:
-        config = json.load(handle)
-except Exception:
-    sys.exit(0)
-endpoints = config.get("hermesEndpoints") or []
-profiles = endpoints[0].get("profiles", {}) if len(endpoints) == 1 else {}
-if isinstance(profiles, dict):
-    for name in profiles:
-        print(name)
-PY
-  exit 0
-fi
+    data = load_unique(path)
+    endpoints = data.get("hermesEndpoints") if isinstance(data, dict) else None
+    if not isinstance(endpoints, list) or len(endpoints) != 1 or not isinstance(endpoints[0], dict):
+        raise ValueError("requires exactly one Hermes endpoint")
+    profiles = endpoints[0].get("profiles")
+    if not isinstance(profiles, dict):
+        raise ValueError("profiles must be an object")
+    for name, entry in profiles.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("tokenEnv"), str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", entry["tokenEnv"]):
+            raise ValueError("invalid profile tokenEnv")
+    pending = load_unique(journal) if journal.exists() else {}
+    if (not isinstance(pending, dict) or not all(valid(name) for name in pending)
+        or not all(isinstance(keys, list) and all(isinstance(key, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) for key in keys) for keys in pending.values())):
+        raise ValueError("invalid deprovision journal")
+    if not all(valid(name) for name in names):
+        raise ValueError("invalid or reserved profile name")
+    if action == "list":
+        # Reserved profiles can be valid keepers but can never be sweep targets.
+        for name in sorted(set(profiles) | set(pending)):
+            if valid(name):
+                print(name)
+    elif action == "clean":
+        env = env_path.read_text()  # Failure is not equivalent to absence.
+        owned = {}
+        for name in names:
+            keys = set(pending.get(name, []))
+            keys.add("COZYGATEWAY_ATTACH_TOKEN_" + re.sub(r"[^A-Z0-9]", "_", name.upper()).rstrip("_"))
+            if name in profiles:
+                keys.add(profiles[name]["tokenEnv"])
+            owned[name] = sorted(keys)
+        keys = {key for values in owned.values() for key in values}
+        # A shared key belongs to surviving profiles too; never remove it.
+        keys -= {entry["tokenEnv"] for n, entry in profiles.items() if n not in names}
+        filtered = "".join(line for line in env.splitlines(keepends=True)
+                           if not any(re.match(r"^\s*(?:export\s+)?" + re.escape(key) + r"\s*=", line) for key in keys))
+        changed_config = bool(names & set(profiles))
+        changed_env = filtered != env
+        if changed_config or changed_env or names & set(pending):
+            # Capture custom tokenEnv names before config removal, so a crash
+            # between the two atomic writes cannot lose the credential key.
+            pending.update(owned)
+            save(journal, pending)
+        if changed_config:
+            for name in names:
+                profiles.pop(name, None)
+            save(path, data)
+        if changed_env:
+            atomic(env_path, filtered)
+        print(len(profiles), int(bool(names & set(pending))))
+    elif action == "complete":
+        remaining = {name: keys for name, keys in pending.items() if name not in names}
+        if remaining:
+            save(journal, remaining)
+        elif journal.exists():
+            journal.unlink()
+    else:
+        raise ValueError("unknown action")
+except Exception as exc:
+    # Never include file contents or token values in diagnostics.
+    print("deprovision state refused: " + type(exc).__name__, file=sys.stderr)
+    sys.exit(1)
+PYREMOTE
+}
 
-[ "${#PROFILES[@]}" -gt 0 ] || { usage >&2; die "no profile named"; }
 have ssh || die "ssh not found on PATH"
-have python3 || die "python3 not found on PATH"
-
-# Same derivation provision-bot.sh used to CREATE the name, so this script
-# removes the same line rather than a near miss: upper-cased, every
-# non-alphanumeric run folded to one _.
-token_env_name() {
-  printf 'COZYGATEWAY_ATTACH_TOKEN_%s\n' \
-    "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' '_' | sed 's/_*$//')"
-}
-
-is_reserved() {
-  local name="$1" reserved
-  for reserved in $RESERVED_NAMES; do
-    [ "$name" = "$reserved" ] && return 0
-  done
-  return 1
-}
+if [ "${LIST_CONFIGURED:-0}" = 1 ]; then box_state list; exit $?; fi
+[ "${#PROFILES[@]}" -gt 0 ] || { usage >&2; die "no profile named"; }
+case "$VERIFY_TIMEOUT" in ''|*[!0-9]*) die "invalid verification timeout" ;; esac
+# Validate the entire batch before any service, file or remote state is changed.
+for profile in "${PROFILES[@]}"; do
+  [[ "$profile" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || die "invalid profile name"
+  case " $RESERVED_NAMES " in *" $profile "*) die "reserved profile name: $profile" ;; esac
+  if [ "$ORPHANS_ONLY" = 1 ] && { [ -e "$HERMES_HOME_ROOT/profiles/$profile" ] || [ -L "$HERMES_HOME_ROOT/profiles/$profile" ]; }; then
+    die "[$profile] live profile path exists; refusing orphan cleanup"
+  fi
+done
 
 # --- steps ----------------------------------------------------------------
 
@@ -144,6 +225,10 @@ is_reserved() {
 # provision-bot.sh documents on the install side.
 remove_service() {
   local profile="$1"
+  if [ "$ORPHANS_ONLY" = 1 ] && { [ -e "$HERMES_HOME_ROOT/profiles/$profile" ] || [ -L "$HERMES_HOME_ROOT/profiles/$profile" ]; }; then
+    warn "[$profile] profile reappeared; refusing service cleanup"
+    return 1
+  fi
   local label="ai.hermes.gateway-$profile"
   local plist="$HOME/Library/LaunchAgents/$label.plist"
   local loaded=0
@@ -165,7 +250,7 @@ remove_service() {
     say "  service $label booted out"
   fi
   if [ -f "$plist" ]; then
-    rm -f "$plist"
+    rm -f "$plist" || return 1
     say "  service plist removed: $plist"
   fi
   if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
@@ -197,148 +282,53 @@ remove_profile_dir() {
   say "  profile dir removed: $dir"
 }
 
-# Deletes the profile from the configured Hermes endpoint. A json edit rather than a text
-# removal for the same reason provision-bot.sh inserted it with one: the file
-# is a single object and a sed would have to guess at formatting. Prints
-# "removed" or "already absent" so the caller can tell whether the attach count
-# has any reason to move.
-remove_box_config_entry() {
-  local profile="$1"
-  if [ "$DRY_RUN" = 1 ]; then
-    # "dry-run" rather than a guessed outcome: the caller keys the verification
-    # off this word, and a dry run must not claim the entry was or was not there.
-    printf 'dry-run\n'
-    return 0
-  fi
-  ssh -o BatchMode=yes "$BOX_SSH" \
-    "python3 - '$BOX_REPO/$BOX_CONFIG_REL' '$profile'" <<'PY'
-import json, os, sys
-path, profile = sys.argv[1], sys.argv[2]
-with open(path) as fh:
-    data = json.load(fh)
-endpoints = data.get("hermesEndpoints") or []
-if len(endpoints) != 1:
-    raise SystemExit("deprovision-bot requires exactly one Hermes endpoint")
-profiles = endpoints[0].get("profiles", {})
-if profile not in profiles:
-    print("already absent")
-    sys.exit(0)
-del profiles[profile]
-tmp = path + ".deprovision-tmp"
-with open(tmp, "w") as fh:
-    json.dump(data, fh, indent=2)
-    fh.write("\n")
-os.replace(tmp, path)
-print("removed")
-PY
-}
-
-# Drops the token line from the box .env. The value is never echoed, printed or
-# passed on a command line: the remote filter only ever matches on the KEY.
-remove_box_env_line() {
-  local key="$1"
-  # The dry-run check comes FIRST, before the probe: a run that changes nothing
-  # should also reach nothing, so --dry-run works with the box unreachable.
-  if [ "$DRY_RUN" = 1 ]; then say "  DRY  remove $key from $BOX_SSH:$BOX_REPO/.env"; return 0; fi
-  if ! ssh -o BatchMode=yes "$BOX_SSH" "grep -q '^${key}=' '$BOX_REPO/.env'" 2>/dev/null; then
-    say "  box env $key already absent"
-    return 0
-  fi
-  ssh -o BatchMode=yes "$BOX_SSH" \
-    "cd '$BOX_REPO' && grep -v '^${key}=' .env > .env.deprovision-tmp && chmod 600 .env.deprovision-tmp && mv .env.deprovision-tmp .env"
-  BOX_CHANGED=1
-  say "  box env $key removed"
-}
-
-recreate_box_gateway() {
-  if [ "$DRY_RUN" = 1 ]; then say "  DRY  docker compose up -d --force-recreate gateway on $BOX_SSH"; return 0; fi
-  # up -d, not --build: the image is unchanged, only the env and the mounted
-  # config moved, and a recreate is what re-reads both.
-  # Only when this run actually changed the box env or config. A sweep that merely refreshed
-  # a profile's plugin would otherwise bounce the live gateway once per profile.
-  if [ "$BOX_CHANGED" != 1 ]; then say "  box gateway unchanged, not recreated"; return 0; fi
-  ssh -o BatchMode=yes "$BOX_SSH" "cd '$BOX_REPO' && docker compose up -d --force-recreate gateway" >/dev/null
-  BOX_CHANGED=0
-  say "  box gateway recreated"
-}
-
-# attach.configured is built at BOOT from the endpoint profiles, so it is the one
-# number that proves the box no longer holds an identity for this bot.
-attach_configured() {
-  curl -fsS --max-time 5 "$GATEWAY_URL/ready" 2>/dev/null | python3 -c \
-    'import json,sys; print(json.load(sys.stdin).get("attach",{}).get("configured",""))' 2>/dev/null
-}
-
-verify_configured_dropped() {
-  local profile="$1" before="$2" deadline now
-  if [ "$DRY_RUN" = 1 ] || [ "$SKIP_VERIFY" = 1 ]; then
-    say "  (verification skipped)"
-    return 0
-  fi
-  if ! have curl; then
-    warn "[$profile] curl not found, cannot verify the attach count"
-    return 1
-  fi
-  if [ -z "$before" ]; then
-    warn "[$profile] no attach count was read before the sweep, cannot verify the drop"
-    return 1
-  fi
+# --- batch cleanup ---------------------------------------------------------
+# Read the expected final count from the edited config, not an earlier /ready
+# response: startup may already have applied some of the removal by then.
+verify_configured() {
+  local expected="$1" deadline now
+  if [ "$SKIP_VERIFY" = 1 ]; then say "  (verification skipped)"; return 0; fi
+  have curl || { warn "curl not found, cannot verify configured count"; return 1; }
+  have python3 || { warn "python3 not found, cannot verify configured count"; return 1; }
   deadline=$(( $(date +%s) + VERIFY_TIMEOUT ))
   while :; do
-    now="$(attach_configured || true)"
-    if [ -n "$now" ] && [ "$now" -lt "$before" ] 2>/dev/null; then
-      say "  VERIFIED: attach.configured dropped $before -> $now"
-      return 0
-    fi
+    now="$(curl -fsS --max-time 5 "$GATEWAY_URL/ready" 2>/dev/null | python3 -c \
+      'import json,sys; print(json.load(sys.stdin).get("attach",{}).get("hermes",{}).get("configured",""))' 2>/dev/null || true)"
+    if [ "$now" = "$expected" ]; then say "  VERIFIED: attach.hermes.configured=$expected"; return 0; fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      warn "[$profile] attach.configured did not drop below $before within ${VERIFY_TIMEOUT}s (now: ${now:-unreadable})"
+      warn "attach.hermes.configured did not reach $expected within ${VERIFY_TIMEOUT}s (now: ${now:-unreadable})"
       return 1
     fi
     sleep 5
   done
 }
 
-# --- main -----------------------------------------------------------------
+if [ "$DRY_RUN" = 1 ]; then
+  for profile in "${PROFILES[@]}"; do
+    remove_service "$profile"
+    [ "$ORPHANS_ONLY" = 1 ] || remove_profile_dir "$profile" "$HERMES_HOME_ROOT/profiles/$profile"
+  done
+  say "DRY  remove box config/token entries for ${PROFILES[*]}; recreate gateway once if needed"
+  exit 0
+fi
 
+# A failed parse/read prevents local teardown as well as remote mutation.
+result="$(box_state clean "${PROFILES[@]}")" || die "box cleanup failed; next sweep will retry"
+[[ "$result" =~ ^[0-9]+\ [01]$ ]] || die "unexpected box cleanup response; pending work retained"
+read -r expected needs_restart <<< "$result"
 overall_rc=0
-for profile in ${PROFILES[@]+"${PROFILES[@]}"}; do
-  say ""
+for profile in "${PROFILES[@]}"; do
   say "=== $profile ==="
-
-  if is_reserved "$profile"; then
-    warn "[$profile] reserved profile name, refusing to deprovision"
-    overall_rc=1
-    continue
-  fi
-
-  profile_dir="$HERMES_HOME_ROOT/profiles/$profile"
-  env_name="$(token_env_name "$profile")"
-  say "  box token env var: $env_name"
-
-  # Read BEFORE anything moves: the verification at the end is a comparison,
-  # and a count read after the recreate has nothing to compare against.
-  configured_before=""
-  if [ "$SKIP_VERIFY" != 1 ] && [ "$DRY_RUN" != 1 ] && have curl; then
-    configured_before="$(attach_configured || true)"
-    say "  attach.configured before: ${configured_before:-unreadable}"
-  fi
-
   remove_service "$profile" || overall_rc=1
-  remove_profile_dir "$profile" "$profile_dir"
-
-  config_result="$(remove_box_config_entry "$profile" | tail -n 1)"
-  say "  box config entry: $config_result"
-  [ "$config_result" = removed ] && BOX_CHANGED=1
-  remove_box_env_line "$env_name"
-  recreate_box_gateway
-
-  if [ "$config_result" = "removed" ]; then
-    verify_configured_dropped "$profile" "$configured_before" || overall_rc=1
-  else
-    say "  box never knew this profile, nothing for the attach count to drop"
-  fi
+  # In automatic mode a recreated directory is never removed, even if it
+  # appeared after orphan discovery. The next sweep will provision it again.
+  [ "$ORPHANS_ONLY" = 1 ] || remove_profile_dir "$profile" "$HERMES_HOME_ROOT/profiles/$profile"
 done
-
-say ""
-if [ "$overall_rc" = 0 ]; then say "deprovision-bot: all profiles swept"; fi
-exit "$overall_rc"
+if [ "$needs_restart" = 1 ]; then
+  ssh -o BatchMode=yes "$BOX_SSH" "cd $(shell_quote "$BOX_REPO") && docker compose up -d --force-recreate gateway" >/dev/null \
+    || die "gateway recreate failed; pending cleanup retained for retry"
+  verify_configured "$expected" || exit 1
+fi
+[ "$overall_rc" = 0 ] || exit "$overall_rc"
+box_state complete "${PROFILES[@]}" || die "could not acknowledge completed cleanup"
+say "deprovision-bot: all profiles swept"

@@ -47,6 +47,7 @@ printf '%s\n' "$*" >> "$COZY_TEST_SSH_LOG"
 # The rollout tests exercise an already provisioned profile, so the remote
 # token check must succeed.  All other remote mutations are harmless no-ops.
 case "$*" in
+  *"python3 -c "*) printf 'unchanged\n' ;;
   *"python3 - "*) printf 'already present\n' ;;
 esac
 exit 0
@@ -176,7 +177,7 @@ printf '%s\n' "$*" > "$COZY_TEST_PROVISION_CALLS"
 SH
   chmod +x "$bin/provision"
   mkdir -p "$TMP/watcher-runtime"
-  date +%s > "$TMP/watcher-runtime/cozylabs-bot-provisioner.reconcile"
+  date +%s > "$TMP/watcher.lock.reconcile"
 
   HOME="$TMP/watcher-home" TMPDIR="$TMP/watcher-runtime" PATH="$bin:/usr/bin:/bin" \
     COZY_TEST_HERMES_HOME="$hermes" \
@@ -192,7 +193,7 @@ SH
 test_watcher_ignores_checkout_pytest_cache() {
   local repo="$TMP/cache-repo" hermes="$TMP/cache-hermes" bin="$TMP/cache-bin" log="$TMP/cache.log" calls="$TMP/cache-calls"
   mkdir -p "$repo/scripts" "$repo/integrations/attach-plugin/.pytest_cache/v/cache"
-  cp "$ROOT/scripts/bot-provisioner-watch.sh" "$repo/scripts/"
+  cp "$ROOT/scripts/bot-provisioner-watch.sh" "$ROOT/scripts/deprovision-bot.sh" "$repo/scripts/"
   printf 'name: cozygateway\n' > "$repo/integrations/attach-plugin/plugin.yaml"
   printf '[]\n' > "$repo/integrations/attach-plugin/.pytest_cache/v/cache/nodeids"
   make_fake_bin "$bin"
@@ -206,7 +207,7 @@ printf '%s\n' "$*" > "$COZY_TEST_PROVISION_CALLS"
 SH
   chmod +x "$bin/provision"
   mkdir -p "$TMP/cache-runtime"
-  date +%s > "$TMP/cache-runtime/cozylabs-bot-provisioner.reconcile"
+  date +%s > "$TMP/cache.lock.reconcile"
 
   HOME="$TMP/cache-home" TMPDIR="$TMP/cache-runtime" PATH="$bin:/usr/bin:/bin" \
     COZY_TEST_HERMES_HOME="$hermes" \
@@ -525,7 +526,7 @@ SH
 test_watcher_picks_up_a_wired_profile_that_cannot_stream() {
   local repo="$TMP/stream-repo" hermes="$TMP/stream-hermes" bin="$TMP/stream-bin" log="$TMP/stream.log" calls="$TMP/stream-calls"
   mkdir -p "$repo/scripts" "$repo/integrations/attach-plugin"
-  cp "$ROOT/scripts/bot-provisioner-watch.sh" "$repo/scripts/"
+  cp "$ROOT/scripts/bot-provisioner-watch.sh" "$ROOT/scripts/deprovision-bot.sh" "$repo/scripts/"
   printf 'name: cozygateway\n' > "$repo/integrations/attach-plugin/plugin.yaml"
   make_fake_bin "$bin"
   make_profile "$hermes" silent
@@ -539,7 +540,7 @@ printf '%s\n' "$*" > "$COZY_TEST_PROVISION_CALLS"
 SH
   chmod +x "$bin/provision"
   mkdir -p "$TMP/stream-runtime"
-  date +%s > "$TMP/stream-runtime/cozylabs-bot-provisioner.reconcile"
+  date +%s > "$TMP/stream.lock.reconcile"
 
   HOME="$TMP/stream-home" TMPDIR="$TMP/stream-runtime" PATH="$bin:/usr/bin:/bin" \
     COZY_TEST_HERMES_HOME="$hermes" \

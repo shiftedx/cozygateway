@@ -20,4 +20,8 @@ else
 fi
 grep -Fq "<string>$HOME/.local/bin/hermes</string>" "$PLIST"
 grep -Fq "<string>$HOME/.local/bin:/opt/homebrew/bin" "$PLIST"
+test -x "$TMP/stage/current/scripts/deprovision-bot.sh"
+cmp "$ROOT/scripts/deprovision-bot.sh" "$TMP/stage/current/scripts/deprovision-bot.sh"
 printf 'bot provisioner installer: ok\n'
+
+python3 "$ROOT/scripts/test/bot-deprovision.test.py"

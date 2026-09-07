@@ -27,8 +27,8 @@
 # IDEMPOTENCE
 #   Every step is a check-then-act against real state, so a second run is a
 #   no-op and a run interrupted halfway is repaired by the next one. In
-#   particular an EXISTING token is never rotated: a profile that already has
-#   COZYGATEWAY_TOKEN keeps it, which is what keeps the six live bots untouched
+#   particular a token already scoped to this profile home is never rotated,
+#   which is what keeps the existing live bots untouched
 #   when the watcher sweeps every 30 seconds.
 #
 # SHADOW-DIR TRAP (repo memory: hermes-plugin-shadow-dir-gotcha)
@@ -37,7 +37,7 @@
 #   the real one. This script refuses to touch a plugins/ dir containing one.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The installer preserves this repository-relative layout in its staged
 # payload. Do not change SRC_DIR back to the checkout: a LaunchAgent cannot read
 # a checkout under ~/Documents because macOS TCC blocks background access.
@@ -75,7 +75,7 @@ Binds a Hermes profile to the CozyGateway attach surface so its bot is
 chattable from the phone: plugin sync, token mint, box config + env entry,
 gateway recreate, per-profile launchd service, live verification.
 
-Idempotent. Safe to re-run. Never rotates a token that already exists.
+Idempotent. Safe to re-run. Keeps tokens scoped to existing profile homes.
 
   -n, --dry-run          print every step, change nothing
   --no-verify            skip the live attach verification at the end
@@ -493,12 +493,6 @@ unclaim_inherited_platforms() {
   done
 }
 
-# Whether the box's .env already names this profile's token env var, which is
-# the only durable record of "this profile has been provisioned before".
-box_knows_profile() {
-  ssh -o BatchMode=yes "$BOX_SSH" "grep -q '^${1}=' '$BOX_REPO/.env'" 2>/dev/null
-}
-
 check_shadow_dir() {
   local plugins_dir="$1" entry
   [ -d "$plugins_dir" ] || return 0
@@ -691,20 +685,67 @@ inherit_chat_registry() {
   say "  chat workspace registry copied from an existing configured Hermes profile"
 }
 
-# Same append-if-absent rule, over ssh, against the box's .env.
+# An inherited token must replace a deleted incarnation's stale env value.
+# Compare and edit structurally; secrets travel on stdin and never in argv.
+shell_quote() { local value="$1"; value=${value//\'/\'\\\'\'}; printf "'%s'" "$value"; }
 ensure_box_env_line() {
-  local key="$1" value="$2"
-  if ssh -o BatchMode=yes "$BOX_SSH" "grep -q '^${key}=' '$BOX_REPO/.env'" 2>/dev/null; then
-    say "  box env $key already set, left alone"
-    return 0
-  fi
-  if [ "$DRY_RUN" = 1 ]; then say "  DRY  append $key to $BOX_SSH:$BOX_REPO/.env"; return 0; fi
-  # The value goes in on stdin, never on the command line, so it stays out of
-  # the remote process table and out of any shell history.
-  printf '%s\n' "$value" | ssh -o BatchMode=yes "$BOX_SSH" \
-    "read -r v; printf '%s=%s\n' '$key' \"\$v\" >> '$BOX_REPO/.env'"
-  BOX_CHANGED=1
-  say "  box env $key written"
+  local key="$1" value="$2" profile="$3" code out
+  if [ "$DRY_RUN" = 1 ]; then say "  DRY  reconcile $key on $BOX_SSH"; return 0; fi
+  code="$(cat <<'PYREMOTE'
+import json, os, re, sys, tempfile
+from pathlib import Path
+path, config_path = map(Path, sys.argv[1:3])
+key, profile = sys.argv[3:5]
+value = sys.stdin.read().strip()
+try:
+    data = json.loads(config_path.read_text())
+    endpoints = data.get("hermesEndpoints")
+    if not isinstance(endpoints, list) or len(endpoints) != 1:
+        raise ValueError("requires one Hermes endpoint")
+    profiles = endpoints[0].get("profiles")
+    if not isinstance(profiles, dict):
+        raise ValueError("invalid profiles")
+    text = path.read_text()
+    pattern = re.compile(r"^\s*(?:export\s+)?" + re.escape(key) + r"\s*=(.*)$")
+    lines = text.splitlines(keepends=True)
+    matches = [pattern.match(line.rstrip("\r\n")) for line in lines]
+    current = [match.group(1) for match in matches if match]
+    if current == [value]:
+        print("unchanged")
+        sys.exit(0)
+    if any(not isinstance(entry, dict) or (name != profile and entry.get("tokenEnv") == key)
+           for name, entry in profiles.items()):
+        raise ValueError("refusing to replace a shared or uncertain token key")
+    updated = "".join(line for line, match in zip(lines, matches) if not match)
+    if updated and not updated.endswith("\n"):
+        updated += "\n"
+    updated += key + "=" + value + "\n"
+    fd, tmp = tempfile.mkstemp(prefix=".env.provision-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(updated)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    print("changed")
+except Exception as exc:
+    print("provision token update refused: " + type(exc).__name__, file=sys.stderr)
+    sys.exit(1)
+PYREMOTE
+)"
+  out="$(printf '%s' "$value" | ssh -o BatchMode=yes "$BOX_SSH" \
+    "python3 -c $(shell_quote "$code") $(shell_quote "$BOX_REPO/.env") $(shell_quote "$BOX_REPO/$BOX_CONFIG_REL") $(shell_quote "$key") $(shell_quote "$profile")")" \
+    || die "[$profile] could not reconcile box token"
+  case "$out" in
+    changed) BOX_CHANGED=1 ;;
+    unchanged) ;;
+    *) die "[$profile] unexpected box token update response" ;;
+  esac
+  say "  box env $key: $out"
 }
 
 # Inserts the profile into the configured Hermes endpoint. A json edit rather
@@ -869,27 +910,30 @@ for profile in "${PROFILES[@]}"; do
   env_name="$(token_env_name "$profile")"
   say "  box token env var: $env_name"
 
-  # WHOSE TOKEN IS THIS?
-  #   A fresh Hermes profile arrives holding a COPY of the launch profile's
-  #   .env, and that copy already contains a COZYGATEWAY_TOKEN. It is not this
-  #   profile's: it is the one it was cloned from, and every bot created this
-  #   way would inherit the SAME one and attach as the same identity. So the
-  #   presence of a token locally proves nothing.
-  #
-  #   The box is the authority. If it already names a token env var for this
-  #   profile, this profile has been provisioned before and its local token is
-  #   the real one, which is what keeps a 30-second sweep from rotating the six
-  #   live bots out from under themselves. If it does not, whatever is in the
-  #   file is inherited and gets replaced by a freshly minted one.
-  if box_knows_profile "$env_name"; then
+  # A deleted name can be recreated before orphan reconciliation. Box config
+  # alone cannot distinguish that incarnation from the old one. Only this
+  # profile's exact spool path proves the local env was already provisioned;
+  # a launch profile's inherited path never does.
+  spool_path="$profile_dir/plugin-data/cozygateway/attach-v1.sqlite"
+  token_changed=0
+  if [ "$(env_value "$env_file" COZYGATEWAY_SPOOL_PATH || true)" = "$spool_path" ]; then
     token="$(env_value "$env_file" COZYGATEWAY_TOKEN || true)"
-    [ -n "$token" ] || die "[$profile] the box names $env_name but $env_file holds no token"
-    say "  already known to the box, keeping this profile's token"
+    [ -n "$token" ] || die "[$profile] scoped profile env holds no token"
+    say "  scoped profile env, keeping this profile's token"
   else
-    # Same shape as the six live tokens: 32 random bytes, hex.
     token="$(openssl rand -hex 32)"
-    say "  first provisioning, minted a fresh attach token"
+    token_changed=1
+    say "  new profile incarnation, minted a fresh attach token"
     unclaim_inherited_platforms "$env_file"
+  fi
+  provisioning_pending="$profile_dir/.cozygateway-provision-pending"
+  pending_before=0
+  [ ! -f "$provisioning_pending" ] || pending_before=1
+  if [ "$DRY_RUN" != 1 ]; then
+    # Written before local/remote credentials change; a failed handoff remains
+    # visible even when the next attempt finds matching env and plugin files.
+    touch "$provisioning_pending"
+    chmod 600 "$provisioning_pending"
   fi
 
   # Upserted like the token and spool, NOT merely ensured: a fresh profile arrives with a COPY of
@@ -908,13 +952,18 @@ for profile in "${PROFILES[@]}"; do
     "$profile_dir/plugin-data/cozygateway/attach-v1.sqlite"
   inherit_chat_registry "$env_file"
   ensure_streaming_config "$profile" "$profile_dir"
-  ensure_box_env_line "$env_name" "$token"
+  ensure_box_env_line "$env_name" "$token" "$profile"
   ensure_box_config_entry "$profile" "$env_name"
+  [ "$pending_before" = 0 ] || BOX_CHANGED=1
   recreate_box_gateway
   restart_needed=0
-  { [ "$PLUGIN_SYNC_CHANGED" = 1 ] || [ "$STREAMING_CONFIG_CHANGED" = 1 ]; } && restart_needed=1
+  { [ "$PLUGIN_SYNC_CHANGED" = 1 ] || [ "$STREAMING_CONFIG_CHANGED" = 1 ] || [ "$token_changed" = 1 ] || [ "$pending_before" = 1 ]; } && restart_needed=1
   ensure_service "$profile" "$restart_needed"
-  verify_attached "$profile" || overall_rc=1
+  if verify_attached "$profile"; then
+    [ "$DRY_RUN" = 1 ] || rm -f "$provisioning_pending"
+  else
+    overall_rc=1
+  fi
 done
 
 say ""
