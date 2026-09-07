@@ -16,25 +16,35 @@ let relay: RunningRelay;
 let receiver: Server;
 let receiverUrl: string;
 let plugin: WebSocket;
-let received: string[];
-let resolveDelivery: ((ciphertext: string) => void) | undefined;
+/** Every push this device received, decrypted, in arrival order. One settled turn legitimately
+ *  produces TWO of them, from two independent fire-and-forget sends: the reply's `message` push
+ *  and capability 68's `task_completed` push for the Task that turn is. Neither send waits on the
+ *  other, so their arrival ORDER is not a fact about the gateway, and no assertion here may read
+ *  it as one. Tests select the push they mean by `kind` instead of taking whichever landed first.
+ */
+let deliveries: PushDelivery[];
 
-function decrypt(wire: string): { threadId: string; agentName: string; preview: string } {
+interface PushDelivery {
+  kind: string;
+  threadId?: string;
+  agentName?: string;
+  preview?: string;
+  taskId?: string;
+  agentId?: string;
+}
+
+function decrypt(wire: string): PushDelivery {
   const key = Buffer.from(hkdfSync("sha256", Buffer.from(PUSH_KEY), Buffer.alloc(0), Buffer.from("cozygateway-push-v0"), 32));
   const raw = Buffer.from(wire, "base64url");
   const decipher = createDecipheriv("aes-256-gcm", key, raw.subarray(0, 12));
   decipher.setAuthTag(raw.subarray(raw.length - 16));
-  return JSON.parse(Buffer.concat([decipher.update(raw.subarray(12, raw.length - 16)), decipher.final()]).toString("utf8")) as {
-    threadId: string; agentName: string; preview: string;
-  };
+  return JSON.parse(Buffer.concat([decipher.update(raw.subarray(12, raw.length - 16)), decipher.final()]).toString("utf8")) as PushDelivery;
 }
 
-function nextDelivery(): Promise<string> {
-  return new Promise((resolve) => {
-    const next = received.shift();
-    if (next !== undefined) resolve(next);
-    else resolveDelivery = resolve;
-  });
+/** Waits for the push of one kind, whatever else arrived before it. */
+async function deliveryOf(kind: string): Promise<PushDelivery> {
+  await until(() => deliveries.some((delivery) => delivery.kind === kind));
+  return deliveries.find((delivery) => delivery.kind === kind)!;
 }
 
 async function until(predicate: () => boolean, timeout = 2_000): Promise<void> {
@@ -46,16 +56,13 @@ async function until(predicate: () => boolean, timeout = 2_000): Promise<void> {
 }
 
 beforeEach(async () => {
-  received = [];
+  deliveries = [];
   receiver = createServer((request, response) => {
     const chunks: Buffer[] = [];
     request.on("data", (chunk: Buffer) => chunks.push(chunk));
     request.on("end", () => {
       const { ciphertext } = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { ciphertext: string };
-      const resolve = resolveDelivery;
-      resolveDelivery = undefined;
-      if (resolve !== undefined) resolve(ciphertext);
-      else received.push(ciphertext);
+      deliveries.push(decrypt(ciphertext));
       response.writeHead(200).end();
     });
   });
@@ -125,10 +132,28 @@ describe("push e2e over attach-v1", () => {
     const token = await pair();
     await register(token);
     const threadId = await thread(token);
-    const delivery = nextDelivery();
     await send(token, threadId);
-    const payload = decrypt(await delivery);
-    expect(payload).toMatchObject({ threadId, agentName: "Echo", preview: "Echo: ping" });
+    expect(await deliveryOf("message")).toMatchObject({ threadId, agentName: "Echo", preview: "Echo: ping" });
+  });
+
+  // The second half of the same turn. Kept as its own test so that a regression in the completion
+  // leg names itself instead of showing up as an ordering surprise in the test above.
+  it("delivers the Task completion push for the same turn, in either order", async () => {
+    const token = await pair();
+    await register(token);
+    const threadId = await thread(token);
+    await send(token, threadId);
+    const completion = await deliveryOf("task_completed");
+    expect(completion).toMatchObject({ kind: "task_completed", threadId: "bot:echo", agentId: "echo" });
+    await deliveryOf("message");
+    // Exactly one of each, and nothing else: contract/push-v0.md sends the completion once per
+    // Task. The settle window gives a duplicate a chance to land and be caught.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(deliveries.map((delivery) => delivery.kind).sort()).toEqual(["message", "task_completed"]);
+    // The taskId is a live Task this device can open, which is all the payload carries.
+    const task = await fetch(`${gateway.url}/tasks/${completion.taskId!}`, { headers: { authorization: `Bearer ${token}` } });
+    expect(task.status).toBe(200);
+    expect(((await task.json()) as { view: { state: string; bot: string } }).view).toMatchObject({ state: "completed", bot: "echo" });
   });
 
   it("does not push when the paired app client is connected", async () => {
@@ -144,7 +169,7 @@ describe("push e2e over attach-v1", () => {
     await send(token, threadId);
     await until(() => frames.some((frame) => frame.type === "done" && frame.threadId === threadId));
     await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(received).toEqual([]);
+    expect(deliveries).toEqual([]);
     client.close();
   });
 });
