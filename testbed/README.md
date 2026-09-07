@@ -100,6 +100,12 @@ docker build -f packages/gateway/Dockerfile -t burner-cozygateway:tb1 .
 
 `up.sh` is idempotent: it skips anything already listening or already running.
 
+**Never run it as `out=$(./up.sh)` (or with backticks).** It backgrounds `nohup` processes
+from inside subshells, which keeps a command-substitution pipe open and hangs the capture
+until every one of those background processes exits. Plain redirection
+(`./up.sh > log 2>&1`, or just running it directly) is fine; only capturing its output as a
+shell variable or expression is not.
+
 **Cold-start order matters.** `/ready` cannot go true until the Hermes bridge connects, and
 the bridge only connects once the burner dashboard and both profile gateways are up. So
 `up.sh` starts things in this order: the gateway container (gated only on the container

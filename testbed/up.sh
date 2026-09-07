@@ -8,8 +8,17 @@
 # blocks below. So the container comes up first (gated only on the container
 # itself being up, not on /ready), then the dashboard, then the profile
 # gateways, then the runner, and only THEN do we gate on /ready -- see F20.
+#
+# NEVER capture this script's output with `out=$(./up.sh)` (or backticks).
+# The dashboard, profile-gateway and runner blocks each background a `nohup`
+# process from inside a `( ... )` subshell; that keeps the write end of a
+# command-substitution pipe open even though the backgrounded process's own
+# stdout/stderr are redirected to a log file, and the substitution then hangs
+# until every one of those background processes exits. Plain redirection
+# (`./up.sh > log 2>&1`, or just `./up.sh` interactively) is unaffected --
+# only `$(...)`/backtick capture of the whole script hits this.
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
+cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 . ./env.sh
 
 echo "==> burner gateway (docker, ${TB1_GATEWAY})"
@@ -34,6 +43,10 @@ if ! lsof -nP -iTCP:"$TB1_DASHBOARD_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   echo "$!" > "$TB1_SCRATCH/burner-dashboard.pid"
   sleep 20
 fi
+lsof -nP -iTCP:"$TB1_DASHBOARD_PORT" -sTCP:LISTEN >/dev/null 2>&1 || {
+  echo "burner Hermes dashboard never came up on port $TB1_DASHBOARD_PORT (see $TB1_SCRATCH/logs/burner-dashboard.log)"
+  exit 1
+}
 
 echo "==> burner Hermes profile gateways"
 for p in $TB1_PROFILES; do
@@ -41,16 +54,26 @@ for p in $TB1_PROFILES; do
     ( cd "$TB1_HERMES_HOME/profiles/$p" && \
       HERMES_HOME="$TB1_HERMES_HOME" nohup "$TB1_HERMES_BIN" --profile "$p" gateway run \
         > "$TB1_SCRATCH/logs/hermes-$p.log" 2>&1 & echo "$!" > "$TB1_SCRATCH/burner-hermes-$p.pid" )
+    sleep 2
   fi
+  pgrep -f -- "--profile $p gateway run" >/dev/null 2>&1 || {
+    echo "burner Hermes profile gateway $p never came up (see $TB1_SCRATCH/logs/hermes-$p.log)"
+    exit 1
+  }
 done
 
 echo "==> burner CozyAgents runner"
-if [ -f "$TB1_SCRATCH/cozyagents-home/runner.env" ] && \
-   ! pgrep -f "cozyagents-bin/cozyagents.mjs runner" >/dev/null 2>&1; then
-  ( cd "$TB1_SCRATCH" && nohup node "$TB1_SCRATCH/cozyagents-bin/cozyagents.mjs" runner \
-      --env "$TB1_SCRATCH/cozyagents-home/runner.env" \
-      >> "$TB1_SCRATCH/logs/runner-stdout.log" 2>&1 & echo "$!" > "$TB1_SCRATCH/burner-runner.pid" )
-  sleep 15
+if [ -f "$TB1_SCRATCH/cozyagents-home/runner.env" ]; then
+  if [ -z "$(tb1_runner_pids)" ]; then
+    ( cd "$TB1_SCRATCH" && nohup node "$TB1_SCRATCH/cozyagents-bin/cozyagents.mjs" runner \
+        --env "$TB1_SCRATCH/cozyagents-home/runner.env" \
+        >> "$TB1_SCRATCH/logs/runner-stdout.log" 2>&1 & echo "$!" > "$TB1_SCRATCH/burner-runner.pid" )
+    sleep 15
+  fi
+  [ -n "$(tb1_runner_pids)" ] || {
+    echo "burner CozyAgents runner never came up (see $TB1_SCRATCH/logs/runner-stdout.log)"
+    exit 1
+  }
 fi
 
 echo "==> waiting for attach peers"

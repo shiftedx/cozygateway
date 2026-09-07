@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # What of the TB1 burner bed is up right now.
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
+cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 . ./env.sh
 
 echo "== burner gateway =="
@@ -28,5 +28,5 @@ pgrep -f -- "--profile burnerhermes" >/dev/null 2>&1 \
   && pgrep -fl -- "--profile burnerhermes" | sed 's/^/   /' || echo "   no burner Hermes profile gateway"
 lsof -nP -iTCP:"$TB1_DASHBOARD_PORT" -sTCP:LISTEN >/dev/null 2>&1 \
   && echo "   burner dashboard listening on $TB1_DASHBOARD_PORT" || echo "   no burner dashboard"
-pgrep -f "cozyagents-bin/cozyagents.mjs runner" >/dev/null 2>&1 \
+[ -n "$(tb1_runner_pids)" ] \
   && echo "   burner CozyAgents runner up" || echo "   no burner CozyAgents runner"

@@ -6,7 +6,7 @@
 #
 # Usage: TB1_SCRATCH=<scratch dir> ./cold-start.test.sh
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
+cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 . ./env.sh
 
 assert_cold() {
@@ -20,7 +20,7 @@ assert_cold() {
     echo "FAIL  ($label) the burner dashboard is still listening on $TB1_DASHBOARD_PORT" >&2
     exit 1
   fi
-  if pgrep -f "cozyagents-bin/cozyagents.mjs" >/dev/null 2>&1; then
+  if [ -n "$(tb1_runner_pids)" ]; then
     echo "FAIL  ($label) a burner CozyAgents process is still running" >&2
     exit 1
   fi

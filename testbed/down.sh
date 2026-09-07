@@ -6,7 +6,7 @@
 # honeyed-tilly, polished-satellite, dewy-bayberry). Match on the burner
 # profile names or on the hermes-burner home, or kill by recorded PID.
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
+cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 . ./env.sh
 
 echo "==> burner Hermes profile gateways"
@@ -23,9 +23,14 @@ done
 [ -f "$TB1_SCRATCH/burner-dashboard.pid" ] && kill "$(cat "$TB1_SCRATCH/burner-dashboard.pid")" 2>/dev/null
 
 echo "==> burner CozyAgents runner and its bot children"
-for pid in $(pgrep -f "cozyagents-bin/cozyagents.mjs" 2>/dev/null); do
+# Anchored to $TB1_SCRATCH (see env.sh's tb1_runner_pids), never the bare
+# `cozyagents-bin/cozyagents.mjs` fragment: that path segment is only this
+# packet's own bundling convention, not a burner-only marker, so an unanchored
+# match could also hit a production runner bundled the same way.
+for pid in $(tb1_runner_pids); do
   echo "  kill $pid"; kill "$pid" 2>/dev/null
 done
+[ -f "$TB1_SCRATCH/burner-runner.pid" ] && kill "$(cat "$TB1_SCRATCH/burner-runner.pid")" 2>/dev/null
 
 echo "==> burner gateway container"
 docker compose -p "$TB1_COMPOSE_PROJECT" -f "$TB1_COMPOSE_FILE" down
