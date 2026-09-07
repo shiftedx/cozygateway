@@ -1,6 +1,10 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createDecipheriv, hkdfSync } from "node:crypto";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { ObservationRing } from "../src/observe/ring.ts";
 
 import { openStorage } from "../src/storage.ts";
 import { PREVIEW_MAX_CHARS, RelayNotifier, chatMessageCollapseId, taskCompletionPayload, type ReplyPushTracker } from "../src/push-notifier.ts";
@@ -62,6 +66,60 @@ async function settle(): Promise<void> {
 }
 
 describe("RelayNotifier", () => {
+  it.each(["queued", "rejected", "accepted", "missing", "fallback", "recovery"])("shuts down %s sends without touching closed storage or losing recovery markers", async phase => {
+    const directory = mkdtempSync(join(tmpdir(), "notifier-close-"));
+    const path = join(directory, "gateway.db");
+    const storage = openStorage(path);
+    const sessionId = storage.nativeBotChat("sage", 1).sessionId;
+    const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "Check" }, 2);
+    storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+    const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+    storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: sessionId, turnId: "run", messageId: "reply", blocks: [{ type: "paragraph", text: "Done" }] } }, 4);
+    storage.createDevice({ id: "phone", name: "Phone", tokenHash: "fixture", createdAt: 1 });
+    storage.savePushRegistration("phone", { pushId: "push", relayUrl: "http://relay.test", pushKey: "fixture" });
+    let calls = 0;
+    let finish: ((response: Response) => void) | undefined;
+    let fail: ((error: Error) => void) | undefined;
+    let signal: AbortSignal | undefined;
+    const fetchImpl = (async (_input, init) => {
+      calls++;
+      if (phase === "fallback" && calls === 1) throw new Error("reply failed while open");
+      signal = init?.signal ?? undefined;
+      return await new Promise<Response>((resolve, reject) => { finish = resolve; fail = reject; });
+    }) as typeof fetch;
+    const observe = new ObservationRing({ store: storage.observe, options: { enabled: true, retentionDays: 7 } });
+    const measured = vi.spyOn(observe, "pushResult");
+    const notifier = new RelayNotifier({ storage, replyPushes: storage.tasks, fetchImpl, log: () => {}, observe });
+    const marker = { taskId, runId: "run", deviceId: "phone" };
+    const payload = { kind: "task_completed" as const, taskId, threadId: "bot:sage", agentId: "sage" };
+    if (phase === "recovery") {
+      storage.tasks.noteReplyPush(marker);
+      notifier.recoverTaskCompletion(payload, "run", "phone");
+    } else {
+      notifier.notify({ threadId: sessionId, runId: "run", agentName: "Sage", preview: "Done" }, new Set());
+      notifier.notifyTaskCompletion(payload, new Set(), "run");
+    }
+    if (phase !== "queued") await expect.poll(() => finish !== undefined).toBe(true);
+    notifier.close();
+    notifier.close();
+    storage.close();
+    measured.mockClear();
+    if (signal !== undefined) expect(signal.aborted).toBe(true);
+    if (phase === "rejected") fail?.(new Error("late network error"));
+    else finish?.(new Response(null, { status: phase === "missing" ? 404 : 202 }));
+    await settle();
+    expect(calls).toBe(phase === "queued" ? 0 : phase === "fallback" ? 2 : 1);
+    expect(measured).not.toHaveBeenCalled();
+    // Calls queued by another shutdown producer are no-ops, including recovery's no-registration arm.
+    notifier.recoverTaskCompletion(payload, "run", "phone");
+    notifier.notifyTaskCompletion(payload, new Set(), "run");
+    const reopened = openStorage(path);
+    try {
+      expect(reopened.tasks.replyPushRecoveries()).toEqual([expect.objectContaining(marker)]);
+      expect(reopened.pushRegistrations()).toHaveLength(1);
+    } finally { reopened.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it("writes the reply marker synchronously, includes its Task id, and suppresses the queued completion", async () => {
     const storage = seeded([
       { deviceId: "d1", pushId: "p1", relayUrl: "http://relay.test", pushKey: "key-1" },
