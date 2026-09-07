@@ -1,0 +1,39 @@
+# TB1 burner test bed. Disposable, LAN-bound, never the production gateway.
+# Modeled on the repo's docker-compose.yml + docker-compose.lan.yml, with its own
+# image tag, project name, port, config directory and data volume.
+services:
+  gateway:
+    image: burner-cozygateway:tb1
+    container_name: burner-tb1-gateway
+    environment:
+      COZYGATEWAY_HOST: "0.0.0.0"
+      COZYGATEWAY_PORT: "8795"
+      COZYGATEWAY_DB_PATH: "/data/cozygateway.db"
+      COZYGATEWAY_PUSH_RELAY_URL: "${COZYGATEWAY_PUSH_RELAY_URL:-https://push.cozylabs.ai}"
+    env_file:
+      - "${COZYGATEWAY_SECRETS_FILE:?set COZYGATEWAY_SECRETS_FILE}"
+    # Deliberate LAN exposure: the simulator and the burner agents reach it by LAN IP.
+    # No Cloudflare tunnel, no TLS overlay; trusted private network only.
+    ports:
+      - "8795:8795"
+    volumes:
+      - burner-tb1-gateway-data:/data
+      - "${COZYGATEWAY_CONFIG_DIR:?set COZYGATEWAY_CONFIG_DIR}:/config:rw"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8795/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  burner-tb1-gateway-data:
