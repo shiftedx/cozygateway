@@ -210,6 +210,13 @@ CREATE TABLE IF NOT EXISTS runners (
 CREATE TABLE IF NOT EXISTS deleted_bots (
   bot TEXT PRIMARY KEY, deleted_at INTEGER NOT NULL
 ) STRICT;
+-- A name can be explicitly recreated, but the old attach credential must never authenticate
+-- again. Store only its fingerprint and canonical owner; restoreBot never clears this ledger.
+CREATE TABLE IF NOT EXISTS revoked_attach_credentials (
+  token_sha256 TEXT PRIMARY KEY,
+  bot TEXT NOT NULL,
+  revoked_at INTEGER NOT NULL
+) STRICT;
 CREATE TABLE IF NOT EXISTS agents (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -1763,6 +1770,26 @@ export class Storage {
 
   isBotDeleted(bot: string): boolean {
     return this.#db.prepare("SELECT 1 FROM deleted_bots WHERE bot = ?").get(bot) !== undefined;
+  }
+
+  /** Revocation precedes any in-memory identity removal. Commit the bot and execution
+   * credentials together so a restart cannot resurrect a partially revoked incarnation. */
+  revokeAttachCredentials(bot: string, tokens: readonly string[], at: number): void {
+    if (tokens.length === 0) return;
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const insert = this.#db.prepare("INSERT OR IGNORE INTO revoked_attach_credentials (token_sha256, bot, revoked_at) VALUES (?, ?, ?)");
+      for (const token of tokens) insert.run(createHash("sha256").update(token).digest("hex"), bot, at);
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  isAttachCredentialRevoked(token: string): boolean {
+    return this.#db.prepare("SELECT 1 FROM revoked_attach_credentials WHERE token_sha256 = ?")
+      .get(createHash("sha256").update(token).digest("hex")) !== undefined;
   }
 
   /** Only the successful explicit-create path may reauthorize this name. */

@@ -692,6 +692,7 @@ export async function startGateway(
   for (const { endpoint } of parsedEndpoints) {
     const tokens = collectAttachTokens(endpoint.config.profiles, process.env);
     for (const [token, rawProfile] of tokens) {
+      if (storage.isAttachCredentialRevoked(token)) continue;
       if (attachTokens.has(token))
         throw new Error("duplicate attach credential across Hermes endpoints; every profile must use a distinct token");
       attachTokens.set(token, publicProfileId(endpoint, rawProfile));
@@ -706,6 +707,7 @@ export async function startGateway(
     "bot",
   );
   for (const [token, botId] of runtimeBotTokens) {
+    if (storage.isAttachCredentialRevoked(token)) continue;
     if (attachTokens.has(token))
       throw new Error("duplicate attach credential; every bot must use a distinct token");
     attachTokens.set(token, botId);
@@ -714,12 +716,14 @@ export async function startGateway(
   // in an environment variable, because nothing placed it there: the gateway minted it during a
   // `POST /bots` that had to work with no operator at a terminal.
   for (const bot of storedRuntimeBots) {
+    if (storage.isAttachCredentialRevoked(bot.token)) continue;
     if (attachTokens.has(bot.token))
       throw new Error("duplicate attach credential; every bot must use a distinct token");
     attachTokens.set(bot.token, bot.id);
   }
   for (const execution of storage.chatExecutions()) {
-    if (execution.stage !== "deleted" && storage.nativeBotHasSession(execution.bot, execution.sessionId))
+    if (execution.stage !== "deleted" && !storage.isAttachCredentialRevoked(execution.token)
+        && storage.nativeBotHasSession(execution.bot, execution.sessionId))
       attachTokens.set(execution.token, execution.executionId);
   }
   let nativeBotPlane: NativeBotDataPlane | undefined;
@@ -963,10 +967,17 @@ export async function startGateway(
   // otherwise keep a turn pending forever. Returns whether an attach identity was actually held,
   // which is what the delete response reports as `tokenRevoked`.
   killAttachIdentity = (name: string): boolean => {
+    const executions = storage.chatExecutions().filter((execution) => execution.bot === name);
+    // A successful create may clear the name fence before the host has replaced its old .env.
+    // Credential revocation therefore has its own durable, irreversible fingerprint ledger.
+    storage.revokeAttachCredentials(name, [
+      ...[...attachTokens].filter(([, owner]) => owner === name).map(([token]) => token),
+      ...executions.map((execution) => execution.token),
+    ], Date.now());
     storage.tasks.ownerDeleted(name, Date.now());
     nativeBotPlane?.removeRuntimeBot(name);
     mobileNode?.disconnectAgent(name);
-    for (const execution of storage.chatExecutions()) if (execution.bot === name) {
+    for (const execution of executions) {
       storage.setChatExecutionStage(execution.executionId, "deleted");
       attachTokens.delete(execution.token);
       mobileNode?.disconnectAgent(execution.executionId);

@@ -39,10 +39,15 @@ async function attachStatus(gateway: RunningGateway, token: string): Promise<num
 describe("deletion survives the real gateway restart with stale host configuration", () => {
   it.each([false, true])("blocks placeholder and token resurrection (federated=%s)", async (federated) => {
     let absent = false;
+    let allowCreate = false;
     const staleProfiles = () => ({ profiles: [BOT, KEEP].map((name) => ({ name, description: "", has_avatar: false })), bot_mode_protocol: true });
     const first = await startFakeHermesServer({
       // Simulate delayed host/roster cleanup even AFTER its delete endpoint confirmed success.
-      methods: { "profiles.list": staleProfiles, "profiles.create": () => { throw { code: 4062, message: "already exists" }; } },
+      methods: { "profiles.list": staleProfiles, "profiles.create": () => {
+        if (!allowCreate) throw { code: 4062, message: "already exists" };
+        absent = false;
+        return { name: BOT };
+      } },
       dashboard: (request) => {
         if (request.method === "DELETE") {
           const status = absent ? 404 : 200; absent = true;
@@ -97,5 +102,26 @@ describe("deletion survives the real gateway restart with stale host configurati
       expect(gateway.storage.isBotDeleted(name)).toBe(true);
       expect(await attachStatus(gateway, "old-attach")).toBe(1008);
     }
+    // A successful name recreation is NOT permission to reauthorize that incarnation's token.
+    // Exercise the vulnerable window before the installer rotates the old config/env binding.
+    allowCreate = true;
+    const recreated = await authed("/bots", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) });
+    expect(recreated.status).toBe(201);
+    expect(gateway.storage.isBotDeleted(name)).toBe(false);
+    expect(gateway.storage.isAttachCredentialRevoked("old-attach")).toBe(true);
+    await gateway.close(); gateways.splice(gateways.indexOf(gateway), 1);
+    gateway = await startGateway(config, { profileProvisioner: null, traceLog: () => {} }); gateways.push(gateway);
+    await until(async () => (await roster()).includes(name));
+    expect(await attachStatus(gateway, "old-attach")).toBe(1008);
+    expect((await fetch(`${gateway.url}/attach/v1/deliveries/fixture`, { headers: { authorization: "Bearer old-attach" } })).status).toBe(401);
+    expect(await attachStatus(gateway, "keep-attach")).toBe(101);
+    if (federated) expect(await attachStatus(gateway, "second-attach")).toBe(101);
+    // When provisioning eventually installs a fresh token, that new incarnation can attach.
+    process.env["DELETE_TEST_ATTACH"] = "fresh-attach";
+    await gateway.close(); gateways.splice(gateways.indexOf(gateway), 1);
+    gateway = await startGateway(config, { profileProvisioner: null, traceLog: () => {} }); gateways.push(gateway);
+    expect(await attachStatus(gateway, "fresh-attach")).toBe(101);
+    expect(await attachStatus(gateway, "old-attach")).toBe(1008);
+    if (federated) expect(await attachStatus(gateway, "second-attach")).toBe(101);
   });
 });

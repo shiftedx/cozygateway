@@ -113,6 +113,37 @@ describe("bot deletion owns its complete SQLite graph", () => {
     expect(db.prepare("SELECT settled_at FROM task_waits WHERE task_id = ?").get(taskId)).toMatchObject({ settled_at: 10 });
   });
 
+  it("keeps only credential fingerprints with canonical attribution across recreation and restart", () => {
+    const { storage, db, path } = fixture();
+    storage.revokeAttachCredentials(`home:${BOT}`, ["old-private-token", "execution-private-token"], 1);
+    storage.purgeBot(`home:${BOT}`);
+    storage.restoreBot(`home:${BOT}`);
+    storage.revokeAttachCredentials(`studio:${BOT}`, ["old-private-token"], 2);
+    const reopened = openStorage(path); stores.push(reopened);
+    expect(reopened.isBotDeleted(`home:${BOT}`)).toBe(false);
+    expect(reopened.isAttachCredentialRevoked("old-private-token")).toBe(true);
+    expect(reopened.isAttachCredentialRevoked("execution-private-token")).toBe(true);
+    expect(reopened.isAttachCredentialRevoked("new-private-token")).toBe(false);
+    expect(reopened.isAttachCredentialRevoked("other-endpoint-token")).toBe(false);
+    const records = db.prepare("SELECT * FROM revoked_attach_credentials ORDER BY token_sha256").all();
+    expect(records).toHaveLength(2);
+    expect(records).toEqual(expect.arrayContaining([
+      { token_sha256: createHash("sha256").update("old-private-token").digest("hex"), bot: `home:${BOT}`, revoked_at: 1 },
+      { token_sha256: createHash("sha256").update("execution-private-token").digest("hex"), bot: `home:${BOT}`, revoked_at: 1 },
+    ]));
+    expect(JSON.stringify(records)).not.toContain("private-token");
+  });
+
+  it("revokes all credentials for an incarnation atomically", () => {
+    const { storage, db } = fixture();
+    const failingHash = createHash("sha256").update("execution-private-token").digest("hex");
+    db.exec(`CREATE TRIGGER reject_revocation BEFORE INSERT ON revoked_attach_credentials
+      WHEN NEW.token_sha256 = '${failingHash}' BEGIN SELECT RAISE(ABORT, 'revocation fixture'); END`);
+    expect(() => storage.revokeAttachCredentials(BOT, ["old-private-token", "execution-private-token"], 1)).toThrow("revocation fixture");
+    expect(storage.isAttachCredentialRevoked("old-private-token")).toBe(false);
+    expect(storage.isAttachCredentialRevoked("execution-private-token")).toBe(false);
+  });
+
   it("commits the deletion fence and runner cleanup atomically, rolling back a failed outbox write", () => {
     const { storage, db, path } = fixture();
     storage.nativeBotChat(BOT, 1);
