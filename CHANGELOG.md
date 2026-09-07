@@ -5,6 +5,14 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## 0.7.8 (2026-09-07): responsive task reconciliation on retained histories
+
+Fixes gateway startup and health-check stalls when task reconciliation reads a profile with a
+large retained attach-event history. Delegation lookups use a targeted index instead of repeatedly
+scanning and decoding every retained event. Task results and existing configuration, history, and
+pairings are preserved. This replaces v0.7.7, which was returned to pre-release after production
+validation exposed the slowdown.
+
 ## 0.7.7 (2026-09-07): observer dashboard, room approvals, and delivery reliability
 
 This release adds a paired, read-only dashboard for gateway health, latency, usage, and tool costs.
