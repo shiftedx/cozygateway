@@ -70,7 +70,6 @@ describe("attach-v1 ingress", () => {
   let memoryResults: AttachV1MemoryResult[];
   let logs: string[];
   let snapshotFrames: unknown[];
-  let liveness: Array<{ agent: string; at: number }>;
 
   function makeIngress(maxPendingConnections?: number): AttachV1Ingress {
     return new AttachV1Ingress({
@@ -84,7 +83,6 @@ describe("attach-v1 ingress", () => {
         onEvent: (_agent, frame) => { accepted.push(frame); return projectionSucceeds; },
         canAcceptEvent: () => acceptsTarget,
         onPresence: (_agent, state) => presence.push(state),
-        onLiveness: (agent, at) => liveness.push({ agent, at }),
         onMobileRequest: (_agent, frame) => mobileRequests.push(frame),
         onMobileCancel: (_agent, frame) => mobileCancels.push(frame.requestId),
         onMemoryResult: (_agent, frame) => memoryResults.push(frame),
@@ -111,7 +109,6 @@ describe("attach-v1 ingress", () => {
     acceptsTarget = true;
     memoryResults = [];
     logs = [];
-    liveness = [];
     snapshotFrames = [];
     ingress = makeIngress();
     server = createServer();
@@ -153,7 +150,7 @@ describe("attach-v1 ingress", () => {
   it("ignores unknown hello capabilities while granting supported ones", async () => {
     const { ws, frames } = await dial(undefined, ["draft", "future.capability", "observation_snapshot"]);
     const ack = frames.find(frame => frame.kind === "hello_ack");
-    expect(ack).toMatchObject({ capabilities: ["draft", "observation_snapshot"], extensions: { [BOTS_CAPABILITY_ID]: 75 } });
+    expect(ack).toMatchObject({ capabilities: ["draft", "observation_snapshot"], extensions: { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION } });
     expect(ws.readyState).toBe(WebSocket.OPEN);
     ws.close();
   });
@@ -644,30 +641,6 @@ describe("attach-v1 ingress", () => {
     clock = 6_000;
     await until(() => presence.includes("absent"), 1_500);
     await until(() => ws.readyState !== WebSocket.OPEN, 1_500);
-  });
-
-  it("reports a heartbeating peer alive at its last inbound byte, and stops the moment it goes", async () => {
-    // Capability 69, F2. This is the ONLY channel a turn has while its model request is in flight
-    // and the peer has no token to send yet, so the lease depends on it firing here, before the
-    // socket ever closes: nothing can be reported for a peer that is already gone.
-    const { ws } = await dial();
-    clock = 400;
-    ws.send(JSON.stringify({ kind: "heartbeat", sentAt: 400 }));
-    await until(() => ingress.health().lastHeartbeatAt === 400);
-    clock = 900;
-    await until(() => liveness.some((entry) => entry.at === 400), 1_500);
-
-    // At the peer's last byte, never at the moment of asking: a peer that stopped answering must
-    // not be credited with the silence the gateway is measuring.
-    expect(liveness.every((entry) => entry.agent === "sage" && entry.at <= 400)).toBe(true);
-
-    // And the close reports absence with no proof of life behind it.
-    const seen = liveness.length;
-    ws.close();
-    await until(() => presence.includes("absent"), 1_500);
-    clock = 12_000;
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(liveness).toHaveLength(seen);
   });
 
   it("treats plugin heartbeats as acknowledgements instead of echoing them", async () => {

@@ -177,31 +177,20 @@ export interface NativeBotDataPlaneOptions {
  *  still says the turn is running. Provisional, and re-evaluated with measured findings. */
 const OWNER_LOSS_LEASE_MS = 120_000;
 
-/** Capability 69, F2. How long a turn whose peer dropped MID MODEL REQUEST waits before that lease
- *  clock starts at all.
+/** Capability 69, F2b. How long a detached turn with a recent emitted frame waits before that
+ *  lease clock starts.
  *
- *  The lease above measures silence from the instant the socket closed, and for a peer that was
- *  answering heartbeats right up to that instant, silence is the wrong reading: it was working,
- *  the model had not returned a token yet, and the drop is what a peer blocked inside one long
- *  synchronous prefill looks like from here. LV1 measured a cold 45k token window at about 123
- *  seconds on one endpoint and LV2 measured 8 seconds for the same window on another, from the
- *  same code, so no lease number tells a slow model call apart from a dead process. What does tell
- *  them apart is whether the peer was alive when it went: an outstanding model request on a turn
- *  whose peer was breathing a moment ago is positive evidence the owner is still there, and the
- *  gateway waits one model request out before it starts counting silence.
+ *  A frame in the final 30 seconds is gateway-observed evidence that this specific turn was active
+ *  when its peer detached. LV1 measured a cold 45k-token prefill at about 123 seconds, so two
+ *  measured cold-prefill windows leave bounded headroom without turning a recent frame into an
+ *  open-ended liveness proof.
  *
- *  Bounded on purpose. A peer that never comes back is still reaped, at the drop plus this window
- *  plus the unchanged lease, so about six minutes and never more than the ceiling. That is
- *  deliberately INSIDE the ten minute grace an attached quiet peer already gets for exactly the
- *  same reason, so no window here is longer than one this gateway already grants. */
-const IN_FLIGHT_MODEL_REQUEST_MS = 240_000;
+ *  A peer that never comes back is still reaped after this fixed grant plus the unchanged lease,
+ *  never after the operator ceiling and never by changing the undeclared grace. */
+const RECENT_FRAME_DETACH_EXTENSION_MS = 240_000;
 
-/** Capability 69, F2. How recently the peer must have proved it was alive, at the moment its
- *  socket closed, for the turn it was carrying to count as a model request in flight rather than a
- *  process that had already been gone a while. One ingress heartbeat timeout plus slack: the
- *  transport gives up on a silent peer at 45 seconds, so a proof older than this means the peer had
- *  already stopped talking to us before the socket went. */
-const IN_FLIGHT_PROOF_MS = 60_000;
+/** A last turn frame outside this window is idle evidence and earns no detached-lease extension. */
+const RECENT_FRAME_AT_DETACH_MS = 30_000;
 
 /** Capability 69. The window for a turn whose peer HAS re-attached but could not declare whether
  *  it still holds it, which is every Hermes peer until HF1 ships. It is deliberately far longer
@@ -458,6 +447,9 @@ export class NativeBotDataPlane {
   /** Last moment this turn produced ANY frame. Seeded from the durable queuedAt, so a restart
    *  does not hand a turn that was already silent for an hour a fresh hour of silence. */
   readonly #turnActivity = new Map<string, number>();
+  /** Last gateway-observed frame from this turn. Unlike #turnActivity, dispatch and hello never
+   *  seed it, so it is valid evidence for the bounded detached-lease extension. */
+  readonly #turnLastFrame = new Map<string, number>();
   /** When an interrupt for this turn was accepted by the plugin. */
   readonly #interruptAcked = new Map<string, number>();
   /** Capability 69. When the gateway last learned that no peer is carrying this turn: the peer
@@ -465,17 +457,9 @@ export class NativeBotDataPlane {
    *  on the owner-loss lease instead of the long silence ceiling; any frame on the turn, or a
    *  hello that declares it active, is proof of ownership and removes it.
    *
-   *  F2. `inFlight` is the reading taken AT THE MOMENT the mark was made, and only for a detached
-   *  peer: the peer was proving it was alive within `IN_FLIGHT_PROOF_MS` of losing its socket, so
-   *  the turn it was carrying had a model request outstanding rather than a process that had
-   *  already been gone a while. It buys that turn one model request of quiet before the lease
-   *  clock starts, and nothing else. */
-  readonly #turnOwnerLost = new Map<string, { at: number; kind: "detached" | "undeclared"; inFlight?: boolean }>();
-  /** Capability 69, F2. When the peer carrying this turn last PROVED it was alive by a means other
-   *  than a frame: the attach-v1 heartbeat the ingress already runs, stamped at the peer's last
-   *  inbound byte. Only ever read at the instant the peer detaches, which is the only instant that
-   *  question matters, because a detached peer proves nothing afterwards by construction. */
-  readonly #turnLiveness = new Map<string, number>();
+   *  F2b. `recentFrame` is read at detach and only for that branch. It is a fixed, bounded grant,
+   *  not ongoing liveness, so no later peer activity can stretch it. */
+  readonly #turnOwnerLost = new Map<string, { at: number; kind: "detached" | "undeclared"; recentFrame?: boolean }>();
   /** Capability 69. The chat context (workspace and model) one open turn was dispatched with, so
    *  a promoted turn runs in the same workspace rather than the peer's default. Process-local and
    *  best effort: the durable copy rides on the pending steer row, which is what survives a
@@ -1160,24 +1144,6 @@ export class NativeBotDataPlane {
     };
   }
 
-  /** Capability 69, F2. The peer behind this attach identity was alive as of `at`, on evidence that
-   *  is not a frame: the ingress heartbeat it is still answering, stamped at its last inbound byte
-   *  rather than at the moment of asking. Every turn it has actually TAKEN off the wire and not
-   *  terminated is therefore a dispatched, unterminated model request being worked by a live
-   *  process, whatever its model is doing and however long it has been since it had a token to
-   *  send. That reading is what `#markOwnerLost` consults if the socket later goes.
-   *
-   *  This is peer-agnostic on purpose: it reads the gateway's own delivery record and its own
-   *  transport, never anything a peer chose to send, so a Hermes profile gets it with no plugin
-   *  change and a CozyAgents peer needs no new frame. It can only ever EXTEND the detached lease:
-   *  the undeclared grace, the interrupt grace and the silence ceiling never read it. */
-  handleAttachLiveness(peer: string, at: number): void {
-    const bot = this.#peerBot(peer);
-    if (bot === undefined) return;
-    for (const turn of this.#reconcilableTurns(bot, peer))
-      this.#turnLiveness.set(this.#nativeTurnKey(bot, turn.sessionId, turn.turnId), at);
-  }
-
   handleAttachPresence(bot: string, state: "online" | "degraded" | "absent"): void {
     const key = this.#peerBot(bot);
     if (key === undefined) return;
@@ -1213,10 +1179,6 @@ export class NativeBotDataPlane {
   handleAttachHello(peer: string, activeTurns?: readonly string[]): void {
     const bot = this.#peerBot(peer);
     if (bot === undefined) return;
-    // F2. The hello is bytes from the peer, arriving now, so it is proof of life in its own right
-    // for whatever it is still carrying. It matters only if this peer's socket later drops before
-    // the first heartbeat tick reaches it.
-    this.handleAttachLiveness(peer, this.#now());
     const declared = activeTurns === undefined ? undefined : new Set(activeTurns);
     for (const turn of this.#reconcilableTurns(bot, peer)) {
       const key = this.#nativeTurnKey(bot, turn.sessionId, turn.turnId);
@@ -1262,13 +1224,12 @@ export class NativeBotDataPlane {
   #markOwnerLost(bot: string, sessionId: string, turnId: string, kind: "detached" | "undeclared"): void {
     const key = this.#nativeTurnKey(bot, sessionId, turnId);
     const now = this.#now();
-    // F2. Take the in-flight reading HERE, because this is the last instant it can be taken: a
-    // detached peer sends nothing more, so whether it was working when it went is a question only
-    // its final heartbeat can answer, and only a detached peer is asked it. An undeclared peer is
-    // attached and keeps its own grace untouched.
-    const proof = this.#turnLiveness.get(key);
-    const inFlight = kind === "detached" && proof !== undefined && now - proof <= IN_FLIGHT_PROOF_MS;
-    this.#turnOwnerLost.set(key, { at: now, kind, ...(inFlight ? { inFlight } : {}) });
+    // F2b. Read the actual last turn frame at the moment the peer detaches. A hello, dispatch or
+    // heartbeat can prove transport activity but cannot substitute for work this turn emitted.
+    const lastFrame = this.#turnLastFrame.get(key);
+    const recentFrame = kind === "detached" && lastFrame !== undefined
+      && now - lastFrame >= 0 && now - lastFrame <= RECENT_FRAME_AT_DETACH_MS;
+    this.#turnOwnerLost.set(key, { at: now, kind, ...(recentFrame ? { recentFrame } : {}) });
     this.#seedTurnActivity(bot, sessionId, turnId);
   }
 
@@ -1421,9 +1382,9 @@ export class NativeBotDataPlane {
     if (this.#staleTurnSweep !== undefined) clearInterval(this.#staleTurnSweep);
     this.#staleTurnSweep = undefined;
     this.#turnActivity.clear();
+    this.#turnLastFrame.clear();
     this.#interruptAcked.clear();
     this.#turnOwnerLost.clear();
-    this.#turnLiveness.clear();
     this.#turnContexts.clear();
     for (const timer of this.#interactionTimers.values()) clearTimeout(timer);
     this.#interactionTimers.clear();
@@ -1582,6 +1543,7 @@ export class NativeBotDataPlane {
       // steps, drafts, and since #189 interim commits), which is exactly what makes total silence
       // a safe staleness signal rather than a race against slow work.
       this.#turnActivity.set(this.#nativeTurnKey(key, sessionId, event.turnId), this.#now());
+      this.#turnLastFrame.set(this.#nativeTurnKey(key, sessionId, event.turnId), this.#now());
       // Capability 69. The same proof answers the owner question: a peer that is emitting frames
       // for this turn is carrying it, whatever a hello or a dropped socket suggested. The one
       // exception is the typed unknown-turn failure, which is the peer saying the opposite, so it
@@ -2592,9 +2554,9 @@ export class NativeBotDataPlane {
     });
     this.#tracedTurnStates.delete(this.#nativeTurnKey(bot, sessionId, turnId));
     this.#turnActivity.delete(this.#nativeTurnKey(bot, sessionId, turnId));
+    this.#turnLastFrame.delete(this.#nativeTurnKey(bot, sessionId, turnId));
     this.#interruptAcked.delete(this.#nativeTurnKey(bot, sessionId, turnId));
     this.#turnOwnerLost.delete(this.#nativeTurnKey(bot, sessionId, turnId));
-    this.#turnLiveness.delete(this.#nativeTurnKey(bot, sessionId, turnId));
     this.#turnContexts.delete(this.#nativeTurnKey(bot, sessionId, turnId));
     this.#stopStaleTurnSweepWhenIdle();
     this.#expireTurnInteractions(bot, sessionId, turnId);
@@ -3486,21 +3448,15 @@ export class NativeBotDataPlane {
           ownerLost.kind === "detached" ? OWNER_LOSS_LEASE_MS : UNDECLARED_OWNER_GRACE_MS,
           this.#staleTurnCeilingMs,
         );
-        // F2. A peer that dropped its socket while it was still answering heartbeats dropped it
-        // MID MODEL REQUEST: it was working, its model had not returned a token yet, and that is
-        // exactly what a peer blocked inside one long synchronous prefill looks like from here.
-        // One model request of quiet is excluded from this clock before it starts, the way a
-        // pending approval or device request already suspends it, and then the unchanged lease
-        // runs. Only the detached branch asks: an undeclared peer is attached, and its own grace
-        // is left exactly as capability 69 shipped it. The exclusion can never carry a turn past
-        // a ceiling an operator shortened.
-        const inFlight = ownerLost.inFlight === true
-          ? Math.min(IN_FLIGHT_MODEL_REQUEST_MS, Math.max(0, this.#staleTurnCeilingMs - lease))
+        // F2b. Only a detached turn with a frame from this turn in its final 30 seconds gets the
+        // fixed cold-prefill grant. The undeclared branch cannot reach this extension.
+        const extension = ownerLost.kind === "detached" && ownerLost.recentFrame === true
+          ? Math.min(RECENT_FRAME_DETACH_EXTENSION_MS, Math.max(0, this.#staleTurnCeilingMs - lease))
           : 0;
-        const since = Math.max(lastActive, ownerLost.at) + inFlight;
+        const since = Math.max(lastActive, ownerLost.at) + extension;
         if (now - since - this.#storage.tasks.suspended(peer, turnId, Math.min(since, now), now) >= lease) {
           this.#log(
-            `reaping unowned turn ${turnId} for ${bot}: ${ownerLost.kind} peer${ownerLost.inFlight === true ? " lost mid model request" : ""}, silent for ${now - Math.max(lastActive, ownerLost.at)}ms`,
+            `reaping unowned turn ${turnId} for ${bot}: ${ownerLost.kind} peer${ownerLost.recentFrame === true ? " with a recent frame" : ""}, silent for ${now - Math.max(lastActive, ownerLost.at)}ms`,
           );
           this.#sealOwnerLoss(bot, chat.sessionId, turnId);
           continue;
@@ -3528,7 +3484,7 @@ export class NativeBotDataPlane {
     }
     // A turn can also leave through /new, which discards it without a terminal. Anything no
     // longer the active turn is bookkeeping this sweep should not carry (or watch) any further.
-    for (const map of [this.#turnActivity, this.#interruptAcked, this.#turnOwnerLost, this.#turnLiveness])
+    for (const map of [this.#turnActivity, this.#turnLastFrame, this.#interruptAcked, this.#turnOwnerLost])
       for (const key of map.keys()) if (!live.has(key)) map.delete(key);
     this.#stopStaleTurnSweepWhenIdle();
   }

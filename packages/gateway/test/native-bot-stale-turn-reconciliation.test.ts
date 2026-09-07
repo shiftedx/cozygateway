@@ -24,13 +24,10 @@ const CEILING_MS = 1_800_000;
 const LEASE_MS = 120_000;
 /** The longer window a peer that re-attached but cannot declare its turns gets. */
 const GRACE_WINDOW_MS = 600_000;
-/** F2. How often the ingress heartbeat tick reports a live peer: `ATTACH_V1_HEARTBEAT_INTERVAL_MS`. */
-const HEARTBEAT_MS = 15_000;
-/** F2. The quiet a turn gets when its peer dropped its socket mid model request, before the lease
- *  clock starts. */
-const IN_FLIGHT_MS = 240_000;
-/** F2. How stale the last proof of life may be at the drop and still read as a request in flight. */
-const IN_FLIGHT_PROOF_MS = 60_000;
+/** F2b. A detached turn with a frame in its last 30 seconds receives this fixed extension. */
+const RECENT_FRAME_MS = 30_000;
+/** Two measured LV1 cold-prefill windows, preserving the fixed bounded r1 extension. */
+const RECENT_FRAME_EXTENSION_MS = 240_000;
 
 interface Harness {
   storage: Storage;
@@ -208,68 +205,34 @@ describe("HF2: a stale native turn never swallows a reply", () => {
     harness.close();
   });
 
-  it("bounds a disconnected peer's turn to the owner-loss lease", async () => {
+  it("extends a detached turn only when its last actual frame was recent", async () => {
     const harness = await startTurn();
 
-    harness.plane.handleAttachPresence("sage", "absent");
-    harness.advance(LEASE_MS + SWEEP_MS);
-
-    expect(terminalOf(harness)).toBeDefined();
-    harness.close();
-  });
-
-  /** F2. What the ingress actually does to a live peer, in the order it does it: every heartbeat
-   *  tick reports the peer alive at its last inbound byte, and the socket close that follows is
-   *  the ONLY thing that marks the turn detached. No proof can arrive after the close, because the
-   *  ingress removes the connection before it reports `absent`, so this ordering is the whole
-   *  reachable surface of the rule. */
-  function heartbeat(harness: Harness, forMs: number): void {
-    for (let elapsed = 0; elapsed < forMs; elapsed += HEARTBEAT_MS) {
-      harness.plane.handleAttachLiveness("sage", harness.now());
-      harness.advance(HEARTBEAT_MS);
-    }
-  }
-
-  it("never reaps a peer that dropped its socket mid model request at the bare lease", async () => {
-    const harness = await startTurn();
-
-    // Three minutes inside one cold prefill: the peer answers every heartbeat and has no token to
-    // send yet, so not one frame leaves it. Then its socket goes, which is what a peer blocked in
-    // a long synchronous model call looks like from here. LV1 measured that window at about 123
-    // seconds against this 120 second lease.
-    heartbeat(harness, 3 * 60_000);
+    harness.event("recent-frame", {
+      kind: "thinking", threadId: harness.sessionId, turnId: harness.turnId,
+      text: "still working", seq: 1, lastActiveAt: harness.now(),
+    });
+    harness.advance(RECENT_FRAME_MS - 1);
     harness.plane.handleAttachPresence("sage", "absent");
     harness.advance(LEASE_MS + SWEEP_MS);
 
     expect(terminalOf(harness)).toBeUndefined();
-    expect(harness.storage.nativeBotChat("sage", harness.now()).activeTurnId).toBe(harness.turnId);
-    harness.close();
-  });
-
-  it("reaps a peer lost mid model request once one model request and the lease have passed", async () => {
-    const harness = await startTurn();
-
-    // The same drop, and this time the process really is gone. It waits one model request out and
-    // then counts the ordinary lease, so the turn ends within a stated bound rather than never.
-    heartbeat(harness, 3 * 60_000);
-    harness.plane.handleAttachPresence("sage", "absent");
-    harness.advance(IN_FLIGHT_MS + LEASE_MS - SWEEP_MS);
+    harness.advance(RECENT_FRAME_EXTENSION_MS - 2 * SWEEP_MS);
     expect(terminalOf(harness)).toBeUndefined();
-
     harness.advance(2 * SWEEP_MS);
 
     expect(terminalOf(harness)).toMatchObject({ status: "failed" });
-    expect(harness.storage.nativeBotChat("sage", harness.now()).activeTurnId).toBeUndefined();
     harness.close();
   });
 
-  it("reaps a peer that had already stopped answering before its socket went, at the bare lease", async () => {
+  it("reaps a detached turn whose last frame was older than 30 seconds at the bare lease", async () => {
     const harness = await startTurn();
 
-    // A proof of life older than the transport's own patience is not a request in flight, it is a
-    // process that was already gone. Nothing is excluded and the lease is exactly what it was.
-    heartbeat(harness, HEARTBEAT_MS);
-    harness.advance(IN_FLIGHT_PROOF_MS + SWEEP_MS);
+    harness.event("stale-frame", {
+      kind: "thinking", threadId: harness.sessionId, turnId: harness.turnId,
+      text: "was working", seq: 1, lastActiveAt: harness.now(),
+    });
+    harness.advance(RECENT_FRAME_MS + 1);
     harness.plane.handleAttachPresence("sage", "absent");
     harness.advance(LEASE_MS + SWEEP_MS);
 
@@ -277,18 +240,16 @@ describe("HF2: a stale native turn never swallows a reply", () => {
     harness.close();
   });
 
-  it("never lets a heartbeat stretch the undeclared grace an older peer keeps", async () => {
+  it("keeps the undeclared grace at 600 seconds without any detached-frame extension", async () => {
     const harness = await startTurn();
 
-    // Never nerf Hermes, and never weaken HF2's own floor. A peer that re-attached without
-    // declaring its turns is ATTACHED, so the ingress heartbeats it every 15 seconds for as long
-    // as it lives. That must not carry the turn past the 10 minute grace: the incident HF2 was
-    // written for was a connected peer that had dropped a turn internally.
+    // A peer that cannot declare stays on its pre-existing 10 minute grace. Transport heartbeats
+    // have no owner-loss lease role, so this reaches the same bound without a lease-side callback.
     harness.plane.handleAttachHello("sage", undefined);
-    heartbeat(harness, GRACE_WINDOW_MS - SWEEP_MS);
+    harness.advance(GRACE_WINDOW_MS - SWEEP_MS);
     expect(terminalOf(harness)).toBeUndefined();
 
-    heartbeat(harness, SWEEP_MS);
+    harness.advance(2 * SWEEP_MS);
 
     expect(terminalOf(harness)).toBeDefined();
     expect(harness.storage.nativeBotChat("sage", harness.now()).activeTurnId).toBeUndefined();
