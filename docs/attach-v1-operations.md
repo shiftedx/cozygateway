@@ -363,7 +363,10 @@ recreates the gateway once. Verification compares `/ready`'s
 `attach.hermes.configured` with the remaining Hermes config count; other attached
 runtimes do not affect that check.
 
-The watcher checks the box every 30 seconds by default. Failed reads, malformed
+The watcher checks the box every 30 seconds by default. An OS advisory lock
+serializes sweeps and releases automatically when the worker process group exits,
+including after SIGKILL; old mkdir-lock directories no longer block the watcher.
+Failed reads, malformed
 config, failed restarts, and failed verification return failure and retry on the
 next sweep. Before editing, the deprovisioner records unfinished work and exact
 credential key names in `<box config path>.deprovision-pending.json`. That journal

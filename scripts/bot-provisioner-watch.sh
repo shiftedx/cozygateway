@@ -22,7 +22,7 @@
 #   next one finishes the job rather than leaving a half-provisioned bot.
 #
 # CONCURRENCY
-#   A flock guard means a slow sweep (the provisioner waits up to 90s for the
+#   An OS advisory lock means a slow sweep (the provisioner waits up to 90s for the
 #   attach hello) never overlaps the next tick.
 #
 # INSTALLATION
@@ -63,18 +63,31 @@ done
 mkdir -p "$(dirname "$LOG_FILE")"
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$LOG_FILE"; }
 
-# Serialize sweeps. Without flock (a bare macOS box has none) fall back to an
-# mkdir lock, which is atomic everywhere and good enough for one writer.
-if command -v flock >/dev/null 2>&1; then
+# Re-exec the sweep under an OS advisory lock. FD 9 remains open across exec,
+# so the kernel releases the lock even on SIGKILL. The PID guard is specific to
+# this process; it cannot accidentally skip locking in a later child sweep.
+if [ "${COZY_PROVISIONER_LOCK_PID:-}" != "$$" ]; then
+  LOCK_PYTHON="$(command -v python3 || true)"
+  [ -n "$LOCK_PYTHON" ] || { log "sweep aborted: no python3 for lock"; exit 1; }
   exec 9>"$LOCK_FILE"
-  flock -n 9 || { log "sweep skipped: another sweep still running"; exit 0; }
-else
-  if ! mkdir "$LOCK_FILE.d" 2>/dev/null; then
-    log "sweep skipped: another sweep still running"
-    exit 0
-  fi
-  trap 'rmdir "$LOCK_FILE.d" 2>/dev/null || true' EXIT
+  export COZY_PROVISIONER_LOCK_PID="$$"
+  exec "$LOCK_PYTHON" - "$SCRIPT_DIR/bot-provisioner-watch.sh" "$HERMES_HOME_ROOT" "$LOG_FILE" "$DRY_RUN" <<'PYLOCK'
+import datetime, fcntl, os, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    with open(sys.argv[3], "a") as log:
+        log.write(datetime.datetime.now().astimezone().isoformat() + "  sweep skipped: another sweep still running\n")
+    sys.exit(0)
+os.set_inheritable(9, True)
+args = ["/bin/bash", sys.argv[1], "--hermes-home", sys.argv[2], "--log", sys.argv[3]]
+if sys.argv[4] == "1":
+    args.append("--dry-run")
+os.execv(args[0], args)
+PYLOCK
 fi
+# A same-process re-entry must have inherited the locked descriptor.
+: >&9
 
 PYTHON="$HERMES_HOME_ROOT/hermes-agent/venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3 || true)"
