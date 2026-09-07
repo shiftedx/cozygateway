@@ -1491,6 +1491,7 @@ export async function startGateway(
       });
       if (durableAttachShutdown) runner.abandonAll();
       else await runner.closeAll();
+      notifier.close();
       storage.close();
     },
   };

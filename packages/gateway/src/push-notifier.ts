@@ -117,6 +117,17 @@ export interface RelayNotifierDeps {
  *  Fire-and-forget by contract: notify() never throws, never rejects, and never blocks
  *  the turn that triggered it (design spec, section 4). */
 export class RelayNotifier implements Notifier {
+  #closed = false;
+  readonly #shutdown = new AbortController();
+
+  /** Stop deferred work before storage closes. Scheduled markers remain durable for recovery. */
+  close(): void {
+    this.#closed = true;
+    this.#shutdown.abort();
+    this.#inflightReplyPushes.clear();
+    this.#pendingCompletions.clear();
+  }
+
   readonly #storage: Storage;
   readonly #fetch: typeof fetch;
   readonly #relayBaseUrl: string | undefined;
@@ -191,6 +202,7 @@ export class RelayNotifier implements Notifier {
     this.#replyPushes.noteReplyPush(marker);
     this.#inflightReplyPushes.add(key);
     void this.#send(registration, payload, routing).then((outcome) => {
+      if (this.#closed) return;
       this.#inflightReplyPushes.delete(key);
       if (outcome === "sent") {
         this.#replyPushes?.markReplyPushSent(marker);
@@ -200,6 +212,7 @@ export class RelayNotifier implements Notifier {
         this.#sendPendingCompletion(key, marker);
       }
     }).catch((err: unknown) => {
+      if (this.#closed) return;
       this.#inflightReplyPushes.delete(key);
       this.#log(`push: notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`);
       this.#sendPendingCompletion(key, marker);
@@ -207,12 +220,14 @@ export class RelayNotifier implements Notifier {
   }
 
   #sendPendingCompletion(key: string, marker: { taskId: string; runId: string; deviceId: string }): void {
+    if (this.#closed) return;
     const pending = this.#pendingCompletions.get(key);
     if (pending === undefined) return;
     this.#pendingCompletions.delete(key);
     // Keep the original scheduled marker through fallback failure and process loss.
     this.#replyPushes?.noteReplyPush(marker);
     void this.#send(pending.registration, pending.payload, pending.routing).then(() => {
+      if (this.#closed) return;
       this.#replyPushes?.clearReplyPush(marker);
     }).catch((err: unknown) => {
       this.#log(`push: task completion fallback failed for device ${pending.registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`);
@@ -326,6 +341,7 @@ export class RelayNotifier implements Notifier {
         continue;
       }
       void this.#send(registration, payload, { category: TASK_COMPLETED_CATEGORY, collapseId }).then(() => {
+        if (this.#closed) return;
         if (marker !== undefined) this.#replyPushes?.clearReplyPush(marker);
       }).catch((err: unknown) => {
         this.#log(
@@ -338,12 +354,14 @@ export class RelayNotifier implements Notifier {
   /** Startup recovery for a marker that survived before its deferred reply request ran. The marker
    * remains scheduled until the relay accepts this completion, so another restart retries it. */
   recoverTaskCompletion(payload: TaskCompletionPushPayload, runId: string, deviceId: string): void {
+    if (this.#closed) return;
     const marker = { taskId: payload.taskId, runId, deviceId };
     const registration = this.#registrations()?.find((candidate) => candidate.deviceId === deviceId);
     if (registration === undefined) { this.#replyPushes?.clearReplyPush(marker); return; }
     const collapseId = payload.taskId;
     if (!COLLAPSE_ID_RE.test(collapseId)) { this.#replyPushes?.clearReplyPush(marker); return; }
     void this.#send(registration, payload, { category: TASK_COMPLETED_CATEGORY, collapseId }).then(() => {
+      if (this.#closed) return;
       this.#replyPushes?.clearReplyPush(marker);
     }).catch((err: unknown) => {
       this.#log(`push: task completion recovery failed for device ${deviceId}: ${err instanceof Error ? err.message : String(err)}`);
@@ -351,6 +369,7 @@ export class RelayNotifier implements Notifier {
   }
 
   #registrations(): PushRegistrationRow[] | undefined {
+    if (this.#closed) return undefined;
     try {
       return this.#storage.pushRegistrations();
     } catch (err) {
@@ -364,7 +383,7 @@ export class RelayNotifier implements Notifier {
     payload: PushPayload,
     /** Both or neither, per contract/push-v0.md: the relay 400s a body carrying only one. */
     routing?: { category: string; collapseId: string; interruptionLevel?: "time-sensitive" },
-  ): Promise<"sent" | "skipped" | "not_found"> {
+  ): Promise<"sent" | "skipped" | "not_found" | "closed"> {
     // Yield one macrotask before the presence recheck. Without this yield the recheck would
     // run in the same synchronous span as notify()'s commit-time snapshot and could never
     // observe anything newer. setImmediate callbacks run after pending I/O callbacks, so a WS
@@ -373,6 +392,7 @@ export class RelayNotifier implements Notifier {
     // send path defers; the commit-time notify decision in the turn runner stays fully
     // synchronous, and one macrotask of extra push latency is invisible at human scale.
     await new Promise<void>((resolve) => setImmediate(resolve));
+    if (this.#closed) return "closed";
     // Late recheck, narrowing (not closing) the race window: the device may have connected
     // since notify()'s commit-time snapshot was taken. Skip the send without touching the
     // registration row, which is prunable only on a relay 404, not on this kind of skip.
@@ -390,12 +410,13 @@ export class RelayNotifier implements Notifier {
           ciphertext,
           ...(routing === undefined ? {} : routing),
         }),
-        signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
+        signal: AbortSignal.any([AbortSignal.timeout(NOTIFY_TIMEOUT_MS), this.#shutdown.signal]),
       });
       // Old strict relays reject the new field before delivery. Only that explicit schema
       // rejection is safe to retry; uncertain network/server failures may already have delivered.
       if (res.status === 400 && routing?.interruptionLevel === "time-sensitive") {
         const rejection: unknown = await res.json().catch(() => undefined);
+        if (this.#closed) return "closed";
         if (typeof rejection === "object" && rejection !== null && "error" in rejection) {
           const error = rejection.error;
           if (typeof error === "object" && error !== null && "code" in error && "message" in error
@@ -406,16 +427,18 @@ export class RelayNotifier implements Notifier {
               method: "POST",
               headers: { "content-type": "application/json" },
               body: JSON.stringify({ pushId: registration.pushId, ciphertext, category: routing.category, collapseId: routing.collapseId }),
-              signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
+              signal: AbortSignal.any([AbortSignal.timeout(NOTIFY_TIMEOUT_MS), this.#shutdown.signal]),
             });
           }
         }
       }
     } catch (error) {
+      if (this.#closed) return "closed";
       emitTrace(this.#trace, "relay_result", { device: traceId(registration.deviceId), result: "network_error" });
       this.#observe?.pushResult(registration.deviceId, "network_error");
       throw error;
     }
+    if (this.#closed) return "closed";
     emitTrace(this.#trace, "relay_result", { device: traceId(registration.deviceId), result: res.ok ? "ok" : res.status === 404 ? "not_found" : "http_error" });
     this.#observe?.pushResult(registration.deviceId, res.ok ? "ok" : res.status === 404 ? "not_found" : "http_error");
     if (res.status === 404) {
