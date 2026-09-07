@@ -253,8 +253,10 @@ It copies this routing hint to `aps["interruption-level"]`, never an APNs HTTP h
 name and approval details remain encrypted; the relay learns only this delivery urgency hint.
 Webhook transports preserve the same optional hint.
 
-Upgrade the relay before a gateway emits this optional field: older strict relay schemas reject
-it. The app requires the Time Sensitive Notifications entitlement in its signed provisioning
+Older strict relays reject this optional field before delivery. On exactly HTTP 400 with
+`invalid_request` and `malformed notify body`, the gateway retries once with identical ciphertext,
+category and collapse id but no urgency hint, and logs the downgrade. Other errors are not retried.
+Upgrading the relay enables the higher interruption level. The app requires the Time Sensitive Notifications entitlement in its signed provisioning
 profile. A user can disable time-sensitive interruptions, so this flag is not proof of immediate
 presentation. Delivery approval TTL remains 180 seconds pending real-device Focus verification.
 

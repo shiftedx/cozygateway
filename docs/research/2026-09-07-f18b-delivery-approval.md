@@ -22,6 +22,18 @@ The local integration POC passes a real room approval payload through gateway en
 
 No gateway, relay, app or runner release/deployment was performed. No real user received a push. The app entitlement and provenance implementation are owned by the parent/app worker.
 
-Upgrade the relay before enabling this gateway version: an older relay's strict notify schema rejects the optional urgency field. The app needs the Time Sensitive Notifications entitlement in its signed provisioning profile. Real-device Focus presentation, user notification settings, and signed entitlement verification remain outstanding. CozyAgents `DELIVERY_APPROVAL_TTL_MS` is unchanged at 180 seconds; its existing shorter interaction-bound clamp is untouched.
+An older strict relay's explicit HTTP 400 `invalid_request` / `malformed notify body` response triggers one retry with the same ciphertext, category and collapse id, omitting only urgency. The gateway logs the downgrade. No network, server or unrelated validation failure is retried. Upgrade the relay to enable elevated delivery. The app needs the Time Sensitive Notifications entitlement in its signed provisioning profile. Real-device Focus presentation, user notification settings, and signed entitlement verification remain outstanding. CozyAgents `DELIVERY_APPROVAL_TTL_MS` is unchanged at 180 seconds; its existing shorter interaction-bound clamp is untouched.
 
 Apple documents the key in the [remote notification payload](https://developer.apple.com/documentation/usernotifications/generating-a-remote-notification). Apple also states that [time-sensitive notifications can break through Focus](https://developer.apple.com/documentation/usernotifications/unnotificationinterruptionlevel/timesensitive), but users can disable this behavior. Therefore the payload and entitlement alone do not justify lowering the approval window.
+
+## Backward compatibility review follow-up
+
+The old-relay fallback regression failed before the retry was added. It now proves exactly two
+requests on the supported schema rejection, with identical ciphertext and routing identity, and
+ordinary delivery accepted on the second request. A repeatedly rejecting relay receives at most
+two attempts. Network, HTTP 500, and unrelated HTTP 400 failures each receive one attempt. The
+existing new-relay integration still proves that urgency is retained when supported.
+
+91 focused tests passed after this follow-up across push notifier, room interactions, and APNs
+transport. Typecheck passed. The room expiry harness uses the same split dispatch wiring as the
+server and asserts exactly one pending and one resolved push, preserving the room namespace.

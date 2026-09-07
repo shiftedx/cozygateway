@@ -1,3 +1,4 @@
+import { roomApprovalPush } from "../src/push-crypto.ts";
 import { createServer, type Server } from "node:http";
 import { once } from "node:events";
 
@@ -90,6 +91,7 @@ interface Harness {
   /** Every attach turn command the rooms handed to the transport, in dispatch order. */
   commands: Array<{ agentId: string; threadId: string; turnId: string }>;
   frames: ServerFrame[];
+  pushedApprovals: Array<{ kind: string; room?: string }>;
   /** Pushes one attach event at the room, answering whether the room accepted it. A `false` here
    *  is a DEAD LETTER: the ingress would retry it and then block the member's whole stream. */
   push: (agentId: string, event: Record<string, unknown>) => boolean;
@@ -133,6 +135,7 @@ async function setup(
   // publish to the same hub, so a terminal frame the plane emits for a room interaction lands on
   // the same wire the room's own frames do.
   const frames: ServerFrame[] = [];
+  const pushedApprovals: Array<{ kind: string; room?: string }> = [];
 
   const received = new Map<string, AttachV1ServerFrame[]>();
   const sockets: WebSocket[] = [];
@@ -160,6 +163,7 @@ async function setup(
     nativeBots: runtimeBots,
     chatSuggestion: "",
     broadcast: (frame) => frames.push(frame),
+    onApproval: event => pushedApprovals.push({ kind: event.outcome === undefined ? "approval_pending" : "approval_resolved", ...(event.room === undefined ? {} : { room: event.room }) }),
     now: () => NOW,
     log: () => {},
   });
@@ -173,7 +177,11 @@ async function setup(
   const bridge = new HermesBridge({
     client,
     storage,
-    broadcast: (frame) => frames.push(frame),
+    broadcast: (frame) => {
+      frames.push(frame);
+      const push = roomApprovalPush(frame);
+      if (push !== undefined) pushedApprovals.push({ kind: push.kind, room: "room" in frame ? String(frame.room) : undefined });
+    },
     now: () => NOW,
     logSink: () => {},
     runtimeBotNames: () => runtime,
@@ -215,6 +223,7 @@ async function setup(
     client,
     commands,
     frames,
+    pushedApprovals,
     app,
     received,
     resolutions: (bot) =>
@@ -872,6 +881,10 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
     expect(h.frames.some((frame) =>
       frame.type === "bot_approval_resolved" && frame.outcome === "expired" && frame.room === "Launch",
     )).toBe(true);
+    expect(h.pushedApprovals).toEqual([
+      { kind: "approval_pending", room: "Launch" },
+      { kind: "approval_resolved", room: "Launch" },
+    ]);
     expect(h.bridge.groups()[0]?.pendingInteractions).toBeUndefined();
   });
 

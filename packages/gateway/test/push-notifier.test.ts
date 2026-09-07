@@ -519,6 +519,41 @@ describe("RelayNotifier.notifyApproval", () => {
     name: "run_shell",
   };
 
+  it("retries an old relay schema rejection once without urgency using identical ciphertext", async () => {
+    const storage = seeded([registration]);
+    const bodies: Array<Record<string, unknown>> = [];
+    const log: string[] = [];
+    const impl = (async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      return body.interruptionLevel === undefined ? new Response(null, { status: 202 })
+        : Response.json({ error: { code: "invalid_request", message: "malformed notify body" } }, { status: 400 });
+    }) as typeof fetch;
+    new RelayNotifier({ storage, fetchImpl: impl, log: line => log.push(line) }).notifyApproval({ ...pendingPayload, name: "send_file" }, new Set());
+    await settle();
+    expect(bodies).toHaveLength(2);
+    const { interruptionLevel, ...original } = bodies[0]!;
+    expect(interruptionLevel).toBe("time-sensitive");
+    expect(bodies[1]).toEqual(original);
+    expect(log).toContain("push: relay rejected delivery urgency; retrying once at the ordinary interruption level");
+    storage.close();
+  });
+
+  it.each(["network", "server", "other400", "repeated400"])("does not repeat uncertain or unrelated failures: %s", async failure => {
+    const storage = seeded([registration]);
+    let calls = 0;
+    const impl = (async () => {
+      calls++;
+      if (failure === "network") throw new Error("offline");
+      if (failure === "server") return new Response(null, { status: 500 });
+      return Response.json({ error: { code: "invalid_request", message: failure === "other400" ? "category and collapseId must be sent together" : "malformed notify body" } }, { status: 400 });
+    }) as typeof fetch;
+    new RelayNotifier({ storage, fetchImpl: impl, log: () => {} }).notifyApproval({ ...pendingPayload, name: "send_file" }, new Set());
+    await settle();
+    expect(calls).toBe(failure === "repeated400" ? 2 : 1);
+    storage.close();
+  });
+
   it("elevates only a delivery approval pending push", async () => {
     const storage = seeded([registration]);
     const { impl, sent } = fetchStub(() => 202);

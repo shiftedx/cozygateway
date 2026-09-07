@@ -392,6 +392,25 @@ export class RelayNotifier implements Notifier {
         }),
         signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
       });
+      // Old strict relays reject the new field before delivery. Only that explicit schema
+      // rejection is safe to retry; uncertain network/server failures may already have delivered.
+      if (res.status === 400 && routing?.interruptionLevel === "time-sensitive") {
+        const rejection: unknown = await res.json().catch(() => undefined);
+        if (typeof rejection === "object" && rejection !== null && "error" in rejection) {
+          const error = rejection.error;
+          if (typeof error === "object" && error !== null && "code" in error && "message" in error
+            && error.code === "invalid_request" && error.message === "malformed notify body") {
+            if (this.#isDeviceConnected?.(registration.deviceId) === true) return "skipped";
+            this.#log("push: relay rejected delivery urgency; retrying once at the ordinary interruption level");
+            res = await this.#fetch(url, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ pushId: registration.pushId, ciphertext, category: routing.category, collapseId: routing.collapseId }),
+              signal: AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
+            });
+          }
+        }
+      }
     } catch (error) {
       emitTrace(this.#trace, "relay_result", { device: traceId(registration.deviceId), result: "network_error" });
       this.#observe?.pushResult(registration.deviceId, "network_error");
