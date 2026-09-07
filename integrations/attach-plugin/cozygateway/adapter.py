@@ -132,6 +132,22 @@ def _env_float(name: str, default: float) -> float:
     return value if (math.isfinite(value) and value > 0) else default
 
 
+# What Hermes finalizes a native stream with when the turn produced no text at
+# all ("Native streams MUST close with finish=true even when empty", the native
+# branch of ``_finalize_turn``). Not an answer, so never a commit.
+_NATIVE_STREAM_PLACEHOLDERS = ("", "✅")
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read an on/off switch from the environment; anything unrecognised is the default."""
+    raw = (os.getenv(name) or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 def _env_int(name: str, default: int) -> int:
     """Read a positive int from the environment, falling back on unset/garbage."""
     raw = os.getenv(name)
@@ -852,6 +868,16 @@ class AttachAdapter:
     # disposable previews. Keep Hermes tool-boundary segment breaks on the
     # draft path; only the true turn-final send may emit ``done`` and clean up.
     draft_stream_is_message = True
+
+    # Hermes' second, ungated streaming transport. `_resolve_native_streaming`
+    # (gateway/stream_consumer_transport.py) needs this class attribute AND a
+    # truthy `supports_native_streaming` probe before it will route frames
+    # through `send_stream_frame`, and the native branch of `_should_edit` then
+    # pushes every delta with no edit-rate limit at all. Declaring the attribute
+    # here is what makes the transport reachable for this platform; the probe
+    # below decides per profile whether to take it. See `supports_native_streaming`
+    # for why that decision is not simply "always".
+    SUPPORTS_NATIVE_STREAMING = True
 
     # -- construction ---------------------------------------------------------
     def _attach_init(self, config: Any) -> None:
@@ -2693,6 +2719,66 @@ class AttachAdapter:
             logger.debug("attach: send_draft failed", exc_info=True)
             return SendResult(success=False, error=str(exc))
         return SendResult(success=True)
+
+    # -- native streaming transport -------------------------------------------
+    def supports_native_streaming(
+        self, chat_type: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Whether this profile takes Hermes' ungated per-delta transport.
+
+        Off unless ``COZYGATEWAY_NATIVE_STREAMING`` says otherwise, and the reason
+        is the turn lifecycle rather than the cadence. On the native transport
+        Hermes owns delivery end to end: ``send()`` is never called for the
+        answer, and every finalize frame arrives here as the same
+        ``send_stream_frame(..., finalize=True)``. That includes the one
+        ``_finalize_boundary_stream`` sends BEFORE an approval or clarify prompt,
+        which this platform cannot tell apart from the turn-final one, and a
+        finalize here commits and seals the turn. Sealing a turn that is about to
+        ask a person a question is worse than a slow stream, so the default lane
+        stays the draft one, whose cadence the seeded ``streaming.edit_interval``
+        and ``streaming.buffer_threshold`` already bring down to the run loop's
+        own 0.05s tick.
+        """
+        return _env_flag("COZYGATEWAY_NATIVE_STREAMING", False)
+
+    async def send_stream_frame(
+        self,
+        text: str,
+        *,
+        finalize: bool = False,
+        chat_id: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        **_kwargs: Any,
+    ) -> bool:
+        """One native-stream frame, carrying the FULL text so far (not a delta).
+
+        An interim frame is the same ``draft`` the debounced path emits, so the
+        wire the app sees is unchanged: one ``bot_chat_delta`` per frame, just
+        more of them. A finalize frame is the turn's terminal delivery and goes
+        through ``send`` so the commit, the media, the receipts and the seal all
+        stay in the one place that has ever owned them.
+
+        Returns a bool because that is what the harness reads; False permanently
+        disables native streaming for the run and falls back to send/edit, so a
+        frame that merely has nowhere to go yet answers True.
+        """
+        if not chat_id or chat_id.startswith("__cozyapp__:"):
+            return True
+        if finalize:
+            # Hermes closes a contentless native stream with a bare placeholder
+            # ("✅"). Committing that would append a checkmark bubble no other
+            # transport produces; delivered as the empty reply it is, it takes
+            # `send`'s existing "no content ever materialized" seal instead.
+            active = self._active_turn.get(chat_id)
+            body = "" if text.strip() in _NATIVE_STREAM_PLACEHOLDERS else text
+            result = await self.send(
+                chat_id, body, reply_to=reply_to or turn_id or active,
+                metadata={"notify": True},
+            )
+            return bool(getattr(result, "success", False))
+        result = await self.send_draft(chat_id, 0, text)
+        return bool(getattr(result, "success", False))
 
     # -- tool-chip tap --------------------------------------------------------
     def observe_tool_event(

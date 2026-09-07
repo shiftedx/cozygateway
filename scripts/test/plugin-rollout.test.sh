@@ -64,18 +64,36 @@ printf '%s\n' "$*" >> "${COZY_TEST_HERMES_LOG:-/dev/null}"
 if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "set" ]; then
   [ -n "${COZY_TEST_HERMES_WRITER_FAILS:-}" ] && exit 1
   [ -n "${COZY_TEST_HERMES_NOOP_WRITER:-}" ] && exit 0
-  [ "$6" = true ] || exit 2
+  # The caller is expected to pass the value the reader named for each key, so a
+  # bare "true" over a cadence knob is a bug this fake refuses rather than hides.
+  case "$5=$6" in
+    display.streaming=true|display.platforms.cozygateway.streaming=true) ;;
+    streaming.edit_interval=0.05|streaming.buffer_threshold=1) ;;
+    *) exit 2 ;;
+  esac
   dir="$COZY_TEST_HERMES_HOME/profiles/$2"
   : > "$dir/.wrote-$5"
-  # Rewrite the display block from the keys written so far. Only these two keys
-  # are ever set here, so a real YAML writer (and a YAML library) is not needed
-  # to prove the caller reads the file back.
-  awk '/^display:/ { skip = 1; next } skip && ($0 ~ /^[ \t]/ || $0 == "") { next } { skip = 0; print }' \
-    "$dir/config.yaml" > "$dir/config.yaml.tmp"
-  printf 'display:\n' >> "$dir/config.yaml.tmp"
-  [ -f "$dir/.wrote-display.streaming" ] && printf '  streaming: true\n' >> "$dir/config.yaml.tmp"
-  [ -f "$dir/.wrote-display.platforms.cozygateway.streaming" ] \
-    && printf '  platforms:\n    cozygateway:\n      streaming: true\n' >> "$dir/config.yaml.tmp"
+  # Rewrite ONLY the block this key lives in, from the keys written so far, and
+  # leave the other one exactly as the fixture wrote it. Only these four keys are
+  # ever set here, so a real YAML writer (and a YAML library) is not needed to
+  # prove the caller reads the file back.
+  case "$5" in
+    display.*)
+      awk '/^display:/ { skip = 1; next } skip && ($0 ~ /^[ \t]/ || $0 == "") { next } { skip = 0; print }' \
+        "$dir/config.yaml" > "$dir/config.yaml.tmp"
+      printf 'display:\n' >> "$dir/config.yaml.tmp"
+      [ -f "$dir/.wrote-display.streaming" ] && printf '  streaming: true\n' >> "$dir/config.yaml.tmp"
+      [ -f "$dir/.wrote-display.platforms.cozygateway.streaming" ] \
+        && printf '  platforms:\n    cozygateway:\n      streaming: true\n' >> "$dir/config.yaml.tmp"
+      ;;
+    streaming.*)
+      awk '/^streaming:/ { skip = 1; next } skip && ($0 ~ /^[ \t]/ || $0 == "") { next } { skip = 0; print }' \
+        "$dir/config.yaml" > "$dir/config.yaml.tmp"
+      printf 'streaming:\n' >> "$dir/config.yaml.tmp"
+      [ -f "$dir/.wrote-streaming.edit_interval" ] && printf '  edit_interval: 0.05\n' >> "$dir/config.yaml.tmp"
+      [ -f "$dir/.wrote-streaming.buffer_threshold" ] && printf '  buffer_threshold: 1\n' >> "$dir/config.yaml.tmp"
+      ;;
+  esac
   mv "$dir/config.yaml.tmp" "$dir/config.yaml"
 fi
 exit 0
@@ -111,6 +129,9 @@ display:
   platforms:
     cozygateway:
       streaming: true
+streaming:
+  edit_interval: 0.05
+  buffer_threshold: 1
 YAML
   cat > "$hermes/profiles/$name/.env" <<EOF
 COZYGATEWAY_TOKEN=test-token
@@ -330,16 +351,18 @@ test_streaming_reader_answers_without_pyyaml() {
   local dir="$TMP/reader" answer
   mkdir -p "$dir/mute" "$dir/both" "$dir/off" "$dir/telegram-only" "$dir/unjudgeable"
   printf 'plugins:\n  enabled:\n    - cozygateway\n' > "$dir/mute/config.yaml"
-  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\n' > "$dir/both/config.yaml"
-  printf 'display:\n  streaming: false\n  platforms:\n    cozygateway:\n      streaming: false\n' > "$dir/off/config.yaml"
+  # Every shape that must answer "nothing absent" carries the cadence knobs too:
+  # the reader now looks for four keys, not two.
+  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  edit_interval: 0.05\n  buffer_threshold: 1\n' > "$dir/both/config.yaml"
+  printf 'display:\n  streaming: false\n  platforms:\n    cozygateway:\n      streaming: false\nstreaming:\n  edit_interval: 0.05\n  buffer_threshold: 1\n' > "$dir/off/config.yaml"
   printf 'display:\n  streaming: true\n  platforms:\n    telegram:\n      streaming: false\n  runtime_footer:\n    fields:\n      - model\n' > "$dir/telegram-only/config.yaml"
   printf 'display: {streaming: true}\n' > "$dir/unjudgeable/config.yaml"
   mkdir -p "$dir/nested-block" "$dir/nested-block-top" "$dir/null-value"
   # An operator who tuned streaming as a BLOCK. PyYAML reads a mapping, which is
   # not absence, and writing `true` over it would throw their settings away.
-  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming:\n        enabled: true\n        min_interval_ms: 400\n' \
+  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming:\n        enabled: true\n        min_interval_ms: 400\nstreaming:\n  edit_interval: 0.05\n  buffer_threshold: 1\n' \
     > "$dir/nested-block/config.yaml"
-  printf 'display:\n  streaming:\n    a: b\n  platforms:\n    cozygateway:\n      streaming: true\n' \
+  printf 'display:\n  streaming:\n    a: b\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  edit_interval: 0.05\n  buffer_threshold: 1\n' \
     > "$dir/nested-block-top/config.yaml"
   # A key with nothing under it at all IS absent, the way PyYAML reads it, so
   # this one is still repaired.
@@ -349,13 +372,25 @@ test_streaming_reader_answers_without_pyyaml() {
   # A YAML tag in front of a block mapping. The block still opens on the line
   # BELOW, so a probe that reads the tag as an ordinary value walks straight
   # past the keys inside it and calls them absent.
-  printf 'display: !!map\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\n' \
+  printf 'display: !!map\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  edit_interval: 0.05\n  buffer_threshold: 1\n' \
     > "$dir/tagged-display/config.yaml"
-  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway: !!map\n      streaming: true\n' \
+  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway: !!map\n      streaming: true\nstreaming:\n  edit_interval: 0.05\n  buffer_threshold: 1\n' \
     > "$dir/tagged-platform/config.yaml"
   # A tagged SCALAR is a value like any other, so both keys are present.
-  printf 'display:\n  streaming: !!bool true\n  platforms:\n    cozygateway:\n      streaming: !!bool false\n' \
+  printf 'display:\n  streaming: !!bool true\n  platforms:\n    cozygateway:\n      streaming: !!bool false\nstreaming:\n  edit_interval: 0.05\n  buffer_threshold: 1\n' \
     > "$dir/tagged-scalar/config.yaml"
+
+  # F16. The two cadence knobs are a SEPARATE top-level key from the two display
+  # switches, so a profile ST1 already repaired is still edit-rate-limited to
+  # Telegram's envelope and must be reported; an operator who tuned them keeps
+  # every value they chose.
+  mkdir -p "$dir/cadence-absent" "$dir/cadence-tuned" "$dir/cadence-partial"
+  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\n' \
+    > "$dir/cadence-absent/config.yaml"
+  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  edit_interval: 2.0\n  buffer_threshold: 200\n' \
+    > "$dir/cadence-tuned/config.yaml"
+  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  enabled: true\n  edit_interval: 2.0\n' \
+    > "$dir/cadence-partial/config.yaml"
 
   read_with() {
     PYTHON="$1" bash -c '
@@ -372,14 +407,14 @@ SH
   chmod +x "$TMP/python3-nosite"
 
   answer="$(read_with "$TMP/python3-nosite" "$dir/mute" | tr '\n' ' ')"
-  [ "$answer" = 'display.streaming display.platforms.cozygateway.streaming ' ] \
+  [ "$answer" = 'display.streaming=true display.platforms.cozygateway.streaming=true streaming.edit_interval=0.05 streaming.buffer_threshold=1 ' ] \
     || fail "stdlib probe on a mute profile answered: $answer"
   answer="$(read_with "$TMP/python3-nosite" "$dir/both" | tr '\n' ' ')"
   [ -z "$answer" ] || fail "stdlib probe on a streaming profile answered: $answer"
   answer="$(read_with "$TMP/python3-nosite" "$dir/off" | tr '\n' ' ')"
   [ -z "$answer" ] || fail "stdlib probe treated an explicit false as absent: $answer"
   answer="$(read_with "$TMP/python3-nosite" "$dir/telegram-only" | tr '\n' ' ')"
-  [ "$answer" = 'display.platforms.cozygateway.streaming ' ] \
+  [ "$answer" = 'display.platforms.cozygateway.streaming=true streaming.edit_interval=0.05 streaming.buffer_threshold=1 ' ] \
     || fail "stdlib probe beside another platform answered: $answer"
   # A flow mapping is not something this probe judges, so it says nothing is
   # absent and the caller leaves the file alone.
@@ -391,8 +426,17 @@ SH
   answer="$(read_with "$TMP/python3-nosite" "$dir/nested-block-top" | tr '\n' ' ')"
   [ -z "$answer" ] || fail "stdlib probe called a nested block absent: $answer"
   answer="$(read_with "$TMP/python3-nosite" "$dir/null-value" | tr '\n' ' ')"
-  [ "$answer" = 'display.streaming ' ] \
+  [ "$answer" = 'display.streaming=true streaming.edit_interval=0.05 streaming.buffer_threshold=1 ' ] \
     || fail "stdlib probe on a key with no value answered: $answer"
+
+  answer="$(read_with "$TMP/python3-nosite" "$dir/cadence-absent" | tr '\n' ' ')"
+  [ "$answer" = 'streaming.edit_interval=0.05 streaming.buffer_threshold=1 ' ] \
+    || fail "stdlib probe on a streaming-but-slow profile answered: $answer"
+  answer="$(read_with "$TMP/python3-nosite" "$dir/cadence-tuned" | tr '\n' ' ')"
+  [ -z "$answer" ] || fail "stdlib probe reported cadence an operator had tuned: $answer"
+  answer="$(read_with "$TMP/python3-nosite" "$dir/cadence-partial" | tr '\n' ' ')"
+  [ "$answer" = 'streaming.buffer_threshold=1 ' ] \
+    || fail "stdlib probe on a half-tuned streaming block answered: $answer"
 
   local tagged
   for tagged in tagged-display tagged-platform tagged-scalar; do
@@ -414,7 +458,7 @@ SH
   case "$answer" in
     *$'\r'*) fail 'a carriage return from a Windows interpreter reached the caller' ;;
   esac
-  [ "$(printf '%s' "$answer" | tr '\n' ' ')" = 'display.streaming display.platforms.cozygateway.streaming' ] \
+  [ "$(printf '%s' "$answer" | tr '\n' ' ')" = 'display.streaming=true display.platforms.cozygateway.streaming=true streaming.edit_interval=0.05 streaming.buffer_threshold=1' ] \
     || fail "the CRLF interpreter answered: $answer"
 
   if [ -z "$YAML_PYTHON" ]; then
@@ -423,7 +467,7 @@ SH
   fi
   local case_dir
   for case_dir in mute both off telegram-only nested-block nested-block-top null-value \
-    tagged-display tagged-platform tagged-scalar; do
+    tagged-display tagged-platform tagged-scalar cadence-absent cadence-tuned cadence-partial; do
     [ "$(read_with "$YAML_PYTHON" "$dir/$case_dir" | tr '\n' ' ')" \
       = "$(read_with "$TMP/python3-nosite" "$dir/$case_dir" | tr '\n' ' ')" ] \
       || fail "the two readers disagree on $case_dir"
@@ -460,7 +504,7 @@ SH
     COZY_PROVISIONER_LOCK="$TMP/stream.lock" COZY_PROVISIONER_RECONCILE_SECONDS=999999 \
     "$repo/scripts/bot-provisioner-watch.sh" --dry-run --hermes-home "$hermes" --log "$log"
 
-  assert_contains "$log" 'pending: silent (streaming is off in config.yaml)'
+  assert_contains "$log" 'pending: silent (streaming settings are incomplete in config.yaml)'
 
   # And a profile that already carries both keys is steady state, not work.
   make_profile "$hermes" silent
@@ -493,6 +537,11 @@ test_provisioner_turns_streaming_on_and_restarts_once() {
 
   assert_contains "$hermes_log" '-p silent config set display.streaming true'
   assert_contains "$hermes_log" '-p silent config set display.platforms.cozygateway.streaming true'
+  # F16. Streaming ON is only half of it: without these the profile still flushes
+  # at most one frame per 0.8 seconds, which is two frames for a minute-long
+  # reply on the wire TB2 measured.
+  assert_contains "$hermes_log" '-p silent config set streaming.edit_interval 0.05'
+  assert_contains "$hermes_log" '-p silent config set streaming.buffer_threshold 1'
   # Exactly one restart, not one per key and not one per sweep.
   local restarts
   restarts="$(grep -c 'kickstart -k gui/' "$launch_log" || true)"
@@ -545,6 +594,57 @@ test_provisioner_keeps_sweeping_when_a_write_fails() {
   assert_contains "$output" 'provision-bot: all profiles provisioned'
 }
 
+# F16. ST1 turned streaming ON for every profile it swept, and those profiles
+# are still edit-rate-limited to one frame per 0.8 seconds. The cadence half is
+# the same repair through the same kickstart path: once, then never again.
+test_provisioner_repairs_cadence_on_an_already_streaming_profile_once() {
+  local hermes="$TMP/cadence-hermes" bin="$TMP/cadence-bin" launch_log="$TMP/cadence-launchctl" hermes_log="$TMP/cadence-hermes-calls"
+  make_fake_bin "$bin"
+  make_profile "$hermes" already-streaming
+  make_fake_python "$hermes" ''
+  mkdir -p "$hermes/profiles/already-streaming/plugins"
+  cp -R "$ROOT/integrations/attach-plugin" "$hermes/profiles/already-streaming/plugins/cozygateway"
+  # Exactly what ST1 leaves behind: both display keys, no cadence block at all.
+  cat > "$hermes/profiles/already-streaming/config.yaml" <<'YAML'
+plugins:
+  enabled:
+    - cozygateway
+display:
+  streaming: true
+  platforms:
+    cozygateway:
+      streaming: true
+YAML
+
+  run_sweep() {
+    HOME="$TMP/cadence-home" PATH="$bin:/usr/bin:/bin" \
+      COZY_TEST_HERMES_HOME="$hermes" \
+      COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/cadence-ssh" \
+      COZY_TEST_HERMES_LOG="$hermes_log" \
+      "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake already-streaming >/dev/null
+  }
+  run_sweep
+
+  assert_contains "$hermes_log" '-p already-streaming config set streaming.edit_interval 0.05'
+  assert_contains "$hermes_log" '-p already-streaming config set streaming.buffer_threshold 1'
+  if grep -q 'config set display' "$hermes_log"; then
+    fail 'provisioner rewrote display keys the profile already carried'
+  fi
+  local restarts
+  restarts="$(grep -c 'kickstart -k gui/' "$launch_log" || true)"
+  [ "$restarts" = 1 ] || fail "expected exactly one restart for the cadence repair, got $restarts"
+
+  # Second sweep: the keys are there now, so nothing is written and nothing is
+  # restarted. A repair that runs every tick is a restart loop.
+  : > "$hermes_log"
+  run_sweep
+  if grep -q 'config set' "$hermes_log"; then
+    fail 'provisioner repaired the cadence a second time'
+  fi
+  restarts="$(grep -c 'kickstart -k gui/' "$launch_log" || true)"
+  [ "$restarts" = 1 ] || fail "expected no further restart on the second sweep, got $restarts"
+}
+
 test_provisioner_leaves_streaming_turned_off_on_purpose() {
   local hermes="$TMP/stream-off-hermes" bin="$TMP/stream-off-bin" launch_log="$TMP/stream-off-launchctl" hermes_log="$TMP/stream-off-hermes-calls"
   make_fake_bin "$bin"
@@ -561,6 +661,9 @@ display:
   platforms:
     cozygateway:
       streaming: false
+streaming:
+  edit_interval: 2.0
+  buffer_threshold: 200
 YAML
 
   HOME="$TMP/stream-off-home" PATH="$bin:/usr/bin:/bin" \
@@ -572,6 +675,9 @@ YAML
   if [ -e "$hermes_log" ] && grep -q 'config set display' "$hermes_log"; then
     fail 'provisioner overrode a streaming setting the operator turned off'
   fi
+  if [ -e "$hermes_log" ] && grep -q 'config set streaming' "$hermes_log"; then
+    fail 'provisioner overrode a streaming cadence the operator had tuned'
+  fi
   if grep -Fq 'kickstart -k' "$launch_log"; then
     fail 'provisioner restarted a profile it had no reason to change'
   fi
@@ -581,6 +687,7 @@ test_watcher_repairs_content_drift
 test_streaming_reader_answers_without_pyyaml
 test_watcher_picks_up_a_wired_profile_that_cannot_stream
 test_provisioner_turns_streaming_on_and_restarts_once
+test_provisioner_repairs_cadence_on_an_already_streaming_profile_once
 test_provisioner_leaves_streaming_turned_off_on_purpose
 test_provisioner_does_not_restart_when_the_write_did_not_land
 test_provisioner_keeps_sweeping_when_a_write_fails

@@ -937,8 +937,9 @@ streaming_python() {
   done
   return 1
 }
-# The display keys Hermes reads before it will stream a reply, printed one per
-# line when the profile does not carry them, read with the interpreter named in $1.
+# The keys Hermes reads before it will stream a reply, and before it will stream
+# one often enough to look like a stream, printed one `key=value` per line when
+# the profile does not carry them, read with the interpreter named in $1.
 #
 # Hermes' own default is silence: `StreamingConfig.enabled` is false
 # (gateway/config.py) and `_setup_stream_consumer` asks the runner for stream
@@ -946,6 +947,13 @@ streaming_python() {
 # the turn's platform. `cozygateway` has no per-platform default of its own, so
 # a profile that names neither key never emits a single draft frame and the
 # phone only ever receives the finished message.
+#
+# Cadence is the second half, and a separate top-level key. `_should_edit`
+# flushes at most one frame per `streaming.edit_interval` (0.8s) unless
+# `streaming.buffer_threshold` (24) is reached, which is Telegram's
+# one-edit-a-second envelope and turns a minute-long reply into a couple of
+# frames on the wire. Both are read by `StreamingConfig.from_dict`, so seeding
+# them is a value Hermes already understands, not a change to any Hermes source.
 #
 # Structural, not a grep: only a parse can tell an absent key from one an
 # operator deliberately set to false, and only the absent ones may be written.
@@ -961,7 +969,21 @@ import re
 import sys
 from pathlib import Path
 
-WANTED = (("display", "streaming"), ("display", "platforms", "cozygateway", "streaming"))
+# Each entry is a config path and the value to write when the profile does not
+# carry it. The two `display` keys turn streaming ON at all; the two top-level
+# `streaming` keys decide how OFTEN an in-flight reply is pushed. Hermes'
+# defaults there are a 0.8 second edit interval and a 24 codepoint buffer
+# threshold (gateway/config.py), which is Telegram's one-edit-a-second envelope
+# and shows up on a phone as two frames for a minute-long answer instead of a
+# stream. Both are read by `StreamingConfig.from_dict`, so this is a value
+# Hermes already understands and not a change to any Hermes source.
+WANTED = (
+    (("display", "streaming"), "true"),
+    (("display", "platforms", "cozygateway", "streaming"), "true"),
+    (("streaming", "edit_interval"), "0.05"),
+    (("streaming", "buffer_threshold"), "1"),
+)
+WANTED_PATHS = tuple(path for path, _ in WANTED)
 KEY = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z0-9_][A-Za-z0-9_.\-]*):(?P<rest>[ \t].*|)$")
 BLOCK_SCALAR = re.compile(r"^[|>][0-9+-]*$")
 
@@ -971,22 +993,27 @@ def block(parent, key):
     return value if isinstance(value, dict) else {}
 
 
+def report(path, value):
+    """One line of the answer: the dotted key, then the value to write for it."""
+    return ".".join(path) + "=" + value
+
+
 def absent_with_yaml(text, yaml):
     data = yaml.safe_load(text) or {}
-    display = block(data, "display")
-    platform = block(block(display, "platforms"), "cozygateway")
     absent = []
-    if display.get("streaming") is None:
-        absent.append("display.streaming")
-    if platform.get("streaming") is None:
-        absent.append("display.platforms.cozygateway.streaming")
+    for path, value in WANTED:
+        parent = data
+        for segment in path[:-1]:
+            parent = block(parent, segment)
+        if not isinstance(parent, dict) or parent.get(path[-1]) is None:
+            absent.append(report(path, value))
     return absent
 
 
 def on_the_way(path):
     """True when `path` is a prefix of a key this probe is looking for, so an
     unjudgeable line there could hide one."""
-    return any(wanted[: len(path)] == path for wanted in WANTED)
+    return any(wanted[: len(path)] == path for wanted in WANTED_PATHS)
 
 
 def absent_without_yaml(text):
@@ -998,8 +1025,8 @@ def absent_without_yaml(text):
     which is what a merge key or a quoted key arrives as),
     or anywhere at all for a tab or a second document. None means "assume they
     are present", so the caller writes nothing: the only safe way to be unsure
-    about somebody's config file. Everything outside `display` is skipped rather
-    than judged, since nothing there can carry these keys.
+    about somebody's config file. Everything outside the top-level sections that
+    could hold a wanted key is skipped rather than judged.
     """
     stack = []
     present = set()
@@ -1062,13 +1089,13 @@ def absent_without_yaml(text):
             if key in seen_top:
                 return None
             seen_top.add(key)
-        if here in WANTED and value != "":
+        if here in WANTED_PATHS and value != "":
             present.add(here)
         if value == "":
             stack.append((indent, key))
     return [
-        ".".join(name)
-        for name in WANTED
+        report(name, value)
+        for name, value in WANTED
         if name not in present and name not in containers
     ]
 
@@ -1102,7 +1129,7 @@ main()
 PY
 }
 ensure_streaming_config() {
-  local profile="$1" home="$2" python keys key rc=0
+  local profile="$1" home="$2" python keys entry key value rc=0
   python="$(streaming_python)" || {
     say "NOTE  no usable python found, so streaming settings for profile $profile were left alone"
     return 0
@@ -1113,15 +1140,18 @@ ensure_streaming_config() {
     return 0
   fi
   [ -n "$keys" ] || { say "OK    streaming is already decided in config.yaml for Hermes profile $profile"; return 0; }
-  for key in $keys; do
-    if [ "$DRY_RUN" = 1 ]; then say "DRY   set $key to true for Hermes profile $profile"; continue; fi
+  # Each line the reader printed is a key and the value to write for it, so a
+  # cadence knob is seeded with its own number rather than a bare true.
+  for entry in $keys; do
+    key="${entry%%=*}"; value="${entry#*=}"
+    if [ "$DRY_RUN" = 1 ]; then say "DRY   set $key to $value for Hermes profile $profile"; continue; fi
     # A display default never fails an install: this profile keeps Hermes'
     # behaviour and every other part of the install carries on.
-    if ! "$HERMES_BIN" -p "$profile" config set "$key" true >/dev/null; then
+    if ! "$HERMES_BIN" -p "$profile" config set "$key" "$value" >/dev/null; then
       say "NOTE  hermes could not set $key, so streaming settings for profile $profile were left alone"
       return 0
     fi
-    say "OK    set $key to true for Hermes profile $profile"
+    say "OK    set $key to $value for Hermes profile $profile"
   done
   [ "$DRY_RUN" = 1 ] && return 0
   # Read the file back before restarting anything. `config set` is not proof of a

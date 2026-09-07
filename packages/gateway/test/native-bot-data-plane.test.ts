@@ -602,6 +602,58 @@ describe("attach-v1 native Bot Mode plane", () => {
     }
   });
 
+  // F16. A Hermes-backed bot now streams its reply at the run loop's own tick rather than one
+  // frame per 0.8s, and this is the gateway's half of that promise: while text keeps arriving,
+  // the app must keep being told. The coalescer is deliberately kept (a full-replacement frame
+  // per token would be pure waste on the wire), so what is pinned here is its ceiling, and it is
+  // pinned for BOTH lanes at once because both a Hermes draft and a CozyAgents runner delta take
+  // this same path. Lowering it would speed nothing up; raising it would make Hermes bots feel
+  // slower than CozyAgents bots for no reason.
+  it("delivers a chat delta at least every 250ms while text keeps arriving", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const storage = openStorage(":memory:");
+      const deltaAt: number[] = [];
+      const plane = new NativeBotDataPlane({
+        control: {} as BotsSurface,
+        storage,
+        ingress: {} as AttachV1Ingress,
+        nativeBots: ["sage"], chatSuggestion: "",
+        broadcast: (frame) => {
+          if (frame.type === "bot_chat_delta") deltaAt.push(Date.now());
+        },
+      });
+      const chat = storage.nativeBotChat("sage", 1);
+      storage.enqueueAttachCommand("sage", "turn", {
+        kind: "turn", threadId: chat.sessionId, turnId: "turn", messageId: "user", text: "hello",
+      } as never, 1);
+      storage.setNativeBotTurn("sage", chat.sessionId, "turn", 1);
+
+      // Two seconds of a reply arriving at the stream consumer's own 50ms tick, which is the
+      // fastest either lane can produce frames.
+      let text = "";
+      for (let tick = 0; tick < 40; tick += 1) {
+        text += `word${tick} `;
+        expect(plane.handle("sage", {
+          kind: "event", sequence: tick + 1, eventId: `draft-${tick}`, event: {
+            kind: "draft", threadId: chat.sessionId, turnId: "turn",
+            blocks: [{ type: "paragraph", text }],
+          },
+        })).toBe(true);
+        await vi.advanceTimersByTimeAsync(50);
+      }
+
+      expect(deltaAt.length).toBeGreaterThanOrEqual(8);
+      const gaps = deltaAt.slice(1).map((at, index) => at - deltaAt[index]!);
+      expect(Math.max(...gaps)).toBeLessThanOrEqual(250);
+      plane.close();
+      storage.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("flushes the latest live activity before terminal frames and leaves no stale timer", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(100);
