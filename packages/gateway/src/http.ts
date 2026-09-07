@@ -52,7 +52,6 @@ import { Value } from "@sinclair/typebox/value";
 import type { GatewayConfig } from "./config.ts";
 import { GatewaySettingsPersistenceError } from "./gateway-settings.ts";
 import { GatewayMaintenance, GatewayMaintenanceFailure, GatewayMaintenanceNotFound } from "./gateway-maintenance.ts";
-import type { ObservationRing } from "./observe/ring.ts";
 import type { Storage, ThreadRow } from "./storage.ts";
 import { SETUP_CODE_TTL_MS, hashToken, mintDeviceToken, newSetupCode } from "./auth.ts";
 import { listenerOrigin } from "./configure.ts";
@@ -196,7 +195,6 @@ function configuredOrigin(config: GatewayConfig): string {
 
 export interface AppDeps {
   storage: Storage;
-  observe?: ObservationRing;
   flushTaskCommands?: () => void;
   /** Test-only override for the gateway-wide `/pair` bucket. Production leaves this absent and
    *  builds its limiter from `now`; a long-lived black-box harness supplies one with virtual time. */

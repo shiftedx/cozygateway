@@ -1219,7 +1219,6 @@ export async function startGateway(
       (storage.chatExecutionById(id)?.bot ?? id) === bot && attachV1Ingress.isAttached(id)
       && attachV1Ingress.negotiatedCapabilities(id).has("observation_snapshot")),
     storage,
-    observe,
     flushTaskCommands: () => attachV1Ingress.flushTaskCommands(),
     config,
     gatewayInfo,
