@@ -176,8 +176,14 @@ CREATE TABLE IF NOT EXISTS devices (
   token_hash TEXT NOT NULL UNIQUE,
   created_at INTEGER NOT NULL,
   last_seen_at INTEGER,
-  kind TEXT NOT NULL DEFAULT 'device' CHECK (kind IN ('device', 'observer')),
-  scope TEXT NOT NULL DEFAULT 'write' CHECK (scope IN ('read', 'write'))
+  -- Capability 72. No CHECK on either column ON PURPOSE, and the migration that adds them to an
+  -- existing database therefore produces the SAME schema rather than a weaker one: SQLite cannot
+  -- add a CHECK by ALTER TABLE, and rebuilding this table is not an option because two tables
+  -- reference devices(id) ON DELETE CASCADE, so a drop-and-rename would take their rows with it.
+  -- The constraint lives in the type system instead (StoredDeviceKind and DeviceScope), which is
+  -- the same choice setup_codes.kind already makes.
+  kind TEXT NOT NULL DEFAULT 'device',
+  scope TEXT NOT NULL DEFAULT 'write'
 ) STRICT;
 CREATE TABLE IF NOT EXISTS setup_codes (
   code TEXT PRIMARY KEY,
@@ -858,6 +864,11 @@ CREATE INDEX IF NOT EXISTS runner_operations_bot ON runner_operations (bot, crea
  *  token whose scope is `read`. */
 export type SetupCodeKind = "device" | "runner" | "observer";
 
+/** Capability 72. The kinds this table can hold, which is `DeviceKind` minus `runner`: runners
+ *  live in their own table, so widening this to the wire type would let `createDevice` be called
+ *  with a kind the devices table has no meaning for. */
+export type StoredDeviceKind = Exclude<DeviceKind, "runner">;
+
 const DEVICE_COLUMNS =
   "id, name, created_at AS createdAt, last_seen_at AS lastSeenAt, kind, scope";
 
@@ -871,8 +882,9 @@ export interface DeviceRow {
   createdAt: number;
   lastSeenAt: number | null;
   /** Capability 72. `observer` is a browser paired to watch and nothing else. A row written
-   *  before 72 reads as `device`, which is what every device paired before 72 was. */
-  kind: DeviceKind;
+   *  before 72 reads as `device`, which is what every device paired before 72 was. This is
+   *  narrower than the wire's `DeviceKind`: a runner is never a row in this table. */
+  kind: StoredDeviceKind;
   /** Capability 72. `write` for every device paired before 72, so no shipped credential is ever
    *  silently downgraded by the migration that added this column. */
   scope: DeviceScope;
@@ -1337,7 +1349,7 @@ export class Storage {
     name: string;
     tokenHash: string;
     createdAt: number;
-    kind?: DeviceKind;
+    kind?: StoredDeviceKind;
     scope?: DeviceScope;
   }): void {
     this.#db
@@ -1352,6 +1364,18 @@ export class Storage {
         device.kind ?? "device",
         device.scope ?? "write",
       );
+  }
+
+  /** Capability 72. Lets a test compare a freshly created devices table against one an in-place
+   *  migration produced, so the two schemas cannot silently drift apart. */
+  devicesTableInfoForTesting(): Array<{ name: string; type: string; notnull: number; dflt_value: unknown }> {
+    return (
+      this.#db.prepare("PRAGMA table_info(devices)").all() as unknown as Array<{
+        name: string; type: string; notnull: number; dflt_value: unknown;
+      }>
+    ).map((column) => ({
+      name: column.name, type: column.type, notnull: column.notnull, dflt_value: column.dflt_value,
+    }));
   }
 
   deviceByTokenHash(tokenHash: string): DeviceRow | undefined {

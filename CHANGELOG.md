@@ -56,11 +56,17 @@ release; everything older is marked pre-release so installers resolve one "lates
   gateway serves. The refusal lives in ONE middleware that runs before every route handler rather
   than in a check each route remembers to make, so a write route added later is refused by
   construction: the test that proves it walks the router itself instead of a hand written list.
+  An observer can pair nothing, including a replacement for itself: `POST /pair` is a write, so a
+  request presenting a read-scoped bearer is refused and the setup code it carried is not spent,
+  which means a client re-pairing after its token went stale clears the stored token first.
   The app websocket is held to the same rule, refusing every command frame from a read-scoped
   socket with an `error` frame carrying `code: "scope_read_only"` while `sync` still works, so an
   observer can never advertise itself as a phone capability node. An observer appears on
   `GET /devices` with its `kind` and `scope` beside its name, and `DELETE /devices/:id` deletes it
-  and closes its socket exactly as it does for any device. Every device paired before this change
+  and closes its socket exactly as it does for any device. A read token is a FULL READ of
+  everything a person said to their bots, so a leaked observer token is a leaked transcript
+  archive even though it can never act; the credential-bearing reads are already redacted at the
+  schema, so it is not a path to a provider key. Every device paired before this change
   reads back as `scope: "write"` and is refused nothing: the migration that added the column
   defaults it, so no shipped credential is silently downgraded to read-only. Additive for every
   client and every peer of every backend, Hermes-backed and CozyAgents-backed alike, with zero

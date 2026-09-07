@@ -11,7 +11,7 @@ import type { ServerFrame } from "cozygateway-contract";
 
 import { testHermes } from "./support/test-config.ts";
 import { openStorage, type Storage } from "../src/storage.ts";
-import { createApp } from "../src/http.ts";
+import { createApp, type AppDeps } from "../src/http.ts";
 import { WsHub } from "../src/ws-hub.ts";
 import { SETUP_CODE_TTL_MS, mintDeviceToken, newSetupCode } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
@@ -24,7 +24,23 @@ const config: GatewayConfig = {
   hermesEndpoints: [{ id: "default", ...testHermes() }],
 };
 
-function makeApp(now = () => 1_000) {
+/** Every optional dependency of `createApp` gates a whole family of routes behind
+ *  `if (deps.x !== undefined)`, so an app built without them registers well under half the write
+ *  routes a real gateway serves. The read-scope refusal happens before any handler runs, so the
+ *  surface behind these stubs is never reached: a throwing proxy is enough to make the router
+ *  complete, and it fails loudly rather than quietly if anything ever does reach it. */
+function unreachable<T>(name: string): T {
+  return new Proxy(
+    {},
+    {
+      get: (_target, property) => () => {
+        throw new Error(`${name}.${String(property)} is not under test`);
+      },
+    },
+  ) as T;
+}
+
+function makeApp(now = () => 1_000, wired = true) {
   const storage = openStorage(":memory:");
   const revoked: string[] = [];
   const app = createApp({
@@ -39,6 +55,28 @@ function makeApp(now = () => 1_000) {
     resolveApproval: () => Promise.resolve("unknown" as const),
     onDeviceRevoked: (id) => revoked.push(id),
     now,
+    ...(wired
+      ? {
+          bots: unreachable<NonNullable<AppDeps["bots"]>>("bots"),
+          runners: unreachable<NonNullable<AppDeps["runners"]>>("runners"),
+          runnerPresence: unreachable<NonNullable<AppDeps["runnerPresence"]>>("runnerPresence"),
+          providerConnections:
+            unreachable<NonNullable<AppDeps["providerConnections"]>>("providerConnections"),
+          maintenance: unreachable<NonNullable<AppDeps["maintenance"]>>("maintenance"),
+          hermesGlobalSkills:
+            unreachable<NonNullable<AppDeps["hermesGlobalSkills"]>>("hermesGlobalSkills"),
+          memory: unreachable<NonNullable<AppDeps["memory"]>>("memory"),
+          history: unreachable<NonNullable<AppDeps["history"]>>("history"),
+          chatConfiguration:
+            unreachable<NonNullable<AppDeps["chatConfiguration"]>>("chatConfiguration"),
+          harnessUpdates: unreachable<NonNullable<AppDeps["harnessUpdates"]>>("harnessUpdates"),
+          harnessWorkspace:
+            unreachable<NonNullable<AppDeps["harnessWorkspace"]>>("harnessWorkspace"),
+          hermesSessions: unreachable<NonNullable<AppDeps["hermesSessions"]>>("hermesSessions"),
+          gatewaySettings: unreachable<NonNullable<AppDeps["gatewaySettings"]>>("gatewaySettings"),
+          attachTokens: new Map<string, string>(),
+        }
+      : {}),
   });
   return { app, storage, revoked };
 }
@@ -176,7 +214,11 @@ describe("the read scope is refused by every write route", () => {
         .filter((route) => writeMethods.has(route.method.toUpperCase()))
         .map((route) => `${route.method.toUpperCase()} ${route.path}`),
     );
-    expect(paths.size).toBeGreaterThan(20);
+    // The floor is the real count at the time this packet landed, not a token "more than a few".
+    // If a whole route family stops being registered, because a dependency name drifted or the
+    // stub above stopped satisfying an `if (deps.x !== undefined)` guard, this fails loudly
+    // instead of quietly walking a fraction of the router and passing.
+    expect(paths.size).toBeGreaterThanOrEqual(97);
     const failures: string[] = [];
     for (const entry of paths) {
       const [method, path] = entry.split(" ", 2) as [string, string];
@@ -198,6 +240,41 @@ describe("the read scope is refused by every write route", () => {
       }
     }
     expect(failures).toEqual([]);
+  });
+
+  // Guards the guard: the walk above is only worth anything if the app it walks is the wired one.
+  it("walks a fully wired router, not the handful of routes a bare app registers", async () => {
+    const writeMethods = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+    const count = (app: ReturnType<typeof makeApp>["app"]) =>
+      new Set(
+        app.routes
+          .filter((route) => writeMethods.has(route.method.toUpperCase()))
+          .map((route) => `${route.method.toUpperCase()} ${route.path}`),
+      ).size;
+    const bare = count(makeApp(() => 1_000, false).app);
+    const wired = count(makeApp().app);
+    // Every conditionally registered family (bots, runners, provider connections, maintenance,
+    // global skills) is absent from a bare app, so the wired router is more than twice the size.
+    expect(wired).toBeGreaterThan(bare * 2);
+  });
+
+  it("refuses a read token on POST /pair, so an observer cannot pair anything", async () => {
+    const { app, storage } = makeApp();
+    const observer = (await (await pairObserver(app, storage)).json()) as { deviceToken: string };
+    const code = newSetupCode();
+    storage.createSetupCode(code, 1_000 + SETUP_CODE_TTL_MS);
+    const res = await app.request("/pair", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${observer.deviceToken}`,
+      },
+      body: JSON.stringify({ setupCode: code, deviceName: "Test phone" }),
+    });
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("scope_read_only");
+    // The code was not spent, so a client that clears its stale token can still pair with it.
+    expect(storage.consumeSetupCode(code, 1_000)).toBe("ok");
   });
 
   it("leaves a write scoped token's behavior unchanged on the same routes", async () => {
@@ -326,6 +403,35 @@ describe("storage migration", () => {
     } finally {
       storage.close();
     }
+  });
+});
+
+describe("the devices schema", () => {
+  it("is identical on a fresh database and on one migrated in place", () => {
+    const fresh = join(mkdtempSync(join(tmpdir(), "cozygateway-fresh-")), "gateway.db");
+    const migrated = join(mkdtempSync(join(tmpdir(), "cozygateway-migrated-")), "gateway.db");
+
+    const legacy = new DatabaseSync(migrated);
+    legacy.exec(`CREATE TABLE devices (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL,
+      last_seen_at INTEGER
+    ) STRICT;`);
+    legacy.close();
+
+    const columns = (path: string) => {
+      const storage = openStorage(path);
+      try {
+        return storage.devicesTableInfoForTesting();
+      } finally {
+        storage.close();
+      }
+    };
+    // Not just the column names: the type, the NOT NULL flag and the default too, so a migration
+    // that adds a weaker column than the one a fresh database gets fails here.
+    expect(columns(migrated)).toEqual(columns(fresh));
   });
 });
 
