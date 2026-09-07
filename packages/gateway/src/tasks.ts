@@ -69,6 +69,7 @@ export class Tasks {
       db.exec("DROP TABLE task_reply_pushes");
       db.exec("CREATE TABLE task_reply_pushes (task_id TEXT NOT NULL REFERENCES tasks(task_id), run_id TEXT NOT NULL, device_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('scheduled', 'sent')), pushed_at INTEGER NOT NULL, PRIMARY KEY(task_id, run_id, device_id)) STRICT");
     }
+    db.exec("CREATE INDEX IF NOT EXISTS task_reply_pushes_expiry ON task_reply_pushes(state, pushed_at)");
     // Legacy peers omitted deadlines. Preserve a first-seen bound across restart and replay.
     db.exec(`UPDATE bot_native_interactions SET expires_at = COALESCE((
       SELECT MIN(received_at) FROM attach_event_inbox WHERE disposition = 'accepted'
@@ -164,9 +165,9 @@ export class Tasks {
 
   /** A process may die between the synchronous marker and the deferred relay request. Only a
    * completed current Run is recoverable; a retry never inherits an older Run's marker. */
-  replyPushRecoveries(limit = 100): Array<TaskCompletionNotice & { deviceId: string }> {
+  replyPushRecoveries(limit = Number.MAX_SAFE_INTEGER): Array<TaskCompletionNotice & { deviceId: string }> {
     const rows = this.#db.prepare("SELECT p.task_id AS taskId, p.run_id AS runId, p.device_id AS deviceId, t.bot, t.session_id AS sessionId, t.room FROM task_reply_pushes p JOIN task_completion_notifications n ON n.task_id = p.task_id JOIN tasks t ON t.task_id = p.task_id WHERE p.state = 'scheduled' ORDER BY p.pushed_at LIMIT ?").all(limit) as unknown as Array<{ taskId: string; runId: string; deviceId: string; bot: string; sessionId: string; room: string | null }>;
-    return rows.filter((row) => this.#read(row.taskId)?.view.currentRun.runId === row.runId)
+    return rows.filter((row) => { const view = this.#read(row.taskId)?.view; return view?.state === "completed" && view.currentRun.runId === row.runId; })
       .map((row) => ({ taskId: row.taskId, runId: row.runId, deviceId: row.deviceId, bot: row.bot, sessionId: row.sessionId, ...(row.room === null ? {} : { room: row.room }) }));
   }
 
@@ -219,6 +220,10 @@ export class Tasks {
     this.#reconciling = true;
     try {
       this.atomic(() => {
+        // `sent` markers only suppress the completion leg for one short window. Keep their
+        // task/run/device identities no longer than that window, including after a restart.
+        // `scheduled` rows are the recovery outbox and deliberately never enter this sweep.
+        this.#db.prepare("DELETE FROM task_reply_pushes WHERE state = 'sent' AND pushed_at <= ?").run(at - REPLY_PUSH_COLLAPSE_WINDOW_MS);
         const due = this.#db.prepare("SELECT bot, kind, interaction_id AS id FROM bot_native_interactions WHERE status = 'pending' AND expires_at <= ?").all(at) as unknown as { bot: string; kind: "approval" | "clarify"; id: string }[];
         for (const interaction of due) this.#expireInteraction?.(interaction.bot, interaction.kind, interaction.id, at);
         const devices = this.#db.prepare("SELECT task_id AS taskId, run_id AS runId, record_id AS id, expires_at AS expiresAt FROM task_waits WHERE kind = 'device' AND settled_at IS NULL AND expires_at <= ?").all(at) as unknown as { taskId: string; runId: string; id: string; expiresAt: number }[];

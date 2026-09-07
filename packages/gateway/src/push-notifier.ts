@@ -172,8 +172,8 @@ export class RelayNotifier implements Notifier {
   }
 
   /** The reply marker has a deliberately narrow lifetime. It is `inflight` only in this process,
-   * becomes durable `sent` only after the relay accepts, and is removed before a per-device
-   * completion fallback when the reply was skipped or failed. */
+   * becomes durable `sent` only after the relay accepts, and retains a recovery marker until
+   * any required per-device completion fallback is accepted or no longer needed. */
   #sendReply(
     registration: PushRegistrationRow,
     payload: PushPayload,
@@ -192,22 +192,29 @@ export class RelayNotifier implements Notifier {
     this.#inflightReplyPushes.add(key);
     void this.#send(registration, payload, routing).then((outcome) => {
       this.#inflightReplyPushes.delete(key);
-      if (outcome === "sent") this.#replyPushes?.markReplyPushSent(marker);
-      else this.#replyPushes?.clearReplyPush(marker);
-      if (outcome !== "sent") this.#sendPendingCompletion(key);
+      if (outcome === "sent") {
+        this.#replyPushes?.markReplyPushSent(marker);
+        this.#pendingCompletions.delete(key);
+      } else {
+        this.#replyPushes?.clearReplyPush(marker);
+        this.#sendPendingCompletion(key, marker);
+      }
     }).catch((err: unknown) => {
       this.#inflightReplyPushes.delete(key);
-      this.#replyPushes?.clearReplyPush(marker);
       this.#log(`push: notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`);
-      this.#sendPendingCompletion(key);
+      this.#sendPendingCompletion(key, marker);
     });
   }
 
-  #sendPendingCompletion(key: string): void {
+  #sendPendingCompletion(key: string, marker: { taskId: string; runId: string; deviceId: string }): void {
     const pending = this.#pendingCompletions.get(key);
     if (pending === undefined) return;
     this.#pendingCompletions.delete(key);
-    void this.#send(pending.registration, pending.payload, pending.routing).catch((err: unknown) => {
+    // Keep the original scheduled marker through fallback failure and process loss.
+    this.#replyPushes?.noteReplyPush(marker);
+    void this.#send(pending.registration, pending.payload, pending.routing).then(() => {
+      this.#replyPushes?.clearReplyPush(marker);
+    }).catch((err: unknown) => {
       this.#log(`push: task completion fallback failed for device ${pending.registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`);
     });
   }
@@ -316,7 +323,9 @@ export class RelayNotifier implements Notifier {
         this.#log(`push: task completion suppressed after sent reply push for ${payload.taskId}/${runId}/${registration.deviceId}`);
         continue;
       }
-      void this.#send(registration, payload, { category: TASK_COMPLETED_CATEGORY, collapseId }).catch((err: unknown) => {
+      void this.#send(registration, payload, { category: TASK_COMPLETED_CATEGORY, collapseId }).then(() => {
+        if (marker !== undefined) this.#replyPushes?.clearReplyPush(marker);
+      }).catch((err: unknown) => {
         this.#log(
           `push: task completion notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`,
         );

@@ -164,6 +164,26 @@ describe("RelayNotifier", () => {
     storage.close();
   });
 
+  it("retains recovery when both reply and completion fallback fail", async () => {
+    const storage = seeded([{ deviceId: "d1", pushId: "p1", relayUrl: "http://relay.test", pushKey: "key-1" }]);
+    const tracker = replyPushTracker({ thread: { taskId: "task_9", runId: "run_1" } }, () => 0);
+    const failing = fetchStub(() => "reject");
+    const notifier = new RelayNotifier({ storage, fetchImpl: failing.impl, log: () => {}, replyPushes: tracker });
+    const payload = { kind: "task_completed" as const, taskId: "task_9", threadId: "bot:a", agentId: "a" };
+    notifier.notify({ threadId: "thread", agentName: "A", preview: "reply", runId: "run_1" }, new Set());
+    notifier.notifyTaskCompletion(payload, new Set(), "run_1");
+    await settle();
+    const marker = { taskId: "task_9", runId: "run_1", deviceId: "d1" };
+    expect(tracker.replyPushState(marker)).toBe("scheduled");
+    const recovered = fetchStub(() => 202);
+    new RelayNotifier({ storage, fetchImpl: recovered.impl, log: () => {}, replyPushes: tracker })
+      .recoverTaskCompletion(payload, "run_1", "d1");
+    await settle();
+    expect(recovered.sent).toHaveLength(1);
+    expect(tracker.replyPushState(marker)).toBeUndefined();
+    storage.close();
+  });
+
   it("schedules one privacy-minimal status wake for the selected registered device", async () => {
     const storage = seeded([
       { deviceId: "selected", pushId: "selected-push", relayUrl: "http://relay.test", pushKey: "selected-key" },

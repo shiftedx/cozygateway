@@ -60,6 +60,32 @@ describe("durable Tasks on actual attach storage admission", () => {
     } finally { storage.close(); rmSync(directory, { recursive: true }); }
   });
 
+  it("sweeps expired sent reply markers after restart without deleting scheduled recovery", () => {
+    const root = join(process.cwd(), "../../benchmark-runs/f23-reply-push"); mkdirSync(root, { recursive: true });
+    const directory = mkdtempSync(join(root, "expiry-")); const path = join(directory, "gateway.sqlite");
+    let now = 0;
+    let storage = openStorage(path); storage.tasks.clock(() => now);
+    try {
+      const sessionId = storage.nativeBotChat("sage", 1).sessionId;
+      const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "work" }, 2);
+      const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+      storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+      storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: sessionId, turnId: "run", messageId: "reply", blocks: [] } }, 4);
+      storage.tasks.noteReplyPush({ taskId, runId: "run", deviceId: "sent" });
+      storage.tasks.markReplyPushSent({ taskId, runId: "run", deviceId: "sent" });
+      storage.tasks.noteReplyPush({ taskId, runId: "run", deviceId: "scheduled" });
+      storage.close();
+
+      now = REPLY_PUSH_COLLAPSE_WINDOW_MS;
+      storage = openStorage(path); storage.tasks.clock(() => now);
+      storage.tasks.reconcile();
+      const db = new DatabaseSync(path);
+      expect(db.prepare("SELECT device_id AS deviceId, state FROM task_reply_pushes ORDER BY device_id").all())
+        .toEqual([{ deviceId: "scheduled", state: "scheduled" }]);
+      db.close();
+    } finally { storage.close(); rmSync(directory, { recursive: true }); }
+  });
+
   it("creates the Task with a direct turn, starts on ack and completes once on its final proof", () => {
     const storage = openStorage(":memory:");
     storage.tasks.clock(() => 0);
