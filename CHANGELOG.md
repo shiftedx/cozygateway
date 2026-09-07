@@ -7,6 +7,25 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## Unreleased
 
+- The owner-loss lease no longer reaps a turn whose peer was lost mid model request
+  (`com.cozylabs.bots` capability 69, F2). Capability 69 starts a 120 second lease the instant a
+  peer's socket closes, and for a peer that was answering heartbeats right up to that instant,
+  silence is the wrong reading: it was working, its model had not returned a token yet, and the
+  drop is what a peer blocked inside one long synchronous prefill looks like from the gateway. LV1
+  measured a cold 45k token window at about 123 seconds against that 120 second lease, and LV2
+  measured 8 seconds for the same window on another endpoint from the same code, so no lease number
+  tells a slow model call apart from a dead process. Such a turn now waits one model request out,
+  4 minutes, before the lease clock starts, which is time excluded the way a pending approval or
+  device request already suspends it. The lease itself is unchanged, the exclusion applies once and
+  only to a disconnected peer that was demonstrably alive when it went, and a peer that never comes
+  back is still reaped, about 6 minutes after the drop and never past a ceiling an operator
+  shortened. That total is shorter than the 10 minute grace an attached quiet peer already gets, so
+  no window on this path is longer than one the gateway already grants: the undeclared grace, the
+  interrupt grace and the 30 minute silence ceiling are untouched, and a heartbeat never stretches
+  the undeclared grace. Derived gateway side from the delivery record and the transport, so it
+  needs no new frame, field or peer behavior and covers a Hermes peer and a CozyAgents peer
+  identically with no plugin change.
+
 - Rooms on a gateway with two or more Hermes endpoints (`com.cozylabs.bots` capabilities 46 and 52,
   F8): such a gateway refused every room, including one whose members all lived on a single
   endpoint. A room is now hosted by the one host its membership resolves to. Every member on one

@@ -816,6 +816,9 @@ export async function startGateway(
         nativeBotPlane?.handleAttachHello(agentId, activeTurns);
       },
       onTaskTurnQueued: (agentId, command) => nativeBotPlane?.taskTurnQueued(agentId, command),
+      // Capability 69, F2. The heartbeat the peer is still answering is proof its process is
+      // alive, which is the only proof a turn has while its model request is in flight.
+      onLiveness: (agentId, at) => nativeBotPlane?.handleAttachLiveness(agentId, at),
       onPresence: (agentId, state) => {
         // A chat execution is a transport peer, never another bot in the roster.
         if (storage.chatExecutionById(agentId)) return;
