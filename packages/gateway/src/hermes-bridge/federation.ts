@@ -8,14 +8,16 @@ import type {
 import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
 import type { BotControlSurface, BotFocusScreen, BotRoutineList, BotRosterView } from "./bridge.ts";
-import type { GatewayRoomHost } from "./group-rooms.ts";
+import type { GatewayRoomHost, RoomHost } from "./group-rooms.ts";
 import type { ProfileConfigureResult } from "./profile.ts";
 import type { RoutineWriteResult } from "./routines.ts";
 
 export interface FederationMember {
   id: string;
   label?: string;
-  bridge: BotControlSurface;
+  /** A `HermesBridge`. It is also a `RoomHost`, because a room whose members all live on this
+   *  endpoint is hosted by this endpoint's own `GroupRooms` (F8). */
+  bridge: BotControlSurface & RoomHost;
 }
 
 export function federatedBotName(endpointId: string, profileId: string): string {
@@ -27,6 +29,38 @@ export function splitFederatedBotName(name: string): { endpointId: string; profi
   if (separator < 1 || separator === name.length - 1) return undefined;
   return { endpointId: name.slice(0, separator), profileId: name.slice(separator + 1) };
 }
+
+/** The refusal a room spanning two Hermes endpoints has always got, kept verbatim: a room's durable
+ *  state lives inside one endpoint's `GroupRooms`, so there is no host for a membership that is not
+ *  all on one side. */
+export const CROSS_ENDPOINT_ROOMS = "cross-endpoint groups are not supported";
+
+/** F8's ruling, by name. A room is hosted by the endpoint its membership resolved to when it was
+ *  created, and it stays there: moving a live room's transcript, turn bindings and drive from one
+ *  endpoint's `GroupRooms` to another's is not something this gateway can do, so a membership that
+ *  has come to name a bot on some other endpoint is refused rather than silently re-homed.
+ *
+ *  A `BackendUnavailable` on purpose, so the wire answer is the same 503 `backend_unavailable` a
+ *  cross-endpoint room has always got. No route, frame or schema moves for this. */
+export class RoomEndpointMismatch extends BackendUnavailable {
+  readonly room: string;
+  readonly host: string;
+  readonly foreign: readonly string[];
+  constructor(room: string, host: string, foreign: readonly string[]) {
+    super(
+      `room "${room}" is hosted by Hermes endpoint "${host}" and cannot take a member on `
+      + `${foreign.map((id) => `"${id}"`).join(", ")}: a room stays on the endpoint it was created on`,
+    );
+    this.name = "RoomEndpointMismatch";
+    this.room = room;
+    this.host = host;
+    this.foreign = foreign;
+  }
+}
+
+/** The gateway itself, as a room owner id. A room whose members are all gateway runtime bots
+ *  resolves to no Hermes endpoint at all, and belongs to the Hermes-free host (R1). */
+const GATEWAY_HOST = "";
 
 function summary(id: string, bot: BotSummary): BotSummary {
   const name = federatedBotName(id, bot.name);
@@ -64,15 +98,29 @@ export class FederatedBotControlSurface implements BotControlSurface {
   readonly #members: Map<string, FederationMember>;
   readonly #broadcast?: (view: BotRosterView) => void;
   #overlay: ((bots: readonly BotSummary[]) => BotSummary[]) | undefined;
-  /** Rooms, when this surface is standing in for a gateway that has no Hermes endpoint at all
-   *  (finding V1-F1). A room is gateway-owned, so the absence of an endpoint is not a reason to
-   *  refuse one; genuinely cross-endpoint membership still is, and that case leaves this undefined
-   *  and keeps the refusal below. */
+  /** The gateway's OWN room host (finding V1-F1). A room is gateway-owned, so the absence of a
+   *  Hermes endpoint is not a reason to refuse one; it also owns a room on a federated gateway
+   *  whose members are all gateway runtime bots, which likewise resolves to no endpoint. */
   readonly #rooms: GatewayRoomHost | undefined;
-  constructor(members: FederationMember[], broadcast?: (view: BotRosterView) => void, rooms?: GatewayRoomHost) {
+  /** The room's stored membership, by room key. Read only to resolve ownership; `undefined` for a
+   *  room that does not exist. Absent in surface-only tests, where no room can exist either. */
+  readonly #roomMembers: ((key: string) => readonly string[] | undefined) | undefined;
+  /** Which host owns a room, by room key: an endpoint id, or `GATEWAY_HOST`. Resolved ONCE per room
+   *  and then remembered, so a later call routes without re-deriving ownership from membership and
+   *  a live room's host can never flip underneath it. Rebuilt lazily after a restart from the
+   *  durable membership, which is the same answer by construction: ownership is fixed at create and
+   *  a membership that would change it is refused (`RoomEndpointMismatch`). */
+  readonly #roomHosts = new Map<string, string>();
+  constructor(
+    members: FederationMember[],
+    broadcast?: (view: BotRosterView) => void,
+    rooms?: GatewayRoomHost,
+    roomMembers?: (key: string) => readonly string[] | undefined,
+  ) {
     this.#members = new Map(members.map((member) => [member.id, member]));
     this.#broadcast = broadcast;
     this.#rooms = rooms;
+    this.#roomMembers = roomMembers;
   }
   #route(name: string): { member: FederationMember; profile: string } {
     const parsed = splitFederatedBotName(name);
@@ -136,13 +184,84 @@ export class FederatedBotControlSurface implements BotControlSurface {
   async patchRoutine(name: string, id: string, patch: BotRoutinePatch): Promise<RoutineWriteResult> { const r = this.#route(name); return r.member.bridge.patchRoutine(r.profile, id, patch); }
   async deleteRoutine(name: string, id: string): Promise<void> { const r = this.#route(name); return r.member.bridge.deleteRoutine(r.profile, id); }
   setFocus(deviceId: string, screen: BotFocusScreen | null): void { for (const member of this.#members.values()) member.bridge.setFocus(deviceId, screen); }
-  #hostedRooms(): GatewayRoomHost {
-    if (this.#rooms === undefined) throw new BackendUnavailable("cross-endpoint groups are not supported");
-    return this.#rooms;
+  /** The endpoint that owns a public bot name, or `GATEWAY_HOST` when no endpoint does. A gateway
+   *  runtime bot is named bare on every gateway shape and belongs to no endpoint; so does a name
+   *  carrying a prefix no configured endpoint answers to, which the host's own membership check
+   *  then refuses as "not a bot on this gateway" rather than a 503 about federation. */
+  #owningEndpoint(name: string): string {
+    const parsed = splitFederatedBotName(name.trim().toLowerCase());
+    if (parsed === undefined) return GATEWAY_HOST;
+    return this.#members.has(parsed.endpointId) ? parsed.endpointId : GATEWAY_HOST;
   }
+  /** The one host a membership resolves to. Endpoint-owned members must all sit on the SAME
+   *  endpoint; bare runtime members are endpoint-agnostic and join whichever host the rest picks. */
+  #resolveHost(members: readonly string[]): { host: string } | { spans: string[] } {
+    const endpoints: string[] = [];
+    for (const member of members) {
+      const owner = this.#owningEndpoint(member);
+      if (owner !== GATEWAY_HOST && !endpoints.includes(owner)) endpoints.push(owner);
+    }
+    if (endpoints.length > 1) return { spans: endpoints };
+    return { host: endpoints[0] ?? GATEWAY_HOST };
+  }
+  #hostById(id: string): RoomHost {
+    if (id === GATEWAY_HOST) {
+      if (this.#rooms === undefined) throw new BackendUnavailable(CROSS_ENDPOINT_ROOMS);
+      return this.#rooms;
+    }
+    const member = this.#members.get(id);
+    if (member === undefined) throw new BackendUnavailable(CROSS_ENDPOINT_ROOMS);
+    return member.bridge;
+  }
+  /** The host of an EXISTING room, plus the ownership guard. The remembered host is what routes;
+   *  the membership read only checks that the room has not come to name a bot on another endpoint,
+   *  which is refused by name rather than migrated (F8's ruling). */
+  #hostOf(name: string): RoomHost {
+    const key = name.trim().toLowerCase();
+    const members = this.#roomMembers?.(key);
+    const remembered = this.#roomHosts.get(key);
+    if (members === undefined) {
+      // No such room. Hand it to the remembered host, or to the gateway's own, so the caller gets
+      // the host's ordinary `GroupNotFound` (404) instead of a 503 about federation.
+      return this.#hostById(remembered ?? GATEWAY_HOST);
+    }
+    const resolved = this.#resolveHost(members);
+    if (remembered === undefined) {
+      if ("spans" in resolved) throw new BackendUnavailable(CROSS_ENDPOINT_ROOMS);
+      this.#roomHosts.set(key, resolved.host);
+      return this.#hostById(resolved.host);
+    }
+    const foreign = "spans" in resolved
+      ? resolved.spans.filter((id) => id !== remembered)
+      : resolved.host === remembered ? [] : [resolved.host];
+    if (foreign.length > 0) {
+      throw new RoomEndpointMismatch(name.trim(), remembered === GATEWAY_HOST ? "(gateway)" : remembered, foreign);
+    }
+    return this.#hostById(remembered);
+  }
+  /** Every room on this gateway, from the gateway's own host: room rows are gateway-wide durable
+   *  state, so one host lists them all whichever host drives each one. */
   groups(): BotGroup[] { return this.#rooms?.groups() ?? []; }
-  createGroup(name: string, members: string[]): Promise<BotGroup> { return this.#hostedRooms().createGroup(name, members); }
-  deleteGroup(name: string): void { this.#hostedRooms().deleteGroup(name); }
-  groupDetail(name: string): BotGroupDetail { return this.#hostedRooms().groupDetail(name); }
-  sendGroupMessage(name: string, text: string, opts?: { clientId?: string }): BotGroupMessage { return this.#hostedRooms().sendGroupMessage(name, text, opts ?? {}); }
+  async createGroup(name: string, members: string[]): Promise<BotGroup> {
+    const resolved = this.#resolveHost(members);
+    if ("spans" in resolved) throw new BackendUnavailable(CROSS_ENDPOINT_ROOMS);
+    const group = await this.#hostById(resolved.host).createGroup(name, members);
+    this.#roomHosts.set(group.name.trim().toLowerCase(), resolved.host);
+    return group;
+  }
+  deleteGroup(name: string): void {
+    this.#hostOf(name).deleteGroup(name);
+    this.#roomHosts.delete(name.trim().toLowerCase());
+  }
+  groupDetail(name: string): BotGroupDetail { return this.#hostOf(name).groupDetail(name); }
+  sendGroupMessage(name: string, text: string, opts?: { clientId?: string }): BotGroupMessage { return this.#hostOf(name).sendGroupMessage(name, text, opts ?? {}); }
+  /** The host that drives a room, for the server's attach-event and room-turn wiring. Never
+   *  throws: an event for a room whose ownership no longer resolves has no host to project it. */
+  roomHostFor(key: string): RoomHost | undefined {
+    try {
+      return this.#hostOf(key);
+    } catch {
+      return undefined;
+    }
+  }
 }

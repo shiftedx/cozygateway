@@ -1421,6 +1421,22 @@ function sleep(ms: number): Promise<void> {
  *  The member callbacks are the Hermes-free half of the bridge's: with no endpoint configured every
  *  bot on this gateway is a runtime bot, so membership, existence and display identity are answered
  *  from the runtime set and the roster overlay with no RPC anywhere. */
+/** Whatever holds a room's `GroupRooms`: a Hermes endpoint's own `HermesBridge`, or the gateway's
+ *  `GatewayRoomHost` below. A gateway with two or more endpoints has several of these at once and
+ *  hosts each room on exactly one of them (F8), so the server and the federated control surface
+ *  both need to name the type rather than test for `instanceof HermesBridge`. */
+export interface RoomHost {
+  groups(): BotGroup[];
+  createGroup(name: string, members: string[]): Promise<BotGroup>;
+  deleteGroup(name: string): void;
+  groupDetail(name: string): BotGroupDetail;
+  sendGroupMessage(name: string, text: string, opts?: { clientId?: string }): BotGroupMessage;
+  setGroupNativeTurns(endpoint: NativeGroupTurnEndpoint): void;
+  setGroupInteractionExpiry(expiry: RoomInteractionExpiry): void;
+  canAcceptGroupAttachEvent(agentId: string, frame: AttachV1EventFrame): boolean;
+  handleGroupAttachEvent(agentId: string, frame: AttachV1EventFrame): boolean;
+}
+
 export interface GatewayRoomHostOptions {
   storage: Storage;
   broadcast: (frame: ServerFrame) => void;
@@ -1433,7 +1449,7 @@ export interface GatewayRoomHostOptions {
   escalate?: (event: { group: string; member: string; displayName: string; text: string }) => void;
 }
 
-export class GatewayRoomHost {
+export class GatewayRoomHost implements RoomHost {
   readonly #rooms: GroupRooms;
   readonly #runtime: () => ReadonlySet<string>;
   constructor(opts: GatewayRoomHostOptions) {

@@ -1092,8 +1092,18 @@ Committed transcript history remains the recovery source after reconnect.
   all runtime bots is created and run without the Hermes Dashboard being consulted at all, on a
   gateway with no `hermesEndpoints` entry as well as on one with a single plain endpoint
   (capability 52): a room is gateway-owned, so the absence of an endpoint is never a reason to
-  refuse one. A gateway with two or more endpoints, or a single `namespace: true` endpoint,
-  still refuses every room with 503 until rooms learn to span endpoints. The
+  refuse one. On a gateway with two or more endpoints, or a single `namespace: true` endpoint, a
+  room is hosted by the ONE host its membership resolves to, where a member named
+  `<endpoint>:<profile>` resolves to that endpoint and a runtime bot, named bare on every gateway
+  shape, resolves to no endpoint at all: a room whose members all live on a single endpoint is
+  hosted by that endpoint and created, run and answered exactly as it is on a single-endpoint
+  gateway, and a room whose members are all runtime bots is hosted by the gateway itself. A room
+  whose membership spans two or more endpoints has no host and is refused
+  `503 backend_unavailable`, "cross-endpoint groups are not supported". A room stays on the host
+  it was created on for its whole life: it is addressed, listed and deleted there without its
+  ownership being re-derived, and a membership that comes to name a bot on a different endpoint is
+  refused `503 backend_unavailable` naming both hosts rather than migrating the room. None of this
+  moves a route, frame, schema or version; it is which host serves the same bytes. The
   member turn is unchanged in every other respect: the same attach-v1 `turn` command on the same
   gateway-owned `group:<room>:<member>` thread, the same rounds, the same transcript. A member's
   display name and handle in the room come from its roster row, which for a runtime bot is the

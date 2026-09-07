@@ -5,6 +5,20 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## Unreleased
+
+- Rooms on a gateway with two or more Hermes endpoints (`com.cozylabs.bots` capabilities 46 and 52,
+  F8): such a gateway refused every room, including one whose members all lived on a single
+  endpoint. A room is now hosted by the one host its membership resolves to. Every member on one
+  endpoint means that endpoint's own rooms host it, created and run exactly as on a single-endpoint
+  gateway; every member a gateway runtime bot means the gateway's own host, the one added for the
+  Hermes-free shape; a membership spanning two endpoints still has no host and is still refused
+  `503 backend_unavailable`, "cross-endpoint groups are not supported". A room stays on the host it
+  was created on: ownership is resolved once and remembered, and a membership that comes to name a
+  bot on another endpoint is refused by name rather than migrated. A single un-namespaced endpoint
+  is untouched. No route, frame, schema or version moved, and Hermes needs no plugin change: an
+  endpoint hosting a room sees the attach-v1 traffic it already handles today.
+
 ## 0.7.6 (2026-09-06): rooms without a Hermes endpoint, installer fixes
 
 - Rooms on a gateway with no `hermesEndpoints` entry (`com.cozylabs.bots` capabilities 46 and 52,
