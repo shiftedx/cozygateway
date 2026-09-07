@@ -3565,12 +3565,18 @@ export class Storage {
     messageIds: readonly string[],
     deviceId: string,
     at: number,
+    /** Capability 73. What the person waited and which network they were on, both measured on the
+     * phone. Stored on the receipt rather than only folded into the observation ring so a receipt
+     * read back later still says what it was, and never mixed into a gateway-measured hop. */
+    perceived?: { feltLatencyMs?: number; networkPath?: string },
   ): { recorded: number; deliveries: Array<{ deliveryId: string; messageId: string }> } {
     const insert = this.#db.prepare(
-      `INSERT OR IGNORE INTO bot_message_receipts (bot, message_id, displayed_at, device_id)
-       SELECT ?, ?, ?, ?
+      `INSERT OR IGNORE INTO bot_message_receipts (bot, message_id, displayed_at, device_id, felt_latency_ms, network_path)
+       SELECT ?, ?, ?, ?, ?, ?
        WHERE EXISTS (SELECT 1 FROM bot_native_messages WHERE bot = ? AND message_id = ?)`,
     );
+    const feltLatencyMs = perceived?.feltLatencyMs ?? null;
+    const networkPath = perceived?.networkPath ?? null;
     const binding = this.#db.prepare(
       `SELECT delivery_id AS deliveryId FROM attach_scheduled_deliveries
        WHERE agent_id = ? AND message_id = ?`,
@@ -3585,7 +3591,7 @@ export class Storage {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       for (const messageId of new Set(messageIds)) {
-        if (insert.run(bot, messageId, at, deviceId, bot, messageId).changes !== 1) continue;
+        if (insert.run(bot, messageId, at, deviceId, feltLatencyMs, networkPath, bot, messageId).changes !== 1) continue;
         recorded += 1;
         displayed.push(messageId);
         const bound = (binding.get(bot, messageId) ?? turnBinding.get(bot, messageId)) as
@@ -3604,13 +3610,18 @@ export class Storage {
     return { recorded, deliveries };
   }
 
-  botMessageReceipt(bot: string, messageId: string): { displayedAt: number; deviceId: string } | undefined {
+  botMessageReceipt(bot: string, messageId: string): {
+    displayedAt: number; deviceId: string; feltLatencyMs: number | null; networkPath: string | null;
+  } | undefined {
     return this.#db
       .prepare(
-        `SELECT displayed_at AS displayedAt, device_id AS deviceId
+        `SELECT displayed_at AS displayedAt, device_id AS deviceId,
+                felt_latency_ms AS feltLatencyMs, network_path AS networkPath
          FROM bot_message_receipts WHERE bot = ? AND message_id = ?`,
       )
-      .get(bot, messageId) as { displayedAt: number; deviceId: string } | undefined;
+      .get(bot, messageId) as {
+        displayedAt: number; deviceId: string; feltLatencyMs: number | null; networkPath: string | null;
+      } | undefined;
   }
 
   /** Read the admitted event's existing durable records; it intentionally performs no projection

@@ -54,6 +54,7 @@ import { sanitizeApprovalDetail, sanitizeApprovalRepair, sanitizeApprovalScope, 
 import { resolveMobileTargetDevice, type MobileNodeBroker, type MobileNodeReceiptInput } from "../mobile-node.ts";
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import type { Storage } from "../storage.ts";
+import type { ObservationRing } from "../observe/ring.ts";
 import type { GatewayChatConfiguration } from "../chat-configuration.ts";
 import { CozyAgentsHarnessModelSettingsAdapter } from "../harness-settings.ts";
 import { ATTACH_MEDIA_TTL_MS } from "./photos.ts";
@@ -152,6 +153,9 @@ export interface NativeBotDataPlaneOptions {
     name?: string;
     outcome?: "approved" | "denied" | "expired";
   }) => void;
+  /** Dashboard packet D2. Absent means the observation ring is off, and then every turn path here
+   * behaves exactly as it did before the ring existed: no timing state is kept and no row written. */
+  observe?: ObservationRing;
   now?: () => number;
   /** Existing gateway wall-clock bound; durable attach queueing lasts until this deadline. */
   turnTimeoutMs?: number;
@@ -476,6 +480,7 @@ export class NativeBotDataPlane {
    *  best effort: the durable copy rides on the pending steer row, which is what survives a
    *  restart. */
   readonly #turnContexts = new Map<string, unknown>();
+  readonly #observe: ObservationRing | undefined;
   #staleTurnSweep: ReturnType<typeof setInterval> | undefined;
 
   constructor(opts: NativeBotDataPlaneOptions) {
@@ -495,6 +500,7 @@ export class NativeBotDataPlane {
     this.#broadcast = opts.broadcast;
     this.#onChatMessage = opts.onChatMessage;
     this.#onApproval = opts.onApproval;
+    this.#observe = opts.observe?.enabled === true ? opts.observe : undefined;
     this.#now = opts.now ?? Date.now;
     this.#storage.tasks.expireInteractions((bot, kind, id, at) => this.#expireInteraction(bot, kind, id, at));
     this.#turnTimeoutMs = opts.turnTimeoutMs ?? 0;
@@ -596,8 +602,8 @@ export class NativeBotDataPlane {
       chatAttachmentInfo: (name, fileId) => this.#attachmentInfo(name, fileId),
       chatAttachmentSlice: (name, fileId, offset, length) =>
         this.#attachmentSlice(name, fileId, offset, length),
-      recordDisplayed: (name, messageIds, deviceId) =>
-        this.#recordDisplayed(name, messageIds, deviceId),
+      recordDisplayed: (name, messageIds, deviceId, perceived) =>
+        this.#recordDisplayed(name, messageIds, deviceId, perceived),
     };
     return new Proxy(this.#control, {
       get: (target, property) => {
@@ -1316,7 +1322,7 @@ export class NativeBotDataPlane {
     this.#log(`promoted an unanswered steer on ${deadTurnId} for ${bot} to durable turn ${turnId}`);
     this.#storage.settlePendingNativeSteer(bot, first.messageId, now);
     this.#storage.rebindNativeBotMessageTurn(bot, sessionId, first.messageId, turnId);
-    this.#storage.setNativeBotTurn(bot, sessionId, turnId, now);
+    this.#admitNativeTurn(bot, sessionId, turnId, now);
     if (first.context !== undefined)
       this.#turnContexts.set(this.#nativeTurnKey(bot, sessionId, turnId), first.context);
     // The push suppression the original send earned belongs to the promoted turn too: the same
@@ -1391,6 +1397,9 @@ export class NativeBotDataPlane {
   taskTurnQueued(peer: string, command: { threadId: string; turnId: string }): void {
     const bot = this.#storage.chatExecutionById(peer)?.bot ?? normalize(peer);
     if (!this.handles(bot) || !this.#storage.nativeBotHasSession(bot, command.threadId)) return;
+    // Dashboard packet D2. The command is on the peer's lane, which closes the admission-to-dispatch
+    // leg of gateway handling.
+    this.#observe?.turnDispatched(bot, command.turnId);
     this.#scheduleTurnTimeout(bot, command.threadId, command.turnId);
     this.#seedTurnActivity(bot, command.threadId, command.turnId);
     this.#state(bot, command.threadId, "polling", true);
@@ -1571,6 +1580,11 @@ export class NativeBotDataPlane {
       }
     }
     if (event.kind === "draft") {
+      // Dashboard packet D2. The first draft of a turn is time to first token as this gateway can
+      // observe it, and every draft counts toward the turn's delta frame count. For a Hermes bot
+      // this is the only model-side timing there is, and it is MEASURED here rather than inferred:
+      // what cannot be measured (the peer-to-model leg alone) is simply never written.
+      this.#observe?.turnDelta(key, event.turnId);
       const seq = (this.#draftSeq.get(event.turnId) ?? 0) + 1;
       this.#draftSeq.set(event.turnId, seq);
       const delta: BotChatDeltaFrame = {
@@ -2002,7 +2016,7 @@ export class NativeBotDataPlane {
       ...(opts?.clientId === undefined ? {} : { clientId: opts.clientId }),
     });
     if (chat.activeTurnId === undefined) {
-      this.#storage.setNativeBotTurn(bot, chat.sessionId, turnId, now);
+      this.#admitNativeTurn(bot, chat.sessionId, turnId, now);
       if (opts?.deviceId !== undefined) this.#turnOrigins.set(this.#nativeTurnKey(bot, chat.sessionId, turnId), opts.deviceId);
       this.#scheduleTurnTimeout(bot, chat.sessionId, turnId);
       this.#seedTurnActivity(bot, chat.sessionId, turnId);
@@ -2160,7 +2174,7 @@ export class NativeBotDataPlane {
       turnId,
       ...(input.clientId === undefined ? {} : { clientId: input.clientId }),
     });
-    this.#storage.setNativeBotTurn(bot, chat.sessionId, turnId, now);
+    this.#admitNativeTurn(bot, chat.sessionId, turnId, now);
     if (input.deviceId !== undefined) this.#turnOrigins.set(this.#nativeTurnKey(bot, chat.sessionId, turnId), input.deviceId);
     this.#scheduleTurnTimeout(bot, chat.sessionId, turnId);
     this.#broadcastMessage(bot, chat.sessionId, message, now);
@@ -2524,6 +2538,15 @@ export class NativeBotDataPlane {
     );
   }
 
+  /** Dashboard packet D2, design section 10. Admission is the moment a durable turn row exists and
+   * the gateway owes the peer a command; it is the zero of every per-turn duration the gateway can
+   * honestly measure. Wrapping the durable write rather than stamping each caller keeps the three
+   * admission paths (a send, a routine, a promoted steer) impossible to get out of step. */
+  #admitNativeTurn(bot: string, sessionId: string, turnId: string, at: number): void {
+    this.#storage.setNativeBotTurn(bot, sessionId, turnId, at);
+    this.#observe?.turnAdmitted(bot, turnId);
+  }
+
   #finish(
     bot: string,
     sessionId: string,
@@ -2570,6 +2593,13 @@ export class NativeBotDataPlane {
       terminal.status === "completed" ? "ok" : "error",
     );
     this.#sealDelegations(bot, sessionId, turnId, terminal.status === "completed");
+    // Dashboard packet D2. `turn_ms`, `delta_frames` and the turn terminal marker are written here;
+    // the returned function closes the terminal-to-broadcast leg of gateway handling once the final
+    // frame and state have actually gone out.
+    const broadcast = this.#observe?.turnTerminal(bot, turnId, {
+      status: terminal.status,
+      ...(terminal.cause === undefined ? {} : { reason: terminal.cause }),
+    });
     const seq = (this.#draftSeq.get(turnId) ?? 0) + 1;
     this.#broadcast({
       type: "bot_chat_delta",
@@ -2584,6 +2614,7 @@ export class NativeBotDataPlane {
     this.#draftSeq.delete(turnId);
     this.#thinkingSeq.delete(turnId);
     this.#state(bot, sessionId, terminal.phase, false, terminal);
+    broadcast?.();
   }
 
   /** Capability 31. Turns a device's "I put these on screen" report into durable receipts, and
@@ -2629,11 +2660,18 @@ export class NativeBotDataPlane {
     name: string,
     messageIds: readonly string[],
     deviceId: string,
+    perceived?: { feltLatencyMs?: number; networkPath?: "wifi" | "cellular" | "vpn_on" | "vpn_off" },
   ): { recorded: number } {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
     const at = this.#now();
-    const result = this.#storage.recordBotMessageDisplayed(bot, messageIds, deviceId, at);
+    const result = this.#storage.recordBotMessageDisplayed(bot, messageIds, deviceId, at, perceived);
+    // Dashboard packet D2, design section 11. Exactly one sample per request whatever the batch
+    // size, so a coalesced scroll burst cannot report the same wait sixty four times. Kept apart
+    // from every gateway-measured hop: this is the phone's clock and those are this process's.
+    if (perceived?.feltLatencyMs !== undefined && result.recorded > 0) {
+      this.#observe?.feltLatency(bot, perceived.feltLatencyMs, perceived.networkPath);
+    }
     for (const delivery of result.deliveries) {
       this.#ingress.sendDeliveryReceipt(bot, {
         deliveryId: delivery.deliveryId,

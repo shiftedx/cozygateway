@@ -36,7 +36,10 @@ import {
 } from "cozygateway-contract";
 
 import { DEFAULT_ARTIFACT_STORE_BYTES } from "./artifacts.ts";
-import { hermesEndpoints, nativeBots, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
+import { hermesEndpoints, nativeBots, observability, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
+import { ObservationRing } from "./observe/ring.ts";
+import { TunnelSelfProbe, TUNNEL_PROBE_INTERVAL_MS } from "./observe/self-probe.ts";
+import { publicHostOf } from "./observe/origin.ts";
 import { fileGatewaySettings, type GatewaySettingsStore } from "./gateway-settings.ts";
 import { createInstallerProvisioner, type ProfileChangeEvent, type ProfileProvisioner } from "./hermes-bridge/profile-provisioner.ts";
 import {
@@ -94,6 +97,12 @@ import { GatewayProviderConnections } from "./provider-connections.ts";
 import { AttachHistorySurface } from "./hermes-bridge/bot-history.ts";
 import { AttachMemorySurface } from "./hermes-bridge/memory.ts";
 import { PHOTO_SWEEP_MS } from "./hermes-bridge/photos.ts";
+
+/** Dashboard packet D2. How often the gateway-wide depths are sampled, and how often the seven day
+ *  ring is trimmed. A minute is fine enough to see a queue build and coarse enough that a week of
+ *  it is a few thousand rows per series rather than a few million. */
+const OBSERVE_SWEEP_MS = 60_000;
+const OBSERVE_TRIM_MS = 3_600_000;
 import { resolveTlsMaterial } from "./tls.ts";
 import type { TraceLog } from "./trace.ts";
 import { CozyAgentsHarnessModelSettingsAdapter, GatewayHarnessSettings, HermesHarnessModelSettingsAdapter } from "./harness-settings.ts";
@@ -481,9 +490,17 @@ export async function startGateway(
     hermesGlobalSkills !== undefined,
     maintenance !== undefined,
   );
+  // Dashboard packet D2. The observation ring: what the gateway already measures on every turn,
+  // heartbeat and sweep, kept for a week instead of thrown away. OFF BY DEFAULT; constructed
+  // either way so every hook below takes the same shape, and inert when disabled.
+  const observeOptions = observability(config);
+  const observe = new ObservationRing({ store: storage.observe, options: observeOptions });
+  const observePublicHost = publicHostOf(config.publicUrl);
   let mobileNode: MobileNodeBroker | undefined;
   const hub = new WsHub({
     storage, gatewayInfo, now: () => Date.now(), trace: traceLog,
+    observe,
+    ...(observePublicHost === undefined ? {} : { publicHost: observePublicHost }),
     onMobileResult: (deviceId, frame) => mobileNode?.result(deviceId, frame),
     onMobileProgress: (deviceId, frame) => mobileNode?.progress(deviceId, frame),
     onDeviceDisconnect: (deviceId) => mobileNode?.disconnectDevice(deviceId),
@@ -706,6 +723,7 @@ export async function startGateway(
     storage,
     allowedCapabilities,
     trace: traceLog,
+    observe,
     events: {
       canAcceptEvent: (agentId, frame) => {
         if (storage.chatExecutionById(agentId)) return nativeBotPlane?.canAccept(agentId, frame) === true;
@@ -936,6 +954,7 @@ export async function startGateway(
       : { relayBaseUrl: config.pushRelayUrl }),
     log: options.notifierLog,
     trace: traceLog,
+    observe,
     isDeviceConnected: (deviceId) => hub.isDeviceConnected(deviceId),
   });
   const liveActivityNotifier = new LiveActivityNotifier({
@@ -974,6 +993,7 @@ export async function startGateway(
   nativeBotPlane = new NativeBotDataPlane({
     control: bridge,
     storage,
+    observe,
     ingress: attachV1Ingress,
     nativeBots: nativeBotIds,
     runtimeBots,
@@ -1336,12 +1356,60 @@ export async function startGateway(
     }
   }, PHOTO_SWEEP_MS);
   attachMediaSweep.unref?.();
+  // Dashboard packet D2. Three periodic jobs, all following the retention sweep's shape above so
+  // they start and stop with the gateway process the same way, and all skipped entirely when
+  // observability is off. Every callback absorbs its own failure: a metric that can terminate the
+  // process it measures is worse than no metric.
+  const observationSweep = observeOptions.enabled
+    ? setInterval(() => {
+        try {
+          // Section 3's gateway-wide figures. Sampled on a cadence rather than only when somebody
+          // opens the dashboard, so a chart can be drawn through a night nobody was watching.
+          const health = attachV1Ingress.health();
+          observe.attachDepths({
+            online: health.online,
+            queueDepth: health.queueDepth,
+            deadLetters: health.deadLetters,
+            outboxDepth: health.pluginOutboxDepth ?? 0,
+          });
+        } catch (error) {
+          console.error(
+            `observation sweep failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }, OBSERVE_SWEEP_MS)
+    : undefined;
+  observationSweep?.unref?.();
+  // The nightly trim the design names. Hourly rather than once a day at a fixed hour: a gateway
+  // that is only ever awake in the evening would otherwise never reach its own retention pass, and
+  // a delete of nothing costs an indexed range scan that finds no rows.
+  const observationTrim = setInterval(() => {
+    try {
+      observe.trim();
+    } catch (error) {
+      console.error(
+        `observation trim failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }, OBSERVE_TRIM_MS);
+  observationTrim.unref?.();
   const address = server.address();
   const port =
     address !== null && typeof address === "object"
       ? address.port
       : config.port;
   boundPort = port;
+  // Section 10 and 11, the tunnel leg. Built after the port is known, because the loopback half of
+  // the comparison has to reach THIS listener; a gateway with no public URL has no tunnel to probe,
+  // so it never runs one and never records an absent hop as a zero.
+  const tunnelProbe = observeOptions.enabled && config.publicUrl !== undefined
+    ? new TunnelSelfProbe({
+        ring: observe,
+        publicUrl: config.publicUrl,
+        loopbackUrl: `${scheme}://127.0.0.1:${port}`,
+      })
+    : undefined;
+  tunnelProbe?.start(TUNNEL_PROBE_INTERVAL_MS);
 
   return {
     url: `${scheme}://${config.host ?? "127.0.0.1"}:${port}`,
@@ -1354,6 +1422,9 @@ export async function startGateway(
     },
     close: async () => {
       clearInterval(attachMediaSweep);
+      if (observationSweep !== undefined) clearInterval(observationSweep);
+      clearInterval(observationTrim);
+      tunnelProbe?.stop();
       // A runtime bot is a durable attach-v1 identity exactly like a Hermes profile (same
       // ingress, same recovery-in-SQLite story), so it has to be checked here too: skipping it
       // left a Hermes-free gateway with a negotiated runtime bot connection always falling to

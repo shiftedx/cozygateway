@@ -55,6 +55,7 @@ import {
   PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS,
   PendingWebsocketLimiter,
 } from "../../websocket-limits.ts";
+import type { ObservationRing } from "../../observe/ring.ts";
 
 export const ATTACH_V1_MAX_IN_FLIGHT_EVENTS = 64;
 export const ATTACH_V1_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
@@ -148,6 +149,7 @@ export class AttachV1Ingress implements TurnEndpoint {
   readonly #heartbeatIntervalMs: number;
   readonly #heartbeatTimeoutMs: number;
   readonly #heartbeat: ReturnType<typeof setInterval>;
+  readonly #observe: ObservationRing | undefined;
   readonly #now: () => number;
   readonly #allowedCapabilities: ReadonlyMap<string, ReadonlySet<AttachV1Capability>>;
   readonly #projectionRetryMs: number;
@@ -164,6 +166,10 @@ export class AttachV1Ingress implements TurnEndpoint {
     events: AttachV1Events;
     heartbeatIntervalMs?: number;
     heartbeatTimeoutMs?: number;
+    /** Dashboard packet D2. The heartbeat this ingress already runs is a request with exactly one
+     *  acknowledgement, which makes it the gateway-to-peer round trip section 10 asks for. Absent
+     *  means the observation ring is off and the heartbeat is byte identical to its pre-D2 self. */
+    observe?: ObservationRing;
     now?: () => number;
     allowedCapabilities?: ReadonlyMap<string, ReadonlySet<AttachV1Capability>>;
     projectionRetryMs?: number;
@@ -178,6 +184,7 @@ export class AttachV1Ingress implements TurnEndpoint {
     this.#tokens = deps.tokens;
     this.#storage = deps.storage;
     this.#events = deps.events;
+    this.#observe = deps.observe?.enabled === true ? deps.observe : undefined;
     this.#heartbeatIntervalMs = deps.heartbeatIntervalMs ?? ATTACH_V1_HEARTBEAT_INTERVAL_MS;
     this.#heartbeatTimeoutMs = deps.heartbeatTimeoutMs ?? ATTACH_V1_HEARTBEAT_TIMEOUT_MS;
     this.#now = deps.now ?? (() => Date.now());
@@ -347,6 +354,12 @@ export class AttachV1Ingress implements TurnEndpoint {
         // Gateway is the sole heartbeat initiator. The inbound frame is its one acknowledgement,
         // not a request for another response; echoing it makes two healthy peers amplify heartbeats.
         this.#lastHeartbeatAt = receivedAt;
+        // Dashboard packet D2, design section 10. This frame is the peer's sole acknowledgement of
+        // the heartbeat the tick below sent, so the pair is a round trip and nothing else has to be
+        // added to the wire to measure it. Timed on the gateway's monotonic clock at both ends; the
+        // peer's own `sentAt` echo is never subtracted, because that would cross two machines'
+        // clocks and section 11 forbids exactly that.
+        this.#observe?.peerHeartbeatAcked(agentId);
         if (frame.telemetry !== undefined)
           connection.telemetry = this.#recordTelemetry(agentId, frame.telemetry, receivedAt);
         this.#refreshDegraded(agentId, connection);
@@ -888,6 +901,10 @@ export class AttachV1Ingress implements TurnEndpoint {
         }
         this.#presence(agentId, "degraded");
         this.#traceAttach("attach_projection", agentId, { outcome: "dead_letter" });
+        // Dashboard packet D2. A dead letter is one of the state changes section 3 names as worth a
+        // marker. The sequence number is the reference; the event that failed and the error text
+        // are not, because either could carry a person's words.
+        this.#observe?.deadLetter(agentId, null, { sequence: frame.sequence, attempts: failure.attempts });
         return;
       }
       const delay = Math.min(this.#projectionRetryMs * 2 ** Math.max(0, failure.attempts - 1), 30_000);
@@ -917,6 +934,7 @@ export class AttachV1Ingress implements TurnEndpoint {
         // if it has emitted no frame for minutes because its model has not returned a token yet.
         // `lastSeenAt` is the last byte it actually sent, so that instant is the proof, not `now`.
         this.#events.onLiveness?.(agentId, connection.lastSeenAt);
+        this.#observe?.peerHeartbeatSent(agentId);
         this.#send(connection, { kind: "heartbeat", sentAt: now });
       }
     }

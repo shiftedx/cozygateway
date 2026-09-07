@@ -1176,6 +1176,30 @@ export type BotChatSendRequest = Static<typeof BotChatSendRequestSchema>;
  *  retrying a batch it cannot repair. */
 export const BotChatDisplayedRequestSchema = Type.Object({
   messageIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: 64 }),
+  /** Capability 73. What the person actually waited, from the send being tapped to the first delta
+   *  being rendered, on the PHONE's own clock. The gateway cannot measure this and never will: it
+   *  sees an admission and a frame leaving, not a thumb and a pixel.
+   *
+   *  It is reported here rather than on a new route because this is already the one call the app
+   *  makes when a row reaches the screen. It describes THIS report: a client that has a perceived
+   *  latency to declare sends the message it belongs to on its own rather than folded into a
+   *  coalesced scroll burst, and a gateway records at most one measurement per request whatever the
+   *  batch size, so a burst can never inflate a sample count.
+   *
+   *  Never added to a gateway-measured hop and never subtracted from one. Two clocks that were
+   *  never synchronised cannot be differenced, so this is its own figure beside them. */
+  feltLatencyMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 600_000 })),
+  /** Capability 73. The network path the phone was on when it measured `feltLatencyMs`, from the
+   *  system path monitor and the presence of a tunnel interface. The gateway cannot see a VPN; the
+   *  phone can, and this is the only way the cost of one is ever a measured difference of two
+   *  medians rather than a guess. Reported without `feltLatencyMs` it is accepted and stored,
+   *  because a path with no timing still says which paths a device uses. */
+  networkPath: Type.Optional(Type.Union([
+    Type.Literal("wifi"),
+    Type.Literal("cellular"),
+    Type.Literal("vpn_on"),
+    Type.Literal("vpn_off"),
+  ])),
 });
 export type BotChatDisplayedRequest = Static<typeof BotChatDisplayedRequestSchema>;
 
@@ -2963,4 +2987,13 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * `GET /devices` and is revoked by `DELETE /devices/:id` like any device. Additive: a device
  * paired before 72 is `scope: "write"` and refused nothing, a client that never sends
  * `kind: "observer"` is byte identical to its pre-72 self, and no peer of any backend changes. */
-export const BOTS_CAPABILITY_VERSION = 72;
+/** Capability 73: the one hop the gateway cannot measure is reported by the phone that can.
+ * `POST /bots/:name/chat/messages/displayed` gains two optional fields, `feltLatencyMs` (send
+ * tapped to first delta rendered, on the phone's own clock) and `networkPath` (`wifi`, `cellular`,
+ * `vpn_on`, `vpn_off`), and the gateway stores both on the receipt and records at most one sample
+ * per request whatever the batch size. Neither is ever added to or subtracted from a
+ * gateway-measured figure: two clocks that were never synchronised cannot be differenced, and the
+ * dashboard shows the perceived figure beside the measured hops rather than inside them. Nothing
+ * else changes: no new route, no new frame, no peer of any backend touched, and a client below 73
+ * sends neither field and is byte identical to its pre-73 self. */
+export const BOTS_CAPABILITY_VERSION = 73;

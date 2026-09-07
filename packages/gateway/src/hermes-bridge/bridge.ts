@@ -389,6 +389,10 @@ export interface BotsSurface extends BotControlSurface {
     name: string,
     messageIds: readonly string[],
     deviceId: string,
+    /** Capability 73. The app's own perceived latency and network path for this report. Optional
+     * everywhere: a client below 73 sends neither and is byte identical to its pre-73 self, and a
+     * backend that has nowhere to put them ignores them. */
+    perceived?: { feltLatencyMs?: number; networkPath?: "wifi" | "cellular" | "vpn_on" | "vpn_off" },
   ): { recorded: number };
   desktopSessions(name: string): Promise<BotDesktopHermesSession[]>;
   resumeDesktopSession(name: string, hermesSessionId: string): Promise<BotDesktopHermesResumeResponse>;

@@ -187,8 +187,8 @@ describe("the privacy rule at the writer", () => {
   const forbidden = [
     "https://gateway.example.com/ready",
     "http://192.168.1.5:8787/bots/luna/chat",
-    "/Users/someone/Library/Application Support/cozygateway.db",
-    "C:\\Users\\someone\\gateway.db",
+    "/var/lib/cozygateway/Application Support/cozygateway.db",
+    "D:\\data\\gateway.db",
     "../../etc/passwd",
     "sk-ant-api03-abcdefghijklmnop",
     "ghp_0123456789abcdefghij",

@@ -29,7 +29,11 @@ describe("bot message receipts", () => {
     // original timestamp and device survive. A client MUST NOT read that zero as a failure.
     expect(storage.recordBotMessageDisplayed("sage", ["m1", "m2"], "device-2", 200))
       .toEqual({ recorded: 0, deliveries: [] });
-    expect(storage.botMessageReceipt("sage", "m1")).toEqual({ displayedAt: 100, deviceId: "device-1" });
+    // Capability 73 added two nullable columns to the receipt; a client that reports neither leaves
+    // both null rather than a zero, because "not reported" and "instant" are different facts.
+    expect(storage.botMessageReceipt("sage", "m1")).toEqual({
+      displayedAt: 100, deviceId: "device-1", feltLatencyMs: null, networkPath: null,
+    });
 
     // An id naming no durable row is ignored rather than refused: a device flushing an offline
     // queue after a reset must not be stuck on a batch it cannot repair.
