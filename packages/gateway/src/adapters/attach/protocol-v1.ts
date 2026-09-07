@@ -26,8 +26,7 @@ import {
 const Id = Type.String({ minLength: 1, maxLength: 256 });
 const Sequence = Type.Integer({ minimum: 0 });
 
-/** The one capability set. There is no reduced legacy subset: a peer either speaks the current
- * contract or it is refused at hello. */
+/** The gateway's supported capability names. Hello accepts bounded unknown names and ignores them. */
 export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("draft"),
   Type.Literal("media"),
@@ -62,6 +61,7 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("bot_history"),
   /** Capability 60: durable metadata-only local search tombstone. */
   Type.Literal("session_deletion"),
+  Type.Literal("observation_snapshot"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -97,13 +97,12 @@ export const AttachV1TelemetrySchema = Type.Object({
 }, { additionalProperties: false });
 export type AttachV1Telemetry = Static<typeof AttachV1TelemetrySchema>;
 
-/** The one hello. `version` stays a literal on the wire so a peer built against an older shape is
- * rejected out loud at the handshake instead of negotiating a quietly reduced capability set. */
+/** The protocol version remains mandatory; optional capabilities negotiate by intersection. */
 export const AttachV1HelloSchema = Type.Object({
   kind: Type.Literal("hello"),
   version: Type.Literal(2),
   instanceId: Id,
-  capabilities: Type.Array(AttachV1CapabilitySchema, { uniqueItems: true }),
+  capabilities: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { uniqueItems: true, maxItems: 128 }),
   resume: Type.Optional(Type.Object({ eventSequence: Sequence, commandSequence: Sequence })),
   limits: Type.Optional(AttachV1LimitsSchema),
   commands: Type.Optional(AttachV1CommandCatalogSchema),
@@ -849,7 +848,14 @@ export const AttachV1HelloAckSchema = Type.Object({
   extensions: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 0 }))),
 });
 
+/** Optional telemetry is validated by the snapshot lane, never by a socket-fatal payload schema. */
+export const AttachV1ObservationSnapshotSchema = Type.Object({
+  kind: Type.Literal("observation_snapshot"),
+  payload: Type.Optional(Type.Unknown()),
+}, { additionalProperties: false });
+
 export const AttachV1ClientFrameSchema = Type.Union([
+  AttachV1ObservationSnapshotSchema,
   AttachV1HelloSchema,
   AttachV1EventFrameSchema,
   AttachV1AckSchema,

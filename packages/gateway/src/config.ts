@@ -168,6 +168,11 @@ const GatewayConfigSchema = Type.Object({
   observability: Type.Optional(Type.Object({
     enabled: Type.Boolean({ default: false }),
     retentionDays: Type.Integer({ minimum: 1, maximum: 365, default: 7 }),
+    prices: Type.Optional(Type.Record(Type.String(), Type.Object({
+      inputPerMillion: Type.Optional(Type.Number({ minimum: 0 })),
+      cachedInputPerMillion: Type.Optional(Type.Number({ minimum: 0 })),
+      outputPerMillion: Type.Optional(Type.Number({ minimum: 0 })),
+    }, { additionalProperties: false }))),
   })),
 });
 export type GatewayConfig = Static<typeof GatewayConfigSchema>;
@@ -373,4 +378,8 @@ export function applyEnvOverrides(
     next.tls = { certFile: resolvedCert, keyFile: resolvedKey };
   }
   return next;
+}
+
+export function observabilityPrices(config: GatewayConfig): import("./observe/prices.ts").ObservePriceSheet {
+  return config.observability?.prices ?? {};
 }

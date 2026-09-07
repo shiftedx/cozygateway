@@ -1,0 +1,488 @@
+/** The `observation_snapshot` payload, as the GATEWAY reads it (contract row 74, packet D5).
+ *
+ *  A CozyAgents peer that negotiated row 74 sends one of these every 30 seconds while no turn is
+ *  running and one more at every turn terminal. This module is the gateway's own validator for it,
+ *  and it exists because the peer's promise is not the gateway's guarantee: the harness redacts
+ *  every name before it sends, and the gateway still checks every one of them, because a peer is
+ *  software somebody else builds and a privacy rule enforced only at the writer is a privacy rule
+ *  enforced only while that writer is correct.
+ *
+ *  THE SHAPE IS CLOSED AND THE FAILURE IS TOTAL. Every object refuses an unknown key, every string
+ *  comes from a closed set or an allowlisted grammar, every collection is bounded, and every
+ *  timestamp is an integer. A payload that fails ANY of those is dropped WHOLE, counted, and
+ *  logged as one bounded content-free line. It is never scrubbed and stored in part: a partially
+ *  redacted snapshot invites a reader to trust the fields that survived, and the whole value of
+ *  this lane is that nothing in it is a person's words.
+ *
+ *  Two things the fold downstream must know, both stated in row 74:
+ *
+ *  - `emittedAt` is the PEER's clock. It is validated and kept for display, and it is never used to
+ *    place a sample on this gateway's calendar; the receive time is.
+ *  - A tool row whose step row is gone is legal. The peer caps each frame at 64 KiB and gives up
+ *    the oldest step and tool entries last but independently, so an ORPHAN TOOL ROW is a trimmed
+ *    frame rather than a malformed one, and refusing it would throw away the whole snapshot over
+ *    the one thing the cap was protecting. */
+
+// ---------------------------------------------------------------- constants
+
+export const OBSERVATION_SNAPSHOT_LANE_SCHEMA = "cozyagents.observation-snapshot-lane.v1";
+export const OBSERVATION_SNAPSHOT_AGGREGATE_SCHEMA = "cozyagents.observation-snapshot.v1";
+export const OBSERVATION_SNAPSHOT_DASHBOARD_SCHEMA = "cozyagents.observability-dashboard.v1";
+
+/** The attach-v1 capability row 74 negotiates, and the frame kind it gates. Same string for both,
+ *  exactly as the harness half declares them. */
+export const OBSERVATION_SNAPSHOT_CAPABILITY = "observation_snapshot";
+export const OBSERVATION_SNAPSHOT_FRAME_KIND = "observation_snapshot";
+
+/** The peer caps every frame at 64 KiB. The gateway refuses anything larger rather than trusting
+ *  that it did: a peer at the cap is a peer that trimmed, and a peer over it is a peer this
+ *  gateway has no reason to buffer for. */
+export const OBSERVATION_SNAPSHOT_MAX_BYTES = 64 * 1024;
+
+/** Every bound the wire shape obeys, mirroring the harness half's own table so the two cannot
+ *  drift into a gateway that refuses what the peer legitimately sends. */
+export const OBSERVATION_SNAPSHOT_BOUNDS = {
+  name: 64,
+  hash: 128,
+  servers: 32,
+  impact: 16,
+  cards: 64,
+  rules: 32,
+  steps: 64,
+  toolCalls: 64,
+  counters: 64,
+  builds: 64,
+} as const;
+
+// ---------------------------------------------------------------- string rules
+
+/** A string that carries a control character, a Unicode Format character, a lone surrogate or
+ *  nothing but whitespace is refused before any other test looks at it. Row 74 names all four, and
+ *  they are the shapes that let a value look like a name in a log and behave like something else
+ *  in a terminal or a browser. */
+function printable(value: string): boolean {
+  if (value.trim().length === 0) return false;
+  if (/[\u0000-\u001f\u007f-\u009f]/u.test(value)) return false;
+  if (/\p{Cf}/u.test(value)) return false;
+  return !/[\ud800-\udfff]/u.test(value) || /^(?:[^\ud800-\udfff]|[\ud800-\udbff][\udc00-\udfff])*$/u.test(value);
+}
+
+/** The name allowlist, the same grammar the peer applies before it sends: at most three
+ *  dot-separated segments, each starting with a letter and holding letters, digits, `_` and `-`,
+ *  at most 48 characters in all. A `redacted-<12 hex>` stand-in satisfies it by construction, which
+ *  is what lets a refused name still be a row on the dashboard rather than a hole. */
+const NAME_ALLOWED = /^[A-Za-z][A-Za-z0-9_-]{0,31}(?:\.[A-Za-z][A-Za-z0-9_-]{0,31}){0,2}$/;
+const NAME_MAX = 48;
+
+/** A name whose last segment is a file extension is a file name, and a file name is a path with
+ *  one segment left. */
+const FILE_EXTENSIONS = new Set([
+  "md", "txt", "json", "jsonl", "yaml", "yml", "toml", "ini", "conf", "cfg", "env", "lock", "log",
+  "csv", "tsv", "xml", "html", "htm", "css", "js", "jsx", "ts", "tsx", "mjs", "cjs", "py", "rb",
+  "go", "rs", "java", "kt", "swift", "sh", "bash", "zsh", "sql", "pdf", "png", "jpg", "jpeg",
+  "gif", "svg", "webp", "mp3", "mp4", "wav", "zip", "tar", "gz", "pem", "key", "crt", "p12",
+]);
+
+/** Credential SHAPES rather than vendor words, so a legitimate name that happens to start with the
+ *  same letters is unaffected. Copied deliberately from the peer's own list: this is the second of
+ *  two independent checks on the same rule, not a different rule. */
+const CREDENTIAL_SHAPES: readonly RegExp[] = [
+  /^eyJ[A-Za-z0-9_-]{6,}/,
+  /^(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{8,}$/,
+  /^AIza[0-9A-Za-z_-]{10,}$/,
+  /^(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{10,}$/i,
+  /^glpat-[A-Za-z0-9_-]{8,}$/i,
+  /^(?:hf|npm|dop|shpat|sq0|nr)_[A-Za-z0-9]{10,}$/i,
+  /^(?:sk|pk|rk|pat|api|apikey|token|secret|bearer|password|passwd|aws|xox[a-z]?)[-_][A-Za-z0-9_-]{6,}$/i,
+  /^ya29\.[A-Za-z0-9_-]{6,}/,
+];
+
+/** A separator-free segment is where a credential with no recognisable prefix hides. It is refused
+ *  when it carries three or more digits, when it mixes case with no word boundary, or when it is
+ *  simply very long. A camelCase tool name survives, because section 13's table exists to be read
+ *  by a person and a table of hashes cannot be. */
+function tokenShaped(segment: string): boolean {
+  if (segment.includes("_") || segment.includes("-")) return false;
+  if (segment.length >= 40) return true;
+  if ((segment.match(/\d/gu) ?? []).length >= 3) return true;
+  const mixedCase = /[a-z]/u.test(segment) && /[A-Z]/u.test(segment);
+  return mixedCase && !/[A-Z][a-z]/u.test(segment);
+}
+
+function isName(value: string): boolean {
+  if (value.length > NAME_MAX || !NAME_ALLOWED.test(value)) return false;
+  const segments = value.split(".");
+  const last = segments.length > 1 ? segments[segments.length - 1]?.toLowerCase() : undefined;
+  if (last !== undefined && FILE_EXTENSIONS.has(last)) return false;
+  if (segments.some((segment) => tokenShaped(segment))) return false;
+  return !CREDENTIAL_SHAPES.some((shape) => shape.test(value));
+}
+
+/** A model id is the one name that may carry a vendor separator. Never a URL, never a path. */
+const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,63}$/;
+function isModelId(value: string): boolean {
+  if (value.length > NAME_MAX || !MODEL_PATTERN.test(value)) return false;
+  if (value.includes("//") || value.includes("://") || value.includes("..")) return false;
+  const segments = value.split(/[./:+]/u);
+  const extension = segments.length > 1 ? segments[segments.length - 1]?.toLowerCase() : undefined;
+  if (extension !== undefined && FILE_EXTENSIONS.has(extension)) return false;
+  if (segments.some((segment) => tokenShaped(segment))) return false;
+  return !CREDENTIAL_SHAPES.some((shape) => shape.test(value));
+}
+
+const HASH_PATTERN = /^(?:[0-9a-f]{8,128}|[0-9a-z]{1,16}:[0-9a-f]{8,120})$/;
+const VERSION_PATTERN = /^(?:unavailable|other|\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]{1,40})?)$/;
+/** The opaque turn reference the harness already uses everywhere else. The fold keys on it. */
+const TURN_REFERENCE = /^obs:[a-f0-9]{64}$/;
+/** ISO 8601 with a UTC offset, which is what the aggregate's own `generatedAt` is. A closed
+ *  grammar, so a date cannot be a place to write a sentence. */
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+// ---------------------------------------------------------------- the schema language
+
+type Spec =
+  | { t: "int"; max?: number }
+  | { t: "num" }
+  | { t: "bool" }
+  | { t: "true" }
+  | { t: "name" }
+  | { t: "model" }
+  | { t: "hash" }
+  | { t: "turn" }
+  | { t: "version" }
+  | { t: "iso" }
+  | { t: "literal"; value: string }
+  | { t: "code"; values: ReadonlySet<string> }
+  | { t: "obj"; fields: Record<string, Spec>; required: readonly string[] }
+  | { t: "arr"; item: Spec; max: number }
+  | { t: "counts"; key: Spec; max: number };
+
+const int = (max?: number): Spec => (max === undefined ? { t: "int" } : { t: "int", max });
+const num: Spec = { t: "num" };
+const bool: Spec = { t: "bool" };
+const yes: Spec = { t: "true" };
+const name: Spec = { t: "name" };
+const model: Spec = { t: "model" };
+const hash: Spec = { t: "hash" };
+const turn: Spec = { t: "turn" };
+const version: Spec = { t: "version" };
+const iso: Spec = { t: "iso" };
+const literal = (value: string): Spec => ({ t: "literal", value });
+const code = (...values: readonly string[]): Spec => ({ t: "code", values: new Set(values) });
+const obj = (fields: Record<string, Spec>, required: readonly string[] = []): Spec => ({ t: "obj", fields, required });
+const arr = (item: Spec, max: number): Spec => ({ t: "arr", item, max });
+const counts = (key: Spec, max: number): Spec => ({ t: "counts", key, max });
+
+/** Every key of this record must be present and every value is a non-negative integer. The shape
+ *  the harness's aggregate uses for its own closed enums. */
+function tally(keys: readonly string[]): Spec {
+  const fields: Record<string, Spec> = {};
+  for (const key of keys) fields[key] = int();
+  return obj(fields, keys);
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+/** Validates one value against one spec, returning the value the gateway will store, or undefined
+ *  for a refusal. The returned object is REBUILT from declared keys only, so a key that slipped
+ *  past a future edit of a field list cannot ride along into the database. */
+function validate(spec: Spec, value: unknown): unknown {
+  switch (spec.t) {
+    case "int":
+      return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+        && (spec.max === undefined || value <= spec.max) ? value : undefined;
+    case "num":
+      return typeof value === "number" && Number.isFinite(value) && value >= 0 && value < 1e15 ? value : undefined;
+    case "bool":
+      return typeof value === "boolean" ? value : undefined;
+    case "true":
+      return value === true ? true : undefined;
+    case "name":
+      return typeof value === "string" && printable(value) && isName(value) ? value : undefined;
+    case "model":
+      return typeof value === "string" && printable(value) && isModelId(value) ? value : undefined;
+    case "hash":
+      return typeof value === "string" && value.length <= OBSERVATION_SNAPSHOT_BOUNDS.hash
+        && HASH_PATTERN.test(value) ? value : undefined;
+    case "turn":
+      return typeof value === "string" && TURN_REFERENCE.test(value) ? value : undefined;
+    case "version":
+      return typeof value === "string" && VERSION_PATTERN.test(value) ? value : undefined;
+    case "iso":
+      return typeof value === "string" && ISO_INSTANT.test(value) && Number.isFinite(Date.parse(value))
+        ? value : undefined;
+    case "literal":
+      return value === spec.value ? value : undefined;
+    case "code":
+      return typeof value === "string" && spec.values.has(value) ? value : undefined;
+    case "arr": {
+      if (!Array.isArray(value) || value.length > spec.max) return undefined;
+      const out: unknown[] = [];
+      for (const entry of value) {
+        const validated = validate(spec.item, entry);
+        if (validated === undefined) return undefined;
+        out.push(validated);
+      }
+      return out;
+    }
+    case "counts": {
+      const source = record(value);
+      if (source === undefined) return undefined;
+      const keys = Object.keys(source);
+      if (keys.length > spec.max) return undefined;
+      const out: Record<string, number> = {};
+      for (const key of keys) {
+        const validKey = validate(spec.key, key);
+        const count = validate(int(), source[key]);
+        if (typeof validKey !== "string" || typeof count !== "number") return undefined;
+        out[validKey] = count;
+      }
+      return out;
+    }
+    case "obj": {
+      const source = record(value);
+      if (source === undefined) return undefined;
+      const out: Record<string, unknown> = {};
+      for (const key of Object.keys(source)) {
+        // A closed schema: an undeclared key is a refusal of the whole payload, never a drop.
+        const field = spec.fields[key];
+        if (field === undefined) return undefined;
+        if (source[key] === undefined) continue;
+        const validated = validate(field, source[key]);
+        if (validated === undefined) return undefined;
+        out[key] = validated;
+      }
+      for (const key of spec.required) if (out[key] === undefined) return undefined;
+      return out;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- the payload schema
+
+const LANES = ["direct", "gateway", "routine", "benchmark"] as const;
+const OUTCOMES = ["completed", "failed", "aborted", "unknown"] as const;
+const FAILURE_CATEGORIES = ["provider_length", "provider", "tool", "policy", "cancelled", "transport", "internal", "unknown"] as const;
+const TOOL_FAMILIES = ["investigation", "mutation", "verification", "unknown"] as const;
+const POSTURES = ["chat", "workspace", "room", "room51", "unattended", "consolidation", "unavailable"] as const;
+const OBSERVATION_SOURCES = ["service_runtime", "unavailable"] as const;
+const MCP_LAYERS = ["configured", "transport_reachable", "session_authenticated", "tool_discovery_current", "selected_tools_registered", "backend_healthy"] as const;
+
+function perLane(inner: Spec): Spec {
+  const fields: Record<string, Spec> = {};
+  for (const lane of LANES) fields[lane] = inner;
+  return obj(fields, LANES);
+}
+
+/** The harness's own aggregate, re-declared here as a closed shape. Nothing in it is a string
+ *  except the build labels, which take the semantic-version grammar or the aggregate's own
+ *  reserved `other`. */
+const AGGREGATE: Spec = obj({
+  runs: perLane(tally(OUTCOMES)),
+  failures: perLane(tally(FAILURE_CATEGORIES)),
+  latency: tally(["samples", "wallMs", "toolMs", "firstTokenSamples", "firstTokenMs"]),
+  tools: obj(
+    Object.fromEntries(TOOL_FAMILIES.map((family) => [family, tally(["calls", "succeeded", "failed", "blocked"])])),
+    TOOL_FAMILIES,
+  ),
+  usage: obj({
+    samples: int(), availability: code("unavailable", "reported"),
+    inputTokens: int(), outputTokens: int(), cacheReadTokens: int(), cacheWriteTokens: int(),
+    reasoningTokens: int(), totalTokens: int(), providerRequests: int(), providerLengthStops: int(),
+  }, ["samples", "availability"]),
+  policy: tally(["pendingVerification", "blockedDuplicates", "blockedIntraBatchDuplicates", "blockedStalls", "terminalCorrections"]),
+  delivery: tally(["publishedAttachments", "awaitingReceiptTurns", "displayedTurns", "failedTurns", "unmatchedReceipts"]),
+  context: obj({
+    compactions: int(), recoveryAttempts: int(), recoverySucceeded: int(), recoveryFailed: int(),
+    toolResults: tally(["rawBytes", "modelBytes", "exactResults", "projectedResults", "retrievals", "retrievalMisses"]),
+  }, ["compactions", "recoveryAttempts", "recoverySucceeded", "recoveryFailed", "toolResults"]),
+  identity: obj({
+    sources: tally(OBSERVATION_SOURCES),
+    postures: tally(POSTURES),
+    builds: counts(version, OBSERVATION_SNAPSHOT_BOUNDS.builds),
+  }, ["sources", "postures", "builds"]),
+  observer: tally(["retained", "retainedBytes", "evictions", "droppedOversize", "failures", "droppedSpans", "malformedSources"]),
+}, ["runs", "failures", "latency", "tools", "usage", "policy", "delivery", "context", "identity", "observer"]);
+
+const MCP_SERVER: Spec = obj({
+  server: name,
+  summary: code("healthy", "degraded", "offline", "unknown"),
+  layers: obj(
+    Object.fromEntries(MCP_LAYERS.map((layer) => [layer, obj({ value: code("yes", "no", "unknown"), atMs: int() }, ["value"])])),
+    MCP_LAYERS,
+  ),
+  lastSuccess: obj({ atMs: int(), operation: name }),
+  lastFailure: obj({
+    atMs: int(),
+    reason: code("start_failed", "start_timeout", "url_refused", "env_missing", "install_unavailable",
+      "unauthorized", "assert_failed", "crashed", "tool_error", "call_failed", "stale_tool", "relist_failed"),
+    operation: name,
+  }),
+  fingerprint: obj({ current: hash, previous: hash, refreshedAtMs: int(), changedAtMs: int() }),
+  // The same reduced `mcp_reconnect` proposal capability 62 already carries, present only while a
+  // proposal is open on a person.
+  repair: obj({
+    kind: literal("mcp_reconnect"),
+    reason: code("stale_tool", "relist_failed", "crashed", "unauthorized"),
+    policy: code("approve_once", "auto_refresh"),
+    scope: literal("server"),
+    impactCount: int(),
+    impact: arr(name, OBSERVATION_SNAPSHOT_BOUNDS.impact),
+    fingerprint: obj({ current: hash, previous: hash }),
+  }, ["kind", "reason", "policy", "scope", "impactCount", "impact", "fingerprint"]),
+}, ["server", "summary", "layers", "fingerprint"]);
+
+const PAYLOAD: Spec = obj({
+  schema: literal(OBSERVATION_SNAPSHOT_LANE_SCHEMA),
+  reason: code("idle_interval", "turn_terminal"),
+  // PEER clock. Kept for display; never used to place a sample on this gateway's calendar.
+  emittedAt: int(),
+  windowMs: int(),
+  snapshot: obj({
+    schema: literal(OBSERVATION_SNAPSHOT_AGGREGATE_SCHEMA),
+    dashboard: literal(OBSERVATION_SNAPSHOT_DASHBOARD_SCHEMA),
+    view: literal("aggregate"),
+    generatedAt: iso,
+    aggregate: AGGREGATE,
+  }, ["schema", "dashboard", "view", "generatedAt", "aggregate"]),
+  runtime: obj({
+    stage: code("pulling_image", "creating", "starting", "recovering", "ready", "deleting", "deleted", "needs_attention", "unknown"),
+    backend: code("docker", "process"),
+    isolation: name,
+    specGeneration: int(),
+    observedGeneration: int(),
+    lastContactAtMs: int(),
+    bundleVersion: version,
+    failureCode: name,
+  }, ["stage"]),
+  mcp: arr(MCP_SERVER, OBSERVATION_SNAPSHOT_BOUNDS.servers),
+  prompt: obj({
+    lateSchemaBytes: int(), sharedSchemaBytes: int(), opensOnAttach: int(),
+    late: arr(obj({
+      name, kind: code("toolset", "mcp", "skill"), schemaBytes: int(),
+      opensOnAttach: yes, briefBytes: int(), sectionTokens: int(),
+    }, ["name", "kind", "schemaBytes"]), OBSERVATION_SNAPSHOT_BOUNDS.cards),
+    shared: arr(obj({ name, bytes: int(), cards: int() }, ["name", "bytes", "cards"]), OBSERVATION_SNAPSHOT_BOUNDS.cards),
+  }, ["lateSchemaBytes", "sharedSchemaBytes", "opensOnAttach", "late", "shared"]),
+  recall: obj({
+    source: code("index", "maintenance"),
+    before: int(), after: int(), indexed: int(), evicted: int(), tombstoned: int(),
+    secrets: int(), orphaned: int(), dropped: int(), bytes: int(),
+    rules: arr(name, OBSERVATION_SNAPSHOT_BOUNDS.rules),
+  }, ["source", "rules"]),
+  // Counts only. No decision line, no thread, turn or call id, no host, ever.
+  guardrails: obj({
+    total: int(),
+    verdicts: counts(code("read", "routine", "outside", "critical", "refused", "unknown"), OBSERVATION_SNAPSHOT_BOUNDS.counters),
+    actions: counts(code("run", "ask", "refuse"), OBSERVATION_SNAPSHOT_BOUNDS.counters),
+    decisions: counts(code("permitted", "refused", "denied", "expired", "failed"), OBSERVATION_SNAPSHOT_BOUNDS.counters),
+    rules: counts(name, OBSERVATION_SNAPSHOT_BOUNDS.counters),
+  }, ["total"]),
+  // A LEVEL over the peer's process lifetime, which is not the ring's window. Named on the wire so
+  // the fold cannot mistake it for a rate and sum it across snapshots.
+  cache: obj({
+    availability: code("reported", "unavailable"),
+    window: literal("process_lifetime"),
+    reason: code("run_scoped_cache_not_wired"),
+    hits: int(), misses: int(), writes: int(), errors: int(), invalidations: int(),
+  }, ["availability"]),
+  checkpoints: obj({ written: int() }, ["written"]),
+  steps: arr(obj({
+    turn, step: int(), model,
+    promptTokens: int(), completionTokens: int(), cachedTokens: int(),
+    timeToFirstTokenMs: int(), generationMs: int(),
+    prefillTokensPerSecond: num, decodeTokensPerSecond: num,
+    prefix: code("cached_prefix", "no_prefix_cache"),
+  }, ["step"]), OBSERVATION_SNAPSHOT_BOUNDS.steps),
+  toolCalls: arr(obj({
+    tool: name, turn, step: int(),
+    family: code(...TOOL_FAMILIES),
+    estimated: yes,
+    calls: int(), resultTokens: int(), callTokens: int(), schemaShareTokens: int(),
+    inducedTokens: int(), durationMs: int(), attributed: bool,
+    outcomes: counts(code("ok", "error", "blocked_duplicate", "cache_hit"), OBSERVATION_SNAPSHOT_BOUNDS.counters),
+  }, ["tool", "calls"]), OBSERVATION_SNAPSHOT_BOUNDS.toolCalls),
+}, ["schema", "reason", "emittedAt", "snapshot", "cache"]);
+
+// ---------------------------------------------------------------- the typed result
+
+export interface ObservationSnapshotStepRow {
+  turn?: string;
+  step: number;
+  model?: string;
+  promptTokens?: number;
+  completionTokens?: number;
+  cachedTokens?: number;
+  timeToFirstTokenMs?: number;
+  generationMs?: number;
+  prefillTokensPerSecond?: number;
+  decodeTokensPerSecond?: number;
+  prefix?: "cached_prefix" | "no_prefix_cache";
+}
+
+export interface ObservationSnapshotToolRow {
+  tool: string;
+  turn?: string;
+  step?: number;
+  family?: "investigation" | "mutation" | "verification" | "unknown";
+  estimated?: true;
+  calls: number;
+  resultTokens?: number;
+  callTokens?: number;
+  schemaShareTokens?: number;
+  inducedTokens?: number;
+  durationMs?: number;
+  attributed?: boolean;
+  outcomes?: Record<string, number>;
+}
+
+export interface ObservationSnapshotPayload {
+  schema: typeof OBSERVATION_SNAPSHOT_LANE_SCHEMA;
+  reason: "idle_interval" | "turn_terminal";
+  /** The PEER's clock. Never this gateway's calendar. */
+  emittedAt: number;
+  windowMs?: number;
+  snapshot: Record<string, unknown>;
+  runtime?: Record<string, unknown>;
+  mcp?: readonly Record<string, unknown>[];
+  prompt?: Record<string, unknown>;
+  recall?: Record<string, unknown>;
+  guardrails?: Record<string, unknown>;
+  cache: Record<string, unknown>;
+  checkpoints?: { written: number };
+  steps?: readonly ObservationSnapshotStepRow[];
+  toolCalls?: readonly ObservationSnapshotToolRow[];
+}
+
+/** The whole rule, in one call. Returns the value to store, or undefined for a refusal.
+ *
+ *  Undefined rather than a thrown error and rather than a scrubbed copy, for the reason the ring's
+ *  own `serializeDetail` gives: a partially redacted row invites a reader to trust the fields that
+ *  survived it. */
+export function validateObservationSnapshotPayload(value: unknown): ObservationSnapshotPayload | undefined {
+  const validated = validate(PAYLOAD, value);
+  if (validated === undefined) return undefined;
+  const payload = validated as ObservationSnapshotPayload;
+  // The cache section's two shapes are exclusive, and neither may borrow the other's fields: a
+  // section that says "unavailable" and then reports hits is a contradiction, not a snapshot.
+  const cache = payload.cache;
+  const reported = cache.availability === "reported";
+  if (reported && cache.window !== "process_lifetime") return undefined;
+  if (!reported && cache.reason === undefined) return undefined;
+  if (reported && (cache.reason !== undefined || ["hits", "misses", "writes", "errors", "invalidations"].some(key => cache[key] === undefined))) return undefined;
+  if (!reported && ["hits", "misses", "writes", "errors", "invalidations", "window"].some(key => cache[key] !== undefined)) return undefined;
+  return payload;
+}
+
+/** The same closed row rule at the numeric-record storage boundary. */
+export function validateObservationSnapshotRecord(kind: "step" | "tool", value: unknown): object | undefined {
+  if (PAYLOAD.t !== "obj") return undefined;
+  const collection = PAYLOAD.fields[kind === "step" ? "steps" : "toolCalls"];
+  return collection?.t === "arr" ? validate(collection.item, value) as object | undefined : undefined;
+}
+
+export function isObservationToolName(value: string): boolean { return isName(value); }

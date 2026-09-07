@@ -1,3 +1,4 @@
+import { validateObservationSnapshotRecord, isObservationToolName, validateObservationSnapshotPayload, OBSERVATION_SNAPSHOT_MAX_BYTES, type ObservationSnapshotPayload } from "./snapshot.ts";
 import { randomBytes } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
@@ -191,6 +192,8 @@ export class ObserveStore {
     for (const [table, key, add] of [
       ["observe_series", "rowid", (rows: number) => { series += rows; }],
       ["observe_events", "rowid", (rows: number) => { events += rows; }],
+      ["observe_tool_durations", "rowid", (_rows: number) => {}],
+      ["observe_snapshot_records", "rowid", (_rows: number) => {}],
       // WITHOUT ROWID, so the batch is taken by its primary key instead.
       ["observe_lifetime_folds", "snapshot_id", (rows: number) => { folds += rows; }],
     ] as const) {
@@ -318,6 +321,8 @@ export class ObserveStore {
     cached: number;
     costMicros: number;
     turns: number;
+    priced?: number;
+    unpriced?: number;
     at: number;
   }): boolean {
     if (!isIdentityHash(input.bot) || !isIdentityHash(input.model) || !isIdentityHash(input.snapshotId)) {
@@ -330,35 +335,37 @@ export class ObserveStore {
         return false;
       }
     }
-    this.#db.exec("BEGIN IMMEDIATE");
+    this.#db.exec("SAVEPOINT observe_lifetime_write");
     try {
       const claimed = this.#db
         .prepare("INSERT OR IGNORE INTO observe_lifetime_folds (snapshot_id, at) VALUES (?, ?)")
         .run(input.snapshotId, Math.trunc(input.at)).changes;
       if (Number(claimed) !== 1) {
-        this.#db.exec("COMMIT");
+        this.#db.exec("RELEASE observe_lifetime_write");
         return false;
       }
       this.#db
         .prepare(
-          `INSERT INTO observe_lifetime (bot, model, prompt, completion, cached, cost_micros, turns, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO observe_lifetime (bot, model, prompt, completion, cached, cost_micros, turns, updated_at, priced, unpriced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (bot, model) DO UPDATE SET
              prompt = prompt + excluded.prompt,
              completion = completion + excluded.completion,
              cached = cached + excluded.cached,
              cost_micros = cost_micros + excluded.cost_micros,
              turns = turns + excluded.turns,
+             priced = priced + excluded.priced,
+             unpriced = unpriced + excluded.unpriced,
              updated_at = excluded.updated_at`,
         )
         .run(
           input.bot, input.model,
           Math.trunc(input.prompt), Math.trunc(input.completion), Math.trunc(input.cached),
-          Math.trunc(input.costMicros), Math.trunc(input.turns), Math.trunc(input.at),
+          Math.trunc(input.costMicros), Math.trunc(input.turns), Math.trunc(input.at), input.priced ?? 0, input.unpriced ?? 0,
         );
-      this.#db.exec("COMMIT");
+      this.#db.exec("RELEASE observe_lifetime_write");
     } catch (error) {
-      this.#db.exec("ROLLBACK");
+      this.#db.exec("ROLLBACK TO observe_lifetime_write; RELEASE observe_lifetime_write");
       throw error;
     }
     return true;
@@ -366,15 +373,112 @@ export class ObserveStore {
 
   lifetime(bot?: string): Array<{
     bot: string; model: string; prompt: number; completion: number; cached: number;
-    costMicros: number; turns: number; updatedAt: number;
+    costMicros: number; turns: number; updatedAt: number; priced: number; unpriced: number;
   }> {
     const sql = `SELECT bot, model, prompt, completion, cached, cost_micros AS costMicros,
-                        turns, updated_at AS updatedAt FROM observe_lifetime`;
+                        turns, priced, unpriced, updated_at AS updatedAt FROM observe_lifetime`;
     return (bot === undefined
       ? this.#db.prepare(`${sql} ORDER BY bot ASC, model ASC`).all()
       : this.#db.prepare(`${sql} WHERE bot = ? ORDER BY model ASC`).all(bot)) as unknown as Array<{
         bot: string; model: string; prompt: number; completion: number; cached: number;
-        costMicros: number; turns: number; updatedAt: number;
+        costMicros: number; turns: number; updatedAt: number; priced: number; unpriced: number;
       }>;
+  }
+
+  putSnapshotRecord(bot: string, kind: "step" | "tool", record: object, at: number): void {
+    if (!isIdentityHash(bot) || !Number.isSafeInteger(at) || validateObservationSnapshotRecord(kind, record) === undefined) {
+      this.#refused++; return;
+    }
+    this.#db.prepare("INSERT INTO observe_snapshot_records (bot, kind, at, record_json) VALUES (?, ?, ?, ?)")
+      .run(bot, kind, at, JSON.stringify(record));
+  }
+
+  snapshotRecords(query: { bot?: string; kind: "step" | "tool"; from: number; to: number }): Array<{ bot: string; at: number; record: Record<string, unknown> }> {
+    const sql = "SELECT bot, at, record_json AS json FROM observe_snapshot_records WHERE kind = ? AND at >= ? AND at < ?";
+    const rows = (query.bot === undefined
+      ? this.#db.prepare(sql + " ORDER BY at").all(query.kind, query.from, query.to)
+      : this.#db.prepare(sql + " AND bot = ? ORDER BY at").all(query.kind, query.from, query.to, query.bot)) as unknown as Array<{ bot: string; at: number; json: string }>;
+    return rows.map(row => ({ bot: row.bot, at: row.at, record: JSON.parse(row.json) as Record<string, unknown> }));
+  }
+
+  transaction<T>(write: () => T): T {
+    this.#db.exec("SAVEPOINT observe_snapshot_write");
+    try {
+      const result = write();
+      this.#db.exec("RELEASE observe_snapshot_write");
+      return result;
+    } catch (error) {
+      this.#db.exec("ROLLBACK TO observe_snapshot_write; RELEASE observe_snapshot_write");
+      throw error;
+    }
+  }
+
+  /** A durable, hashed claim shared by snapshot records and their lifetime counters. */
+  claimSnapshotRecord(key: string, at: number): boolean {
+    return Number(this.#db.prepare("INSERT OR IGNORE INTO observe_lifetime_folds (snapshot_id, at) VALUES (?, ?)")
+      .run(this.identify(key), at).changes) === 1;
+  }
+
+  putSnapshot(bot: string, payload: ObservationSnapshotPayload, receivedAt: number): boolean {
+    const json = JSON.stringify(payload);
+    if (!isIdentityHash(bot) || !Number.isSafeInteger(receivedAt)
+      || Buffer.byteLength(json) > OBSERVATION_SNAPSHOT_MAX_BYTES
+      || validateObservationSnapshotPayload(payload) === undefined) {
+      this.#refused += 1;
+      return false;
+    }
+    this.#db.prepare(`INSERT INTO observe_snapshots (bot, snapshot_json, received_at) VALUES (?, ?, ?)
+      ON CONFLICT (bot) DO UPDATE SET snapshot_json = excluded.snapshot_json, received_at = excluded.received_at`)
+      .run(bot, json, receivedAt);
+    return true;
+  }
+
+  snapshot(bot: string): { payload: ObservationSnapshotPayload; receivedAt: number } | undefined {
+    const row = this.#db.prepare("SELECT snapshot_json AS json, received_at AS receivedAt FROM observe_snapshots WHERE bot = ?")
+      .get(bot) as { json: string; receivedAt: number } | undefined;
+    return row === undefined ? undefined : { payload: JSON.parse(row.json) as ObservationSnapshotPayload, receivedAt: row.receivedAt };
+  }
+
+  snapshotSubjects(): string[] {
+    return (this.#db.prepare("SELECT bot FROM observe_snapshots ORDER BY bot").all() as unknown as Array<{ bot: string }>).map(row => row.bot);
+  }
+
+  accumulateToolLifetime(input: {
+    bot: string; tool: string; calls: number; tokens: number; failures: number;
+    costMicros: number; priced: number; unpriced: number; at: number;
+  }): void {
+    if (!isIdentityHash(input.bot) || !isObservationToolName(input.tool)
+      || ![input.calls, input.tokens, input.failures, input.costMicros, input.priced, input.unpriced, input.at].every(value => Number.isSafeInteger(value) && value >= 0)) {
+      this.#refused++; return;
+    }
+    this.#db.prepare(`INSERT INTO observe_tool_lifetime
+      (bot, tool, calls, tokens, failures, cost_micros, priced, unpriced, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (bot, tool) DO UPDATE SET calls = calls + excluded.calls, tokens = tokens + excluded.tokens,
+      failures = failures + excluded.failures, cost_micros = cost_micros + excluded.cost_micros,
+      priced = priced + excluded.priced, unpriced = unpriced + excluded.unpriced, updated_at = excluded.updated_at`)
+      .run(input.bot, input.tool, input.calls, input.tokens, input.failures, input.costMicros, input.priced, input.unpriced, input.at);
+  }
+
+  toolLifetime(bot?: string): Array<{ bot: string; tool: string; calls: number; tokens: number; failures: number; costMicros: number; priced: number; unpriced: number; updatedAt: number }> {
+    const sql = "SELECT bot, tool, calls, tokens, failures, cost_micros AS costMicros, priced, unpriced, updated_at AS updatedAt FROM observe_tool_lifetime";
+    return (bot === undefined ? this.#db.prepare(sql + " ORDER BY bot, tool").all()
+      : this.#db.prepare(sql + " WHERE bot = ? ORDER BY tool").all(bot)) as unknown as ReturnType<ObserveStore["toolLifetime"]>;
+  }
+
+  sampleToolDuration(bot: string, tool: string, at: number, value: number): void {
+    if (!isIdentityHash(bot) || !isObservationToolName(tool) || !Number.isSafeInteger(at) || !isStorableValue(value)) {
+      this.#refused++; return;
+    }
+    this.#db.prepare("INSERT INTO observe_tool_durations (bot, tool, at, value) VALUES (?, ?, ?, ?)").run(bot, tool, at, value);
+  }
+
+  toolDurations(query: { bot?: string; tool?: string; from: number; to: number }): ObserveSummary {
+    const clauses = ["at >= ?", "at < ?"];
+    const args: Array<string | number> = [query.from, query.to];
+    for (const key of ["bot", "tool"] as const) {
+      if (query[key] !== undefined) { clauses.push(`${key} = ?`); args.push(query[key]); }
+    }
+    const values = (this.#db.prepare(`SELECT value FROM observe_tool_durations WHERE ${clauses.join(" AND ")} ORDER BY value`).all(...args) as unknown as Array<{ value: number }>).map(row => row.value);
+    return { count: values.length, p50: nearestRank(values, .5), p95: nearestRank(values, .95), min: values[0], max: values.at(-1) };
   }
 }

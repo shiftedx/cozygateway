@@ -2987,13 +2987,8 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * `GET /devices` and is revoked by `DELETE /devices/:id` like any device. Additive: a device
  * paired before 72 is `scope: "write"` and refused nothing, a client that never sends
  * `kind: "observer"` is byte identical to its pre-72 self, and no peer of any backend changes. */
-/** Capability 73: the one hop the gateway cannot measure is reported by the phone that can.
- * `POST /bots/:name/chat/messages/displayed` gains two optional fields, `feltLatencyMs` (send
- * tapped to first delta rendered, on the phone's own clock) and `networkPath` (`wifi`, `cellular`,
- * `vpn_on`, `vpn_off`), and the gateway stores both on the receipt and records at most one sample
- * per request whatever the batch size. Neither is ever added to or subtracted from a
- * gateway-measured figure: two clocks that were never synchronised cannot be differenced, and the
- * dashboard shows the perceived figure beside the measured hops rather than inside them. Nothing
- * else changes: no new route, no new frame, no peer of any backend touched, and a client below 73
- * sends neither field and is byte identical to its pre-73 self. */
-export const BOTS_CAPABILITY_VERSION = 73;
+/** Capability 74: negotiated, unsequenced observation snapshots from CozyAgents peers.
+ * The gateway stores latest state, folds numeric steps, and accumulates token and tool lifetimes.
+ * Unknown hello capability names are ignored. Peers offer this lane only after a hello acknowledgement
+ * advertises bots version 74 or later, keeping older gateways compatible. */
+export const BOTS_CAPABILITY_VERSION = 74;

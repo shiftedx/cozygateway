@@ -20,6 +20,7 @@ import {
   AttachV1GapSchema,
   AttachV1HeartbeatSchema,
   AttachV1HelloSchema,
+  AttachV1ObservationSnapshotSchema,
   sanitizeActiveTurns,
   AttachV1ConfigResultSchema,
   AttachV1HistoryResultSchema,
@@ -65,7 +66,7 @@ export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
  *  capability; it does NOT prove the list is complete, so adding one to the schema and forgetting
  *  it here type-checks cleanly and silently refuses the surface at negotiation. A test compares
  *  this list against the schema for exactly that reason. */
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "memory_ownership", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "cozyapps_dashboard", "bot_config", "chat_configuration", "provider_connections", "bot_history", "session_deletion"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "memory_ownership", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "cozyapps_dashboard", "bot_config", "chat_configuration", "provider_connections", "bot_history", "session_deletion", "observation_snapshot"] as const satisfies readonly AttachV1Capability[];
 
 /** Why a memory request did or did not reach the attached plugin. */
 export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
@@ -77,6 +78,7 @@ export type ConfigSendOutcome = MemorySendOutcome;
 export type HistorySendOutcome = MemorySendOutcome;
 
 export interface AttachV1Events {
+  onObservationSnapshot?(agentId: string, payload: unknown, bytes: number): "stored" | "refused" | "too_large" | "disabled";
   /** True only after the event was durably projected into its owning app/transcript state. */
   onEvent(agentId: string, frame: AttachV1EventFrame): boolean;
   /** Authorization/canonical-target check performed before inbox admission. */
@@ -369,6 +371,16 @@ export class AttachV1Ingress implements TurnEndpoint {
         if (frame.telemetry !== undefined)
           connection.telemetry = this.#recordTelemetry(agentId, frame.telemetry, receivedAt);
         this.#refreshDegraded(agentId, connection);
+        return;
+      }
+      if (frame.kind === "observation_snapshot") {
+        if (!connection.capabilities.has("observation_snapshot")) {
+          socket.close(1008, "attach-v1 capability not negotiated: observation_snapshot");
+          return;
+        }
+        const outcome = this.#events.onObservationSnapshot?.(agentId, frame.payload, Buffer.byteLength(String(data)));
+        if (outcome === "refused" || outcome === "too_large")
+          this.#log(`attach-v1: observation_snapshot dropped (${outcome})`);
         return;
       }
       if (frame.kind === "mobile_request") {
@@ -1003,7 +1015,7 @@ export class AttachV1Ingress implements TurnEndpoint {
 
 /** The peer's claimed frame kind, constrained to the known set. An unknown or absent kind is
  *  reported as "unknown" rather than echoed, so the log line stays bounded and content-free. */
-const KNOWN_FRAME_KINDS = new Set(["hello", "event", "ack", "gap", "heartbeat", "mobile_request", "mobile_cancel", "memory_result", "config_result", "history_result"]);
+const KNOWN_FRAME_KINDS = new Set(["hello", "event", "ack", "gap", "heartbeat", "mobile_request", "mobile_cancel", "memory_result", "config_result", "history_result", "observation_snapshot"]);
 function frameKind(decoded: unknown): string {
   const kind = typeof decoded === "object" && decoded !== null ? (decoded as { kind?: unknown }).kind : undefined;
   return typeof kind === "string" && KNOWN_FRAME_KINDS.has(kind) ? kind : "unknown";
@@ -1014,6 +1026,7 @@ function frameKind(decoded: unknown): string {
  *  at the root, which is exactly as useless as the silent drop it replaced. */
 const KIND_SCHEMAS: Record<string, TSchema> = {
   hello: AttachV1HelloSchema,
+  observation_snapshot: AttachV1ObservationSnapshotSchema,
   event: AttachV1EventFrameSchema,
   ack: AttachV1AckSchema,
   gap: AttachV1GapSchema,

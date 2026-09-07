@@ -80,8 +80,8 @@ describe("the observation ring's row shape", () => {
     observe.pushResult("device-1", "ok");
     observe.feltLatency("luna", 900, "vpn_on");
     observe.foldSnapshotIntoSeries("luna", {
-      steps: [{ turnId: "turn-1", step: 0, modelStepMs: 120, promptTokens: 1_000, completionTokens: 200, cachedTokens: 800 }],
-      toolCalls: [{ turnId: "turn-1", step: 0, toolMs: 8 }],
+      steps: [{ turnId: "turn-1", step: 0, modelStepMs: 120, promptTokens: 1_000, completionTokens: 200, cachedTokens: 800, prefillTokensPerSecond: 10, decodeTokensPerSecond: 2 }],
+      toolCalls: [{ turnId: "turn-1", step: 0, toolMs: 8, inducedTokens: 4 }],
       turns: [{ turnId: "turn-1", modelSteps: 2 }],
     });
 
@@ -240,7 +240,7 @@ describe("the ring's retention", () => {
     // Every series row those folds wrote ages out; the lifetime counters they fed do not.
     observe.trim(clock);
     expect(storage.observe.lifetime(id("luna"))).toEqual([
-      { bot: id("luna"), model: id("qwen3"), prompt: 11, completion: 6, cached: 2, costMicros: 8, turns: 2, updatedAt: clock },
+      { bot: id("luna"), model: id("qwen3"), prompt: 11, completion: 6, cached: 2, costMicros: 8, turns: 2, priced: 0, unpriced: 0, updatedAt: clock },
     ]);
   });
 
@@ -593,9 +593,9 @@ describe("the fold-in seam D5 calls", () => {
     const observe = ring();
     // D5's harness repeats a step index between an idle tick and a terminal, and a cumulative
     // snapshot replays the whole turn on every tick.
-    expect(observe.foldSnapshotIntoSeries("luna", snapshot)).toEqual({ folded: 4, skipped: 0 });
-    expect(observe.foldSnapshotIntoSeries("luna", snapshot)).toEqual({ folded: 0, skipped: 4 });
-    expect(observe.foldSnapshotIntoSeries("luna", snapshot)).toEqual({ folded: 0, skipped: 4 });
+    expect(observe.foldSnapshotIntoSeries("luna", snapshot)).toMatchObject({ folded: 4, skipped: 0 });
+    expect(observe.foldSnapshotIntoSeries("luna", snapshot)).toMatchObject({ folded: 0, skipped: 4 });
+    expect(observe.foldSnapshotIntoSeries("luna", snapshot)).toMatchObject({ folded: 0, skipped: 4 });
 
     expect(storage.observe.summarize({ series: "model_step_ms", from: 0, to: clock + 1 }).count).toBe(2);
     expect(storage.observe.summarize({ series: "tool_ms", from: 0, to: clock + 1 }).count).toBe(1);
@@ -608,9 +608,9 @@ describe("the fold-in seam D5 calls", () => {
     observe.foldSnapshotIntoSeries("luna", snapshot);
     expect(observe.foldSnapshotIntoSeries("luna", {
       steps: [...snapshot.steps, { turnId: "turn-1", step: 2, modelStepMs: 300 }],
-    })).toEqual({ folded: 1, skipped: 2 });
+    })).toMatchObject({ folded: 1, skipped: 2 });
     // Two bots reporting the same step index are two different measurements.
-    expect(observe.foldSnapshotIntoSeries("pixel", snapshot)).toEqual({ folded: 4, skipped: 0 });
+    expect(observe.foldSnapshotIntoSeries("pixel", snapshot)).toMatchObject({ folded: 4, skipped: 0 });
     expect(storage.observe.summarize({ series: "model_step_ms", bot: id("luna"), from: 0, to: clock + 1 }).count).toBe(3);
     expect(storage.observe.summarize({ series: "model_step_ms", bot: id("pixel"), from: 0, to: clock + 1 }).count).toBe(2);
   });

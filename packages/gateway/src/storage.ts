@@ -920,6 +920,27 @@ CREATE TABLE IF NOT EXISTS observe_lifetime_folds (
   at INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS observe_lifetime_folds_age ON observe_lifetime_folds (at);
+CREATE TABLE IF NOT EXISTS observe_snapshot_records (
+  bot TEXT NOT NULL, kind TEXT NOT NULL, at INTEGER NOT NULL, record_json TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS observe_snapshot_records_window ON observe_snapshot_records (bot, kind, at);
+CREATE TABLE IF NOT EXISTS observe_snapshots (
+  bot TEXT PRIMARY KEY,
+  snapshot_json TEXT NOT NULL,
+  received_at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS observe_tool_lifetime (
+  bot TEXT NOT NULL, tool TEXT NOT NULL,
+  calls INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0,
+  failures INTEGER NOT NULL DEFAULT 0, cost_micros INTEGER NOT NULL DEFAULT 0,
+  priced INTEGER NOT NULL DEFAULT 0, unpriced INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bot, tool)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS observe_tool_durations (
+  bot TEXT NOT NULL, tool TEXT NOT NULL, at INTEGER NOT NULL, value REAL NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS observe_tool_durations_window ON observe_tool_durations (bot, tool, at);
 CREATE TABLE IF NOT EXISTS observe_lifetime (
   bot TEXT NOT NULL,
   model TEXT NOT NULL,
@@ -928,6 +949,8 @@ CREATE TABLE IF NOT EXISTS observe_lifetime (
   cached INTEGER NOT NULL,
   cost_micros INTEGER NOT NULL,
   turns INTEGER NOT NULL,
+  priced INTEGER NOT NULL DEFAULT 0,
+  unpriced INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (bot, model)
 ) STRICT, WITHOUT ROWID;
@@ -5922,6 +5945,12 @@ export function openStorage(dbPath: string): Storage {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
+  const observeLifetimeColumns = new Set(
+    (db.prepare("PRAGMA table_info(observe_lifetime)").all() as unknown as Array<{ name: string }>).map(row => row.name),
+  );
+  for (const column of ["priced", "unpriced"]) {
+    if (!observeLifetimeColumns.has(column)) db.exec(`ALTER TABLE observe_lifetime ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`);
+  }
   // Setup codes are short-lived invitations, not durable sessions. Old builds retained expired
   // and consumed rows forever; prune that residue while keeping a live invitation across restart.
   db.prepare("DELETE FROM setup_codes WHERE used_at IS NOT NULL OR expires_at < ?").run(Date.now());

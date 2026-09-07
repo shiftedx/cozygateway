@@ -69,6 +69,7 @@ describe("attach-v1 ingress", () => {
   let acceptsTarget: boolean;
   let memoryResults: AttachV1MemoryResult[];
   let logs: string[];
+  let snapshotFrames: unknown[];
   let liveness: Array<{ agent: string; at: number }>;
 
   function makeIngress(maxPendingConnections?: number): AttachV1Ingress {
@@ -79,6 +80,7 @@ describe("attach-v1 ingress", () => {
         ["soak-4", "soak-4"], ["soak-5", "soak-5"], ["soak-6", "soak-6"],
       ]), storage,
       events: {
+        onObservationSnapshot: (_agent, payload) => { snapshotFrames.push(payload); return "refused"; },
         onEvent: (_agent, frame) => { accepted.push(frame); return projectionSucceeds; },
         canAcceptEvent: () => acceptsTarget,
         onPresence: (_agent, state) => presence.push(state),
@@ -110,6 +112,7 @@ describe("attach-v1 ingress", () => {
     memoryResults = [];
     logs = [];
     liveness = [];
+    snapshotFrames = [];
     ingress = makeIngress();
     server = createServer();
     server.on("upgrade", (req, socket, head) => ingress.handleUpgrade(req, socket, head));
@@ -146,6 +149,36 @@ describe("attach-v1 ingress", () => {
     await until(() => frames.some((frame) => frame.kind === "hello_ack"));
     return { ws, frames };
   }
+
+  it("ignores unknown hello capabilities while granting supported ones", async () => {
+    const { ws, frames } = await dial(undefined, ["draft", "future.capability", "observation_snapshot"]);
+    const ack = frames.find(frame => frame.kind === "hello_ack");
+    expect(ack).toMatchObject({ capabilities: ["draft", "observation_snapshot"], extensions: { [BOTS_CAPABILITY_ID]: 74 } });
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  });
+
+  it("drops invalid snapshots without ACKs or socket loss and accepts subsequent events", async () => {
+    const { ws, frames } = await dial(undefined, ["draft", "observation_snapshot"]);
+    ws.send(JSON.stringify({ kind: "observation_snapshot", payload: { transcript: "private" } }));
+    await until(() => snapshotFrames.length === 1);
+    expect(logs.at(-1)).toBe("attach-v1: observation_snapshot dropped (refused)");
+    expect(frames.filter(frame => frame.kind === "ack")).toHaveLength(0);
+    ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "after-snapshot", event: {
+      kind: "commit", threadId: "session", turnId: "turn", messageId: "reply", blocks: [],
+    } }));
+    await until(() => accepted.length === 1);
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  });
+
+  it("closes with 1008 when a snapshot was not negotiated", async () => {
+    const { ws } = await dial();
+    const closed = once(ws, "close");
+    ws.send(JSON.stringify({ kind: "observation_snapshot", payload: {} }));
+    expect((await closed)[0]).toBe(1008);
+    expect(snapshotFrames).toHaveLength(0);
+  });
 
   it("ignores delayed frames and close from a superseded authenticated socket", async () => {
     const originalClose = WebSocket.prototype.close;
