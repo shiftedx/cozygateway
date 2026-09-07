@@ -188,6 +188,10 @@ export interface RunningGateway {
   url: string;
   port: number;
   storage: Storage;
+  /** The registered HTTP route manifest, exposed for black-box conformance walks. */
+  routes(): readonly { method: string; path: string }[];
+  /** The production observation writers this gateway registered at startup. */
+  observations: { ring: ObservationRing; snapshots: ObservationSnapshotLane };
   issueSetupCode(): string;
   close(): Promise<void>;
 }
@@ -1440,6 +1444,8 @@ export async function startGateway(
     url: `${scheme}://${config.host ?? "127.0.0.1"}:${port}`,
     port,
     storage,
+    routes: () => app.routes.map((route) => ({ method: route.method, path: route.path })),
+    observations: { ring: observe, snapshots: observationSnapshots },
     issueSetupCode: () => {
       const code = newSetupCode();
       storage.createSetupCode(code, Date.now() + SETUP_CODE_TTL_MS);
