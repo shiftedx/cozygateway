@@ -1,3 +1,6 @@
+import { RelayNotifier } from "../../gateway/src/push-notifier.ts";
+import { openStorage } from "../../gateway/src/storage.ts";
+import { roomApprovalPush } from "../../gateway/src/push-crypto.ts";
 import { createServer, type ClientHttp2Session, type Http2Server } from "node:http2";
 import { EventEmitter, once } from "node:events";
 import { generateKeyPairSync, verify as cryptoVerify } from "node:crypto";
@@ -322,9 +325,39 @@ describe("relay APNs registration invalidation", () => {
 });
 
 describe("apnsTransport push categories", () => {
+  it("carries a real gateway room delivery through relay validation to the APNs socket", async () => {
+    const { config } = testConfig();
+    const bodies: Array<{ aps: Record<string, unknown>; c: string }> = [];
+    const baseUrl = await fakeApns((_headers, body, stream) => {
+      bodies.push(JSON.parse(body)); stream.respond({ ":status": 200 }); stream.end();
+    });
+    const storage = openRelayStorage(":memory:"); relayStorages.push(storage);
+    const app = createRelayApp({ storage, transports: { "apns:development": apnsTransport(config, { baseUrl }) }, dailyCap: 500, maxRegistrations: 100, version: "test", now: () => 1_800_000_000_000, restrictEgress: false, log: () => {} });
+    const registered = await app.request("/register", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ platform: "apns", environment: "development", token: "DEVICE" }) });
+    const { pushId } = await registered.json() as { pushId: string };
+    const gateway = openStorage(":memory:");
+    try {
+      gateway.createDevice({ id: "phone", name: "Phone", tokenHash: "fixture", createdAt: 1 });
+      gateway.savePushRegistration("phone", { pushId, relayUrl: "https://relay.test", pushKey: "fixture" });
+      const statuses: number[] = [];
+      const notifier = new RelayNotifier({ storage: gateway, log: () => {}, fetchImpl: (async (input, init) => {
+        const response = await app.request(String(input), init); statuses.push(response.status); return response;
+      }) as typeof fetch });
+      const payload = roomApprovalPush({ type: "bot_approval_pending", bot: "sage", sessionId: "group:launch:sage", turnId: "turn", toolCallId: "delivery", name: "send_file", room: "Launch", updatedAt: 1 })!;
+      notifier.notifyApproval(payload, new Set());
+      notifier.notifyApproval({ ...payload, kind: "approval_pending", name: "run_shell", toolCallId: "ordinary" }, new Set());
+      await expect.poll(() => bodies.length).toBe(2);
+      expect(statuses).toEqual([202, 202]);
+      expect(bodies.map(body => body.aps["interruption-level"])).toEqual(["time-sensitive", undefined]);
+      expect(JSON.stringify(bodies)).not.toContain("send_file");
+      expect(JSON.stringify(bodies)).not.toContain("Launch");
+    } finally { gateway.close(); }
+  });
+
   async function deliverWithCategory(
     category: "message" | "approval.pending" | "approval.resolved" | "mobile.status.wake",
     collapseId: string,
+    interruptionLevel?: "time-sensitive",
   ): Promise<{ headers: Record<string, unknown>; body: Record<string, unknown>; rawBody: string }> {
     const { config } = testConfig();
     let seen: { headers: Record<string, unknown>; body: string } | undefined;
@@ -333,10 +366,16 @@ describe("apnsTransport push categories", () => {
       stream.respond({ ":status": 200 });
       stream.end();
     });
-    await apnsTransport(config, { baseUrl }).deliver("DEVTOK", "CIPHERBLOB", { category, collapseId });
+    await apnsTransport(config, { baseUrl }).deliver("DEVTOK", "CIPHERBLOB", { category, collapseId, ...(interruptionLevel === undefined ? {} : { interruptionLevel }) });
     const rawBody = seen?.body ?? "{}";
     return { headers: seen?.headers ?? {}, body: JSON.parse(rawBody) as Record<string, unknown>, rawBody };
   }
+
+  it("places delivery urgency inside aps, never in an APNs header", async () => {
+    const { body, headers } = await deliverWithCategory("approval.pending", "delivery", "time-sensitive");
+    expect(body["aps"]).toMatchObject({ "interruption-level": "time-sensitive" });
+    expect(headers["interruption-level"]).toBeUndefined();
+  });
 
   it("sets aps.category so the app can attach its Approve/Deny actions client-side", async () => {
     const { body } = await deliverWithCategory("approval.pending", "toolu_01");

@@ -152,6 +152,7 @@ export interface NativeBotDataPlaneOptions {
     turnId: string;
     toolCallId: string;
     name?: string;
+    room?: string;
     outcome?: "approved" | "denied" | "expired";
   }) => void;
   /** Dashboard packet D2. Absent means the observation ring is off, and then every turn path here
@@ -3844,6 +3845,7 @@ export class NativeBotDataPlane {
       turnId,
       toolCallId: approvalId,
       outcome,
+      ...(room === undefined ? {} : { room }),
     });
   }
 

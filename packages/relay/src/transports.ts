@@ -24,6 +24,8 @@ export const DELIVERY_TIMEOUT_MS = 10_000;
 export interface PushDeliveryOptions {
   /** Envelope category id; alert categories become `aps.category` on APNs. */
   category?: PushCategoryId;
+  /** Delivery approvals only; mapped to aps, not an HTTP header. */
+  interruptionLevel?: "time-sensitive";
   /** Coalescing key; becomes `apns-collapse-id` on APNs. Approvals pass the `toolCallId`; bot
    *  messages pass an opaque digest of bot name and canonical chat session. */
   collapseId?: string;
@@ -148,7 +150,8 @@ export function createVettingLookup(
  *  UnifiedPush-style consumer that only knows `{ciphertext}` keeps working. */
 function webhookBody(ciphertext: string, options: PushDeliveryOptions | undefined): string {
   if (options?.category === undefined) return JSON.stringify({ ciphertext });
-  return JSON.stringify({ ciphertext, category: options.category, collapseId: options.collapseId });
+  return JSON.stringify({ ciphertext, category: options.category, collapseId: options.collapseId,
+    ...(options.interruptionLevel === undefined ? {} : { interruptionLevel: options.interruptionLevel }) });
 }
 
 /** Restricted-mode delivery: `node:http`/`node:https` `request` with a vetting `lookup`,

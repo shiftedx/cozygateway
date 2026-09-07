@@ -119,6 +119,8 @@ export function apnsTransport(config: ApnsConfig, options: ApnsTransportOptions 
         aps: {
           alert: { title: alert.title, body: alert.body },
           "mutable-content": 1,
+          ...(push?.category === "approval.pending" && push.interruptionLevel === "time-sensitive"
+            ? { "interruption-level": "time-sensitive" } : {}),
           ...(spec === undefined ? {} : { category: spec.id }),
         },
         c: ciphertext,

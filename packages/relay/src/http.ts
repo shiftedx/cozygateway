@@ -178,6 +178,9 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
     if ((parsed.category === undefined) !== (parsed.collapseId === undefined)) {
       return c.json(relayError("invalid_request", "category and collapseId must be sent together"), 400);
     }
+    if (parsed.interruptionLevel !== undefined && (parsed.category !== "approval.pending" || parsed.liveActivity !== undefined)) {
+      return c.json(relayError("invalid_request", "interruptionLevel is limited to pending approval alerts"), 400);
+    }
     const now = deps.now();
     // TTL sweep BEFORE the lookup: an expired registration 404s on this very request (issue #28).
     deps.storage.pruneRegistrations(now, registrationTtlDays);
@@ -202,7 +205,8 @@ export function createRelayApp(deps: RelayAppDeps): Hono {
     const push =
       parsed.category === undefined
         ? undefined
-        : { category: parsed.category, collapseId: parsed.collapseId };
+        : { category: parsed.category, collapseId: parsed.collapseId,
+            ...(parsed.interruptionLevel === undefined ? {} : { interruptionLevel: parsed.interruptionLevel }) };
     const delivery = parsed.liveActivity === undefined
       ? push
       : { liveActivity: parsed.liveActivity };

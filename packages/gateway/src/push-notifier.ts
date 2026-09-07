@@ -178,7 +178,7 @@ export class RelayNotifier implements Notifier {
     registration: PushRegistrationRow,
     payload: PushPayload,
     task: { taskId: string; runId: string } | undefined,
-    routing?: { category: string; collapseId: string },
+    routing?: { category: string; collapseId: string; interruptionLevel?: "time-sensitive" },
   ): void {
     if (task === undefined || this.#replyPushes === undefined) {
       void this.#send(registration, payload, routing).catch((err: unknown) => {
@@ -286,7 +286,9 @@ export class RelayNotifier implements Notifier {
     if (targets.length === 0) return;
     const category = APPROVAL_CATEGORY[payload.kind];
     for (const registration of targets) {
-      void this.#send(registration, payload, { category, collapseId }).catch((err: unknown) => {
+      void this.#send(registration, payload, { category, collapseId,
+        ...(payload.kind === "approval_pending" && payload.name === "send_file" ? { interruptionLevel: "time-sensitive" as const } : {}),
+      }).catch((err: unknown) => {
         this.#log(
           `push: approval notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`,
         );
@@ -361,7 +363,7 @@ export class RelayNotifier implements Notifier {
     registration: PushRegistrationRow,
     payload: PushPayload,
     /** Both or neither, per contract/push-v0.md: the relay 400s a body carrying only one. */
-    routing?: { category: string; collapseId: string },
+    routing?: { category: string; collapseId: string; interruptionLevel?: "time-sensitive" },
   ): Promise<"sent" | "skipped" | "not_found"> {
     // Yield one macrotask before the presence recheck. Without this yield the recheck would
     // run in the same synchronous span as notify()'s commit-time snapshot and could never

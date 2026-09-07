@@ -519,6 +519,19 @@ describe("RelayNotifier.notifyApproval", () => {
     name: "run_shell",
   };
 
+  it("elevates only a delivery approval pending push", async () => {
+    const storage = seeded([registration]);
+    const { impl, sent } = fetchStub(() => 202);
+    const notifier = new RelayNotifier({ storage, fetchImpl: impl, log: () => {} });
+    notifier.notifyApproval({ ...pendingPayload, name: "send_file" }, new Set());
+    notifier.notifyApproval(pendingPayload, new Set());
+    notifier.notifyApproval({ ...pendingPayload, kind: "approval_resolved", outcome: "approved" }, new Set());
+    await settle();
+    expect(sent.map(row => (row.body as { interruptionLevel?: string }).interruptionLevel)).toEqual(["time-sensitive", undefined, undefined]);
+    expect(JSON.stringify(sent[0]!.body)).not.toContain("send_file");
+    storage.close();
+  });
+
   it("sends the pending payload with the category and the toolCallId as the collapse id", async () => {
     const storage = seeded([registration]);
     const { impl, sent } = fetchStub(() => 202);

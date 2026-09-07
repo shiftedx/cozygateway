@@ -1,6 +1,6 @@
 import { createCipheriv, hkdfSync, randomBytes } from "node:crypto";
 
-import type { ApprovalArgSummary, ApprovalOutcome } from "cozygateway-contract";
+import type { ApprovalArgSummary, ApprovalOutcome, ServerFrame } from "cozygateway-contract";
 
 /** HKDF info string, fixed by contract/push-v0.md. */
 export const PUSH_HKDF_INFO = "cozygateway-push-v0";
@@ -94,4 +94,13 @@ export function encryptPushPayload(pushKey: string, payload: PushPayload, nonce:
   const plaintext = Buffer.from(JSON.stringify(payload), "utf8");
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   return Buffer.concat([nonce, ciphertext, cipher.getAuthTag()]).toString("base64url");
+}
+
+/** Room approvals share the encrypted push lane with chat approvals. Other room frames are silent. */
+export function roomApprovalPush(frame: ServerFrame): ApprovalPushPayload | undefined {
+  if ((frame.type !== "bot_approval_pending" && frame.type !== "bot_approval_resolved") || frame.room === undefined) return undefined;
+  const identity = { threadId: `group:${frame.room}`, agentId: frame.bot, turnId: frame.turnId, toolCallId: frame.toolCallId };
+  return frame.type === "bot_approval_pending"
+    ? { kind: "approval_pending", ...identity, name: frame.name }
+    : { kind: "approval_resolved", ...identity, outcome: frame.outcome };
 }

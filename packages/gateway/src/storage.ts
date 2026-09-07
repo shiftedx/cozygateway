@@ -5376,7 +5376,7 @@ export class Storage {
    * A POINTER projection only: the member, the kind, the resolution id, and the room turn. No
    * rule name, prompt or option list, because the room surface is not where a card is rendered. */
   botGroupPendingInteractions(key: string): BotGroupPendingInteraction[] {
-    return this.#db
+    const rows = this.#db
       .prepare(
         `SELECT bot AS member, kind, interaction_id AS id, turn_id AS turnId
          FROM bot_native_interactions
@@ -5385,6 +5385,10 @@ export class Storage {
          LIMIT 32`,
       )
       .all(key) as unknown as BotGroupPendingInteraction[];
+    return rows.map(row => {
+      const turn = this.botGroupTurn(key, row.turnId);
+      return row.kind === "approval" && turn?.member === row.member && turn.cause !== undefined ? { ...row, cause: turn.cause } : row;
+    });
   }
 
   /** Bounded display-safe clarification recovery. The original payload remains private in the

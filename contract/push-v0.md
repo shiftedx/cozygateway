@@ -242,3 +242,21 @@ absent-kind rule above.
 The gateway sends one notify per registered device when an agent reply commits while no
 client is connected. Outcomes are fire-and-forget: 404 prunes that device's
 registration; anything else is logged and the registration kept.
+
+## Delivery approval urgency (bots capability 77)
+
+A gateway sends optional cleartext `interruptionLevel: "time-sensitive"` to `/notify` only for
+`approval.pending` whose encrypted approval name is exactly `send_file`. Ordinary approvals,
+resolved approvals, messages, task completions, mobile wakes and Live Activities are unchanged.
+The relay validates the closed value and rejects it for any other category or Live Activity.
+It copies this routing hint to `aps["interruption-level"]`, never an APNs HTTP header. The tool
+name and approval details remain encrypted; the relay learns only this delivery urgency hint.
+Webhook transports preserve the same optional hint.
+
+Upgrade the relay before a gateway emits this optional field: older strict relay schemas reject
+it. The app requires the Time Sensitive Notifications entitlement in its signed provisioning
+profile. A user can disable time-sensitive interruptions, so this flag is not proof of immediate
+presentation. Delivery approval TTL remains 180 seconds pending real-device Focus verification.
+
+Apple references: [remote notification payload](https://developer.apple.com/documentation/usernotifications/generating-a-remote-notification)
+and [time-sensitive presentation](https://developer.apple.com/documentation/usernotifications/unnotificationinterruptionlevel/timesensitive).

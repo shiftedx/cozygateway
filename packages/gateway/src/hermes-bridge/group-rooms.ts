@@ -1156,6 +1156,7 @@ export class GroupRooms {
         name: event.name,
         updatedAt: this.#now(),
         room: room.name,
+        ...(turn.cause === undefined ? {} : { cause: turn.cause }),
         ...(detail === undefined ? {} : { detail }),
         ...(repair === undefined ? {} : { repair }),
         ...(scope === undefined ? {} : { scope }),
