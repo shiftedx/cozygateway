@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -267,14 +267,41 @@ describe("profile lifecycle hands the change to the provisioner", () => {
   });
 
   it("cancels a deferred seed before deletion so it cannot provision a removed profile", async () => {
+    const retryDelay = 23;
+    const { authed, seen, storage } = await setup({ dashboardFailures: 1, seedRetryBaseMs: retryDelay });
+    // Control only this seed callback. Freezing all timers also freezes the real HTTP/WS
+    // client's scheduling; a wall-clock race cannot establish which lifecycle action won.
+    const realSetTimeout = globalThis.setTimeout;
+    let retry: (() => void) | undefined;
+    const scheduler = vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) => {
+      if (delay === retryDelay) {
+        retry = () => callback(...args);
+        return realSetTimeout(() => {}, 0);
+      }
+      return realSetTimeout(callback, delay, ...args);
+    });
+    try {
+      expect((await authed("/bots", post({ name: "night-owl" }))).status).toBe(201);
+      expect(storage.pendingHermesProfileSeeds()).toHaveLength(1);
+      expect(retry).toBeDefined();
+      expect(seen).toEqual([]);
+      expect((await authed("/bots/night-owl", { method: "DELETE" })).status).toBe(200);
+      // Release the already-scheduled retry only after DELETE committed. Its original closure
+      // must consult the durable cancellation rather than emit a stale creation event.
+      retry!();
+      await new Promise<void>((resolve) => realSetTimeout(resolve, 0));
+      expect(storage.pendingHermesProfileSeeds()).toEqual([]);
+      expect(seen).toEqual([{ event: { profile: "night-owl", change: "deleted" }, rosterAtCall: ["default"] }]);
+    } finally { scheduler.mockRestore(); }
+  });
+
+  it("preserves a completed deferred creation event when its retry legitimately wins before deletion", async () => {
     const { authed, seen, storage } = await setup({ dashboardFailures: 1, seedRetryBaseMs: 20 });
     expect((await authed("/bots", post({ name: "night-owl" }))).status).toBe(201);
-    expect(storage.pendingHermesProfileSeeds()).toHaveLength(1);
-
+    await until(() => seen.some((entry) => entry.event.change === "created"));
     expect((await authed("/bots/night-owl", { method: "DELETE" })).status).toBe(200);
-    await new Promise((resolve) => setTimeout(resolve, 60));
     expect(storage.pendingHermesProfileSeeds()).toEqual([]);
-    expect(seen).toEqual([{ event: { profile: "night-owl", change: "deleted" }, rosterAtCall: ["default"] }]);
+    expect(seen.map((entry) => entry.event.change)).toEqual(["created", "deleted"]);
   });
 
   it("keeps deferred seed recovery when Hermes refuses deletion", async () => {

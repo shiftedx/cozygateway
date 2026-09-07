@@ -716,7 +716,7 @@ export class AttachV1Ingress implements TurnEndpoint {
   sendMemoryRequest(agentId: string, input: AttachV1MemoryRequest): MemorySendOutcome {
     if (![...this.#tokens.values()].includes(agentId)) return "unknown_bot";
     const connection = this.#current.get(agentId);
-    if (connection?.hello !== true) return "not_attached";
+    if (connection?.hello !== true || connection.socket.readyState !== WebSocket.OPEN) return "not_attached";
     if (!connection.capabilities.has("memory_management")) return "capability_not_negotiated";
     if (input.operation === "setup" && !connection.capabilities.has("memory_setup")) return "capability_not_negotiated";
     if (input.operation === "create" && input.input.owner !== undefined && !connection.capabilities.has("memory_ownership")) return "capability_not_negotiated";
@@ -731,7 +731,7 @@ export class AttachV1Ingress implements TurnEndpoint {
   sendConfigRequest(agentId: string, input: AttachV1ConfigRequest): ConfigSendOutcome {
     if (![...this.#tokens.values()].includes(agentId)) return "unknown_bot";
     const connection = this.#current.get(agentId);
-    if (connection?.hello !== true) return "not_attached";
+    if (connection?.hello !== true || connection.socket.readyState !== WebSocket.OPEN) return "not_attached";
     const capability = input.operation.startsWith("chat.") ? "chat_configuration"
       : input.operation.startsWith("providers.connections.") ? "provider_connections" : "bot_config";
     if (!connection.capabilities.has(capability)) return "capability_not_negotiated";
@@ -744,7 +744,7 @@ export class AttachV1Ingress implements TurnEndpoint {
   sendHistoryRequest(agentId: string, input: AttachV1HistoryRequest): HistorySendOutcome {
     if (![...this.#tokens.values()].includes(agentId)) return "unknown_bot";
     const connection = this.#current.get(agentId);
-    if (connection?.hello !== true) return "not_attached";
+    if (connection?.hello !== true || connection.socket.readyState !== WebSocket.OPEN) return "not_attached";
     if (!connection.capabilities.has("bot_history")) return "capability_not_negotiated";
     return this.#send(connection, input) ? "sent" : "not_attached";
   }

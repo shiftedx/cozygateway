@@ -759,6 +759,18 @@ describe("attach-v1 ingress", () => {
     expect(ingress.isAttached("sage")).toBe(false);
   });
 
+  it("reports closing live request lanes as disconnected before the close event removes the connection", async () => {
+    const peer = await dial(undefined, ["draft"]);
+    // Pause at the real WebSocket CLOSING state while #current still holds the negotiated peer.
+    const readyState = vi.spyOn(WebSocket.prototype, "readyState", "get").mockReturnValue(WebSocket.CLOSING);
+    try {
+      expect(ingress.isAttached("sage")).toBe(false);
+      expect(ingress.sendMemoryRequest("sage", { kind: "memory_request", requestId: "closing", operation: "overview", input: {} })).toBe("not_attached");
+      expect(ingress.sendConfigRequest("sage", { kind: "config_request", requestId: "closing-config", operation: "profile.read", input: {} })).toBe("not_attached");
+      expect(ingress.sendHistoryRequest("sage", { kind: "history_request", requestId: "closing-history", operation: "list", input: {} })).toBe("not_attached");
+    } finally { readyState.mockRestore(); peer.ws.close(); }
+  });
+
   it("separates the three ways the memory lane can be closed", async () => {
     const peer = await dial(undefined, ["draft"]);
     expect(logs.some((line) => line.includes("negotiated hello v2") && !line.includes("memory_management"))).toBe(true);
