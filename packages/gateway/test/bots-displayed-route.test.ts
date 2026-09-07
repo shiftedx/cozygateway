@@ -47,17 +47,20 @@ describe("capability-31 displayed route", () => {
   it("passes the app's own perceived latency and network path through when a client reports them", async () => {
     const recordDisplayed = vi.fn(() => ({ recorded: 1 }));
     const response = await post(harness(recordDisplayed), {
-      messageIds: ["m1"], feltLatencyMs: 1_240, networkPath: "vpn_on",
+      messageIds: ["m1"], feltLatencyMs: 1_240, networkPath: "wifi", vpn: true,
+      edgeRttMs: 42, edgeColo: "ORD",
     });
     expect(response.status).toBe(202);
     expect(recordDisplayed).toHaveBeenCalledWith("sage", ["m1"], "device-1", {
-      feltLatencyMs: 1_240, networkPath: "vpn_on",
+      feltLatencyMs: 1_240, networkPath: "wifi", vpn: true, edgeRttMs: 42, edgeColo: "ORD",
     });
   });
 
   it("refuses a network path outside the closed set and a negative perceived latency", async () => {
     expect((await post(harness(() => ({ recorded: 0 })), { messageIds: ["m1"], networkPath: "carrier_pigeon" })).status).toBe(400);
     expect((await post(harness(() => ({ recorded: 0 })), { messageIds: ["m1"], feltLatencyMs: -1 })).status).toBe(400);
+    expect((await post(harness(() => ({ recorded: 0 })), { messageIds: ["m1"], networkPath: "vpn_on" })).status).toBe(400);
+    expect((await post(harness(() => ({ recorded: 0 })), { messageIds: ["m1"], edgeColo: "ord" })).status).toBe(400);
   });
 
   it("answers zero rather than an error when nothing was new", async () => {

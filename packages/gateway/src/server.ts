@@ -540,6 +540,7 @@ export async function startGateway(
     const member = new HermesBridge({
     client,
     storage: memberStorage,
+    observe,
     broadcast: (frame) => {
       if (endpoint.namespace && (frame.type === "bot_roster" || frame.type === "bot_presence")) {
         federation?.publish();
@@ -1087,6 +1088,7 @@ export async function startGateway(
     ...(legacyRunnerConfigured ? { token: runnerToken } : {}),
     roster: runnerRoster,
     storage,
+    observe,
     attachTokenFor: (botId) => storage.runtimeBot(botId)?.token,
     onReceipt: () => bridge.refreshSoon("runner receipt"),
     now: () => Date.now(),
@@ -1127,6 +1129,7 @@ export async function startGateway(
   };
   runtimeBotService = new RuntimeBotService({
     storage,
+    observe,
     lane: runnerLane,
     spec: () => runtimeSpecDefaults(process.env),
     now: () => Date.now(),
@@ -1216,6 +1219,7 @@ export async function startGateway(
       (storage.chatExecutionById(id)?.bot ?? id) === bot && attachV1Ingress.isAttached(id)
       && attachV1Ingress.negotiatedCapabilities(id).has("observation_snapshot")),
     storage,
+    observe,
     flushTaskCommands: () => attachV1Ingress.flushTaskCommands(),
     config,
     gatewayInfo,

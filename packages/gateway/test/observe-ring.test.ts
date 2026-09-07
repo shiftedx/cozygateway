@@ -37,7 +37,8 @@ afterEach(() => {
 });
 
 const TAG_SUFFIXES = [
-  "", "|tunnel", "|lan", "|wifi", "|cellular", "|vpn_on", "|vpn_off",
+  "", "|tunnel", "|lan", "|wifi", "|cellular", "|wired", "|other",
+  "|wifi_vpn", "|cellular_vpn", "|wired_vpn", "|other_vpn",
   "|ok", "|not_found", "|http_error", "|network_error",
 ];
 
@@ -78,7 +79,8 @@ describe("the observation ring's row shape", () => {
     observe.turnTerminal("luna", "turn-1", { status: "completed" })();
     observe.attachDepths({ online: 2, queueDepth: 0, deadLetters: 0, outboxDepth: 1 });
     observe.pushResult("device-1", "ok");
-    observe.feltLatency("luna", 900, "vpn_on");
+    observe.feltLatency("luna", 900, "wifi", true);
+    observe.edgeRtt("luna", 40, "wifi", true);
     observe.foldSnapshotIntoSeries("luna", {
       steps: [{ turnId: "turn-1", step: 0, modelStepMs: 120, promptTokens: 1_000, completionTokens: 200, cachedTokens: 800, prefillTokensPerSecond: 10, decodeTokensPerSecond: 2 }],
       toolCalls: [{ turnId: "turn-1", step: 0, toolMs: 8, inducedTokens: 4 }],
@@ -424,14 +426,21 @@ describe("p50 and p95 helpers", () => {
 
   it("reports each network path separately so a VPN cost is a difference of two measured medians", () => {
     const observe = ring();
-    for (const value of [100, 120, 140]) observe.feltLatency("luna", value, "vpn_on");
-    for (const value of [40, 50, 60]) observe.feltLatency("luna", value, "vpn_off");
-    const on = observe.summarize({ series: "felt_latency_ms", tag: "vpn_on", from: 0, to: clock + 1 });
-    const off = observe.summarize({ series: "felt_latency_ms", tag: "vpn_off", from: 0, to: clock + 1 });
+    for (const value of [100, 120, 140]) observe.feltLatency("luna", value, "wifi", true);
+    for (const value of [40, 50, 60]) observe.feltLatency("luna", value, "wifi", false);
+    const on = observe.summarize({ series: "felt_latency_ms", tag: "wifi_vpn", from: 0, to: clock + 1 });
+    const off = observe.summarize({ series: "felt_latency_ms", tag: "wifi", from: 0, to: clock + 1 });
     expect(on.count).toBe(3);
     expect(off.count).toBe(3);
     expect(on.p50).toBe(120);
     expect(off.p50).toBe(50);
+  });
+
+  it("records the app's Cloudflare edge round trip under the same radio and VPN tags", () => {
+    const observe = ring();
+    observe.edgeRtt("luna", 41, "cellular", true);
+    expect(observe.summarize({ series: "edge_rtt_ms", tag: "cellular_vpn", from: 0, to: clock + 1 }))
+      .toMatchObject({ count: 1, p50: 41 });
   });
 
   it("does not read a neighbouring series through the underscore LIKE wildcard", () => {

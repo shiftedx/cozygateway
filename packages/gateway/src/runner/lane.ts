@@ -12,6 +12,7 @@ import {
 import { resolveAttachBearer } from "../adapters/attach/token-auth.ts";
 import type { RunnerOperationRow, Storage } from "../storage.ts";
 import { LEGACY_RUNNER_ID, type RunnerRoster } from "./roster.ts";
+import type { ObservationRing } from "../observe/ring.ts";
 import {
   RUNNER_V1_HEARTBEAT_INTERVAL_MS,
   RUNNER_V1_HEARTBEAT_TIMEOUT_MS,
@@ -46,6 +47,7 @@ export interface RunnerLaneOptions {
   /** A receipt landed. The gateway uses this to refresh what the app sees; the callback is handed
    *  identity and stage only, never the payload. */
   onReceipt?: (receipt: RunnerReceipt) => void;
+  observe?: ObservationRing;
   /** Diagnostics sink. Every line here carries ids, stages and counts only: no token, no env
    *  value, no host path (ADR 0002). */
   log?: (line: string) => void;
@@ -91,6 +93,7 @@ export class RunnerLane {
   readonly #heartbeatIntervalMs: number;
   readonly #heartbeatTimeoutMs: number;
   readonly #onReceipt: RunnerLaneOptions["onReceipt"];
+  readonly #observe: ObservationRing | undefined;
   readonly #log: (line: string) => void;
   readonly #wss: WebSocketServer;
   readonly #connections = new Map<string, RunnerConnection>();
@@ -109,6 +112,7 @@ export class RunnerLane {
     this.#heartbeatIntervalMs = opts.heartbeatIntervalMs ?? RUNNER_V1_HEARTBEAT_INTERVAL_MS;
     this.#heartbeatTimeoutMs = opts.heartbeatTimeoutMs ?? RUNNER_V1_HEARTBEAT_TIMEOUT_MS;
     this.#onReceipt = opts.onReceipt;
+    this.#observe = opts.observe?.enabled === true ? opts.observe : undefined;
     this.#log = opts.log ?? ((line) => void process.stderr.write(`[runner] ${line}\n`));
     this.#pendingConnections = new PendingWebsocketLimiter(opts.maxPendingConnections ?? PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS);
     this.#wss = new WebSocketServer({ noServer: true, maxPayload: PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES });
@@ -364,6 +368,7 @@ export class RunnerLane {
         connection.chatExecution = frame.capabilities?.chat_execution === 1 && frame.backends.includes("process");
         connection.chatExecutionHarnesses = frame.chatExecutionHarnesses ?? ["cozyagents"];
         this.#connections.set(connection.key, connection);
+        this.#observe?.event("runner_contact_regained", null, connection.key, { gap_ms: 0 });
         if (connection.rowId !== undefined) {
           this.#roster?.observe(connection.rowId, {
             backends: frame.backends,
@@ -419,6 +424,9 @@ export class RunnerLane {
       releasePending?.();
       if (this.#connections.get(connection.key)?.socket === socket) {
         this.#connections.delete(connection.key);
+        this.#observe?.event("runner_contact_lost", null, connection.key, {
+          gap_ms: Math.max(0, this.#now() - connection.lastSeenAt),
+        });
         for (const listener of this.#chatConnections) listener(connection.key, undefined);
         this.#log(`runner ${connection.key} detached`);
       }
@@ -455,6 +463,7 @@ export class RunnerLane {
       `receipt ${receipt.operationId} bot ${receipt.botId} stage ${receipt.stage}` +
         (receipt.code === undefined ? "" : ` code ${receipt.code}`),
     );
+    this.#observe?.event("runtime_stage", receipt.botId, receipt.operationId, { stage: receipt.stage });
     this.#onReceipt?.(receipt);
   }
 

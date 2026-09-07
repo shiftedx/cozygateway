@@ -1570,6 +1570,9 @@ export function registerBotRoutes(
         {
           ...(parsed.feltLatencyMs === undefined ? {} : { feltLatencyMs: parsed.feltLatencyMs }),
           ...(parsed.networkPath === undefined ? {} : { networkPath: parsed.networkPath }),
+          ...(parsed.vpn === undefined ? {} : { vpn: parsed.vpn }),
+          ...(parsed.edgeRttMs === undefined ? {} : { edgeRttMs: parsed.edgeRttMs }),
+          ...(parsed.edgeColo === undefined ? {} : { edgeColo: parsed.edgeColo }),
         },
       );
       return c.json(recorded, 202);

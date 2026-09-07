@@ -33,6 +33,7 @@ describe("bot message receipts", () => {
     // both null rather than a zero, because "not reported" and "instant" are different facts.
     expect(storage.botMessageReceipt("sage", "m1")).toEqual({
       displayedAt: 100, deviceId: "device-1", feltLatencyMs: null, networkPath: null,
+      vpn: null, edgeRttMs: null, edgeColo: null,
     });
 
     // An id naming no durable row is ignored rather than refused: a device flushing an offline
@@ -74,6 +75,17 @@ describe("bot message receipts", () => {
     // exactly once no matter how often a device re-reports the row.
     expect(storage.recordBotMessageDisplayed("sage", ["cron-message"], "device-1", 200))
       .toEqual({ recorded: 0, deliveries: [] });
+    storage.close();
+  });
+
+  it("keeps the radio, VPN state, and app edge probe together on a receipt", () => {
+    const { storage } = seed();
+    storage.recordBotMessageDisplayed("sage", ["m1"], "device-1", 100, {
+      networkPath: "wired", vpn: false, edgeRttMs: 38, edgeColo: "DFW",
+    });
+    expect(storage.botMessageReceipt("sage", "m1")).toMatchObject({
+      networkPath: "wired", vpn: false, edgeRttMs: 38, edgeColo: "DFW",
+    });
     storage.close();
   });
 

@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import type { ObservationRing } from "../observe/ring.ts";
 
 import { type Static, Type } from "@sinclair/typebox";
 import { ContractViolation, assertValid } from "cozygateway-contract";
@@ -249,6 +250,7 @@ export interface RuntimeBotRegistration {
 
 export interface RuntimeBotServiceOptions {
   storage: Storage;
+  observe?: ObservationRing;
   /** Absent means this deployment has no runner credential configured. Operations are still
    *  accepted and still wait; they are simply never handed to anybody until one exists. */
   lane?: RunnerLane;
@@ -296,6 +298,7 @@ export class RuntimeBotRecoveryUnavailable extends Error {
  * even when no runner has ever connected. */
 export class RuntimeBotService {
   readonly #storage: Storage;
+  readonly #observe: ObservationRing | undefined;
   readonly #lane: RunnerLane | undefined;
   readonly #spec: () => RuntimeSpecDefaults;
   readonly #now: () => number;
@@ -309,6 +312,7 @@ export class RuntimeBotService {
 
   constructor(opts: RuntimeBotServiceOptions) {
     this.#storage = opts.storage;
+    this.#observe = opts.observe?.enabled === true ? opts.observe : undefined;
     this.#lane = opts.lane;
     this.#spec = opts.spec ?? (() => ({}));
     this.#now = opts.now ?? Date.now;
@@ -390,6 +394,7 @@ export class RuntimeBotService {
       at,
       runnerId: runner?.id ?? null,
     });
+    this.#observe?.event("runtime_stage", name, operationId, { stage: "creating" });
     this.#log(`created runtime bot ${name}, operation ${operationId}`);
     this.#lane?.dispatchPending();
     this.#rosterChanged(`runtime bot ${name} created`);
@@ -436,6 +441,7 @@ export class RuntimeBotService {
       // default picks it up exactly as it picks up a pre-54 row.
       runnerId: this.#placement(bot.runnerId),
     });
+    this.#observe?.event("runtime_stage", canon, operationId, { stage: "deleting" });
     this.#log(`deleted runtime bot ${canon}, operation ${operationId}`);
     this.#lane?.dispatchPending();
     this.#rosterChanged(`runtime bot ${canon} deleted`);
@@ -482,6 +488,8 @@ export class RuntimeBotService {
     // into a second recovery command merely because the first requester has not received its 202.
     if (recovered === undefined) throw new RuntimeBotRecoveryUnavailable(canon);
     this.#log(`recovered runtime bot ${canon}, operation ${operationId}`);
+    this.#observe?.event("repair_proposed", canon, operationId, { attempts: 1 });
+    this.#observe?.event("runtime_stage", canon, operationId, { stage: "creating" });
     this.#lane?.dispatchPending();
     this.#rosterChanged(`runtime bot ${canon} recovery requested`);
     return { operationId, runtime: this.projection(canon) };

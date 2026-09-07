@@ -16,6 +16,12 @@ release; everything older is marked pre-release so installers resolve one "lates
   responses report sample counts and content-free updates; observers never receive chat text,
   task goals or roster previews. Existing write-scoped app connections keep their frames.
 
+- Dashboard observation now records the remaining lifecycle events for every gateway-backed bot:
+  device pairing and revocation, approvals and repair proposals, runtime stages, runner contact,
+  and accepted maintenance operations. Capability 73's receipt amendment separates radio from VPN
+  state, adds wired and other radios, and accepts the app's Cloudflare edge round trip and validated
+  colo code on both a receipt and websocket auth. This amends row 73 without a new capability version.
+
 - A group room's approval now carries its scoped-approval block, so a room ask can be answered
   with the same scoped decision a 1:1 chat gets (`com.cozylabs.bots` capability 66, F4). The room
   approval handler validated capability 56's `detail` and capability 62's `repair` and silently

@@ -25,6 +25,8 @@ describe("client frames", () => {
     const sync: ClientFrame = { type: "sync", threads: { t1: 0, t2: 17 } };
     expect(check(ClientFrameSchema, auth)).toBe(true);
     expect(check(ClientFrameSchema, sync)).toBe(true);
+    expect(check(ClientFrameSchema, { type: "auth", token: "tok", edgeRttMs: 42, edgeColo: "ORD" })).toBe(true);
+    expect(check(ClientFrameSchema, { type: "auth", token: "tok", edgeColo: "ord" })).toBe(false);
   });
 
   it("decodes the closed device status v2 phone result and background advertisement", () => {

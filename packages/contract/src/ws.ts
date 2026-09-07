@@ -56,6 +56,8 @@ export const AuthFrameSchema = Type.Object({
   type: Type.Literal("auth"),
   token: Type.String({ minLength: 1 }),
   capabilities: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 0 }))),
+  edgeRttMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 600_000 })),
+  edgeColo: Type.Optional(Type.String({ pattern: "^[A-Z]{3,4}$" })),
 });
 export type AuthFrame = Static<typeof AuthFrameSchema>;
 
