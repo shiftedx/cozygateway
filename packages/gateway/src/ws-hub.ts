@@ -48,6 +48,9 @@ interface Client {
    *  asked for none. Governs ONLY a read-scoped socket: a write-scoped client's frames are exactly
    *  what they were before this row, and it never receives an `observe_*` frame at all. */
   observeKinds?: Set<ObserveSubscriptionKind>;
+  observeQueue?: string[];
+  observeDropped?: number;
+  observeTimer?: ReturnType<typeof setTimeout>;
 }
 
 /** Frames a client is sent only when it did not rule itself out. A client that declares a version
@@ -131,6 +134,7 @@ export class WsHub {
     this.#onDeviceDisconnect = deps.onDeviceDisconnect;
     this.#onMobileAvailable = deps.onMobileAvailable;
     this.#observe = deps.observe?.enabled === true ? deps.observe : undefined;
+    this.#observe?.bindEmitter((frame) => this.broadcast(frame));
     this.#publicHost = deps.publicHost;
     this.#pendingConnections = new PendingWebsocketLimiter(deps.maxPendingConnections ?? PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS);
     const heartbeatMs = deps.heartbeatMs ?? HEARTBEAT_MS;
@@ -241,7 +245,7 @@ export class WsHub {
         this.#clients.add(client);
         this.#deviceCounts.set(device.id, (this.#deviceCounts.get(device.id) ?? 0) + 1);
         this.#send(socket, { type: "ready", deviceId: device.id, gateway: this.#gatewayInfo });
-        this.#send(socket, { type: "cozyapps_snapshot", ...this.#storage.cozyAppsSnapshot() });
+        if (client.scope === "write") this.#send(socket, { type: "cozyapps_snapshot", ...this.#storage.cozyAppsSnapshot() });
         return;
       }
 
@@ -313,10 +317,11 @@ export class WsHub {
       }
       if (frame.type === "observe_unsubscribe") {
         client.observeKinds = undefined;
+        this.#clearObserveQueue(client);
         return;
       }
 
-      for (const [threadId, sinceSeq] of Object.entries(frame.threads)) {
+      for (const [threadId, sinceSeq] of Object.entries(client.scope === "write" ? frame.threads : {})) {
         for (const message of this.#storage.messagesSince(threadId, sinceSeq)) {
           this.#send(socket, { type: "committed", threadId, seq: message.seq, message });
         }
@@ -340,6 +345,7 @@ export class WsHub {
       clearTimeout(authTimer);
       releasePending?.();
       if (client !== undefined) {
+        this.#clearObserveQueue(client);
         this.#clients.delete(client);
         this.#releaseDevice(client.deviceId);
         if (this.#mobileNodes.get(client.deviceId) === client) {
@@ -385,11 +391,71 @@ export class WsHub {
     }
   }
 
+  #clearObserveQueue(client: Client): void {
+    if (client.observeTimer !== undefined) clearTimeout(client.observeTimer);
+    client.observeTimer = undefined;
+    client.observeQueue = [];
+    client.observeDropped = 0;
+  }
+
+  #queueObserve(client: Client, frame: ServerFrame): void {
+    const queue = client.observeQueue ??= [];
+    if (queue.length >= 256) {
+      queue.shift();
+      client.observeDropped = (client.observeDropped ?? 0) + 1;
+    }
+    queue.push(JSON.stringify(frame));
+    this.#scheduleObserve(client);
+  }
+
+  #scheduleObserve(client: Client): void {
+    if (client.observeTimer !== undefined) return;
+    client.observeTimer = setTimeout(() => {
+      client.observeTimer = undefined;
+      if (client.socket.readyState !== WebSocket.OPEN || client.observeKinds === undefined) {
+        this.#clearObserveQueue(client);
+        return;
+      }
+      if (client.socket.bufferedAmount < 64 * 1024) {
+        if ((client.observeDropped ?? 0) > 0) {
+          this.#send(client.socket, { type: "observe_gap", dropped: client.observeDropped! });
+          client.observeDropped = 0;
+        }
+        const queue = client.observeQueue ?? [];
+        while (queue.length > 0 && client.socket.bufferedAmount < 64 * 1024) {
+          client.socket.send(queue.shift()!);
+        }
+      }
+      if ((client.observeQueue?.length ?? 0) > 0) this.#scheduleObserve(client);
+    }, 10);
+    client.observeTimer.unref();
+  }
+
   broadcast(frame: ServerFrame): void {
     const payload = JSON.stringify(frame);
     for (const client of this.#clients) {
       if (client.socket.readyState !== WebSocket.OPEN) continue;
       if (!understands(client, frame)) continue;
+      if (client.scope === "read") {
+        if (frame.type === "bot_chat_delta") {
+          if (client.observeKinds?.has("observe_chat_delta")) {
+            this.#queueObserve(client, {
+              type: "observe_chat_delta", bot: frame.bot, turnId: frame.turnId,
+              seq: frame.seq, textLength: frame.text.length, updatedAt: frame.updatedAt,
+              ...(frame.done === undefined ? {} : { done: frame.done }),
+            });
+          }
+        } else if (client.observeKinds?.has(frame.type as ObserveSubscriptionKind)) {
+          if (frame.type === "observe_sample" || frame.type === "observe_event" || frame.type === "observe_chat_delta") {
+            this.#queueObserve(client, frame);
+          } else if (frame.type === "bot_task_updated" || frame.type === "bot_presence" || frame.type === "bot_roster"
+            || frame.type === "bot_approval_pending" || frame.type === "bot_approval_resolved") {
+            this.#queueObserve(client, { type: "observe_update", kind: frame.type, at: this.#now() });
+          }
+        }
+        continue;
+      }
+      if (frame.type.startsWith("observe_")) continue;
       client.socket.send(payload);
     }
   }
@@ -474,6 +540,8 @@ export class WsHub {
 
   close(): void {
     clearInterval(this.#heartbeatTimer);
+    this.#observe?.bindEmitter(undefined);
+    for (const client of this.#clients) this.#clearObserveQueue(client);
     for (const client of this.#clients) client.socket.close(1001, "server shutdown");
     this.#wss.close();
   }

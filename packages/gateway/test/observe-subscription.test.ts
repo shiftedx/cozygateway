@@ -178,8 +178,8 @@ describe("bot_chat_delta is count only for a read scoped subscriber", () => {
 describe("a read scoped socket is refused every non subscribe frame", () => {
   const commands = [
     { type: "mobile_node_advertise", foreground: true, commands: ["device.status"] },
-    { type: "mobile_node_result", requestId: "r1", lease: "0".repeat(32), status: "ok" },
-    { type: "mobile_node_progress", requestId: "r1", lease: "0".repeat(32), stage: "approved" },
+    { type: "mobile_node_result", requestId: "r1", lease: "0".repeat(43), status: "denied" },
+    { type: "mobile_node_progress", requestId: "r1", lease: "0".repeat(43), stage: "approved" },
   ];
 
   it("answers scope_read_only to each of them and keeps the socket open", async () => {
@@ -225,5 +225,42 @@ describe("a subscriber that falls behind", () => {
     const gap = await session.waitFor("observe_gap", 3_000);
     expect((gap as { dropped: number }).dropped).toBeGreaterThan(0);
     session.close();
+  });
+});
+
+
+describe("observer content boundary", () => {
+  it("receives an invalidation instead of an approval description", async () => {
+    const observer = await connect(readToken, ["bot_approval_pending"]);
+    const phone = await connect(writeToken);
+    hub.broadcast({ type: "bot_approval_pending", bot: "cleo", sessionId: "session",
+      turnId: "turn", toolCallId: "call", name: "shell", updatedAt: 42,
+      detail: "private transcript and /private/file" });
+    expect(await observer.waitFor("observe_update")).toEqual({
+      type: "observe_update", kind: "bot_approval_pending", at: 1_000,
+    });
+    expect(JSON.stringify(observer.frames)).not.toContain("private transcript");
+    expect(await phone.waitFor("bot_approval_pending")).toMatchObject({ detail: "private transcript and /private/file" });
+    observer.close(); phone.close();
+  });
+
+  it("acknowledges sync without replaying a transcript to an observer", async () => {
+    storage.upsertAgent({ id: "a1", name: "agent", avatar: null, backend: "mock" });
+    storage.createThread({ id: "thread", agentId: "a1", title: "thread", createdAt: 1 });
+    storage.appendMessage("thread", { role: "user", blocks: [{ type: "paragraph", text: "private transcript" }] }, 1);
+    const observer = await connect(readToken);
+    observer.socket.send(JSON.stringify({ type: "sync", threads: { thread: 0 } }));
+    await observer.waitFor("synced");
+    expect(observer.frames.some((frame) => frame.type === "committed")).toBe(false);
+    expect(JSON.stringify(observer.frames)).not.toContain("private transcript");
+    observer.close();
+  });
+
+  it("never emits a sample the store refused", async () => {
+    const observer = await connect(readToken, ["observe_sample"]);
+    observe.sample("ttft_ms", "cleo", Number.NaN);
+    await settle();
+    expect(observer.frames.some((frame) => frame.type === "observe_sample")).toBe(false);
+    observer.close();
   });
 });

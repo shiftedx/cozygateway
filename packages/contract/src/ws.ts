@@ -42,6 +42,7 @@ import {
   ObserveChatDeltaFrameSchema,
   ObserveEventFrameSchema,
   ObserveGapFrameSchema,
+  ObserveUpdateFrameSchema,
   ObserveSampleFrameSchema,
   ObserveSubscribeFrameSchema,
   ObserveUnsubscribeFrameSchema,
@@ -321,5 +322,6 @@ export const ServerFrameSchema = Type.Union([
   ObserveEventFrameSchema,
   ObserveChatDeltaFrameSchema,
   ObserveGapFrameSchema,
+  ObserveUpdateFrameSchema,
 ]);
 export type ServerFrame = Static<typeof ServerFrameSchema>;

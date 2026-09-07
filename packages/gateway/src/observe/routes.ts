@@ -1,8 +1,5 @@
 /** Dashboard packet D3 (capability 75): the observer's read routes, `/observe/api/*`.
  *
- *  STATUS: the wire types and the D5 seam are declared; the route group itself is not implemented
- *  yet (see `packages/gateway/test/observe-routes.test.ts`, which is the failing specification).
- *
  *  Three rules the finished module holds:
  *
  *  1. EVERY ROUTE IS A `GET`. The dashboard is strictly read only, so there is no request shape
@@ -122,3 +119,131 @@ export const ABSENT_SNAPSHOT_READER: ObserveSnapshotReader = {
   throughput: () => ({ priceSheetConfigured: false, rows: [] }),
   toolCosts: () => ({ priceSheetConfigured: false, rows: [] }),
 };
+
+import { Hono } from "hono";
+import type { AppDeps } from "../http.ts";
+import { isAllowedEventKind, isAllowedSeries, OBSERVE_SERIES_TAGS } from "./privacy.ts";
+import type { ObserveSummary } from "./store.ts";
+
+function aggregate(summary: ObserveSummary, speed = false): ObserveAggregate {
+  const belowSampleFloor = speed && summary.count < SPEED_SAMPLE_FLOOR;
+  return { samples: summary.count, p50: belowSampleFloor ? null : summary.p50 ?? null,
+    p95: belowSampleFloor ? null : summary.p95 ?? null, belowSampleFloor };
+}
+
+/** Auth is installed by the parent router before this group. Every projection below is explicit:
+ * adding a field to a chat, artifact, or runner record never silently exposes it to the dashboard. */
+export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["observe"]> }): Hono {
+  const app = new Hono();
+  const ring = deps.observe;
+  const reader = deps.observeSnapshots ?? ABSENT_SNAPSHOT_READER;
+  const startedAt = deps.now();
+  const windows = { "1h": 3_600_000, "24h": 86_400_000, "7d": 604_800_000 };
+  const paths = ["overview", "bots", "turns", "roundtrip", "attach", "approvals", "deliveries",
+    "devices", "events", "series", "cozyagents", "cozyagents/spend", "cozyagents/tools"] as const;
+  for (const path of paths) app.get(`/observe/api/${path}`, (c) => {
+    const window = c.req.query("window") ?? "24h";
+    if (!Object.hasOwn(windows, window)) return c.json({ error: { code: "invalid_request", message: "invalid window" } }, 400);
+    const now = deps.now();
+    const from = now - windows[window as keyof typeof windows];
+    const to = now + 1; // Store windows are half-open; include measurements made on this millisecond.
+    const bot = c.req.query("bot");
+    const query = { from, to, ...(bot === undefined ? {} : { bot: ring.identify(bot) }) };
+    const readerQuery = { from, to, ...(bot === undefined ? {} : { bot }) };
+    const roster = deps.bots?.roster().bots ?? [];
+    const selected = roster.filter((row) => bot === undefined || row.name === bot);
+    const names = new Map(roster.map((row) => [ring.identify(row.name), row.name]));
+    const summary = (series: string, speed = false, subject = query.bot) => aggregate(ring.store.summarize({
+      series, from, to, ...(subject === undefined ? {} : { bot: subject }), includeTags: true,
+    }), speed);
+    const points = (series: string, subject = query.bot) => ring.store.samples({
+      series, from, to, ...(subject === undefined ? {} : { bot: subject }), limit: 20_000,
+    });
+    const events = (kind?: string) => ring.store.events({ ...query, ...(kind === undefined ? {} : { kind }), limit: 5_000 })
+      .map(({ detailJson, ...row }) => ({ ...row, botName: row.bot === null ? null : names.get(row.bot) ?? "former bot",
+        detail: detailJson === null ? null : JSON.parse(detailJson) as Record<string, string | number | boolean> }));
+    const pending = deps.bots !== undefined && "pendingApprovals" in deps.bots
+      ? deps.bots.pendingApprovals().filter((row) => bot === undefined || row.bot === bot) : [];
+    const attach = deps.attachHealth?.() ?? null;
+    const terminals = () => events("turn_terminal");
+    switch (path) {
+      case "series": {
+        const base = c.req.query("series") ?? "ttft_ms";
+        const tag = c.req.query("tag");
+        const series = tag === undefined ? base : `${base}|${tag}`;
+        if (!isAllowedSeries(series)) return c.json({ error: { code: "invalid_request", message: "invalid series or tag" } }, 400);
+        return c.json({ summary: summary(series), points: points(series), pointLimit: 20_000 });
+      }
+      case "events": {
+        const kind = c.req.query("kind");
+        if (kind !== undefined && !isAllowedEventKind(kind)) return c.json({ error: { code: "invalid_request", message: "invalid kind" } }, 400);
+        return c.json({ events: events(kind), limit: 5_000 });
+      }
+      case "overview": {
+        const flaps = events("tunnel_flap");
+        const repairs = reader.attached() ? reader.internals(readerQuery).reduce((n, row) => n + row.toolServers.filter((server) => server.state === "repair_pending").length, 0) : 0;
+        return c.json({ gateway: { name: deps.gatewayInfo.name, version: deps.gatewayInfo.version,
+          uptimeMs: Math.max(0, now - startedAt), bridge: deps.hermesBridgeAbsent ? "absent" : deps.bots?.health().online ? "online" : "offline" },
+          attach, tunnel: { lastFlapAt: flaps[0]?.at ?? null, state: flaps[0]?.detail?.reason === "recovered" ? "online" : flaps.length ? "offline" : "unknown" },
+          needsAPerson: { total: pending.length + repairs, approvals: pending.length, repairs },
+          tiles: { firstToken: summary("ttft_ms"), roundTrip: summary("device_rtt_ms"), turns: terminals().length,
+            spend: reader.attached() ? reader.throughput(readerQuery) : null } });
+      }
+      case "bots": return c.json({ bots: selected.map((row) => {
+        const hash = ring.identify(row.name);
+        const turns = ring.store.events({ from, to, bot: hash, kind: "turn_terminal", limit: 5_000 });
+        return { id: hash, name: row.name, harness: row.runtime === "cozyagents" ? "cozyagents" : "hermes",
+          online: deps.presenceOf(row.name) === "online", lastTurnAt: turns[0]?.at ?? null,
+          firstToken: summary("ttft_ms", false, hash), sparkline: points("ttft_ms", hash), turns: turns.length,
+          failures: turns.filter((turn) => turn.detailJson !== null && JSON.parse(turn.detailJson).status === "failed").length,
+          openApprovals: pending.filter((approval) => approval.bot === row.name).length };
+      }) });
+      case "turns": {
+        const hours = new Map<number, number[]>();
+        for (const point of points("ttft_ms")) {
+          const hour = Math.floor(point.at / 3_600_000) * 3_600_000;
+          const values = hours.get(hour) ?? []; values.push(point.value); hours.set(hour, values);
+        }
+        return c.json({ terminals: terminals(), firstTokenByHour: [...hours].map(([at, values]) => {
+          values.sort((a, b) => a - b);
+          return { at, samples: values.length, p50: values[Math.ceil(values.length * .5) - 1], p95: values[Math.ceil(values.length * .95) - 1] };
+        }) });
+      }
+      case "roundtrip": return c.json({ hops: [
+        ["device", "device_rtt_ms"], ["tunnel", "tunnel_rtt_ms"], ["gateway", "gateway_handle_ms"],
+        ["peer", "peer_rtt_ms"], ["model", "model_step_ms"], ["turn", "turn_ms"],
+      ].map(([hop, series]) => ({ hop, ...summary(series!) })), felt: summary("felt_latency_ms"),
+        byNetworkPath: OBSERVE_SERIES_TAGS.filter((tag) => !["tunnel", "lan", "ok", "not_found", "http_error", "network_error"].includes(tag))
+          .map((networkPath) => ({ networkPath, ...summary(`felt_latency_ms|${networkPath}`) })) });
+      case "attach": return c.json({ summary: attach,
+        peers: selected.map((row) => ({ bot: row.name, id: ring.identify(row.name), online: deps.presenceOf(row.name) === "online", roundTrip: summary("peer_rtt_ms", false, ring.identify(row.name)) })),
+        deadLetters: (deps.attachDeadLetters?.() ?? []).filter((row) => bot === undefined || row.agentId === bot)
+          .map((row) => ({ bot: ring.identify(row.agentId), sequence: row.sequence, attempts: row.attempts, at: row.deadLetteredAt })) });
+      case "approvals": return c.json({ pending: pending.map((row) => ({ bot: row.bot, id: ring.identify(row.toolCallId), createdAt: row.createdAt })),
+        grants: selected.flatMap((row) => deps.storage.approvalGrants(row.name, now).map((grant) => ({ bot: row.name,
+          id: ring.identify(grant.grantId), scope: grant.scope, category: grant.category, createdAt: grant.createdAt, expiresAt: grant.expiresAt }))),
+        events: events().filter((row) => row.kind === "approval_raised" || row.kind === "approval_resolved") });
+      case "deliveries": return c.json({ artifacts: deps.storage.artifacts.list(bot === undefined ? {} : { bot })
+        .filter((row) => row.createdAt >= from && row.createdAt < to).map((row) => ({ id: ring.identify(row.artifactId), bot: row.bot,
+          state: row.state, sizeBytes: row.sizeBytes, createdAt: row.createdAt, committedAt: row.committedAt ?? null })),
+        push: summary("push_result"), events: events("push_result") });
+      case "devices": return c.json({ devices: deps.storage.listDevices().map((row) => ({ id: ring.identify(row.id), name: row.name,
+        kind: row.kind, scope: row.scope, createdAt: row.createdAt, lastSeenAt: row.lastSeenAt })),
+        runners: (deps.runners?.list() ?? []).map((row) => ({ id: ring.identify(row.id), name: row.displayName ?? row.name,
+          online: deps.runnerPresence?.online(row.id) ?? false, lastContactAt: deps.runnerPresence?.lastContactAt(row.id) ?? row.lastSeenAt })) });
+      case "cozyagents": return c.json(reader.attached() ? { available: true, internals: reader.internals(readerQuery),
+        model: { stepLatency: summary("model_step_ms", true) } } : { available: false, reason: "no_snapshot_lane" });
+      case "cozyagents/spend": {
+        if (!reader.attached()) return c.json({ available: false, reason: "no_snapshot_lane" });
+        const result = reader.throughput(readerQuery);
+        return c.json({ available: true, priceSheet: { configured: result.priceSheetConfigured }, rows: result.rows });
+      }
+      case "cozyagents/tools": {
+        if (!reader.attached()) return c.json({ available: false, reason: "no_snapshot_lane" });
+        const result = reader.toolCosts(readerQuery);
+        return c.json({ available: true, priceSheet: { configured: result.priceSheetConfigured }, rows: result.rows });
+      }
+    }
+  });
+  return app;
+}

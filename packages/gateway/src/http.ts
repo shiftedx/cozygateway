@@ -1,3 +1,4 @@
+import { observeRoutes } from "./observe/routes.ts";
 import { registerArtifactRoutes } from "./artifact-routes.ts";
 import { registerTaskRoutes } from "./task-routes.ts";
 import { createHash, randomUUID } from "node:crypto";
@@ -488,6 +489,12 @@ export function createApp(deps: AppDeps): Hono<Env> {
     // remember it and none of them can forget it.
     await next();
   });
+
+  if (deps.observe?.enabled === true) {
+    for (const route of observeRoutes({ ...deps, observe: deps.observe }).routes) {
+      app.get(route.path, requireDevice, route.handler);
+    }
+  }
 
   const requireAttach = createMiddleware<Env>(async (c, next) => {
     const agentId =

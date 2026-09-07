@@ -95,3 +95,13 @@ export const ObserveGapFrameSchema = Type.Object({
   dropped: Type.Integer({ minimum: 1 }),
 }, { additionalProperties: false });
 export type ObserveGapFrame = Static<typeof ObserveGapFrameSchema>;
+
+/** A content-free invalidation of a live panel. The ordinary task/roster/approval frames carry
+ * goals, previews and resource descriptions, so observers receive only the source kind and time
+ * and refresh the corresponding read route. */
+export const ObserveUpdateFrameSchema = Type.Object({
+  type: Type.Literal("observe_update"),
+  kind: Type.Union(["bot_task_updated", "bot_presence", "bot_roster", "bot_approval_pending", "bot_approval_resolved"].map((kind) => Type.Literal(kind))),
+  at: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type ObserveUpdateFrame = Static<typeof ObserveUpdateFrameSchema>;

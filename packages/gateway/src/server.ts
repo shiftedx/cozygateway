@@ -1211,6 +1211,7 @@ export async function startGateway(
     notifier.notifyTaskCompletion(taskCompletionPayload(notice), hub.connectedDeviceIds());
   });
   const app = createApp({
+    observe,
     storage,
     flushTaskCommands: () => attachV1Ingress.flushTaskCommands(),
     config,
