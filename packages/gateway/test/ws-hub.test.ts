@@ -83,6 +83,45 @@ async function until(predicate: () => boolean, ms = 2_000): Promise<void> {
   }
 }
 
+describe("capability-71 draft frames", () => {
+  it("keeps a below-71 client byte identical by not sending it the frame at all", async () => {
+    // A client may say what it understands on `auth`. One that says it is below 71 is NOT sent
+    // `bot_draft_updated`, so "additive" means what it says rather than "one extra frame it drops".
+    // A client that declares nothing is sent it, because that is every client shipped before this
+    // row and the contract's own rule is that an unknown server frame is ignored; taking the frame
+    // away from them instead would break the ones that DO understand it and simply never said so.
+    const below = connect();
+    const seenBelow = frames(below);
+    await once(below, "open");
+    below.send(JSON.stringify({ type: "auth", token, capabilities: { "com.cozylabs.bots": 70 } }));
+    await until(() => seenBelow.some((frame) => frame.type === "ready"));
+
+    const current = connect();
+    const seenCurrent = frames(current);
+    await once(current, "open");
+    current.send(JSON.stringify({ type: "auth", token, capabilities: { "com.cozylabs.bots": 71 } }));
+    await until(() => seenCurrent.some((frame) => frame.type === "ready"));
+
+    const silent = connect();
+    const seenSilent = frames(silent);
+    await once(silent, "open");
+    silent.send(JSON.stringify({ type: "auth", token }));
+    await until(() => seenSilent.some((frame) => frame.type === "ready"));
+
+    hub.broadcast({ type: "bot_draft_updated", bot: "sage", sessionId: "thread-1",
+                    text: "half a thought", updatedAt: 2_000 });
+    await until(() => seenCurrent.some((frame) => frame.type === "bot_draft_updated"));
+    await until(() => seenSilent.some((frame) => frame.type === "bot_draft_updated"));
+    expect(seenBelow.some((frame) => frame.type === "bot_draft_updated")).toBe(false);
+
+    // Every other frame still reaches all three: the filter is one frame wide.
+    hub.broadcast({ type: "bot_presence", agents: [] });
+    await until(() => seenBelow.some((frame) => frame.type === "bot_presence"));
+
+    below.close(); current.close(); silent.close();
+  });
+});
+
 describe("auth", () => {
   it("bounds pending handshakes, then frees a slot once a client authenticates", async () => {
     hub.close();

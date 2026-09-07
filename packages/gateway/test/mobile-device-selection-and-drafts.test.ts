@@ -27,7 +27,7 @@ import {
   type MobileNodeLifecycleEvent,
   type MobileNodeRoute,
 } from "../src/mobile-node.ts";
-import { stripPeerDeviceHint } from "../src/adapters/attach/protocol-v1.ts";
+import { AttachV1MobileRequestSchema } from "../src/adapters/attach/protocol-v1.ts";
 import { openStorage } from "../src/storage.ts";
 
 const purpose = "Report phone readiness";
@@ -125,35 +125,25 @@ describe("capability-70 explicit device selection", () => {
       .toEqual(["deviceId", "source"]);
   });
 
-  it("ignores a peer-supplied device hint without refusing the request or closing the socket", () => {
-    // A frame carrying `targetDeviceId` is a peer trying to pick which of a person's phones
-    // rings. The field is not part of this wire: it is stripped at the boundary, said out loud
-    // once, and the request is admitted exactly as if it had never been there. Refusing the frame
-    // would lose a request a person is waiting on over a field that means nothing.
-    const lines: string[] = [];
-    const frame = {
+  it("has no wire field a peer could name a device with", () => {
+    // Removed, not tolerated. `targetDeviceId` is not a member of any of the five request shapes,
+    // so the closed key set refuses a frame carrying one the way it refuses any other unknown key,
+    // with the ingress's ordinary named refusal rather than a silent drop. There is no sanitizer
+    // for it and no code path that reads it, which is the only way a routing rule can be checked
+    // by reading the schema.
+    for (const command of ["device.status", "location.current", "camera.capture", "file.pick", "notification.present"]) {
+      const shape = AttachV1MobileRequestSchema.anyOf.find(
+        (member) => (member as { properties: { command: { const: string } } }).properties.command.const === command,
+      ) as { properties: Record<string, unknown>; additionalProperties: boolean } | undefined;
+      expect(shape, command).toBeDefined();
+      expect(Object.keys(shape!.properties)).not.toContain("targetDeviceId");
+      expect(shape!.additionalProperties).toBe(false);
+    }
+    expect(check(AttachV1MobileRequestSchema, {
       kind: "mobile_request", requestId: "req-1", command: "device.status",
       threadId: "thread-1", turnId: "turn-1", expiresAt: 20_000,
       purpose: "Report phone readiness", targetDeviceId: "phone-b",
-    };
-    const stripped = stripPeerDeviceHint(frame, (line) => lines.push(line));
-
-    expect("targetDeviceId" in (stripped as Record<string, unknown>)).toBe(false);
-    expect(stripped).toEqual({
-      kind: "mobile_request", requestId: "req-1", command: "device.status",
-      threadId: "thread-1", turnId: "turn-1", expiresAt: 20_000,
-      purpose: "Report phone readiness",
-    });
-    // Said out loud, bounded, and with no value in it: the id a peer tried to name is not logged.
-    const logged = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
-    expect(logged).toEqual([{ event: "mobile_peer_device_hint_ignored", command: "device.status" }]);
-
-    // An ordinary frame is untouched and costs no line.
-    const quiet: string[] = [];
-    const ordinary = { ...frame, targetDeviceId: undefined };
-    delete (ordinary as Record<string, unknown>)["targetDeviceId"];
-    expect(stripPeerDeviceHint(ordinary, (line) => quiet.push(line))).toBe(ordinary);
-    expect(quiet).toEqual([]);
+    })).toBe(false);
   });
 
   it("a second device attaching mid-request does not steal an explicitly targeted request", () => {
@@ -192,6 +182,21 @@ describe("capability-70 explicit device selection", () => {
 
     store.setBotMobilePreferredDevice("sage", "thread-1", "phone-a", 2_000);
     store.setBotMobilePreferredDevice("sage", "thread-1", null, 2_100);
+    expect(store.botMobilePreferredDevice("sage", "thread-1")).toEqual({ sessionId: "thread-1" });
+    store.close();
+  });
+
+  it("takes a preference with the device it names when that device is unpaired", () => {
+    const store = storageWithDevices("phone-a", "tablet-b");
+    store.setBotMobilePreferredDevice("sage", "thread-1", "tablet-b", 2_000);
+    store.setBotMobilePreferredDevice("sage", "thread-2", "phone-a", 2_000);
+
+    store.deleteDevice("tablet-b");
+
+    // The read already hid it behind its join; this is the row itself going, so an unpaired
+    // device leaves no routing choice pointing at it in the database either.
+    expect(store.mobilePreferredDeviceRowsForTesting("sage").map((row) => row.sessionId))
+      .toEqual(["thread-2"]);
     expect(store.botMobilePreferredDevice("sage", "thread-1")).toEqual({ sessionId: "thread-1" });
     store.close();
   });
@@ -290,7 +295,7 @@ describe("capability-71 composer draft sync", () => {
     store.close();
   });
 
-  it("sweeps an untouched draft after thirty days and never a fresh one", () => {
+  it("sweeps an untouched draft after thirty days, on an idle gateway as well as a busy one", () => {
     const store = storageWithDevices("phone-a");
     const day = 24 * 60 * 60 * 1_000;
     store.setBotComposerDraft("sage", "old", "abandoned", 1_000);
@@ -298,6 +303,35 @@ describe("capability-71 composer draft sync", () => {
 
     expect(store.botComposerDraft("sage", "old").text).toBe("");
     expect(store.botComposerDraft("sage", "new").text).toBe("current");
+
+    // A GATEWAY WHERE NOBODY EVER TYPES AGAIN still forgets. Sweeping only on the next write meant
+    // one abandoned draft on an idle gateway was kept for as long as the gateway ran, which is not
+    // what row 71 promises. The retention pass owns it, and so does the read.
+    const idle = storageWithDevices("phone-a");
+    idle.setBotComposerDraft("sage", "abandoned", "left behind", 1_000);
+    expect(idle.botComposerDraft("sage", "abandoned").text).toBe("left behind");
+    idle.pruneExpiredComposerDrafts(1_000 + 31 * day);
+    expect(idle.botComposerDraft("sage", "abandoned").text).toBe("");
+    // The read is the second guard, for a gateway between two retention passes.
+    const read = storageWithDevices("phone-a");
+    read.setBotComposerDraft("sage", "abandoned", "left behind", 1_000);
+    expect(read.botComposerDraft("sage", "abandoned", 1_000 + 31 * day).text).toBe("");
+    store.close(); idle.close(); read.close();
+  });
+
+  it("keeps drafts strictly ordered, so a slow write can never revive a cleared one", () => {
+    // Row 71's cross-device clear rests on the order of two writes. `updatedAt` is the version a
+    // client compares, so it must move FORWARD on every stored change even when the gateway clock
+    // repeats a millisecond or steps backwards; two writes sharing a version would make "newer"
+    // unanswerable at exactly the moment it matters, which is a send racing a keystroke.
+    const store = storageWithDevices("phone-a");
+    const first = store.setBotComposerDraft("sage", "thread-1", "hi", 2_000);
+    const same = store.setBotComposerDraft("sage", "thread-1", "hi there", 2_000);
+    const backwards = store.setBotComposerDraft("sage", "thread-1", "", 1_500);
+
+    expect(same.draft.updatedAt).toBeGreaterThan(first.draft.updatedAt);
+    expect(backwards.draft.updatedAt).toBeGreaterThan(same.draft.updatedAt);
+    expect(store.botComposerDraft("sage", "thread-1").updatedAt).toBe(backwards.draft.updatedAt);
     store.close();
   });
 
@@ -309,6 +343,32 @@ describe("capability-71 composer draft sync", () => {
     expect(check(BotDraftUpdatedFrameSchema, frame)).toBe(true);
     // A draft belongs to the person, so no device id is accepted on the frame.
     expect(check(BotDraftUpdatedFrameSchema, { ...frame, deviceId: "phone-a" })).toBe(false);
+  });
+
+  it("answers a bot this gateway does not hold with a refusal, never a 200 that stored nothing", async () => {
+    // The surface answers "no such bot" by answering nothing at all. Echoing the body back with a
+    // 200 tells a person their draft or their device choice was saved, when the next read will say
+    // it was not, and that is worse than either a refusal or a silent failure alone.
+    const app = mount({
+      composerDraft: vi.fn(() => undefined),
+      setComposerDraft: vi.fn(() => undefined),
+      mobilePreferredDevice: vi.fn(() => undefined),
+      setMobilePreferredDevice: vi.fn(() => "unknown_bot" as const),
+    });
+
+    for (const [path, body] of [
+      ["/bots/ghost/drafts", { sessionId: "thread-1", text: "hi" }],
+      ["/bots/ghost/mobile-requests/preferred-device?sessionId=thread-1", { deviceId: null }],
+    ] as const) {
+      const written = await app.request(path, {
+        method: "PUT", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      expect(written.status, path).toBe(404);
+      expect(await written.json()).toMatchObject({ error: { code: "not_found" } });
+    }
+    expect((await app.request("/bots/ghost/drafts?sessionId=thread-1")).status).toBe(404);
+    expect((await app.request("/bots/ghost/mobile-requests/preferred-device?sessionId=thread-1")).status).toBe(404);
   });
 
   it("reads and writes the draft over its route and refuses an overlong one by name", async () => {
