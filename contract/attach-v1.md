@@ -570,3 +570,13 @@ For camera and file-picker media, the deadline governs admission to the authenti
 The gateway consumes the one-shot device/lease claim before reading the request body. An upload
 claimed before the deadline may finish reading, validating, and storing after it; the consumed
 claim remains replay-safe and cannot authorize a second upload.
+
+### Observation snapshots (capability 74)
+
+A CozyAgents peer first discovers the gateway's bots extension version in `hello_ack`. It offers
+`observation_snapshot` only on a subsequent hello after seeing version 74 or later. The gateway
+ignores unknown hello capability names and grants only supported names. Existing Hermes peers
+remain unchanged. The negotiated lane sends `{kind: "observation_snapshot", payload}` without
+sequence, durable spool, ACK or replay. Payload failures and frames above 64 KiB are counted drops;
+sending this frame without negotiation closes with 1008. Row 74 in `ext-bots-v1.md` defines the
+closed payload, privacy rule, cadence, latest-state store and lifetime accounting.

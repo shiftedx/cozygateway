@@ -78,6 +78,8 @@ export interface ObserveSnapshotStep {
   promptTokens?: number;
   completionTokens?: number;
   cachedTokens?: number;
+  prefillTokensPerSecond?: number;
+  decodeTokensPerSecond?: number;
 }
 
 export interface ObserveSnapshotToolCall {
@@ -85,7 +87,9 @@ export interface ObserveSnapshotToolCall {
   step: number;
   /** Distinguishes two tool calls made in the same step. */
   index?: number;
-  toolMs: number;
+  toolMs?: number;
+  tool?: string;
+  inducedTokens?: number;
 }
 
 export interface ObserveSnapshot {
@@ -380,6 +384,8 @@ export class ObservationRing {
     cached: number;
     costMicros: number;
     turns: number;
+    priced?: number;
+    unpriced?: number;
     at: number;
   }): boolean {
     if (!this.#enabled) return false;
@@ -403,38 +409,47 @@ export class ObservationRing {
    *
    *  Only numeric fields cross, each under a CozyAgents-measured series name, so a Hermes bot that
    *  never sends a snapshot simply has no rows here rather than an inferred one. */
-  foldSnapshotIntoSeries(bot: string, snapshot: ObserveSnapshot): { folded: number; skipped: number } {
-    if (!this.#enabled) return { folded: 0, skipped: 0 };
+  foldSnapshotIntoSeries(bot: string, snapshot: ObserveSnapshot, durablyClaimed = false): {
+    folded: number; skipped: number; acceptedSteps: ObserveSnapshotStep[]; acceptedToolCalls: ObserveSnapshotToolCall[];
+  } {
+    const acceptedSteps: ObserveSnapshotStep[] = [];
+    const acceptedToolCalls: ObserveSnapshotToolCall[] = [];
+    if (!this.#enabled) return { folded: 0, skipped: 0, acceptedSteps, acceptedToolCalls };
     let folded = 0;
     let skipped = 0;
     for (const step of snapshot.steps ?? []) {
-      if (!claim(this.#folded, `${bot} ${step.turnId} s${step.step}`)) {
+      if (!durablyClaimed && !claim(this.#folded, `${bot} ${step.turnId} s${step.step}`)) {
         skipped += 1;
         continue;
       }
       folded += 1;
+      acceptedSteps.push(step);
+      if (step.prefillTokensPerSecond !== undefined) this.sample("prefill_tokens_per_second", bot, step.prefillTokensPerSecond);
+      if (step.decodeTokensPerSecond !== undefined) this.sample("decode_tokens_per_second", bot, step.decodeTokensPerSecond);
       if (step.modelStepMs !== undefined) this.sample("model_step_ms", bot, step.modelStepMs);
       if (step.promptTokens !== undefined) this.sample("prompt_tokens", bot, step.promptTokens);
       if (step.completionTokens !== undefined) this.sample("completion_tokens", bot, step.completionTokens);
       if (step.cachedTokens !== undefined) this.sample("cached_tokens", bot, step.cachedTokens);
     }
     for (const call of snapshot.toolCalls ?? []) {
-      if (!claim(this.#folded, `${bot} ${call.turnId} t${call.step}.${call.index ?? 0}`)) {
+      if (!durablyClaimed && !claim(this.#folded, `${bot} ${call.turnId} t${call.step}.${call.tool ?? call.index ?? 0}`)) {
         skipped += 1;
         continue;
       }
       folded += 1;
-      this.sample("tool_ms", bot, call.toolMs);
+      acceptedToolCalls.push(call);
+      if (call.toolMs !== undefined) this.sample("tool_ms", bot, call.toolMs);
+      if (call.inducedTokens !== undefined) this.sample("induced_tokens", bot, call.inducedTokens);
     }
     for (const turn of snapshot.turns ?? []) {
-      if (!claim(this.#folded, `${bot} ${turn.turnId} n`)) {
+      if (!durablyClaimed && !claim(this.#folded, `${bot} ${turn.turnId} n`)) {
         skipped += 1;
         continue;
       }
       folded += 1;
       this.sample("model_steps", bot, turn.modelSteps);
     }
-    return { folded, skipped };
+    return { folded, skipped, acceptedSteps, acceptedToolCalls };
   }
 
   // retention

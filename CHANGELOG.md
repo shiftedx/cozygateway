@@ -7,6 +7,11 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## Unreleased
 
+- Capability 74 adds CozyAgents observation snapshots: latest bot internals, per-step throughput,
+  lifetime usage, and attributed tool costs. Unknown models show tokens only; the dated Claude
+  list-price sheet and local zero rates can be overridden in `observability.prices`. Unknown
+  capability names on attach hello are ignored so additive lanes can negotiate safely.
+
 - A group room's approval now carries its scoped-approval block, so a room ask can be answered
   with the same scoped decision a 1:1 chat gets (`com.cozylabs.bots` capability 66, F4). The room
   approval handler validated capability 56's `detail` and capability 62's `repair` and silently

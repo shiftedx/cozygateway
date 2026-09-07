@@ -36,7 +36,8 @@ import {
 } from "cozygateway-contract";
 
 import { DEFAULT_ARTIFACT_STORE_BYTES } from "./artifacts.ts";
-import { hermesEndpoints, nativeBots, observability, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
+import { hermesEndpoints, nativeBots, observability, observabilityPrices, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
+import { ObservationSnapshotLane } from "./observe/lane.ts";
 import { ObservationRing } from "./observe/ring.ts";
 import { TunnelSelfProbe, TUNNEL_PROBE_INTERVAL_MS } from "./observe/self-probe.ts";
 import { publicHostOf } from "./observe/origin.ts";
@@ -495,6 +496,7 @@ export async function startGateway(
   // either way so every hook below takes the same shape, and inert when disabled.
   const observeOptions = observability(config);
   const observe = new ObservationRing({ store: storage.observe, options: observeOptions });
+  const observationSnapshots = new ObservationSnapshotLane({ ring: observe, prices: observabilityPrices(config) });
   const observePublicHost = publicHostOf(config.publicUrl);
   let mobileNode: MobileNodeBroker | undefined;
   const hub = new WsHub({
@@ -725,6 +727,10 @@ export async function startGateway(
     trace: traceLog,
     observe,
     events: {
+      onObservationSnapshot: (agentId, payload, bytes) => {
+        const bot = storage.chatExecutionById(agentId)?.bot ?? agentId;
+        return observationSnapshots.accept(bot, payload, bytes);
+      },
       canAcceptEvent: (agentId, frame) => {
         if (storage.chatExecutionById(agentId)) return nativeBotPlane?.canAccept(agentId, frame) === true;
         if (roomHostForEvent(agentId, frame)?.canAcceptGroupAttachEvent(agentId, frame) === true) return true;
