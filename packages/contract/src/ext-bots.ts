@@ -2955,4 +2955,12 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * measured; the row does make an unsent draft DURABLE SERVER STATE, dropped with its conversation's
  * history and swept after thirty days untouched. Additive: a client below 71 keeps its
  * own per-device draft and every peer of every backend is untouched. */
-export const BOTS_CAPABILITY_VERSION = 71;
+/** Capability 72: an observer device, a browser paired as a strictly read-only device.
+ * `POST /pair` accepts `kind: "observer"`, consumes an observer-kind setup code, and mints a
+ * device token whose scope is `read`. A read-scoped token is refused `403 scope_read_only` by
+ * every write route and every websocket command frame, enforced in one auth middleware rather
+ * than per route, so a write route added later is refused by construction. An observer appears on
+ * `GET /devices` and is revoked by `DELETE /devices/:id` like any device. Additive: a device
+ * paired before 72 is `scope: "write"` and refused nothing, a client that never sends
+ * `kind: "observer"` is byte identical to its pre-72 self, and no peer of any backend changes. */
+export const BOTS_CAPABILITY_VERSION = 72;
