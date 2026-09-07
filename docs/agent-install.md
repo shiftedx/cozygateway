@@ -179,6 +179,8 @@ cozygateway repair
 bash ~/.cozygateway/bin/agent-install.sh --uninstall --gateway-dir ~/.cozygateway
 ```
 
+Install and repair also run the ownership-checked [hygiene protocol](install-hygiene.md), including safe migration of older recorded scopes and preservation of unrelated environment settings.
+
 `cozygateway update` is an alias for `repair`. Both commands use the persisted,
 checksummed release bootstrap and fetch one current matched release; they never
 treat the installed bundle or a checkout as an update source. A repair retains
