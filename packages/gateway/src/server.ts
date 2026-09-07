@@ -1233,7 +1233,7 @@ export async function startGateway(
     ...(options.pairingAdmission === undefined ? {} : { pairingAdmission: options.pairingAdmission }),
     attachHealth: () => ({ ...attachV1Ingress.health(), hermes: attachV1Ingress.connectionHealth(hermesProfileIds) }),
     observeAttachPeers: () => [...new Set(attachTokens.values())].map(id => ({
-      bot: storage.chatExecutionById(id)?.bot ?? id, ...attachV1Ingress.peerHealth(id),
+      bot: storage.chatExecutionById(id)?.bot ?? id, peerId: id, ...attachV1Ingress.peerHealth(id),
     })),
     observeBotForPeer: id => storage.chatExecutionById(id)?.bot ?? id,
     attachDeadLetters: () => storage.attachProjectionDeadLetters(),

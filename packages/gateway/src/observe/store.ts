@@ -230,6 +230,7 @@ export class ObserveStore {
   summarize(query: {
     series: string;
     bot?: string | null;
+    bots?: readonly string[];
     from: number;
     to: number;
     includeTags?: boolean;
@@ -245,6 +246,10 @@ export class ObserveStore {
     if (query.bot !== undefined && query.bot !== null) {
       clauses.push("bot = ?");
       args.push(query.bot);
+    }
+    if (query.bots !== undefined) {
+      clauses.push(query.bots.length === 0 ? "0" : `bot IN (${query.bots.map(() => "?").join(",")})`);
+      args.push(...query.bots);
     }
     const rows = this.#db
       .prepare(`SELECT value FROM observe_series WHERE ${clauses.join(" AND ")} ORDER BY value ASC`)
@@ -267,9 +272,10 @@ export class ObserveStore {
     from: number;
     to: number;
     limit?: number;
+    includeTags?: boolean;
   }): ObserveSeriesRow[] {
-    const clauses = ["series = ?", "at >= ?", "at < ?"];
-    const args: Array<string | number> = [query.series, Math.trunc(query.from), Math.trunc(query.to)];
+    const clauses = [query.includeTags ? `(series = ? OR series LIKE ? ESCAPE '${LIKE_ESCAPE}')` : "series = ?", "at >= ?", "at < ?"];
+    const args: Array<string | number> = [query.series, ...(query.includeTags ? [`${escapeLike(query.series)}|%`] : []), Math.trunc(query.from), Math.trunc(query.to)];
     if (query.bot !== undefined && query.bot !== null) {
       clauses.push("bot = ?");
       args.push(query.bot);

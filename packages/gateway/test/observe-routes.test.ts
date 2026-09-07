@@ -284,6 +284,25 @@ describe("the D5 seam", () => {
 });
 
 describe("the panels the concept page draws", () => {
+  it("joins native execution peers without pooling unrelated device subjects", async () => {
+    const app = makeApp({ observeAttachPeers: () => [{ bot: "cleo", peerId: "execution-peer", online: 1,
+      degraded: 0, absent: 0, queueDepth: 3, deadLetters: 0, lastContactAt: clock,
+      pluginOutboxDepth: null, pluginOldestEventAgeMs: null, pluginLastAckProgressAt: null,
+      pluginAckCursor: null, pluginCommandInboxDepth: null }] });
+    const token = await observerToken(app);
+    observe.sample("peer_rtt_ms", "execution-peer", 42);
+    observe.sample("device_rtt_ms", "phone", 55, "tunnel");
+    const attached = await (await get(app, "/observe/api/attach?bot=cleo", token)).json();
+    expect(attached.peers[0]).toMatchObject({ bot: "cleo", id: observe.identify("execution-peer"), queueDepth: 3, roundTrip: { p50: 42 } });
+    expect(attached.peers[0]).not.toHaveProperty("peerId");
+    const roundtrip = await (await get(app, "/observe/api/roundtrip?bot=cleo", token)).json();
+    expect(roundtrip.hops.find((hop: { hop: string }) => hop.hop === "peer").p50).toBe(42);
+    expect(roundtrip.hops.find((hop: { hop: string }) => hop.hop === "device")).toMatchObject({ p50: 55, scope: "gateway" });
+    const series = await (await get(app, "/observe/api/series?series=device_rtt_ms", token)).json();
+    expect(series).toMatchObject({ summary: { samples: 1 }, totalPoints: 1, truncated: false });
+    expect(series.points).toHaveLength(1);
+  });
+
   it("counts the complete window beyond bounded display feeds", async () => {
     const app = makeApp();
     const token = await observerToken(app);

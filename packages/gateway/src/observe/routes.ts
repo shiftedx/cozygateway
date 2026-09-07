@@ -167,13 +167,13 @@ export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["ob
     const roster = deps.bots?.roster().bots ?? [];
     const selected = roster.filter((row) => bot === undefined || row.name === bot);
     const names = new Map(roster.map((row) => [ring.identify(row.name), row.name]));
-    const summary = (series: string, speed = false, subject = query.bot) => aggregate(ring.store.summarize({
+    const summary = (series: string, speed = false, subject: string | null | undefined = query.bot) => aggregate(ring.store.summarize({
       series, from, to, ...(subject === undefined ? {} : { bot: subject }), includeTags: true,
     }), speed);
     const points = (series: string, subject = query.bot) => ring.store.samples({
-      series, from, to, ...(subject === undefined ? {} : { bot: subject }), limit: 20_000,
+      series, from, to, ...(subject === undefined ? {} : { bot: subject }), limit: 20_000, includeTags: true,
     });
-    const events = (kind?: string) => ring.store.events({ ...query, ...(kind === undefined ? {} : { kind }), limit: 5_000 })
+    const events = (kind?: string, subject: string | null | undefined = query.bot) => ring.store.events({ ...query, bot: subject, ...(kind === undefined ? {} : { kind }), limit: 5_000 })
       .map(({ detailJson, ...row }) => ({ ...row, botName: row.bot === null ? null : names.get(row.bot) ?? "former bot",
         detail: detailJson === null ? null : JSON.parse(detailJson) as Record<string, string | number | boolean> }));
     const pending = deps.bots !== undefined && "pendingApprovals" in deps.bots
@@ -187,7 +187,7 @@ export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["ob
         const series = tag === undefined ? base : `${base}|${tag}`;
         if (!isAllowedSeries(series)) return c.json({ error: { code: "invalid_request", message: "invalid series or tag" } }, 400);
         const samples = points(series);
-        const total = ring.store.summarize({ series, ...query }).count;
+        const total = ring.store.summarize({ series, ...query, includeTags: true }).count;
         return c.json({ summary: summary(series), points: samples, pointLimit: 20_000,
           view: "bounded_history", totalPoints: total, truncated: total > samples.length });
       }
@@ -199,13 +199,13 @@ export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["ob
         return c.json({ events: rows, limit: 5_000, view: "bounded_history", totalEvents: total, truncated: total > rows.length });
       }
       case "overview": {
-        const flaps = events("tunnel_flap");
+        const flaps = events("tunnel_flap", null);
         const repairs = reader.attached() ? reader.internals(readerQuery).reduce((n, row) => n + row.toolServers.filter((server) => server.state === "repair_pending").length, 0) : 0;
         return c.json({ gateway: { name: deps.gatewayInfo.name, version: deps.gatewayInfo.version,
           uptimeMs: Math.max(0, now - startedAt), bridge: deps.hermesBridgeAbsent ? "absent" : deps.bots?.health().online ? "online" : "offline" },
           attach, tunnel: { lastFlapAt: flaps[0]?.at ?? null, state: flaps[0]?.detail?.reason === "recovered" ? "online" : flaps.length ? "offline" : "unknown" },
           needsAPerson: { total: pending.length + repairs, approvals: pending.length, repairs },
-          tiles: { firstToken: summary("ttft_ms"), roundTrip: summary("device_rtt_ms"), turns: ring.store.countEvents({ ...query, kind: "turn_terminal" }),
+          tiles: { firstToken: summary("ttft_ms"), roundTrip: summary("device_rtt_ms", false, null), turns: ring.store.countEvents({ ...query, kind: "turn_terminal" }),
             spend: reader.attached() ? reader.throughput(readerQuery) : null } });
       }
       case "bots": return c.json({ bots: selected.map((row) => {
@@ -231,14 +231,18 @@ export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["ob
       case "roundtrip": return c.json({ byDevice: observeReceiptDistributions(ring, query), vpnComparisonSampleFloor: 30, hops: [
         ["device", "device_rtt_ms"], ["tunnel", "tunnel_rtt_ms"], ["gateway", "gateway_handle_ms"],
         ["peer", "peer_rtt_ms"], ["model", "model_step_ms"], ["turn", "turn_ms"],
-      ].map(([hop, series]) => ({ hop, ...summary(series!) })), felt: summary("felt_latency_ms"),
+      ].map(([hop, series]) => ({ hop, scope: hop === "device" || hop === "tunnel" ? "gateway" : "selected_bots",
+        ...(hop === "peer" && bot !== undefined && deps.observeAttachPeers !== undefined
+          ? aggregate(ring.store.summarize({ series: series!, from, to, includeTags: true,
+            bots: deps.observeAttachPeers().filter(row => row.bot === bot).map(row => ring.identify(row.peerId)) }))
+          : summary(series!, false, hop === "device" || hop === "tunnel" ? null : query.bot)) })), felt: summary("felt_latency_ms"),
         byNetworkPath: OBSERVE_SERIES_TAGS.filter((tag) => !["tunnel", "lan", "ok", "not_found", "http_error", "network_error"].includes(tag))
           .map((networkPath) => ({ networkPath, ...summary(`felt_latency_ms|${networkPath}`) })) });
       case "attach": return c.json({ summary: attach,
-        peers: (deps.observeAttachPeers?.() ?? selected.map(row => ({ bot: row.name,
+        peers: (deps.observeAttachPeers?.() ?? selected.map(row => ({ bot: row.name, peerId: row.name,
           online: deps.presenceOf(row.name) === "online" ? 1 : 0 })))
           .filter(row => bot === undefined || row.bot === bot)
-          .map(row => ({ ...row, id: ring.identify(row.bot), roundTrip: summary("peer_rtt_ms", false, ring.identify(row.bot)) })),
+          .map(({ peerId, ...row }) => ({ ...row, id: ring.identify(peerId), roundTrip: summary("peer_rtt_ms", false, ring.identify(peerId)) })),
         deadLetters: (deps.attachDeadLetters?.() ?? []).map(row => ({ ...row, agentId: deps.observeBotForPeer?.(row.agentId) ?? row.agentId })).filter((row) => bot === undefined || row.agentId === bot)
           .map((row) => ({ bot: ring.identify(row.agentId), sequence: row.sequence, attempts: row.attempts, at: row.deadLetteredAt })) });
       case "approvals": return c.json({ pending: pending.map((row) => ({ bot: row.bot, id: ring.identify(row.toolCallId), createdAt: row.createdAt })),
@@ -248,7 +252,7 @@ export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["ob
       case "deliveries": return c.json({ artifacts: deps.storage.artifacts.list(bot === undefined ? {} : { bot })
         .filter((row) => row.createdAt >= from && row.createdAt < to).map((row) => ({ id: ring.identify(row.artifactId), bot: row.bot,
           state: row.state, sizeBytes: row.sizeBytes, createdAt: row.createdAt, committedAt: row.committedAt ?? null })),
-        push: summary("push_result"), events: events("push_result") });
+        push: summary("push_result", false, null), events: events("push_result", null), pushScope: "gateway" });
       case "devices": return c.json({ devices: deps.storage.listDevices().map((row) => ({ id: ring.identify(row.id), name: row.name,
         kind: row.kind, scope: row.scope, createdAt: row.createdAt, lastSeenAt: row.lastSeenAt })),
         runners: (deps.runners?.list() ?? []).map((row) => ({ id: ring.identify(row.id), name: row.displayName ?? row.name,

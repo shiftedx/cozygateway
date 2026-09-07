@@ -270,8 +270,8 @@ export interface AppDeps {
   /** Synchronous, aggregate attach-v1 state for operator health routes only. */
   attachHealth?: () => AttachHealthSummary;
   observeBotForPeer?: (id: string) => string;
-  observeAttachPeers?: () => Array<{ bot: string; online: number; degraded: number; absent: number;
-    queueDepth: number; deadLetters: number; lastHeartbeatAt: number | null; pluginOutboxDepth: number | null;
+  observeAttachPeers?: () => Array<{ bot: string; peerId: string; online: number; degraded: number; absent: number;
+    queueDepth: number; deadLetters: number; lastContactAt: number | null; pluginOutboxDepth: number | null;
     pluginOldestEventAgeMs: number | null; pluginLastAckProgressAt: number | null; pluginAckCursor: number | null; pluginCommandInboxDepth: number | null }>;
 
   /** Separate attach-v1 app-action lane; it never injects hidden chat content. */
