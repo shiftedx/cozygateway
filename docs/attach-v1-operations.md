@@ -372,7 +372,11 @@ next sweep. Before editing, the deprovisioner records unfinished work and exact
 credential key names in `<box config path>.deprovision-pending.json`. That journal
 contains no token values and is removed only after successful cleanup. It lets a
 later sweep find unfinished cleanup even after config entries and services are
-already gone. Surviving profiles' shared token variables are retained.
+already gone. Surviving profiles' shared token variables are retained. If the
+name has been recreated in the meantime, the watcher finishes its provisioning
+first, then removes only journaled obsolete keys that no current profile uses.
+That reconciliation preserves the new profile's config, token, service, and
+files, and clears the old journal after gateway restart and verification.
 
 Automatic cleanup uses `--orphans-only`: live profile paths and symlinks are
 refused, and the live path is checked again before service teardown. An

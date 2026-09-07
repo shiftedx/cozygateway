@@ -164,6 +164,40 @@ os.replace = replace
         self.run_script()
         self.assert_clean()
 
+    def test_interrupted_deletion_then_recreation_clears_only_obsolete_journal_keys(self):
+        data = json.loads(self.config.read_text())
+        data["hermesEndpoints"][0]["profiles"]["deleted-a"]["tokenEnv"] = "CUSTOM_DELETED_CREDENTIAL"
+        self.config.write_text(json.dumps(data))
+        self.envfile.write_text(self.envfile.read_text() + "CUSTOM_DELETED_CREDENTIAL=fixture-secret\n")
+        hooks = self.base / "interrupt-before-env"
+        hooks.mkdir()
+        (hooks / "sitecustomize.py").write_text('''import os
+original_replace = os.replace
+def replace(source, destination):
+    if str(destination).endswith("/.env"):
+        raise OSError("fixture interrupted env rename")
+    return original_replace(source, destination)
+os.replace = replace
+''')
+        self.env["PYTHONPATH"] = str(hooks)
+        self.run_script(succeeds=False)
+        self.assertTrue(self.journal.exists())
+        profile = self.enable_real_provisioning()
+        self.run_script()
+        token = dict(line.split("=", 1) for line in (profile / ".env").read_text().splitlines())["COZYGATEWAY_TOKEN"]
+        remote = dict(line.split("=", 1) for line in self.envfile.read_text().splitlines())
+        self.assertEqual(remote["COZYGATEWAY_ATTACH_TOKEN_DELETED_A"], token)
+        self.assertRegex(token, r"^[0-9a-f]{64}$")
+        self.assertNotIn("CUSTOM_DELETED_CREDENTIAL", remote)
+        self.assertEqual(remote["COZYGATEWAY_ATTACH_TOKEN_KEEPER"], "fixture-secret")
+        self.assertFalse(self.journal.exists())
+        self.assertTrue((self.loaded / "ai.hermes.gateway-deleted-a").exists())
+        self.assertEqual(self.archive.read_bytes(), b"archived history")
+        before = self.calls.read_text()
+        self.run_script()
+        self.assertEqual(before, self.calls.read_text())
+        self.assertEqual(remote, dict(line.split("=", 1) for line in self.envfile.read_text().splitlines()))
+
     def test_malformed_config_and_ssh_failure_fail_closed(self):
         original_env = self.envfile.read_bytes()
         for text in ('{broken', '{"hermesEndpoints": []}', '{"hermesEndpoints": [{"profiles": []}]}'):
