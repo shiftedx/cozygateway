@@ -153,24 +153,15 @@ release; everything older is marked pre-release so installers resolve one "lates
   read or write, and a client below 73 sends neither field and is byte identical to its pre-73
   self.
 
-- The owner-loss lease no longer reaps a turn whose peer was lost mid model request
-  (`com.cozylabs.bots` capability 69, F2). Capability 69 starts a 120 second lease the instant a
-  peer's socket closes, and for a peer that was answering heartbeats right up to that instant,
-  silence is the wrong reading: it was working, its model had not returned a token yet, and the
-  drop is what a peer blocked inside one long synchronous prefill looks like from the gateway. LV1
-  measured a cold 45k token window at about 123 seconds against that 120 second lease, and LV2
-  measured 8 seconds for the same window on another endpoint from the same code, so no lease number
-  tells a slow model call apart from a dead process. Such a turn now waits one model request out,
-  4 minutes, before the lease clock starts, which is time excluded the way a pending approval or
-  device request already suspends it. The lease itself is unchanged, the exclusion applies once and
-  only to a disconnected peer that was demonstrably alive when it went, and a peer that never comes
-  back is still reaped, about 6 minutes after the drop and never past a ceiling an operator
-  shortened. That total is shorter than the 10 minute grace an attached quiet peer already gets, so
-  no window on this path is longer than one the gateway already grants: the undeclared grace, the
-  interrupt grace and the 30 minute silence ceiling are untouched, and a heartbeat never stretches
-  the undeclared grace. Derived gateway side from the delivery record and the transport, so it
-  needs no new frame, field or peer behavior and covers a Hermes peer and a CozyAgents peer
-  identically with no plugin change.
+- The owner-loss lease gives a detached turn one fixed 240 second extension only when the gateway
+  observed that turn emit a frame in the final 30 seconds before detach (`com.cozylabs.bots`
+  capability 69, F2b). LV1 measured a cold 45k-token prefill at about 123 seconds, so two measured
+  windows leave bounded headroom before the unchanged 120 second lease begins. A stale frame, a
+  hello, a dispatch, and an attach heartbeat earn no extension. The extension applies once, is
+  limited by any operator ceiling, and a peer that never returns is still reaped within the fixed
+  extension plus lease. The undeclared 10 minute grace, interrupt grace, and 30 minute silence
+  ceiling are unchanged. This gateway-side reading covers Hermes and CozyAgents peers without a
+  plugin change.
 
 - Portable conformance suite, Hermes-free (F9): the black-box suite in
   `packages/conformance/src/suite.ts` assumed a Hermes endpoint existed, so it failed against a

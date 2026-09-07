@@ -119,6 +119,17 @@ and does not register `/bots` routes.
 
 | 76 | A settled reply push may carry the Task id for the same turn. The gateway resolves it from the newest `task_runs.session_id` row before its fire-and-forget relay send is deferred, records that reply-push fact durably, and suppresses the queued `task_completed` push only for that Task during the following ten seconds. This collapses one fast reply and completion into one actionable banner without delaying either path or depending on delivery acknowledgement. A missing Task id remains a normal message push for old clients. The marker is written only when at least one background device is targeted, survives a gateway restart, and never applies to another Task. |
 
+### Capability 69 F2b amendment
+
+The row 69 owner-loss paragraph is amended as follows. A disconnected peer's lease stays 120
+seconds. Only when the gateway observed an actual frame from that same turn in the final 30 seconds
+before detach does the detached branch receive one fixed 240 second extension, derived from two
+LV1 cold-prefill windows of about 123 seconds each. A heartbeat, hello, dispatch, or any frame from
+another turn does not qualify. The extension is never proportional to elapsed silence, applies once,
+and is capped by an operator-shortened ceiling. It never applies to the undeclared 600 second grace,
+which remains an attached-peer bound. This uses gateway-observed frame timing only, adds no wire
+field or peer behavior, and applies identically to Hermes and CozyAgents peers.
+
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
 

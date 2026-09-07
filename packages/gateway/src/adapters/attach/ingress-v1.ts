@@ -94,11 +94,6 @@ export interface AttachV1Events {
    * the outbox until it returns, and timing a model from there would chart the gateway's waiting. */
   onTurnDispatched?(agentId: string, turnId: string): void;
   onPresence(agentId: string, state: "online" | "degraded" | "absent"): void;
-  /** Capability 69, F2. The peer answered the heartbeat, so the process behind this identity was
-   * alive at `at`. Transport-only proof, and the only proof there is while a model request is in
-   * flight and the peer has no frame to send yet: it says the process is there, never that any
-   * particular work happened. The owner-loss lease clock runs from it. */
-  onLiveness?(agentId: string, at: number): void;
   /** The peer took a command off the wire. Transport-only proof: it says the command reached the
    * process that will run it, never that the work happened. Capability row 67 uses it to move a
    * CozyApp action receipt to the public `running`, for a v1 peer too. */
@@ -959,10 +954,6 @@ export class AttachV1Ingress implements TurnEndpoint {
       } else {
         connection.heartbeatDegraded = age >= this.#heartbeatIntervalMs * 2;
         this.#refreshDegraded(agentId, connection);
-        // Capability 69, F2. The socket is still answering, so the process is alive right now even
-        // if it has emitted no frame for minutes because its model has not returned a token yet.
-        // `lastSeenAt` is the last byte it actually sent, so that instant is the proof, not `now`.
-        this.#events.onLiveness?.(agentId, connection.lastSeenAt);
         this.#observe?.peerHeartbeatSent(agentId);
         this.#send(connection, { kind: "heartbeat", sentAt: now });
       }
