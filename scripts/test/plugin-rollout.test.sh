@@ -391,6 +391,9 @@ test_streaming_reader_answers_without_pyyaml() {
     > "$dir/cadence-tuned/config.yaml"
   printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  enabled: true\n  edit_interval: 2.0\n' \
     > "$dir/cadence-partial/config.yaml"
+  mkdir -p "$dir/cadence-partial-threshold"
+  printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  buffer_threshold: 200\n' \
+    > "$dir/cadence-partial-threshold/config.yaml"
 
   read_with() {
     PYTHON="$1" bash -c '
@@ -468,9 +471,15 @@ SH
     || fail "stdlib probe on a streaming-but-slow profile answered: $answer"
   answer="$(read_with "$TMP/python3-nosite" "$dir/cadence-tuned" | tr '\n' ' ')"
   [ -z "$answer" ] || fail "stdlib probe reported cadence an operator had tuned: $answer"
+  # The two cadence keys are ONE setting, read as a disjunction: writing a
+  # threshold of 1 beside an operator's deliberate 2.0 second interval makes that
+  # interval unreachable. Half set means neither is written, and it says so.
   answer="$(read_with "$TMP/python3-nosite" "$dir/cadence-partial" | tr '\n' ' ')"
-  [ "$answer" = 'streaming.buffer_threshold=1 ' ] \
+  [ "$answer" = '!cadence-partly-set:streaming.edit_interval ' ] \
     || fail "stdlib probe on a half-tuned streaming block answered: $answer"
+  answer="$(read_with "$TMP/python3-nosite" "$dir/cadence-partial-threshold" | tr '\n' ' ')"
+  [ "$answer" = '!cadence-partly-set:streaming.buffer_threshold ' ] \
+    || fail "stdlib probe on the other half-tuned block answered: $answer"
 
   local tagged
   for tagged in tagged-display tagged-platform tagged-scalar; do
@@ -502,7 +511,7 @@ SH
   local case_dir
   for case_dir in mute both off telegram-only nested-block nested-block-top null-value \
     tagged-display tagged-platform tagged-scalar cadence-absent cadence-tuned cadence-partial \
-    shared-env shared-plugin shared-empty-token shared-decided; do
+    cadence-partial-threshold shared-env shared-plugin shared-empty-token shared-decided; do
     [ "$(read_with "$YAML_PYTHON" "$dir/$case_dir" | tr '\n' ' ')" \
       = "$(read_with "$TMP/python3-nosite" "$dir/$case_dir" | tr '\n' ' ')" ] \
       || fail "the two readers disagree on $case_dir"

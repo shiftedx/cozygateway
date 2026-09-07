@@ -22,7 +22,7 @@ import sys
 import types
 import unittest
 
-from cozygateway.adapter import AttachAdapter
+from cozygateway.adapter import AttachAdapter, _make_adapter_class
 
 # Stock Hermes, verbatim, so this suite fails if the plugin drifts from what the
 # harness actually gates on (gateway/config.py, the shared streaming defaults).
@@ -39,6 +39,25 @@ def _set_native_env(value):
         os.environ.pop(NATIVE_ENV, None)
     else:
         os.environ[NATIVE_ENV] = value
+
+
+class _Platform:
+    """Enough of Hermes' closed Platform enum for the concrete class to build."""
+
+    WEBHOOK = "webhook"
+
+    def __init__(self, name):
+        raise ValueError(name)
+
+
+class _BasePlatformAdapter:
+    """Stand-in for the harness base the concrete adapter subclasses."""
+
+    SUPPORTS_MESSAGE_EDITING = True
+
+    def __init__(self, config=None, platform=None):
+        self.config = config
+        self.platform = platform
 
 
 class _SendResult:
@@ -90,6 +109,8 @@ class _StreamConsumerShim:
         self.last_edit_time = 0.0
 
     def resolve_native_streaming(self) -> bool:
+        # The harness reads the attribute off the CONCRETE class, which is where
+        # the switch is applied; the shim is handed an adapter built the same way.
         if not getattr(type(self.adapter), "SUPPORTS_NATIVE_STREAMING", False):
             return False
         probe = getattr(self.adapter, "supports_native_streaming", None)
@@ -140,17 +161,23 @@ class NativeStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._saved = {
             key: sys.modules.get(key)
-            for key in ("gateway", "gateway.platforms", "gateway.platforms.base")
+            for key in ("gateway", "gateway.platforms", "gateway.platforms.base",
+                        "gateway.config")
         }
+        config = types.ModuleType("gateway.config")
+        config.Platform = _Platform
         gateway = types.ModuleType("gateway")
         platforms = types.ModuleType("gateway.platforms")
         base = types.ModuleType("gateway.platforms.base")
         base.SendResult = _SendResult
+        base.BasePlatformAdapter = _BasePlatformAdapter
         gateway.platforms = platforms
         platforms.base = base
         sys.modules["gateway"] = gateway
         sys.modules["gateway.platforms"] = platforms
         sys.modules["gateway.platforms.base"] = base
+        sys.modules["gateway.config"] = config
+        gateway.config = config
         self._saved_env = os.environ.get(NATIVE_ENV)
 
     def tearDown(self):
@@ -162,8 +189,8 @@ class NativeStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         _set_native_env(self._saved_env)
 
     def _adapter(self, client=None):
-        adapter = AttachAdapter()
-        adapter._attach_init(types.SimpleNamespace(extra={}))
+        """The concrete adapter Hermes registers, so the class attribute is real."""
+        adapter = _make_adapter_class()(types.SimpleNamespace(extra={}))
         if client is not None:
             adapter._client = client
             adapter._active_turn["thread"] = "turn"
@@ -173,9 +200,28 @@ class NativeStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
     def test_adapter_declares_native_streaming_support(self):
         """The class attribute and the probe method Hermes looks for both exist."""
         adapter = self._adapter()
-        self.assertIs(AttachAdapter.SUPPORTS_NATIVE_STREAMING, True)
+        self.assertIn("SUPPORTS_NATIVE_STREAMING", vars(AttachAdapter))
         self.assertTrue(callable(getattr(adapter, "supports_native_streaming", None)))
         self.assertTrue(callable(getattr(adapter, "send_stream_frame", None)))
+
+    def test_the_class_attribute_follows_the_flag_not_just_the_probe(self):
+        """The attribute has a reader that never asks the probe, so it must not lie.
+
+        ``gateway/slash_commands.py``'s ``_deliver_approval_confirmation`` sends an
+        ``/approve`` or ``/deny`` confirmation through the adapter directly when
+        ``SUPPORTS_NATIVE_STREAMING`` is True, instead of returning the text for
+        Hermes' own delivery, and it never consults
+        ``supports_native_streaming``. A True attribute with the switch off would
+        move that path while the transport is still off.
+        """
+        _set_native_env(None)
+        self.assertIs(_make_adapter_class().SUPPORTS_NATIVE_STREAMING, False)
+        _set_native_env("0")
+        self.assertIs(_make_adapter_class().SUPPORTS_NATIVE_STREAMING, False)
+        _set_native_env("1")
+        self.assertIs(_make_adapter_class().SUPPORTS_NATIVE_STREAMING, True)
+        # Attribute and probe are read from the same switch, so they cannot drift.
+        self.assertTrue(self._adapter().supports_native_streaming(chat_type="direct"))
 
     def test_the_probe_answers_per_profile_and_defaults_off(self):
         adapter = self._adapter()
@@ -205,14 +251,15 @@ class NativeStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         for. The native branch has no head cost at all.
         """
         deltas = ["He", "llo", " the", "re, ", "this", " is ", "a re", "ply."]
-        adapter = self._adapter()
 
-        shim = _StreamConsumerShim(adapter)
+        shim = _StreamConsumerShim(self._adapter())
         self.assertFalse(shim.resolve_native_streaming())
         debounced = shim.frames_for(deltas)
 
+        # A fresh adapter, because the switch is read once when the concrete
+        # class is built, which is exactly how a Hermes profile picks this up.
         _set_native_env("1")
-        shim = _StreamConsumerShim(adapter)
+        shim = _StreamConsumerShim(self._adapter())
         self.assertTrue(shim.resolve_native_streaming())
         native = shim.frames_for(deltas)
 
@@ -240,9 +287,9 @@ class NativeStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
 
     # -- the frames themselves ------------------------------------------------
     async def test_interim_frames_are_drafts_and_never_seal_the_turn(self):
+        _set_native_env("1")
         client = _Client()
         adapter = self._adapter(client)
-        _set_native_env("1")
 
         for text in ("hel", "hello", "hello wo", "hello world"):
             self.assertTrue(
@@ -256,9 +303,9 @@ class NativeStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter._active_turn, {"thread": "turn"})
 
     async def test_the_finalize_frame_commits_the_turn_exactly_once(self):
+        _set_native_env("1")
         client = _Client()
         adapter = self._adapter(client)
-        _set_native_env("1")
 
         await adapter.send_stream_frame("hello", chat_id="thread", reply_to="turn", turn_id="turn")
         self.assertTrue(
@@ -278,9 +325,9 @@ class NativeStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         other transport produces, so it is delivered as the empty reply it is and
         takes ``send``'s existing "no content ever materialized" seal.
         """
+        _set_native_env("1")
         client = _Client()
         adapter = self._adapter(client)
-        _set_native_env("1")
 
         self.assertTrue(
             await adapter.send_stream_frame(

@@ -873,11 +873,18 @@ class AttachAdapter:
     # (gateway/stream_consumer_transport.py) needs this class attribute AND a
     # truthy `supports_native_streaming` probe before it will route frames
     # through `send_stream_frame`, and the native branch of `_should_edit` then
-    # pushes every delta with no edit-rate limit at all. Declaring the attribute
-    # here is what makes the transport reachable for this platform; the probe
-    # below decides per profile whether to take it. See `supports_native_streaming`
-    # for why that decision is not simply "always".
-    SUPPORTS_NATIVE_STREAMING = True
+    # pushes every delta with no edit-rate limit at all.
+    #
+    # It is False HERE and set from the same switch as the probe on the concrete
+    # class (`_make_adapter_class`), because the attribute has a second reader
+    # that never consults the probe: `gateway/slash_commands.py`'s
+    # `_deliver_approval_confirmation` sends an `/approve` or `/deny`
+    # confirmation through the adapter directly when it is True, instead of
+    # returning the text for Hermes' own delivery. Declaring it True
+    # unconditionally would therefore change that path with the transport still
+    # off, which is not what "off" may mean. With the switch off this adapter is
+    # what it was before the transport existed, on every path.
+    SUPPORTS_NATIVE_STREAMING = False
 
     # -- construction ---------------------------------------------------------
     def _attach_init(self, config: Any) -> None:
@@ -5303,6 +5310,12 @@ def _make_adapter_class() -> type:
     from gateway.platforms.base import BasePlatformAdapter  # harness-defined identifier
 
     class _AttachPlatformAdapter(AttachAdapter, BasePlatformAdapter):
+        # The one place the native-streaming attribute is ever True. Read once, at
+        # class build, from the same switch `supports_native_streaming` reads, so
+        # the attribute and the probe can never disagree and an unset switch
+        # leaves every Hermes branch that reads the attribute alone.
+        SUPPORTS_NATIVE_STREAMING = _env_flag("COZYGATEWAY_NATIVE_STREAMING", False)
+
         def __init__(self, config: Any, **_kwargs: Any) -> None:
             try:
                 platform = Platform(PLATFORM_NAME)

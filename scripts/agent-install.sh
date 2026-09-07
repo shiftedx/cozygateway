@@ -1122,11 +1122,23 @@ def absent_without_yaml(text):
 #     two modes could answer differently.
 #
 # Unsure reads as "another platform", which is the direction that writes nothing.
+# So does a token assigned in the HOME `.env` that the profile `.env` blanks:
+# the union is over names ASSIGNED anywhere, not over the value the profile
+# finally resolves to, so such a profile keeps its own cadence. That is the
+# withholding direction, and cheaper than reimplementing Hermes' env precedence.
+#
+# The two cadence keys are also seeded only TOGETHER. They are one setting read
+# as a disjunction (`(elapsed >= edit_interval and acc) or len(acc) >= threshold`),
+# so writing a threshold of 1 beside an operator's deliberate 2.0 second interval
+# makes that interval unreachable: every tick flushes anyway. An operator who set
+# either half therefore keeps both, and is told so.
 PLATFORM_ENV_VARS = (
     "TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN",
     "WHATSAPP_ENABLED", "QQ_APP_ID",
 )
 CADENCE_PREFIX = "streaming."
+CADENCE_KEYS = tuple(
+    ".".join(path) for path, _ in WANTED if path and path[0] == "streaming")
 
 
 def env_names(path):
@@ -1198,11 +1210,20 @@ def main():
             absent = absent_with_yaml(text, yaml)
         except Exception:
             sys.exit(1)
-    if any(entry.startswith(CADENCE_PREFIX) for entry in absent):
-        other = other_chat_platform(profile_dir)
-        if other:
-            # A leading "!" marks a line the caller SAYS; it is never a key to write.
-            absent = ["!another-chat-platform:" + other] + [
+    cadence = [entry for entry in absent if entry.startswith(CADENCE_PREFIX)]
+    if cadence:
+        # A leading "!" marks a line the caller SAYS; it is never a key to write.
+        note = ""
+        if len(cadence) < len(CADENCE_KEYS):
+            missing = {entry.split("=", 1)[0] for entry in cadence}
+            note = "!cadence-partly-set:" + ",".join(
+                name for name in CADENCE_KEYS if name not in missing)
+        else:
+            other = other_chat_platform(profile_dir)
+            if other:
+                note = "!another-chat-platform:" + other
+        if note:
+            absent = [note] + [
                 entry for entry in absent if not entry.startswith(CADENCE_PREFIX)
             ]
     # Written as BYTES on purpose. A Windows interpreter translates "\n" into
@@ -1234,6 +1255,8 @@ ensure_streaming_config() {
     case "$note" in
       '!another-chat-platform:'*)
         say "NOTE  Hermes profile $profile also serves ${note#!another-chat-platform:}, so its streaming cadence was left as the operator set it (the edit interval and buffer threshold are profile-wide, not per platform)" ;;
+      '!cadence-partly-set:'*)
+        say "NOTE  Hermes profile $profile already sets ${note#!cadence-partly-set:}, so both streaming cadence keys were left alone (they are one setting: a buffer threshold of 1 would make a tuned edit interval unreachable)" ;;
       *) say "NOTE  ${note#!} for Hermes profile $profile" ;;
     esac
   done
