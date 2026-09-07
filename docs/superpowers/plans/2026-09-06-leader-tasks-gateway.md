@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript (Node 24, ESM, `.ts` imports), Hono, `node:sqlite` `DatabaseSync`, TypeBox schemas in `cozygateway-contract`, vitest 3, pnpm workspaces.
 
-**Spec:** `/Users/kmcdowell/Documents/repos/worktrees/cozychat-features/docs/superpowers/specs/2026-09-06-leader-bot-design.md` (repo cozychat). This plan implements its slice 1: "Contract and gateway task store".
+**Spec:** `docs/superpowers/specs/2026-09-06-leader-bot-design.md` (repo cozychat). This plan implements its slice 1: "Contract and gateway task store".
 
 ## Global Constraints
 
@@ -23,12 +23,12 @@
 - `TurnContext` rule from capability 47 holds: the turn `text` is byte-identical with and without `context`.
 - The assignee's reply ends with a `Result:` block listing `status (done | partial | blocked)`, what changed, and artifacts as paths or links. Its absence is recorded, never invented.
 - Hermes bots can be assignees with zero plugin changes. A Hermes profile cannot be a leader in v1 (nothing on the Hermes side can call the assign route); the gateway still stores `role` for it so the app can say so honestly.
-- Nothing ships without Kyle. This slice lands behind the capability gate and is releasable on its own.
+- Nothing ships without the owner. This slice lands behind the capability gate and is releasable on its own.
 - Every test file runs green under `pnpm -r test`; `pnpm -r typecheck` is clean.
 
 ## Deviations from the spec, decided by reading the code
 
-The spec was written from a seams report that predates capability 64. Three of its choices collide with what already ships and are adapted here; the behaviour Kyle approved is unchanged.
+The spec was written from a seams report that predates capability 64. Three of its choices collide with what already ships and are adapted here; the behaviour the owner approved is unchanged.
 
 1. **No `bot_tasks` trio.** The gateway already has durable Tasks (`packages/gateway/src/tasks.ts`, tables `tasks`, `task_runs`, `task_events`, …) with ten states and 45 reasons. Creating a parallel state machine would give two answers for one Run. An assignment therefore *wraps* a Task: the assignment turn is admitted exactly like a room member turn, and the nine assignment states the spec lists are **derived** from the Task view plus the assignment's own facts (deadline, acknowledgement, cancel). The mapping is in Task 3.
 2. **Route names.** `GET /bots/:name/tasks` already exists (capability 64, lists Tasks by bot) and `GET /tasks/:taskId` already reads one. The spec's `POST /bots/:name/tasks` would shadow that surface. The peer and device routes are `/bots/:name/assignments`, `/assignments/:assignmentId`, `/assignments/:assignmentId/cancel`, `/assignments/:assignmentId/acknowledge`, plus `POST /bots/tasks/:taskId/acknowledge`, the same acknowledgement addressed by the wrapped Task id for a device that arrived from `GET /tasks/:taskId`. The CozyAgents tools acknowledge by `assignmentId` on `/assignments/:assignmentId/acknowledge`. The Task view stays reachable through `GET /tasks/:taskId` via the assignment's `taskId`. The two inbox routes keep the spec's paths.
@@ -55,7 +55,7 @@ The spec was written from a seams report that predates capability 64. Three of i
 | `contract/ext-bots-v1.md`, `CHANGELOG.md` (modify) | Capability rows 70 and agent-inbox 1, routes table, changelog entry. |
 | Tests | `packages/contract/test/{ext-bots,assignments}.test.ts`, `packages/gateway/test/{assignment-storage,assignment-protocol,assignments,assignment-routes,bots-profile-team,assignments-e2e}.test.ts`. |
 
-Run commands (from the repo root `/Users/kmcdowell/Documents/repos/worktrees/cozygateway-council`):
+Run commands (from the repo root `<local path>`):
 
 ```bash
 pnpm --filter cozygateway-contract test test/ext-bots.test.ts     # one contract file
