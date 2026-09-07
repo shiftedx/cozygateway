@@ -889,8 +889,14 @@ export async function startGateway(
     sendNativeTurn: (agentId, input) =>
       attachV1Ingress.sendNativeTurn(agentId, input),
   });
-  const adapters = new Map(
-    profileEntries.map(([profileId]) => {
+  // A runtime bot (capability 45/49) is an attach-v1 identity exactly like a Hermes profile: same
+  // storage row, same `backend: "attach"` shape, same ingress. Rooms already route a member turn
+  // to one through `sendNativeTurn` regardless, so a plain 1:1 `/threads` conversation must reach
+  // the same bot the same way; registering it here, beside the Hermes profiles, is what makes
+  // `POST /threads { agentId: <runtime bot id> }` work on a gateway with no Hermes endpoint at
+  // all instead of leaving every turn 503 `backend_unavailable` for want of an adapter.
+  const adapters = new Map([
+    ...profileEntries.map(([profileId]) => {
       const adapter = createAttachAdapter({
         agentId: profileId,
         endpoint: attachEndpoint,
@@ -899,7 +905,16 @@ export async function startGateway(
       router.register(profileId, adapter);
       return [profileId, adapter] as const;
     }),
-  );
+    ...runtimeBots.map((bot) => {
+      const adapter = createAttachAdapter({
+        agentId: bot.id,
+        endpoint: attachEndpoint,
+        turnTimeoutMs: config.turnTimeoutSeconds * 1000,
+      });
+      router.register(bot.id, adapter);
+      return [bot.id, adapter] as const;
+    }),
+  ]);
   // Capability 37. Every runtime surface that would still answer for a deleted bot, torn down in
   // one place: the token map both public attach surfaces authenticate against (the WebSocket
   // upgrade and HTTP media share this exact Map object, so one delete covers both), the live
@@ -1332,9 +1347,15 @@ export async function startGateway(
     },
     close: async () => {
       clearInterval(attachMediaSweep);
-      const durableAttachShutdown = profileEntries.some(([profileId]) =>
-        attachV1Ingress.hasNegotiated(profileId),
-      );
+      // A runtime bot is a durable attach-v1 identity exactly like a Hermes profile (same
+      // ingress, same recovery-in-SQLite story), so it has to be checked here too: skipping it
+      // left a Hermes-free gateway with a negotiated runtime bot connection always falling to
+      // the `runner.closeAll()` branch below, which waits on an in-memory turn promise that
+      // `attachV1Ingress.close()` (a few lines down) can no longer settle, deadlocking shutdown.
+      const durableAttachShutdown = [
+        ...profileEntries.map(([profileId]) => profileId),
+        ...runtimeBots.map((bot) => bot.id),
+      ].some((agentId) => attachV1Ingress.hasNegotiated(agentId));
       hub.close();
       // Closing attach sockets fires the disconnect path, which fails in-flight turns, so the
       // runner's per-thread chains settle before closeAll drains them.

@@ -139,13 +139,19 @@ export type AttachHealthSummary = Static<typeof AttachHealthSummarySchema>;
  *  capability entry (a capability is a shape promise, `bridges` is a liveness reading of one
  *  backend that shape happens to be backed by), so a client that does not know the field yet sees
  *  exactly the payload it always saw. Keyed by bridge name (`"hermes"` today); absent when a
- *  gateway has no bridge to report on, e.g. no `com.cozylabs.bots` configured at all. */
+ *  gateway has no bridge to report on, e.g. no `com.cozylabs.bots` configured at all.
+ *
+ *  A bridge entry itself is either a `BridgeLivenessSchema` object (a bridge is configured and
+ *  its liveness is known) or the literal string `"absent"` (capability 52: a gateway configured
+ *  with no Hermes endpoint at all has no link to read liveness from, and reports the bridge as
+ *  absent rather than inventing an offline reading; `packages/gateway/src/http.ts`'s `/health`
+ *  and `/ready` routes already emit exactly this shape for a Hermes-free deployment). */
 export const GatewayInfoSchema = Type.Object({
   name: Type.String(),
   version: Type.String(),
   contract: Type.Literal("v1"),
   capabilities: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 1 }))),
-  bridges: Type.Optional(Type.Record(Type.String(), BridgeLivenessSchema)),
+  bridges: Type.Optional(Type.Record(Type.String(), Type.Union([BridgeLivenessSchema, Type.Literal("absent")]))),
   attach: Type.Optional(AttachHealthSummarySchema),
 });
 export type GatewayInfo = Static<typeof GatewayInfoSchema>;

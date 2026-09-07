@@ -26,6 +26,17 @@ afterEach(async () => {
   for (const server of servers.splice(0)) await server.close();
 });
 
+// GatewayInfo.bridges' value type is a union (F9: `BridgeLivenessSchema | "absent"`) since a
+// Hermes-free gateway reports the literal string rather than inventing a liveness reading. Every
+// fixture in this file always configures a Hermes endpoint, so its bridge is never actually
+// "absent"; this narrows the type for the assertions below without weakening any of them.
+function liveHermesBridge(info: GatewayInfo): { online: boolean; since: number; reconnectAttempt: number } | undefined {
+  const bridge = info.bridges?.["hermes"];
+  if (bridge === undefined) return undefined;
+  if (bridge === "absent") throw new Error("expected the hermes bridge to be a liveness reading, got \"absent\"");
+  return bridge;
+}
+
 async function until(predicate: () => boolean | Promise<boolean>, timeoutMs = 4_000): Promise<void> {
   const start = Date.now();
   while (!(await predicate())) {
@@ -307,10 +318,10 @@ describe("startGateway with a hermes bridge", () => {
     const readHealth = async (): Promise<GatewayInfo> =>
       (await (await fetch(`${gateway.url}/health`)).json()) as GatewayInfo;
 
-    await until(async () => (await readHealth()).bridges?.["hermes"]?.online === true);
+    await until(async () => liveHermesBridge(await readHealth())?.online === true);
     const info = await readHealth();
-    expect(info.bridges?.["hermes"]).toMatchObject({ online: true, reconnectAttempt: 0 });
-    expect(typeof info.bridges?.["hermes"]?.since).toBe("number");
+    expect(liveHermesBridge(info)).toMatchObject({ online: true, reconnectAttempt: 0 });
+    expect(typeof liveHermesBridge(info)?.since).toBe("number");
 
     delete process.env["TEST_HERMES_TOKEN"];
     delete process.env["TEST_ATTACH_TOKEN"];
@@ -335,25 +346,25 @@ describe("startGateway with a hermes bridge", () => {
     const readHealth = async (): Promise<GatewayInfo> =>
       (await (await fetch(`${gateway.url}/health`)).json()) as GatewayInfo;
 
-    await until(async () => (await readHealth()).bridges?.["hermes"]?.online === true);
+    await until(async () => liveHermesBridge(await readHealth())?.online === true);
 
     // Kill the fake hermes host out from under the bridge, exactly what a dead dashboard looks
     // like from the gateway's side: the reconnect loop keeps retrying a socket nobody answers.
     await hermes.close();
     servers.splice(servers.indexOf(hermes), 1);
 
-    await until(async () => (await readHealth()).bridges?.["hermes"]?.online === false);
+    await until(async () => liveHermesBridge(await readHealth())?.online === false);
     const first = await readHealth();
-    expect(first.bridges?.["hermes"]?.online).toBe(false);
-    expect(first.bridges?.["hermes"]?.reconnectAttempt).toBeGreaterThanOrEqual(1);
+    expect(liveHermesBridge(first)?.online).toBe(false);
+    expect(liveHermesBridge(first)?.reconnectAttempt).toBeGreaterThanOrEqual(1);
     // capabilities.["com.cozylabs.bots"] is exactly the field issue #63 filed against: it must
     // still be advertised while offline (a client's feature-detection contract does not change),
     // with `bridges` as the ADDED signal a monitor reads instead.
     expect(first.capabilities?.["com.cozylabs.bots"]).toBe(BOTS_CAPABILITY_VERSION);
 
     await until(async () => {
-      const attempt = (await readHealth()).bridges?.["hermes"]?.reconnectAttempt ?? 0;
-      return attempt > (first.bridges?.["hermes"]?.reconnectAttempt ?? 0);
+      const attempt = liveHermesBridge(await readHealth())?.reconnectAttempt ?? 0;
+      return attempt > (liveHermesBridge(first)?.reconnectAttempt ?? 0);
     });
 
     delete process.env["TEST_HERMES_TOKEN"];

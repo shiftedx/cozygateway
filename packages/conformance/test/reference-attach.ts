@@ -184,3 +184,58 @@ export class ReferenceAttachGateway {
     return this.gateway;
   }
 }
+
+/** F9: the same reference echo/stall/approval trio as `ReferenceAttachGateway`, but behind a
+ *  gateway with NO Hermes endpoint at all. The three peers are config-declared runtime bots
+ *  (capability 45) rather than Hermes profiles, so this is the shape a CozyAgents-only deployment
+ *  actually ships. There is no fake Hermes server here, on purpose: nothing behind this gateway
+ *  is a Hermes profile. */
+export class ReferenceAttachGatewayHermesFree {
+  gateway: RunningGateway | undefined;
+  #peers: AttachPeer[] = [];
+  #pairingClock = 0;
+  readonly #pairingAdmission = new PairingAdmission(() => {
+    this.#pairingClock += 6_000;
+    return this.#pairingClock;
+  });
+
+  async start(): Promise<RunningGateway> {
+    process.env.CONFORMANCE_HERMES_FREE_ECHO_TOKEN = "hermes-free-echo-secret";
+    process.env.CONFORMANCE_HERMES_FREE_STALL_TOKEN = "hermes-free-stall-secret";
+    process.env.CONFORMANCE_HERMES_FREE_APPROVAL_TOKEN = "hermes-free-approval-secret";
+    this.gateway = await startGateway({
+      name: "conformance-reference-hermes-free",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      // No `hermesEndpoints` at all: the whole point of this reference gateway.
+      bots: [
+        { id: "conformance-echo", name: "Echo", tokenEnv: "CONFORMANCE_HERMES_FREE_ECHO_TOKEN", runtime: "cozyagents" },
+        { id: "conformance-stall", name: "Stall", tokenEnv: "CONFORMANCE_HERMES_FREE_STALL_TOKEN", runtime: "cozyagents" },
+        { id: "conformance-approval", name: "Approval", tokenEnv: "CONFORMANCE_HERMES_FREE_APPROVAL_TOKEN", runtime: "cozyagents" },
+      ],
+    }, { pairingAdmission: this.#pairingAdmission });
+    this.#peers = [
+      new AttachPeer(() => this.requireGateway(), "hermes-free-echo-secret", "echo"),
+      new AttachPeer(() => this.requireGateway(), "hermes-free-stall-secret", "stall"),
+      new AttachPeer(() => this.requireGateway(), "hermes-free-approval-secret", "approval"),
+    ];
+    await Promise.all(this.#peers.map((peer) => peer.connect()));
+    return this.requireGateway();
+  }
+
+  async close(): Promise<void> {
+    for (const peer of this.#peers) peer.close();
+    await this.gateway?.close();
+    this.gateway = undefined;
+    this.#peers = [];
+    delete process.env.CONFORMANCE_HERMES_FREE_ECHO_TOKEN;
+    delete process.env.CONFORMANCE_HERMES_FREE_STALL_TOKEN;
+    delete process.env.CONFORMANCE_HERMES_FREE_APPROVAL_TOKEN;
+  }
+
+  private requireGateway(): RunningGateway {
+    if (this.gateway === undefined) throw new Error("reference gateway has not started");
+    return this.gateway;
+  }
+}

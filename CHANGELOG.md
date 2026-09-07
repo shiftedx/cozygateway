@@ -26,6 +26,22 @@ release; everything older is marked pre-release so installers resolve one "lates
   needs no new frame, field or peer behavior and covers a Hermes peer and a CozyAgents peer
   identically with no plugin change.
 
+- Portable conformance suite, Hermes-free (F9): the black-box suite in
+  `packages/conformance/src/suite.ts` assumed a Hermes endpoint existed, so it failed against a
+  Hermes-free reference gateway for reasons that had nothing to do with rooms. Two fixes: (1)
+  `GatewayInfo.bridges`' value type now accepts either the `BridgeLivenessSchema` object or the
+  literal string `"absent"`, matching the gateway's own already-documented Hermes-free `/health`
+  and `/ready` shape instead of rejecting it; (2) a runtime bot (`bots` config, capability 45) is
+  now registered into the same turn-adapter/router map a Hermes profile already uses, so a plain
+  1:1 `/threads` conversation against a runtime bot works instead of every send answering 503
+  `backend_unavailable`. A related shutdown fix: the durable-vs-abandon decision on gateway close
+  now also checks negotiated runtime bot connections, not only Hermes profiles, so a Hermes-free
+  gateway with an in-flight runtime bot turn no longer deadlocks on close. New third in-repo
+  runner, `packages/conformance/test/reference-gateway-hermes-free.test.ts`, runs the full portable
+  suite against a Hermes-free reference gateway; the two existing Hermes-attached runners are
+  unchanged and stay green. The phone capability request lifecycle group (capability 68) is not
+  enabled for this shape: `com.cozylabs.mobile-node` is a Hermes-Dashboard phone bridge capability
+  a Hermes-free gateway correctly never advertises, not a suite gap.
 - Rooms on a gateway with two or more Hermes endpoints (`com.cozylabs.bots` capabilities 46 and 52,
   F8): such a gateway refused every room, including one whose members all lived on a single
   endpoint. A room is now hosted by the one host its membership resolves to. Every member on one
