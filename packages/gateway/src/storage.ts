@@ -1339,6 +1339,10 @@ export class Storage {
   }
 
   deleteDevice(id: string): boolean {
+    // Capability 70. A routing choice naming a device nobody is paired to any more is dead weight:
+    // the read already hides it behind its join, and leaving the row would mean the database
+    // disagreed with every answer the gateway gives about it.
+    this.#db.prepare("DELETE FROM bot_mobile_preferred_devices WHERE device_id = ?").run(id);
     return this.#db.prepare("DELETE FROM devices WHERE id = ?").run(id).changes === 1;
   }
 
@@ -4546,8 +4550,13 @@ export class Storage {
   ): { draft: BotComposerDraft; changed: boolean } {
     this.#sweepComposerDrafts(at);
     const existing = this.#db
-      .prepare("SELECT text FROM bot_composer_drafts WHERE bot = ? AND session_id = ?")
-      .get(bot, sessionId) as { text: string } | undefined;
+      .prepare("SELECT text, updated_at AS updatedAt FROM bot_composer_drafts WHERE bot = ? AND session_id = ?")
+      .get(bot, sessionId) as { text: string; updatedAt: number } | undefined;
+    // `updatedAt` IS THE VERSION a client compares two drafts by, so it must move FORWARD on every
+    // stored change even when the clock repeats a millisecond or steps backwards. Two writes
+    // sharing a version would make "which of these is newer" unanswerable at exactly the moment it
+    // matters: a send's clear racing the keystroke before it.
+    const updatedAt = existing === undefined ? at : Math.max(at, existing.updatedAt + 1);
     this.#db
       .prepare(
         `INSERT INTO bot_composer_drafts (bot, session_id, text, updated_at)
@@ -4555,11 +4564,14 @@ export class Storage {
          ON CONFLICT (bot, session_id) DO UPDATE SET text = excluded.text,
            updated_at = excluded.updated_at`,
       )
-      .run(bot, sessionId, text, at);
-    return { draft: { sessionId, text, updatedAt: at }, changed: existing?.text !== text };
+      .run(bot, sessionId, text, updatedAt);
+    return { draft: { sessionId, text, updatedAt }, changed: existing?.text !== text };
   }
 
-  botComposerDraft(bot: string, sessionId: string): BotComposerDraft {
+  /** Pass `now` to sweep on the way in. A read is the second guard on retention, for a gateway
+   *  that sits between two maintenance passes; omitting it reads without sweeping. */
+  botComposerDraft(bot: string, sessionId: string, now?: number): BotComposerDraft {
+    if (now !== undefined) this.#sweepComposerDrafts(now);
     const row = this.#db
       .prepare("SELECT text, updated_at AS updatedAt FROM bot_composer_drafts WHERE bot = ? AND session_id = ?")
       .get(bot, sessionId) as { text: string; updatedAt: number } | undefined;
@@ -4568,12 +4580,26 @@ export class Storage {
       : { sessionId, text: row.text, updatedAt: row.updatedAt };
   }
 
-  /** Swept on the next write, the way settled request records are, so an abandoned composer needs
-   *  no timer to stop holding text. */
+  /** The retention pass's own entry point. Sweeping only on the next write meant one abandoned
+   *  draft on a gateway where nobody ever typed again was kept for as long as the gateway ran,
+   *  which is not what row 71 promises: the periodic sweep is what makes "forgotten after thirty
+   *  days" true on an idle gateway, and the write and the read are the two cheap guards beside it. */
+  pruneExpiredComposerDrafts(now: number): void {
+    this.#sweepComposerDrafts(now);
+  }
+
   #sweepComposerDrafts(now: number): void {
     this.#db
       .prepare("DELETE FROM bot_composer_drafts WHERE updated_at < ?")
       .run(now - COMPOSER_DRAFT_RETENTION_MS);
+  }
+
+  /** Test-only view of the stored preference rows, so a test can prove an unpaired device's row is
+   *  GONE rather than merely hidden behind the read's join. */
+  mobilePreferredDeviceRowsForTesting(bot: string): { sessionId: string; deviceId: string }[] {
+    return this.#db
+      .prepare("SELECT session_id AS sessionId, device_id AS deviceId FROM bot_mobile_preferred_devices WHERE bot = ? ORDER BY session_id")
+      .all(bot) as unknown as { sessionId: string; deviceId: string }[];
   }
 
   nativeBotMobileReceipts(bot: string, sessionId: string): BotMobileReceipt[] {

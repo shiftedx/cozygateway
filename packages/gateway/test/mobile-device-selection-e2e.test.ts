@@ -3,7 +3,8 @@
  *  selection is admitted the same way whatever runs behind the attach socket. The peer here is the
  *  attach lane a Hermes plugin speaks; nothing in Hermes' own agent loop takes part, and the two
  *  frame it sends is the pre-70 frame, unchanged: a peer has no say in which of a person's phones
- *  rings, and a frame that tries to name one is stripped rather than obeyed or refused.
+ *  rings, and there is no field for one, so a frame that tries to name a device is refused by the
+ *  closed key set the way any other contract skew is.
  *
  *  Capability 71 rides along at the end: a draft written by one paired device reaches the other,
  *  and the clear a send writes reaches it too, so nothing is ever offered for sending twice. */
@@ -102,21 +103,8 @@ it("admits a Hermes bot's phone capability request against the selected device",
     const record = await lifecycle(gateway.url, tokenA, turn.threadId, "chosen");
     expect(record).toMatchObject({ deviceId: appB.ready.deviceId });
 
-    // A PEER CANNOT PICK THE PHONE. A frame naming the other device is admitted against the
-    // person's stored choice all the same: the field is stripped at the boundary, so it steers
-    // nothing, and the request is not lost or the socket closed over it either.
-    plugin.send(JSON.stringify({
-      kind: "mobile_request", requestId: "hinted", command: "device.status",
-      threadId: turn.threadId, turnId: turn.turnId, expiresAt: Date.now() + 1_000,
-      purpose: "Report phone readiness", targetDeviceId: appA.ready.deviceId,
-    }));
-    await until(() => appB.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "hinted"));
-    expect(appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "hinted")).toBe(false);
-    // And the peer is still attached: a hint is ignored, never a reason to close a socket.
-    expect(plugin.readyState).toBe(WebSocket.OPEN);
-
-    // With the choice cleared, the same hint still steers nothing: the target is the device that
-    // opened the turn, which is the pre-70 rule.
+    // With the choice cleared, the target is the device that opened the turn, which is the pre-70
+    // rule and the only other source there is.
     await fetch(
       `${gateway.url}/bots/sage/mobile-requests/preferred-device?sessionId=${encodeURIComponent(turn.threadId)}`,
       {
@@ -124,11 +112,7 @@ it("admits a Hermes bot's phone capability request against the selected device",
         body: JSON.stringify({ deviceId: null }),
       },
     );
-    plugin.send(JSON.stringify({
-      kind: "mobile_request", requestId: "cleared", command: "device.status",
-      threadId: turn.threadId, turnId: turn.turnId, expiresAt: Date.now() + 1_000,
-      purpose: "Report phone readiness", targetDeviceId: appB.ready.deviceId,
-    }));
+    requestStatus(plugin, turn, "cleared");
     await until(() => appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "cleared"));
     expect(appB.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "cleared")).toBe(false);
 
@@ -162,6 +146,28 @@ it("admits a Hermes bot's phone capability request against the selected device",
       { headers: { authorization: `Bearer ${tokenB}` } },
     );
     expect(await clearedOnB.json()).toMatchObject({ text: "" });
+    // A PEER CANNOT PICK THE PHONE, AND THERE IS NO FIELD FOR IT. `targetDeviceId` is not a member
+    // of any request shape, so a frame carrying one is refused by the closed key set exactly as any
+    // other contract skew is: a named refusal and a closed socket, rather than a silent drop or a
+    // tolerated spelling that would leave the routing rule unreadable from the schema. Sent on its
+    // OWN socket, because the refusal ends that connection.
+    const skewed = new WebSocket(`${gateway.url.replace("http", "ws")}/attach/v1`, { headers: { authorization: "Bearer attach-secret" } });
+    sockets.push(skewed);
+    await once(skewed, "open");
+    skewed.send(JSON.stringify({
+      kind: "hello", version: 2, instanceId: "device-selection-skew",
+      capabilities: ["draft", "mobile_node"], resume: { eventSequence: 0, commandSequence: 0 },
+    }));
+    await pause();
+    skewed.send(JSON.stringify({
+      kind: "mobile_request", requestId: "named-a-device", command: "device.status",
+      threadId: turn.threadId, turnId: turn.turnId, expiresAt: Date.now() + 1_000,
+      purpose: "Report phone readiness", targetDeviceId: appA.ready.deviceId,
+    }));
+    await until(() => skewed.readyState === WebSocket.CLOSED || skewed.readyState === WebSocket.CLOSING);
+    // And no phone was asked anything on the strength of it.
+    expect(appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "named-a-device")).toBe(false);
+    expect(appB.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "named-a-device")).toBe(false);
   } finally {
     for (const socket of sockets)
       if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close();

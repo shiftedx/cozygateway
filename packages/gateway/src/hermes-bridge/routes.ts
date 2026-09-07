@@ -943,7 +943,10 @@ export function registerBotRoutes(
     const sessionId = c.req.query("sessionId");
     if (sessionId === undefined || sessionId === "")
       return c.json(errorBody("invalid_request", "sessionId is required"), 400);
-    return c.json(chat.mobilePreferredDevice?.(resolved.name, sessionId) ?? { sessionId });
+    const preference = chat.mobilePreferredDevice?.(resolved.name, sessionId);
+    if (preference === undefined)
+      return c.json(errorBody("not_found", "no such bot"), 404);
+    return c.json(preference);
   });
 
   app.put("/bots/:name/mobile-requests/preferred-device", requireDevice, async (c) => {
@@ -968,10 +971,18 @@ export function registerBotRoutes(
     }
     // A choice that resolves to nothing at admission time is a routing rule that quietly does not
     // work, so an unpaired id is refused by name rather than stored.
-    const outcome = chat.setMobilePreferredDevice?.(resolved.name, sessionId, parsed.deviceId) ?? "ok";
+    const outcome = chat.setMobilePreferredDevice?.(resolved.name, sessionId, parsed.deviceId)
+      ?? "unknown_bot";
     if (outcome === "unknown_device")
       return c.json(errorBody("invalid_request", "deviceId names no paired device"), 400);
-    return c.json(chat.mobilePreferredDevice?.(resolved.name, sessionId) ?? { sessionId });
+    // A write that stored nothing is never a 200. Answering with the body that was sent would
+    // tell a person their choice was saved when the next read will say it was not.
+    if (outcome === "unknown_bot")
+      return c.json(errorBody("not_found", "no such bot"), 404);
+    const stored = chat.mobilePreferredDevice?.(resolved.name, sessionId);
+    if (stored === undefined)
+      return c.json(errorBody("not_found", "no such bot"), 404);
+    return c.json(stored);
   });
 
   // Capability 71. One composer draft per conversation, belonging to the PERSON. It never reaches
@@ -982,7 +993,10 @@ export function registerBotRoutes(
     const sessionId = c.req.query("sessionId");
     if (sessionId === undefined || sessionId === "")
       return c.json(errorBody("invalid_request", "sessionId is required"), 400);
-    return c.json(chat.composerDraft?.(resolved.name, sessionId) ?? { sessionId, text: "", updatedAt: 0 });
+    const draft = chat.composerDraft?.(resolved.name, sessionId);
+    if (draft === undefined)
+      return c.json(errorBody("not_found", "no such bot"), 404);
+    return c.json(draft);
   });
 
   app.put("/bots/:name/drafts", requireDevice, async (c) => {
@@ -1004,12 +1018,13 @@ export function registerBotRoutes(
         return c.json(errorBody("invalid_request", "sessionId is required and text is at most 8000 characters"), 400);
       throw err;
     }
-    if (parsed.sessionId === "")
-      return c.json(errorBody("invalid_request", "sessionId is required"), 400);
-    return c.json(
-      chat.setComposerDraft?.(resolved.name, parsed.sessionId, parsed.text)
-        ?? { sessionId: parsed.sessionId, text: parsed.text, updatedAt: 0 },
-    );
+    // `sessionId` is already bounded to at least one character by the schema above, so there is
+    // no separate empty check here: a second one would be an unreachable branch pretending to be
+    // a guard.
+    const stored = chat.setComposerDraft?.(resolved.name, parsed.sessionId, parsed.text);
+    if (stored === undefined)
+      return c.json(errorBody("not_found", "no such bot"), 404);
+    return c.json(stored);
   });
 
   app.delete("/bots/:name/approvals/grants/:grantId", requireDevice, (c) => {

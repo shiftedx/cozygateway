@@ -357,6 +357,7 @@ export async function startGateway(
   const scheme = tls === undefined ? "http" : "https";
   const storage = openStorage(config.dbPath);
   storage.pruneExpiredAttachMedia(Date.now());
+  storage.pruneExpiredComposerDrafts(Date.now());
   const endpoints = hermesEndpoints(config);
   const profileEntries = endpoints.flatMap((endpoint) => Object.entries(endpoint.config.profiles).map(
     ([rawId, profile]) => [publicProfileId(endpoint, rawId), profile] as const,
@@ -1323,9 +1324,13 @@ export async function startGateway(
   const attachMediaSweep = setInterval(() => {
     try {
       storage.pruneExpiredAttachMedia(Date.now());
+      // Capability 71. An abandoned composer must stop holding a person's words even on a gateway
+      // where nobody ever types again, so retention runs on this pass rather than only on the
+      // next write.
+      storage.pruneExpiredComposerDrafts(Date.now());
     } catch (error) {
       console.error(
-        `attachment media retention sweep failed: ${error instanceof Error ? error.message : String(error)}`,
+        `retention sweep failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }, PHOTO_SWEEP_MS);

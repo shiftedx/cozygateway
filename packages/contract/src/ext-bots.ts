@@ -506,7 +506,11 @@ export type BotMobilePreferredDeviceRequest = Static<typeof BotMobilePreferredDe
 /** Capability 71. One composer draft for one conversation on one profile, belonging to the person
  *  rather than to any one of their phones, which is why NO device id appears here or on the write.
  *  Empty text with a zero `updatedAt` is a conversation that has no draft; empty text with a real
- *  `updatedAt` is a draft a send CLEARED, which is what stops another device offering to resend. */
+ *  `updatedAt` is a draft a send CLEARED, which is what stops another device offering to resend.
+ *  `updatedAt` is also the VERSION: it moves strictly forward on every stored change, even across a
+ *  repeated or backwards clock, so two drafts can always be ordered and a client applies only the
+ *  newer one. Without that, a slow write landing after a send's clear would put a sent message back
+ *  on another phone, which is the one thing this row exists to prevent. */
 export const BotComposerDraftSchema = Type.Object({
   sessionId: Type.String({ minLength: 1, maxLength: 256 }),
   text: Type.String({ maxLength: 8_000 }),
@@ -2926,9 +2930,9 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * conversation. `GET`/`PUT /bots/:name/mobile-requests/preferred-device?sessionId=` records the
  * choice, which is read ONLY at admission and written by a device-authenticated client and by
  * nothing else. NO PEER HAS ANY INPUT INTO WHICH PHONE RINGS: no frame carries a target device,
- * and a `mobile_request` that includes one anyway has that key stripped at ingress with one
- * bounded log line rather than being refused, so a request a person is waiting on is never lost
- * over a field that means nothing. Capability 68's binding is otherwise untouched: the target
+ * and a `mobile_request` that includes one anyway is refused by the closed key set like any other
+ * unknown key. One exception, stated as a rule: a CozyApp action is answered on the device that
+ * tapped it and consults no preference, because a tap's answer belongs on the screen that took it. Capability 68's binding is otherwise untouched: the target
  * never moves, and a second device attaching never becomes one. A stored choice naming a device
  * that is no longer paired is skipped, and admission falls through to the device that opened the
  * turn. Additive: every peer is byte identical to its pre-70 self, and a client that writes no

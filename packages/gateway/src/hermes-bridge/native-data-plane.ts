@@ -2255,31 +2255,38 @@ export class NativeBotDataPlane {
 
   /** Capability 70. The person's own choice of which phone this conversation's capability
    *  requests reach. Stored per profile and conversation, read only at admission. */
-  #mobilePreferredDevice(name: string, sessionId: string): BotMobilePreferredDevice {
+  #mobilePreferredDevice(name: string, sessionId: string): BotMobilePreferredDevice | undefined {
     const bot = normalize(name);
-    if (!this.#native.has(bot)) return { sessionId };
+    // A bot this plane does not hold is answered with NOTHING rather than an empty preference: a
+    // 200 saying "no choice recorded" for a name that does not exist is an answer about a
+    // conversation nobody has.
+    if (!this.#native.has(bot)) return undefined;
     return this.#storage.botMobilePreferredDevice(bot, sessionId);
   }
 
   #setMobilePreferredDevice(
     name: string, sessionId: string, deviceId: string | null,
-  ): "ok" | "unknown_device" {
+  ): "ok" | "unknown_device" | "unknown_bot" {
     const bot = normalize(name);
-    if (!this.#native.has(bot)) return "ok";
+    // Telling a person their choice was saved when nothing was written is worse than either a
+    // refusal or a silent failure: the next read will disagree with what they were just told.
+    if (!this.#native.has(bot)) return "unknown_bot";
     return this.#storage.setBotMobilePreferredDevice(bot, sessionId, deviceId, this.#now());
   }
 
   /** Capability 71. Composer state for the PERSON: it rides no attach lane, reaches no peer and
    *  no model, and carries no device id, because every paired device is the same person. */
-  #composerDraft(name: string, sessionId: string): BotComposerDraft {
+  #composerDraft(name: string, sessionId: string): BotComposerDraft | undefined {
     const bot = normalize(name);
-    if (!this.#native.has(bot)) return { sessionId, text: "", updatedAt: 0 };
-    return this.#storage.botComposerDraft(bot, sessionId);
+    if (!this.#native.has(bot)) return undefined;
+    return this.#storage.botComposerDraft(bot, sessionId, this.#now());
   }
 
-  #setComposerDraft(name: string, sessionId: string, text: string): BotComposerDraft {
+  #setComposerDraft(name: string, sessionId: string, text: string): BotComposerDraft | undefined {
     const bot = normalize(name);
-    if (!this.#native.has(bot)) return { sessionId, text, updatedAt: this.#now() };
+    // Echoing the draft back for a bot nobody holds says it was kept when the next read will say
+    // it was not, which is the one answer worse than refusing.
+    if (!this.#native.has(bot)) return undefined;
     const written = this.#storage.setBotComposerDraft(bot, sessionId, text, this.#now());
     // A device replaying the text it already had wakes nobody. Everything else, INCLUDING the
     // empty string a send writes, reaches every other paired device at once: that clear is what

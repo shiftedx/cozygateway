@@ -115,7 +115,7 @@ describe("capability-71 draft frames", () => {
     expect(seenBelow.some((frame) => frame.type === "bot_draft_updated")).toBe(false);
 
     // Every other frame still reaches all three: the filter is one frame wide.
-    hub.broadcast({ type: "bot_presence", agents: [] });
+    hub.broadcast({ type: "bot_presence", active: [], updatedAt: 1_000 });
     await until(() => seenBelow.some((frame) => frame.type === "bot_presence"));
 
     below.close(); current.close(); silent.close();

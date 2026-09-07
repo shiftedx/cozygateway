@@ -150,7 +150,7 @@ export function emitMobileNodeFailure(
  *  THE ONLY TWO SOURCES ARE THE PERSON'S. Their recorded choice for this conversation, then the
  *  device that opened the turn. A PEER HAS NO INPUT HERE AND THERE IS NO PARAMETER FOR ONE: which
  *  of somebody's phones rings is theirs to decide, not something a bot or a harness can name, and
- *  a `targetDeviceId` on the wire is stripped at the ingress boundary before it ever reaches this.
+ *  no frame on this wire carries a field for one, so there is nothing to ignore here either.
  *
  *  A stored choice naming a device that is no longer paired is skipped rather than resolved,
  *  because a target that cannot answer is worse than the turn origin it displaced. */

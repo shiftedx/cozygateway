@@ -333,13 +333,17 @@ RESOLUTION ORDER, first that resolves wins:
 There is no third source, and in particular no peer input. WHICH OF A PERSON'S PHONES RINGS IS THE
 PERSON'S CHOICE. The preference is written by a device-authenticated client, and nothing a bot, a
 harness, a runtime or a Hermes plugin sends can name a target device: no frame carries such a
-field. A `mobile_request` that carries `targetDeviceId` anyway has that key STRIPPED at the ingress
-boundary, before validation, with one bounded log line naming only the closed command; the request
-is then admitted exactly as if the field had never been there. Stripping rather than refusing is
-deliberate, and it is the same instinct capability 56's `detail` and 62's `repair` follow: the
-closed key set would close the socket and lose a request a person is waiting on over a field that
-means nothing. The id a peer tried to name is NEVER logged, because it is the thing being refused
-rather than something to record.
+field. A `mobile_request` that carries `targetDeviceId` anyway is REFUSED by the closed key set,
+with the ingress's ordinary named refusal, exactly as any other unknown key on any other frame is.
+The field is REMOVED rather than tolerated. A spelling the gateway silently accepts and drops is
+worse than one it refuses on two counts: the routing rule stops being readable from the schema, and
+a peer that thinks it is steering a request keeps thinking so, with nothing anywhere to correct it.
+
+ONE EXCEPTION, and it is a rule rather than an oversight: a request whose origin is a registered
+CozyApp action is answered on THE DEVICE THAT TAPPED IT, and consults no stored preference. The
+answer to a tap belongs on the screen that took it; a camera prompt appearing on a phone in another
+room because a chat preference said so would break the interaction the person is standing in front
+of. The conversation's preference governs the CONVERSATION.
 
 A stored choice whose device is no longer paired is SKIPPED rather than resolved, and admission
 falls through to the turn origin: a target that cannot answer is worse than the one it displaced.
@@ -399,7 +403,9 @@ holds the newest text of each conversation's draft in the clear, in its own data
 already holds that conversation's messages. WHAT IS STORED is the text, the conversation, the
 profile and one timestamp. WHAT IS NOT is a device, an author, a history, an earlier version, or
 anything a peer could read. A draft is dropped when its conversation's history is, and an untouched
-draft is swept after thirty days, so an abandoned composer cannot hold a person's words forever.
+draft is swept after thirty days, so an abandoned composer cannot hold a person's words forever;
+that sweep runs on the gateway's own periodic retention pass, not only on the next write, so a
+gateway where nobody ever types again forgets on the same schedule as a busy one.
 A DRAFT'S TEXT IS NEVER LOGGED: not in a log line, not in a trace, not in a metric, and not as a
 length either. The two routes and the one frame carry it, and nothing else does.
 
@@ -954,10 +960,10 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `GET /bots/approvals` | optional `state=pending` | `BotInteractionRecovery` | Bounded pending approvals/clarifications plus confirmed terminal receipts. |
 | `GET /bots/:name/approvals/grants` | — | `BotApprovalGrants` | Capability 66. The standing approvals this bot holds that are neither expired nor revoked. |
 | `DELETE /bots/:name/approvals/grants/:grantId` | — | `200 { status: "revoked" }` | Capability 66. Ends one standing approval immediately; `404` for a grant this gateway does not hold. |
-| `GET /bots/:name/mobile-requests/preferred-device?sessionId=` | — | `BotMobilePreferredDevice` | Capability 70. The phone this conversation's capability requests should go to; every field but `sessionId` is absent when no choice was recorded. |
-| `PUT /bots/:name/mobile-requests/preferred-device?sessionId=` | `BotMobilePreferredDeviceRequest` | `BotMobilePreferredDevice` | Capability 70. Records the choice, or clears it with a `null` `deviceId`. An unpaired `deviceId`, or a missing `sessionId`, is `400 invalid_request` naming the field. |
-| `GET /bots/:name/drafts?sessionId=` | — | `BotComposerDraft` | Capability 71. This conversation's composer draft for the person, empty text and a zero `updatedAt` when there is none. |
-| `PUT /bots/:name/drafts` | `BotComposerDraftRequest` | `BotComposerDraft` | Capability 71. Stores the newest draft, last write wins; the empty string is the clear. Broadcasts `bot_draft_updated` unless the text is unchanged. |
+| `GET /bots/:name/mobile-requests/preferred-device?sessionId=` | — | `BotMobilePreferredDevice` | Capability 70. The phone this conversation's capability requests should go to; every field but `sessionId` is absent when no choice was recorded. `404 not_found` for a bot this gateway does not hold. |
+| `PUT /bots/:name/mobile-requests/preferred-device?sessionId=` | `BotMobilePreferredDeviceRequest` | `BotMobilePreferredDevice` | Capability 70. Records the choice, or clears it with a `null` `deviceId`. An unpaired `deviceId`, or a missing `sessionId`, is `400 invalid_request` naming the field; a bot this gateway does not hold is `404 not_found`, never a `200` echoing a choice that was not stored. |
+| `GET /bots/:name/drafts?sessionId=` | — | `BotComposerDraft` | Capability 71. This conversation's composer draft for the person, empty text and a zero `updatedAt` when there is none. `404 not_found` for a bot this gateway does not hold. |
+| `PUT /bots/:name/drafts` | `BotComposerDraftRequest` | `BotComposerDraft` | Capability 71. Stores the newest draft, last write wins; the empty string is the clear. `updatedAt` moves strictly forward on every stored change, so it is the version a client orders two drafts by. Broadcasts `bot_draft_updated` unless the text is unchanged. `404 not_found` for a bot this gateway does not hold. |
 | `POST /bots/:name/clarifications/:clarifyId` | `BotClarifyResolveRequest` | `202 { outcome: "requested" }` | Durably requests a clarification option; the terminal event confirms it. |
 | `GET /bots/:name/memory` | — | `BotMemoryOverviewResponse` | Profile-local source health/capabilities only; the gateway never opens Hermes files or provider storage. |
 | `PATCH /bots/:name/memory/setup` | `BotMemorySetupRequest` | `BotMemoryOverviewResponse` | Applies the three credential-free Hermes settings through the attached profile and returns a fresh authoritative projection. |
@@ -1169,7 +1175,15 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
   empty string is the CLEAR that stops every other paired device offering a message already sent.
   It carries no device id, because the draft belongs to the person and not to the phone that typed
   it, and it is never sent to a peer, a runtime or a model. Safe to drop: the next
-  `GET /bots/:name/drafts?sessionId=` is the recovery read.
+  `GET /bots/:name/drafts?sessionId=` is the recovery read. `updatedAt` is its VERSION and moves
+  strictly forward on every stored change, even when the gateway clock repeats a millisecond or
+  steps backwards, so "which of these two is newer" always has an answer at the one moment it
+  matters: a send's clear racing the keystroke before it. A client applies a draft only when its
+  `updatedAt` is newer than the one it holds. A client may declare `com.cozylabs.bots` on the
+  `auth` frame; one that declares a version below 71 is not sent this frame at all, so a below-71
+  client is byte identical rather than receiving one frame it drops. A client that declares
+  nothing is sent it and ignores it, which is what every client shipped before the declaration
+  existed does.
 
 Frames are independently safe to drop where their schema says they are deltas or snapshots.
 Committed transcript history remains the recovery source after reconnect.
