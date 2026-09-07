@@ -236,6 +236,7 @@ export class WsHub {
         clearTimeout(authTimer);
         releasePending?.();
         this.#storage.touchDevice(device.id, this.#now());
+        this.#storage.recordDeviceEdgeProbe(device.id, frame.edgeRttMs, frame.edgeColo);
         client = {
           socket, deviceId: device.id, scope: device.scope, heartbeatAlive: true, mobileCommands: new Set(),
           mobileForeground: false,

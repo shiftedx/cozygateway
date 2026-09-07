@@ -73,6 +73,7 @@ import type {
 import { GroupRooms, type RoomInteractionExpiry } from "./group-rooms.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
 import type { ProfileChangeEvent } from "./profile-provisioner.ts";
+import type { ObservationRing } from "../observe/ring.ts";
 import {
   BotNameInvalid,
   BotNameTaken,
@@ -392,7 +393,13 @@ export interface BotsSurface extends BotControlSurface {
     /** Capability 73. The app's own perceived latency and network path for this report. Optional
      * everywhere: a client below 73 sends neither and is byte identical to its pre-73 self, and a
      * backend that has nowhere to put them ignores them. */
-    perceived?: { feltLatencyMs?: number; networkPath?: "wifi" | "cellular" | "vpn_on" | "vpn_off" },
+    perceived?: {
+      feltLatencyMs?: number;
+      networkPath?: "wifi" | "cellular" | "wired" | "other";
+      vpn?: boolean;
+      edgeRttMs?: number;
+      edgeColo?: string;
+    },
   ): { recorded: number };
   desktopSessions(name: string): Promise<BotDesktopHermesSession[]>;
   resumeDesktopSession(name: string, hermesSessionId: string): Promise<BotDesktopHermesResumeResponse>;
@@ -401,6 +408,7 @@ export interface BotsSurface extends BotControlSurface {
 export interface HermesBridgeOptions {
   client: HermesClient;
   storage: Storage;
+  observe?: ObservationRing;
   broadcast: (frame: ServerFrame) => void;
   now: () => number;
   hiddenProfiles?: Iterable<string>;
@@ -522,6 +530,7 @@ export class HermesBridge implements BotControlSurface {
       ((line) => void process.stderr.write(`[hermes-bridge] ${line}\n`));
     this.#groups = new GroupRooms({
       storage: this.#storage,
+      ...(opts.observe === undefined ? {} : { observe: opts.observe }),
       broadcast: this.#broadcast,
       now: this.#now,
       memberInfo: (name) => this.#memberInfo(name),

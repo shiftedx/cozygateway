@@ -43,6 +43,7 @@ export const OBSERVE_SERIES = [
   "push_result",
   // Section 11, reported by the app on the delivery receipt it already sends.
   "felt_latency_ms",
+  "edge_rtt_ms",
   // Section 3 and 12, folded in from the CozyAgents snapshot lane by D5. The gateway never measures
   // these itself and never infers them.
   "model_step_ms",
@@ -79,6 +80,8 @@ export const OBSERVE_EVENT_KINDS = [
   "dead_letter",
   "tunnel_flap",
   "maintenance_operation",
+  /** One app-reported receipt measurement, keyed by its bot and reporting device hashes. */
+  "receipt_measurement",
   "push_result",
 ] as const;
 export type ObserveEventKind = (typeof OBSERVE_EVENT_KINDS)[number];
@@ -90,7 +93,11 @@ export const OBSERVE_SERIES_TAGS = [
   // Section 10, the origin of a device websocket as the gateway saw it.
   "tunnel", "lan",
   // Section 11, the network path the app reports for itself.
-  "wifi", "cellular", "vpn_on", "vpn_off",
+  // A missing VPN reading remains the bare radio. Observed `false` and `true` have distinct tags
+  // so the dashboard can compare the same device/radio pair without inventing an off sample.
+  "wifi", "cellular", "wired", "other",
+  "wifi_vpn_off", "cellular_vpn_off", "wired_vpn_off", "other_vpn_off",
+  "wifi_vpn_on", "cellular_vpn_on", "wired_vpn_on", "other_vpn_on",
   // Push relay outcomes, mirroring the existing relay_result trace vocabulary.
   "ok", "not_found", "http_error", "network_error",
 ] as const;
@@ -165,6 +172,8 @@ export type DetailFieldSpec =
   | { kind: "count" }
   | { kind: "flag" }
   | { kind: "hash" }
+  /** Cloudflare colos are three or four uppercase ASCII letters, never arbitrary text. */
+  | { kind: "colo" }
   | { kind: "code"; values: readonly string[] };
 
 const count = { kind: "count" } as const;
@@ -190,7 +199,11 @@ export const OBSERVE_EVENT_DETAIL: Record<ObserveEventKind, Record<string, Detai
   approval_raised: { grant: hash },
   approval_resolved: { grant: hash, decision: withOther("approved", "denied", "expired") },
   repair_proposed: { attempts: count },
-  runtime_stage: { stage: withOther("waiting_for_runner", "creating", "running", "deleting", "deleted", "failed") },
+  runtime_stage: { stage: withOther(
+    "waiting_for_runner", "waiting_for_capacity", "pulling_image", "creating", "starting",
+    "ready", "draining", "stopping", "stopped", "recovering", "upgrading", "deleting",
+    "deleted", "needs_attention",
+  ) },
   runner_contact_lost: { gap_ms: count },
   runner_contact_regained: { gap_ms: count },
   device_paired: {},
@@ -203,6 +216,13 @@ export const OBSERVE_EVENT_DETAIL: Record<ObserveEventKind, Record<string, Detai
     outage_ms: count,
   },
   maintenance_operation: { outcome: withOther("ok", "failed", "skipped") },
+  receipt_measurement: {
+    radio: code("wifi", "cellular", "wired", "other"),
+    vpn: { kind: "flag" },
+    felt_latency_ms: count,
+    edge_rtt_ms: count,
+    edge_colo: { kind: "colo" },
+  },
   push_result: { result: withOther("ok", "not_found", "http_error", "network_error") },
 };
 
@@ -240,6 +260,9 @@ export function serializeDetail(kind: string, detail: ObserveDetail | undefined)
         break;
       case "hash":
         if (typeof value !== "string" || !isIdentityHash(value)) return undefined;
+        break;
+      case "colo":
+        if (typeof value !== "string" || !/^[A-Z]{3,4}$/.test(value)) return undefined;
         break;
       case "code":
         if (typeof value !== "string" || !spec.values.includes(value)) return undefined;

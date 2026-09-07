@@ -38,6 +38,7 @@ import {
 } from "./group-protocol.ts";
 import { blocksToText } from "../adapters/attach/blocks-to-text.ts";
 import { settledGroupTurn, startNativeMemberTurn, type GroupTurnResult, type NativeGroupTurnEndpoint } from "./group-turn.ts";
+import type { ObservationRing } from "../observe/ring.ts";
 
 /** Server-side group chats: durable rooms whose deliberation rounds run HERE rather than in a
  *  client (spec section 4, the one deliberate deviation from the Hermes desktop).
@@ -206,6 +207,7 @@ export class GroupInvalid extends Error {
 
 export interface GroupRoomsOptions {
   storage: Storage;
+  observe?: ObservationRing;
   broadcast: (frame: ServerFrame) => void;
   now: () => number;
   /** The bot's handle and display title, from the bridge's roster view. Always answers: a member
@@ -263,6 +265,7 @@ export interface GroupRoomsOptions {
 
 export class GroupRooms {
   readonly #storage: Storage;
+  readonly #observe: ObservationRing | undefined;
   readonly #broadcast: (frame: ServerFrame) => void;
   readonly #now: () => number;
   readonly #memberInfo: (name: string) => GroupMember;
@@ -310,6 +313,7 @@ export class GroupRooms {
 
   constructor(opts: GroupRoomsOptions) {
     this.#storage = opts.storage;
+    this.#observe = opts.observe?.enabled === true ? opts.observe : undefined;
     this.#broadcast = opts.broadcast;
     this.#now = opts.now;
     this.#memberInfo = opts.memberInfo;
@@ -1138,6 +1142,11 @@ export class GroupRooms {
         ...(detail === undefined ? {} : { detail }),
         ...(scope === undefined ? {} : { scope }),
       });
+      this.#observe?.event("approval_raised", turn.member, event.approvalId, {
+        ...(grantId === undefined ? {} : { grant: this.#observe.identify(grantId) }),
+      });
+      if (repair !== undefined)
+        this.#observe?.event("repair_proposed", turn.member, event.approvalId, { attempts: 1 });
       this.#broadcast({
         type: "bot_approval_pending",
         bot: turn.member,
@@ -1164,6 +1173,7 @@ export class GroupRooms {
         });
       }
     } else {
+      this.#observe?.event("approval_resolved", turn.member, event.approvalId, { decision: outcome });
       this.#broadcast({
         type: "bot_approval_resolved",
         bot: turn.member,

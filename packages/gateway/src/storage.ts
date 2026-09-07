@@ -184,7 +184,9 @@ CREATE TABLE IF NOT EXISTS devices (
   -- The constraint lives in the type system instead (StoredDeviceKind and DeviceScope), which is
   -- the same choice setup_codes.kind already makes.
   kind TEXT NOT NULL DEFAULT 'device',
-  scope TEXT NOT NULL DEFAULT 'write'
+  scope TEXT NOT NULL DEFAULT 'write',
+  edge_rtt_ms INTEGER,
+  edge_colo TEXT
 ) STRICT;
 CREATE TABLE IF NOT EXISTS setup_codes (
   code TEXT PRIMARY KEY,
@@ -627,6 +629,9 @@ CREATE TABLE IF NOT EXISTS bot_message_receipts (
   -- back later still says what it was, and they are never mixed into a gateway-measured hop.
   felt_latency_ms INTEGER,
   network_path TEXT,
+  vpn INTEGER,
+  edge_rtt_ms INTEGER,
+  edge_colo TEXT,
   PRIMARY KEY (bot, message_id)
 ) STRICT, WITHOUT ROWID;
 -- Capability 39 phone-sharing receipts. The request id is the idempotency key; the remaining
@@ -1510,6 +1515,14 @@ export class Storage {
 
   touchDevice(id: string, at: number): void {
     this.#db.prepare("UPDATE devices SET last_seen_at = ? WHERE id = ?").run(at, id);
+  }
+
+  /** Records exactly what the app reported on its authenticated websocket auth frame. */
+  recordDeviceEdgeProbe(id: string, edgeRttMs?: number, edgeColo?: string): void {
+    if (edgeRttMs === undefined && edgeColo === undefined) return;
+    this.#db.prepare(
+      "UPDATE devices SET edge_rtt_ms = COALESCE(?, edge_rtt_ms), edge_colo = COALESCE(?, edge_colo) WHERE id = ?",
+    ).run(edgeRttMs ?? null, edgeColo ?? null, id);
   }
 
   /** Capability 52. A paired runner's row. The token is stored as a hash, exactly as a device
@@ -3626,15 +3639,18 @@ export class Storage {
     /** Capability 73. What the person waited and which network they were on, both measured on the
      * phone. Stored on the receipt rather than only folded into the observation ring so a receipt
      * read back later still says what it was, and never mixed into a gateway-measured hop. */
-    perceived?: { feltLatencyMs?: number; networkPath?: string },
+    perceived?: { feltLatencyMs?: number; networkPath?: string; vpn?: boolean; edgeRttMs?: number; edgeColo?: string },
   ): { recorded: number; deliveries: Array<{ deliveryId: string; messageId: string }> } {
     const insert = this.#db.prepare(
-      `INSERT OR IGNORE INTO bot_message_receipts (bot, message_id, displayed_at, device_id, felt_latency_ms, network_path)
-       SELECT ?, ?, ?, ?, ?, ?
+      `INSERT OR IGNORE INTO bot_message_receipts (bot, message_id, displayed_at, device_id, felt_latency_ms, network_path, vpn, edge_rtt_ms, edge_colo)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
        WHERE EXISTS (SELECT 1 FROM bot_native_messages WHERE bot = ? AND message_id = ?)`,
     );
     const feltLatencyMs = perceived?.feltLatencyMs ?? null;
     const networkPath = perceived?.networkPath ?? null;
+    const vpn = perceived?.vpn === undefined ? null : perceived.vpn ? 1 : 0;
+    const edgeRttMs = perceived?.edgeRttMs ?? null;
+    const edgeColo = perceived?.edgeColo ?? null;
     const binding = this.#db.prepare(
       `SELECT delivery_id AS deliveryId FROM attach_scheduled_deliveries
        WHERE agent_id = ? AND message_id = ?`,
@@ -3649,7 +3665,7 @@ export class Storage {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       for (const messageId of new Set(messageIds)) {
-        if (insert.run(bot, messageId, at, deviceId, feltLatencyMs, networkPath, bot, messageId).changes !== 1) continue;
+        if (insert.run(bot, messageId, at, deviceId, feltLatencyMs, networkPath, vpn, edgeRttMs, edgeColo, bot, messageId).changes !== 1) continue;
         recorded += 1;
         displayed.push(messageId);
         const bound = (binding.get(bot, messageId) ?? turnBinding.get(bot, messageId)) as
@@ -3670,16 +3686,20 @@ export class Storage {
 
   botMessageReceipt(bot: string, messageId: string): {
     displayedAt: number; deviceId: string; feltLatencyMs: number | null; networkPath: string | null;
+    vpn: boolean | null; edgeRttMs: number | null; edgeColo: string | null;
   } | undefined {
-    return this.#db
+    const row = this.#db
       .prepare(
         `SELECT displayed_at AS displayedAt, device_id AS deviceId,
-                felt_latency_ms AS feltLatencyMs, network_path AS networkPath
+                felt_latency_ms AS feltLatencyMs, network_path AS networkPath,
+                vpn, edge_rtt_ms AS edgeRttMs, edge_colo AS edgeColo
          FROM bot_message_receipts WHERE bot = ? AND message_id = ?`,
       )
       .get(bot, messageId) as {
         displayedAt: number; deviceId: string; feltLatencyMs: number | null; networkPath: string | null;
+        vpn: number | null; edgeRttMs: number | null; edgeColo: string | null;
       } | undefined;
+    return row === undefined ? undefined : { ...row, vpn: row.vpn === null ? null : row.vpn === 1 };
   }
 
   /** Read the admitted event's existing durable records; it intentionally performs no projection
@@ -5989,6 +6009,9 @@ export function openStorage(dbPath: string): Storage {
     );
     if (!columns.has("felt_latency_ms")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN felt_latency_ms INTEGER");
     if (!columns.has("network_path")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN network_path TEXT");
+    if (!columns.has("vpn")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN vpn INTEGER");
+    if (!columns.has("edge_rtt_ms")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN edge_rtt_ms INTEGER");
+    if (!columns.has("edge_colo")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN edge_colo TEXT");
   }
   for (const table of ["runtime_bots", "runner_operations"]) {
     const columns = new Set(
@@ -6018,6 +6041,8 @@ export function openStorage(dbPath: string): Storage {
     db.exec("ALTER TABLE devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'device'");
   if (!deviceColumns.has("scope"))
     db.exec("ALTER TABLE devices ADD COLUMN scope TEXT NOT NULL DEFAULT 'write'");
+  if (!deviceColumns.has("edge_rtt_ms")) db.exec("ALTER TABLE devices ADD COLUMN edge_rtt_ms INTEGER");
+  if (!deviceColumns.has("edge_colo")) db.exec("ALTER TABLE devices ADD COLUMN edge_colo TEXT");
   const attachStreamColumns = new Set(
     (db.prepare("PRAGMA table_info(attach_streams)").all() as unknown as Array<{ name: string }>)
       .map((column) => column.name),

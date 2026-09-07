@@ -620,20 +620,40 @@ export function createApp(deps: AppDeps): Hono<Env> {
       }
     });
     app.post("/gateway/maintenance/restart", requireDevice, async (c) => {
+      let requestId: string | undefined;
       try {
         const input = assertValid(GatewayMaintenanceRestartRequestSchema, await readBody(c));
-        return c.json(await deps.maintenance!.restart(input.requestId), 202);
-      } catch (error) { return maintenanceFailure(c, error); }
+        requestId = input.requestId;
+        const receipt = await deps.maintenance!.restart(input.requestId);
+        deps.observe?.event("maintenance_operation", null, receipt.operationId, { outcome: "ok" });
+        return c.json(receipt, 202);
+      } catch (error) {
+        if (requestId !== undefined) deps.observe?.event("maintenance_operation", null, requestId, {
+          outcome: error instanceof GatewayMaintenanceFailure && error.code === "maintenance_failed"
+            ? "failed" : "skipped",
+        });
+        return maintenanceFailure(c, error);
+      }
     });
     app.post("/gateway/maintenance/update", requireDevice, async (c) => {
+      let requestId: string | undefined;
       try {
         const input = assertValid(GatewayMaintenanceUpdateRequestSchema, await readBody(c));
-        return c.json(await deps.maintenance!.update(
+        requestId = input.requestId;
+        const receipt = await deps.maintenance!.update(
           input.requestId,
           input.expectedCurrentVersion,
           input.expectedTargetVersion,
-        ), 202);
-      } catch (error) { return maintenanceFailure(c, error); }
+        );
+        deps.observe?.event("maintenance_operation", null, receipt.operationId, { outcome: "ok" });
+        return c.json(receipt, 202);
+      } catch (error) {
+        if (requestId !== undefined) deps.observe?.event("maintenance_operation", null, requestId, {
+          outcome: error instanceof GatewayMaintenanceFailure && error.code === "maintenance_failed"
+            ? "failed" : "skipped",
+        });
+        return maintenanceFailure(c, error);
+      }
     });
   }
 
@@ -1080,6 +1100,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
       scope: kind === "observer" ? ("read" as const) : ("write" as const),
     };
     deps.storage.createDevice(device);
+    deps.observe?.event("device_paired", null, device.id);
     // The response shape is unchanged: `device` gains no new field on the wire, because the scope
     // lives on the token the browser stores and the pairing client needs none of it echoed back.
     return c.json({
@@ -1482,6 +1503,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
       return c.json(errorBody("not_found", "no such device"), 404);
     }
     deps.onDeviceRevoked(id);
+    deps.observe?.event("device_revoked", null, id);
     return c.json({ ok: true });
   });
 

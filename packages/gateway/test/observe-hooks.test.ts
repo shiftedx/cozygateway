@@ -274,11 +274,12 @@ describe("the app-reported perceived latency on the delivery receipt", () => {
     });
 
     const first = storage.recordBotMessageDisplayed("luna", ["m1"], "device-1", clock, {
-      feltLatencyMs: 1_240, networkPath: "vpn_on",
+      feltLatencyMs: 1_240, networkPath: "wifi", vpn: true, edgeRttMs: 43, edgeColo: "ORD",
     });
     expect(first.recorded).toBe(1);
     expect(storage.botMessageReceipt("luna", "m1")).toMatchObject({
-      deviceId: "device-1", feltLatencyMs: 1_240, networkPath: "vpn_on",
+      deviceId: "device-1", feltLatencyMs: 1_240, networkPath: "wifi",
+      vpn: true, edgeRttMs: 43, edgeColo: "ORD",
     });
   });
 
@@ -290,7 +291,7 @@ describe("the app-reported perceived latency on the delivery receipt", () => {
     });
     storage.recordBotMessageDisplayed("luna", ["m2"], "device-1", clock);
     expect(storage.botMessageReceipt("luna", "m2")).toMatchObject({
-      feltLatencyMs: null, networkPath: null,
+      feltLatencyMs: null, networkPath: null, vpn: null, edgeRttMs: null, edgeColo: null,
     });
   });
 });

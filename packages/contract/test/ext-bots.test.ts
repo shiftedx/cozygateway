@@ -1272,11 +1272,12 @@ describe("capability advertisement", () => {
     // Both optional: a client below 73 sends neither and is byte identical to its pre-73 self.
     expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"] })).toBe(true);
     expect(check(BotChatDisplayedRequestSchema, {
-      messageIds: ["m1"], feltLatencyMs: 1_240, networkPath: "vpn_on",
+      messageIds: ["m1"], feltLatencyMs: 1_240, networkPath: "wifi", vpn: true,
+      edgeRttMs: 42, edgeColo: "ORD",
     })).toBe(true);
     // A path with no timing still says which paths a device uses, so it stands on its own.
     expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"], networkPath: "cellular" })).toBe(true);
-    for (const path of ["wifi", "cellular", "vpn_on", "vpn_off"]) {
+    for (const path of ["wifi", "cellular", "wired", "other"]) {
       expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"], networkPath: path })).toBe(true);
     }
     // A closed set, so a new path name is a refusal rather than an unreadable row.
@@ -1284,6 +1285,8 @@ describe("capability advertisement", () => {
     expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"], feltLatencyMs: -1 })).toBe(false);
     expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"], feltLatencyMs: 600_001 })).toBe(false);
     expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"], feltLatencyMs: 12.5 })).toBe(false);
+    expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"], networkPath: "vpn_on" })).toBe(false);
+    expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"], edgeColo: "ord" })).toBe(false);
   });
 
   it("carries a capability-31 marker on a gateway-authored system row without changing older rows", () => {

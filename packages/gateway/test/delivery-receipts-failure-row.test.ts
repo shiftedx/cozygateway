@@ -7,11 +7,16 @@ import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 import type { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { AttachV1EventFrame } from "../src/adapters/attach/protocol-v1.ts";
 import { openStorage } from "../src/storage.ts";
+import { ObservationRing } from "../src/observe/index.ts";
 
 /** A scheduled delivery that dies is invisible by construction: nothing arrives, and nothing says
  *  why. These cover the two halves of making it visible again, to the plugin and to the user. */
 describe("terminal scheduled-delivery failure", () => {
-  function plane(now: () => number, sendDeliveryReceipt = vi.fn(() => true)) {
+  function plane(
+    now: () => number,
+    sendDeliveryReceipt = vi.fn(() => true),
+    observe?: ObservationRing,
+  ) {
     const storage = openStorage(":memory:");
     const frames: ServerFrame[] = [];
     const instance = new NativeBotDataPlane({
@@ -22,6 +27,7 @@ describe("terminal scheduled-delivery failure", () => {
       chatSuggestion: "",
       broadcast: (frame) => frames.push(frame),
       now,
+      observe,
     });
     return { storage, frames, instance, sendDeliveryReceipt };
   }
@@ -105,6 +111,40 @@ describe("terminal scheduled-delivery failure", () => {
     send.mockClear();
     expect(surface.recordDisplayed("sage", ["cron-message"], "device-1")).toEqual({ recorded: 0 });
     expect(send).not.toHaveBeenCalled();
+    instance.close();
+    storage.close();
+  });
+
+  it("writes one hashed receipt measurement for a real displayed hook, never once per batch row", () => {
+    const at = 100;
+    const storage = openStorage(":memory:");
+    const observe = new ObservationRing({
+      store: storage.observe, options: { enabled: true, retentionDays: 7 }, now: () => at,
+    });
+    const instance = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress, nativeBots: ["sage"],
+      chatSuggestion: "", broadcast: () => undefined, now: () => at, observe,
+    });
+    const chat = storage.nativeBotChat("sage", 1);
+    for (const messageId of ["m1", "m2"]) storage.appendNativeBotMessage({
+      bot: "sage", sessionId: chat.sessionId, messageId, role: "assistant", text: "report", at,
+    });
+
+    expect(instance.surface().recordDisplayed("sage", ["m1", "m2"], "device-1", {
+      feltLatencyMs: 900, networkPath: "wifi", vpn: false, edgeRttMs: 41, edgeColo: "ORD",
+    })).toEqual({ recorded: 2 });
+    expect(instance.surface().recordDisplayed("sage", ["m1", "m2"], "device-1", {
+      feltLatencyMs: 900, networkPath: "wifi", vpn: false, edgeRttMs: 41, edgeColo: "ORD",
+    })).toEqual({ recorded: 0 });
+
+    const events = storage.observe.events({ kind: "receipt_measurement", from: 0, to: at + 1 });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      bot: storage.observe.identify("sage"), ref: storage.observe.identify("device-1"),
+    });
+    expect(JSON.parse(events[0]?.detailJson ?? "{}")).toEqual({
+      radio: "wifi", vpn: false, felt_latency_ms: 900, edge_rtt_ms: 41, edge_colo: "ORD",
+    });
     instance.close();
     storage.close();
   });

@@ -2671,7 +2671,13 @@ export class NativeBotDataPlane {
     name: string,
     messageIds: readonly string[],
     deviceId: string,
-    perceived?: { feltLatencyMs?: number; networkPath?: "wifi" | "cellular" | "vpn_on" | "vpn_off" },
+    perceived?: {
+      feltLatencyMs?: number;
+      networkPath?: "wifi" | "cellular" | "wired" | "other";
+      vpn?: boolean;
+      edgeRttMs?: number;
+      edgeColo?: string;
+    },
   ): { recorded: number } {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
@@ -2681,7 +2687,16 @@ export class NativeBotDataPlane {
     // size, so a coalesced scroll burst cannot report the same wait sixty four times. Kept apart
     // from every gateway-measured hop: this is the phone's clock and those are this process's.
     if (perceived?.feltLatencyMs !== undefined && result.recorded > 0) {
-      this.#observe?.feltLatency(bot, perceived.feltLatencyMs, perceived.networkPath);
+      this.#observe?.feltLatency(bot, perceived.feltLatencyMs, perceived.networkPath, perceived.vpn);
+    }
+    if (perceived?.edgeRttMs !== undefined && result.recorded > 0) {
+      this.#observe?.edgeRtt(bot, perceived.edgeRttMs, perceived.networkPath, perceived.vpn);
+    }
+    // One marker per receipt request, never per message in its batch. It carries the app's numeric
+    // fields beside hashed bot/device identities, which is the only data D3 needs to compare the
+    // same device on the same radio with VPN on and off.
+    if (result.recorded > 0) {
+      this.#observe?.receiptMeasurement({ bot, deviceId, ...perceived });
     }
     for (const delivery of result.deliveries) {
       this.#ingress.sendDeliveryReceipt(bot, {
@@ -3678,6 +3693,11 @@ export class NativeBotDataPlane {
       const grantId = covering === undefined
         ? undefined
         : this.#claimGrant(bot, sessionId, event.turnId, covering, scope === undefined);
+      this.#observe?.event("approval_raised", bot, event.approvalId, {
+        ...(grantId === undefined ? {} : { grant: this.#observe.identify(grantId) }),
+      });
+      if (repair !== undefined)
+        this.#observe?.event("repair_proposed", bot, event.approvalId, { attempts: 1 });
       const wire: BotApprovalPendingFrame = {
         type: "bot_approval_pending",
         bot,
@@ -3723,6 +3743,7 @@ export class NativeBotDataPlane {
         this.#honorApprovalGrant(bot, sessionId, event.turnId, event.approvalId, grantId);
       }
     } else {
+      this.#observe?.event("approval_resolved", bot, event.approvalId, { decision: outcome });
       this.#clearInteractionTimer("approval", bot, event.approvalId);
       this.#emitApprovalResolved(
         bot,

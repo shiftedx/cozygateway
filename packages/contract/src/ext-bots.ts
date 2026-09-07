@@ -1189,17 +1189,16 @@ export const BotChatDisplayedRequestSchema = Type.Object({
    *  Never added to a gateway-measured hop and never subtracted from one. Two clocks that were
    *  never synchronised cannot be differenced, so this is its own figure beside them. */
   feltLatencyMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 600_000 })),
-  /** Capability 73. The network path the phone was on when it measured `feltLatencyMs`, from the
-   *  system path monitor and the presence of a tunnel interface. The gateway cannot see a VPN; the
-   *  phone can, and this is the only way the cost of one is ever a measured difference of two
-   *  medians rather than a guess. Reported without `feltLatencyMs` it is accepted and stored,
-   *  because a path with no timing still says which paths a device uses. */
+  /** Capability 73. The radio path the phone was on. A tunnel is reported separately. */
   networkPath: Type.Optional(Type.Union([
     Type.Literal("wifi"),
     Type.Literal("cellular"),
-    Type.Literal("vpn_on"),
-    Type.Literal("vpn_off"),
+    Type.Literal("wired"),
+    Type.Literal("other"),
   ])),
+  vpn: Type.Optional(Type.Boolean()),
+  edgeRttMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 600_000 })),
+  edgeColo: Type.Optional(Type.String({ pattern: "^[A-Z]{3,4}$" })),
 });
 export type BotChatDisplayedRequest = Static<typeof BotChatDisplayedRequestSchema>;
 
@@ -2989,8 +2988,9 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * `kind: "observer"` is byte identical to its pre-72 self, and no peer of any backend changes. */
 /** Capability 73: the one hop the gateway cannot measure is reported by the phone that can.
  * `POST /bots/:name/chat/messages/displayed` gains two optional fields, `feltLatencyMs` (send
- * tapped to first delta rendered, on the phone's own clock) and `networkPath` (`wifi`, `cellular`,
- * `vpn_on`, `vpn_off`), and the gateway stores both on the receipt and records at most one sample
+ * tapped to first delta rendered, on the phone's own clock), radio-only `networkPath` (`wifi`,
+ * `cellular`, `wired`, `other`), `vpn`, `edgeRttMs`, and `edgeColo`, and the gateway stores them
+ * on the receipt and records at most one sample
  * per request whatever the batch size. Neither is ever added to or subtracted from a
  * gateway-measured figure: two clocks that were never synchronised cannot be differenced, and the
  * dashboard shows the perceived figure beside the measured hops rather than inside them. Nothing
