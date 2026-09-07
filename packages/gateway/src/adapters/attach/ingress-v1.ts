@@ -85,6 +85,12 @@ export interface AttachV1Events {
    * array is the declaration "none", and `undefined` is a peer that cannot declare. */
   onHello?(agentId: string, activeTurns?: readonly string[]): void;
   onTaskTurnQueued?(agentId: string, command: Extract<AttachV1Command, { kind: "turn" }>): void;
+  /** Dashboard packet D2. The turn command frame HAS BEEN WRITTEN TO THE PEER'S SOCKET, which is the
+   * moment section 10 calls dispatch and the zero of `ttft_ms` and `turn_ms`. Distinct from
+   * `onTaskTurnQueued`, which fires when a durable task command is queued, and distinct from
+   * admission, which is only the gateway's own durable write: a turn for an unattached peer sits in
+   * the outbox until it returns, and timing a model from there would chart the gateway's waiting. */
+  onTurnDispatched?(agentId: string, turnId: string): void;
   onPresence(agentId: string, state: "online" | "degraded" | "absent"): void;
   /** Capability 69, F2. The peer answered the heartbeat, so the process behind this identity was
    * alive at `at`. Transport-only proof, and the only proof there is while a model request is in
@@ -475,6 +481,11 @@ export class AttachV1Ingress implements TurnEndpoint {
         this.#current.delete(agentId);
         this.#presence(agentId, "absent");
       }
+      // Dashboard packet D2. Drop any outstanding heartbeat stamp with the socket that sent it. An
+      // ack arriving on the NEXT connection would otherwise be differenced against this one's send
+      // and record the whole disconnect as a peer round trip, which is a one-way silence reported
+      // as a measurement.
+      this.#observe?.peerForgotten(agentId);
       this.#traceAttach("attach_close", agentId, { code, commandCursor: connection.commandCursor });
     });
   }
@@ -515,6 +526,7 @@ export class AttachV1Ingress implements TurnEndpoint {
       const bytes = Buffer.byteLength(JSON.stringify(frame));
       if (connection.sentCommandBytes + bytes > connection.maxInFlightBytes) break;
       if (!this.#send(connection, frame)) break;
+      if (frame.command.kind === "turn") this.#events.onTurnDispatched?.(agentId, frame.command.turnId);
       connection.sentCommands.set(frame.sequence, { commandId: frame.commandId, bytes });
       connection.sentCommandBytes += bytes;
       connection.sendCursor = frame.sequence;

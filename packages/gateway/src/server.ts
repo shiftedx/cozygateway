@@ -836,6 +836,9 @@ export async function startGateway(
         nativeBotPlane?.handleAttachHello(agentId, activeTurns);
       },
       onTaskTurnQueued: (agentId, command) => nativeBotPlane?.taskTurnQueued(agentId, command),
+      // Dashboard packet D2. The turn command is on the wire, which is the zero of the model-side
+      // timings; the gateway's own queueing before it is already its own measured series.
+      onTurnDispatched: (agentId, turnId) => nativeBotPlane?.turnDispatched(agentId, turnId),
       // Capability 69, F2. The heartbeat the peer is still answering is proof its process is
       // alive, which is the only proof a turn has while its model request is in flight.
       onLiveness: (agentId, at) => nativeBotPlane?.handleAttachLiveness(agentId, at),

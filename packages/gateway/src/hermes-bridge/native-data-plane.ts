@@ -1394,6 +1394,17 @@ export class NativeBotDataPlane {
     this.#broadcast({ type: "bot_chat", bot, sessionId, messages: [message], updatedAt: at });
   }
 
+  /** Dashboard packet D2. The turn command frame reached the peer's socket. Resolves the bot the
+   * same way every other peer-keyed callback here does, and is the only thing that starts the
+   * `ttft_ms` and `turn_ms` clocks; a turn whose command never reaches a peer therefore has neither,
+   * rather than a number made of the gateway's own queueing. */
+  turnDispatched(peer: string, turnId: string): void {
+    if (this.#observe === undefined) return;
+    const bot = this.#storage.chatExecutionById(peer)?.bot ?? normalize(peer);
+    if (!this.handles(bot)) return;
+    this.#observe.turnDispatched(bot, turnId);
+  }
+
   taskTurnQueued(peer: string, command: { threadId: string; turnId: string }): void {
     const bot = this.#storage.chatExecutionById(peer)?.bot ?? normalize(peer);
     if (!this.handles(bot) || !this.#storage.nativeBotHasSession(bot, command.threadId)) return;

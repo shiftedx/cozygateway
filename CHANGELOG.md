@@ -96,10 +96,16 @@ release; everything older is marked pre-release so installers resolve one "lates
   it did time, and the only subtraction anywhere is the tunnel leg, where both terms are this
   process's own measurements seconds apart. COUNTS TRAVEL WITH AGGREGATES: the p50 and p95 helpers
   always return the sample count beside them, because a p95 over four samples is not a p95.
-  PRIVACY, enforced at the writer rather than at the call sites: no message text, no transcript, no
-  url, path, query or body and no token can enter either table, because the one class that writes
-  them refuses any string that is not id shaped and any series name or event kind nothing declared,
-  and refuses a row whole rather than scrubbing part of it. Peer-type-agnostic: every writer reads
+  PRIVACY, enforced at the writer rather than at the call sites, AS AN ALLOWLIST WITH NO FREE
+  STRING IN IT: every column is a name from a closed enum, a 16 hex keyed identity hash, a number,
+  or, inside `detail_json`, a number, a boolean, a hash or a code from that field's own closed set
+  under a per-kind schema that refuses an unknown key outright. No identifier reaches a row: a bot,
+  device, agent, turn or grant id is hashed with a per-gateway key kept in that gateway's own
+  database, so the same subject hashes the same way across restarts, differently on somebody else's
+  gateway, and never appears as itself. A shape test cannot tell a person's words from a reason
+  code, which is why nothing here tries: a caller that wants a word declares it in an enum, and a
+  caller that wants an identifier stores its hash. A refused row is dropped whole and counted rather
+  than scrubbed in part. Peer-type-agnostic: every writer reads
   something the gateway already computes for any attached peer, so a Hermes-backed bot gets the
   full ring with no plugin change and no Hermes fork; the only gaps are the two series the design
   marks CozyAgents-snapshot-only, which are left as a documented fold-in seam rather than inferred.

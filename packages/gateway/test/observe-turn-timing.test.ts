@@ -115,7 +115,7 @@ describe("per-turn timing on the native data plane", () => {
 
       // One first-token measurement per turn, however many drafts arrive.
       expect(samples(storage, "ttft_ms")).toHaveLength(1);
-      expect(samples(storage, "ttft_ms")[0]?.bot).toBe("sage");
+      expect(samples(storage, "ttft_ms")[0]?.bot).toBe(storage.observe.identify("sage"));
 
       const frames = samples(storage, "delta_frames");
       expect(frames).toHaveLength(1);
@@ -134,8 +134,8 @@ describe("per-turn timing on the native data plane", () => {
 
       const terminals = storage.observe.events({ kind: "turn_terminal", from: 0, to: Number.MAX_SAFE_INTEGER });
       expect(terminals).toHaveLength(1);
-      expect(terminals[0]?.bot).toBe("sage");
-      expect(terminals[0]?.ref).toBe(turnId);
+      expect(terminals[0]?.bot).toBe(storage.observe.identify("sage"));
+      expect(terminals[0]?.ref).toBe(storage.observe.identify(turnId));
       expect(JSON.parse(terminals[0]?.detailJson ?? "{}")).toEqual({ status: "completed" });
       // The reply text the turn produced never reaches the ring.
       expect(terminals[0]?.detailJson).not.toContain("done");

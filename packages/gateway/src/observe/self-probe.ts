@@ -13,6 +13,11 @@ export const TUNNEL_PROBE_TIMEOUT_MS = 10_000;
  *
  *  A gateway with no public URL has no tunnel, and this never runs for one.
  *
+ *  Flap events are EDGE TRIGGERED. The probe keeps the last outcome and writes one event when the
+ *  tunnel goes down and one when it comes back, carrying how long it was out. Writing one per failing
+ *  probe would put 2,880 identical rows in the ring for a day of downtime and bury the transition
+ *  D3 wants to draw, during exactly the incident an operator is looking at.
+ *
  *  Nothing about the probe reaches a row: the URL it fetched, the host it resolved and any body it
  *  received are used and dropped. A flap event carries a reason code and, when there was one, an
  *  HTTP status integer. */
@@ -24,6 +29,11 @@ export class TunnelSelfProbe {
   readonly #timeoutMs: number;
   #timer: ReturnType<typeof setInterval> | undefined;
   #inFlight = false;
+  /** Undefined until the first probe resolves, so a gateway that starts with its tunnel already down
+   *  still writes the transition once rather than assuming it was up. */
+  #up: boolean | undefined;
+  #downSince = 0;
+  #consecutiveFailures = 0;
 
   constructor(deps: {
     ring: ObservationRing;
@@ -64,13 +74,28 @@ export class TunnelSelfProbe {
       const loopback = await this.#time(this.#loopbackReadyUrl);
       const publicSide = await this.#time(this.#publicReadyUrl);
       if (publicSide.outcome !== "ok") {
-        this.#ring.tunnelFlap(publicSide.outcome, publicSide.status);
+        this.#consecutiveFailures += 1;
+        if (this.#up !== false) {
+          this.#up = false;
+          this.#downSince = monotonicNow();
+          this.#ring.tunnelDown(publicSide.outcome, publicSide.status);
+        }
         return;
       }
+      if (this.#up === false) {
+        this.#ring.tunnelRecovered(monotonicNow() - this.#downSince, this.#consecutiveFailures);
+      }
+      this.#up = true;
+      this.#consecutiveFailures = 0;
       // A loopback probe that failed leaves nothing to subtract from. The public leg was fine, so
       // this is not a flap; it is simply a sample this gateway cannot honestly take.
       if (loopback.outcome !== "ok") return;
-      this.#ring.tunnelRtt(Math.max(0, publicSide.ms - loopback.ms));
+      // Nor can it when the loopback leg was the slower of the two, which a GC pause or a busy
+      // /ready produces. Clamping that to zero would store a number nothing measured as a measured
+      // tunnel round trip, which is the one thing the ring must never do.
+      const difference = publicSide.ms - loopback.ms;
+      if (difference < 0) return;
+      this.#ring.tunnelRtt(difference);
     } catch {
       // Unreachable in practice; #time already absorbs every failure. Belt to that pair of braces.
     } finally {

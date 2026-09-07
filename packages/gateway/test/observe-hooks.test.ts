@@ -19,6 +19,11 @@ function ring(enabled = true): ObservationRing {
   return new ObservationRing({ store: storage.observe, options: { enabled, retentionDays: 7 }, now: () => clock });
 }
 
+/** Every subject in the ring is a keyed hash, so a test looks a name up the way D3 does. */
+function id(value: string): string {
+  return storage.observe.identify(value);
+}
+
 function samples(series: string) {
   return storage.observe.samples({ series, from: 0, to: Number.MAX_SAFE_INTEGER });
 }
@@ -102,7 +107,7 @@ describe("the device round trip on the app websocket heartbeat", () => {
     await once(local, "close");
 
     for (const row of [...samples("device_rtt_ms|tunnel"), ...samples("device_rtt_ms|lan")]) {
-      expect(row.bot).toBe("device-1");
+      expect(row.bot).toBe(id("device-1"));
       expect(row.value).toBeGreaterThanOrEqual(0);
       // Timed on the gateway's monotonic clock, so a frozen wall clock cannot produce the sample.
       expect(row.value).toBeLessThan(4_000);
@@ -185,7 +190,7 @@ describe("the peer round trip on the attach heartbeat", () => {
     await once(socket, "close");
 
     for (const row of samples("peer_rtt_ms")) {
-      expect(row.bot).toBe("sage");
+      expect(row.bot).toBe(id("sage"));
       expect(row.value).toBeGreaterThanOrEqual(0);
       expect(row.value).toBeLessThan(4_000);
     }
@@ -199,6 +204,27 @@ describe("the peer round trip on the attach heartbeat", () => {
     socket.close();
     await once(socket, "close");
     expect(samples("peer_rtt_ms")).toHaveLength(0);
+  });
+
+  it("never differences an ack on a new connection against the previous one's send", async () => {
+    await boot(ring());
+    // A peer that goes away with a heartbeat outstanding and comes back must not have the whole
+    // disconnect recorded as a round trip: that is a one-way silence reported as a measurement.
+    const first = await dial(false);
+    await until(() => true);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    first.close();
+    await once(first, "close");
+    const second = await dial(true);
+    await until(() => samples("peer_rtt_ms").length >= 1);
+    second.close();
+    await once(second, "close");
+
+    for (const row of samples("peer_rtt_ms")) {
+      // Every sample is a real request-to-ack pair on one connection, so none of them can be as
+      // large as the gap the first socket spent unanswered.
+      expect(row.value).toBeLessThan(50);
+    }
   });
 
   it("writes nothing when observability is off", async () => {
@@ -234,7 +260,7 @@ describe("push results", () => {
     expect(samples("push_result|not_found").map((row) => row.value)).toEqual([0]);
     const events = storage.observe.events({ kind: "push_result", from: 0, to: Number.MAX_SAFE_INTEGER });
     expect(events).toHaveLength(1);
-    expect(events[0]?.ref).toBe("device-1");
+    expect(events[0]?.ref).toBe(id("device-1"));
     expect(JSON.parse(events[0]?.detailJson ?? "{}")).toEqual({ result: "not_found" });
   });
 });

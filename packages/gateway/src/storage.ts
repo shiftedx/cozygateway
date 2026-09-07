@@ -901,6 +901,21 @@ CREATE INDEX IF NOT EXISTS observe_events_age ON observe_events (at);
 -- OUTSIDE it: these are summed since the bot was created and the seven day trim never touches
 -- them. D5 owns the producer; the table lives here because it is one storage decision with the
 -- ring it sits next to.
+-- This gateway's identity key. Every id in the ring is stored as a keyed hash rather than raw, so
+-- there is no string a caller can invent that lands in the bot or ref column, only a hash of one.
+-- Per gateway and durable: a bot hashes the same across restarts, so a chart survives one, and
+-- differently on somebody else's gateway, so two exports cannot be joined by guessing a name.
+CREATE TABLE IF NOT EXISTS observe_identity (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  key TEXT NOT NULL
+) STRICT;
+-- Which snapshots have already been folded into the lifetime counters below. Those counters are
+-- additive and are never trimmed, so a snapshot folded twice would inflate a token and cost figure
+-- permanently with nothing able to correct it. The claim and the addition share one transaction.
+CREATE TABLE IF NOT EXISTS observe_lifetime_folds (
+  snapshot_id TEXT PRIMARY KEY,
+  at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS observe_lifetime (
   bot TEXT NOT NULL,
   model TEXT NOT NULL,

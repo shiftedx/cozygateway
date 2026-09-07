@@ -1,7 +1,14 @@
 import { performance } from "node:perf_hooks";
 
 import type { ObserveStore, ObserveSummary } from "./store.ts";
-import { seriesName, type ObserveDetail, type ObserveEventKind, type ObserveSeries, type ObserveSeriesTag } from "./privacy.ts";
+import {
+  codeOf,
+  seriesName,
+  type ObserveDetail,
+  type ObserveEventKind,
+  type ObserveSeries,
+  type ObserveSeriesTag,
+} from "./privacy.ts";
 
 /** One monotonic clock, in milliseconds, shared by every duration in the ring.
  *
@@ -28,6 +35,11 @@ export const OBSERVABILITY_DEFAULT_RETENTION_DAYS = 7;
  *  one. Oldest entries are dropped first, and dropping one loses a metric and nothing else. */
 const MAX_TRACKED = 4_096;
 
+/** How many folded snapshot steps the ring remembers for the replay guard. A turn is a few dozen
+ *  steps, so this covers hundreds of concurrent turns; forgetting the oldest entry can only ever
+ *  re-admit a very old duplicate, which is a far smaller error than admitting every duplicate. */
+const MAX_FOLDED = 16_384;
+
 function remember<K, V>(map: Map<K, V>, key: K, value: V): void {
   if (map.size >= MAX_TRACKED && !map.has(key)) {
     const oldest = map.keys().next();
@@ -36,12 +48,51 @@ function remember<K, V>(map: Map<K, V>, key: K, value: V): void {
   map.set(key, value);
 }
 
+/** Claims a key in a bounded seen-set. False means it was already there. */
+function claim(seen: Set<string>, key: string): boolean {
+  if (seen.has(key)) return false;
+  if (seen.size >= MAX_FOLDED) {
+    const oldest = seen.values().next();
+    if (oldest.done !== true) seen.delete(oldest.value);
+  }
+  seen.add(key);
+  return true;
+}
+
 interface TurnTiming {
-  /** Monotonic reading at admission. */
+  /** Monotonic reading at admission: the durable turn row exists. */
   admittedAt: number;
+  /** Monotonic reading at dispatch: the command is on the peer's lane. The zero of `ttft_ms` and
+   *  `turn_ms`, because everything before it is the gateway's own queueing. */
   dispatchedAt?: number;
   firstDeltaAt?: number;
   deltaFrames: number;
+}
+
+/** One step of a CozyAgents snapshot, as D5's harness reports it. Every record carries the turn it
+ *  belongs to and its index within that turn, which is what makes a repeated fold detectable. */
+export interface ObserveSnapshotStep {
+  turnId: string;
+  step: number;
+  modelStepMs?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  cachedTokens?: number;
+}
+
+export interface ObserveSnapshotToolCall {
+  turnId: string;
+  step: number;
+  /** Distinguishes two tool calls made in the same step. */
+  index?: number;
+  toolMs: number;
+}
+
+export interface ObserveSnapshot {
+  steps?: readonly ObserveSnapshotStep[];
+  toolCalls?: readonly ObserveSnapshotToolCall[];
+  /** How many model steps a FINISHED turn took. Folded once per turn. */
+  turns?: readonly { turnId: string; modelSteps: number }[];
 }
 
 /** The observation ring: everything the gateway measures once and would otherwise throw away.
@@ -50,10 +101,13 @@ interface TurnTiming {
  *  writer returns before it touches SQLite, so a gateway with observability off does exactly the
  *  work it did before this module existed, including keeping no in-memory timing state.
  *
- *  Nothing in here is derived. A hop the gateway cannot measure is absent from the ring rather
- *  than computed by subtraction and stored beside the measured ones: section 11 requires derived
- *  figures to be drawn hatched and labelled, which the dashboard can only do if the store never
- *  blurred the two. */
+ *  Nothing in here is derived. A hop the gateway cannot measure is absent from the ring rather than
+ *  computed by subtraction and stored beside the measured ones: section 11 requires derived figures
+ *  to be drawn hatched and labelled, which the dashboard can only do if the store never blurred the
+ *  two.
+ *
+ *  No identifier reaches a row. Every bot, device, agent and turn id is put through the store's
+ *  keyed `identify` first, so the ring is keyed by stable hashes and holds no name at all. */
 export class ObservationRing {
   readonly #store: ObserveStore;
   readonly #now: () => number;
@@ -61,6 +115,7 @@ export class ObservationRing {
   readonly #retentionDays: number;
   readonly #turns = new Map<string, TurnTiming>();
   readonly #peerHeartbeats = new Map<string, number>();
+  readonly #folded = new Set<string>();
 
   constructor(deps: {
     store: ObserveStore;
@@ -88,16 +143,33 @@ export class ObservationRing {
     return this.#store;
   }
 
-  // primitives
-
-  sample(series: ObserveSeries, bot: string | null, value: number, tag?: ObserveSeriesTag): void {
-    if (!this.#enabled) return;
-    this.#store.sample(seriesName(series, tag), bot, this.#now(), value);
+  /** The value the ring stores for an identifier. D3 calls this on a name it already knows (a bot
+   *  from the roster, a device from the pairing table) to find that subject's rows. */
+  identify(value: string): string {
+    return this.#store.identify(value);
   }
 
-  event(kind: ObserveEventKind, bot: string | null, ref: string | null, detail?: ObserveDetail): void {
+  // primitives
+
+  sample(series: ObserveSeries, subject: string | null, value: number, tag?: ObserveSeriesTag): void {
     if (!this.#enabled) return;
-    this.#store.event(kind, this.#now(), bot, ref, detail);
+    this.#store.sample(
+      seriesName(series, tag),
+      subject === null ? null : this.#store.identify(subject),
+      this.#now(),
+      value,
+    );
+  }
+
+  event(kind: ObserveEventKind, subject: string | null, ref: string | null, detail?: ObserveDetail): void {
+    if (!this.#enabled) return;
+    this.#store.event(
+      kind,
+      this.#now(),
+      subject === null ? null : this.#store.identify(subject),
+      ref === null ? null : this.#store.identify(ref),
+      detail,
+    );
   }
 
   // hop writers
@@ -108,30 +180,43 @@ export class ObservationRing {
     this.sample("device_rtt_ms", deviceId, milliseconds, via);
   }
 
-  /** A device answered so late that a ping was already outstanding, or never answered at all. The
-   *  gap is a measured silence, not a round trip, which is why it is its own series. */
+  /** A device answered so late that a ping was already outstanding, or never answered at all. The gap
+   *  is a measured silence, not a round trip, which is why it is its own series. */
   heartbeatGap(deviceId: string, milliseconds: number): void {
     this.sample("heartbeat_gap_ms", deviceId, milliseconds);
   }
 
   /** Section 10, the tunnel leg alone: the public round trip minus the loopback round trip, both
-   *  timed by this process on the same clock in the same second. This IS a subtraction, and it is
-   *  the one section 11 explicitly sanctions and names ("difference is the gateway-side tunnel leg
-   *  plus the edge"), because both terms are measurements this gateway took itself. */
+   *  timed by this process on the same clock in the same second. This IS a subtraction, and it is the
+   *  one section 11 explicitly sanctions and names ("difference is the gateway-side tunnel leg plus
+   *  the edge"), because both terms are measurements this gateway took itself. */
   tunnelRtt(milliseconds: number): void {
     this.sample("tunnel_rtt_ms", null, milliseconds);
   }
 
-  tunnelFlap(reason: "timeout" | "bad_gateway" | "unreachable" | "http_error", status?: number): void {
+  /** The tunnel stopped answering. EDGE TRIGGERED: the probe calls this on the transition into an
+   *  outage, never once per failing probe, because a state that has not changed is not a state
+   *  change and a day of downtime would otherwise bury the transition under 2,880 identical rows. */
+  tunnelDown(reason: "timeout" | "bad_gateway" | "unreachable" | "http_error", status?: number): void {
     this.event("tunnel_flap", null, null, {
-      reason,
+      reason: codeOf("tunnel_flap", "reason", reason) ?? "other",
       ...(status === undefined ? {} : { status }),
     });
   }
 
-  /** Section 10, gateway handling. Two legs per turn: admission to dispatch, and the peer's
-   *  terminal to the app broadcast. Both are gateway-internal time and both land in this series,
-   *  so its sample count is per leg rather than per turn. */
+  /** The tunnel answered again. Carries how long it was down, which is the figure an operator
+   *  actually wants and the one nothing else in the gateway records. */
+  tunnelRecovered(outageMs: number, consecutiveFailures: number): void {
+    this.event("tunnel_flap", null, null, {
+      reason: "recovered",
+      outage_ms: Math.round(outageMs),
+      consecutive: consecutiveFailures,
+    });
+  }
+
+  /** Section 10, gateway handling. Two legs per turn: admission to dispatch, and the peer's terminal
+   *  to the app broadcast. Both are gateway-internal time and both land in this series, so its sample
+   *  count is per leg rather than per turn. */
   gatewayHandle(bot: string, milliseconds: number): void {
     this.sample("gateway_handle_ms", bot, milliseconds);
   }
@@ -150,6 +235,9 @@ export class ObservationRing {
     this.sample("peer_rtt_ms", agentId, monotonicNow() - sentAt);
   }
 
+  /** The peer's socket went away. Drops any outstanding heartbeat stamp, so an ack arriving on the
+   *  NEXT connection cannot be differenced against the previous one's send: that would record an
+   *  entire disconnect as a round trip, which is a one-way silence reported as a measurement. */
   peerForgotten(agentId: string): void {
     this.#peerHeartbeats.delete(agentId);
   }
@@ -157,7 +245,7 @@ export class ObservationRing {
   // turn timing
 
   #turnKey(bot: string, turnId: string): string {
-    return `${bot} ${turnId}`;
+    return `${bot} ${turnId}`;
   }
 
   /** The turn was admitted: a durable turn row exists and the gateway now owes the peer a command. */
@@ -166,7 +254,15 @@ export class ObservationRing {
     remember(this.#turns, this.#turnKey(bot, turnId), { admittedAt: monotonicNow(), deltaFrames: 0 });
   }
 
-  /** The turn command reached the peer's lane. Writes the admission-to-dispatch leg. */
+  /** The turn command reached the peer's lane. Writes the admission-to-dispatch leg, and starts the
+   *  clock for `ttft_ms` and `turn_ms`.
+   *
+   *  Dispatch rather than admission is the zero for those two ON PURPOSE. A turn for a peer that is
+   *  not attached sits in the durable outbox until it comes back, bounded only by the operator's turn
+   *  timeout, and timing from admission would report minutes of queueing as time to first token: the
+   *  p95 of a gateway with an intermittent peer would be a chart of its own waiting. The queueing is
+   *  not lost, it is `gateway_handle_ms`, which is a separate measured series rather than something a
+   *  reader has to derive by subtracting two. */
   turnDispatched(bot: string, turnId: string): void {
     if (!this.#enabled) return;
     const timing = this.#turns.get(this.#turnKey(bot, turnId));
@@ -184,7 +280,10 @@ export class ObservationRing {
     timing.deltaFrames += 1;
     if (timing.firstDeltaAt !== undefined) return;
     timing.firstDeltaAt = monotonicNow();
-    this.sample("ttft_ms", bot, timing.firstDeltaAt - timing.admittedAt);
+    // No dispatch reading means nothing honest to measure from, so no sample. An invented zero
+    // would be a derived figure wearing a measurement's clothes.
+    if (timing.dispatchedAt === undefined) return;
+    this.sample("ttft_ms", bot, timing.firstDeltaAt - timing.dispatchedAt);
   }
 
   /** The turn reached a terminal. Writes `turn_ms`, `delta_frames` and the terminal event, and
@@ -200,12 +299,13 @@ export class ObservationRing {
     const terminalAt = monotonicNow();
     if (timing !== undefined) {
       this.#turns.delete(key);
-      this.sample("turn_ms", bot, terminalAt - timing.admittedAt);
+      if (timing.dispatchedAt !== undefined) this.sample("turn_ms", bot, terminalAt - timing.dispatchedAt);
       this.sample("delta_frames", bot, timing.deltaFrames);
     }
+    const reason = codeOf("turn_terminal", "reason", terminal.reason);
     this.event("turn_terminal", bot, turnId, {
-      status: terminal.status,
-      ...(terminal.reason === undefined ? {} : { reason: terminal.reason }),
+      status: codeOf("turn_terminal", "status", terminal.status) ?? "other",
+      ...(reason === undefined ? {} : { reason }),
     });
     let closed = false;
     return () => {
@@ -213,10 +313,6 @@ export class ObservationRing {
       closed = true;
       this.gatewayHandle(bot, monotonicNow() - terminalAt);
     };
-  }
-
-  turnForgotten(bot: string, turnId: string): void {
-    this.#turns.delete(this.#turnKey(bot, turnId));
   }
 
   // gateway wide
@@ -240,18 +336,18 @@ export class ObservationRing {
     this.event("dead_letter", bot, ref, detail);
   }
 
-  /** Push relay outcome, written beside the existing `relay_result` trace rather than replacing
-   *  it: the trace is a debugging line an operator tails, this is a countable series. The value is
-   *  1 for a delivered push and 0 for anything else, so a success rate is a mean over the base
-   *  series and the reason is the tag. */
+  /** Push relay outcome, written beside the existing `relay_result` trace rather than replacing it:
+   *  the trace is a debugging line an operator tails, this is a countable series. The value is 1 for
+   *  a delivered push and 0 for anything else, so a success rate is a mean over the base series and
+   *  the reason is the tag. */
   pushResult(deviceId: string, result: "ok" | "not_found" | "http_error" | "network_error"): void {
     this.sample("push_result", deviceId, result === "ok" ? 1 : 0, result);
     if (result !== "ok") this.event("push_result", null, deviceId, { result });
   }
 
   /** Section 11, perceived by the person: the app's own send-tapped to first-delta-rendered
-   *  measurement, reported on the delivery receipt. Measured on the PHONE's clock, which is why it
-   *  is a separate series from every gateway-side hop and is never added to one. */
+   *  measurement, reported on the delivery receipt. Measured on the PHONE's clock, which is why it is
+   *  a separate series from every gateway-side hop and is never added to one. */
   feltLatency(
     bot: string,
     milliseconds: number,
@@ -260,47 +356,87 @@ export class ObservationRing {
     this.sample("felt_latency_ms", bot, milliseconds, networkPath);
   }
 
-  /** Section 12's lifetime counters, outside the ring and never trimmed. */
-  accumulateLifetime(input: Parameters<ObserveStore["accumulateLifetime"]>[0]): void {
-    if (!this.#enabled) return;
-    this.#store.accumulateLifetime(input);
+  /** Section 12's lifetime counters, outside the ring and never trimmed.
+   *
+   *  `snapshotId` is the replay guard, enforced durably by the store: these counters are additive and
+   *  nothing downstream can correct an inflated one. */
+  accumulateLifetime(input: {
+    snapshotId: string;
+    bot: string;
+    model: string;
+    prompt: number;
+    completion: number;
+    cached: number;
+    costMicros: number;
+    turns: number;
+    at: number;
+  }): boolean {
+    if (!this.#enabled) return false;
+    return this.#store.accumulateLifetime({
+      ...input,
+      snapshotId: this.#store.identify(input.snapshotId),
+      bot: this.#store.identify(input.bot),
+      model: this.#store.identify(input.model),
+    });
   }
 
   /** THE SEAM D5 CALLS. D5's gateway-side store-latest-snapshot code invokes this once per
-   *  `observation_snapshot` it accepts; D2 owns the series-write side and nothing else. Only the
-   *  numeric fields cross, and each is written under the CozyAgents-measured series name, so a
-   *  Hermes bot that never sends a snapshot simply has no rows here rather than an inferred one. */
-  foldSnapshotIntoSeries(
-    bot: string,
-    snapshot: {
-      modelStepMs?: readonly number[];
-      modelSteps?: number;
-      toolMs?: readonly number[];
-      promptTokens?: number;
-      completionTokens?: number;
-      cachedTokens?: number;
-    },
-  ): void {
-    if (!this.#enabled) return;
-    for (const value of snapshot.modelStepMs ?? []) this.sample("model_step_ms", bot, value);
-    for (const value of snapshot.toolMs ?? []) this.sample("tool_ms", bot, value);
-    if (snapshot.modelSteps !== undefined) this.sample("model_steps", bot, snapshot.modelSteps);
-    if (snapshot.promptTokens !== undefined) this.sample("prompt_tokens", bot, snapshot.promptTokens);
-    if (snapshot.completionTokens !== undefined) this.sample("completion_tokens", bot, snapshot.completionTokens);
-    if (snapshot.cachedTokens !== undefined) this.sample("cached_tokens", bot, snapshot.cachedTokens);
+   *  `observation_snapshot` it accepts; D2 owns the series-write side and nothing else.
+   *
+   *  IDEMPOTENT PER BOT, TURN AND STEP. D5's harness repeats a step index between an idle tick and a
+   *  terminal, and a cumulative snapshot replays the whole turn on every tick, so folding blind would
+   *  double count by a factor that grows with the number of ticks. Every record carries the turn it
+   *  belongs to and its index within that turn, and a record already folded is skipped. The return
+   *  says how many of each it did, so a caller can see a replay rather than guess at one.
+   *
+   *  Only numeric fields cross, each under a CozyAgents-measured series name, so a Hermes bot that
+   *  never sends a snapshot simply has no rows here rather than an inferred one. */
+  foldSnapshotIntoSeries(bot: string, snapshot: ObserveSnapshot): { folded: number; skipped: number } {
+    if (!this.#enabled) return { folded: 0, skipped: 0 };
+    let folded = 0;
+    let skipped = 0;
+    for (const step of snapshot.steps ?? []) {
+      if (!claim(this.#folded, `${bot} ${step.turnId} s${step.step}`)) {
+        skipped += 1;
+        continue;
+      }
+      folded += 1;
+      if (step.modelStepMs !== undefined) this.sample("model_step_ms", bot, step.modelStepMs);
+      if (step.promptTokens !== undefined) this.sample("prompt_tokens", bot, step.promptTokens);
+      if (step.completionTokens !== undefined) this.sample("completion_tokens", bot, step.completionTokens);
+      if (step.cachedTokens !== undefined) this.sample("cached_tokens", bot, step.cachedTokens);
+    }
+    for (const call of snapshot.toolCalls ?? []) {
+      if (!claim(this.#folded, `${bot} ${call.turnId} t${call.step}.${call.index ?? 0}`)) {
+        skipped += 1;
+        continue;
+      }
+      folded += 1;
+      this.sample("tool_ms", bot, call.toolMs);
+    }
+    for (const turn of snapshot.turns ?? []) {
+      if (!claim(this.#folded, `${bot} ${turn.turnId} n`)) {
+        skipped += 1;
+        continue;
+      }
+      folded += 1;
+      this.sample("model_steps", bot, turn.modelSteps);
+    }
+    return { folded, skipped };
   }
 
   // retention
 
   /** The nightly trim. Runs even when the ring is disabled: an operator who turns observability off
    *  should watch the rows it already wrote age out, not keep them forever. */
-  trim(nowMs: number = this.#now()): { series: number; events: number } {
+  trim(nowMs: number = this.#now()): { series: number; events: number; complete: boolean } {
     return this.#store.trim(nowMs - this.#retentionDays * 86_400_000);
   }
 
   // read helpers
 
-  /** p50, p95 and the sample count for one series over one window, for D3 to call. */
+  /** p50, p95 and the sample count for one series over one window, for D3 to call. `bot` is a NAME,
+   *  hashed here the same way the writer hashed it. */
   summarize(query: {
     series: ObserveSeries;
     tag?: ObserveSeriesTag;
@@ -312,7 +448,7 @@ export class ObservationRing {
   }): ObserveSummary {
     return this.#store.summarize({
       series: query.allTags === true ? query.series : seriesName(query.series, query.tag),
-      ...(query.bot === undefined ? {} : { bot: query.bot }),
+      ...(query.bot === undefined || query.bot === null ? {} : { bot: this.#store.identify(query.bot) }),
       from: query.from,
       to: query.to,
       ...(query.allTags === true ? { includeTags: true } : {}),
