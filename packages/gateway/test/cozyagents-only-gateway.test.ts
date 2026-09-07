@@ -377,6 +377,81 @@ describe("a gateway configured with no Hermes endpoint", () => {
     });
   });
 
+  /** F9 fix round 1 (review finding, Major): the boot-time adapter registration alone was not
+   *  enough. A bot created through `POST /bots` (capability 49) gets its attach token and its
+   *  runtime-plane row from `RuntimeBotService`'s `register` hook, but that hook never built the
+   *  attach adapter `TurnRunner.submitUserMessage` needs, so a plain 1:1 thread against a
+   *  runtime-created bot answered `503 backend_unavailable "no adapter for agent"` until the
+   *  gateway process restarted (and the boot-time loop ran again with the bot now in storage). No
+   *  restart happens anywhere in this test, which is the whole point. */
+  it("a bot created through POST /bots answers its 1:1 thread without a gateway restart", async () => {
+    const l = await live();
+    const peers = await roomOfTwoRuntimeBots(l);
+    const sage = peers.get("sage")!;
+
+    const threadRes = await l.authed("/threads", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId: "sage", title: "runtime-created bot thread" }),
+    });
+    expect(threadRes.status).toBe(200);
+    const thread = (await threadRes.json()) as { id: string };
+
+    const sent = await l.authed(`/threads/${thread.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ blocks: [{ type: "paragraph", text: "hello runtime-created bot" }] }),
+    });
+    expect(sent.status).toBe(200);
+
+    // Not just a 200: the turn really reaches the same socket the runner dialed in for this bot,
+    // so the fix is a real adapter, not a route that stopped erroring for the wrong reason.
+    const isTurn = (frame: Record<string, any>): boolean =>
+      frame["kind"] === "command" && frame["command"]?.["threadId"] === thread.id;
+    await until(() => sage.frames.some(isTurn));
+  });
+
+  /** F9 fix round 1 (review finding, Low): the shutdown-deadlock fix
+   *  (`durableAttachShutdown` in `server.ts`'s `close()`) was previously covered only implicitly,
+   *  by an `afterAll` hook timing out in the conformance runner. This pins it directly: a
+   *  Hermes-free gateway with one runtime bot's turn genuinely in flight (the peer receives the
+   *  command and deliberately never commits, fails, or is interrupted) must still close within a
+   *  few seconds, not hang until the process is killed. */
+  it("closes within a few seconds even with a runtime bot turn genuinely in flight", async () => {
+    const l = await live();
+    const peers = await roomOfTwoRuntimeBots(l);
+    const sage = peers.get("sage")!;
+
+    const threadRes = await l.authed("/threads", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId: "sage", title: "in flight at shutdown" }),
+    });
+    const thread = (await threadRes.json()) as { id: string };
+    const sent = await l.authed(`/threads/${thread.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ blocks: [{ type: "paragraph", text: "never answer this" }] }),
+    });
+    expect(sent.status).toBe(200);
+
+    const isTurn = (frame: Record<string, any>): boolean =>
+      frame["kind"] === "command" && frame["command"]?.["threadId"] === thread.id;
+    await until(() => sage.frames.some(isTurn));
+    // The peer now holds an open turn command it will never ack, commit, or fail: exactly what
+    // "in flight at shutdown" means.
+
+    const closing = l.gateway.close();
+    // Remove it from the shared afterEach close list now: this test owns closing it, and closing
+    // twice would be a double-close race rather than evidence about the fix.
+    gateways.splice(gateways.indexOf(l.gateway), 1);
+    const outcome = await Promise.race([
+      closing.then(() => "closed" as const),
+      new Promise<"timed_out">((resolve) => setTimeout(() => resolve("timed_out"), 3_000)),
+    ]);
+    expect(outcome).toBe("closed");
+  });
+
 });
 
 interface RoomPeer {

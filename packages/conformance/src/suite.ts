@@ -71,7 +71,9 @@ export interface ConformanceEnv {
   baseUrl: () => string;
   /** Mint a fresh single-use setup code on the gateway under test. */
   issueSetupCode: () => Promise<string>;
-  /** Hermes profile id of the reference attach echo peer on the gateway under test. */
+  /** Agent id of the reference attach echo peer on the gateway under test: a Hermes profile id on
+   *  a Hermes-attached gateway, or a runtime bot id (`bots` config, capability 45) on a
+   *  Hermes-free one. Either is a plain attach-v1 identity as far as this suite is concerned. */
   echoAgentId: string;
   /** OPTIONAL stall hook (issue #21). Agent id of a stall-capable, interruptible backend on the
    *  gateway under test. Declaring it activates the live in-flight interrupt group, which is the
