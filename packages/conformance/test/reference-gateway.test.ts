@@ -37,9 +37,10 @@ afterAll(async () => {
   // notify failed") since the approval agent above raises one per turn, and the Bot Mode chat
   // reply leg ("chat message notify failed") the repair hook's denied turns commit, and the
   // capability-68 Task completion leg ("task completion notify failed"), which every completed
-  // conformance Task raises for the paired device that has no live socket.
+  // conformance Task raises for the paired device that has no live socket. Capability 76 also
+  // retries a queued completion after its reply push fails ("task completion fallback failed").
   for (const line of notifierLogLines) {
-    expect(line).toMatch(/^push: (approval |chat message |task completion )?notify failed for device .+: fetch failed$/);
+    expect(line).toMatch(/^push: (?:(?:approval |chat message |task completion )?notify failed|task completion fallback failed) for device .+: fetch failed$/);
   }
 });
 
