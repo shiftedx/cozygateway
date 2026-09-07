@@ -128,6 +128,29 @@ describe("cozygateway pair", () => {
     storage.close();
   });
 
+  // Capability 72.
+  it("mints an observer-kind code with --kind observer, which no device pair can spend", async () => {
+    const { configPath, dbPath } = tempConfig();
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+      lines.push(String(line));
+    });
+    const exitCode = await runCli(["pair", "--config", configPath, "--kind", "observer"]);
+    vi.restoreAllMocks();
+    expect(exitCode).toBe(0);
+
+    const payload = JSON.parse(lines.find((l) => l.startsWith("{")) ?? "{}") as {
+      setupCode: string;
+      kind?: string;
+    };
+    expect(payload.kind).toBe("observer");
+    const storage = openStorage(dbPath);
+    expect(storage.consumeSetupCode(payload.setupCode, Date.now())).toBe("invalid");
+    expect(storage.consumeSetupCode(payload.setupCode, Date.now(), "runner")).toBe("invalid");
+    expect(storage.consumeSetupCode(payload.setupCode, Date.now(), "observer")).toBe("ok");
+    storage.close();
+  });
+
   it("keeps a device pair's payload byte-shaped as it always was", async () => {
     const { configPath } = tempConfig();
     const payload = await pairPayload(configPath);

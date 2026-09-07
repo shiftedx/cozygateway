@@ -357,8 +357,38 @@ function sanitizedContentType(value: string): string {
 
 type Env = { Variables: { deviceId: string } };
 
+/** Capability 72. The methods that change something. A read-scoped token is refused all of them
+ *  and nothing else, so a dashboard can read every `GET` and act on nothing. */
+const WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
 export function createApp(deps: AppDeps): Hono<Env> {
   const app = new Hono<Env>();
+  // Capability 72. THE ONE ENFORCEMENT POINT for the read scope. It runs before every route
+  // handler this app registers, resolving the bearer itself rather than leaning on
+  // `requireDevice`, so a write route added later is refused by construction rather than by a
+  // reviewer remembering to guard it. A request carrying no device token, or a token this gateway
+  // does not know, falls through untouched and meets the auth its own route already applies:
+  // this middleware answers one question only, whether the credential presented may write.
+  app.use(
+    "*",
+    createMiddleware<Env>(async (c, next) => {
+      if (WRITE_METHODS.has(c.req.method.toUpperCase())) {
+        const header = c.req.header("authorization") ?? "";
+        const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
+        const device =
+          token === "" ? undefined : deps.storage.deviceByTokenHash(hashToken(token));
+        // FAIL CLOSED: anything that is not `write` is refused, rather than only the one value
+        // known to be read-only. A row carrying a scope this build has never heard of, written by
+        // a newer gateway and read back after a rollback, is refused rather than treated as a
+        // full credential because it failed to match a literal.
+        if (device !== undefined && device.scope !== "write") {
+          return c.json(errorBody("scope_read_only", "this device token may only read"), 403);
+        }
+      }
+      await next();
+      return undefined;
+    }),
+  );
   const pairingAdmission = deps.pairingAdmission ?? new PairingAdmission(deps.now);
   const relayFetch = deps.pushRelayFetch ?? fetch;
   const relayLog = deps.pushRelayLog ?? ((message: string) => process.stderr.write(`${message}\n`));
@@ -444,6 +474,9 @@ export function createApp(deps: AppDeps): Hono<Env> {
     }
     deps.storage.touchDevice(device.id, deps.now());
     c.set("deviceId", device.id);
+    // Capability 72. No scope check here on purpose: the refusal lives in the one middleware
+    // above, which runs before every route handler, so no route and no sub-router has to
+    // remember it and none of them can forget it.
     await next();
   });
 
@@ -980,8 +1013,10 @@ export function createApp(deps: AppDeps): Hono<Env> {
     // Capability 52. `deviceName` is required for a device pair and optional for a runner pair,
     // enforced here rather than in the schema so no existing device client's request, response or
     // error message changes shape.
+    // Capability 72 adds `observer`, which mints a device and therefore carries the same
+    // `deviceName` requirement a plain device pair carries.
     const kind = pairRequest.kind ?? "device";
-    if (kind === "device" && pairRequest.deviceName === undefined) {
+    if ((kind === "device" || kind === "observer") && pairRequest.deviceName === undefined) {
       return c.json(errorBody("invalid_request", "deviceName is required"), 400);
     }
     if (kind === "runner" && deps.runners === undefined) {
@@ -1012,13 +1047,19 @@ export function createApp(deps: AppDeps): Hono<Env> {
       });
     }
     const { token, tokenHash } = mintDeviceToken();
+    // Capability 72. The scope is a property of the token, decided here by the kind of code that
+    // was consumed, and never something the pairing client asks for or is told.
     const device = {
       id: randomUUID(),
       name: pairRequest.deviceName!,
       tokenHash,
       createdAt: deps.now(),
+      kind: kind === "observer" ? ("observer" as const) : ("device" as const),
+      scope: kind === "observer" ? ("read" as const) : ("write" as const),
     };
     deps.storage.createDevice(device);
+    // The response shape is unchanged: `device` gains no new field on the wire, because the scope
+    // lives on the token the browser stores and the pairing client needs none of it echoed back.
     return c.json({
       deviceToken: token,
       device: {
@@ -1032,6 +1073,31 @@ export function createApp(deps: AppDeps): Hono<Env> {
   });
 
   app.get("/devices", requireDevice, (c) => c.json(deps.storage.listDevices()));
+
+  // Capability 72. Minting an observer code from CozyChat's device list, shaped exactly like the
+  // runner mint above and spending the same 10 minute TTL and the same gateway-wide bucket the
+  // unauthenticated pairing route spends: a code is a credential in waiting wherever it is minted.
+  // It is guarded by `requireDevice` like every authenticated route, and the one scope middleware
+  // above already refuses a read-scoped token here, so an observer can never mint another
+  // observer.
+  app.post("/observers/pair-code", requireDevice, (c) => {
+    const retryAfter = pairingAdmission.attempt();
+    if (retryAfter !== undefined) {
+      return c.json(
+        errorBody("invalid_request", "too many pairing attempts; try again later"),
+        429,
+        { "retry-after": String(retryAfter) },
+      );
+    }
+    const setupCode = newSetupCode();
+    const expiresAt = deps.now() + SETUP_CODE_TTL_MS;
+    deps.storage.createSetupCode(setupCode, expiresAt, "observer");
+    return c.json({
+      setupCode,
+      expiresAt,
+      gatewayUrl: deps.pairingUrl?.() ?? configuredOrigin(deps.config),
+    });
+  });
 
   // Capability 52. The paired computers that run bots, beside the paired phones and shaped like
   // them, including the 404 an unknown id gets.

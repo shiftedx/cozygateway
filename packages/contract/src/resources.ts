@@ -16,6 +16,8 @@ export const ERROR_CODES = [
   "approval_not_pending",
   "approval_resolution_pending",
   "approval_expired",
+  /** Capability 72. A read-scoped device token tried to act. */
+  "scope_read_only",
   "internal",
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -81,11 +83,26 @@ export type ApprovalOutcome = Static<typeof ApprovalOutcomeSchema>;
 export const APPROVALS_CAPABILITY_ID = "approvals";
 export const APPROVALS_CAPABILITY_VERSION = 1;
 
+export const DeviceKindSchema = Type.Union([
+  Type.Literal("device"),
+  Type.Literal("runner"),
+  Type.Literal("observer"),
+]);
+export type DeviceKind = Static<typeof DeviceKindSchema>;
+
+/** Capability 72. What a device token may do. `write` is every credential this gateway ever
+ *  minted before 72, so a device paired earlier is refused nothing. */
+export const DeviceScopeSchema = Type.Union([Type.Literal("read"), Type.Literal("write")]);
+export type DeviceScope = Static<typeof DeviceScopeSchema>;
+
 export const DeviceSchema = Type.Object({
   id: Type.String(),
   name: Type.String(),
   createdAt: Type.Integer(),
   lastSeenAt: Type.Union([Type.Integer(), Type.Null()]),
+  /** Capability 72. Optional so a gateway below 72 and a client below 72 are both unaffected. */
+  kind: Type.Optional(DeviceKindSchema),
+  scope: Type.Optional(DeviceScopeSchema),
 });
 export type Device = Static<typeof DeviceSchema>;
 
