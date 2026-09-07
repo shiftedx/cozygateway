@@ -924,7 +924,7 @@ describe("capability advertisement", () => {
     // originals, tombstoned deletion, supersession, and an independent delivery lifecycle.
     // Capability 66 adds the typed scoped-approval block, payload-hash binding, standing once and
     // category grants, the always-require list no grant may cover, and the revocation view.
-    expect(BOTS_CAPABILITY_VERSION).toBe(72);
+    expect(BOTS_CAPABILITY_VERSION).toBe(73);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {
@@ -1266,6 +1266,24 @@ describe("capability advertisement", () => {
     expect(check(BotChatDisplayedRequestSchema, { messageIds: ["x".repeat(129)] })).toBe(false);
     expect(check(BotChatDisplayedResponseSchema, { recorded: 0 })).toBe(true);
     expect(check(BotChatDisplayedResponseSchema, { recorded: -1 })).toBe(false);
+  });
+
+  it("accepts capability 73's perceived latency and network path, and refuses anything outside them", () => {
+    // Both optional: a client below 73 sends neither and is byte identical to its pre-73 self.
+    expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"] })).toBe(true);
+    expect(check(BotChatDisplayedRequestSchema, {
+      messageIds: ["m1"], feltLatencyMs: 1_240, networkPath: "vpn_on",
+    })).toBe(true);
+    // A path with no timing still says which paths a device uses, so it stands on its own.
+    expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"], networkPath: "cellular" })).toBe(true);
+    for (const path of ["wifi", "cellular", "vpn_on", "vpn_off"]) {
+      expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"], networkPath: path })).toBe(true);
+    }
+    // A closed set, so a new path name is a refusal rather than an unreadable row.
+    expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"], networkPath: "carrier_pigeon" })).toBe(false);
+    expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"], feltLatencyMs: -1 })).toBe(false);
+    expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"], feltLatencyMs: 600_001 })).toBe(false);
+    expect(check(BotChatDisplayedRequestSchema, { messageIds: ["m1"], feltLatencyMs: 12.5 })).toBe(false);
   });
 
   it("carries a capability-31 marker on a gateway-authored system row without changing older rows", () => {
