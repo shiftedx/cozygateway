@@ -82,17 +82,89 @@ case "$STAGE_ROOT" in
     die "stage directory must be outside macOS TCC-protected user folders: $STAGE_ROOT" ;;
 esac
 
-install_lock="$STAGE_ROOT/.install.lock"
-if ! mkdir "$install_lock" 2>/dev/null; then
-  old_pid="$(sed -n '1p' "$install_lock/pid" 2>/dev/null || true)"
-  case "$old_pid" in ''|*[!0-9]*) old_pid="" ;; esac
-  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-    die "another provisioner install is running (pid $old_pid)"
-  fi
-  rm -rf "$install_lock"
-  mkdir "$install_lock" 2>/dev/null || die "could not acquire installer lock"
+# Upgrade ownership is structural, not a label/prefix guess. Legacy staged
+# releases have STAGED_FROM but may lack the deprovision helper; they are the
+# exact old shape this migration repairs. Unknown stages/services stay intact.
+have python3 || die "python3 is required to validate installed provisioner ownership"
+prior_target="$(python3 - "$STAGE_ROOT" "$PLIST" "$LABEL" <<'PYOWN'
+import os, plistlib, re, sys
+from pathlib import Path
+root, plist, label = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+def regular(path):
+    if path.is_symlink() or not path.is_file() or path.stat().st_uid != os.getuid():
+        raise ValueError("unowned file")
+def metadata(release):
+    regular(release / "STAGED_FROM")
+    values = {}
+    for line in (release / "STAGED_FROM").read_text().splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or key in values:
+            raise ValueError("invalid staging metadata")
+        values[key] = value
+    if not re.fullmatch(r"[a-f0-9]{40}|unknown", values.get("SOURCE_REVISION", "")) or not values.get("SOURCE_REPO", "").startswith("/"):
+        raise ValueError("missing source identity")
+    for name in ("bot-provisioner-watch.sh", "provision-bot.sh"):
+        regular(release / "scripts" / name)
+    if (release / "scripts").is_symlink() or (release / "integrations").is_symlink() or (release / "integrations/attach-plugin").is_symlink() or not (release / "integrations/attach-plugin").is_dir():
+        raise ValueError("redirected payload")
+    return values
+try:
+    if root.stat().st_uid != os.getuid() or (root / "releases").is_symlink():
+        raise ValueError("unowned staging root")
+    current = root / "current"
+    target = ""
+    values = None
+    if current.exists() or current.is_symlink():
+        if not current.is_symlink():
+            raise ValueError("current is not a staged symlink")
+        target = os.readlink(current)
+        if not re.fullmatch(r"releases/[0-9]{8}T[0-9]{6}Z-[0-9]+", target):
+            raise ValueError("unknown release target")
+        release = root / target
+        if release.is_symlink() or not release.is_dir():
+            raise ValueError("redirected release")
+        values = metadata(release)
+    if plist.exists() or plist.is_symlink():
+        regular(plist)
+        data = plistlib.loads(plist.read_bytes())
+        allowed = [str(root / "current/scripts/bot-provisioner-watch.sh")]
+        if values:
+            allowed += [str(root / target / "scripts/bot-provisioner-watch.sh"), values["SOURCE_REPO"] + "/scripts/bot-provisioner-watch.sh"]
+        args = data.get("ProgramArguments")
+        if not values or data.get("Label") != label or not isinstance(args, list) or len(args) != 2 or args[0] != "/bin/bash" or args[1] not in allowed:
+            raise ValueError("service ownership mismatch")
+        expected_cwd = str(Path(args[1]).parent.parent)
+        if data.get("WorkingDirectory") != expected_cwd:
+            raise ValueError("service working directory mismatch")
+    print(target)
+except Exception:
+    print("Installed provisioner ownership is ambiguous; existing payload and service were preserved. Inspect the configured stage and LaunchAgent before retrying this installer.", file=sys.stderr)
+    sys.exit(1)
+PYOWN
+)" || die "automatic provisioner repair stopped safely"
+
+# The kernel owns lock lifetime, including a killed installer. Legacy mkdir
+# locks are left untouched and cannot prevent a newer repair from running.
+install_lock="$STAGE_ROOT/.install-advisory.lock"
+if [ "${COZY_PROVISIONER_INSTALL_LOCK_PID:-}" != "$$" ]; then
+  [ ! -L "$install_lock" ] || die "refusing redirected installer lock"
+  exec 8>>"$install_lock"
+  export COZY_PROVISIONER_INSTALL_LOCK_PID="$$" HERMES_BIN
+  exec python3 - "$SCRIPT_DIR/install-bot-provisioner.sh" "$STAGE_ROOT" "$LOAD" <<'PYLOCK'
+import fcntl, os, sys
+try:
+    fcntl.flock(8, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print("FAIL  another provisioner install is running; retry after it finishes", file=sys.stderr)
+    sys.exit(1)
+os.set_inheritable(8, True)
+args = ["/bin/bash", sys.argv[1], "--stage-dir", sys.argv[2]]
+if sys.argv[3] == "0":
+    args.append("--no-load")
+os.execv(args[0], args)
+PYLOCK
 fi
-printf '%s\n' "$$" > "$install_lock/pid"
+: >&8
 
 release_name="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
 releases="$STAGE_ROOT/releases"
@@ -101,7 +173,9 @@ release="$releases/$release_name"
 current="$STAGE_ROOT/current"
 next="$STAGE_ROOT/.current-$release_name"
 plist_tmp="$PLIST.tmp.$$"
-cleanup() { rm -rf "$staging" "$next"; rm -f "$plist_tmp"; rm -rf "$install_lock"; }
+prior_plist="$STAGE_ROOT/.prior-plist-$release_name"
+[ ! -f "$PLIST" ] || cp -p "$PLIST" "$prior_plist"
+cleanup() { rm -rf "$staging" "$next"; rm -f "$plist_tmp" "$prior_plist"; }
 trap cleanup EXIT
 
 mkdir -p "$staging/scripts" "$staging/integrations/attach-plugin" "$(dirname "$PLIST")"
@@ -111,6 +185,7 @@ rsync -a --delete \
   "$REPO_ROOT/integrations/attach-plugin/" "$staging/integrations/attach-plugin/"
 chmod 700 "$staging/scripts/bot-provisioner-watch.sh" "$staging/scripts/provision-bot.sh" "$staging/scripts/deprovision-bot.sh"
 {
+  printf 'INSTALL_HYGIENE_PROTOCOL=1\n'
   printf 'STAGED_AT_UTC=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   printf 'SOURCE_REPO=%s\n' "$REPO_ROOT"
   if have git && git -C "$REPO_ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
@@ -157,21 +232,27 @@ mv "$plist_tmp" "$PLIST"
 if [ "$LOAD" = 1 ]; then
   uid="$(id -u)"
   launchctl bootout "gui/$uid/$LABEL" >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/$uid" "$PLIST"
-  launchctl kickstart "gui/$uid/$LABEL"
-  launchctl print "gui/$uid/$LABEL" >/dev/null \
-    || die "LaunchAgent did not load: $LABEL"
+  if ! launchctl bootstrap "gui/$uid" "$PLIST" \
+    || ! launchctl kickstart "gui/$uid/$LABEL" \
+    || ! launchctl print "gui/$uid/$LABEL" >/dev/null; then
+    # Roll back only the previously verified payload/service. Keep both release
+    # directories, so an interrupted repair never consumes its recovery copy.
+    launchctl bootout "gui/$uid/$LABEL" >/dev/null 2>&1 || true
+    if [ -n "$prior_target" ]; then
+      ln -s "$prior_target" "$next"
+      if mv --help 2>&1 | grep -q -- '--no-target-directory'; then mv -fT "$next" "$current"; else mv -fh "$next" "$current"; fi
+    fi
+    if [ -f "$prior_plist" ]; then
+      cp -p "$prior_plist" "$PLIST"
+      launchctl bootstrap "gui/$uid" "$PLIST" >/dev/null 2>&1 || true
+    fi
+    die "provisioner activation failed; prior owned configuration was restored when available and release copies were retained. Retry scripts/install-bot-provisioner.sh from this release"
+  fi
 fi
 
-# The old payload cannot be in use after bootout. Keep only current so repeated
-# loaded refreshes do not grow this directory forever. With --no-load, retain
-# old releases because an already-running agent may still refer to one.
-if [ "$LOAD" = 1 ]; then
-  for old in "$releases"/*; do
-    [ -d "$old" ] || continue
-    [ "$old" = "$release" ] || rm -rf "$old"
-  done
-fi
+# Retired releases are recovery payloads, not live state. Preserve them rather
+# than deleting directories from a caller-selected stage root by glob/prefix.
+# The verified current symlink is the sole execution target for future sweeps.
 
 say "Bot provisioner staged at $current"
 say "LaunchAgent installed at $PLIST"
