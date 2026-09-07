@@ -1791,6 +1791,13 @@ export function createApp(deps: AppDeps): Hono<Env> {
         404,
       );
     }
+    // Activity cards belong to an exact conversation, including across turns.
+    // The runId is the client's card identity, not authority to adopt a new session.
+    const hasConversation = () => !deps.storage.isBotDeleted(decoded.bot)
+      && deps.storage.nativeBotHasSession(decoded.bot, decoded.conversationId);
+    if (!hasConversation()) {
+      return c.json(errorBody("not_found", "Live Activity conversation no longer exists"), 404);
+    }
     const relayBase = deps.config.pushRelayUrl.replace(/\/+$/, "");
     const upstream = await relayFetch(`${relayBase}/register`, {
       method: "POST",
@@ -1810,6 +1817,11 @@ export function createApp(deps: AppDeps): Hono<Env> {
     const result = (await upstream.json()) as { pushId?: unknown };
     if (typeof result.pushId !== "string" || result.pushId.length === 0) {
       return c.json(errorBody("internal", "relay returned no push id"), 502);
+    }
+    if (!hasConversation()) {
+      deps.storage.queueLiveActivityRelayDeletion(result.pushId, deps.now());
+      requestLiveActivityDeletionDrain();
+      return c.json(errorBody("not_found", "Live Activity conversation no longer exists"), 404);
     }
     deps.storage.saveLiveActivityRegistration({
       deviceId: c.get("deviceId"),

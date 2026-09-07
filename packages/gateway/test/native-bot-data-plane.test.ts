@@ -1038,6 +1038,47 @@ describe("attach-v1 native Bot Mode plane", () => {
     }
   });
 
+  it.each([false, true])("does not run a deleted bot's old turn timeout after recreation=%s", async (recreate) => {
+    vi.useFakeTimers();
+    const storage = openStorage(":memory:");
+    let now = 0;
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface,
+      storage,
+      ingress: {
+        sendNativeTurn: (bot: string, input: Record<string, unknown>) => {
+          storage.enqueueAttachCommand(bot, "turn", { kind: "turn", ...input } as never, now);
+          return true;
+        },
+      } as unknown as AttachV1Ingress,
+      nativeBots: ["disposable-delete", "keeper"],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+      now: () => now,
+      turnTimeoutMs: 50,
+    });
+    try {
+      const old = await plane.surface().sendChatMessage("disposable-delete", "old turn");
+      await plane.surface().sendChatMessage("keeper", "keeper turn");
+      plane.removeRuntimeBot("disposable-delete");
+      storage.purgeBot("disposable-delete");
+      if (recreate) {
+        storage.restoreBot("disposable-delete");
+        storage.nativeBotChat("disposable-delete", now);
+      }
+      now = 50;
+      await vi.advanceTimersByTimeAsync(50);
+      expect(storage.nativeBotHasSession("disposable-delete", old.sessionId)).toBe(false);
+      expect(storage.nativeBotSessions("disposable-delete", 10)).toHaveLength(recreate ? 1 : 0);
+      expect(storage.pendingAttachCommands("disposable-delete", 0, 10)).toEqual([]);
+      expect(await plane.surface().chatHistory("keeper")).toMatchObject({ status: "timed_out" });
+    } finally {
+      plane.close();
+      storage.close();
+      vi.useRealTimers();
+    }
+  });
+
   it("does not impose a wall-clock timeout when none is configured", async () => {
     vi.useFakeTimers();
     try {

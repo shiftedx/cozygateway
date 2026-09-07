@@ -440,7 +440,7 @@ export class NativeBotDataPlane {
     string,
     ReturnType<typeof setTimeout>
   >();
-  readonly #turnTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly #turnTimers = new Map<string, { bot: string; timer: ReturnType<typeof setTimeout> }>();
   readonly #liveTurnBatches = new Map<string, LiveTurnBatch>();
   readonly #staleTurnSweepMs: number;
   readonly #staleTurnInterruptGraceMs: number;
@@ -889,6 +889,11 @@ export class NativeBotDataPlane {
     const bot = normalize(id);
     this.#runtimeBots.delete(bot);
     this.#native.delete(bot);
+    for (const [key, pending] of this.#turnTimers) {
+      if (pending.bot !== bot) continue;
+      clearTimeout(pending.timer);
+      this.#turnTimers.delete(key);
+    }
   }
 
   #roster() {
@@ -1389,7 +1394,7 @@ export class NativeBotDataPlane {
     this.#turnContexts.clear();
     for (const timer of this.#interactionTimers.values()) clearTimeout(timer);
     this.#interactionTimers.clear();
-    for (const timer of this.#turnTimers.values()) clearTimeout(timer);
+    for (const { timer } of this.#turnTimers.values()) clearTimeout(timer);
     this.#turnTimers.clear();
     for (const timer of this.#cozyAppOriginTimers.values()) clearTimeout(timer);
     this.#cozyAppOriginTimers.clear();
@@ -3357,13 +3362,15 @@ export class NativeBotDataPlane {
       Math.max(1, (waiting?.expiresAt ?? 0) - this.#now(), delivery.queuedAt + this.#turnTimeoutMs + suspended - this.#now()),
     );
     timer.unref();
-    this.#turnTimers.set(key, timer);
+    this.#turnTimers.set(key, { bot, timer });
   }
 
   #timeoutTurn(bot: string, sessionId: string, turnId: string): void {
     this.#turnTimers.delete(this.#nativeTurnKey(bot, sessionId, turnId));
-    const chat = this.#storage.nativeBotChat(bot, this.#now());
-    if (chat.sessionId !== sessionId || chat.activeTurnId !== turnId) return;
+    // A delayed callback observes its original binding; it must never create a
+    // chat for a deleted bot or borrow a same-name replacement's session.
+    const chat = this.#storage.nativeBotActiveTurn(bot);
+    if (chat?.sessionId !== sessionId || chat.turnId !== turnId) return;
     const peer = this.#executionPeer(bot, sessionId);
     const delivery = peer === undefined ? undefined : this.#storage.nativeBotTurnDelivery(peer, turnId);
     if (delivery === undefined) return;
@@ -3498,7 +3505,7 @@ export class NativeBotDataPlane {
   #clearTurnTimeout(bot: string, sessionId: string, turnId: string): void {
     const key = this.#nativeTurnKey(bot, sessionId, turnId);
     const timer = this.#turnTimers.get(key);
-    if (timer !== undefined) clearTimeout(timer);
+    if (timer !== undefined) clearTimeout(timer.timer);
     this.#turnTimers.delete(key);
   }
 

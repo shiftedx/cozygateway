@@ -20,7 +20,10 @@ interface RelayCall {
   authorization: string | null;
 }
 
-async function setup(liveActivityPushIds: readonly string[] = ["relay-push-id"]) {
+async function setup(
+  liveActivityPushIds: readonly string[] = ["relay-push-id"],
+  relayResponse?: (request: Request) => Promise<Response>,
+) {
   const calls: RelayCall[] = [];
   let liveActivityRegistration = 0;
   const relayFetch: typeof fetch = async (input, init) => {
@@ -31,6 +34,7 @@ async function setup(liveActivityPushIds: readonly string[] = ["relay-push-id"])
       body: await request.text(),
       authorization: request.headers.get("authorization"),
     });
+    if (relayResponse !== undefined) return relayResponse(request);
     return request.method === "DELETE"
       ? new Response(null, { status: 204 })
       : new Response(JSON.stringify({
@@ -49,6 +53,7 @@ async function setup(liveActivityPushIds: readonly string[] = ["relay-push-id"])
     pushRelayUrl: "http://relay.internal:8788/",
   };
   const storage = openStorage(":memory:");
+  const sessionId = storage.nativeBotChat("sage", 1_000).sessionId;
   const app = createApp({
     storage,
     config,
@@ -76,7 +81,7 @@ async function setup(liveActivityPushIds: readonly string[] = ["relay-push-id"])
       ...init,
       headers: { ...(init?.headers ?? {}), authorization: `Bearer ${deviceToken}` },
     });
-  return { app, authed, calls, storage };
+  return { app, authed, calls, storage, sessionId };
 }
 
 describe("authenticated push relay proxy", () => {
@@ -146,11 +151,11 @@ describe("authenticated push relay proxy", () => {
   });
 
   it("registers and removes a device-scoped Live Activity token through the relay", async () => {
-    const { authed, calls } = await setup();
+    const { authed, calls, sessionId } = await setup();
     const response = await authed("/push/live-activities/register", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ activityId: "activity-1", runId: "run-1",
-        conversationId: "gateway-1", bot: "sage", token: "aa".repeat(32), environment: "development" }),
+        conversationId: sessionId, bot: "sage", token: "aa".repeat(32), environment: "development" }),
     });
     expect(response.status).toBe(200);
     expect(calls[0]).toMatchObject({ method: "POST", url: "http://relay.internal:8788/register" });
@@ -165,10 +170,10 @@ describe("authenticated push relay proxy", () => {
   });
 
   it("retires a superseded Live Activity registration for the same device conversation", async () => {
-    const { authed, calls, storage } = await setup(["stale-push-id", "current-push-id"]);
+    const { authed, calls, storage, sessionId } = await setup(["stale-push-id", "current-push-id"]);
     const register = (activityId: string, runId: string) => authed("/push/live-activities/register", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ activityId, runId, conversationId: "gateway-1", bot: "sage",
+      body: JSON.stringify({ activityId, runId, conversationId: sessionId, bot: "sage",
         token: "aa".repeat(32), environment: "development" }),
     });
 
@@ -181,6 +186,43 @@ describe("authenticated push relay proxy", () => {
     expect.soft(calls.filter((call) => call.method === "DELETE")).toMatchObject([
       { url: "http://relay.internal:8788/register/stale-push-id" },
     ]);
+  });
+
+  it.each([false, true])("retires a late relay registration after bot deletion with recreation=%s", async (recreate) => {
+    const entered = Promise.withResolvers<void>();
+    const reply = Promise.withResolvers<Response>();
+    const { authed, calls, storage, sessionId } = await setup([], async (request) => {
+      if (request.method === "DELETE") return new Response(null, { status: 503 });
+      entered.resolve();
+      return reply.promise;
+    });
+    const pending = authed("/push/live-activities/register", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ activityId: "late-activity", runId: "old-run", conversationId: sessionId,
+        bot: "sage", token: "aa".repeat(32), environment: "development" }),
+    });
+    await entered.promise;
+    storage.purgeBot("sage");
+    if (recreate) {
+      storage.restoreBot("sage");
+      const replacement = storage.nativeBotChat("sage", 2_000).sessionId;
+      storage.saveLiveActivityRegistration({
+        deviceId: storage.listDevices()[0]!.id, activityId: "late-activity", runId: "new-run",
+        conversationId: replacement, bot: "sage", pushId: "new-push", createdAt: 2_000,
+      });
+    }
+    reply.resolve(new Response('{"pushId":"late-push"}', {
+      status: 201, headers: { "content-type": "application/json" },
+    }));
+    expect((await pending).status).toBe(404);
+    await tick();
+    expect(storage.liveActivityRegistrations("sage")).toMatchObject(recreate
+      ? [{ runId: "new-run", pushId: "new-push" }] : []);
+    expect(storage.liveActivityRelayDeletions(10)).toEqual(["late-push"]);
+    expect(calls.filter((call) => call.method === "DELETE")).toMatchObject([
+      { url: "http://relay.internal:8788/register/late-push" },
+    ]);
+    storage.close();
   });
 
   it("keeps a failed relay deletion durable across reopen and retries it at app construction", async () => {
@@ -302,7 +344,7 @@ describe("authenticated push relay proxy", () => {
     const registered = await app.request("/push/live-activities/register", {
       method: "POST",
       headers: { "content-type": "application/json", authorization: "Bearer device-token" },
-      body: JSON.stringify({ activityId: "other", runId: "other", conversationId: "other",
+      body: JSON.stringify({ activityId: "other", runId: "other", conversationId: storage.nativeBotChat("sage", 1_000).sessionId,
         bot: "sage", token: "aa".repeat(32), environment: "development" }),
     });
     expect(registered.status).toBe(200);
