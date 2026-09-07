@@ -226,7 +226,9 @@ export class WsHub {
       // read; everything else a client can send is a command, so the check is written as "not a
       // read frame" rather than as a list of commands to keep in step, and a client frame added
       // later is refused for a read token by construction.
-      if (client.scope === "read" && frame.type !== "sync") {
+      // Fail closed for the same reason the HTTP middleware does: any scope that is not `write`
+      // may send `auth` and `sync` and nothing else.
+      if (client.scope !== "write" && frame.type !== "sync") {
         this.#send(socket, {
           type: "error", code: "scope_read_only", message: "this device token may only read",
         });

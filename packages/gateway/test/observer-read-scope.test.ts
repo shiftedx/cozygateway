@@ -74,7 +74,9 @@ function makeApp(now = () => 1_000, wired = true) {
             unreachable<NonNullable<AppDeps["harnessWorkspace"]>>("harnessWorkspace"),
           hermesSessions: unreachable<NonNullable<AppDeps["hermesSessions"]>>("hermesSessions"),
           gatewaySettings: unreachable<NonNullable<AppDeps["gatewaySettings"]>>("gatewaySettings"),
-          attachTokens: new Map<string, string>(),
+          // One entry, not an empty map: the attach media routes are registered behind a
+          // non-empty token map, so an empty one leaves two write routes out of the walk.
+          attachTokens: new Map<string, string>([["attach-token", "a1"]]),
         }
       : {}),
   });
@@ -218,7 +220,7 @@ describe("the read scope is refused by every write route", () => {
     // If a whole route family stops being registered, because a dependency name drifted or the
     // stub above stopped satisfying an `if (deps.x !== undefined)` guard, this fails loudly
     // instead of quietly walking a fraction of the router and passing.
-    expect(paths.size).toBeGreaterThanOrEqual(97);
+    expect(paths.size).toBeGreaterThanOrEqual(99);
     const failures: string[] = [];
     for (const entry of paths) {
       const [method, path] = entry.split(" ", 2) as [string, string];
@@ -230,6 +232,45 @@ describe("the read scope is refused by every write route", () => {
         method,
         headers: {
           authorization: `Bearer ${observer.deviceToken}`,
+          "content-type": "application/json",
+        },
+        body: "{}",
+      });
+      const body = (await res.json().catch(() => ({}))) as { error?: { code?: string } };
+      if (res.status !== 403 || body.error?.code !== "scope_read_only") {
+        failures.push(`${method} ${path} answered ${res.status} ${body.error?.code ?? "(no code)"}`);
+      }
+    }
+    expect(failures).toEqual([]);
+  });
+
+  // The check is fail-closed: it refuses anything that is not `write`, rather than refusing the
+  // one value it knows to be read-only. A row carrying a scope this build has never heard of, from
+  // a database a newer gateway wrote and this one was rolled back under, is refused rather than
+  // waved through as if it were a full credential.
+  it("refuses a scope value it does not recognise on every write route, not only read", async () => {
+    const { app, storage } = makeApp();
+    const minted = mintDeviceToken();
+    storage.createDevice({ id: "future", name: "Future", tokenHash: minted.tokenHash, createdAt: 1 });
+    storage.setDeviceScopeForTesting("future", "append_only");
+    const writeMethods = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+    const paths = new Set(
+      app.routes
+        .filter((route) => writeMethods.has(route.method.toUpperCase()))
+        .map((route) => `${route.method.toUpperCase()} ${route.path}`),
+    );
+    expect(paths.size).toBeGreaterThanOrEqual(99);
+    const failures: string[] = [];
+    for (const entry of paths) {
+      const [method, path] = entry.split(" ", 2) as [string, string];
+      const concrete = path
+        .replace(/:[A-Za-z0-9_]+\{[^}]*\}/g, "x")
+        .replace(/:[A-Za-z0-9_]+/g, "x")
+        .replace(/\*/g, "x");
+      const res = await app.request(concrete, {
+        method,
+        headers: {
+          authorization: `Bearer ${minted.token}`,
           "content-type": "application/json",
         },
         body: "{}",
@@ -429,8 +470,13 @@ describe("the devices schema", () => {
         storage.close();
       }
     };
-    // Not just the column names: the type, the NOT NULL flag and the default too, so a migration
-    // that adds a weaker column than the one a fresh database gets fails here.
+    // What this guards: the column set, and per column the declared type, the NOT NULL flag and
+    // the default, so a migration that adds a column a fresh database does not have, or adds one
+    // nullable or with a different default, fails here. What it CANNOT guard: `PRAGMA table_info`
+    // does not report CHECK constraints, so this would not notice a CHECK on one side and not the
+    // other. That is exactly why neither side carries one: the kind and scope vocabularies are
+    // held by `StoredDeviceKind` and `DeviceScope` in the type system instead, where the two
+    // creation paths cannot diverge at all.
     expect(columns(migrated)).toEqual(columns(fresh));
   });
 });

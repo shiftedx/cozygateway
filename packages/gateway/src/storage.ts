@@ -1378,6 +1378,14 @@ export class Storage {
     }));
   }
 
+  /** Capability 72. Writes a scope string the type system would never allow, so a test can prove
+   *  the scope check is fail-closed: a row a newer gateway wrote, read back by an older one that
+   *  has never heard of that scope, must be refused rather than waved through. Unreachable through
+   *  any ordinary code path, which is why it exists only here. */
+  setDeviceScopeForTesting(id: string, scope: string): void {
+    this.#db.prepare("UPDATE devices SET scope = ? WHERE id = ?").run(scope, id);
+  }
+
   deviceByTokenHash(tokenHash: string): DeviceRow | undefined {
     return this.#db
       .prepare(`SELECT ${DEVICE_COLUMNS} FROM devices WHERE token_hash = ?`)

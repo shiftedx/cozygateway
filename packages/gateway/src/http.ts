@@ -377,7 +377,11 @@ export function createApp(deps: AppDeps): Hono<Env> {
         const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
         const device =
           token === "" ? undefined : deps.storage.deviceByTokenHash(hashToken(token));
-        if (device !== undefined && device.scope === "read") {
+        // FAIL CLOSED: anything that is not `write` is refused, rather than only the one value
+        // known to be read-only. A row carrying a scope this build has never heard of, written by
+        // a newer gateway and read back after a rollback, is refused rather than treated as a
+        // full credential because it failed to match a literal.
+        if (device !== undefined && device.scope !== "write") {
           return c.json(errorBody("scope_read_only", "this device token may only read"), 403);
         }
       }

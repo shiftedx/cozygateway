@@ -51,11 +51,14 @@ release; everything older is marked pre-release so installers resolve one "lates
 - An observer device, so a dashboard can watch a gateway and never act on it (`com.cozylabs.bots`
   capability 72, D1). `cozygateway pair --kind observer` mints a setup code that only an observer
   pair can spend, `POST /observers/pair-code` mints one from CozyChat's device list the way
-  `POST /runners/pair-code` already mints a runner code and spends the same bucket and TTL, `POST /pair { kind: "observer" }` consumes one and mints a device token whose
-  scope is `read`, and that token is refused `403 scope_read_only` by every write route this
-  gateway serves. The refusal lives in ONE middleware that runs before every route handler rather
-  than in a check each route remembers to make, so a write route added later is refused by
-  construction: the test that proves it walks the router itself instead of a hand written list.
+  `POST /runners/pair-code` already mints a runner code and spends the same bucket and TTL, and
+  `POST /pair { kind: "observer" }` consumes one and mints a device token whose scope is `read`,
+  and that token is refused `403 scope_read_only` by every write route this gateway serves. The
+  refusal lives in ONE middleware that runs before every route handler rather than in a check each
+  route remembers to make, so a write route added later is refused by
+  construction: the test that proves it walks the router itself, all 99 write routes of a fully
+  wired gateway, instead of a hand written list. The check admits `write` and refuses everything
+  else, so it fails closed on a scope value a given build has never heard of.
   An observer can pair nothing, including a replacement for itself: `POST /pair` is a write, so a
   request presenting a read-scoped bearer is refused and the setup code it carried is not spent,
   which means a client re-pairing after its token went stale clears the stored token first.
