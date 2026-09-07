@@ -97,8 +97,8 @@
   const panelPaths = { overview:['glance','header-strip'], bots:['bots'], turns:['turns'], roundtrip:['roundtrip','felt','network-path'], attach:['attach'], approvals:['approvals'], deliveries:['deliveries'], devices:['devices'], events:['events'], cozyagents:['internals','model','agent-glance'], 'cozyagents/spend':['spend'], 'cozyagents/tools':['tool-costs'], 'series?series=tunnel_rtt_ms':['tunnel-chart'], 'series?series=ttft_ms':['first-token-chart'] };
   function render() {
     renderOverview(); renderBots(); renderLatency(); renderTurns(); renderAttach(); renderApprovals(); renderDeliveries(); renderDevices(); renderEvents(); renderAgents(); renderFlow();
-    chart('tunnel-chart', state.data['series?series=tunnel_rtt_ms']?.points, 'Derived tunnel round trip');
-    chart('first-token-chart', state.data['series?series=ttft_ms']?.points, 'First token');
+    chart('tunnel-chart', state.data['series?series=tunnel_rtt_ms']?.points, 'Derived tunnel round trip', state.data['series?series=tunnel_rtt_ms']);
+    chart('first-token-chart', state.data['series?series=ttft_ms']?.points, 'First token', state.data['series?series=ttft_ms']);
     for (const [path, ids] of Object.entries(panelPaths)) for (const id of ids) {
       const el = $(id); el.classList.toggle('panel-stale', state.errors.has(path));
       el.querySelectorAll('.panel-error').forEach(x => x.remove());
@@ -124,12 +124,16 @@
     const repairs = (state.data.cozyagents?.internals ?? []).flatMap(bot => (bot.toolServers ?? []).filter(server => server.state === 'repair_pending').map(server => ({ bot: bot.bot, server: server.server })));
     $('attention-items').innerHTML = [...approvals.map(row=>`<li>${chip('Approval','wait')}<span>${esc(row.bot)} has a pending approval. Answer in CozyChat.</span><span class="since">${esc(age(row.createdAt))}</span></li>`), ...repairs.map(row=>`<li>${chip('Repair','wait')}<span>${esc(row.bot)} · ${esc(row.server)} needs a decision in CozyChat.</span></li>`)].join('') || '<li class="empty">No pending decisions reported.</li>';
   }
-  function chart(id, points, label) {
+  function historyNote(data, count, total, label, oldest = false) {
+    if (data?.view !== 'bounded_history') return '';
+    return `<p class="note">${data.truncated ? `Showing the ${oldest ? 'oldest' : 'newest'} ${number(count)} of ${number(total)} ${label} in this window. This view is truncated.` : `${number(count)} ${label} shown in this window.`}</p>`;
+  }
+  function chart(id, points, label, data) {
     const valid = (points ?? []).filter(p => typeof p.value === 'number' && typeof p.at === 'number');
     if (!valid.length) { $(id).innerHTML = '<div class="chart-empty">No samples in this window.</div>'; return; }
     const width = 580, height = 118, lo = Math.min(...valid.map(p=>p.at)), hi = Math.max(...valid.map(p=>p.at)), max = Math.max(1,...valid.map(p=>p.value));
     const coords = valid.map(p=>`${40+(p.at-lo)/Math.max(1,hi-lo)*width},${140-p.value/max*height}`).join(' ');
-    $(id).innerHTML = `<svg class="chart" viewBox="0 0 640 160" role="img" aria-label="${esc(label)}, ${valid.length} samples"><line class="grid" x1="40" y1="140" x2="620" y2="140"/><polyline class="ctx" fill="none" stroke="var(--sage-ink)" stroke-width="2" points="${coords}"/><text x="40" y="155">${esc(clock(lo))}</text><text x="620" y="155" text-anchor="end">${esc(clock(hi))}</text><text x="40" y="16">${esc(duration(max))} max · n ${valid.length}</text></svg>`;
+    $(id).innerHTML = `<svg class="chart" viewBox="0 0 640 160" role="img" aria-label="${esc(label)}, ${valid.length} samples"><line class="grid" x1="40" y1="140" x2="620" y2="140"/><polyline class="ctx" fill="none" stroke="var(--sage-ink)" stroke-width="2" points="${coords}"/><text x="40" y="155">${esc(clock(lo))}</text><text x="620" y="155" text-anchor="end">${esc(clock(hi))}</text><text x="40" y="16">${esc(duration(max))} max · n ${valid.length}</text></svg>` + historyNote(data, valid.length, data?.totalPoints, 'samples', true);
   }
   function renderBots() {
     const bots = state.data.bots?.bots; if (!bots) return;
@@ -148,11 +152,11 @@
   }
   function renderTurns() {
     const data=state.data.turns;if(!data)return;
-    $('turns').innerHTML=table(['Time','Bot','Turn reference','Outcome','Reason'],(data.terminals??[]).map(row=>[esc(clock(row.at)),esc(row.botName??'former bot'),esc(row.ref??'Not reported'),chip(row.detail?.status??'unknown',row.detail?.status==='failed'?'bad':'ok'),esc(row.detail?.reason??'Not reported')]));
+    $('turns').innerHTML=table(['Time','Bot','Turn reference','Outcome','Reason'],(data.terminals??[]).map(row=>[esc(clock(row.at)),esc(row.botName??'former bot'),esc(row.ref??'Not reported'),chip(row.detail?.status??'unknown',row.detail?.status==='failed'?'bad':'ok'),esc(row.detail?.reason??'Not reported')]))+historyNote(data,data.terminals?.length??0,data.totalTerminals,'terminal records');
   }
   function renderAttach() {
     const data=state.data.attach;if(!data)return;
-    $('attach').innerHTML=`<div class="peers-grid">${(data.peers??[]).map(peer=>`<div class="peer"><div class="ph">${esc(peer.bot)}${chip(peer.online?'online':'absent',peer.online?'ok':'stale')}</div><p class="note">${esc(metric(peer.roundTrip))}</p>${kv([['Queue',number(peer.queueDepth)],['Dead letters',number(peer.deadLetters)],['Outbox',number(peer.pluginOutboxDepth)],['Oldest outbox event',duration(peer.pluginOldestEventAgeMs)],['Inbox',number(peer.pluginCommandInboxDepth)],['Heartbeat',age(peer.lastHeartbeatAt)]])}</div>`).join('')||empty('No attach peers reported.')}</div><details class="numbers"><summary>Dead letters · ${number(data.deadLetters?.length??0)}</summary>${table(['Bot reference','Sequence','Attempts','Time'],(data.deadLetters??[]).map(row=>[esc(row.bot),number(row.sequence),number(row.attempts),esc(clock(row.at))]))}</details>`;
+    $('attach').innerHTML=`<div class="peers-grid">${(data.peers??[]).map(peer=>`<div class="peer"><div class="ph">${esc(peer.bot)}${chip(peer.online?'online':'absent',peer.online?'ok':'stale')}</div><p class="note">${esc(metric(peer.roundTrip))}</p>${kv([['Queue',number(peer.queueDepth)],['Dead letters',number(peer.deadLetters)],['Outbox',number(peer.pluginOutboxDepth)],['Oldest outbox event',duration(peer.pluginOldestEventAgeMs)],['Inbox',number(peer.pluginCommandInboxDepth)],['Last contact',age(peer.lastContactAt)]])}</div>`).join('')||empty('No attach peers reported.')}</div><details class="numbers"><summary>Dead letters · ${number(data.deadLetters?.length??0)}</summary>${table(['Bot reference','Sequence','Attempts','Time'],(data.deadLetters??[]).map(row=>[esc(row.bot),number(row.sequence),number(row.attempts),esc(clock(row.at))]))}</details>`;
   }
   function renderApprovals() {
     const data=state.data.approvals;if(!data)return;
@@ -170,7 +174,7 @@
     const all=state.data.events?.events;if(!all)return;
     const select=$('event-kind'); const kinds=[...new Set(all.map(row=>row.kind))].sort();
     select.innerHTML='<option value="">All kinds</option>'+kinds.map(kind=>`<option value="${esc(kind)}">${esc(kind)}</option>`).join(''); select.value=state.kind;
-    $('events').innerHTML=table(['Time','Kind','Bot','Details'],all.filter(row=>!state.kind||row.kind===state.kind).map(row=>[esc(clock(row.at)),chip(row.kind),esc(row.botName??'gateway'),esc(Object.entries(row.detail??{}).map(([k,v])=>`${k}: ${v}`).join(' · ')||'No detail')]));
+    $('events').innerHTML=table(['Time','Kind','Bot','Details'],all.filter(row=>!state.kind||row.kind===state.kind).map(row=>[esc(clock(row.at)),chip(row.kind),esc(row.botName??'gateway'),esc(Object.entries(row.detail??{}).map(([k,v])=>`${k}: ${v}`).join(' · ')||'No detail')]))+historyNote(state.data.events,all.length,state.data.events.totalEvents,'events')+(state.kind?empty('Kind filter applies to the received event feed.'): '');
   }
   function renderAgents() {
     const data=state.data.cozyagents;if(!data)return;
