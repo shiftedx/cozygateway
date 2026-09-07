@@ -2669,7 +2669,7 @@ export class Storage {
   /** The live row wins over a deleted-room tombstone when the same name is recreated. */
   botGroupOwner(key: string): string | undefined {
     const live = this.#db.prepare("SELECT owning_host AS owningHost FROM bot_groups WHERE key = ?").get(key) as { owningHost: string | null } | undefined;
-    if (live?.owningHost !== null && live !== undefined) return live.owningHost;
+    if (live !== undefined) return live.owningHost ?? undefined;
     const tombstone = this.#db.prepare("SELECT owning_host AS owningHost FROM bot_group_owner_tombstones WHERE group_key = ?").get(key) as { owningHost: string } | undefined;
     return tombstone?.owningHost;
   }

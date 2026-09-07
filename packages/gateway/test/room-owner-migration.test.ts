@@ -28,6 +28,11 @@ describe("room owner migration", () => {
       legacy.close();
 
       storage = openStorage(path);
+      // A recreated legacy row must derive its own membership, never inherit the prior room.
+      const db = new DatabaseSync(path);
+      db.prepare("INSERT INTO bot_group_owner_tombstones VALUES (?, ?)").run("launch", "old-host");
+      db.close();
+      expect(storage.botGroupOwner("launch")).toBeUndefined();
       expect(storage.botGroup("launch")?.owningHost).toBeUndefined();
       storage.backfillBotGroupOwner("launch", "home");
       storage.backfillBotGroupOwner("launch", "studio");
