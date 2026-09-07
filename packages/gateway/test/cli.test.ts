@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import { isExpectedCertificate, isGatewayReady, runCli } from "../src/cli.ts";
-import { startGateway } from "../src/server.ts";
+import { GATEWAY_VERSION, startGateway } from "../src/server.ts";
 import { openStorage } from "../src/storage.ts";
 import { generateSelfSigned } from "./helpers/self-signed.ts";
 
@@ -377,7 +377,7 @@ describe("cozygateway terminal menu", () => {
       delete process.env.TEST_HERMES_CONTROL_TOKEN;
       delete process.env.TEST_ATTACH_TOKEN;
     }
-    expect(lines.join("\n")).toContain("Gateway:  v0.7.6");
+    expect(lines.join("\n")).toContain(`Gateway:  v${GATEWAY_VERSION}`);
     expect(lines.join("\n")).toContain("Hermes attach needs attention: 0/1 Hermes profiles online");
     expect(lines.join("\n")).toContain("Run cozygateway repair");
   });
