@@ -145,6 +145,13 @@ exec '{real_mv}' "$@"
         for path, content in original.items():
             self.assertEqual(path.read_bytes(), content)
 
+    def test_multiline_custom_value_is_retained_when_cleanup_is_ambiguous(self):
+        self.envfile.write_text(self.envfile.read_text() + 'CUSTOM_NOTE="before\nCOZYGATEWAY_ATTACH_TOKEN_RETIRED=note content\nafter"\n')
+        original = {path: path.read_bytes() for path in (self.state, self.config, self.envfile)}
+        self.run_bootstrap("--no-qr", success=False)
+        for path, content in original.items():
+            self.assertEqual(path.read_bytes(), content)
+
     def test_unknown_mapping_blocks_automatic_scope_cleanup(self):
         config = json.loads(self.config.read_text())
         config["hermesEndpoints"][0]["profiles"]["unknown"] = {"tokenEnv": "CUSTOM_UNOWNED_TOKEN"}

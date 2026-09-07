@@ -79,6 +79,13 @@ and retains both payloads for retry. The installer uses an OS advisory lock;
 legacy mkdir locks cannot permanently disable repair. Retired release directories
 remain recovery copies and are no longer deleted by a broad directory glob.
 User backups, unproven stage directories, and profile histories are untouched.
+Per-profile services also require a regular, current-user-owned plist with the
+exact profile home, working directory, and recognized Hermes interpreter/module
+arguments before removal. An ambiguous or definition-less loaded job is retained
+for inspection. Line-based credential cleanup refuses ambiguous multiline dotenv
+values; native repair also verifies every retained parsed value before replacing
+the file. These failures preserve the original environment and remain actionable
+rather than silently changing user content.
 The new staged origin records `INSTALL_HYGIENE_PROTOCOL=1`.
 
 ## Validation and Windows handoff
