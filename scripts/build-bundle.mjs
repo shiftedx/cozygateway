@@ -55,7 +55,10 @@ const result = await build({
   },
 });
 rmSync(wrapperEntry, { force: true });
-const notices = thirdPartyNotices([result.metafile]);
+const fontNotices = ["inter", "jetbrains-mono", "silkscreen", "fraunces"].map(name =>
+  `Observe font: ${name}\n${readFileSync(`packages/gateway/src/observe/dashboard/fonts/${name}-LICENSE.txt`, "utf8")}`,
+).join("\n\n");
+const notices = `${thirdPartyNotices([result.metafile])}\n\n${fontNotices}`;
 writeFileSync("dist-bundle/THIRD_PARTY_NOTICES.txt", notices);
 writeFileSync("dist-bundle/cozygateway.mjs", `${readFileSync("dist-bundle/cozygateway.mjs", "utf8")}\n/*\n${notices.replaceAll("*/", "* /")}*/\n`);
 const body = readFileSync("dist-bundle/cozygateway.mjs");

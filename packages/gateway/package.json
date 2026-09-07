@@ -27,7 +27,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "build": "tsc -p tsconfig.build.json"
+    "build": "node ../../scripts/build-observe-assets.mjs && tsc -p tsconfig.build.json"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.17",

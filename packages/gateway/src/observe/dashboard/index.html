@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CozyGateway Observe</title><link rel="stylesheet" href="/observe/assets/app.css?v=__ASSET_VERSION__"><script src="/observe/assets/app.js?v=__ASSET_VERSION__" defer></script></head><body>
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="g-warn" viewBox="0 0 12 12"><circle cx="6" cy="6" r="6" fill="var(--lantern)"/><path d="M6 3.1 9.2 8.9H2.8z" fill="var(--lantern-ink)"/></symbol>
+    <symbol id="g-bad" viewBox="0 0 12 12"><circle cx="6" cy="6" r="6" fill="var(--berry)"/><path d="M3.8 3.8l4.4 4.4M8.2 3.8l-4.4 4.4" stroke="var(--on-strong)" stroke-width="1.7" stroke-linecap="round"/></symbol>
+    <symbol id="g-live" viewBox="0 0 12 12"><circle cx="6" cy="6" r="6" fill="var(--sky)"/><circle cx="6" cy="6" r="3.2" fill="none" stroke="var(--sky-ink)" stroke-width="1.3"/><path d="M6 2.8a3.2 3.2 0 0 1 0 6.4z" fill="var(--sky-ink)"/></symbol>
+    <symbol id="g-ok" viewBox="0 0 12 12"><circle cx="6" cy="6" r="6" fill="var(--clover)"/><path d="M3.6 6.2l1.7 1.7 3.2-3.6" fill="none" stroke="var(--on-strong)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="g-off" viewBox="0 0 12 12"><circle cx="6" cy="6" r="5" fill="none" stroke="var(--stone-ink)" stroke-width="1.6" stroke-dasharray="2.2 2"/></symbol>
+    <symbol id="g-up" viewBox="0 0 12 12"><path d="M2 9.5 6 3.5l4 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="g-down" viewBox="0 0 12 12"><path d="M2 3.5 6 9.5l4-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="g-inv" viewBox="0 0 12 12"><circle cx="5.2" cy="5.2" r="3.4" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M7.8 7.8 10.5 10.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="g-mut" viewBox="0 0 12 12"><path d="M6 1.2 10.8 6 6 10.8 1.2 6z" fill="currentColor"/></symbol>
+    <symbol id="g-flat" viewBox="0 0 12 12"><path d="M2 6h8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <path id="pk-in" d="M-9,0 L0,-3.6 L2.4,0 L0,3.6 Z"/>
+    <path id="pk-out" d="M-8,0 L0,-3.2 L2.2,0 L0,3.2 Z"/>
+    <path id="pk-model" d="M0,-4.2 L4.2,0 L0,4.2 L-4.2,0 Z"/>
+  </defs>
+</svg>
+<main>
+<header class="top">
+ <div class="brand"><span class="jelly" aria-hidden="true"></span><h1>Observe <span id="gateway-name"></span></h1></div>
+ <nav class="tabs" role="tablist" aria-label="Views"><button role="tab" id="tab-gw" aria-selected="true" aria-controls="view-gw" tabindex="0">Gateway</button><button role="tab" id="tab-ca" aria-selected="false" aria-controls="view-ca" tabindex="-1" hidden>CozyAgents</button></nav>
+ <div class="right"><span class="seg" role="group" aria-label="Window"><button aria-pressed="false" data-window="1h">1h</button><button aria-pressed="true" data-window="24h">24h</button><button aria-pressed="false" data-window="7d">7d</button></span><span class="obs" id="connection-status" role="status"><i aria-hidden="true"></i>Connecting · read only</span></div>
+</header>
+<div id="page-error" class="surface attention" role="alert" hidden></div>
+<div class="status-strip" id="header-strip" aria-label="Gateway health"></div>
+<div class="filterchip" id="filterchip"><span>Showing <b id="filtername"></b></span><button id="clearfilter" aria-label="Show all bots">Clear filter</button></div>
+<section id="view-gw" role="tabpanel" aria-labelledby="tab-gw">
+ <section class="block"><div class="glance" id="glance" role="list" aria-label="Gateway at a glance"><p class="empty">Loading gateway measurements.</p></div></section>
+ <section class="block"><div class="surface attention" id="attention"><h2>Needs a person <small>decisions stay in CozyChat</small></h2><ol id="attention-items"><li class="empty">Loading pending decisions.</li></ol></div></section>
+ <section class="block"><h2>Round trip <small>measured round trips, never one-way delay · <span data-win>24h</span></small></h2><div id="roundtrip" class="two"><p class="empty">Loading latency samples.</p></div><div class="two section-gap"><div><h3>As the person felt it</h3><div id="felt"></div></div><div><h3>By network path</h3><div id="network-path"></div></div></div><div class="two section-gap"><div><h3>Tunnel over time</h3><div id="tunnel-chart"></div></div><div><h3>First token over time</h3><div id="first-token-chart"></div></div></div></section>
+ <section class="block"><h2>Right now <small>what is moving, drawn from live state</small></h2><div class="surface"><svg class="flow flow-wide" viewBox="0 0 1200 262" role="img" aria-label="Live flow map, waiting for data" id="flowmap"></svg><div class="flow-narrow" id="flow-narrow"></div><div class="flow-caption"><span><i class="tri"></i>incoming work</span><span><i class="tri out"></i>reply</span><span><i class="dia"></i>model step</span><span>Motion shows recent observed activity.</span></div></div></section>
+ <section class="block"><h2>Bots <small>select a row to filter all panels</small></h2><div id="bots" class="board"><p class="empty">Loading bots.</p></div></section>
+ <section class="block"><h2>Turns <small>terminal events · <span data-win>24h</span></small></h2><div id="turns"></div></section>
+ <section class="block"><h2>Attach health <small>durable queues and peer heartbeats</small></h2><div id="attach"></div></section>
+ <section class="block"><div class="two"><div><h2>Approvals and grants</h2><div id="approvals"></div></div><div><h2>Deliveries</h2><div id="deliveries"></div></div></div></section>
+ <section class="block"><h2>Devices and runners <small>paired with this gateway</small></h2><div id="devices" class="two"></div></section>
+ <section class="block"><h2>Events <small>metadata only · <span data-win>24h</span></small><label class="event-filter">Kind <select id="event-kind"><option value="">All kinds</option></select></label></h2><div id="events"></div></section>
+</section>
+<section id="view-ca" role="tabpanel" aria-labelledby="tab-ca" hidden>
+ <section class="block"><div class="glance" id="agent-glance" role="list" aria-label="CozyAgents at a glance"></div></section>
+ <section class="block"><h2>Anatomy of the last turn <small id="turn-sub">recorded steps and tool calls</small></h2><div class="surface turn"><svg class="flow flow-wide turnsvg" id="turnsvg" viewBox="0 0 800 250" role="img" aria-label="Turn anatomy unavailable" hidden><defs><pattern id="hatch-wait" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" fill="var(--lantern-surface)"/><line x1="0" y1="0" x2="0" y2="6" stroke="var(--lantern)" stroke-width="2"/></pattern></defs></svg><div id="turn-narrow"></div><div id="turn-steps"></div><div class="two turn-foot"><div class="inspector" id="turn-inspect" aria-live="polite"></div><div><h3>In words</h3><p class="turn-summary" id="turn-summary">Waiting for a CozyAgents snapshot.</p></div></div></div></section>
+ <section class="block"><h2>Model <small>latency and throughput from the snapshot lane</small></h2><div id="model"></div></section>
+ <section class="block"><h2>Throughput and spend <small>per bot and model · <span data-win>24h</span> and lifetime</small></h2><div id="spend" class="thr"></div><p class="note">Speeds need at least 20 reported steps. Cost estimates use reported token categories and the gateway price sheet; an unknown price reads “tokens only”.</p></section>
+ <section class="block"><h2>Cost per tool call <small>ranked by induced tokens · <span data-win>24h</span></small></h2><div id="tool-costs"></div><p class="note">Induced tokens include result, call and schema share. “Attributed” means several calls shared a model step. Timing samples include only individually measured calls.</p></section>
+ <section class="block"><h2>Agent internals <small>latest snapshot from each bot</small></h2><div id="internals"></div></section>
+</section>
+<footer class="foot"><span>Read-only view over gateway records and a 7-day series ring. Approve, revoke and configure in CozyChat.</span><span id="updated-at">Waiting for first update.</span></footer>
+</main></body></html>
