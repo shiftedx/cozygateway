@@ -454,6 +454,89 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
       .toHaveLength(0);
   });
 
+  it("capability 66: a standing grant covers a later room ask exactly as it covers a 1:1 ask", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    const base = {
+      kind: "scoped_approval", action: "workspace.write", category: "other",
+      system: "workspace", resource: "repo/notes.md", effects: [], reason: "guardrail",
+      expiresAt: NOW + 600_000, retry: "idempotent", requested: "category",
+    } as const;
+    const pendingFrame = (toolCallId: string): BotApprovalPendingFrame => h.frames.find(
+      (frame) => frame.type === "bot_approval_pending" && (frame as BotApprovalPendingFrame).toolCallId === toolCallId,
+    ) as BotApprovalPendingFrame;
+
+    // One decision, one standing category policy.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-first", callId: "call-1", name: "workspace_write", status: "pending",
+      scope: { ...base, change: "append one line to notes.md", payloadHash: "a".repeat(64) },
+    })).toBe(true);
+    const approved = await h.app.request("/bots/sage/approvals/approval-first/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: "category", expiresAt: NOW + 3_600_000 }),
+    });
+    expect(approved.status).toBe(202);
+
+    // A LATER room ask of the same action on the same resource is covered by it. The card is still
+    // raised, it names the grant, and the gateway settles it through the ordinary relay, which is
+    // the whole of the 1:1 behavior and must not differ here.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-second", callId: "call-2", name: "workspace_write", status: "pending",
+      scope: { ...base, change: "append two lines to notes.md", payloadHash: "b".repeat(64) },
+    })).toBe(true);
+
+    const covered = pendingFrame("approval-second");
+    expect(covered).toMatchObject({ bot: "sage", room: "Launch" });
+    expect(covered.grantId).toBeDefined();
+    // On the durable record too, so the rebroadcast and a cold inbox read say who answered.
+    expect(h.storage.nativeInteraction("sage", "approval", "approval-second")?.payload)
+      .toMatchObject({ grantId: covered.grantId });
+    expect(h.storage.pendingNativeApprovals(["sage"], 100)
+      .find((row) => row.toolCallId === "approval-second")?.grantId).toBe(covered.grantId);
+    // And the peer got the same `resolve_approval` a tapped card sends: relayed, never executed.
+    await until(() => h.resolutions("sage").some((command) => command.approvalId === "approval-second"));
+    expect(h.resolutions("sage").find((command) => command.approvalId === "approval-second"))
+      .toEqual({
+        kind: "resolve_approval", threadId: "group:launch:sage", turnId: turn.turnId,
+        approvalId: "approval-second", decision: "approve",
+      });
+  });
+
+  it("capability 66: no standing grant covers an always-require room ask", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    // Planted directly, because the routes refuse to make one over this category at all. The floor
+    // is that the CONSULT never reads one either, whatever route put it there.
+    h.storage.recordApprovalGrant({
+      bot: "sage", grantId: "grant:sage:planted", scope: "category", deviceId: "device-1",
+      sessionId: turn.threadId, turnId: turn.turnId, approvalId: "approval-planted",
+      action: "payments.send",
+      category: "money_movement", system: "banking", resource: "invoice/8821",
+      payloadHash: null, expiresAt: NOW + 3_600_000, createdAt: NOW,
+    });
+
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-money", callId: "call-1", name: "pay_invoice", status: "pending",
+      scope: {
+        kind: "scoped_approval", action: "payments.send", category: "money_movement",
+        system: "banking", resource: "invoice/8821", change: "send 40 dollars to the vendor",
+        effects: [], reason: "always_require", payloadHash: "c".repeat(64),
+        expiresAt: NOW + 600_000, retry: "idempotent", requested: "once",
+      },
+    })).toBe(true);
+
+    const raised = h.frames.find(
+      (frame) => frame.type === "bot_approval_pending"
+        && (frame as BotApprovalPendingFrame).toolCallId === "approval-money",
+    ) as BotApprovalPendingFrame;
+    expect(raised).not.toHaveProperty("grantId");
+    expect(h.resolutions("sage")).toEqual([]);
+  });
+
   it("capability 66: the always-require floor holds for a room approval too", async () => {
     const h = await setup();
     const turn = await blockedTurn(h, ["sage", "scout"]);

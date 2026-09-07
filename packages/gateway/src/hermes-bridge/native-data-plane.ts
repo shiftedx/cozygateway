@@ -1123,10 +1123,33 @@ export class NativeBotDataPlane {
       turnId: string; payload: unknown; expiresAt: number | null; updatedAt: number;
     }) => void;
     expireTurn: (bot: string, sessionId: string, turnId: string) => boolean;
+    claimApprovalGrant: (input: {
+      bot: string; sessionId: string; turnId: string; approvalId: string;
+      name: string; detail?: string; scope?: BotApprovalScope;
+    }) => string | undefined;
+    honorApprovalGrant: (input: {
+      bot: string; sessionId: string; turnId: string; approvalId: string; grantId: string;
+    }) => void;
   } {
     return {
       schedule: (pending) => this.#scheduleInteractionExpiry(pending),
       expireTurn: (bot, sessionId, turnId) => this.#expireTurnInteractions(bot, sessionId, turnId),
+      // Capability 66, F4. The rooms reach the 1:1 lane's own consult through here, ingredients in
+      // rather than a binding, so the derivation for a plain ask lives in exactly one place and a
+      // room ask is covered on the same terms a chat ask is. The stored record is the authority on
+      // the ask's expiry, including the persisted fallback a legacy approval gets.
+      claimApprovalGrant: ({ bot, sessionId, turnId, approvalId, name, detail, scope }) => {
+        const covering = scope ?? plainApprovalScope(
+          { name, ...(detail === undefined ? {} : { detail }) },
+          this.#storage.nativeInteraction(bot, "approval", approvalId)?.expiresAt ?? null,
+        );
+        if (covering === undefined) return undefined;
+        return this.#claimGrant(bot, sessionId, turnId, covering, scope === undefined);
+      },
+      honorApprovalGrant: ({ bot, sessionId, turnId, approvalId, grantId }) => {
+        this.#storage.attachInteractionGrant(bot, approvalId, grantId);
+        this.#honorApprovalGrant(bot, sessionId, turnId, approvalId, grantId);
+      },
     };
   }
 

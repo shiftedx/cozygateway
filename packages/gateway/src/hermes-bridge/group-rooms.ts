@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type {
+  BotApprovalScope,
   BotChatDeltaFrame,
   BotGroup,
   BotGroupDetail,
@@ -155,6 +156,31 @@ export interface RoomInteractionExpiry {
   /** Expires everything this (bot, thread, turn) is still blocked on, emitting the terminal frames.
    *  Answers whether anything actually changed. */
   expireTurn(bot: string, sessionId: string, turnId: string): boolean;
+  /** Capability 66, F4. Does a standing grant already cover this ask, and if it is a single-use
+   *  one, spend it? Answers the grant id, or `undefined` for an ask nothing covers. The room hands
+   *  over the raw ingredients rather than a binding, so the DERIVATION for a plain ask (the rule
+   *  name plus the capability-56 sentence) is the data plane's one implementation and the two lanes
+   *  cannot drift. Optional: a gateway assembled without the native plane raises every room ask to
+   *  the person, which is the safe direction. */
+  claimApprovalGrant?(input: {
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    approvalId: string;
+    name: string;
+    detail?: string;
+    scope?: BotApprovalScope;
+  }): string | undefined;
+  /** Capability 66, F4. Name the grant on the durable record and settle the ask through the very
+   *  same `resolve_approval` relay a tapped card sends. Called AFTER the card has gone out, so the
+   *  person sees what a grant is answering for them rather than a card that resolves itself. */
+  honorApprovalGrant?(input: {
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    approvalId: string;
+    grantId: string;
+  }): void;
 }
 
 export class GroupNotFound extends Error {
@@ -1097,6 +1123,21 @@ export class GroupRooms {
         expiresAt: event.expiresAt ?? null,
         updatedAt: this.#now(),
       });
+      // Capability 66, F4. Consult the standing grants BEFORE the card goes out, so the frame says
+      // which grant is settling this ask rather than the app watching a room card resolve itself
+      // for no stated reason. This is the SAME consult the 1:1 lane runs, reached through the
+      // native plane's seam: the derivation for a plain ask, the always-require exclusion and the
+      // single-use rules all have one implementation, and a room cannot drift from a chat.
+      // Consulting is not executing: the decision still travels as the ordinary `resolve_approval`.
+      const grantId = this.#interactionExpiry?.claimApprovalGrant?.({
+        bot: turn.member,
+        sessionId: turn.threadId,
+        turnId: turn.turnId,
+        approvalId: event.approvalId,
+        name: event.name,
+        ...(detail === undefined ? {} : { detail }),
+        ...(scope === undefined ? {} : { scope }),
+      });
       this.#broadcast({
         type: "bot_approval_pending",
         bot: turn.member,
@@ -1109,7 +1150,19 @@ export class GroupRooms {
         ...(detail === undefined ? {} : { detail }),
         ...(repair === undefined ? {} : { repair }),
         ...(scope === undefined ? {} : { scope }),
+        ...(grantId === undefined ? {} : { grantId }),
       });
+      // The grant is named on the durable record and the ask settled from it, in that order, so a
+      // reconnect between the two still shows the person what answered their card.
+      if (grantId !== undefined) {
+        this.#interactionExpiry?.honorApprovalGrant?.({
+          bot: turn.member,
+          sessionId: turn.threadId,
+          turnId: turn.turnId,
+          approvalId: event.approvalId,
+          grantId,
+        });
+      }
     } else {
       this.#broadcast({
         type: "bot_approval_resolved",

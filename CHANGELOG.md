@@ -18,8 +18,11 @@ release; everything older is marked pre-release so installers resolve one "lates
   rebroadcast a reconnecting app gets. Nothing else moved: a room approval was already the same
   durable row the 1:1 lane writes, so the decision routes, the optional decision body, the grant
   rules, the always-require refusals and the grants view and its `DELETE` already answered for a
-  room approval. A room still does not consult a standing grant before raising a card, which fails
-  closed: every room ask reaches the person. Additive, so a peer that sends no block and a client
+  room approval. The consult moved with it: a room ask is checked against the standing grants before
+  its card goes out, names the `grantId` that covers it on the frame and the record, and is settled
+  through the same `resolve_approval` relay a tapped card sends, reaching the 1:1 lane's own consult
+  rather than a second copy of it, so the plain-ask derivation, the single-use rules and the
+  always-require exclusion cannot drift between a room and a chat. Additive, so a peer that sends no block and a client
   below 66 are byte identical to their pre-66 selves, and a Hermes-raised room approval keeps
   rendering the plain card.
 - The attach plugin can send a scope block with an approval it raises (F4). `send_approval` gained
