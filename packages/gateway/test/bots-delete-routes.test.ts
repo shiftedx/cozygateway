@@ -25,7 +25,7 @@ const config: GatewayConfig = {
 };
 
 const NOW = 1_800_000_000_000;
-const BOT = "night-owl";
+const BOT = "delete-fixture";
 const KEEPER = "day-owl";
 
 const servers: FakeHermesServer[] = [];
@@ -234,7 +234,7 @@ const DELETE_REQUEST: RequestInit = { method: "DELETE" };
 describe("DELETE /bots/:name deletes the profile and purges the gateway", () => {
   it("removes the Hermes profile, purges every table, and revokes the identity", async () => {
     const h = await setup();
-    seed(h, BOT);
+    const deletedSession = seed(h, BOT);
     seed(h, KEEPER);
 
     const res = await h.authed(`/bots/${BOT}`, DELETE_REQUEST);
@@ -271,7 +271,7 @@ describe("DELETE /bots/:name deletes the profile and purges the gateway", () => 
     expect(h.storage.botRoster().bots.some((b) => b.name === BOT)).toBe(false);
     expect(h.storage.nativeBotMessages(BOT, `${BOT}-x`)).toEqual([]);
     // The deleted bot keeps no one's words; the other bot keeps its own.
-    expect(h.storage.pendingNativeSteers(BOT, h.storage.nativeBotChat(BOT, NOW).sessionId)).toEqual([]);
+    expect(h.storage.pendingNativeSteers(BOT, deletedSession)).toEqual([]);
     expect(h.storage.pendingNativeSteers(KEEPER, h.storage.nativeBotChat(KEEPER, NOW).sessionId)
       .map((steer) => steer.text)).toEqual(["and the timeline?"]);
     expect(h.storage.threadById(`thread-${BOT}`)).toBeUndefined();
@@ -299,13 +299,13 @@ describe("DELETE /bots/:name deletes the profile and purges the gateway", () => 
     // Hermes lost the profile some other way; the gateway's own rows are the recovery case.
     const first = await h.authed(`/bots/${BOT}`, DELETE_REQUEST);
     expect(first.status).toBe(200);
-    // Put rows back without the profile existing on the host, then delete again.
-    seed(h, BOT);
+    // Recovery may still find old non-session residue; a deleted identity cannot mint a chat.
+    h.storage.setBotRoutineOverrides(BOT, "leftover", { model: "fixture" });
     const second = await h.authed(`/bots/${BOT}`, DELETE_REQUEST);
     expect(second.status).toBe(200);
     const body = (await second.json()) as { hermesProfile: string; purged: Record<string, number> };
     expect(body.hermesProfile).toBe("already_absent");
-    expect(body.purged["sessions"]).toBeGreaterThan(0);
+    expect(body.purged["routineOverrides"]).toBeGreaterThan(0);
   });
 
   it("refuses a running turn with 409 and names it, and force=1 proceeds", async () => {

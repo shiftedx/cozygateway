@@ -22,7 +22,7 @@
 #   next one finishes the job rather than leaving a half-provisioned bot.
 #
 # CONCURRENCY
-#   A flock guard means a slow sweep (the provisioner waits up to 90s for the
+#   An OS advisory lock means a slow sweep (the provisioner waits up to 90s for the
 #   attach hello) never overlaps the next tick.
 #
 # INSTALLATION
@@ -31,7 +31,7 @@
 #   Terminal but denied to background LaunchAgents by macOS TCC.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SRC_DIR="$REPO_ROOT/integrations/attach-plugin"
 # Kept overridable for the isolated shell regression test. The installed
@@ -63,18 +63,31 @@ done
 mkdir -p "$(dirname "$LOG_FILE")"
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >> "$LOG_FILE"; }
 
-# Serialize sweeps. Without flock (a bare macOS box has none) fall back to an
-# mkdir lock, which is atomic everywhere and good enough for one writer.
-if command -v flock >/dev/null 2>&1; then
+# Re-exec the sweep under an OS advisory lock. FD 9 remains open across exec,
+# so the kernel releases the lock even on SIGKILL. The PID guard is specific to
+# this process; it cannot accidentally skip locking in a later child sweep.
+if [ "${COZY_PROVISIONER_LOCK_PID:-}" != "$$" ]; then
+  LOCK_PYTHON="$(command -v python3 || true)"
+  [ -n "$LOCK_PYTHON" ] || { log "sweep aborted: no python3 for lock"; exit 1; }
   exec 9>"$LOCK_FILE"
-  flock -n 9 || { log "sweep skipped: another sweep still running"; exit 0; }
-else
-  if ! mkdir "$LOCK_FILE.d" 2>/dev/null; then
-    log "sweep skipped: another sweep still running"
-    exit 0
-  fi
-  trap 'rmdir "$LOCK_FILE.d" 2>/dev/null || true' EXIT
+  export COZY_PROVISIONER_LOCK_PID="$$"
+  exec "$LOCK_PYTHON" - "$SCRIPT_DIR/bot-provisioner-watch.sh" "$HERMES_HOME_ROOT" "$LOG_FILE" "$DRY_RUN" <<'PYLOCK'
+import datetime, fcntl, os, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    with open(sys.argv[3], "a") as log:
+        log.write(datetime.datetime.now().astimezone().isoformat() + "  sweep skipped: another sweep still running\n")
+    sys.exit(0)
+os.set_inheritable(9, True)
+args = ["/bin/bash", sys.argv[1], "--hermes-home", sys.argv[2], "--log", sys.argv[3]]
+if sys.argv[4] == "1":
+    args.append("--dry-run")
+os.execv(args[0], args)
+PYLOCK
 fi
+# A same-process re-entry must have inherited the locked descriptor.
+: >&9
 
 PYTHON="$HERMES_HOME_ROOT/hermes-agent/venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3 || true)"
@@ -432,6 +445,7 @@ EOF
 # question at 3am.
 missing_reason() {
   local dir="$1" profile="$2"
+  [ ! -f "$dir/.cozygateway-provision-pending" ] || { printf 'previous provisioning incomplete'; return 0; }
   [ -d "$dir/plugins/cozygateway" ] || { printf 'no synced plugin dir'; return 0; }
   plugin_content_matches_source "$dir/plugins/cozygateway" \
     || { printf 'plugin content differs from staged source'; return 0; }
@@ -470,59 +484,75 @@ missing_reason() {
 # live bot always has its directory, and Hermes deletes that directory itself as
 # the last step of a profile delete.
 DEPROVISION="$SCRIPT_DIR/deprovision-bot.sh"
+[ -x "$DEPROVISION" ] || { log "sweep aborted: staged deprovisioner is missing: $DEPROVISION"; exit 1; }
+# An unavailable profile root is not evidence that every bot was deleted.
+[ -d "$HERMES_HOME_ROOT/profiles" ] && [ -r "$HERMES_HOME_ROOT/profiles" ] && [ -x "$HERMES_HOME_ROOT/profiles" ] \
+  || { log "sweep aborted: Hermes profiles root unavailable"; exit 1; }
+export HERMES_HOME_ROOT
 orphans=()
-if [ -x "$DEPROVISION" ]; then
-  # Residue shows up in TWO shapes and the second one is the common one.
-  #
-  #  1. A launchd gateway service whose profile directory is gone.
-  #  2. A BOX CONFIG entry whose profile is gone. When a bot is deleted from the phone, the
-  #     gateway removes the Hermes profile and Hermes stops and removes the service with it, so
-  #     shape 1 never appears and only the box's hermes.profiles entry and token env line linger
-  #     (observed 2026-08-26: 6 real profiles, 9 configured, 3 absent).
-  #
-  # Shape 1 is free to check. Shape 2 costs one ssh, so it runs on a slow cadence rather than
-  # every 30 second tick; residue is not urgent, it is just untidy.
-  while IFS= read -r label; do
-    [ -n "$label" ] || continue
-    profile="${label#ai.hermes.gateway-}"
-    [ "$profile" != "$label" ] || continue
-    [ -d "$HERMES_HOME_ROOT/profiles/$profile" ] && continue
-    orphans+=("$profile")
-    log "orphaned: $profile (launchd service with no profile directory)"
-  done <<ORPHANS
+live_cleanup=()
+add_orphan() {
+  local profile="$1"
+  [[ "$profile" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || return 0
+  case "$profile" in hermes|default|test|tmp|root|sudo) return 0 ;; esac
+  [ -e "$HERMES_HOME_ROOT/profiles/$profile" ] && return 0
+  [ -L "$HERMES_HOME_ROOT/profiles/$profile" ] && return 0
+  case " ${orphans[*]+${orphans[*]}} " in *" $profile "*) return 0 ;; esac
+  orphans+=("$profile")
+  log "orphaned: $profile"
+}
+while IFS= read -r label; do
+  [ -n "$label" ] || continue
+  add_orphan "${label#ai.hermes.gateway-}"
+done <<ORPHANS
 $(launchctl list 2>/dev/null | awk '{ print $3 }' | grep '^ai\.hermes\.gateway-' || true)
 ORPHANS
+# Unloaded plists also need removal (a reboot could otherwise reload them).
+for plist in "$HOME/Library/LaunchAgents"/ai.hermes.gateway-*.plist; do
+  [ -f "$plist" ] || continue
+  profile="${plist##*/ai.hermes.gateway-}"
+  add_orphan "${profile%.plist}"
+done
 
-  # Shape 2, at most once every RECONCILE_SECONDS, tracked by a stamp file.
-  RECONCILE_SECONDS="${COZY_PROVISIONER_RECONCILE_SECONDS:-600}"
-  STAMP="${TMPDIR:-/tmp}/cozylabs-bot-provisioner.reconcile"
-  now_epoch="$(date +%s)"
-  last_epoch=0
-  [ -f "$STAMP" ] && last_epoch="$(cat "$STAMP" 2>/dev/null || printf 0)"
-  case "$last_epoch" in ''|*[!0-9]*) last_epoch=0 ;; esac
-  if [ "$(( now_epoch - last_epoch ))" -ge "$RECONCILE_SECONDS" ]; then
-    printf '%s' "$now_epoch" > "$STAMP" 2>/dev/null || true
-    configured="$("$DEPROVISION" --list-configured 2>/dev/null || true)"
-    for profile in $configured; do
-      [ -n "$profile" ] || continue
-      [ -d "$HERMES_HOME_ROOT/profiles/$profile" ] && continue
-      case " ${orphans[*]+${orphans[*]}} " in *" $profile "*) continue ;; esac
-      orphans+=("$profile")
-      log "orphaned: $profile (box config entry with no profile directory)"
-    done
+RECONCILE_SECONDS="${COZY_PROVISIONER_RECONCILE_SECONDS:-30}"
+STAMP="${COZY_PROVISIONER_RECONCILE_STAMP:-$LOCK_FILE.reconcile}"
+case "$RECONCILE_SECONDS" in ''|*[!0-9]*) log "invalid reconciliation interval"; exit 1 ;; esac
+now_epoch="$(date +%s)"
+last_epoch=0
+[ -f "$STAMP" ] && last_epoch="$(cat "$STAMP" 2>/dev/null || printf 0)"
+case "$last_epoch" in ''|*[!0-9]*) last_epoch=0 ;; esac
+reconciled=0
+if [ "$(( now_epoch - last_epoch ))" -ge "$RECONCILE_SECONDS" ]; then
+  if ! configured="$("$DEPROVISION" --list-configured 2>> "$LOG_FILE")"; then
+    log "sweep aborted: box reconciliation failed; next sweep will retry"
+    exit 1
+  fi
+  while IFS= read -r profile; do add_orphan "$profile"; done <<< "$configured"
+  if ! journaled="$("$DEPROVISION" --list-pending 2>> "$LOG_FILE")"; then
+    log "sweep aborted: pending cleanup read failed; next sweep will retry"
+    exit 1
+  fi
+  while IFS= read -r profile; do
+    [ -n "$profile" ] || continue
+    [ -d "$HERMES_HOME_ROOT/profiles/$profile" ] && [ ! -L "$HERMES_HOME_ROOT/profiles/$profile" ] || continue
+    live_cleanup+=("$profile")
+  done <<< "$journaled"
+  reconciled=1
+fi
+if [ "${#orphans[@]}" -gt 0 ]; then
+  dargs=(--orphans-only)
+  [ "$DRY_RUN" = 1 ] && dargs+=(--dry-run)
+  if "$DEPROVISION" "${dargs[@]}" "${orphans[@]}" >> "$LOG_FILE" 2>&1; then
+    log "deprovisioned: ${orphans[*]}"
+  else
+    log "deprovision FAILED for ${orphans[*]}; next sweep will retry"
+    # Even a custom slow interval must retry failed work on the next tick.
+    rm -f "$STAMP"
+    exit 1
   fi
 fi
-
-if [ "${#orphans[@]}" -gt 0 ]; then
-  for profile in ${orphans[@]+"${orphans[@]}"}; do
-    dargs=()
-    [ "$DRY_RUN" = 1 ] && dargs+=(--dry-run)
-    if "$DEPROVISION" ${dargs[@]+"${dargs[@]}"} "$profile" >> "$LOG_FILE" 2>&1; then
-      log "deprovisioned: $profile"
-    else
-      log "deprovision FAILED for $profile (see the output above)"
-    fi
-  done
+if [ "$reconciled" = 1 ] && [ "$DRY_RUN" != 1 ]; then
+  printf '%s' "$now_epoch" > "$STAMP"
 fi
 
 pending=()
@@ -539,17 +569,29 @@ for dir in "$HERMES_HOME_ROOT"/profiles/*/; do
   fi
 done
 
-if [ "${#pending[@]}" -eq 0 ]; then
-  # Deliberately quiet: this is the steady state and it runs every 30 seconds.
-  exit 0
+if [ "${#pending[@]}" -gt 0 ]; then
+  log "provisioning: ${pending[*]}"
+  args=()
+  [ "$DRY_RUN" = 1 ] && args+=(--dry-run)
+  if "$PROVISION" ${args[@]+"${args[@]}"} "${pending[@]}" >> "$LOG_FILE" 2>&1; then
+    log "sweep done: ${pending[*]} provisioned"
+  else
+    log "sweep FAILED for one or more of: ${pending[*]} (see the output above)"
+    exit 1
+  fi
 fi
-
-log "provisioning: ${pending[*]}"
-args=()
-[ "$DRY_RUN" = 1 ] && args+=(--dry-run)
-if "$PROVISION" ${args[@]+"${args[@]}"} "${pending[@]}" >> "$LOG_FILE" 2>&1; then
-  log "sweep done: ${pending[*]} provisioned"
-else
-  log "sweep FAILED for one or more of: ${pending[*]} (see the output above)"
-  exit 1
+# A name recreated after an interrupted deletion is live, but the old
+# journal may still own obsolete custom credential keys. Reconcile only after
+# provisioning establishes its new mapping; no live config/service/path is
+# removed by this mode, and all currently referenced token keys are protected.
+if [ "${#live_cleanup[@]}" -gt 0 ]; then
+  args=(--reconcile-recreated)
+  [ "$DRY_RUN" = 1 ] && args+=(--dry-run)
+  if "$DEPROVISION" "${args[@]}" "${live_cleanup[@]}" >> "$LOG_FILE" 2>&1; then
+    log "old cleanup completed for recreated profiles: ${live_cleanup[*]}"
+  else
+    log "cleanup for recreated profiles FAILED; next sweep will retry"
+    rm -f "$STAMP"
+    exit 1
+  fi
 fi

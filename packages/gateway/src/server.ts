@@ -119,7 +119,7 @@ import {
   HERMES_GLOBAL_SKILLS_CAPABILITY_VERSION,
 } from "./hermes-bridge/global-skills.ts";
 
-export const GATEWAY_VERSION = "0.7.8";
+export const GATEWAY_VERSION = "0.7.9";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
@@ -372,7 +372,13 @@ export async function startGateway(
   const storage = openStorage(config.dbPath);
   storage.pruneExpiredAttachMedia(Date.now());
   storage.pruneExpiredComposerDrafts(Date.now());
-  const endpoints = hermesEndpoints(config);
+  // Host provisioning may complete after a restart. A confirmed deletion remains authoritative
+  // while that stale config and its old credential still exist on disk.
+  const endpoints = hermesEndpoints(config).map((endpoint) => ({ ...endpoint, config: {
+    ...endpoint.config,
+    profiles: Object.fromEntries(Object.entries(endpoint.config.profiles)
+      .filter(([rawId]) => !storage.isBotDeleted(publicProfileId(endpoint, rawId)))),
+  } }));
   const profileEntries = endpoints.flatMap((endpoint) => Object.entries(endpoint.config.profiles).map(
     ([rawId, profile]) => [publicProfileId(endpoint, rawId), profile] as const,
   ));
@@ -404,7 +410,7 @@ export async function startGateway(
     return id === LEGACY_RUNNER_ID && legacyRunnerConfigured ? LEGACY_RUNNER_NAME : undefined;
   };
   const storedRuntimeBots = storage.runtimeBots();
-  const merged = mergeRuntimeBots(nativeBots(config), storedRuntimeBots);
+  const merged = mergeRuntimeBots(nativeBots(config).filter((bot) => !storage.isBotDeleted(bot.id)), storedRuntimeBots);
   const runtimeBots = merged.bots;
   /** Only until the plane exists; every later read is the plane's live set. */
   const bootRuntimeBotNames: ReadonlySet<string> = new Set(merged.bots.map((bot) => bot.id));
@@ -686,6 +692,7 @@ export async function startGateway(
   for (const { endpoint } of parsedEndpoints) {
     const tokens = collectAttachTokens(endpoint.config.profiles, process.env);
     for (const [token, rawProfile] of tokens) {
+      if (storage.isAttachCredentialRevoked(token)) continue;
       if (attachTokens.has(token))
         throw new Error("duplicate attach credential across Hermes endpoints; every profile must use a distinct token");
       attachTokens.set(token, publicProfileId(endpoint, rawProfile));
@@ -700,6 +707,7 @@ export async function startGateway(
     "bot",
   );
   for (const [token, botId] of runtimeBotTokens) {
+    if (storage.isAttachCredentialRevoked(token)) continue;
     if (attachTokens.has(token))
       throw new Error("duplicate attach credential; every bot must use a distinct token");
     attachTokens.set(token, botId);
@@ -708,12 +716,14 @@ export async function startGateway(
   // in an environment variable, because nothing placed it there: the gateway minted it during a
   // `POST /bots` that had to work with no operator at a terminal.
   for (const bot of storedRuntimeBots) {
+    if (storage.isAttachCredentialRevoked(bot.token)) continue;
     if (attachTokens.has(bot.token))
       throw new Error("duplicate attach credential; every bot must use a distinct token");
     attachTokens.set(bot.token, bot.id);
   }
   for (const execution of storage.chatExecutions()) {
-    if (execution.stage !== "deleted" && storage.nativeBotHasSession(execution.bot, execution.sessionId))
+    if (execution.stage !== "deleted" && !storage.isAttachCredentialRevoked(execution.token)
+        && storage.nativeBotHasSession(execution.bot, execution.sessionId))
       attachTokens.set(execution.token, execution.executionId);
   }
   let nativeBotPlane: NativeBotDataPlane | undefined;
@@ -957,7 +967,22 @@ export async function startGateway(
   // otherwise keep a turn pending forever. Returns whether an attach identity was actually held,
   // which is what the delete response reports as `tokenRevoked`.
   killAttachIdentity = (name: string): boolean => {
+    const executions = storage.chatExecutions().filter((execution) => execution.bot === name);
+    // A successful create may clear the name fence before the host has replaced its old .env.
+    // Credential revocation therefore has its own durable, irreversible fingerprint ledger.
+    storage.revokeAttachCredentials(name, [
+      ...[...attachTokens].filter(([, owner]) => owner === name).map(([token]) => token),
+      ...executions.map((execution) => execution.token),
+    ], Date.now());
     storage.tasks.ownerDeleted(name, Date.now());
+    nativeBotPlane?.removeRuntimeBot(name);
+    mobileNode?.disconnectAgent(name);
+    for (const execution of executions) {
+      storage.setChatExecutionStage(execution.executionId, "deleted");
+      attachTokens.delete(execution.token);
+      mobileNode?.disconnectAgent(execution.executionId);
+      attachV1Ingress.disconnectAgent(execution.executionId);
+    }
     const revoked = revokeAttachTokens(attachTokens, name);
     attachV1Ingress.disconnectAgent(name);
     allowedCapabilities.delete(name);
@@ -1165,16 +1190,7 @@ export async function startGateway(
       });
       registerAttachAdapter(bot.id);
     },
-    unregister: (id) => {
-      const revoked = killAttachIdentity(id);
-      for (const execution of storage.chatExecutions()) if (execution.bot === id) {
-        storage.setChatExecutionStage(execution.executionId, "deleted");
-        attachTokens.delete(execution.token);
-        attachV1Ingress.disconnectAgent(execution.executionId);
-      }
-      nativePlane.removeRuntimeBot(id);
-      return revoked;
-    },
+    unregister: (id) => killAttachIdentity(id),
     reservedName: (id) => hermesProfileIds.has(id),
     rosterChanged: (reason) => bridge.refreshSoon(reason),
   });

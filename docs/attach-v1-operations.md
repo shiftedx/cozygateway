@@ -341,17 +341,56 @@ Instead, run the installer once from Terminal:
 scripts/install-bot-provisioner.sh
 ```
 
-It copies the watcher, provisioner, and attach-plugin source to
+It copies the watcher, provisioner, deprovisioner, and attach-plugin source to
 `~/Library/Application Support/cozylabs/provisioner`, points the LaunchAgent at
 that self-contained payload, and reloads it in the current Aqua user session.
 The staged payload is deliberately a snapshot: launchd cannot safely refresh it
 from a protected checkout. Re-run the same command after every checkout update
-that changes either provisioner script or `integrations/attach-plugin`; refresh
+that changes any provisioner script or `integrations/attach-plugin`; refresh
 is atomic for future sweeps and the staged `STAGED_FROM` file records its source
 revision.
 
 To stop it: `launchctl bootout "gui/$(id -u)/ai.cozylabs.bot-provisioner"`.
 The log is `~/Library/Logs/cozylabs-bot-provisioner.log`.
+
+### Automatic deletion cleanup
+
+After supported bot deletion removes the Hermes profile, the installed watcher
+reconciles missing profiles against both launchd (including unloaded plists) and
+the box's configured profiles. It passes all orphans to the staged deprovisioner
+in one batch, removes their config entries and dedicated token lines, and
+recreates the gateway once. Verification compares `/ready`'s
+`attach.hermes.configured` with the remaining Hermes config count; other attached
+runtimes do not affect that check.
+
+The watcher checks the box every 30 seconds by default. An OS advisory lock
+serializes sweeps and releases automatically when the worker process group exits,
+including after SIGKILL; old mkdir-lock directories no longer block the watcher.
+Failed reads, malformed
+config, failed restarts, and failed verification return failure and retry on the
+next sweep. Before editing, the deprovisioner records unfinished work and exact
+credential key names in `<box config path>.deprovision-pending.json`. That journal
+contains no token values and is removed only after successful cleanup. It lets a
+later sweep find unfinished cleanup even after config entries and services are
+already gone. Surviving profiles' shared token variables are retained. If the
+name has been recreated in the meantime, the watcher finishes its provisioning
+first, then removes only journaled obsolete keys that no current profile uses.
+That reconciliation preserves the new profile's config, token, service, and
+files, and clears the old journal after gateway restart and verification.
+
+Automatic cleanup uses `--orphans-only`: live profile paths and symlinks are
+refused, and the live path is checked again before service teardown. An
+unavailable Hermes profiles root aborts the sweep. Profile backups, quarantined
+history, keeper profiles, and the shared Hermes installation remain untouched.
+Refresh the installed payload after updating to this implementation; older
+staged payloads may lack `deprovision-bot.sh` entirely.
+
+The disposable regression fixture runs as part of `pnpm test:installer`, or
+alone with `python3 scripts/test/bot-deprovision.test.py`. It exercises the actual
+staged watcher and remote file edits with fixture SSH, launchd, Docker, and
+readiness commands. It does not operate on a live deployment. These scripts
+serve the split Mac/box deployment; Windows native installs use their existing
+agent lifecycle instead.
 
 ### What a fresh profile inherits, and why it has to be undone
 
@@ -360,10 +399,13 @@ copy is the source of three traps the provisioner exists to defuse, all three
 observed live while building it:
 
 - **An attach token it did not mint.** Every bot created this way inherits the
-  same one and would attach as the same identity. So the presence of a
-  `COZYGATEWAY_TOKEN` proves nothing, and the box is treated as the authority:
-  a profile the box already names keeps its token, and a profile it does not
-  gets a freshly minted one.
+  same one and would attach as the same identity. A `COZYGATEWAY_TOKEN` is
+  retained only when its spool path already points at this profile's exact
+  local spool. An inherited path means a new incarnation and a fresh token,
+  even if the box still configures an older bot with that name. The box token
+  write replaces obsolete dedicated values and refuses to change a key another
+  profile uses. A profile-local `.cozygateway-provision-pending` marker keeps a
+  failed token handoff/restart discoverable; retries reuse the minted token.
 - **A spool path pointing at the GLOBAL spool.** Two profiles that both kept it
   would read and acknowledge each other's events out of one file. It is
   rewritten to the profile's own path.

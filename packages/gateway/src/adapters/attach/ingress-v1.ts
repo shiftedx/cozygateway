@@ -246,6 +246,9 @@ export class AttachV1Ingress implements TurnEndpoint {
     helloTimer.unref();
 
     socket.on("message", (data) => {
+      // Includes sockets accepted before deletion that have not sent hello yet: those are not
+      // in #current, but must never recreate their stream/catalog once the credential is revoked.
+      if (this.#agentFor(req) !== agentId) { socket.close(1008, "identity revoked"); return; }
       // A replaced socket may still deliver already-buffered frames before close completes.
       if (connection.hello && this.#current.get(agentId) !== connection) return;
       const receivedAt = this.#now();
@@ -713,7 +716,7 @@ export class AttachV1Ingress implements TurnEndpoint {
   sendMemoryRequest(agentId: string, input: AttachV1MemoryRequest): MemorySendOutcome {
     if (![...this.#tokens.values()].includes(agentId)) return "unknown_bot";
     const connection = this.#current.get(agentId);
-    if (connection?.hello !== true) return "not_attached";
+    if (connection?.hello !== true || connection.socket.readyState !== WebSocket.OPEN) return "not_attached";
     if (!connection.capabilities.has("memory_management")) return "capability_not_negotiated";
     if (input.operation === "setup" && !connection.capabilities.has("memory_setup")) return "capability_not_negotiated";
     if (input.operation === "create" && input.input.owner !== undefined && !connection.capabilities.has("memory_ownership")) return "capability_not_negotiated";
@@ -728,7 +731,7 @@ export class AttachV1Ingress implements TurnEndpoint {
   sendConfigRequest(agentId: string, input: AttachV1ConfigRequest): ConfigSendOutcome {
     if (![...this.#tokens.values()].includes(agentId)) return "unknown_bot";
     const connection = this.#current.get(agentId);
-    if (connection?.hello !== true) return "not_attached";
+    if (connection?.hello !== true || connection.socket.readyState !== WebSocket.OPEN) return "not_attached";
     const capability = input.operation.startsWith("chat.") ? "chat_configuration"
       : input.operation.startsWith("providers.connections.") ? "provider_connections" : "bot_config";
     if (!connection.capabilities.has(capability)) return "capability_not_negotiated";
@@ -741,7 +744,7 @@ export class AttachV1Ingress implements TurnEndpoint {
   sendHistoryRequest(agentId: string, input: AttachV1HistoryRequest): HistorySendOutcome {
     if (![...this.#tokens.values()].includes(agentId)) return "unknown_bot";
     const connection = this.#current.get(agentId);
-    if (connection?.hello !== true) return "not_attached";
+    if (connection?.hello !== true || connection.socket.readyState !== WebSocket.OPEN) return "not_attached";
     if (!connection.capabilities.has("bot_history")) return "capability_not_negotiated";
     return this.#send(connection, input) ? "sent" : "not_attached";
   }
@@ -990,6 +993,9 @@ export class AttachV1Ingress implements TurnEndpoint {
    *  connection authenticated before the revocation cannot keep flowing. Durable journal rows are
    *  the storage purge's business, not this method's. */
   disconnectAgent(agentId: string): void {
+    const timer = this.#projectionTimers.get(agentId);
+    if (timer !== undefined) clearTimeout(timer);
+    this.#projectionTimers.delete(agentId);
     const connection = this.#current.get(agentId);
     if (connection !== undefined) {
       connection.socket.close(1008, "identity revoked");

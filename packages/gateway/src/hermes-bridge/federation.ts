@@ -84,6 +84,8 @@ export function endpointStorage(storage: Storage, endpointId: string): Storage {
         roster = { bots: rows.map((row) => row.summary), updatedAt };
       };
       if (property === "nativeBotActiveTurn") return (name: string) => target.nativeBotActiveTurn(federatedBotName(endpointId, name));
+      if (property === "isBotDeleted") return (name: string) => target.isBotDeleted(federatedBotName(endpointId, name));
+      if (property === "restoreBot") return (name: string) => target.restoreBot(federatedBotName(endpointId, name));
       if (property === "purgeBot") return (name: string) => target.purgeBot(federatedBotName(endpointId, name));
       if (property === "botRoutineOverrides") return (name: string, routineId: string) =>
         target.botRoutineOverrides(federatedBotName(endpointId, name), routineId);

@@ -347,6 +347,8 @@ export class RuntimeBotService {
   create(input: BotCreateRequest, row: (id: string) => BotCreateResponse["bot"]): BotCreateResponse {
     const name = validateNewBotName(input.name);
     if (this.#storage.runtimeBot(name) !== undefined) throw new BotNameTaken(name);
+    const cleanup = this.#storage.latestRunnerOperationForBot(name);
+    if (cleanup?.kind === "delete_runtime" && cleanup.stage !== "deleted") throw new BotNameTaken(name);
     if (this.#reservedName(name)) throw new BotNameTaken(name);
     // Read and validated FIRST, before a row, a credential, or an operation exists: a bot created
     // against a malformed ceiling would be a bot the runner cannot honestly build.
@@ -370,6 +372,7 @@ export class RuntimeBotService {
       createdAt: at,
       runnerId: runner?.id ?? null,
     });
+    this.#storage.restoreBot(name);
     this.#storage.upsertAgent({
       id: name,
       name: display !== undefined && display.length > 0 ? display : name,
@@ -426,9 +429,8 @@ export class RuntimeBotService {
     const active = this.#storage.nativeBotActiveTurn(canon);
     if (active !== undefined && opts.force !== true) throw new BotTurnActive(canon, active.turnId);
     const tokenRevoked = this.#unregister(canon);
-    const purged = this.#storage.purgeBot(canon);
     const operationId = `op_${randomUUID()}`;
-    this.#storage.enqueueRunnerOperation({
+    const purged = this.#storage.purgeBot(canon, {
       operationId,
       bot: canon,
       kind: "delete_runtime",

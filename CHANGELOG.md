@@ -5,6 +5,14 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## 0.7.9 (2026-09-07): automatic, durable bot deletion
+
+Bot deletion now removes owned storage, revokes retired attach credentials across restarts and
+same-name recreation, and retains pending runtime cleanup until the runner acknowledges it.
+Shared room history and backups are preserved. The staged host provisioner includes automatic
+deprovisioning, durable retry records for interrupted configuration and token cleanup, and
+process locks that release automatically after termination.
+
 ## 0.7.8 (2026-09-07): responsive task reconciliation on retained histories
 
 Fixes gateway startup and health-check stalls when task reconciliation reads a profile with a
