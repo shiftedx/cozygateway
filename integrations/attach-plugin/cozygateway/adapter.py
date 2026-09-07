@@ -5421,6 +5421,11 @@ def classify_approval_scope(
         # arguments. A category grant is bounded to it, which is why it must be stable and must
         # never carry a value a person would not want stored in a policy record.
         "resource": resource[:256],
+        # The resource is the OPERATION, not the object it would act on: the object lives in the
+        # call's arguments and row 66 forbids one in a wire string. Saying so is what stops a
+        # standing CATEGORY grant being recorded over it, which would otherwise cover every object
+        # that tool can reach. A single-use grant, bound to the payload hash, is still on offer.
+        "resourceKind": "action",
         "change": change[:400],
         "effects": [],
         # Hermes stopped the call under its own approval policy. This peer does not know whether

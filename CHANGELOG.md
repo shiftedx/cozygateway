@@ -38,7 +38,16 @@ release; everything older is marked pre-release so installers resolve one "lates
   COMPOSED from the action and the resource rather than copied from the harness description, which
   on the answerable surface carries the call's arguments and absolute paths; an action identity
   carrying a URL, a path, whitespace or an assignment is refused outright, since the identity is the
-  only thing that reaches a wire string.
+  only thing that reaches a wire string. Every block it does send declares `resourceKind: "action"`,
+  the new optional member of `BotApprovalScope`: the resource is the operation, never the object the
+  operation would touch, because the object lives in the call's arguments and row 66 forbids one on
+  this wire. A category grant covers any payload of that action on that resource, so over such a
+  block it would cover every object that tool can reach; `grant: "category"` on one is now
+  `409 approval_category_undeclared` at the decision AND at the consult, so a category grant another
+  peer made against a real object of the same name cannot answer for one either. `grant: "once"` is
+  unaffected and is the whole offer there, bound to the payload hash. Absent reads as `object`, so
+  every peer and client that names a real resource is byte identical to its earlier self, and the
+  always-require floor is untouched and still refuses first.
 
 - The owner-loss lease no longer reaps a turn whose peer was lost mid model request
   (`com.cozylabs.bots` capability 69, F2). Capability 69 starts a 120 second lease the instant a

@@ -492,6 +492,92 @@ describe("capability 51: approvals and clarifications on a room turn", () => {
     expect(once.status).toBe(202);
   });
 
+  it("capability 66: a resource that is only the tool carries no category grant, only a once grant", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    // What every Hermes ask the plugin CAN classify looks like: it named the operation, because a
+    // pattern key is an operation, and it could not name the object, because that lives in the
+    // call's arguments and row 66 forbids one on this wire. `resourceKind: "action"` says exactly
+    // that, and a category grant over it would cover every file that tool can reach.
+    const toolResource = {
+      kind: "scoped_approval", action: "fs:write_file", category: "other",
+      system: "fs", resource: "write_file", resourceKind: "action",
+      change: "Run fs:write_file on write_file in fs.", effects: [],
+      reason: "peer_policy", payloadHash: "d".repeat(64), expiresAt: NOW + 600_000,
+      retry: "idempotent", requested: "once",
+    } as const;
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-tool", callId: "call-1", name: "fs:write_file",
+      status: "pending", scope: toolResource,
+    })).toBe(true);
+    // Carried byte for byte, `resourceKind` included: the card has to be able to say what it is.
+    const raised = h.frames.find(
+      (frame) => frame.type === "bot_approval_pending"
+        && (frame as BotApprovalPendingFrame).toolCallId === "approval-tool",
+    ) as BotApprovalPendingFrame;
+    expect(JSON.stringify(raised.scope)).toBe(JSON.stringify(toolResource));
+
+    const refused = await h.app.request("/bots/sage/approvals/approval-tool/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: "category", expiresAt: NOW + 3_600_000 }),
+    });
+    expect(refused.status).toBe(409);
+    expect((await refused.json() as { error: { code: string } }).error.code)
+      .toBe("approval_category_undeclared");
+    expect(((await (await h.app.request("/bots/sage/approvals/grants")).json()) as { grants: unknown[] }).grants)
+      .toHaveLength(0);
+
+    // One decision at a time IS the offer, and it is bound to the payload hash, so it covers one
+    // repetition of the exact ask this person read and nothing else.
+    const once = await h.app.request("/bots/sage/approvals/approval-tool/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: "once" }),
+    });
+    expect(once.status).toBe(202);
+    const { grants } = await (await h.app.request("/bots/sage/approvals/grants")).json() as
+      { grants: Array<{ scope: string }> };
+    expect(grants).toHaveLength(1);
+    expect(grants[0]).toMatchObject({ scope: "once" });
+  });
+
+  it("capability 66: no category grant made against a real object ever covers a tool-only ask", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    // Planted as if another peer, one that CAN name an object, had made it over the same action and
+    // the same string. The consult must refuse it too, or the decision-side refusal would only move
+    // the coverage rather than end it.
+    h.storage.recordApprovalGrant({
+      bot: "sage", grantId: "grant:sage:object", scope: "category", deviceId: "device-1",
+      sessionId: turn.threadId, turnId: null, approvalId: "approval-object",
+      action: "fs:write_file", category: "other", system: "fs",
+      resource: "write_file", payloadHash: null,
+      expiresAt: NOW + 3_600_000, createdAt: NOW,
+    });
+
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-tool", callId: "call-1", name: "fs:write_file",
+      status: "pending",
+      scope: {
+        kind: "scoped_approval", action: "fs:write_file", category: "other",
+        system: "fs", resource: "write_file", resourceKind: "action",
+        change: "Run fs:write_file on write_file in fs.", effects: [],
+        reason: "peer_policy", payloadHash: "d".repeat(64), expiresAt: NOW + 600_000,
+        retry: "idempotent", requested: "once",
+      },
+    })).toBe(true);
+
+    const raised = h.frames.find(
+      (frame) => frame.type === "bot_approval_pending"
+        && (frame as BotApprovalPendingFrame).toolCallId === "approval-tool",
+    ) as BotApprovalPendingFrame;
+    expect(raised).not.toHaveProperty("grantId");
+    expect(h.resolutions("sage")).toEqual([]);
+  });
+
   it("capability 66: a standing grant covers a later room ask exactly as it covers a 1:1 ask", async () => {
     const h = await setup();
     const turn = await blockedTurn(h, ["sage", "scout"]);

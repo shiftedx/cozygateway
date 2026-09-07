@@ -64,8 +64,12 @@ class ApprovalScopeClassifierTests(unittest.TestCase):
         self.assertEqual(scope["requested"], "once")
         self.assertTrue(SHA256_HEX.match(scope["payloadHash"]))
         self.assertEqual(scope["expiresAt"], NOW_MS + adapter_module.APPROVAL_SCOPE_TTL_MS)
+        self.assertEqual(scope["resource"], "rm")
+        # The resource is the operation, never the object, so the block says so and the gateway
+        # refuses a category grant over it (409 approval_category_undeclared). Once is the offer.
+        self.assertEqual(scope["resourceKind"], "action")
         self.assertEqual(set(scope), {
-            "kind", "action", "category", "system", "resource", "change",
+            "kind", "action", "category", "system", "resource", "resourceKind", "change",
             "effects", "reason", "payloadHash", "expiresAt", "retry", "requested",
         })
 
@@ -83,6 +87,16 @@ class ApprovalScopeClassifierTests(unittest.TestCase):
                 scope = adapter_module.classify_approval_scope(payload, now_ms=NOW_MS)
                 self.assertIsNotNone(scope)
                 self.assertEqual(scope["category"], expected)
+
+    def test_every_emitted_block_says_its_resource_is_only_the_operation(self):
+        """This plugin can name what a tool IS and never what it would touch, so no block it sends
+        may carry a category grant. Declaring it is what makes the gateway refuse one."""
+        for identity in ("stripe:create_charge", "terminal:rm", "home:unlock_door",
+                         "social:publish_post", "admin:change_account_role",
+                         "keychain:read_secret"):
+            scope = adapter_module.classify_approval_scope(_kwargs(pattern_key=identity),
+                                                           now_ms=NOW_MS)
+            self.assertEqual(scope["resourceKind"], "action")
 
     def test_an_action_this_plugin_cannot_place_declares_nothing_rather_than_other(self):
         """`other` is the ONE category a standing category grant can cover, so it can never be the
