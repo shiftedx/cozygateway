@@ -333,11 +333,23 @@ RESOLUTION ORDER, first that resolves wins:
 There is no third source, and in particular no peer input. WHICH OF A PERSON'S PHONES RINGS IS THE
 PERSON'S CHOICE. The preference is written by a device-authenticated client, and nothing a bot, a
 harness, a runtime or a Hermes plugin sends can name a target device: no frame carries such a
-field. A `mobile_request` that carries `targetDeviceId` anyway is REFUSED by the closed key set,
-with the ingress's ordinary named refusal, exactly as any other unknown key on any other frame is.
-The field is REMOVED rather than tolerated. A spelling the gateway silently accepts and drops is
-worse than one it refuses on two counts: the routing rule stops being readable from the schema, and
-a peer that thinks it is steering a request keeps thinking so, with nothing anywhere to correct it.
+field. A `mobile_request` that carries `targetDeviceId` anyway has THAT ONE REQUEST refused, with
+capability 68's own `policy_blocked` terminal and the `request_policy_rejected` reason, which is
+what it is: refused before any phone saw it.
+
+THE SOCKET SURVIVES, and that is a deliberate exception to how this wire answers an unknown key
+everywhere else. A named refusal and a closed connection is the right answer to a contract skew
+that makes a peer's whole understanding suspect. It is the wrong answer to one removed routing
+hint: a peer that still sends it is otherwise healthy and may be carrying a live conversation,
+queued turns and other requests, so closing its socket costs a person all of that, while refusing
+the one request costs them only the request that was never going to be honoured. The peer's next
+valid frame on the same socket is handled normally.
+
+The field is still REMOVED rather than tolerated. A spelling the gateway silently accepts and drops
+is worse than one it refuses on two counts: the routing rule stops being readable from the schema,
+and a peer that thinks it is steering a request keeps thinking so, with nothing anywhere to correct
+it. Refusing per request corrects it, once per request, without costing the connection. One bounded
+log line names the removed field; the device id the peer tried to name is never logged.
 
 ONE EXCEPTION, and it is a rule rather than an oversight: a request whose origin is a registered
 CozyApp action is answered on THE DEVICE THAT TAPPED IT, and consults no stored preference. The

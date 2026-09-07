@@ -1066,6 +1066,13 @@ export class NativeBotDataPlane {
     this.#mobileNode?.invoke({ ...request, bot: key, agentId: peer, deviceId: target.deviceId });
   }
 
+  /** Capability 70. Refuse one request the gateway will not route, leaving the connection alone.
+   *  The peer is told through the same typed `policy_blocked` a request refused before any phone
+   *  saw it always gets, which is exactly what this is: nothing was routed, and nothing was asked. */
+  refuseMobileRequest(bot: string, requestId: string): void {
+    this.#mobileNode?.reject(bot, requestId);
+  }
+
   registerCozyAppActionOrigin(bot: string, appId: string, actionRequestId: string, deviceId: string, ttlMs: number): boolean {
     const key = normalize(bot);
     if (!this.handles(key) || !/^[A-Za-z0-9_-]{1,128}$/.test(appId) || !/^[A-Za-z0-9_-]{1,128}$/.test(actionRequestId)) return false;

@@ -54,7 +54,9 @@ release; everything older is marked pre-release so installers resolve one "lates
   `GET`/`PUT /bots/:name/mobile-requests/preferred-device?sessionId=`, read at admission and nowhere
   else. Which of a person's phones rings is the PERSON'S choice: the preference is written by a
   device-authenticated client, no frame carries a target device, and a `mobile_request` that
-  includes `targetDeviceId` anyway is refused by the closed key set like any other unknown key. The
+  includes `targetDeviceId` anyway has that one request refused with capability 68's own
+  `policy_blocked` and `request_policy_rejected`, while the socket and everything queued on it
+  survive, because a stale peer must not lose a live conversation over one removed routing hint. The
   target is the conversation's stored choice when it still names a paired device, then the device
   that opened the turn; from that moment capability 68's binding is unchanged, so the target never
   moves and a second device attaching never becomes one. One stated exception: a CozyApp action is

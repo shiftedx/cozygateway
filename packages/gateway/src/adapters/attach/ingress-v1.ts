@@ -26,6 +26,7 @@ import {
   AttachV1MemoryResultSchema,
   AttachV1MobileCancelSchema,
   AttachV1MobileRequestSchema,
+  mobileRequestRefusal,
   AttachV1MobileResultSchema,
   type AttachV1Capability,
   type AttachV1ClientFrame,
@@ -94,6 +95,8 @@ export interface AttachV1Events {
    * CozyApp action receipt to the public `running`, for a v1 peer too. */
   onCommandDelivered?(agentId: string, commandId: string): void;
   onMobileRequest?(agentId: string, frame: AttachV1MobileRequest): void;
+  /** Capability 70. Refuse ONE request the gateway will not route, without touching the socket. */
+  onMobileRequestRefused?(agentId: string, requestId: string): void;
   onMobileCancel?(agentId: string, frame: AttachV1MobileCancel): void;
   onMemoryResult?(agentId: string, frame: AttachV1MemoryResult): void;
   onConfigResult?(agentId: string, frame: AttachV1ConfigResult): void;
@@ -248,6 +251,18 @@ export class AttachV1Ingress implements TurnEndpoint {
       const helloVersion = helloVersionOf(decoded);
       if (helloVersion !== undefined) {
         this.#refuse(agentId, socket, "hello", `unsupported hello version ${helloVersion}, this gateway speaks hello version 2 only`);
+        return;
+      }
+      // Capability 70. `targetDeviceId` is not on this wire, and a peer that still sends it is
+      // told so PER REQUEST rather than by losing its socket: see `mobileRequestRefusal`. The
+      // request gets the row's own typed refusal, the connection and everything queued on it
+      // survive, and the peer's next valid frame is handled normally.
+      const removedField = mobileRequestRefusal(decoded);
+      if (removedField !== undefined) {
+        emitTrace(this.#trace, "attach_frame_field_removed", {
+          kind: "mobile_request", field: removedField.field,
+        });
+        this.#events.onMobileRequestRefused?.(agentId, removedField.requestId);
         return;
       }
       if (!check(AttachV1ClientFrameSchema, decoded)) {

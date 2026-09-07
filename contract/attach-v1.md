@@ -509,10 +509,14 @@ One-shot `location.current` additionally requires negotiated `mobile_location`; 
 Capability 70 (`contract/ext-bots-v1.md` row 70) adds NOTHING to this frame. WHICH OF A PERSON'S
 PHONES A REQUEST REACHES IS THE PERSON'S CHOICE, recorded on their gateway and read at admission; no
 peer names a target device and no field here carries one. A frame that includes `targetDeviceId`
-anyway is REFUSED by the closed key set, with this lane's ordinary named refusal, exactly as any
-other unknown key on any other frame is. The field is removed rather than tolerated: a spelling the
-gateway silently accepts and drops leaves the routing rule unreadable from the schema, and a peer
-that believes it is steering a request would go on believing it.
+anyway has THAT ONE REQUEST refused, with the `policy_blocked` status and the
+`request_policy_rejected` reason this lane already defines, and the SOCKET IS NOT CLOSED. That is a
+deliberate exception to this lane's usual answer for an unknown key: a peer still sending a removed
+routing hint is otherwise healthy and may be carrying a live conversation, queued turns and other
+requests, and its next valid frame on the same socket is handled normally. The field is removed
+rather than tolerated, because a spelling the gateway silently accepts and drops leaves the routing
+rule unreadable from the schema and lets a peer go on believing it is steering a request; refusing
+per request tells it otherwise without costing the connection.
 
 Every mobile request `purpose` is a trimmed, normalized nonempty string no larger than 160 UTF-8 bytes and contains no
 C0/C1 control characters; invalid input is rejected rather than truncated. Status and location

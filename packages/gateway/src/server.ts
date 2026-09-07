@@ -805,6 +805,7 @@ export async function startGateway(
           hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() });
       },
       onMobileRequest: (agentId, frame) => nativeBotPlane?.mobileRequest(agentId, frame),
+      onMobileRequestRefused: (agentId, requestId) => nativeBotPlane?.refuseMobileRequest(agentId, requestId),
       onMobileCancel: (agentId, frame) => mobileNode?.cancelRequest(agentId, frame.requestId),
       onMemoryResult: (agentId, frame) => { memorySurface?.handle(agentId, frame); },
       onConfigResult: (agentId, frame) => { configSurface?.handle(agentId, frame); },
