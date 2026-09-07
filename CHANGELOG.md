@@ -5,7 +5,14 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
-## Unreleased
+## 0.7.7 (2026-09-07): observer dashboard, room approvals, and delivery reliability
+
+This release adds a paired, read-only dashboard for gateway health, latency, usage, and tool costs.
+It also carries room approval scopes, improves multi-endpoint room ownership and disconnected-turn
+recovery, and prevents duplicate reply/completion push banners. Upgrade the gateway and both relay
+services together, then update the Hermes attach plugin from this matching release. Existing
+configuration and pairings are retained; native Hermes streaming remains off by default.
+
 
 - Adds the paired, read-only Observe dashboard with local fonts, strict same-origin CSP, live
   refresh, sparse measurement states, and light/dark layouts. Its assets are embedded in the
