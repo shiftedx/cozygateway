@@ -24,6 +24,9 @@ const CEILING_MS = 1_800_000;
 const LEASE_MS = 120_000;
 /** The longer window a peer that re-attached but cannot declare its turns gets. */
 const GRACE_WINDOW_MS = 600_000;
+/** F2. How often a live peer proves it is alive: the attach-v1 heartbeat interval, well inside the
+ *  30 second staleness bound the lease clock uses for that proof. */
+const LIVENESS_MS = 30_000;
 
 interface Harness {
   storage: Storage;
@@ -206,6 +209,59 @@ describe("HF2: a stale native turn never swallows a reply", () => {
 
     harness.plane.handleAttachPresence("sage", "absent");
     harness.advance(LEASE_MS + SWEEP_MS);
+
+    expect(terminalOf(harness)).toBeDefined();
+    harness.close();
+  });
+
+  it("never reaps a detached peer that keeps proving it is alive through a long model request", async () => {
+    const harness = await startTurn();
+
+    // F2. The socket dropped mid-turn, so the turn is on the 120 second lease. The process is
+    // very much alive: it is inside one cold prefill-bound model call, which LV1 measured at
+    // about 123 seconds for a 45k token window, and it answers every attach-v1 heartbeat while
+    // producing not one frame. Three minutes of that must not end the turn.
+    harness.plane.handleAttachPresence("sage", "absent");
+    for (let elapsed = 0; elapsed < 3 * 60_000; elapsed += LIVENESS_MS) {
+      harness.plane.handleAttachLiveness("sage", harness.now());
+      harness.advance(LIVENESS_MS);
+    }
+
+    expect(terminalOf(harness)).toBeUndefined();
+    expect(harness.storage.nativeBotChat("sage", harness.now()).activeTurnId).toBe(harness.turnId);
+    harness.close();
+  });
+
+  it("reaps a detached peer that stops proving it is alive, one lease after the last proof", async () => {
+    const harness = await startTurn();
+
+    // The same turn, and the same three minutes of heartbeats, and then the process dies. The
+    // lease clock runs from the LAST proof of life, so the reap still lands within one lease.
+    harness.plane.handleAttachPresence("sage", "absent");
+    for (let elapsed = 0; elapsed < 3 * 60_000; elapsed += LIVENESS_MS) {
+      harness.plane.handleAttachLiveness("sage", harness.now());
+      harness.advance(LIVENESS_MS);
+    }
+    expect(terminalOf(harness)).toBeUndefined();
+
+    harness.advance(LEASE_MS + SWEEP_MS);
+
+    expect(terminalOf(harness)).toMatchObject({ status: "failed" });
+    expect(harness.storage.nativeBotChat("sage", harness.now()).activeTurnId).toBeUndefined();
+    harness.close();
+  });
+
+  it("never lets a proof of life shorten the undeclared grace an older peer keeps", async () => {
+    const harness = await startTurn();
+
+    // Never nerf Hermes. A peer that re-attached without declaring its turns keeps the 600 second
+    // grace exactly as it was: proof of life may only ever extend a window, never shorten one.
+    harness.plane.handleAttachHello("sage", undefined);
+    harness.plane.handleAttachLiveness("sage", harness.now());
+    harness.advance(GRACE_WINDOW_MS - SWEEP_MS);
+    expect(terminalOf(harness)).toBeUndefined();
+
+    harness.advance(SWEEP_MS);
 
     expect(terminalOf(harness)).toBeDefined();
     harness.close();
