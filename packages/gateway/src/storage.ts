@@ -1,4 +1,5 @@
 import { Artifacts } from "./artifacts.ts";
+import { ObserveStore } from "./observe/store.ts";
 import { Tasks } from "./tasks.ts";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
@@ -618,6 +619,14 @@ CREATE TABLE IF NOT EXISTS bot_message_receipts (
   message_id TEXT NOT NULL,
   displayed_at INTEGER NOT NULL,
   device_id TEXT NOT NULL,
+  -- Dashboard packet D2, design section 11 ("Perceived by the person"). What the person actually
+  -- waited, from send tapped to first delta rendered, measured on the PHONE's own clock, plus the
+  -- network path the phone was on. Both are null for every receipt from a client that does not
+  -- report them, which is every client below capability 73 and any client that chooses not to.
+  -- They are stored beside the receipt rather than only folded into the ring so a receipt read
+  -- back later still says what it was, and they are never mixed into a gateway-measured hop.
+  felt_latency_ms INTEGER,
+  network_path TEXT,
   PRIMARY KEY (bot, message_id)
 ) STRICT, WITHOUT ROWID;
 -- Capability 39 phone-sharing receipts. The request id is the idempotency key; the remaining
@@ -857,6 +866,52 @@ CREATE TABLE IF NOT EXISTS runner_operations (
   runner_id TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS runner_operations_bot ON runner_operations (bot, created_at DESC);
+-- The observation ring (dashboard packet D2). Two capped tables holding what the gateway already
+-- measures once per turn, per heartbeat and per sweep and used to throw away. Written only when
+-- config `observability.enabled` is on, trimmed to `observability.retentionDays` by the nightly
+-- maintenance pass, and governed by one rule enforced in observe/store.ts rather than at the call
+-- sites: no message text, no transcript, no url, path, query or body, no token. Tool names, reason
+-- codes, hashes, counts and durations only, the same rule the guardrail audit log follows.
+--
+-- `series` carries its qualifier inline (`device_rtt_ms|tunnel`) because the row shape is four
+-- columns by design and a fifth label column would invite free text into exactly the place the
+-- privacy rule is hardest to police. Both qualifiers are closed enums.
+CREATE TABLE IF NOT EXISTS observe_series (
+  series TEXT NOT NULL,
+  -- The subject of the sample: a bot id, a device id, an agent id, or null for a gateway-wide one.
+  bot TEXT,
+  at INTEGER NOT NULL,
+  value REAL NOT NULL
+) STRICT;
+-- D3 reads one series for one subject over a 1h, 24h or 7d window, and this is that scan.
+CREATE INDEX IF NOT EXISTS observe_series_window ON observe_series (series, bot, at);
+-- The trim deletes by age across every series, which the index above cannot serve.
+CREATE INDEX IF NOT EXISTS observe_series_age ON observe_series (at);
+CREATE TABLE IF NOT EXISTS observe_events (
+  at INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  bot TEXT,
+  -- An id and only an id: a turn id, a grant id, a device id. Never a path or a name a person typed.
+  ref TEXT,
+  detail_json TEXT
+) STRICT;
+CREATE INDEX IF NOT EXISTS observe_events_window ON observe_events (kind, at);
+CREATE INDEX IF NOT EXISTS observe_events_age ON observe_events (at);
+-- Section 12. Lifetime token and cost counters, declared here beside the ring but deliberately
+-- OUTSIDE it: these are summed since the bot was created and the seven day trim never touches
+-- them. D5 owns the producer; the table lives here because it is one storage decision with the
+-- ring it sits next to.
+CREATE TABLE IF NOT EXISTS observe_lifetime (
+  bot TEXT NOT NULL,
+  model TEXT NOT NULL,
+  prompt INTEGER NOT NULL,
+  completion INTEGER NOT NULL,
+  cached INTEGER NOT NULL,
+  cost_micros INTEGER NOT NULL,
+  turns INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bot, model)
+) STRICT, WITHOUT ROWID;
 `;
 
 /** Capability 52. Which credential a setup code may mint. A code written before 52 has no kind
@@ -1277,9 +1332,14 @@ export class Storage {
   readonly #db: DatabaseSync;
   readonly tasks: Tasks;
   readonly artifacts: Artifacts;
+  /** Dashboard packet D2's observation ring. A namespace rather than methods on Storage because
+   *  it is a self-contained store with its own privacy rule, and that rule is easier to trust
+   *  when the only way to write a row is through the one class that enforces it. */
+  readonly observe: ObserveStore;
 
   constructor(db: DatabaseSync) {
     this.#db = db;
+    this.observe = new ObserveStore(db);
     this.tasks = new Tasks(db);
     this.tasks.expireInteractions((bot, kind, id, at) => { this.expireNativeInteractionIfDue(bot, kind, id, at); });
     // Capability 65 is the canonical producer capability 64 left absent by default. Only explicit
@@ -5844,6 +5904,17 @@ export function openStorage(dbPath: string): Storage {
   // adding it nullable is the whole migration. Nothing is backfilled: an operation written before
   // 54 belongs to the account default, and inventing a runner id for it would be a guess this
   // gateway cannot make honestly. Idempotent, so a restarted container runs it harmlessly again.
+  // Dashboard packet D2. An existing database's receipts predate the app-reported perceived
+  // latency and network path. Both are added nullable and nothing is backfilled: a receipt written
+  // before capability 73 carries no measurement, and inventing one would be a guess.
+  {
+    const columns = new Set(
+      (db.prepare("PRAGMA table_info(bot_message_receipts)").all() as unknown as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!columns.has("felt_latency_ms")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN felt_latency_ms INTEGER");
+    if (!columns.has("network_path")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN network_path TEXT");
+  }
   for (const table of ["runtime_bots", "runner_operations"]) {
     const columns = new Set(
       (db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>)
