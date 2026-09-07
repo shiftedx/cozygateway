@@ -372,7 +372,13 @@ export async function startGateway(
   const storage = openStorage(config.dbPath);
   storage.pruneExpiredAttachMedia(Date.now());
   storage.pruneExpiredComposerDrafts(Date.now());
-  const endpoints = hermesEndpoints(config);
+  // Host provisioning may complete after a restart. A confirmed deletion remains authoritative
+  // while that stale config and its old credential still exist on disk.
+  const endpoints = hermesEndpoints(config).map((endpoint) => ({ ...endpoint, config: {
+    ...endpoint.config,
+    profiles: Object.fromEntries(Object.entries(endpoint.config.profiles)
+      .filter(([rawId]) => !storage.isBotDeleted(publicProfileId(endpoint, rawId)))),
+  } }));
   const profileEntries = endpoints.flatMap((endpoint) => Object.entries(endpoint.config.profiles).map(
     ([rawId, profile]) => [publicProfileId(endpoint, rawId), profile] as const,
   ));
@@ -404,7 +410,7 @@ export async function startGateway(
     return id === LEGACY_RUNNER_ID && legacyRunnerConfigured ? LEGACY_RUNNER_NAME : undefined;
   };
   const storedRuntimeBots = storage.runtimeBots();
-  const merged = mergeRuntimeBots(nativeBots(config), storedRuntimeBots);
+  const merged = mergeRuntimeBots(nativeBots(config).filter((bot) => !storage.isBotDeleted(bot.id)), storedRuntimeBots);
   const runtimeBots = merged.bots;
   /** Only until the plane exists; every later read is the plane's live set. */
   const bootRuntimeBotNames: ReadonlySet<string> = new Set(merged.bots.map((bot) => bot.id));
@@ -958,6 +964,14 @@ export async function startGateway(
   // which is what the delete response reports as `tokenRevoked`.
   killAttachIdentity = (name: string): boolean => {
     storage.tasks.ownerDeleted(name, Date.now());
+    nativeBotPlane?.removeRuntimeBot(name);
+    mobileNode?.disconnectAgent(name);
+    for (const execution of storage.chatExecutions()) if (execution.bot === name) {
+      storage.setChatExecutionStage(execution.executionId, "deleted");
+      attachTokens.delete(execution.token);
+      mobileNode?.disconnectAgent(execution.executionId);
+      attachV1Ingress.disconnectAgent(execution.executionId);
+    }
     const revoked = revokeAttachTokens(attachTokens, name);
     attachV1Ingress.disconnectAgent(name);
     allowedCapabilities.delete(name);
@@ -1165,16 +1179,7 @@ export async function startGateway(
       });
       registerAttachAdapter(bot.id);
     },
-    unregister: (id) => {
-      const revoked = killAttachIdentity(id);
-      for (const execution of storage.chatExecutions()) if (execution.bot === id) {
-        storage.setChatExecutionStage(execution.executionId, "deleted");
-        attachTokens.delete(execution.token);
-        attachV1Ingress.disconnectAgent(execution.executionId);
-      }
-      nativePlane.removeRuntimeBot(id);
-      return revoked;
-    },
+    unregister: (id) => killAttachIdentity(id),
     reservedName: (id) => hermesProfileIds.has(id),
     rosterChanged: (reason) => bridge.refreshSoon(reason),
   });

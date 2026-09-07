@@ -693,6 +693,8 @@ export class HermesBridge implements BotControlSurface {
       throw error;
     }
 
+    this.#storage.restoreBot(name);
+
     // The profile exists from here on. Metadata is best-effort decoration, but the idempotent seed
     // is what enrolls its attach plugin.  Persist its original selection if Hermes is transiently
     // unavailable, rather than leaving a phone-created profile permanently outside the watcher.
@@ -942,7 +944,7 @@ export class HermesBridge implements BotControlSurface {
           `the box gateway config still maps profile ${canon} to its token env var`,
           `the box .env still carries this bot's attach token line (it can no longer authenticate)`,
           `the Hermes host may still have the launchd service ai.hermes.gateway-${canon} installed`,
-          `run scripts/deprovision-bot.sh ${canon} to sweep all of these and restart the box gateway`,
+          `host cleanup is queued when this gateway has an installer provisioner; the deletion fence keeps stale config and credentials disabled while cleanup completes`,
         ],
       };
     });
@@ -987,7 +989,7 @@ export class HermesBridge implements BotControlSurface {
         const { profiles } = parseProfilesList(
           await this.#client.request("profiles.list", {}),
         );
-        const bots = buildRoster(profiles, {
+        const bots = buildRoster(profiles.filter((profile) => !this.#storage.isBotDeleted(profile.name)), {
           hidden: this.#hidden,
           routedProfile: null,
           gatewayState: "idle",

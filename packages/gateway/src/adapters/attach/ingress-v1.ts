@@ -246,6 +246,9 @@ export class AttachV1Ingress implements TurnEndpoint {
     helloTimer.unref();
 
     socket.on("message", (data) => {
+      // Includes sockets accepted before deletion that have not sent hello yet: those are not
+      // in #current, but must never recreate their stream/catalog once the credential is revoked.
+      if (this.#agentFor(req) !== agentId) { socket.close(1008, "identity revoked"); return; }
       // A replaced socket may still deliver already-buffered frames before close completes.
       if (connection.hello && this.#current.get(agentId) !== connection) return;
       const receivedAt = this.#now();
@@ -990,6 +993,9 @@ export class AttachV1Ingress implements TurnEndpoint {
    *  connection authenticated before the revocation cannot keep flowing. Durable journal rows are
    *  the storage purge's business, not this method's. */
   disconnectAgent(agentId: string): void {
+    const timer = this.#projectionTimers.get(agentId);
+    if (timer !== undefined) clearTimeout(timer);
+    this.#projectionTimers.delete(agentId);
     const connection = this.#current.get(agentId);
     if (connection !== undefined) {
       connection.socket.close(1008, "identity revoked");

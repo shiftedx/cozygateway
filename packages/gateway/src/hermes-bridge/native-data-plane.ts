@@ -1643,6 +1643,7 @@ export class NativeBotDataPlane {
     if (!this.#native.has(normalize(name))) throw new BotSessionNotFound(name);
     const bot = normalize(name);
     await this.#resolveLatestSession(bot);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
     const chat = this.#storage.nativeBotChat(bot, this.#now());
     return {
       sessionId: chat.sessionId,
@@ -1698,6 +1699,7 @@ export class NativeBotDataPlane {
     if (current.activeTurnId !== undefined) return;
     try {
       const latest = latestDesktopSession(await this.#control.desktopSessions(bot));
+      if (!this.#native.has(bot) || !this.#storage.nativeBotHasSession(bot, current.sessionId)) return;
       if (latest === undefined) return;
       const binding = this.#storage.nativeDesktopResumeBinding(bot, current.sessionId);
       if (binding?.hermesSessionId === latest.hermesSessionId) {
@@ -1761,6 +1763,8 @@ export class NativeBotDataPlane {
     // Read and sanitize the desktop transcript before the plugin can confirm. The staged local
     // session is not selected yet, so a failed/slow source read cannot redirect a normal send.
     const imported = await this.#control.desktopSessionTranscript(bot, hermesSessionId);
+    if (!this.#native.has(bot) || !this.#storage.nativeBotHasSession(bot, staged.sessionId))
+      throw new BotSessionNotFound(staged.sessionId);
     for (const [index, message] of imported.entries()) {
       this.#storage.appendNativeBotMessage({
         bot,
@@ -1915,6 +1919,7 @@ export class NativeBotDataPlane {
     if (!this.#native.has(normalize(name))) throw new BotSessionNotFound(name);
     const bot = normalize(name);
     await this.#resolveLatestSession(bot);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
     const chat = this.#storage.nativeBotChat(bot, this.#now());
     const messages = this.#storage.nativeBotMessages(bot, chat.sessionId);
     const state = this.#turnState(bot, chat.sessionId, chat.activeTurnId);

@@ -572,3 +572,22 @@ describe("attach-v1 native Bot Mode sessions", () => {
     h.storage.close();
   });
 });
+
+
+it("discards an awaited desktop transcript when its bot is deleted before import completes", async () => {
+  const h = nativePlane(["delete-fixture"]);
+  h.desktopSessions.mockResolvedValue([{ source: "hermes_desktop", origin: "tui", hermesSessionId: "desktop-fixture", startedAt: 1, lastActiveAt: 2 }]);
+  let release!: (messages: unknown[]) => void;
+  h.desktopSessionTranscript.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+  try {
+    const resume = h.surface.resumeDesktopSession("delete-fixture", "desktop-fixture");
+    await vi.waitFor(() => expect(release).toBeDefined());
+    h.plane.removeRuntimeBot("delete-fixture");
+    h.storage.purgeBot("delete-fixture");
+    release([{ id: "late", role: "user", text: "must not return", at: 1_000 }]);
+    await expect(resume).rejects.toBeInstanceOf(BotSessionNotFound);
+    expect(h.desktopResumeCommands).toEqual([]);
+    expect(h.storage.nativeBotSessions("delete-fixture", 100)).toEqual([]);
+    expect(h.storage.purgeBot("delete-fixture")).toEqual({});
+  } finally { h.plane.close(); h.storage.close(); }
+});

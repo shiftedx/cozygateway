@@ -70,6 +70,16 @@ it("retires a failed pre-turn execution when the user returns to the bot workspa
   expect(test.storage.chatExecutionById(row.executionId)?.stage).toBe("deleted");
   expect(test.tokens.has(row.token)).toBe(false);
   expect(test.commands.at(-1)?.command).toBe("delete_chat_execution");
+  const receipt = { kind: "chat_execution_receipt" as const, operationId: `chat_delete_${row.executionId}`,
+    executionId: row.executionId, botId: row.bot, sessionId, stage: "deleted" as const };
+  test.frame("intruder", receipt);
+  expect(test.storage.chatExecutionById(row.executionId)).toBeDefined();
+  test.frame("remote", { ...receipt, operationId: row.operationId });
+  expect(test.storage.chatExecutionById(row.executionId)).toBeDefined();
+  test.frame("remote", receipt);
+  expect(test.storage.chatExecutionById(row.executionId)).toBeUndefined();
+  test.frame("remote", receipt);
+  expect(test.storage.chatExecutionById(row.executionId)).toBeUndefined();
 });
 
 it("creates one session peer without moving the source bot or its other chat", async () => {
@@ -123,4 +133,38 @@ it("rejects forged lifecycle receipts and does not restore deleted source sessio
   test.connection("remote", { kind: "hello", version: 1, runnerId: "remote", backends: ["process"] });
   expect(test.tokens.has(row.token)).toBe(false);
   expect(test.commands.at(-1)?.command).toBe("delete_chat_execution");
+});
+
+
+it("does not mint an execution or token after deletion wins an awaited model read", async () => {
+  const test = setup();
+  const sessionId = test.storage.nativeBotChat("delete-fixture", 1).sessionId;
+  let release!: (value: Awaited<ReturnType<typeof test.modelConfig>>) => void;
+  test.modelConfig.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+  const preparing = test.driver.prepareContext({ bot: "delete-fixture", sessionId, workspace, model: null });
+  await vi.waitFor(() => expect(release).toBeDefined());
+  test.storage.purgeBot("delete-fixture");
+  release({ model: "openai:fixture", effort: "medium", efforts: [], catalog: [] });
+  await expect(preparing).rejects.toThrow("chat was deleted");
+  expect(test.storage.chatExecutions()).toEqual([]);
+  expect(test.tokens.size).toBe(0);
+  expect(test.commands).toEqual([]);
+  expect(test.storage.purgeBot("delete-fixture")).toEqual({});
+});
+
+it("does not restore a retired execution when an awaited configuration write finishes", async () => {
+  const test = setup();
+  const sessionId = test.storage.nativeBotChat("delete-fixture", 1).sessionId;
+  let release!: () => void;
+  test.prepareChatConfiguration.mockImplementationOnce(async (_peer, configuration) => {
+    await new Promise<void>((resolve) => { release = resolve; });
+    return { configuration };
+  });
+  const preparing = test.driver.prepareContext({ bot: "delete-fixture", sessionId, workspace, model: null });
+  await vi.waitFor(() => expect(release).toBeDefined());
+  test.storage.purgeBot("delete-fixture");
+  release();
+  await expect(preparing).rejects.toThrow("chat was deleted");
+  expect(test.storage.chatExecutions().map((row) => row.stage)).toEqual(["deleted"]);
+  expect(test.storage.purgeBot("delete-fixture")).toEqual({});
 });

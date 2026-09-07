@@ -102,6 +102,7 @@ export class RunnerChatExecutionDriver implements ChatConfigurationDriver {
   }
 
   async #prepare(input: PrepareInput): Promise<{ workspacePrepared: boolean; effectiveModel?: ChatModelSelection }> {
+    this.#assertSourceSession(input);
     let existing = this.#storage.chatExecution(input.bot, input.sessionId);
     if (existing && JSON.stringify(existing.workspace) !== JSON.stringify(input.workspace)) {
       if (this.#storage.nativeChatConfiguration(input.bot, input.sessionId)?.workspaceLocked)
@@ -153,24 +154,37 @@ export class RunnerChatExecutionDriver implements ChatConfigurationDriver {
         launchModel: { id: model.modelId, ...(endpoint ? { endpoint } : { provider: model.providerId }) },
         stage: "starting", createdAt: this.#options.now?.() ?? Date.now(),
       };
+      this.#assertSourceSession(input);
       this.#storage.saveChatExecution(execution);
       this.#options.tokens.set(execution.token, execution.executionId);
     }
+    this.#assertSourceSession(input);
     this.#launch(execution);
     const deadline = Date.now() + 65_000;
     while (!this.#options.isAttached(execution.executionId)) {
+      this.#assertSourceSession(input);
       if (this.#storage.chatExecutionById(execution.executionId)?.stage === "failed")
         throw new ChatConfigurationUnavailable("The computer could not start this chat. Check its runner and try again.");
       if (!this.#lane.chatCapableRunners().includes(execution.runnerId) || Date.now() >= deadline)
         throw new ChatConfigurationUnavailable("The computer is still starting this chat. Try sending again when it reconnects.");
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
+    this.#assertSourceSession(input);
     if (model?.providerId.startsWith("custom-")) await this.#options.prepareProvider(input.bot, execution.executionId, model);
+    this.#assertSourceSession(input);
     await this.#surface.prepareChatConfiguration(execution.executionId, {
       sessionId: input.sessionId, workspace: input.workspace, model,
     });
+    this.#assertSourceSession(input);
     this.#storage.setChatExecutionStage(execution.executionId, "ready");
     return { workspacePrepared: true, ...(model ? { effectiveModel: model } : {}) };
+  }
+
+  // Model/profile/provider reads and attach preparation can outlive deletion (or an explicit
+  // recreation with the same bot name). The original session is the admission proof.
+  #assertSourceSession(input: PrepareInput): void {
+    if (!this.#storage.nativeBotHasSession(input.bot, input.sessionId))
+      throw new ChatConfigurationUnavailable("This chat was deleted while its computer was preparing.");
   }
 
   #harness(bot: string): "cozyagents" | "hermes" | undefined {
@@ -208,6 +222,10 @@ export class RunnerChatExecutionDriver implements ChatConfigurationDriver {
     if (!row || row.runnerId !== runnerId || row.bot !== frame.botId || row.sessionId !== frame.sessionId) return;
     const expected = row.stage === "deleted" ? `chat_delete_${row.executionId}` : row.operationId;
     if (frame.operationId !== expected || (row.stage === "deleted" && frame.stage !== "deleted")) return;
+    if (row.stage === "deleted" && frame.stage === "deleted") {
+      this.#storage.completeChatExecutionDeletion(row.executionId);
+      return;
+    }
     this.#storage.setChatExecutionStage(row.executionId, frame.stage);
   }
 

@@ -126,7 +126,36 @@ export class Tasks {
   runtime(reader: (bot: string) => string | undefined): void { this.#runtime = reader; }
 
   ownerDeleted(bot: string, at: number): void {
-    this.atomic(() => { for (const view of this.list({ bot })) if (!TERMINAL.has(view.state)) this.append(view.taskId, `owner-deleted:${bot}`, "cancelled", "owner_deleted", "gateway", at, { kind: "run", id: view.currentRun.runId }); });
+    this.atomic(() => {
+      for (const view of this.list({ bot })) if (!TERMINAL.has(view.state))
+        this.append(view.taskId, `owner-deleted:${bot}`, "cancelled", "owner_deleted", "gateway", at, { kind: "run", id: view.currentRun.runId });
+      // Retained room history must not retain authority to dispatch commands or expire device
+      // requests against an identity that a later explicit create could reuse.
+      this.#db.prepare(`UPDATE task_dispatches SET dispatched = 2 WHERE dispatched = 0
+        AND task_id IN (SELECT task_id FROM tasks WHERE bot = ?)`).run(bot);
+      this.#db.prepare(`UPDATE task_waits SET settled_at = MIN(?, expires_at) WHERE settled_at IS NULL
+        AND task_id IN (SELECT task_id FROM tasks WHERE bot = ?)`).run(at, bot);
+    });
+  }
+
+  /** Called inside Storage.purgeBot's transaction. Follow only schema-owned children; a
+   * room Task is shared history and deliberately survives its bot's deletion. */
+  purgeBot(bot: string): Record<string, number> {
+    const purged: Record<string, number> = {};
+    const owners = "SELECT task_id FROM tasks WHERE bot = ? AND room IS NULL";
+    purged["taskToolFacts"] = Number(this.#db.prepare(`DELETE FROM task_tool_facts
+      WHERE (peer, run_id) IN (SELECT peer, run_id FROM task_runs WHERE task_id IN (${owners}))`).run(bot).changes);
+    for (const table of ["task_intent_revisions", "task_events", "task_completion_notifications",
+      "task_reply_pushes", "task_waits", "task_absences", "task_recovery_decisions",
+      "task_required_artifacts", "task_required_batches", "task_commands", "task_dispatches", "task_runs"]) {
+      purged[table] = Number(this.#db.prepare(`DELETE FROM ${table} WHERE task_id IN (${owners})`).run(bot).changes);
+    }
+    purged["tasks"] = Number(this.#db.prepare("DELETE FROM tasks WHERE bot = ? AND room IS NULL").run(bot).changes);
+    purged["taskToolFacts"] += Number(this.#db.prepare(`DELETE FROM task_tool_facts
+      WHERE (peer = ? OR peer IN (SELECT execution_id FROM chat_executions WHERE bot = ?))
+        AND NOT EXISTS (SELECT 1 FROM task_runs WHERE task_runs.peer = task_tool_facts.peer
+          AND task_runs.run_id = task_tool_facts.run_id)`).run(bot, bot).changes);
+    return purged;
   }
 
   /** Capability 68's push leg. Called at most once per Task, in the same guarded post-commit step

@@ -88,6 +88,21 @@ async function createSage(l: Live): Promise<BotCreateResponse> {
 }
 
 describe("capability 49 through the assembled gateway", () => {
+  it("waits for runtime cleanup before explicit recreation and clears the fence with a fresh credential", async () => {
+    const l = await live();
+    await createSage(l);
+    const oldToken = l.gateway.storage.runtimeBot("sage")!.token;
+    expect((await l.authed("/bots/sage", { method: "DELETE" })).status).toBe(200);
+    const create = () => l.authed("/bots", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "sage", runtime: "cozyagents" }) });
+    expect((await create()).status).toBe(409);
+    expect(l.gateway.storage.isBotDeleted("sage")).toBe(true);
+    const cleanup = l.gateway.storage.latestRunnerOperationForBot("sage")!;
+    l.gateway.storage.recordRunnerReceipt({ operationId: cleanup.operationId, botId: "sage", specGeneration: 1, stage: "deleted", at: Date.now() });
+    expect((await create()).status).toBe(201);
+    expect(l.gateway.storage.isBotDeleted("sage")).toBe(false);
+    expect(l.gateway.storage.runtimeBot("sage")!.token).not.toBe(oldToken);
+  });
+
   it("forwards force to the runtime delete, so a bot with a stuck turn is still removable", async () => {
     const l = await live();
     await createSage(l);

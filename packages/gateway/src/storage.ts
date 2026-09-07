@@ -206,6 +206,10 @@ CREATE TABLE IF NOT EXISTS runners (
   last_seen_at INTEGER,
   display_name TEXT
 ) STRICT;
+-- A deletion fence survives stale bootstrap config and is cleared only by an explicit create.
+CREATE TABLE IF NOT EXISTS deleted_bots (
+  bot TEXT PRIMARY KEY, deleted_at INTEGER NOT NULL
+) STRICT;
 CREATE TABLE IF NOT EXISTS agents (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -1411,6 +1415,9 @@ export class Storage {
     this.artifacts.taskJoin((peer, runId) => this.tasks.taskOfRun(peer, runId));
     this.artifacts.onIdentityReplaced((retired, surviving) => { this.tasks.artifactIdentityReplaced(retired, surviving); });
     this.artifacts.onCommitment((taskId, runId, at) => { this.tasks.artifactsSettled(taskId, runId, at); });
+    // Upgrade recovery uses an acknowledged delete as its authority, never a missing config row.
+    for (const row of db.prepare("SELECT DISTINCT bot FROM runner_operations WHERE kind = 'delete_runtime' AND stage = 'deleted'").all() as { bot: string }[])
+      this.#pruneCompletedRuntimeCreates(row.bot);
   }
 
   /** Explicit deletion is the one authority that removes a retained original. The bytes go through
@@ -1754,7 +1761,17 @@ export class Storage {
     ).run(keep);
   }
 
+  isBotDeleted(bot: string): boolean {
+    return this.#db.prepare("SELECT 1 FROM deleted_bots WHERE bot = ?").get(bot) !== undefined;
+  }
+
+  /** Only the successful explicit-create path may reauthorize this name. */
+  restoreBot(bot: string): void {
+    this.#db.prepare("DELETE FROM deleted_bots WHERE bot = ?").run(bot);
+  }
+
   upsertAgent(agent: AgentRow): void {
+    if (this.isBotDeleted(agent.id)) return;
     this.#db
       .prepare(
         `INSERT INTO agents (id, name, avatar, backend) VALUES (?, ?, ?, ?)
@@ -2077,7 +2094,7 @@ export class Storage {
       const insert = this.#db.prepare(
         "INSERT INTO bot_roster (name, summary_json, position, updated_at) VALUES (?, ?, ?, ?)",
       );
-      bots.forEach((bot, index) => {
+      bots.filter((bot) => !this.isBotDeleted(bot.name)).forEach((bot, index) => {
         insert.run(bot.name, JSON.stringify(bot.summary), index, updatedAt);
       });
       this.#db.exec("COMMIT");
@@ -4054,6 +4071,11 @@ export class Storage {
       row.launchModel === undefined ? null : JSON.stringify(row.launchModel), row.harness ?? "cozyagents", row.stage, row.createdAt);
   }
 
+  /** Only an authenticated matching runner delete receipt releases this durable cleanup row. */
+  completeChatExecutionDeletion(executionId: string): void {
+    this.#db.prepare("DELETE FROM chat_executions WHERE execution_id = ? AND stage = 'deleted'").run(executionId);
+  }
+
   setChatExecutionStage(executionId: string, stage: ChatExecutionRow["stage"]): void {
     this.#db.prepare("UPDATE chat_executions SET stage = ? WHERE execution_id = ?").run(stage, executionId);
   }
@@ -4924,6 +4946,7 @@ export class Storage {
   }
 
   #insertNativeBotSession(bot: string, now: number): string {
+    if (this.isBotDeleted(bot)) throw new Error(`bot "${bot}" was deleted`);
     const sessionId = `native:${bot}:${randomUUID()}`;
     this.#db
       .prepare("INSERT INTO bot_native_sessions (bot, session_id, created_at, updated_at, active_turn_id) VALUES (?, ?, ?, ?, NULL)")
@@ -5564,7 +5587,12 @@ export class Storage {
    *  Returns the deleted row count per area (zero-row areas omitted), so the delete route reports
    *  what it actually removed rather than asserting it. Keys are the stable identifiers
    *  `BotDeleteResponse.purged` carries on the wire. */
-  purgeBot(bot: string): Record<string, number> {
+  purgeBot(
+    bot: string,
+    runtimeDelete?: Parameters<Storage["enqueueRunnerOperation"]>[0],
+  ): Record<string, number> {
+    if (runtimeDelete !== undefined && (runtimeDelete.bot !== bot || runtimeDelete.kind !== "delete_runtime"))
+      throw new Error("a bot purge can only enqueue that bot's runtime deletion");
     const areas: ReadonlyArray<readonly [area: string, table: string, column: string]> = [
       ["roster", "bot_roster", "name"],
       ["toolSteps", "bot_chat_tool_steps", "bot"],
@@ -5573,6 +5601,9 @@ export class Storage {
       ["chatPointer", "bot_native_chats", "bot"],
       ["chatConfiguration", "bot_chat_configurations", "bot"],
       ["chatWorkspaceDefault", "bot_chat_workspace_defaults", "bot"],
+      ["desktopResumeBindings", "bot_desktop_resume_bindings", "bot"],
+      ["pendingProfileSeeds", "pending_hermes_profile_seeds", "profile"],
+      ["slashCatalogs", "task_slash_catalogs", "peer"],
       ["sessions", "bot_native_sessions", "bot"],
       ["messages", "bot_native_messages", "bot"],
       ["receipts", "bot_message_receipts", "bot"],
@@ -5600,7 +5631,6 @@ export class Storage {
       ["attachCommands", "attach_command_outbox", "agent_id"],
       ["attachEvents", "attach_event_inbox", "agent_id"],
       ["attachTurnTerminals", "attach_turn_terminals", "agent_id"],
-      ["attachMedia", "attach_media", "agent_id"],
       ["scheduledDeliveries", "attach_scheduled_deliveries", "agent_id"],
       ["groupTurns", "bot_group_turns", "agent_id"],
       ["liveActivities", "live_activity_registrations", "bot"],
@@ -5614,16 +5644,51 @@ export class Storage {
     const purged: Record<string, number> = {};
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      // Capability 65. Deleting the owner is an explicit deletion, so its Artifact records and
-      // their deliveries go with the bytes rather than becoming records pointing at nothing.
+      this.#db.prepare("INSERT OR IGNORE INTO deleted_bots (bot, deleted_at) VALUES (?, ?)").run(bot, Date.now());
+      // Queue host cleanup in the same commit as forgetting the runtime and its credential.
+      if (runtimeDelete !== undefined) this.enqueueRunnerOperation(runtimeDelete);
+      const retiredCreates = this.#pruneCompletedRuntimeCreates(bot);
+      if (retiredCreates > 0) purged["runtimeCreateOperations"] = retiredCreates;
+      // These execution rows ARE the retryable delete outbox. Keep them until their runner
+      // acknowledges deletion; dropping them here would strand a process on an offline computer.
+      this.#db.prepare("UPDATE chat_executions SET stage = 'deleted' WHERE bot = ?").run(bot);
+      // An execution is a separate attach peer, with its own cursors and media. Its id is
+      // resolved from this bot's execution rows, never guessed from a prefix or a session id.
+      for (const table of ["attach_streams", "attach_command_outbox", "attach_event_inbox",
+        "attach_turn_terminals", "attach_scheduled_deliveries"]) {
+        const count = Number(this.#db.prepare(`DELETE FROM ${table}
+          WHERE agent_id IN (SELECT execution_id FROM chat_executions WHERE bot = ?)`).run(bot).changes);
+        if (count > 0) purged[`execution_${table}`] = count;
+      }
+      const catalogs = Number(this.#db.prepare(`DELETE FROM task_slash_catalogs
+        WHERE peer IN (SELECT execution_id FROM chat_executions WHERE bot = ?)`).run(bot).changes);
+      if (catalogs > 0) purged["executionSlashCatalogs"] = catalogs;
+      // Private Task history belongs to the deleted bot. Room Tasks belong to the shared room;
+      // ownerDeleted already settled those and the room's history remains readable.
+      for (const [area, count] of Object.entries(this.tasks.purgeBot(bot))) if (count > 0) purged[area] = count;
+      // Earlier native-history builds used this migration ledger. It is an explicitly known
+      // legacy table, not an invitation to sweep arbitrary tables by a matching identifier.
+      if (this.#db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bot_native_history_migrations'").get()) {
+        const changes = Number(this.#db.prepare("DELETE FROM bot_native_history_migrations WHERE bot = ?").run(bot).changes);
+        if (changes > 0) purged["nativeHistoryMigrations"] = changes;
+      }
+      this.#db.prepare(`INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+        SELECT push_id, ? FROM live_activity_registrations WHERE bot = ?`).run(Date.now(), bot);
+      // Private Artifacts and deliveries follow their owner; room Artifacts retain their
+      // records and referenced media as part of the shared room history.
       // Deliveries first: they reference the record they belong to.
       for (const [area, statement] of [
-        ["artifactDeliveries", "DELETE FROM artifact_deliveries WHERE artifact_id IN (SELECT artifact_id FROM artifacts WHERE bot = ?)"],
-        ["artifacts", "DELETE FROM artifacts WHERE bot = ?"],
+        ["artifactDeliveries", "DELETE FROM artifact_deliveries WHERE artifact_id IN (SELECT artifact_id FROM artifacts WHERE bot = ? AND room IS NULL)"],
+        ["artifacts", "DELETE FROM artifacts WHERE bot = ? AND room IS NULL"],
       ] as const) {
         const changes = Number(this.#db.prepare(statement).run(bot).changes);
         if (changes > 0) purged[area] = changes;
       }
+      const media = Number(this.#db.prepare(`DELETE FROM attach_media
+        WHERE (agent_id = ? OR agent_id IN (SELECT execution_id FROM chat_executions WHERE bot = ?))
+          AND NOT EXISTS (SELECT 1 FROM artifacts WHERE room IS NOT NULL
+            AND created_by = attach_media.agent_id AND media_id = attach_media.media_id)`).run(bot, bot).changes);
+      if (media > 0) purged["attachMedia"] = media;
       for (const [area, table, column] of areas) {
         const changes = Number(
           this.#db.prepare(`DELETE FROM ${table} WHERE ${column} = ?`).run(bot).changes,
@@ -5632,8 +5697,7 @@ export class Storage {
       }
       // The core thread surface is a parent/child chain rather than a flat `WHERE bot = ?`, and
       // `PRAGMA foreign_keys` is ON, so it goes child-first inside this same transaction. The
-      // `agents` row is config-derived and will be rewritten at the next boot if the operator
-      // never runs the deprovision sweep, which is exactly why that sweep is in the residue list.
+      // deletion fence keeps a stale config from reconstructing the `agents` row at the next boot.
       const core: ReadonlyArray<readonly [area: string, sql: string]> = [
         [
           "coreMessages",
@@ -5922,7 +5986,20 @@ export class Storage {
         receipt.at,
         receipt.operationId,
       );
+    if (current.kind === "delete_runtime" && receipt.stage === "deleted") {
+      // Preserve the delete receipt itself as the runner replay/idempotency fence. A later bot
+      // with this name can already exist, so only creates older than an acknowledged delete go.
+      this.#pruneCompletedRuntimeCreates(current.bot);
+    }
     return "recorded";
+  }
+
+  #pruneCompletedRuntimeCreates(bot: string): number {
+    return Number(this.#db.prepare(`DELETE FROM runner_operations AS creation
+      WHERE creation.bot = ? AND creation.kind = 'create_runtime'
+        AND EXISTS (SELECT 1 FROM runner_operations AS deletion
+          WHERE deletion.bot = creation.bot AND deletion.kind = 'delete_runtime'
+            AND deletion.stage = 'deleted' AND deletion.rowid > creation.rowid)`).run(bot).changes);
   }
 
   #runnerOperations(sql: string, ...params: string[]): RunnerOperationRow[] {
