@@ -45,6 +45,7 @@ RESERVED_NAMES="hermes default test tmp root sudo"
 DRY_RUN=0
 SKIP_VERIFY=0
 ORPHANS_ONLY=0
+RECREATED_ONLY=0
 PROFILES=()
 
 say()  { printf '%s\n' "$*"; }
@@ -65,12 +66,14 @@ Idempotent. Safe to re-run. Refuses reserved profile names.
   -n, --dry-run          print every step, change nothing
   --no-verify            skip the configured-count verification at the end
   --orphans-only         refuse any profile whose live directory still exists
+  --reconcile-recreated  finish journaled token cleanup for newly wired live profiles
   --gateway-url URL      gateway base URL (default $GATEWAY_URL)
   --box HOST             ssh target for the gateway box (default $BOX_SSH)
   --box-repo DIR         repo checkout on the box (default $BOX_REPO)
   --hermes-home DIR      hermes home (default \$HERMES_HOME_ROOT or ~/.hermes)
   --verify-timeout SEC   how long to wait for the final count (default $VERIFY_TIMEOUT)
-  --list-configured      print the profile names the box configures, one per line, and exit
+  --list-configured      print configured and unfinished profile names, then exit
+  --list-pending         print profile names with unfinished cleanup, then exit
   -h, --help             show this help
 USAGE
 }
@@ -80,6 +83,8 @@ while [ "$#" -gt 0 ]; do
     -n|--dry-run) DRY_RUN=1; shift ;;
     --no-verify) SKIP_VERIFY=1; shift ;;
     --orphans-only) ORPHANS_ONLY=1; shift ;;
+    --reconcile-recreated) RECREATED_ONLY=1; shift ;;
+    --list-pending) LIST_PENDING=1; shift ;;
     --gateway-url) GATEWAY_URL="$2"; shift 2 ;;
     --box) BOX_SSH="$2"; shift 2 ;;
     --box-repo) BOX_REPO="$2"; shift 2 ;;
@@ -161,21 +166,30 @@ try:
         for name in sorted(set(profiles) | set(pending)):
             if valid(name):
                 print(name)
-    elif action == "clean":
+    elif action == "list-pending":
+        for name in sorted(pending):
+            print(name)
+    elif action in {"clean", "clean-recreated"}:
         env = env_path.read_text()  # Failure is not equivalent to absence.
+        recreated = action == "clean-recreated"
+        if recreated:
+            names &= set(pending)
+            if any(name not in profiles for name in names):
+                raise ValueError("recreated profile has no current config mapping")
         owned = {}
         for name in names:
             keys = set(pending.get(name, []))
-            keys.add("COZYGATEWAY_ATTACH_TOKEN_" + re.sub(r"[^A-Z0-9]", "_", name.upper()).rstrip("_"))
-            if name in profiles:
-                keys.add(profiles[name]["tokenEnv"])
+            if not recreated:
+                keys.add("COZYGATEWAY_ATTACH_TOKEN_" + re.sub(r"[^A-Z0-9]", "_", name.upper()).rstrip("_"))
+                if name in profiles:
+                    keys.add(profiles[name]["tokenEnv"])
             owned[name] = sorted(keys)
         keys = {key for values in owned.values() for key in values}
         # A shared key belongs to surviving profiles too; never remove it.
-        keys -= {entry["tokenEnv"] for n, entry in profiles.items() if n not in names}
+        keys -= {entry["tokenEnv"] for n, entry in profiles.items() if recreated or n not in names}
         filtered = "".join(line for line in env.splitlines(keepends=True)
                            if not any(re.match(r"^\s*(?:export\s+)?" + re.escape(key) + r"\s*=", line) for key in keys))
-        changed_config = bool(names & set(profiles))
+        changed_config = not recreated and bool(names & set(profiles))
         changed_env = filtered != env
         if changed_config or changed_env or names & set(pending):
             # Capture custom tokenEnv names before config removal, so a crash
@@ -206,6 +220,8 @@ PYREMOTE
 
 have ssh || die "ssh not found on PATH"
 if [ "${LIST_CONFIGURED:-0}" = 1 ]; then box_state list; exit $?; fi
+if [ "${LIST_PENDING:-0}" = 1 ]; then box_state list-pending; exit $?; fi
+[ "$ORPHANS_ONLY$RECREATED_ONLY" != 11 ] || die "orphan and recreated modes are mutually exclusive"
 [ "${#PROFILES[@]}" -gt 0 ] || { usage >&2; die "no profile named"; }
 case "$VERIFY_TIMEOUT" in ''|*[!0-9]*) die "invalid verification timeout" ;; esac
 # Validate the entire batch before any service, file or remote state is changed.
@@ -214,6 +230,12 @@ for profile in "${PROFILES[@]}"; do
   case " $RESERVED_NAMES " in *" $profile "*) die "reserved profile name: $profile" ;; esac
   if [ "$ORPHANS_ONLY" = 1 ] && { [ -e "$HERMES_HOME_ROOT/profiles/$profile" ] || [ -L "$HERMES_HOME_ROOT/profiles/$profile" ]; }; then
     die "[$profile] live profile path exists; refusing orphan cleanup"
+  fi
+  if [ "$RECREATED_ONLY" = 1 ] && [ "$DRY_RUN" != 1 ]; then
+    dir="$HERMES_HOME_ROOT/profiles/$profile"
+    [ -d "$dir" ] && [ ! -L "$dir" ] \
+      && grep -Fqx "COZYGATEWAY_SPOOL_PATH=$dir/plugin-data/cozygateway/attach-v1.sqlite" "$dir/.env" \
+      || die "[$profile] recreated profile is not yet wired; retaining pending cleanup"
   fi
 done
 
@@ -305,20 +327,29 @@ verify_configured() {
 
 if [ "$DRY_RUN" = 1 ]; then
   for profile in "${PROFILES[@]}"; do
-    remove_service "$profile"
-    [ "$ORPHANS_ONLY" = 1 ] || remove_profile_dir "$profile" "$HERMES_HOME_ROOT/profiles/$profile"
+    if [ "$RECREATED_ONLY" != 1 ]; then
+      remove_service "$profile"
+      [ "$ORPHANS_ONLY" = 1 ] || remove_profile_dir "$profile" "$HERMES_HOME_ROOT/profiles/$profile"
+    fi
   done
-  say "DRY  remove box config/token entries for ${PROFILES[*]}; recreate gateway once if needed"
+  if [ "$RECREATED_ONLY" = 1 ]; then
+    say "DRY  reconcile only obsolete journaled token keys for ${PROFILES[*]}; preserve current mappings and live profiles"
+  else
+    say "DRY  remove box config/token entries for ${PROFILES[*]}; recreate gateway once if needed"
+  fi
   exit 0
 fi
 
 # A failed parse/read prevents local teardown as well as remote mutation.
-result="$(box_state clean "${PROFILES[@]}")" || die "box cleanup failed; next sweep will retry"
+action=clean
+[ "$RECREATED_ONLY" != 1 ] || action=clean-recreated
+result="$(box_state "$action" "${PROFILES[@]}")" || die "box cleanup failed; next sweep will retry"
 [[ "$result" =~ ^[0-9]+\ [01]$ ]] || die "unexpected box cleanup response; pending work retained"
 read -r expected needs_restart <<< "$result"
 overall_rc=0
 for profile in "${PROFILES[@]}"; do
   say "=== $profile ==="
+  [ "$RECREATED_ONLY" != 1 ] || continue
   remove_service "$profile" || overall_rc=1
   # In automatic mode a recreated directory is never removed, even if it
   # appeared after orphan discovery. The next sweep will provision it again.

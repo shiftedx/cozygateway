@@ -490,6 +490,7 @@ DEPROVISION="$SCRIPT_DIR/deprovision-bot.sh"
   || { log "sweep aborted: Hermes profiles root unavailable"; exit 1; }
 export HERMES_HOME_ROOT
 orphans=()
+live_cleanup=()
 add_orphan() {
   local profile="$1"
   [[ "$profile" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || return 0
@@ -527,6 +528,15 @@ if [ "$(( now_epoch - last_epoch ))" -ge "$RECONCILE_SECONDS" ]; then
     exit 1
   fi
   while IFS= read -r profile; do add_orphan "$profile"; done <<< "$configured"
+  if ! journaled="$("$DEPROVISION" --list-pending 2>> "$LOG_FILE")"; then
+    log "sweep aborted: pending cleanup read failed; next sweep will retry"
+    exit 1
+  fi
+  while IFS= read -r profile; do
+    [ -n "$profile" ] || continue
+    [ -d "$HERMES_HOME_ROOT/profiles/$profile" ] && [ ! -L "$HERMES_HOME_ROOT/profiles/$profile" ] || continue
+    live_cleanup+=("$profile")
+  done <<< "$journaled"
   reconciled=1
 fi
 if [ "${#orphans[@]}" -gt 0 ]; then
@@ -559,17 +569,29 @@ for dir in "$HERMES_HOME_ROOT"/profiles/*/; do
   fi
 done
 
-if [ "${#pending[@]}" -eq 0 ]; then
-  # Deliberately quiet: this is the steady state and it runs every 30 seconds.
-  exit 0
+if [ "${#pending[@]}" -gt 0 ]; then
+  log "provisioning: ${pending[*]}"
+  args=()
+  [ "$DRY_RUN" = 1 ] && args+=(--dry-run)
+  if "$PROVISION" ${args[@]+"${args[@]}"} "${pending[@]}" >> "$LOG_FILE" 2>&1; then
+    log "sweep done: ${pending[*]} provisioned"
+  else
+    log "sweep FAILED for one or more of: ${pending[*]} (see the output above)"
+    exit 1
+  fi
 fi
-
-log "provisioning: ${pending[*]}"
-args=()
-[ "$DRY_RUN" = 1 ] && args+=(--dry-run)
-if "$PROVISION" ${args[@]+"${args[@]}"} "${pending[@]}" >> "$LOG_FILE" 2>&1; then
-  log "sweep done: ${pending[*]} provisioned"
-else
-  log "sweep FAILED for one or more of: ${pending[*]} (see the output above)"
-  exit 1
+# A name recreated after an interrupted deletion is live, but the old
+# journal may still own obsolete custom credential keys. Reconcile only after
+# provisioning establishes its new mapping; no live config/service/path is
+# removed by this mode, and all currently referenced token keys are protected.
+if [ "${#live_cleanup[@]}" -gt 0 ]; then
+  args=(--reconcile-recreated)
+  [ "$DRY_RUN" = 1 ] && args+=(--dry-run)
+  if "$DEPROVISION" "${args[@]}" "${live_cleanup[@]}" >> "$LOG_FILE" 2>&1; then
+    log "old cleanup completed for recreated profiles: ${live_cleanup[*]}"
+  else
+    log "cleanup for recreated profiles FAILED; next sweep will retry"
+    rm -f "$STAMP"
+    exit 1
+  fi
 fi
