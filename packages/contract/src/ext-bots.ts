@@ -941,6 +941,14 @@ export const BotApprovalScopeSchema = Type.Object({
   system: Type.String({ minLength: 1, maxLength: 64 }),
   /** The target resource inside that system. A grant is bounded to this exact resource. */
   resource: Type.String({ minLength: 1, maxLength: 256 }),
+  /** What `resource` actually names. `object` (the default when absent, and what every peer that
+   *  names a real target sends) is a thing the action would act on, which is what a standing
+   *  CATEGORY grant is bounded by. `action` says the peer could only name the operation itself, so
+   *  the resource is the tool rather than the object, and a category grant over it would cover every
+   *  object that tool can reach: it is refused, and only a single-use grant is on offer. */
+  resourceKind: Type.Optional(Type.Union([
+    Type.Literal("object"), Type.Literal("action"),
+  ])),
   /** The exact material change, in one sentence a person can check. */
   change: Type.String({ minLength: 1, maxLength: 400 }),
   /** What else happens if it runs. Empty when the peer claims none. */

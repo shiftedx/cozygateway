@@ -1123,10 +1123,33 @@ export class NativeBotDataPlane {
       turnId: string; payload: unknown; expiresAt: number | null; updatedAt: number;
     }) => void;
     expireTurn: (bot: string, sessionId: string, turnId: string) => boolean;
+    claimApprovalGrant: (input: {
+      bot: string; sessionId: string; turnId: string; approvalId: string;
+      name: string; detail?: string; scope?: BotApprovalScope;
+    }) => string | undefined;
+    honorApprovalGrant: (input: {
+      bot: string; sessionId: string; turnId: string; approvalId: string; grantId: string;
+    }) => void;
   } {
     return {
       schedule: (pending) => this.#scheduleInteractionExpiry(pending),
       expireTurn: (bot, sessionId, turnId) => this.#expireTurnInteractions(bot, sessionId, turnId),
+      // Capability 66, F4. The rooms reach the 1:1 lane's own consult through here, ingredients in
+      // rather than a binding, so the derivation for a plain ask lives in exactly one place and a
+      // room ask is covered on the same terms a chat ask is. The stored record is the authority on
+      // the ask's expiry, including the persisted fallback a legacy approval gets.
+      claimApprovalGrant: ({ bot, sessionId, turnId, approvalId, name, detail, scope }) => {
+        const covering = scope ?? plainApprovalScope(
+          { name, ...(detail === undefined ? {} : { detail }) },
+          this.#storage.nativeInteraction(bot, "approval", approvalId)?.expiresAt ?? null,
+        );
+        if (covering === undefined) return undefined;
+        return this.#claimGrant(bot, sessionId, turnId, covering, scope === undefined);
+      },
+      honorApprovalGrant: ({ bot, sessionId, turnId, approvalId, grantId }) => {
+        this.#storage.attachInteractionGrant(bot, approvalId, grantId);
+        this.#honorApprovalGrant(bot, sessionId, turnId, approvalId, grantId);
+      },
     };
   }
 
@@ -2213,9 +2236,12 @@ export class NativeBotDataPlane {
       resource: scope.resource,
       payloadHash: scope.payloadHash,
       allowOnce: derived || scope.retry === "idempotent",
-      // A category grant needs a DECLARED category. A derived binding has none, so only the
-      // person's own single-use grant can answer for a plain ask.
-      allowCategory: !derived,
+      // A category grant needs a DECLARED category AND a real object to be bounded to. A derived
+      // binding has no category, and a block whose resource is the tool itself has no object, so
+      // only the person's own single-use grant can answer for either. Checked here as well as at
+      // the decision, so a category grant another peer made against a real object of the same name
+      // cannot answer for one by the back door.
+      allowCategory: !derived && scope.resourceKind !== "action",
       now,
     });
   }
@@ -2346,6 +2372,12 @@ export class NativeBotDataPlane {
       // destructive or publishing action nobody categorized. One ask at a time is the only offer.
       if (derived) return "category_undeclared";
       if (ALWAYS_REQUIRE_APPROVAL_CATEGORIES.includes(scope.category)) return "category_forbidden";
+      // Capability 66. A resource that is only the TOOL is not a resource a category grant may be
+      // bounded by: such a grant covers any payload of that action on that resource, so over a
+      // block whose resource IS the action it would cover every object that tool can reach,
+      // bounded by nothing the person was shown. Same code and same reasoning as a plain ask: one
+      // decision at a time is what is on offer, and `grant: "once"` still is.
+      if (scope.resourceKind === "action") return "category_undeclared";
       const now = this.#now();
       // A standing grant is bounded in time by construction: a dead or unbounded expiry is refused
       // here rather than stored and consulted later.
@@ -2384,7 +2416,8 @@ export class NativeBotDataPlane {
       if (grantRequest?.grant === undefined || decision !== "approve") return "requested";
       if (scope === undefined) return "scope_required";
       if (ALWAYS_REQUIRE_APPROVAL_CATEGORIES.includes(scope.category)) return "category_forbidden";
-      if (derived && grantRequest.grant === "category") return "category_undeclared";
+      if (grantRequest.grant === "category" && (derived || scope.resourceKind === "action"))
+        return "category_undeclared";
       const category = grantRequest.grant === "category";
       const now = this.#now();
       const recorded = this.#storage.recordApprovalGrant({

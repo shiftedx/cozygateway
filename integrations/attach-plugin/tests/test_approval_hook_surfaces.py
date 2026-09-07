@@ -25,8 +25,12 @@ import cozygateway.adapter as adapter_module
 class _RecordingAdapter:
     def __init__(self):
         self.events = []
+        self.scopes = []
 
-    def observe_approval_event(self, chat_id, approval_id, name, status):
+    def observe_approval_event(self, chat_id, approval_id, name, status, scope=None):
+        # Capability 66's block rides beside the four fields this suite pins; it is recorded
+        # separately so every assertion below stays the pre-66 tuple it was.
+        self.scopes.append(scope)
         self.events.append((chat_id, approval_id, name, status))
 
 

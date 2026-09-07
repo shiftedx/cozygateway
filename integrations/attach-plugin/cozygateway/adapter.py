@@ -2661,6 +2661,7 @@ class AttachAdapter:
         approval_id: str,
         name: str,
         status: str,
+        scope: Optional[Dict[str, Any]] = None,
     ) -> None:
         loop = self._loop
         if loop is None:
@@ -2671,7 +2672,9 @@ class AttachAdapter:
             return
         try:
             asyncio.run_coroutine_threadsafe(
-                client.send_approval(chat_id, turn_id, approval_id, approval_id, name, status),
+                client.send_approval(
+                    chat_id, turn_id, approval_id, approval_id, name, status, scope=scope,
+                ),
                 loop,
             )
         except Exception:  # noqa: BLE001
@@ -5263,6 +5266,182 @@ def _is_answerable_approval(kwargs: Dict[str, Any]) -> bool:
     return str(kwargs.get("surface") or "").strip() in ANSWERABLE_APPROVAL_SURFACES
 
 
+# Capability 66. How long a block this peer raises stays answerable, in milliseconds. It matches
+#: the gateway's own default approval deadline, and it is a CEILING on any standing grant made
+#: from the ask: a grant dies at the ask's own expiry or sooner, never later.
+APPROVAL_SCOPE_TTL_MS = 600_000
+
+#: Capability 66's closed category set, in the order the classifier tries them. Order is
+#: load-bearing: the five specific families are tested before `destructive`, so "delete the
+#: payment method" is an account change rather than a plain deletion, and a call that matches
+#: nothing lands on `other`, the one category a standing category grant can ever cover.
+#:
+#: Matching is on the ACTION IDENTITY only (the Hermes pattern key or tool name), never on the
+#: command text or its arguments: row 66 forbids a secret, credential, URL, header or env value in
+#: any wire string, and this plugin cannot tell one from a path.
+_APPROVAL_CATEGORY_MARKERS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("money_movement", (
+        "pay", "payment", "charge", "invoice", "transfer", "refund", "payout", "checkout",
+        "purchase", "stripe", "billing_charge",
+    )),
+    ("secret_access", (
+        "secret", "credential", "password", "passphrase", "token", "apikey", "api_key",
+        "keychain", "vault", "private_key", "ssh_key",
+    )),
+    ("lock_or_alarm", (
+        "lock", "unlock", "alarm", "arm", "disarm", "door", "garage", "deadbolt", "siren",
+    )),
+    ("public_publishing", (
+        "publish", "post", "tweet", "broadcast", "release", "deploy", "share", "send_email",
+        "send_mail", "announce",
+    )),
+    ("account_change", (
+        "account", "role", "permission", "member", "invite", "subscription", "plan", "iam",
+        "owner", "acl",
+    )),
+    ("destructive", (
+        "rm", "delete", "remove", "destroy", "drop", "truncate", "wipe", "erase", "format",
+        "kill", "purge", "overwrite", "reset",
+    )),
+)
+
+#: What the classifier will read as an action identity, in order of preference.
+_APPROVAL_ACTION_KEYS = ("pattern_key", "tool_name", "tool", "name")
+
+
+def _approval_action_identity(kwargs: Dict[str, Any]) -> Optional[str]:
+    """The stable name of the ACTION being asked about, or ``None`` when there is none.
+
+    A `pattern_key` like ``terminal:rm`` is Hermes' own name for the rule that stopped the call, so
+    it is the best identity available; a bare tool name is the fallback. Anything else, including a
+    blank string, means this plugin cannot say what the action is, and row 66's answer to that is a
+    plain approval rather than a guess.
+    """
+    for key in _APPROVAL_ACTION_KEYS:
+        value = kwargs.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _approval_category(action: str) -> Optional[str]:
+    """Place one action identity in capability 66's closed category set, or answer ``None``.
+
+    ``None`` means THIS PLUGIN CANNOT SAY, and it is deliberately not `other`. `other` is the one
+    category a standing CATEGORY grant can ever cover, so answering it for an action nobody placed
+    would unlock exactly the grant row 66 withholds from a plain ask, and for the same stated
+    reason: "a standing category policy over one would silently pre-approve a destructive or
+    publishing action nobody classified". `terminal:rm` places; `terminal:rmdir`, `fs:unlink` and
+    `bank:wire` do not, and a card offering "Always allow" over one of those is the failure this
+    guards. An unplaced call emits no block at all, which leaves the plain pre-66 card and the
+    person's own single-use grant on the derived binding as the only coverage there can be.
+    """
+    haystack = re.sub(r"[^a-z0-9]+", "_", action.lower())
+    tokens = {token for token in haystack.split("_") if token}
+    for category, markers in _APPROVAL_CATEGORY_MARKERS:
+        for marker in markers:
+            # A whole word always counts. A substring counts only for a long marker: `rm` is a
+            # substring of `terminal` and `confirm`, and `arm` of `format`, so a short marker
+            # matched loosely would classify half the catalogue as destructive.
+            if marker in tokens or (len(marker) >= 6 and marker in haystack):
+                return category
+    return None
+
+
+#: An action identity is the ONLY thing that reaches a wire string, so it is the only thing that has
+#: to be checked for one. A rule name has no whitespace, no scheme, no path separator and no
+#: assignment in it; anything that does is carrying a value, and row 66 forbids a URL, a path, a
+#: credential or an env value in any of these strings.
+_UNSAFE_IDENTITY = re.compile(r"[\s=/\\]|://|\.\.")
+
+
+def _is_wire_safe_identity(action: str) -> bool:
+    return not _UNSAFE_IDENTITY.search(action)
+
+
+def _approval_payload_hash(kwargs: Dict[str, Any], action: str) -> str:
+    """The BINDING: sha256 over the material fields, so a changed payload is a changed ask.
+
+    The digest is the one place the command text and its arguments may be read, because a digest
+    reveals none of it. It deliberately excludes the clock, the approval id and the session, so two
+    identical invocations bind identically and a person's standing grant means what it says.
+    """
+    material = {
+        "action": action,
+        "command": kwargs.get("command"),
+        "arguments": kwargs.get("arguments") if isinstance(kwargs.get("arguments"), dict) else None,
+    }
+    try:
+        encoded = json.dumps(material, sort_keys=True, default=str, ensure_ascii=True)
+    except Exception:  # noqa: BLE001
+        encoded = repr(material)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def classify_approval_scope(
+    kwargs: Dict[str, Any], now_ms: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Capability 66's ``BotApprovalScope`` for one Hermes approval, or ``None``.
+
+    Row 66 puts this work here on purpose: "Classifying the action correctly belongs to the harness
+    that raises it." What the classifier promises is narrow and checkable:
+
+    * every wire string is built from the ACTION IDENTITY and Hermes' own human description, never
+      from the command, its arguments, a URL or an env value;
+    * it asks for ``once`` and claims ``unknown`` idempotency, so the gateway can never cover a
+      later ask from it without the person's own single-use grant; and
+    * it answers ``None`` for a call it cannot place, which leaves the plain deny-only card that
+      every Hermes approval gets today. Failing to classify FAILS CLOSED.
+    """
+    action_identity = _approval_action_identity(kwargs)
+    if action_identity is None or not _is_wire_safe_identity(action_identity):
+        return None
+    category = _approval_category(action_identity)
+    if category is None:
+        return None
+    system, _, remainder = action_identity.partition(":")
+    if not remainder:
+        # No namespace to read: an MCP tool is `server__tool`, and a bare tool name belongs to the
+        # harness itself rather than to a named external system.
+        server, sep, tool = action_identity.partition("__")
+        system, remainder = (server, tool) if sep else ("hermes", action_identity)
+    resource = (remainder or action_identity)
+    # COMPOSED, never copied. Hermes' own description is a fine sentence for a person and a bad one
+    # for this field: on the answerable surface it carries the call's arguments (the write guard
+    # builds "Write to protected agent-instruction file(s): <absolute paths>."), and row 66 says
+    # `change` describes an action and never carries its arguments. So the sentence is built from
+    # the two identifiers this plugin already vouched for and nothing else.
+    change = f"Run {action_identity} on {resource} in {system or 'hermes'}."
+    return {
+        "kind": "scoped_approval",
+        "action": action_identity[:64],
+        "category": category,
+        "system": (system or "hermes")[:64],
+        # The action's own target as this plugin can honestly name it: the operation, not its
+        # arguments. A category grant is bounded to it, which is why it must be stable and must
+        # never carry a value a person would not want stored in a policy record.
+        "resource": resource[:256],
+        # The resource is the OPERATION, not the object it would act on: the object lives in the
+        # call's arguments and row 66 forbids one in a wire string. Saying so is what stops a
+        # standing CATEGORY grant being recorded over it, which would otherwise cover every object
+        # that tool can reach. A single-use grant, bound to the payload hash, is still on offer.
+        "resourceKind": "action",
+        "change": change[:400],
+        "effects": [],
+        # Hermes stopped the call under its own approval policy. This peer does not know whether
+        # the operator's guardrail or an always-require rule is what did it, and inventing
+        # `always_require` here would claim a floor the gateway is the authority on.
+        "reason": "peer_policy",
+        "payloadHash": _approval_payload_hash(kwargs, action_identity),
+        "expiresAt": int(now_ms if now_ms is not None else time.time() * 1000) + APPROVAL_SCOPE_TTL_MS,
+        # This plugin cannot prove a Hermes tool call is safe to repeat, and `idempotent` is the
+        # only value a standing once grant is consulted for. `unknown` is the honest answer and the
+        # closed one.
+        "retry": "unknown",
+        "requested": "once",
+    }
+
+
 def _dispatch_approval_hook(phase: str, kwargs: Dict[str, Any]) -> None:
     """Observer-only Hermes approval hook → attach-v1 lifecycle event."""
     try:
@@ -5285,8 +5464,12 @@ def _dispatch_approval_hook(phase: str, kwargs: Dict[str, Any]) -> None:
                 else "cancelled"
             )
         name = str(kwargs.get("pattern_key") or kwargs.get("tool_name") or "tool")
+        # Capability 66. Only the ask carries a block: a settlement names a decision already made,
+        # and there is nothing left to scope. A call the classifier cannot place answers `None`,
+        # which is the plain pre-66 approval.
+        scope = classify_approval_scope(kwargs) if phase == "pending" else None
         for adapter in _active_adapters_snapshot():
-            adapter.observe_approval_event(chat_id, approval_id, name, status)
+            adapter.observe_approval_event(chat_id, approval_id, name, status, scope=scope)
     except Exception:  # noqa: BLE001
         logger.debug("attach: approval-hook dispatch failed", exc_info=True)
 

@@ -7,6 +7,48 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## Unreleased
 
+- A group room's approval now carries its scoped-approval block, so a room ask can be answered
+  with the same scoped decision a 1:1 chat gets (`com.cozylabs.bots` capability 66, F4). The room
+  approval handler validated capability 56's `detail` and capability 62's `repair` and silently
+  dropped capability 66's `scope`, so a covered ask raised on a room turn reached the app as a
+  plain approval: no category, no change sentence, no standing grant to make or revoke. The block
+  is now sanitized once on ingest exactly as the 1:1 lane does, dropped on failure while the
+  approval is kept, and carried byte for byte on the room's `bot_approval_pending` frame, the
+  durable interaction record, the expiry payload, the `GET /bots/approvals` inbox row and the
+  rebroadcast a reconnecting app gets. Nothing else moved: a room approval was already the same
+  durable row the 1:1 lane writes, so the decision routes, the optional decision body, the grant
+  rules, the always-require refusals and the grants view and its `DELETE` already answered for a
+  room approval. The consult moved with it: a room ask is checked against the standing grants before
+  its card goes out, names the `grantId` that covers it on the frame and the record, and is settled
+  through the same `resolve_approval` relay a tapped card sends, reaching the 1:1 lane's own consult
+  rather than a second copy of it, so the plain-ask derivation, the single-use rules and the
+  always-require exclusion cannot drift between a room and a chat. Additive, so a peer that sends no block and a client
+  below 66 are byte identical to their pre-66 selves, and a Hermes-raised room approval keeps
+  rendering the plain card.
+- The attach plugin can send a scope block with an approval it raises (F4). `send_approval` gained
+  an optional `scope` parameter, and the plugin classifies a Hermes tool call into capability 66's
+  closed category set from the tool name and the arguments it already reads for the capability-56
+  detail sentence, so a Hermes-raised approval, in a room or a 1:1 chat, can now carry the block
+  the app needs to offer scoped controls. Omitted when the gateway did not advertise
+  `com.cozylabs.bots >= 66` and when the call cannot be classified, so the plain deny-only card
+  stays exactly what it was. An action the classifier cannot place emits NO block rather than
+  declaring `other`: `other` is the one category a standing category grant can cover, so answering
+  it for an unplaced call would unlock exactly the grant row 66 withholds from a plain ask, and
+  `terminal:rm` places where `terminal:rmdir` and `bank:wire` do not. The `change` sentence is
+  COMPOSED from the action and the resource rather than copied from the harness description, which
+  on the answerable surface carries the call's arguments and absolute paths; an action identity
+  carrying a URL, a path, whitespace or an assignment is refused outright, since the identity is the
+  only thing that reaches a wire string. Every block it does send declares `resourceKind: "action"`,
+  the new optional member of `BotApprovalScope`: the resource is the operation, never the object the
+  operation would touch, because the object lives in the call's arguments and row 66 forbids one on
+  this wire. A category grant covers any payload of that action on that resource, so over such a
+  block it would cover every object that tool can reach; `grant: "category"` on one is now
+  `409 approval_category_undeclared` at the decision AND at the consult, so a category grant another
+  peer made against a real object of the same name cannot answer for one either. `grant: "once"` is
+  unaffected and is the whole offer there, bound to the payload hash. Absent reads as `object`, so
+  every peer and client that names a real resource is byte identical to its earlier self, and the
+  always-require floor is untouched and still refuses first.
+
 - The owner-loss lease no longer reaps a turn whose peer was lost mid model request
   (`com.cozylabs.bots` capability 69, F2). Capability 69 starts a 120 second lease the instant a
   peer's socket closes, and for a peer that was answering heartbeats right up to that instant,
