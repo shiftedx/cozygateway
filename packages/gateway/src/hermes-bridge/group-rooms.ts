@@ -400,7 +400,7 @@ export class GroupRooms {
   /** Creates a room. Membership is validated against a FRESH profile list BEFORE anything is
    *  written, so a room can never exist naming a bot that does not, and the caller gets one 400
    *  naming every member that is missing instead of a room that fails on its first round. */
-  async create(rawName: string, rawMembers: string[]): Promise<BotGroup> {
+  async create(rawName: string, rawMembers: string[], owningHost?: string): Promise<BotGroup> {
     const name = rawName.trim();
     if (name.length === 0) throw new GroupInvalid("a group name is required");
     if (name.length > GROUP_NAME_MAX) {
@@ -442,7 +442,7 @@ export class GroupRooms {
       );
     }
 
-    if (!this.#storage.createBotGroup({ key, name, members, createdAt: this.#now() })) {
+    if (!this.#storage.createBotGroup({ key, name, members, ...(owningHost === undefined ? {} : { owningHost }), createdAt: this.#now() })) {
       throw new GroupExists(name);
     }
     const room = this.#storage.botGroup(key);
@@ -1501,7 +1501,7 @@ function sleep(ms: number): Promise<void> {
  *  both need to name the type rather than test for `instanceof HermesBridge`. */
 export interface RoomHost {
   groups(): BotGroup[];
-  createGroup(name: string, members: string[]): Promise<BotGroup>;
+  createGroup(name: string, members: string[], owningHost?: string): Promise<BotGroup>;
   deleteGroup(name: string): void;
   groupDetail(name: string): BotGroupDetail;
   sendGroupMessage(name: string, text: string, opts?: { clientId?: string }): BotGroupMessage;
@@ -1552,8 +1552,8 @@ export class GatewayRoomHost implements RoomHost {
   groups(): BotGroup[] {
     return this.#rooms.list();
   }
-  createGroup(name: string, members: string[]): Promise<BotGroup> {
-    return this.#rooms.create(name, members);
+  createGroup(name: string, members: string[], owningHost?: string): Promise<BotGroup> {
+    return this.#rooms.create(name, members, owningHost);
   }
   deleteGroup(name: string): void {
     this.#rooms.remove(name);

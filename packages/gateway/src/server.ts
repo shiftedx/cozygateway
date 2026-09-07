@@ -645,8 +645,11 @@ export async function startGateway(
           raiseLiveActivityFrame(presence);
         },
         roomHost,
-        // Ownership is resolved from the room's durable membership, once per room.
+        // Legacy ownership is resolved from immutable durable membership exactly once. New rooms
+        // persist it at create, and deleted rooms read the matching turn tombstone.
         (key) => storage.botGroup(key)?.members,
+        (key) => storage.botGroupOwner(key),
+        (key, owner) => storage.backfillBotGroupOwner(key, owner),
       ));
   // Every host that can drive a room on this gateway: each endpoint's bridge, plus the gateway's
   // own host. On a single un-namespaced endpoint that is just the bridge, exactly as before.

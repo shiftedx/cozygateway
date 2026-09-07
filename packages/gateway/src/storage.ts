@@ -388,10 +388,19 @@ CREATE TABLE IF NOT EXISTS bot_groups (
   key TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   members_json TEXT NOT NULL,
+  -- F8b. NULL is a room written before ownership persistence. Federation derives and backfills it
+  -- once; new federated rooms write their host in the same create transaction as their membership.
+  owning_host TEXT,
   created_at INTEGER NOT NULL,
   epoch INTEGER NOT NULL,
   needs_you INTEGER NOT NULL,
   next_seq INTEGER NOT NULL
+) STRICT;
+-- Deleted rooms retain their owner while bot_group_turns retains late-event tombstones. There is
+-- no turn-pruning job today, so this table deliberately has none either.
+CREATE TABLE IF NOT EXISTS bot_group_owner_tombstones (
+  group_key TEXT PRIMARY KEY,
+  owning_host TEXT NOT NULL
 ) STRICT;
 CREATE TABLE IF NOT EXISTS bot_group_log (
   group_key TEXT NOT NULL REFERENCES bot_groups(key) ON DELETE CASCADE,
@@ -1157,6 +1166,7 @@ export interface BotGroupRow {
   key: string;
   name: string;
   members: string[];
+  owningHost?: string;
   createdAt: number;
   epoch: number;
   needsYou: boolean;
@@ -1246,6 +1256,7 @@ interface BotGroupDbRow {
   key: string;
   name: string;
   membersJson: string;
+  owningHost: string | null;
   createdAt: number;
   epoch: number;
   needsYou: number;
@@ -1258,6 +1269,7 @@ function toBotGroupRow(row: BotGroupDbRow): BotGroupRow {
     key: row.key,
     name: row.name,
     members: Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [],
+    ...(row.owningHost === null ? {} : { owningHost: row.owningHost }),
     createdAt: row.createdAt,
     epoch: row.epoch,
     needsYou: row.needsYou === 1,
@@ -2582,7 +2594,7 @@ export class Storage {
 
   /** Creates a room. Returns false when one already exists under the same case-insensitive key,
    *  which the route answers as a 409 rather than silently adopting a different membership. */
-  createBotGroup(room: { key: string; name: string; members: string[]; createdAt: number }): boolean {
+  createBotGroup(room: { key: string; name: string; members: string[]; owningHost?: string; createdAt: number }): boolean {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const existing = this.#db.prepare("SELECT key FROM bot_groups WHERE key = ?").get(room.key);
@@ -2592,10 +2604,10 @@ export class Storage {
       }
       this.#db
         .prepare(
-          `INSERT INTO bot_groups (key, name, members_json, created_at, epoch, needs_you, next_seq)
-           VALUES (?, ?, ?, ?, 0, 0, 1)`,
+          `INSERT INTO bot_groups (key, name, members_json, owning_host, created_at, epoch, needs_you, next_seq)
+           VALUES (?, ?, ?, ?, ?, 0, 0, 1)`,
         )
-        .run(room.key, room.name, JSON.stringify(room.members), room.createdAt);
+        .run(room.key, room.name, JSON.stringify(room.members), room.owningHost ?? null, room.createdAt);
       const member = this.#db.prepare(
         "INSERT INTO bot_group_members (group_key, member, watermark, session_id) VALUES (?, ?, 0, ?)",
       );
@@ -2611,7 +2623,7 @@ export class Storage {
   botGroups(): BotGroupRow[] {
     const rows = this.#db
       .prepare(
-        `SELECT key, name, members_json AS membersJson, created_at AS createdAt, epoch,
+        `SELECT key, name, members_json AS membersJson, owning_host AS owningHost, created_at AS createdAt, epoch,
                 needs_you AS needsYou, next_seq AS nextSeq
          FROM bot_groups ORDER BY created_at, key`,
       )
@@ -2622,7 +2634,7 @@ export class Storage {
   botGroup(key: string): BotGroupRow | undefined {
     const row = this.#db
       .prepare(
-        `SELECT key, name, members_json AS membersJson, created_at AS createdAt, epoch,
+        `SELECT key, name, members_json AS membersJson, owning_host AS owningHost, created_at AS createdAt, epoch,
                 needs_you AS needsYou, next_seq AS nextSeq
          FROM bot_groups WHERE key = ?`,
       )
@@ -2639,6 +2651,12 @@ export class Storage {
       this.#db.prepare(
         "UPDATE bot_group_turns SET state = 'cancelled', detail = 'group deleted', completed_at = COALESCE(completed_at, 0) WHERE group_key = ? AND state = 'pending'",
       ).run(key);
+      // `bot_group_turns` intentionally outlives the room for late attach terminals. Its owner
+      // must outlive the row on the same lifecycle; there is no turn pruning today, so this
+      // tombstone has no invented pruning policy either.
+      this.#db.prepare(
+        "INSERT OR REPLACE INTO bot_group_owner_tombstones (group_key, owning_host) SELECT key, owning_host FROM bot_groups WHERE key = ? AND owning_host IS NOT NULL AND EXISTS (SELECT 1 FROM bot_group_turns WHERE group_key = ?)",
+      ).run(key, key);
       const deleted = this.#db.prepare("DELETE FROM bot_groups WHERE key = ?").run(key).changes === 1;
       this.#db.exec("COMMIT");
       return deleted;
@@ -2646,6 +2664,20 @@ export class Storage {
       this.#db.exec("ROLLBACK");
       throw err;
     }
+  }
+
+  /** The live row wins over a deleted-room tombstone when the same name is recreated. */
+  botGroupOwner(key: string): string | undefined {
+    const live = this.#db.prepare("SELECT owning_host AS owningHost FROM bot_groups WHERE key = ?").get(key) as { owningHost: string | null } | undefined;
+    if (live?.owningHost !== null && live !== undefined) return live.owningHost;
+    const tombstone = this.#db.prepare("SELECT owning_host AS owningHost FROM bot_group_owner_tombstones WHERE group_key = ?").get(key) as { owningHost: string } | undefined;
+    return tombstone?.owningHost;
+  }
+
+  /** Legacy rooms have immutable membership but no owner. Set it once after the deterministic
+   * federation derivation; a concurrent or newer write never changes it. */
+  backfillBotGroupOwner(key: string, owningHost: string): void {
+    this.#db.prepare("UPDATE bot_groups SET owning_host = ? WHERE key = ? AND owning_host IS NULL").run(owningHost, key);
   }
 
   /** Appends one entry and hands back the room-local `seq` it was given. The counter lives on the
@@ -6106,6 +6138,11 @@ export function openStorage(dbPath: string): Storage {
     ["bot_group_turns", [
       ["cause_kind", "ALTER TABLE bot_group_turns ADD COLUMN cause_kind TEXT"],
       ["cause_seq", "ALTER TABLE bot_group_turns ADD COLUMN cause_seq INTEGER"],
+    ]],
+    // F8b. Membership is immutable, so a federated reader can derive this once for a room written
+    // before this column and persist it. A NULL must remain NULL until that reader has evidence.
+    ["bot_groups", [
+      ["owning_host", "ALTER TABLE bot_groups ADD COLUMN owning_host TEXT"],
     ]],
     ["bot_native_messages", [
       ["turn_id", "ALTER TABLE bot_native_messages ADD COLUMN turn_id TEXT"],

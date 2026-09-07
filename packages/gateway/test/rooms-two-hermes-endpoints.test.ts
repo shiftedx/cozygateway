@@ -26,6 +26,7 @@ import {
   type FederationMember,
 } from "../src/hermes-bridge/federation.ts";
 import type { GatewayRoomHost, RoomHost } from "../src/hermes-bridge/group-rooms.ts";
+import { openStorage, type Storage } from "../src/storage.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
 
 async function until(check: () => boolean | Promise<boolean>, timeout = 5_000): Promise<void> {
@@ -42,19 +43,55 @@ async function until(check: () => boolean | Promise<boolean>, timeout = 5_000): 
 class RecordingHost {
   readonly calls: string[] = [];
   readonly id: string;
-  constructor(id: string) { this.id = id; }
+  readonly #createRoom: ((name: string, members: string[], owningHost: string | undefined) => void) | undefined;
+  readonly #deleteRoom: ((name: string) => void) | undefined;
+  constructor(id: string, opts: {
+    createRoom?: (name: string, members: string[], owningHost: string | undefined) => void;
+    deleteRoom?: (name: string) => void;
+  } = {}) { this.id = id; this.#createRoom = opts.createRoom; this.#deleteRoom = opts.deleteRoom; }
   groups(): never[] { return []; }
-  createGroup(name: string, members: string[]): Promise<{ name: string; members: string[] }> {
+  createGroup(name: string, members: string[], owningHost?: string): Promise<{ name: string; members: string[] }> {
     this.calls.push(`create:${name}`);
+    this.#createRoom?.(name, members, owningHost);
     return Promise.resolve({ name, members });
   }
-  deleteGroup(name: string): void { this.calls.push(`delete:${name}`); }
+  deleteGroup(name: string): void { this.calls.push(`delete:${name}`); this.#deleteRoom?.(name); }
   groupDetail(name: string): { name: string } { this.calls.push(`detail:${name}`); return { name }; }
   sendGroupMessage(name: string): { id: string } { this.calls.push(`send:${name}`); return { id: `${this.id}:1` }; }
   setGroupNativeTurns(): void {}
   setGroupInteractionExpiry(): void {}
   canAcceptGroupAttachEvent(): boolean { return false; }
   handleGroupAttachEvent(): boolean { return false; }
+}
+
+function durableSurface(storage: Storage): {
+  federation: FederatedBotControlSurface;
+  hosts: { home: RecordingHost; studio: RecordingHost; gateway: RecordingHost };
+  reads: { members: number };
+} {
+  const reads = { members: 0 };
+  const roomOptions = {
+    createRoom: (name: string, members: string[], owningHost: string | undefined) => {
+      storage.createBotGroup({ key: name.trim().toLowerCase(), name, members, ...(owningHost === undefined ? {} : { owningHost }), createdAt: 1 });
+    },
+    deleteRoom: (name: string) => { storage.deleteBotGroup(name.trim().toLowerCase()); },
+  };
+  const hosts = {
+    home: new RecordingHost("home", roomOptions), studio: new RecordingHost("studio", roomOptions), gateway: new RecordingHost("gateway", roomOptions),
+  };
+  const members: FederationMember[] = [
+    { id: "home", bridge: hosts.home as unknown as FederationMember["bridge"] },
+    { id: "studio", bridge: hosts.studio as unknown as FederationMember["bridge"] },
+  ];
+  const federation = new FederatedBotControlSurface(
+    members,
+    undefined,
+    hosts.gateway as unknown as GatewayRoomHost,
+    (key) => { reads.members += 1; return storage.botGroup(key)?.members; },
+    (key) => storage.botGroupOwner(key),
+    (key, owner) => storage.backfillBotGroupOwner(key, owner),
+  );
+  return { federation, hosts, reads };
 }
 
 function surface(rooms: Map<string, string[]>): {
@@ -76,6 +113,77 @@ function surface(rooms: Map<string, string[]>): {
 }
 
 describe("room ownership on a federated control surface", () => {
+  it("persists a newly created room owner in the create transaction", async () => {
+    const storage = openStorage(":memory:");
+    try {
+      const { federation } = durableSurface(storage);
+      await federation.createGroup("Launch", ["home:luna", "home:sage"]);
+      expect(storage.botGroup("launch")?.owningHost).toBe("home");
+      expect(storage.botGroupOwner("launch")).toBe("home");
+    } finally { storage.close(); }
+  });
+
+  it("reads a persisted owner without walking room membership", async () => {
+    const storage = openStorage(":memory:");
+    try {
+      const first = durableSurface(storage);
+      await first.federation.createGroup("Launch", ["home:luna", "home:sage"]);
+      const restarted = durableSurface(storage);
+      restarted.federation.groupDetail("Launch");
+      expect(restarted.reads.members).toBe(0);
+      expect(restarted.hosts.home.calls).toEqual(["detail:Launch"]);
+    } finally { storage.close(); }
+  });
+
+  it("backfills a pre-migration room owner on its first federated lookup", () => {
+    const storage = openStorage(":memory:");
+    try {
+      storage.createBotGroup({ key: "launch", name: "Launch", members: ["home:luna", "home:sage"], createdAt: 1 });
+      const { federation, reads, hosts } = durableSurface(storage);
+      federation.groupDetail("Launch");
+      expect(reads.members).toBe(1);
+      expect(hosts.home.calls).toEqual(["detail:Launch"]);
+      expect(storage.botGroupOwner("launch")).toBe("home");
+    } finally { storage.close(); }
+  });
+
+  it("bounds the durable-owner cache while every room still resolves", () => {
+    const storage = openStorage(":memory:");
+    try {
+      for (let index = 0; index < 300; index += 1)
+        storage.createBotGroup({ key: `room-${index}`, name: `Room ${index}`, members: ["home:luna", "home:sage"], owningHost: "home", createdAt: index });
+      const { federation, hosts } = durableSurface(storage);
+      for (let index = 0; index < 300; index += 1) federation.groupDetail(`room-${index}`);
+      // room-0 is the least recently used entry and was evicted; it still resolves from storage.
+      federation.groupDetail("room-0");
+      expect(federation.roomHostCacheSizeForTesting()).toBeLessThanOrEqual(256);
+      expect(hosts.home.calls).toHaveLength(301);
+    } finally { storage.close(); }
+  });
+
+  it("retains a deleted room owner with its unpruned turn tombstones", async () => {
+    const storage = openStorage(":memory:");
+    try {
+      const { federation, hosts } = durableSurface(storage);
+      await federation.createGroup("Launch", ["home:luna", "home:sage"]);
+      const threadId = storage.ensureBotGroupThread("launch", "home:luna");
+      storage.beginBotGroupTurn({
+        key: "launch", turnId: "late", member: "home:luna", agentId: "home:luna", threadId,
+        messageId: "user", epoch: 0, watermark: 0, createdAt: 2,
+      });
+      federation.deleteGroup("Launch");
+      // `bot_group_turns` has no pruning mechanism today, so its ownership tombstone has the same
+      // intentionally unbounded lifecycle instead of a made-up retention timer.
+      expect(storage.botGroup("launch")).toBeUndefined();
+      expect(storage.botGroupOwner("launch")).toBe("home");
+      expect(federation.roomHostFor("launch")).toBe(hosts.home as unknown as RoomHost);
+
+      await federation.createGroup("No Turn", ["home:luna", "home:sage"]);
+      federation.deleteGroup("No Turn");
+      expect(storage.botGroupOwner("no turn")).toBeUndefined();
+    } finally { storage.close(); }
+  });
+
   it("hosts a room whose members all live on one endpoint on that endpoint", async () => {
     const rooms = new Map<string, string[]>();
     const { federation, hosts } = surface(rooms);
@@ -280,12 +388,11 @@ describe("rooms on a gateway with two Hermes endpoints", () => {
     expect((await authed("/bots/groups/launch", { method: "DELETE" })).status).toBe(204);
   }, 30_000);
 
-  it("re-derives every room's host after a restart over the same storage, including one whose member was deleted", async () => {
-    // The ruling rests on ownership surviving a restart. The memo dies with the process, so a
-    // restarted gateway rebuilds it from `members_json`, which nothing ever updates: not a member
-    // being deleted (`purgeBot` leaves `bot_groups` and `bot_group_members` alone), not anything
-    // else. Three rooms with three different hosts prove each one lands back where it started, and
-    // a member turn in each proves the routing followed.
+  it("keeps every persisted room host after restart, including one whose member was deleted", async () => {
+    // The owner is stored with immutable membership. A restart reads that owner without a
+    // membership walk; a member deletion does not alter either value. Three rooms with three
+    // different hosts prove each one lands back where it started, and a member turn in each proves
+    // the routing followed.
     let homeProfiles = ["luna", "sage"];
     const list = (names: () => string[]) => (): unknown => ({
       profiles: names().map((name) => ({ name, description: name, has_avatar: false })),

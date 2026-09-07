@@ -278,7 +278,7 @@ export interface BotControlSurface {
   deleteRoutine(name: string, id: string): Promise<void>;
   setFocus(deviceId: string, screen: BotFocusScreen | null): void;
   groups(): BotGroup[];
-  createGroup(name: string, members: string[]): Promise<BotGroup>;
+  createGroup(name: string, members: string[], owningHost?: string): Promise<BotGroup>;
   deleteGroup(name: string): void;
   groupDetail(name: string): BotGroupDetail;
   sendGroupMessage(
@@ -614,8 +614,8 @@ export class HermesBridge implements BotControlSurface {
   groups(): BotGroup[] {
     return this.#groups.list();
   }
-  createGroup(name: string, members: string[]): Promise<BotGroup> {
-    return this.#groups.create(name, members);
+  createGroup(name: string, members: string[], owningHost?: string): Promise<BotGroup> {
+    return this.#groups.create(name, members, owningHost);
   }
   deleteGroup(name: string): void {
     this.#groups.remove(name);
