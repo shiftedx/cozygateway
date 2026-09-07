@@ -24,7 +24,7 @@ import {
   validateListenerHost,
 } from "./configure.ts";
 
-const USAGE = `usage: cozygateway [status|configure|serve|pair] --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>] [--kind device|runner]`;
+const USAGE = `usage: cozygateway [status|configure|serve|pair] --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>] [--kind device|runner|observer]`;
 
 export interface CliIo {
   interactive: boolean;
@@ -291,7 +291,9 @@ async function runPair(
   // client. A device payload is byte-identical to the one every shipped app already reads.
   const payload = kind === "runner"
     ? { gatewayUrl, setupCode: code, kind: "runner" as const }
-    : { gatewayUrl, setupCode: code };
+    : kind === "observer"
+      ? { gatewayUrl, setupCode: code, kind: "observer" as const }
+      : { gatewayUrl, setupCode: code };
   const payloadJson = JSON.stringify(payload);
   try {
     console.log(renderQrHalfBlocks(encodeQr(payloadJson), { color: process.stdout.isTTY === true }));
@@ -305,11 +307,15 @@ async function runPair(
   console.log(
     kind === "runner"
       ? "Pair a computer with: cozyagents runner pair <code> --gateway <url>, or scan the QR from the installer."
-      : "Scan the QR code with CozyChat, or type the gateway URL and setup code in the app.",
+      : kind === "observer"
+        // Capability 72. An observer is read-only: the token this code mints can watch the
+        // gateway and can never act on it, so the instruction says what the code is for.
+        ? "Open the dashboard in a browser and paste the gateway URL and setup code. The token it mints can only read."
+        : "Scan the QR code with CozyChat, or type the gateway URL and setup code in the app.",
   );
   console.log(
     `Setup code ${code} is valid for ${describeTtl(ttlMs)}. Mint a fresh one with: cozygateway pair`
-      + (kind === "runner" ? " --kind runner" : ""),
+      + (kind === "device" ? "" : ` --kind ${kind}`),
   );
   if (isLoopbackUrl(payload.gatewayUrl)) {
     console.log(
@@ -386,9 +392,10 @@ export async function runCli(argv: string[], suppliedIo?: CliIo, runtime: CliRun
 
   if (command === "pair") {
     // Capability 52. `--kind runner` mints a code that can only pair a computer that runs bots.
+    // Capability 72 adds `observer`, a code that can only mint a read-only device token.
     const kind = values.kind ?? "device";
-    if (kind !== "device" && kind !== "runner") {
-      console.error("--kind must be device or runner");
+    if (kind !== "device" && kind !== "runner" && kind !== "observer") {
+      console.error("--kind must be device, runner or observer");
       return 1;
     }
     await runPair(configPath, values.url, values.ttl, kind);

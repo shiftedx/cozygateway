@@ -48,6 +48,23 @@ release; everything older is marked pre-release so installers resolve one "lates
   unaffected and is the whole offer there, bound to the payload hash. Absent reads as `object`, so
   every peer and client that names a real resource is byte identical to its earlier self, and the
   always-require floor is untouched and still refuses first.
+- An observer device, so a dashboard can watch a gateway and never act on it (`com.cozylabs.bots`
+  capability 72, D1). `cozygateway pair --kind observer` mints a setup code that only an observer
+  pair can spend, `POST /observers/pair-code` mints one from CozyChat's device list the way
+  `POST /runners/pair-code` already mints a runner code and spends the same bucket and TTL, `POST /pair { kind: "observer" }` consumes one and mints a device token whose
+  scope is `read`, and that token is refused `403 scope_read_only` by every write route this
+  gateway serves. The refusal lives in ONE middleware that runs before every route handler rather
+  than in a check each route remembers to make, so a write route added later is refused by
+  construction: the test that proves it walks the router itself instead of a hand written list.
+  The app websocket is held to the same rule, refusing every command frame from a read-scoped
+  socket with an `error` frame carrying `code: "scope_read_only"` while `sync` still works, so an
+  observer can never advertise itself as a phone capability node. An observer appears on
+  `GET /devices` with its `kind` and `scope` beside its name, and `DELETE /devices/:id` deletes it
+  and closes its socket exactly as it does for any device. Every device paired before this change
+  reads back as `scope: "write"` and is refused nothing: the migration that added the column
+  defaults it, so no shipped credential is silently downgraded to read-only. Additive for every
+  client and every peer of every backend, Hermes-backed and CozyAgents-backed alike, with zero
+  plugin changes.
 
 - The owner-loss lease no longer reaps a turn whose peer was lost mid model request
   (`com.cozylabs.bots` capability 69, F2). Capability 69 starts a 120 second lease the instant a

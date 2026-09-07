@@ -15,6 +15,7 @@ import {
 } from "cozygateway-contract";
 
 import type { Storage } from "./storage.ts";
+import type { DeviceScope } from "cozygateway-contract";
 import { hashToken } from "./auth.ts";
 import {
   emitMobileNodeFailure,
@@ -32,6 +33,9 @@ import {
 interface Client {
   socket: WebSocket;
   deviceId: string;
+  /** Capability 72. What this socket's token may do. A `read` socket is an observer: it may
+   *  authenticate and it may `sync`, and every command frame is refused. */
+  scope: DeviceScope;
   heartbeatAlive: boolean;
   mobileCommands: Set<MobileNodeRequestFrame["command"]>;
   mobileForeground: boolean;
@@ -199,7 +203,7 @@ export class WsHub {
         releasePending?.();
         this.#storage.touchDevice(device.id, this.#now());
         client = {
-          socket, deviceId: device.id, heartbeatAlive: true, mobileCommands: new Set(),
+          socket, deviceId: device.id, scope: device.scope, heartbeatAlive: true, mobileCommands: new Set(),
           mobileForeground: false,
           ...(frame.capabilities === undefined ? {} : { capabilities: frame.capabilities }),
         };
@@ -214,6 +218,18 @@ export class WsHub {
       if (client === undefined) {
         this.#send(socket, { type: "error", code: "unauthorized", message: "first frame must be auth" });
         socket.close(1008, "unauthenticated");
+        return;
+      }
+
+      // Capability 72. THE ONE ENFORCEMENT POINT on this socket, the websocket half of the rule
+      // the HTTP middleware applies to every write route. `auth` is handled above and `sync` is a
+      // read; everything else a client can send is a command, so the check is written as "not a
+      // read frame" rather than as a list of commands to keep in step, and a client frame added
+      // later is refused for a read token by construction.
+      if (client.scope === "read" && frame.type !== "sync") {
+        this.#send(socket, {
+          type: "error", code: "scope_read_only", message: "this device token may only read",
+        });
         return;
       }
 

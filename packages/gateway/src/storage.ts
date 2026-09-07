@@ -10,6 +10,8 @@ import {
 import type {
   AttachmentBlock,
   BotChatAttachment,
+  DeviceKind,
+  DeviceScope,
   BotChatMessage,
   BotMobileReceipt,
   BotComposerDraft,
@@ -173,7 +175,9 @@ CREATE TABLE IF NOT EXISTS devices (
   name TEXT NOT NULL,
   token_hash TEXT NOT NULL UNIQUE,
   created_at INTEGER NOT NULL,
-  last_seen_at INTEGER
+  last_seen_at INTEGER,
+  kind TEXT NOT NULL DEFAULT 'device' CHECK (kind IN ('device', 'observer')),
+  scope TEXT NOT NULL DEFAULT 'write' CHECK (scope IN ('read', 'write'))
 ) STRICT;
 CREATE TABLE IF NOT EXISTS setup_codes (
   code TEXT PRIMARY KEY,
@@ -850,8 +854,12 @@ CREATE INDEX IF NOT EXISTS runner_operations_bot ON runner_operations (bot, crea
 `;
 
 /** Capability 52. Which credential a setup code may mint. A code written before 52 has no kind
- *  stored and reads as a device code. */
-export type SetupCodeKind = "device" | "runner";
+ *  stored and reads as a device code. Capability 72 adds `observer`, a code that mints a device
+ *  token whose scope is `read`. */
+export type SetupCodeKind = "device" | "runner" | "observer";
+
+const DEVICE_COLUMNS =
+  "id, name, created_at AS createdAt, last_seen_at AS lastSeenAt, kind, scope";
 
 const RUNNER_COLUMNS =
   "id, name, platform, version, backends, is_default AS isDefault, created_at AS createdAt,"
@@ -862,6 +870,12 @@ export interface DeviceRow {
   name: string;
   createdAt: number;
   lastSeenAt: number | null;
+  /** Capability 72. `observer` is a browser paired to watch and nothing else. A row written
+   *  before 72 reads as `device`, which is what every device paired before 72 was. */
+  kind: DeviceKind;
+  /** Capability 72. `write` for every device paired before 72, so no shipped credential is ever
+   *  silently downgraded by the migration that added this column. */
+  scope: DeviceScope;
 }
 /** Capability 52. One paired computer that runs bots. `platform`, `version` and `backends` are
  *  what that runner last reported on its `hello`, so they are null or empty until it has connected
@@ -1316,25 +1330,39 @@ export class Storage {
     }
   }
 
-  createDevice(device: { id: string; name: string; tokenHash: string; createdAt: number }): void {
+  /** Capability 72. `kind` and `scope` default to the pre-72 answer, so every existing caller
+   *  mints exactly the write-scoped device it minted before. */
+  createDevice(device: {
+    id: string;
+    name: string;
+    tokenHash: string;
+    createdAt: number;
+    kind?: DeviceKind;
+    scope?: DeviceScope;
+  }): void {
     this.#db
-      .prepare("INSERT INTO devices (id, name, token_hash, created_at) VALUES (?, ?, ?, ?)")
-      .run(device.id, device.name, device.tokenHash, device.createdAt);
+      .prepare(
+        "INSERT INTO devices (id, name, token_hash, created_at, kind, scope) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        device.id,
+        device.name,
+        device.tokenHash,
+        device.createdAt,
+        device.kind ?? "device",
+        device.scope ?? "write",
+      );
   }
 
   deviceByTokenHash(tokenHash: string): DeviceRow | undefined {
     return this.#db
-      .prepare(
-        "SELECT id, name, created_at AS createdAt, last_seen_at AS lastSeenAt FROM devices WHERE token_hash = ?",
-      )
+      .prepare(`SELECT ${DEVICE_COLUMNS} FROM devices WHERE token_hash = ?`)
       .get(tokenHash) as DeviceRow | undefined;
   }
 
   listDevices(): DeviceRow[] {
     return this.#db
-      .prepare(
-        "SELECT id, name, created_at AS createdAt, last_seen_at AS lastSeenAt FROM devices ORDER BY created_at",
-      )
+      .prepare(`SELECT ${DEVICE_COLUMNS} FROM devices ORDER BY created_at`)
       .all() as unknown as DeviceRow[];
   }
 
@@ -5801,6 +5829,17 @@ export function openStorage(dbPath: string): Storage {
       .map((column) => column.name),
   );
   if (!setupCodeColumns.has("kind")) db.exec("ALTER TABLE setup_codes ADD COLUMN kind TEXT");
+  // Capability 72. A database whose devices table predates the observer gets both columns with
+  // the pre-72 answer baked in, so every device already paired stays a write-scoped device and no
+  // shipped credential is silently downgraded to read-only.
+  const deviceColumns = new Set(
+    (db.prepare("PRAGMA table_info(devices)").all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!deviceColumns.has("kind"))
+    db.exec("ALTER TABLE devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'device'");
+  if (!deviceColumns.has("scope"))
+    db.exec("ALTER TABLE devices ADD COLUMN scope TEXT NOT NULL DEFAULT 'write'");
   const attachStreamColumns = new Set(
     (db.prepare("PRAGMA table_info(attach_streams)").all() as unknown as Array<{ name: string }>)
       .map((column) => column.name),

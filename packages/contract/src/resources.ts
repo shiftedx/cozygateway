@@ -16,6 +16,8 @@ export const ERROR_CODES = [
   "approval_not_pending",
   "approval_resolution_pending",
   "approval_expired",
+  /** Capability 72. A read-scoped device token tried to act. */
+  "scope_read_only",
   "internal",
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
