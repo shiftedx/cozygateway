@@ -1,0 +1,149 @@
+diff --git a/scripts/build-bundle.mjs b/scripts/build-bundle.mjs
+index 3b31b755548a2c82c3d56cfe480d11cd2fd8b89e..2469a6f739ec13b4f02ff8ecf9675eb006e1056e 100755
+--- a/scripts/build-bundle.mjs
++++ b/scripts/build-bundle.mjs
+@@ -158,7 +158,7 @@ const cliBuild = await build({
+ 
+ const workerBuild = await build({
+   metafile: true,
+-  entryPoints: ["dist/runner/update-worker.js"],
++  entryPoints: ["dist/runner/update-worker-cli.js"],
+   bundle: true,
+   platform: "node",
+   format: "esm",
+diff --git a/scripts/test/bundle-entrypoints.mjs b/scripts/test/bundle-entrypoints.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b269770fa6e85df12bddecfa8975db4460bc4890
+--- /dev/null
++++ b/scripts/test/bundle-entrypoints.mjs
+@@ -0,0 +1,39 @@
++#!/usr/bin/env node
++import assert from "node:assert/strict";
++import { spawnSync } from "node:child_process";
++import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { dirname, join, resolve } from "node:path";
++
++const bundle = resolve(process.argv[2] ?? "dist-bundle/cozyagents.mjs");
++const version = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")).version;
++const stage = mkdtempSync(join(tmpdir(), "cozyagents-entrypoints-"));
++const workerUsage = "Usage: cozyagents-update.mjs --home <path> --operation-id <runner_maintenance_id>";
++
++function run(entry, args, status = 0) {
++  const result = spawnSync(process.execPath, [join(stage, entry), ...args], {
++    cwd: stage, encoding: "utf8", timeout: 30_000, windowsHide: true,
++  });
++  assert.ifError(result.error);
++  assert.equal(result.status, status, `${entry} ${args.join(" ")}: ${result.stderr}`);
++  assert.equal(result.stderr, "", `${entry} ${args.join(" ")} must not write stderr`);
++  return result.stdout.trim();
++}
++
++try {
++  // These are installed as standalone files, with no source tree or node_modules beside them.
++  copyFileSync(bundle, join(stage, "cozyagents.mjs"));
++  copyFileSync(join(dirname(bundle), "cozyagents-update.mjs"), join(stage, "cozyagents-update.mjs"));
++  assert.equal(run("cozyagents.mjs", ["--version"]), version);
++  for (const args of [["--help"], ["runner", "--help"]]) {
++    const help = run("cozyagents.mjs", args);
++    assert.match(help, /^CozyAgents \(Pi /);
++    assert.match(help, /cozyagents runner/);
++    assert.ok(!help.includes(workerUsage), "CLI help must not execute the update worker entrypoint");
++  }
++  assert.equal(run("cozyagents-update.mjs", ["--help"]), workerUsage);
++  assert.equal(run("cozyagents-update.mjs", [], 1), "");
++  console.log("OK    isolated CLI and update worker entrypoints run independently");
++} finally {
++  rmSync(stage, { recursive: true, force: true });
++}
+diff --git a/scripts/test/bundle-smoke.sh b/scripts/test/bundle-smoke.sh
+index 31fca798e826eb92e8bcbd3b737e0ab326b78cae..79f0be25419483c51def6c32e8fc0099a0e472f8 100755
+--- a/scripts/test/bundle-smoke.sh
++++ b/scripts/test/bundle-smoke.sh
+@@ -8,6 +8,8 @@ bundle="${1:-dist-bundle/cozyagents.mjs}"
+ runtime="$(dirname "$bundle")/cozyagents-browser-runtime.tar.gz"
+ [ -f "$runtime" ] || { echo "FAIL  $runtime not found; browser MCP runtime must ship beside the bundle"; exit 1; }
+ 
++node scripts/test/bundle-entrypoints.mjs "$bundle"
++
+ # Copy the bundle somewhere with no package.json, node_modules or dist beside it, because that is
+ # how it lives on an installed machine.
+ stage="$(mktemp -d "${TMPDIR:-/tmp}/cozyagents-smoke.XXXXXX")"
+diff --git a/src/runner/update-worker-cli.ts b/src/runner/update-worker-cli.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..25883ce062b37f78d334807c09c00d2a403d35d8
+--- /dev/null
++++ b/src/runner/update-worker-cli.ts
+@@ -0,0 +1,23 @@
++import { fileURLToPath } from "node:url";
++import { runUpdateWorker } from "./update-worker.js";
++
++// Keep CLI startup separate from the worker helpers imported by the main runner bundle.
++function argument(name: string): string | undefined {
++	const index = process.argv.indexOf(name);
++	return index >= 0 ? process.argv[index + 1] : undefined;
++}
++
++async function main(): Promise<void> {
++	if (process.argv.includes("--help")) {
++		console.log("Usage: cozyagents-update.mjs --home <path> --operation-id <runner_maintenance_id>");
++		return;
++	}
++	const home = argument("--home");
++	const operationId = argument("--operation-id");
++	if (!home || !operationId) throw new Error("update_worker_invalid: --home and --operation-id are required");
++	await runUpdateWorker({ home, operationId });
++}
++
++if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
++	void main().catch(() => { process.exitCode = 1; });
++}
+diff --git a/src/runner/update-worker.ts b/src/runner/update-worker.ts
+index ffcdcf1d167fb5ea18c161a195cfffc224d4a6fb..2971a3c6f6b1a23c606a2152c5f8f3ea71822278 100644
+--- a/src/runner/update-worker.ts
++++ b/src/runner/update-worker.ts
+@@ -1,7 +1,6 @@
+ import { lstat, readFile, rm } from "node:fs/promises";
+ import { platform as osPlatform } from "node:os";
+ import { isAbsolute, join, win32 } from "node:path";
+-import { fileURLToPath } from "node:url";
+ import { replaceFileAtomic } from "./atomic-file.js";
+ import { spawnExec, type Exec } from "./exec.js";
+ import { readInstallState } from "./install-state.js";
+@@ -267,23 +266,3 @@ export async function runUpdateWorker(options: RunUpdateWorkerOptions): Promise<
+ 	}
+ 	await (options.cleanupUpdateJob ?? cleanupUpdateJob)({ home: options.home, operationId: options.operationId });
+ }
+-
+-function argument(name: string): string | undefined {
+-	const index = process.argv.indexOf(name);
+-	return index >= 0 ? process.argv[index + 1] : undefined;
+-}
+-
+-async function main(): Promise<void> {
+-	if (process.argv.includes("--help")) {
+-		console.log("Usage: cozyagents-update.mjs --home <path> --operation-id <runner_maintenance_id>");
+-		return;
+-	}
+-	const home = argument("--home");
+-	const operationId = argument("--operation-id");
+-	if (!home || !operationId) throw new Error("update_worker_invalid: --home and --operation-id are required");
+-	await runUpdateWorker({ home, operationId });
+-}
+-
+-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+-	void main().catch(() => { process.exitCode = 1; });
+-}
+diff --git a/tests/windows/bundle.test.ps1 b/tests/windows/bundle.test.ps1
+index d9c376bd0f071554b1a8c1a610d5425dfcd298e1..eb5f6f20a5b32383045d70ebddac5bf3047d53a2 100644
+--- a/tests/windows/bundle.test.ps1
++++ b/tests/windows/bundle.test.ps1
+@@ -19,6 +19,8 @@ try {
+     Remove-Item Env:TAR_OPTIONS -ErrorAction SilentlyContinue
+     & node.exe scripts/build-bundle.mjs
+     if ($LASTEXITCODE -ne 0) { throw 'Windows release build failed with GNU tar' }
++    & node.exe scripts/test/bundle-entrypoints.mjs
++    if ($LASTEXITCODE -ne 0) { throw 'Windows bundle entrypoint isolation failed' }
+     $asset = Join-Path $repo 'dist-bundle\cozyagents-browser-runtime.tar.gz'
+     $expected = (Get-Content -LiteralPath "$asset.sha256" -Raw).Split(' ')[0]
+     if ((Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
