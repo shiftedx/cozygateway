@@ -1,4 +1,5 @@
 import { observeRoutes } from "./observe/routes.ts";
+import { registerObserveDashboard } from "./observe/dashboard.ts";
 import { registerArtifactRoutes } from "./artifact-routes.ts";
 import { registerTaskRoutes } from "./task-routes.ts";
 import { createHash, randomUUID } from "node:crypto";
@@ -472,6 +473,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
     };
   })();
   requestLiveActivityDeletionDrain();
+  registerObserveDashboard(app, deps);
 
   const requireDevice = createMiddleware<Env>(async (c, next) => {
     const header = c.req.header("authorization") ?? "";

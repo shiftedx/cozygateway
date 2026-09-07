@@ -7,6 +7,10 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## Unreleased
 
+- Adds the paired, read-only Observe dashboard with local fonts, strict same-origin CSP, live
+  refresh, sparse measurement states, and light/dark layouts. Its assets are embedded in the
+  standalone gateway bundle.
+
 - Capability 74 adds CozyAgents observation snapshots: latest bot internals, per-step throughput,
   lifetime usage, and attributed tool costs. Unknown models show tokens only; the dated Claude
   list-price sheet and local zero rates can be overridden in `observability.prices`. Unknown
