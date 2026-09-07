@@ -7,20 +7,24 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## Unreleased
 
-- The owner-loss lease no longer reaps a turn whose peer is mid model request (`com.cozylabs.bots`
-  capability 69, F2). Capability 69's 120 second lease for a disconnected peer measured silence in
-  wall time and counted only frames as proof of life, so a turn sitting in one cold prefill was
-  reaped while the process running it was perfectly alive: LV1 measured a 45k token window at about
-  123 seconds against that 120 second lease, and LV2 measured 8 seconds for the same window on
-  another endpoint from the same code, which says the lease was never really a function of wall
-  time. The lease clock now runs from the last proof of life of any kind. The attach-v1 heartbeat
-  the peer is still answering counts alongside its frames, because a peer whose model has not
-  returned a token yet has nothing else to send. The number is unchanged at 120 seconds and no
-  window was lengthened: the undeclared grace, the interrupt grace and the silence ceiling are
-  exactly as they were, and a peer that has genuinely died stops answering and is still reaped
-  within one lease of its last breath plus one sweep interval. Derived gateway-side from the
-  gateway's own delivery record and transport, so it needs no new frame, field or peer behavior and
-  covers a Hermes peer and a CozyAgents peer identically with no plugin change.
+- The owner-loss lease no longer reaps a turn whose peer was lost mid model request
+  (`com.cozylabs.bots` capability 69, F2). Capability 69 starts a 120 second lease the instant a
+  peer's socket closes, and for a peer that was answering heartbeats right up to that instant,
+  silence is the wrong reading: it was working, its model had not returned a token yet, and the
+  drop is what a peer blocked inside one long synchronous prefill looks like from the gateway. LV1
+  measured a cold 45k token window at about 123 seconds against that 120 second lease, and LV2
+  measured 8 seconds for the same window on another endpoint from the same code, so no lease number
+  tells a slow model call apart from a dead process. Such a turn now waits one model request out,
+  4 minutes, before the lease clock starts, which is time excluded the way a pending approval or
+  device request already suspends it. The lease itself is unchanged, the exclusion applies once and
+  only to a disconnected peer that was demonstrably alive when it went, and a peer that never comes
+  back is still reaped, about 6 minutes after the drop and never past a ceiling an operator
+  shortened. That total is shorter than the 10 minute grace an attached quiet peer already gets, so
+  no window on this path is longer than one the gateway already grants: the undeclared grace, the
+  interrupt grace and the 30 minute silence ceiling are untouched, and a heartbeat never stretches
+  the undeclared grace. Derived gateway side from the delivery record and the transport, so it
+  needs no new frame, field or peer behavior and covers a Hermes peer and a CozyAgents peer
+  identically with no plugin change.
 
 - Rooms on a gateway with two or more Hermes endpoints (`com.cozylabs.bots` capabilities 46 and 52,
   F8): such a gateway refused every room, including one whose members all lived on a single
