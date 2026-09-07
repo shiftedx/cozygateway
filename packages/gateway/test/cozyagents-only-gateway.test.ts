@@ -356,10 +356,10 @@ describe("a gateway configured with no Hermes endpoint", () => {
       return groups.length === 1 && l.gateway.storage.pendingNativeApprovals(["sage"], 10).length === 1;
     });
     const blocked = (await (await l.authed("/bots/groups/launch")).json()) as {
-      pendingInteractions?: Array<{ member: string; kind: string; id: string }>;
+      pendingInteractions?: Array<{ member: string; kind: string; id: string; turnId: string; cause?: { kind: "user" | "member"; seq: number } }>;
     };
     expect(blocked.pendingInteractions).toEqual([
-      { member: "sage", kind: "approval", id: "approval-1", turnId: turn.turnId },
+      { member: "sage", kind: "approval", id: "approval-1", turnId: turn.turnId, cause: { kind: "user", seq: 1 } },
     ]);
 
     // The unchanged 1:1 route resolves it, and the peer that asked gets the command.

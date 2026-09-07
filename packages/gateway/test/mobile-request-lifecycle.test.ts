@@ -413,7 +413,7 @@ describe("capability-68 Task completion announcement", () => {
   it("announces once, on the transition that wrote the completion notification record", async () => {
     const store = openStorage(":memory:");
     store.tasks.clock(() => 0);
-    const announced: { taskId: string; bot: string; sessionId: string; room?: string }[] = [];
+    const announced: { taskId: string; runId: string; bot: string; sessionId: string; room?: string }[] = [];
     store.tasks.completions((notice) => announced.push(notice));
     const sessionId = store.nativeBotChat("sage", 1).sessionId;
     const command = store.enqueueAttachCommand(
@@ -435,7 +435,7 @@ describe("capability-68 Task completion announcement", () => {
     store.acceptAttachEvent("sage", final, 5);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-    expect(announced).toEqual([{ taskId, bot: "sage", sessionId }]);
+    expect(announced).toEqual([{ taskId, runId: "run", bot: "sage", sessionId }]);
     expect(store.tasks.read(taskId)?.view.notification?.taskId).toBe(taskId);
     store.close();
   });
