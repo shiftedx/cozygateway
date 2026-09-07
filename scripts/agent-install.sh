@@ -1510,7 +1510,17 @@ try {
       return !match || !keys.has(match[1]);
     }).join('');
     if (retained && !retained.endsWith('\n')) retained += '\n';
-    fs.writeFileSync(stagedPath, retained + fresh, { mode: 0o600 });
+    const candidate = retained + fresh;
+    const candidateValues = parseEnv(candidate);
+    // Physical lines can occur inside a quoted multiline value. Refuse an
+    // ambiguous edit instead of changing an operator's retained value.
+    for (const [key, value] of Object.entries(previousValues)) {
+      if (!keys.has(key) && candidateValues[key] !== value) throw Error('retained value changed');
+    }
+    for (const [key, value] of Object.entries(generated)) {
+      if (candidateValues[key] !== value) throw Error('generated value obscured');
+    }
+    fs.writeFileSync(stagedPath, candidate, { mode: 0o600 });
   }
 } catch {
   console.error('Gateway environment repair refused ambiguous ownership or a shared credential change; existing environment was retained.');
