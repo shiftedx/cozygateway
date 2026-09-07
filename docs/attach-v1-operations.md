@@ -335,6 +335,8 @@ the checkout path: a macOS LaunchAgent is denied TCC access to `~/Documents`,
 block both the watcher script and the provisioner's later read of
 `integrations/attach-plugin`.
 
+Staged upgrades also run the ownership-checked [install hygiene protocol](install-hygiene.md), preserving recovery payloads and refusing unknown services.
+
 Instead, run the installer once from Terminal:
 
 ```bash

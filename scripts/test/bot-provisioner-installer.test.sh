@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/cozy-provisioner-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
+TEST_NODE="${COZYGATEWAY_TEST_REAL_NODE:-$(command -v node || true)}"
 export HOME="$TMP/home"
 mkdir -p "$HOME/.local/bin" "$HOME/Library/LaunchAgents"
 printf '#!/bin/sh\nexit 0\n' > "$HOME/.local/bin/hermes"
@@ -25,3 +26,5 @@ cmp "$ROOT/scripts/deprovision-bot.sh" "$TMP/stage/current/scripts/deprovision-b
 printf 'bot provisioner installer: ok\n'
 
 python3 "$ROOT/scripts/test/bot-deprovision.test.py"
+
+COZYGATEWAY_TEST_REAL_NODE="$TEST_NODE" python3 "$ROOT/scripts/test/install-hygiene.test.py"

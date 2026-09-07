@@ -14,6 +14,7 @@ NODE_BIN="${COZYGATEWAY_NODE:-node}"
 WINDOWS_POWERSHELL="${COZYGATEWAY_POWERSHELL:-}"
 PROFILE_SPEC="all"
 PROFILE_SPEC_EXPLICIT=0
+RECORDED_PROFILES=""
 BIND_HOST_EXPLICIT=0
 PORT_EXPLICIT=0
 PUBLIC_URL_EXPLICIT=0
@@ -696,7 +697,8 @@ install_cozyagents_harness() {
 # could turn a plugin or spool path into a path traversal before constructing it.
 valid_profile() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || [ "$1" = default ]; }
 hydrate_profile_scope() {
-  local profiles saved_scope p
+  local profiles saved_scope p missing=0
+  if [ -f "$STATE_FILE" ]; then RECORDED_PROFILES="$(sed -n 's/^profiles=//p' "$STATE_FILE" | tail -1)"; fi
   [ "$PROFILE_SPEC_EXPLICIT" = 0 ] && [ -f "$STATE_FILE" ] || return 0
   saved_scope="$(sed -n 's/^profile_scope=//p' "$STATE_FILE" | tail -1)"
   if [ "$saved_scope" = all ]; then
@@ -708,6 +710,58 @@ hydrate_profile_scope() {
   IFS=',' read -r -a SELECTED <<<"$profiles"
   [ "${#SELECTED[@]}" -gt 0 ] || die "installer state has an unsafe profile scope; rerun with --profiles all or an explicit profile list"
   for p in "${SELECTED[@]}"; do valid_profile "$p" || die "installer state has an unsafe profile scope; rerun with --profiles all or an explicit profile list"; done
+  for p in "${SELECTED[@]}"; do
+    [ -e "$(profile_home "$p")" ] || [ -L "$(profile_home "$p")" ] || missing=1
+  done
+  if [ "$missing" = 1 ]; then
+    # Only a recorded scope may lose absent identities automatically. Explicit
+    # --profiles remains an explicit request, even when an old CLI sent it.
+    profiles="$("$NODE_RESOLVED" - "$STATE_FILE" "$CONFIG_JSON" "$GATEWAY_ENV" "$HERMES_ROOT" "$profiles" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const { parseEnv } = require('node:util');
+const [statePath, configPath, envPath, root, recorded] = process.argv.slice(2);
+try {
+  for (const file of [statePath, configPath, envPath]) {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || (process.getuid && stat.uid !== process.getuid())) throw Error('ownership');
+  }
+  const state = new Map();
+  for (const line of fs.readFileSync(statePath, 'utf8').split(/\r?\n/).filter(Boolean)) {
+    const at = line.indexOf('=');
+    if (at < 1 || state.has(line.slice(0, at))) throw Error('metadata');
+    state.set(line.slice(0, at), line.slice(at + 1));
+  }
+  if (state.get('hermes_root') !== root || state.get('profiles') !== recorded) throw Error('identity');
+  const names = recorded.split(',');
+  if (new Set(names).size !== names.length) throw Error('duplicate profiles');
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  if (!Array.isArray(config.hermesEndpoints) || config.hermesEndpoints.length !== 1) throw Error('endpoint');
+  const profiles = config.hermesEndpoints[0].profiles;
+  if (!profiles || Array.isArray(profiles) || typeof profiles !== 'object' || Object.keys(profiles).some(name => !names.includes(name))) throw Error('unrecorded profiles');
+  const env = parseEnv(fs.readFileSync(envPath, 'utf8'));
+  const survivors = [];
+  for (const name of names) {
+    const home = name === 'default' ? root : path.join(root, 'profiles', name);
+    let stat;
+    try { stat = fs.lstatSync(home); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (stat) {
+      if (!stat.isDirectory() || stat.isSymbolicLink() || !fs.statSync(path.join(home, 'config.yaml')).isFile()) throw Error('ambiguous profile path');
+      survivors.push(name);
+      continue;
+    }
+    const key = 'COZYGATEWAY_ATTACH_TOKEN_' + name.toUpperCase().replace(/[.\-]/g, '_');
+    if (name === 'default' || profiles[name]?.tokenEnv !== key || (env[key] !== undefined && !/^[A-Za-z0-9_-]{32,128}$/.test(env[key]))) throw Error('unproven obsolete identity');
+  }
+  if (!survivors.length) throw Error('no recorded profiles remain');
+  process.stdout.write(survivors.join(','));
+} catch {
+  console.error('Recorded profile repair refused: ownership is ambiguous or no recorded profiles remain. State was retained; choose an explicit live --profiles list or use --runtime-only.');
+  process.exit(1);
+}
+NODE
+)" || return 1
+  fi
   PROFILE_SPEC="$profiles"
 }
 hermes_config_path() {
@@ -738,7 +792,7 @@ discover_profiles() {
   [ "${#SELECTED[@]}" -gt 0 ] || die "--profiles cannot be empty"
   for p in "${SELECTED[@]}"; do
     valid_profile "$p" || die "invalid Hermes profile name: $p"
-    home="$(profile_home "$p")"; [ -f "$home/config.yaml" ] || die "Hermes profile $p has no config at $home/config.yaml"
+    home="$(profile_home "$p")"; [ -f "$home/config.yaml" ] || die "Hermes profile $p has no config at $home/config.yaml. To repair an older saved selection automatically, update with: curl -fsSL https://cozylabs.ai/install.sh | bash; an explicit --profiles request is never silently changed"
     actual="$(hermes_config_path "$p")" || die "Hermes cannot resolve profile $p"
     actual="$(cd -P "$(dirname "$actual")" && pwd)/$(basename "$actual")"
     [ "$actual" = "$home/config.yaml" ] || die "Hermes profile $p resolved to $actual, not the discovered $home/config.yaml"
@@ -1418,8 +1472,53 @@ write_gateway_env() {
     env_put "$profile_env" COZYGATEWAY_SPOOL_PATH "$spool_path"; env_put "$profile_env" COZYGATEWAY_HOME_CHANNEL thread
     env_write "$staged" "$env_name" "$token"
   done
+  # Replace only generated keys recorded by this install or this run. Older
+  # installers truncated this entire file, including unrelated operator keys.
+  "$NODE_RESOLVED" - "$GATEWAY_ENV" "$staged" "$RECORDED_PROFILES" "$CONFIG_JSON" "$(IFS=,; printf '%s' "${SELECTED[*]}")" <<'NODE' || { rm -f "$staged"; die "gateway environment repair failed; existing environment was retained"; }
+const fs = require('node:fs');
+const { parseEnv } = require('node:util');
+const [previousPath, stagedPath, recorded, configPath, selected] = process.argv.slice(2);
+try {
+  const previousStat = fs.lstatSync(previousPath, { throwIfNoEntry: false });
+  if (previousStat) {
+    if (!previousStat.isFile() || previousStat.isSymbolicLink()) throw Error('refusing redirected gateway environment');
+    const fresh = fs.readFileSync(stagedPath, 'utf8');
+    const generated = parseEnv(fresh);
+    const previous = fs.readFileSync(previousPath, 'utf8');
+    const previousValues = parseEnv(previous);
+    const keys = new Set(Object.keys(generated));
+    for (const name of recorded.split(',').filter(Boolean)) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) throw Error('invalid recorded profile identity');
+      keys.add('COZYGATEWAY_ATTACH_TOKEN_' + name.toUpperCase().replace(/[.\-]/g, '_'));
+    }
+    // A noncanonical key referenced by a surviving profile can also serve other
+    // software. Preserve it rather than claiming ownership from its spelling.
+    if (fs.existsSync(configPath)) {
+      const old = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      for (const endpoint of old.hermesEndpoints ?? []) {
+        for (const [name, entry] of Object.entries(endpoint.profiles ?? {})) {
+          if (selected.split(',').includes(name) && entry.tokenEnv !== 'COZYGATEWAY_ATTACH_TOKEN_' + name.toUpperCase().replace(/[.\-]/g, '_')) {
+            if (generated[entry.tokenEnv] !== undefined) {
+              if (previousValues[entry.tokenEnv] !== generated[entry.tokenEnv]) throw Error('shared key mismatch');
+            } else keys.delete(entry.tokenEnv);
+          }
+        }
+      }
+    }
+    let retained = previous.split(/(?<=\n)/).filter(line => {
+      const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/.exec(line);
+      return !match || !keys.has(match[1]);
+    }).join('');
+    if (retained && !retained.endsWith('\n')) retained += '\n';
+    fs.writeFileSync(stagedPath, retained + fresh, { mode: 0o600 });
+  }
+} catch {
+  console.error('Gateway environment repair refused ambiguous ownership or a shared credential change; existing environment was retained.');
+  process.exit(1);
+}
+NODE
   chmod 600 "$staged"
-  mv -f "$staged" "$GATEWAY_ENV"
+  mv -f "$staged" "$GATEWAY_ENV" || { rm -f "$staged"; return 1; }
   chmod 600 "$GATEWAY_ENV"
 }
 service_action_for() {
@@ -1485,6 +1584,7 @@ write_state() {
     else
       printf 'harness=hermes\n'
     fi
+    printf 'install_hygiene_version=1\n'
     printf 'profiles='; (IFS=,; printf '%s' "${SELECTED[*]}")
     printf '\nprofile_scope=%s' "$PROFILE_SPEC"
     printf '\nhermes_root=%s\n' "$HERMES_ROOT"
@@ -1566,7 +1666,9 @@ if [ "\${1:-}" = repair ] || [ "\${1:-}" = update ]; then
     [[ "\$profiles" =~ ^(default|[A-Za-z0-9][A-Za-z0-9._-]{0,63})(,(default|[A-Za-z0-9][A-Za-z0-9._-]{0,63}))*\$ ]] || { printf 'FAIL  repair metadata is unavailable. Reinstall with: %s\n' "\$reinstall" >&2; exit 1; }
   fi
   printf 'INFO  repair refreshes verified runtime and plugin assets, then restarts CozyGateway and Hermes attachment\n'
-  exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") COZYGATEWAY_INSTALL_ASSET_BASE="\$asset_base" bash "\$bootstrap" --profiles "\$profiles"
+  # Let the verified installer hydrate the recorded scope. Forwarding it as
+  # --profiles would turn repair metadata into a new explicit user request.
+  exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") COZYGATEWAY_INSTALL_ASSET_BASE="\$asset_base" bash "\$bootstrap"
 fi
 cd $(printf %q "$LOCAL_DIR")
 exec $(printf %q "$NODE_RESOLVED") $(printf %q "$BUNDLE_PATH") "\$@"
@@ -3465,7 +3567,9 @@ main() {
   is_windows && preflight_windows_service_ownership
   preflight_profile_env_ownership
   for profile in "${SELECTED[@]}"; do action="$(prior_service_action "$profile")"; record_service_action "$profile" "${action:-unknown}"; done
-  write_state; write_gateway_env
+  # Retain the old ownership inventory until its obsolete keys are reconciled.
+  # A crash before this state write must remain discoverable on the next repair.
+  write_gateway_env; write_state
   # Stage every profile before enabling any of them. Hermes can materialize inherited global
   # plugins into profile-local directories when the default profile is enabled; enabling first
   # would create an unowned legacy copy and make the next profile fail closed.

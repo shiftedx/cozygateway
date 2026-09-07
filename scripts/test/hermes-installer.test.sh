@@ -1136,14 +1136,13 @@ printf '%s  install.sh\n' "$repair_sha" > "$tmp/gateway-live/bin/cozygateway-boo
 COZYGATEWAY_TEST_REPAIR_LOG="$tmp/repair.log" "$tmp/gateway-live/bin/cozygateway" repair >/dev/null
 COZYGATEWAY_TEST_REPAIR_LOG="$tmp/repair.log" "$tmp/gateway-live/bin/cozygateway" update >/dev/null
 grep -Fqx 'profile_scope=all' "$tmp/gateway-live/local/install-state"
-expected_profiles=all
 repair_count="$(wc -l < "$tmp/repair.log" | tr -d ' ')"
 if [ "$repair_count" != 2 ]; then
   printf 'repair route count was %s:\n' "$repair_count" >&2
   cat "$tmp/repair.log" >&2
   exit 1
 fi
-grep -Fq "$tmp/gateway-live:file://$tmp/verified-local-release:--profiles $expected_profiles" "$tmp/repair.log"
+grep -Fqx "$tmp/gateway-live:file://$tmp/verified-local-release:" "$tmp/repair.log"
 printf '# tampered\n' >> "$tmp/gateway-live/bin/cozygateway-bootstrap.sh"
 if checksum_repair_output="$(COZYGATEWAY_TEST_REPAIR_LOG="$tmp/repair.log" "$tmp/gateway-live/bin/cozygateway" repair 2>&1)"; then
   echo 'a tampered repair bootstrap must fail checksum validation' >&2
