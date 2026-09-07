@@ -937,8 +937,9 @@ streaming_python() {
   done
   return 1
 }
-# The display keys Hermes reads before it will stream a reply, printed one per
-# line when the profile does not carry them, read with the interpreter named in $1.
+# The keys Hermes reads before it will stream a reply, and before it will stream
+# one often enough to look like a stream, printed one `key=value` per line when
+# the profile does not carry them, read with the interpreter named in $1.
 #
 # Hermes' own default is silence: `StreamingConfig.enabled` is false
 # (gateway/config.py) and `_setup_stream_consumer` asks the runner for stream
@@ -946,6 +947,13 @@ streaming_python() {
 # the turn's platform. `cozygateway` has no per-platform default of its own, so
 # a profile that names neither key never emits a single draft frame and the
 # phone only ever receives the finished message.
+#
+# Cadence is the second half, and a separate top-level key. `_should_edit`
+# flushes at most one frame per `streaming.edit_interval` (0.8s) unless
+# `streaming.buffer_threshold` (24) is reached, which is Telegram's
+# one-edit-a-second envelope and turns a minute-long reply into a couple of
+# frames on the wire. Both are read by `StreamingConfig.from_dict`, so seeding
+# them is a value Hermes already understands, not a change to any Hermes source.
 #
 # Structural, not a grep: only a parse can tell an absent key from one an
 # operator deliberately set to false, and only the absent ones may be written.
@@ -961,7 +969,21 @@ import re
 import sys
 from pathlib import Path
 
-WANTED = (("display", "streaming"), ("display", "platforms", "cozygateway", "streaming"))
+# Each entry is a config path and the value to write when the profile does not
+# carry it. The two `display` keys turn streaming ON at all; the two top-level
+# `streaming` keys decide how OFTEN an in-flight reply is pushed. Hermes'
+# defaults there are a 0.8 second edit interval and a 24 codepoint buffer
+# threshold (gateway/config.py), which is Telegram's one-edit-a-second envelope
+# and shows up on a phone as two frames for a minute-long answer instead of a
+# stream. Both are read by `StreamingConfig.from_dict`, so this is a value
+# Hermes already understands and not a change to any Hermes source.
+WANTED = (
+    (("display", "streaming"), "true"),
+    (("display", "platforms", "cozygateway", "streaming"), "true"),
+    (("streaming", "edit_interval"), "0.05"),
+    (("streaming", "buffer_threshold"), "1"),
+)
+WANTED_PATHS = tuple(path for path, _ in WANTED)
 KEY = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z0-9_][A-Za-z0-9_.\-]*):(?P<rest>[ \t].*|)$")
 BLOCK_SCALAR = re.compile(r"^[|>][0-9+-]*$")
 
@@ -971,22 +993,27 @@ def block(parent, key):
     return value if isinstance(value, dict) else {}
 
 
+def report(path, value):
+    """One line of the answer: the dotted key, then the value to write for it."""
+    return ".".join(path) + "=" + value
+
+
 def absent_with_yaml(text, yaml):
     data = yaml.safe_load(text) or {}
-    display = block(data, "display")
-    platform = block(block(display, "platforms"), "cozygateway")
     absent = []
-    if display.get("streaming") is None:
-        absent.append("display.streaming")
-    if platform.get("streaming") is None:
-        absent.append("display.platforms.cozygateway.streaming")
+    for path, value in WANTED:
+        parent = data
+        for segment in path[:-1]:
+            parent = block(parent, segment)
+        if not isinstance(parent, dict) or parent.get(path[-1]) is None:
+            absent.append(report(path, value))
     return absent
 
 
 def on_the_way(path):
     """True when `path` is a prefix of a key this probe is looking for, so an
     unjudgeable line there could hide one."""
-    return any(wanted[: len(path)] == path for wanted in WANTED)
+    return any(wanted[: len(path)] == path for wanted in WANTED_PATHS)
 
 
 def absent_without_yaml(text):
@@ -998,8 +1025,8 @@ def absent_without_yaml(text):
     which is what a merge key or a quoted key arrives as),
     or anywhere at all for a tab or a second document. None means "assume they
     are present", so the caller writes nothing: the only safe way to be unsure
-    about somebody's config file. Everything outside `display` is skipped rather
-    than judged, since nothing there can carry these keys.
+    about somebody's config file. Everything outside the top-level sections that
+    could hold a wanted key is skipped rather than judged.
     """
     stack = []
     present = set()
@@ -1062,19 +1089,110 @@ def absent_without_yaml(text):
             if key in seen_top:
                 return None
             seen_top.add(key)
-        if here in WANTED and value != "":
+        if here in WANTED_PATHS and value != "":
             present.add(here)
         if value == "":
             stack.append((indent, key))
     return [
-        ".".join(name)
-        for name in WANTED
+        report(name, value)
+        for name, value in WANTED
         if name not in present and name not in containers
     ]
 
 
+# Never nerf Hermes. `streaming.edit_interval` and `streaming.buffer_threshold`
+# are TOP-LEVEL keys: Hermes has no per-platform override for either one and no
+# adapter seam for them, so tightening them on a profile that also runs Telegram
+# or Discord pushes those bots' edits at the same rate and straight into their
+# flood limits. A profile that serves anything but cozygateway therefore keeps
+# the cadence its operator has, and is told so. The two `display` switches are
+# unaffected: those ARE per-platform and only ever turn cozygateway on.
+#
+# "Serves anything but cozygateway" is answered two ways, both stdlib and both
+# identical with or without PyYAML so the two reader modes cannot disagree here:
+#
+#   * one of Hermes' first-party platform tokens is set in the profile's `.env`
+#     or the Hermes home's `.env`. `_PLATFORM_ENABLE_ENV_VARS` in
+#     hermes_cli/tools_config.py is that list, and env is where Hermes decides
+#     this, not config.yaml.
+#   * a plugin directory in the profile declares `kind: platform` and is not
+#     this one. Deliberately NOT filtered by `plugins.enabled`: a platform
+#     plugin sitting in the profile is enough to leave an operator's cadence
+#     alone, and reading the enabled list would need a YAML sequence parse the
+#     two modes could answer differently.
+#
+# Unsure reads as "another platform", which is the direction that writes nothing.
+# So does a token assigned in the HOME `.env` that the profile `.env` blanks:
+# the union is over names ASSIGNED anywhere, not over the value the profile
+# finally resolves to, so such a profile keeps its own cadence. That is the
+# withholding direction, and cheaper than reimplementing Hermes' env precedence.
+#
+# The two cadence keys are also seeded only TOGETHER. They are one setting read
+# as a disjunction (`(elapsed >= edit_interval and acc) or len(acc) >= threshold`),
+# so writing a threshold of 1 beside an operator's deliberate 2.0 second interval
+# makes that interval unreachable: every tick flushes anyway. An operator who set
+# either half therefore keeps both, and is told so.
+PLATFORM_ENV_VARS = (
+    "TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN",
+    "WHATSAPP_ENABLED", "QQ_APP_ID",
+)
+CADENCE_PREFIX = "streaming."
+CADENCE_KEYS = tuple(
+    ".".join(path) for path, _ in WANTED if path and path[0] == "streaming")
+
+
+def env_names(path):
+    """Names assigned a non-empty value in a dotenv file; empty when unreadable."""
+    names = set()
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return names
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        if value.strip().strip("\"'"):
+            names.add(name.strip().removeprefix("export").strip())
+    return names
+
+
+def other_chat_platform(profile_dir):
+    """Name of another chat platform this profile serves, or "" when only this one."""
+    homes = [profile_dir]
+    if profile_dir.parent.name == "profiles":
+        homes.append(profile_dir.parent.parent)
+    assigned = set()
+    for home in homes:
+        assigned |= env_names(home / ".env")
+    for name in PLATFORM_ENV_VARS:
+        if name in assigned:
+            return name
+    try:
+        entries = sorted(
+            entry for entry in (profile_dir / "plugins").iterdir() if entry.is_dir())
+    except Exception:
+        entries = []
+    for entry in entries:
+        if entry.name == "cozygateway":
+            continue
+        try:
+            manifest = (entry / "plugin.yaml").read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for raw in manifest.splitlines():
+            line = raw.strip()
+            if not line.startswith("kind:"):
+                continue
+            if line.split(":", 1)[1].strip().strip("\"'") == "platform":
+                return entry.name
+    return ""
+
+
 def main():
-    path = Path(sys.argv[2]) / "config.yaml"
+    profile_dir = Path(sys.argv[2])
+    path = profile_dir / "config.yaml"
     try:
         text = path.read_text(encoding="utf-8")
     except Exception:
@@ -1092,6 +1210,22 @@ def main():
             absent = absent_with_yaml(text, yaml)
         except Exception:
             sys.exit(1)
+    cadence = [entry for entry in absent if entry.startswith(CADENCE_PREFIX)]
+    if cadence:
+        # A leading "!" marks a line the caller SAYS; it is never a key to write.
+        note = ""
+        if len(cadence) < len(CADENCE_KEYS):
+            missing = {entry.split("=", 1)[0] for entry in cadence}
+            note = "!cadence-partly-set:" + ",".join(
+                name for name in CADENCE_KEYS if name not in missing)
+        else:
+            other = other_chat_platform(profile_dir)
+            if other:
+                note = "!another-chat-platform:" + other
+        if note:
+            absent = [note] + [
+                entry for entry in absent if not entry.startswith(CADENCE_PREFIX)
+            ]
     # Written as BYTES on purpose. A Windows interpreter translates "\n" into
     # CRLF on a text stream, and the caller would then carry a "\r" inside every
     # key name it went on to write.
@@ -1101,27 +1235,45 @@ def main():
 main()
 PY
 }
+# A "!" line from the reader is a note to say, not a key to write. Both reads
+# below drop them, so a profile that keeps its own cadence is not mistaken for a
+# write that failed to land.
+streaming_notes() { printf '%s\n' "$1" | grep '^!' || true; }
+streaming_writes() { printf '%s\n' "$1" | grep -v '^!' || true; }
 ensure_streaming_config() {
-  local profile="$1" home="$2" python keys key rc=0
+  local profile="$1" home="$2" python answer keys note entry key value rc=0
   python="$(streaming_python)" || {
     say "NOTE  no usable python found, so streaming settings for profile $profile were left alone"
     return 0
   }
-  keys="$(streaming_keys_absent "$python" "$home")" || rc=$?
+  answer="$(streaming_keys_absent "$python" "$home")" || rc=$?
   if [ "$rc" != 0 ]; then
     say "NOTE  could not read $home/config.yaml, so streaming settings for profile $profile were left alone"
     return 0
   fi
+  for note in $(streaming_notes "$answer"); do
+    case "$note" in
+      '!another-chat-platform:'*)
+        say "NOTE  Hermes profile $profile also serves ${note#!another-chat-platform:}, so its streaming cadence was left as the operator set it (the edit interval and buffer threshold are profile-wide, not per platform)" ;;
+      '!cadence-partly-set:'*)
+        say "NOTE  Hermes profile $profile already sets ${note#!cadence-partly-set:}, so both streaming cadence keys were left alone (they are one setting: a buffer threshold of 1 would make a tuned edit interval unreachable)" ;;
+      *) say "NOTE  ${note#!} for Hermes profile $profile" ;;
+    esac
+  done
+  keys="$(streaming_writes "$answer")"
   [ -n "$keys" ] || { say "OK    streaming is already decided in config.yaml for Hermes profile $profile"; return 0; }
-  for key in $keys; do
-    if [ "$DRY_RUN" = 1 ]; then say "DRY   set $key to true for Hermes profile $profile"; continue; fi
+  # Each line the reader printed is a key and the value to write for it, so a
+  # cadence knob is seeded with its own number rather than a bare true.
+  for entry in $keys; do
+    key="${entry%%=*}"; value="${entry#*=}"
+    if [ "$DRY_RUN" = 1 ]; then say "DRY   set $key to $value for Hermes profile $profile"; continue; fi
     # A display default never fails an install: this profile keeps Hermes'
     # behaviour and every other part of the install carries on.
-    if ! "$HERMES_BIN" -p "$profile" config set "$key" true >/dev/null; then
+    if ! "$HERMES_BIN" -p "$profile" config set "$key" "$value" >/dev/null; then
       say "NOTE  hermes could not set $key, so streaming settings for profile $profile were left alone"
       return 0
     fi
-    say "OK    set $key to true for Hermes profile $profile"
+    say "OK    set $key to $value for Hermes profile $profile"
   done
   [ "$DRY_RUN" = 1 ] && return 0
   # Read the file back before restarting anything. `config set` is not proof of a
@@ -1129,7 +1281,8 @@ ensure_streaming_config() {
   # package-managed install (`is_managed()`), and a restart on that evidence
   # would be a restart that changes nothing, every rerun.
   rc=0
-  keys="$(streaming_keys_absent "$python" "$home")" || rc=$?
+  answer="$(streaming_keys_absent "$python" "$home")" || rc=$?
+  keys="$(streaming_writes "$answer")"
   if [ "$rc" != 0 ] || [ -n "$keys" ]; then
     say "NOTE  hermes reported success but streaming settings for profile $profile are still absent, so it was not restarted"
     return 0

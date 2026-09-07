@@ -95,6 +95,9 @@ display:
   platforms:
     cozygateway:
       streaming: true
+streaming:
+  edit_interval: 0.05
+  buffer_threshold: 1
 PROFILE_YAML
 cp "$tmp/hermes/config.yaml" "$tmp/hermes/profiles/ops/config.yaml"
 cat > "$tmp/hermes/profiles/active/config.yaml" <<'PROFILE_YAML'
@@ -103,6 +106,9 @@ display:
   platforms:
     cozygateway:
       streaming: false
+streaming:
+  edit_interval: 2.0
+  buffer_threshold: 200
 PROFILE_YAML
 # The installer reads that config structurally, and PyYAML is NOT a requirement
 # for it: with PyYAML it gets the exact answer, without it a conservative stdlib
@@ -469,7 +475,42 @@ printf 'model: test/model\n' > "$tmp/hermes/profiles/ops/config.yaml"
 mute_profile_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --profiles all --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-scoped" 2>&1)"
 expect_contains "$mute_profile_output" 'set display.streaming to true for Hermes profile ops'
 expect_contains "$mute_profile_output" 'set display.platforms.cozygateway.streaming to true for Hermes profile ops'
+# F16. Streaming ON is only half of it. Without a sub-second edit interval and a
+# near-zero buffer threshold the profile still flushes at most one frame per
+# 0.8 seconds, which is the two-frames-a-turn wire TB2 measured. The value each
+# key gets is the reader's, not a bare `true`.
+expect_contains "$mute_profile_output" 'set streaming.edit_interval to 0.05 for Hermes profile ops'
+expect_contains "$mute_profile_output" 'set streaming.buffer_threshold to 1 for Hermes profile ops'
 expect_contains "$mute_profile_output" 'streaming is already decided in config.yaml for Hermes profile active'
+
+# A profile ST1 already repaired: both display keys, no cadence block. Only the
+# cadence half is written, and the operator's `active` values are still left
+# alone.
+printf 'display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\n' \
+  > "$tmp/hermes/profiles/ops/config.yaml"
+cadence_profile_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --profiles all --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-scoped" 2>&1)"
+expect_contains "$cadence_profile_output" 'set streaming.edit_interval to 0.05 for Hermes profile ops'
+expect_contains "$cadence_profile_output" 'set streaming.buffer_threshold to 1 for Hermes profile ops'
+if grep -Fq 'set display.streaming to true for Hermes profile ops' <<<"$cadence_profile_output"; then
+  echo 'installer rewrote a display key the profile already carried' >&2
+  exit 1
+fi
+expect_contains "$cadence_profile_output" 'streaming is already decided in config.yaml for Hermes profile active'
+
+# F16 ruling 2. The cadence knobs are TOP-LEVEL: Hermes has no per-platform
+# override for them, so seeding them on a profile that also runs Telegram would
+# push that bot's edits into its own flood limits. Streaming is still turned ON;
+# only the profile-wide cadence is left as the operator has it, and it says so.
+printf 'model: test/model\n' > "$tmp/hermes/profiles/ops/config.yaml"
+printf 'TELEGRAM_BOT_TOKEN=abc123\n' > "$tmp/hermes/profiles/ops/.env"
+shared_profile_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --profiles all --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-scoped" 2>&1)"
+expect_contains "$shared_profile_output" 'set display.streaming to true for Hermes profile ops'
+expect_contains "$shared_profile_output" 'also serves TELEGRAM_BOT_TOKEN, so its streaming cadence was left as the operator set it'
+if grep -Fq 'set streaming.edit_interval' <<<"$shared_profile_output"; then
+  echo 'installer tightened a profile-wide cadence on a profile serving another platform' >&2
+  exit 1
+fi
+rm -f "$tmp/hermes/profiles/ops/.env"
 cp "$tmp/hermes/config.yaml" "$tmp/hermes/profiles/ops/config.yaml"
 printf 'profiles=../unsafe\n' > "$tmp/gateway-scoped/local/install-state"
 if malformed_scope_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-scoped" 2>&1)"; then

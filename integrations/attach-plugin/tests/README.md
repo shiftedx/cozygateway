@@ -5,9 +5,12 @@ harness imports are all lazy (inside methods, see `adapter.py`'s module docstrin
 so the package under test imports cleanly with no harness and no `websockets`
 installed.
 
-Run the whole suite from `integrations/attach-plugin/`:
+The one host requirement is an interpreter that has `websockets`, which the plugin's client
+imports at module load. Hermes' own venv python always does; a bare system python3 collects
+13 import errors instead. Run the whole suite from `integrations/attach-plugin/` with that
+interpreter:
 
-    python3 -m unittest discover -s tests -v
+    <hermes root>/hermes-agent/venv/bin/python -m unittest discover -s tests -v
 
 Run a single file:
 

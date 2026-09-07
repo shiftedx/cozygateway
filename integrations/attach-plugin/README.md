@@ -86,6 +86,39 @@ Dependencies: Python 3.10+ and the `websockets` package.
 - Tool use streams as chips (`running`, then `ok` or `error` with a short detail
   preview) when the harness exposes tool-lifecycle hooks; without them the plugin still
   streams text and simply omits chips.
+- Streaming cadence is Hermes' own draft transport. How often a draft is pushed is the
+  profile's `streaming.edit_interval` and `streaming.buffer_threshold` (top-level keys read
+  by `StreamingConfig.from_dict`); the installer and the provisioner seed `0.05` and `1`
+  so an in-flight reply reaches the app at the stream consumer's own tick instead of
+  Telegram's one-edit-a-second envelope. Those two keys are profile-wide with no
+  per-platform override, so they are seeded ONLY when cozygateway is the one chat platform
+  the profile serves; a profile that also carries a Telegram, Discord, Slack, WhatsApp or
+  QQ token, or another `kind: platform` plugin, keeps whatever cadence its operator set and
+  is told so. "Carries a token" means the name is assigned a non-empty value in the profile
+  `.env` or the Hermes home `.env`, so a home-level token that the profile blanks still
+  withholds the cadence: the seed does not reimplement Hermes' env precedence, and the
+  direction it errs in is leaving an operator's setting alone. The two are also seeded only
+  together, because they are one setting read as a disjunction: a threshold of 1 written
+  beside a deliberate 2.0 second interval would make that interval unreachable. The
+  per-platform `display.streaming` switches are seeded either way.
+- The plugin also declares Hermes' native streaming transport
+  (`SUPPORTS_NATIVE_STREAMING`, `supports_native_streaming`, `send_stream_frame`), which
+  pushes every delta with no edit-rate gate at all. **It is off unless
+  `COZYGATEWAY_NATIVE_STREAMING` is set, and it must not be turned on for anyone before a
+  live approval and clarify soak (packet F16b).** On that transport Hermes owns delivery
+  end to end and `_finalize_boundary_stream` closes the stream BEFORE an approval or
+  clarify prompt with the identical `send_stream_frame(..., finalize=True)` it uses for the
+  turn-final one. This platform cannot tell those apart, and a finalize here commits and
+  seals the turn, so a wrong default would seal turns that are about to ask a person a
+  question. Worse when the boundary carries no text yet: the placeholder maps to an empty
+  reply and the turn seals `failed` ("empty reply") right before the prompt. Both belong on
+  the F16b soak list, along with a clarify boundary, a tool-only turn and an interim
+  `send_message` mid-run. The wire is unchanged either way: interim frames are the same
+  drafts and a finalize frame goes through the ordinary terminal send. With the switch off
+  the concrete adapter class carries `SUPPORTS_NATIVE_STREAMING = False`, so the Hermes
+  branches that read the attribute without the probe (the `/approve` and `/deny`
+  confirmation path in `gateway/slash_commands.py`) behave exactly as they did before this
+  transport existed.
 - A turn ends with `done` (the gateway seals the latest draft as the durable reply) or
   `failed` (the gateway records a failed turn the client can retry).
 - The plugin journals events and accepted commands before sending/ACKing, replays after reconnect,
