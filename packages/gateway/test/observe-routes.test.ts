@@ -284,6 +284,22 @@ describe("the D5 seam", () => {
 });
 
 describe("the panels the concept page draws", () => {
+  it("counts the complete window beyond bounded display feeds", async () => {
+    const app = makeApp();
+    const token = await observerToken(app);
+    for (let index = 0; index < 5_010; index++) {
+      observe.event("turn_terminal", "cleo", `turn-${index}`, { status: index < 10 ? "failed" : "completed", reason: "complete" });
+    }
+    for (let index = 0; index < 20_010; index++) observe.sample("ttft_ms", "cleo", index < 20_000 ? 100 : 200);
+    const overview = await (await get(app, "/observe/api/overview", token)).json();
+    expect(overview.tiles.turns).toBe(5_010);
+    const bots = await (await get(app, "/observe/api/bots", token)).json();
+    expect(bots.bots[0]).toMatchObject({ turns: 5_010, failures: 10 });
+    const turns = await (await get(app, "/observe/api/turns", token)).json();
+    expect(turns.terminals).toHaveLength(5_000);
+    expect(turns.firstTokenByHour[0].samples).toBe(20_010);
+  });
+
   it("answers every panel from one route with no extra request shape", async () => {
     const app = makeApp({ observeSnapshots: presentReader() });
     const token = await observerToken(app);

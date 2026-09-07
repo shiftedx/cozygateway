@@ -3160,6 +3160,22 @@ export class Storage {
     };
   }
 
+  /** One attach peer's durable counters. Missing plugin telemetry remains unknown. */
+  attachPeerHealth(agentId: string) {
+    return this.#db.prepare(`SELECT
+      (SELECT COUNT(*) FROM attach_command_outbox WHERE agent_id = ? AND acked_at IS NULL) AS queueDepth,
+      (SELECT COUNT(*) FROM attach_event_inbox WHERE agent_id = ? AND disposition = 'accepted' AND dead_lettered_at IS NOT NULL) AS deadLetters,
+      (SELECT plugin_event_outbox_depth FROM attach_streams WHERE agent_id = ?) AS pluginOutboxDepth,
+      (SELECT plugin_oldest_event_age_ms FROM attach_streams WHERE agent_id = ?) AS pluginOldestEventAgeMs,
+      (SELECT plugin_last_ack_progress_at FROM attach_streams WHERE agent_id = ?) AS pluginLastAckProgressAt,
+      (SELECT plugin_event_ack_cursor FROM attach_streams WHERE agent_id = ?) AS pluginAckCursor,
+      (SELECT plugin_command_inbox_depth FROM attach_streams WHERE agent_id = ?) AS pluginCommandInboxDepth`)
+      .get(agentId, agentId, agentId, agentId, agentId, agentId, agentId) as {
+        queueDepth: number; deadLetters: number; pluginOutboxDepth: number | null;
+        pluginOldestEventAgeMs: number | null; pluginLastAckProgressAt: number | null; pluginAckCursor: number | null; pluginCommandInboxDepth: number | null;
+      };
+  }
+
   /** Persist only bounded spool counters from an authenticated control frame. The gateway owns
    * progress time: a plugin-reported clock can be skewed, while a higher durable cursor is proof. */
   recordAttachTelemetry(agentId: string, telemetry: AttachV1Telemetry, receivedAt: number): {

@@ -51,29 +51,35 @@ export interface ObserveSnapshotReader {
 export interface ObserveAgentInternals {
   bot: string;
   runtimeStage: string;
-  generationsWanted: number;
-  generationsObserved: number;
+  generationsWanted: number | null;
+  generationsObserved: number | null;
   bundleVersion: string | null;
   runnerName: string | null;
   runnerLastContactAt: number | null;
   snapshotAgeMs: number | null;
   toolFamilies: readonly { family: string; calls: number }[];
   toolServers: readonly {
-    server: string; layers: number; healthy: number; fingerprint: string; state: string;
+    server: string; layers: number; healthy: number; fingerprint: string | null; state: string;
   }[];
   policy: {
-    permitted: number; asked: number; denied: number; expired: number; egressRefused: number;
-    level: string;
+    permitted: number | null; asked: number | null; denied: number | null; expired: number | null; egressRefused: number | null;
+    level: string | null;
   };
   context: {
-    inUseTokens: number; windowTokens: number; rollovers: number; lastRolloverAt: number | null;
-    cardsAttached: number; cardsTotal: number;
+    inUseTokens: number | null; windowTokens: number | null; rollovers: number | null; lastRolloverAt: number | null;
+    cardsAttached: number | null; cardsTotal: number | null;
   };
   memory: {
-    recallDocs: number; recallBytes: number; lastConsolidationAt: number | null;
-    evicted: number; tombstoned: number;
+    recallDocs: number | null; recallBytes: number | null; lastConsolidationAt: number | null;
+    evicted: number | null; tombstoned: number | null;
   };
-  checkpoints: { count: number; restores: number; lastRestoreResult: string | null };
+  prompt?: Record<string, unknown> | null;
+  cache?: Record<string, unknown>;
+  recall?: Record<string, unknown> | null;
+  guardrails?: Record<string, unknown> | null;
+  steps?: readonly import("./snapshot.ts").ObservationSnapshotStepRow[];
+  toolCalls?: readonly import("./snapshot.ts").ObservationSnapshotToolRow[];
+  checkpoints: { count: number | null; restores: number | null; lastRestoreResult: string | null };
 }
 
 /** Section 12. `costMicros` is null until the operator enters a price sheet, which is what makes
@@ -83,10 +89,13 @@ export interface ObserveThroughput {
   rows: readonly {
     bot: string;
     model: string;
+    prefix?: string;
+    speedsByPrefix?: readonly { prefix: string; prefill: ObserveAggregate; decode: ObserveAggregate }[];
     prefill: ObserveAggregate;
     decode: ObserveAggregate;
     tokens: { prompt: number; completion: number; cached: number };
     costMicros: number | null;
+    costPerTurn?: ObserveAggregate;
     lifetime: {
       prompt: number; completion: number; cached: number; costMicros: number | null; turns: number;
     };
@@ -96,6 +105,8 @@ export interface ObserveThroughput {
 /** Section 13. `attributed` says the tokens of a step were split across the calls it made, which is
  *  an attribution rule rather than a measurement and is labelled as one. */
 export interface ObserveToolCosts {
+  retryDetectionAvailable?: boolean;
+  heavyDetectionAvailable?: boolean;
   priceSheetConfigured: boolean;
   rows: readonly {
     tool: string;
@@ -103,6 +114,8 @@ export interface ObserveToolCosts {
     calls: number;
     errors: number;
     medianResultTokens: number | null;
+    resultSize?: ObserveAggregate;
+    drivingTurns?: readonly { bot: string; turn: string; calls: number; inducedTokens: number | null }[];
     inducedTokens: number | null;
     costMicros: number | null;
     duration: ObserveAggregate;
@@ -120,6 +133,7 @@ export const ABSENT_SNAPSHOT_READER: ObserveSnapshotReader = {
   toolCosts: () => ({ priceSheetConfigured: false, rows: [] }),
 };
 
+import { createObserveSnapshotReader, observeReceiptDistributions } from "./reader.ts";
 import { Hono } from "hono";
 import type { AppDeps } from "../http.ts";
 import { isAllowedEventKind, isAllowedSeries, OBSERVE_SERIES_TAGS } from "./privacy.ts";
@@ -136,7 +150,7 @@ function aggregate(summary: ObserveSummary, speed = false): ObserveAggregate {
 export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["observe"]> }): Hono {
   const app = new Hono();
   const ring = deps.observe;
-  const reader = deps.observeSnapshots ?? ABSENT_SNAPSHOT_READER;
+  const reader = deps.observeSnapshots ?? createObserveSnapshotReader(deps);
   const startedAt = deps.now();
   const windows = { "1h": 3_600_000, "24h": 86_400_000, "7d": 604_800_000 };
   const paths = ["overview", "bots", "turns", "roundtrip", "attach", "approvals", "deliveries",
@@ -172,12 +186,17 @@ export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["ob
         const tag = c.req.query("tag");
         const series = tag === undefined ? base : `${base}|${tag}`;
         if (!isAllowedSeries(series)) return c.json({ error: { code: "invalid_request", message: "invalid series or tag" } }, 400);
-        return c.json({ summary: summary(series), points: points(series), pointLimit: 20_000 });
+        const samples = points(series);
+        const total = ring.store.summarize({ series, ...query }).count;
+        return c.json({ summary: summary(series), points: samples, pointLimit: 20_000,
+          view: "bounded_history", totalPoints: total, truncated: total > samples.length });
       }
       case "events": {
         const kind = c.req.query("kind");
         if (kind !== undefined && !isAllowedEventKind(kind)) return c.json({ error: { code: "invalid_request", message: "invalid kind" } }, 400);
-        return c.json({ events: events(kind), limit: 5_000 });
+        const rows = events(kind);
+        const total = ring.store.countEvents({ ...query, ...(kind === undefined ? {} : { kind }) });
+        return c.json({ events: rows, limit: 5_000, view: "bounded_history", totalEvents: total, truncated: total > rows.length });
       }
       case "overview": {
         const flaps = events("tunnel_flap");
@@ -186,7 +205,7 @@ export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["ob
           uptimeMs: Math.max(0, now - startedAt), bridge: deps.hermesBridgeAbsent ? "absent" : deps.bots?.health().online ? "online" : "offline" },
           attach, tunnel: { lastFlapAt: flaps[0]?.at ?? null, state: flaps[0]?.detail?.reason === "recovered" ? "online" : flaps.length ? "offline" : "unknown" },
           needsAPerson: { total: pending.length + repairs, approvals: pending.length, repairs },
-          tiles: { firstToken: summary("ttft_ms"), roundTrip: summary("device_rtt_ms"), turns: terminals().length,
+          tiles: { firstToken: summary("ttft_ms"), roundTrip: summary("device_rtt_ms"), turns: ring.store.countEvents({ ...query, kind: "turn_terminal" }),
             spend: reader.attached() ? reader.throughput(readerQuery) : null } });
       }
       case "bots": return c.json({ bots: selected.map((row) => {
@@ -194,35 +213,38 @@ export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["ob
         const turns = ring.store.events({ from, to, bot: hash, kind: "turn_terminal", limit: 5_000 });
         return { id: hash, name: row.name, harness: row.runtime === "cozyagents" ? "cozyagents" : "hermes",
           online: deps.presenceOf(row.name) === "online", lastTurnAt: turns[0]?.at ?? null,
-          firstToken: summary("ttft_ms", false, hash), sparkline: points("ttft_ms", hash), turns: turns.length,
-          failures: turns.filter((turn) => turn.detailJson !== null && JSON.parse(turn.detailJson).status === "failed").length,
+          firstToken: summary("ttft_ms", false, hash), sparkline: points("ttft_ms", hash), turns: ring.store.countEvents({ from, to, bot: hash, kind: "turn_terminal" }),
+          failures: ring.store.countEvents({ from, to, bot: hash, kind: "turn_terminal", status: "failed" }),
           openApprovals: pending.filter((approval) => approval.bot === row.name).length };
       }) });
       case "turns": {
-        const hours = new Map<number, number[]>();
-        for (const point of points("ttft_ms")) {
-          const hour = Math.floor(point.at / 3_600_000) * 3_600_000;
-          const values = hours.get(hour) ?? []; values.push(point.value); hours.set(hour, values);
+        const firstTokenByHour = [];
+        for (let at = Math.floor(from / 3_600_000) * 3_600_000; at < to; at += 3_600_000) {
+          const result = ring.store.summarize({ series: "ttft_ms", from: Math.max(at, from),
+            to: Math.min(at + 3_600_000, to), ...(query.bot === undefined ? {} : { bot: query.bot }), includeTags: true });
+          if (result.count > 0) firstTokenByHour.push({ at, ...aggregate(result) });
         }
-        return c.json({ terminals: terminals(), firstTokenByHour: [...hours].map(([at, values]) => {
-          values.sort((a, b) => a - b);
-          return { at, samples: values.length, p50: values[Math.ceil(values.length * .5) - 1], p95: values[Math.ceil(values.length * .95) - 1] };
-        }) });
+        const total = ring.store.countEvents({ ...query, kind: "turn_terminal" });
+        return c.json({ terminals: terminals(), terminalLimit: 5_000, totalTerminals: total,
+          view: "bounded_history", truncated: total > 5_000, firstTokenByHour });
       }
-      case "roundtrip": return c.json({ hops: [
+      case "roundtrip": return c.json({ byDevice: observeReceiptDistributions(ring, query), vpnComparisonSampleFloor: 30, hops: [
         ["device", "device_rtt_ms"], ["tunnel", "tunnel_rtt_ms"], ["gateway", "gateway_handle_ms"],
         ["peer", "peer_rtt_ms"], ["model", "model_step_ms"], ["turn", "turn_ms"],
       ].map(([hop, series]) => ({ hop, ...summary(series!) })), felt: summary("felt_latency_ms"),
         byNetworkPath: OBSERVE_SERIES_TAGS.filter((tag) => !["tunnel", "lan", "ok", "not_found", "http_error", "network_error"].includes(tag))
           .map((networkPath) => ({ networkPath, ...summary(`felt_latency_ms|${networkPath}`) })) });
       case "attach": return c.json({ summary: attach,
-        peers: selected.map((row) => ({ bot: row.name, id: ring.identify(row.name), online: deps.presenceOf(row.name) === "online", roundTrip: summary("peer_rtt_ms", false, ring.identify(row.name)) })),
-        deadLetters: (deps.attachDeadLetters?.() ?? []).filter((row) => bot === undefined || row.agentId === bot)
+        peers: (deps.observeAttachPeers?.() ?? selected.map(row => ({ bot: row.name,
+          online: deps.presenceOf(row.name) === "online" ? 1 : 0 })))
+          .filter(row => bot === undefined || row.bot === bot)
+          .map(row => ({ ...row, id: ring.identify(row.bot), roundTrip: summary("peer_rtt_ms", false, ring.identify(row.bot)) })),
+        deadLetters: (deps.attachDeadLetters?.() ?? []).map(row => ({ ...row, agentId: deps.observeBotForPeer?.(row.agentId) ?? row.agentId })).filter((row) => bot === undefined || row.agentId === bot)
           .map((row) => ({ bot: ring.identify(row.agentId), sequence: row.sequence, attempts: row.attempts, at: row.deadLetteredAt })) });
       case "approvals": return c.json({ pending: pending.map((row) => ({ bot: row.bot, id: ring.identify(row.toolCallId), createdAt: row.createdAt })),
         grants: selected.flatMap((row) => deps.storage.approvalGrants(row.name, now).map((grant) => ({ bot: row.name,
           id: ring.identify(grant.grantId), scope: grant.scope, category: grant.category, createdAt: grant.createdAt, expiresAt: grant.expiresAt }))),
-        events: events().filter((row) => row.kind === "approval_raised" || row.kind === "approval_resolved") });
+        events: [...events("approval_raised"), ...events("approval_resolved")].sort((a, b) => b.at - a.at), view: "bounded_history", eventLimitPerKind: 5_000 });
       case "deliveries": return c.json({ artifacts: deps.storage.artifacts.list(bot === undefined ? {} : { bot })
         .filter((row) => row.createdAt >= from && row.createdAt < to).map((row) => ({ id: ring.identify(row.artifactId), bot: row.bot,
           state: row.state, sizeBytes: row.sizeBytes, createdAt: row.createdAt, committedAt: row.committedAt ?? null })),
@@ -241,7 +263,7 @@ export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["ob
       case "cozyagents/tools": {
         if (!reader.attached()) return c.json({ available: false, reason: "no_snapshot_lane" });
         const result = reader.toolCosts(readerQuery);
-        return c.json({ available: true, priceSheet: { configured: result.priceSheetConfigured }, rows: result.rows });
+        return c.json({ available: true, priceSheet: { configured: result.priceSheetConfigured }, retryDetectionAvailable: result.retryDetectionAvailable ?? false, heavyDetectionAvailable: result.heavyDetectionAvailable ?? false, rows: result.rows });
       }
     }
   });

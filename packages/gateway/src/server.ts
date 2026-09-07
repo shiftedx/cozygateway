@@ -1212,6 +1212,9 @@ export async function startGateway(
   });
   const app = createApp({
     observe,
+    observePeerAttached: (bot) => [...attachTokens.values()].some((id) =>
+      (storage.chatExecutionById(id)?.bot ?? id) === bot && attachV1Ingress.isAttached(id)
+      && attachV1Ingress.negotiatedCapabilities(id).has("observation_snapshot")),
     storage,
     flushTaskCommands: () => attachV1Ingress.flushTaskCommands(),
     config,
@@ -1229,6 +1232,10 @@ export async function startGateway(
     ...(harnessWorkspace.available ? { harnessWorkspace } : {}),
     ...(options.pairingAdmission === undefined ? {} : { pairingAdmission: options.pairingAdmission }),
     attachHealth: () => ({ ...attachV1Ingress.health(), hermes: attachV1Ingress.connectionHealth(hermesProfileIds) }),
+    observeAttachPeers: () => [...new Set(attachTokens.values())].map(id => ({
+      bot: storage.chatExecutionById(id)?.bot ?? id, ...attachV1Ingress.peerHealth(id),
+    })),
+    observeBotForPeer: id => storage.chatExecutionById(id)?.bot ?? id,
     attachDeadLetters: () => storage.attachProjectionDeadLetters(),
     releaseAttachDeadLetter: (agentId, eventId) =>
       attachV1Ingress.releaseProjectionDeadLetter(agentId, eventId),

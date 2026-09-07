@@ -283,6 +283,25 @@ export class ObserveStore {
       .all(...args) as unknown as ObserveSeriesRow[];
   }
 
+  /** Full-window receipt measurements for same-device comparisons, never a capped event feed. */
+  receiptMeasurements(query: { bot?: string; from: number; to: number }): Array<{ bot: string; device: string; detail: Record<string, unknown> }> {
+    const rows = this.#db.prepare(`SELECT bot, ref AS device, detail_json AS detailJson FROM observe_events
+      WHERE kind = 'receipt_measurement' AND at >= ? AND at < ?${query.bot === undefined ? "" : " AND bot = ?"}`)
+      .all(Math.trunc(query.from), Math.trunc(query.to), ...(query.bot === undefined ? [] : [query.bot])) as Array<{ bot: string; device: string; detailJson: string }>;
+    return rows.map(({ detailJson, ...row }) => ({ ...row, detail: JSON.parse(detailJson) as Record<string, unknown> }));
+  }
+
+  /** Full-window counts are independent of the bounded event feed used for rendering. */
+  countEvents(query: { kind?: string; bot?: string; from: number; to: number; status?: string }): number {
+    const clauses = ["at >= ?", "at < ?"];
+    const args: Array<string | number> = [Math.trunc(query.from), Math.trunc(query.to)];
+    if (query.kind !== undefined) { clauses.push("kind = ?"); args.push(query.kind); }
+    if (query.bot !== undefined) { clauses.push("bot = ?"); args.push(query.bot); }
+    if (query.status !== undefined) { clauses.push("json_extract(detail_json, '$.status') = ?"); args.push(query.status); }
+    return Number((this.#db.prepare(`SELECT COUNT(*) AS n FROM observe_events WHERE ${clauses.join(" AND ")}`)
+      .get(...args) as { n: number }).n);
+  }
+
   /** Event markers in a window, newest first. */
   events(query: { kind?: string; bot?: string | null; from: number; to: number; limit?: number }): ObserveEventRow[] {
     const clauses = ["at >= ?", "at < ?"];

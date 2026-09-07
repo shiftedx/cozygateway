@@ -269,6 +269,11 @@ export interface AppDeps {
   hermesGlobalSkillsLog?: (line: string) => void;
   /** Synchronous, aggregate attach-v1 state for operator health routes only. */
   attachHealth?: () => AttachHealthSummary;
+  observeBotForPeer?: (id: string) => string;
+  observeAttachPeers?: () => Array<{ bot: string; online: number; degraded: number; absent: number;
+    queueDepth: number; deadLetters: number; lastHeartbeatAt: number | null; pluginOutboxDepth: number | null;
+    pluginOldestEventAgeMs: number | null; pluginLastAckProgressAt: number | null; pluginAckCursor: number | null; pluginCommandInboxDepth: number | null }>;
+
   /** Separate attach-v1 app-action lane; it never injects hidden chat content. */
   sendCozyAppAction?: (action: { id: string; appId: string; creatorBot: string; actionId: string }, deviceId: string) => boolean;
   cozyAppsChanged?: () => void;
@@ -334,6 +339,7 @@ export interface AppDeps {
   /** Dashboard packet D3, THE D5 SEAM. Absent makes the CozyAgents panels answer
    *  `{ available: false, reason: "no_snapshot_lane" }` rather than 404. */
   observeSnapshots?: ObserveSnapshotReader;
+  observePeerAttached?: (bot: string) => boolean;
   now: () => number;
 }
 
