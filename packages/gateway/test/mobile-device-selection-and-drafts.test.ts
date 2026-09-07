@@ -81,7 +81,7 @@ function storageWithDevices(...ids: string[]) {
 
 describe("capability-70 explicit device selection", () => {
   it("advertises both new rows on the capability version", () => {
-    expect(BOTS_CAPABILITY_VERSION).toBe(75);
+    expect(BOTS_CAPABILITY_VERSION).toBe(76);
   });
 
   it("a client can select which paired device a request targets", () => {
