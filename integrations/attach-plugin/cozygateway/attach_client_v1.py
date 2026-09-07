@@ -80,6 +80,8 @@ HELLO_VERSION = 2
 # failed.reason "unknown_turn"). A gateway below it must see exactly its pre-69 frames.
 BOTS_EXTENSION = "com.cozylabs.bots"
 STALE_TURN_RECONCILIATION_VERSION = 69
+# Capability 66: the gateway version at which a scoped-approval block is admitted at all.
+SCOPED_APPROVALS_VERSION = 66
 # Closed set of refusal reasons this peer may put on a failed frame.
 FAILED_REASONS = frozenset({"unknown_turn"})
 # The contract's cap on the ids one hello may declare.
@@ -725,12 +727,29 @@ class AttachV1Client:
                 event["durationMs"] = duration
         await self._queue_event(event)
 
-    async def send_approval(self, thread_id: str, turn_id: str, approval_id: str, call_id: str, name: str, status: str) -> None:
-        await self._queue_event({
+    async def send_approval(
+        self, thread_id: str, turn_id: str, approval_id: str, call_id: str, name: str, status: str,
+        *, scope: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Raise or settle one approval, optionally naming exactly what it would do.
+
+        ``scope`` is capability 66's ``BotApprovalScope`` block, built by
+        ``adapter.classify_approval_scope``. It rides only on a gateway that advertised
+        ``com.cozylabs.bots`` at 66 or later, so a gateway below that receives the frame it has
+        always received, and a call the classifier could not place sends ``None`` and gets the
+        plain pre-66 approval. The gateway validates the block and DROPS it on failure while
+        keeping the approval, so a block this side gets wrong costs the scoped controls and never
+        the decision itself.
+        """
+        event: Dict[str, Any] = {
             "kind": "approval", "threadId": thread_id, "turnId": turn_id,
             "approvalId": approval_id, "callId": call_id, "name": (name or "tool")[:128],
             "status": status,
-        })
+        }
+        if (isinstance(scope, dict) and scope
+                and self.extension_version(BOTS_EXTENSION) >= SCOPED_APPROVALS_VERSION):
+            event["scope"] = scope
+        await self._queue_event(event)
 
     async def send_clarify(
         self,
