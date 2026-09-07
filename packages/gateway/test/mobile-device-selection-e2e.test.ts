@@ -3,8 +3,8 @@
  *  selection is admitted the same way whatever runs behind the attach socket. The peer here is the
  *  attach lane a Hermes plugin speaks; nothing in Hermes' own agent loop takes part, and the two
  *  frame it sends is the pre-70 frame, unchanged: a peer has no say in which of a person's phones
- *  rings, and there is no field for one, so a frame that tries to name a device is refused by the
- *  closed key set the way any other contract skew is.
+ *  rings, and there is no field for one, so a frame that tries to name a device has THAT REQUEST
+ *  refused with a typed reason while the connection carries on.
  *
  *  Capability 71 rides along at the end: a draft written by one paired device reaches the other,
  *  and the clear a send writes reaches it too, so nothing is ever offered for sending twice. */
@@ -147,27 +147,37 @@ it("admits a Hermes bot's phone capability request against the selected device",
     );
     expect(await clearedOnB.json()).toMatchObject({ text: "" });
     // A PEER CANNOT PICK THE PHONE, AND THERE IS NO FIELD FOR IT. `targetDeviceId` is not a member
-    // of any request shape, so a frame carrying one is refused by the closed key set exactly as any
-    // other contract skew is: a named refusal and a closed socket, rather than a silent drop or a
-    // tolerated spelling that would leave the routing rule unreadable from the schema. Sent on its
-    // OWN socket, because the refusal ends that connection.
-    const skewed = new WebSocket(`${gateway.url.replace("http", "ws")}/attach/v1`, { headers: { authorization: "Bearer attach-secret" } });
-    sockets.push(skewed);
-    await once(skewed, "open");
-    skewed.send(JSON.stringify({
-      kind: "hello", version: 2, instanceId: "device-selection-skew",
-      capabilities: ["draft", "mobile_node"], resume: { eventSequence: 0, commandSequence: 0 },
-    }));
-    await pause();
-    skewed.send(JSON.stringify({
+    // of any request shape, so a frame carrying one is refused. THAT ONE REQUEST is refused, with
+    // the row's own typed reason, and the CONNECTION SURVIVES: a stale peer holding a live
+    // conversation must not lose every queued turn and every other request because it sent one
+    // field this gateway removed. Durability of the connection beats strictness of the key set.
+    plugin.send(JSON.stringify({
       kind: "mobile_request", requestId: "named-a-device", command: "device.status",
       threadId: turn.threadId, turnId: turn.turnId, expiresAt: Date.now() + 1_000,
       purpose: "Report phone readiness", targetDeviceId: appA.ready.deviceId,
     }));
-    await until(() => skewed.readyState === WebSocket.CLOSED || skewed.readyState === WebSocket.CLOSING);
-    // And no phone was asked anything on the strength of it.
+    await until(() => pluginFrames.some(
+      (frame) => frame["kind"] === "mobile_result" && frame["requestId"] === "named-a-device",
+    ));
+    const refusal = pluginFrames.find(
+      (frame) => frame["kind"] === "mobile_result" && frame["requestId"] === "named-a-device",
+    )!;
+    expect(refusal).toMatchObject({
+      status: "policy_blocked", stage: "policy", reason: "request_policy_rejected",
+    });
+    // No phone was asked anything on the strength of it.
     expect(appA.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "named-a-device")).toBe(false);
     expect(appB.frames.some((frame) => frame.type === "mobile_node_request" && frame.requestId === "named-a-device")).toBe(false);
+    expect(plugin.readyState).toBe(WebSocket.OPEN);
+
+    // And the SAME SOCKET goes on working: the next valid request is admitted normally, which is
+    // the whole point of refusing the one frame rather than the connection.
+    requestStatus(plugin, turn, "after-the-refusal");
+    await until(() => appA.frames.some(
+      (frame) => frame.type === "mobile_node_request" && frame.requestId === "after-the-refusal",
+    ));
+    expect(plugin.readyState).toBe(WebSocket.OPEN);
+
   } finally {
     for (const socket of sockets)
       if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) socket.close();

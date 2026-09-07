@@ -27,7 +27,7 @@ import {
   type MobileNodeLifecycleEvent,
   type MobileNodeRoute,
 } from "../src/mobile-node.ts";
-import { AttachV1MobileRequestSchema } from "../src/adapters/attach/protocol-v1.ts";
+import { AttachV1MobileRequestSchema, mobileRequestRefusal } from "../src/adapters/attach/protocol-v1.ts";
 import { openStorage } from "../src/storage.ts";
 
 const purpose = "Report phone readiness";
@@ -144,6 +144,30 @@ describe("capability-70 explicit device selection", () => {
       threadId: "thread-1", turnId: "turn-1", expiresAt: 20_000,
       purpose: "Report phone readiness", targetDeviceId: "phone-b",
     })).toBe(false);
+  });
+
+  it("names the one request a removed field refuses, and never the connection", () => {
+    // The refusal is scoped to the frame that carried the field. A stale peer holding a live
+    // conversation must not lose every queued turn and every other request over one field this
+    // gateway removed, so the connection outranks the closed key set here.
+    const refusal = mobileRequestRefusal({
+      kind: "mobile_request", requestId: "named-a-device", command: "device.status",
+      threadId: "thread-1", turnId: "turn-1", expiresAt: 20_000,
+      purpose: "Report phone readiness", targetDeviceId: "phone-b",
+    });
+    expect(refusal).toEqual({ requestId: "named-a-device", field: "targetDeviceId" });
+
+    // Only for a frame that actually carries it. Everything else takes the ordinary path, which
+    // still refuses a malformed frame by naming the field and closing.
+    expect(mobileRequestRefusal({
+      kind: "mobile_request", requestId: "ordinary", command: "device.status",
+      threadId: "thread-1", turnId: "turn-1", expiresAt: 20_000, purpose: "Report phone readiness",
+    })).toBeUndefined();
+    // A frame with no usable request id cannot be answered per request, so it is not claimed here.
+    expect(mobileRequestRefusal({
+      kind: "mobile_request", targetDeviceId: "phone-b",
+    })).toBeUndefined();
+    expect(mobileRequestRefusal({ kind: "event", targetDeviceId: "phone-b" })).toBeUndefined();
   });
 
   it("a second device attaching mid-request does not steal an explicitly targeted request", () => {
