@@ -62,6 +62,11 @@ export class RoomEndpointMismatch extends BackendUnavailable {
  *  resolves to no Hermes endpoint at all, and belongs to the Hermes-free host (R1). */
 const GATEWAY_HOST = "";
 
+/** How a host is named in an error. The gateway's own host has no endpoint id to print. */
+function hostLabel(id: string): string {
+  return id === GATEWAY_HOST ? "(gateway)" : id;
+}
+
 function summary(id: string, bot: BotSummary): BotSummary {
   const name = federatedBotName(id, bot.name);
   return { ...bot, name, handle: name };
@@ -107,9 +112,20 @@ export class FederatedBotControlSurface implements BotControlSurface {
   readonly #roomMembers: ((key: string) => readonly string[] | undefined) | undefined;
   /** Which host owns a room, by room key: an endpoint id, or `GATEWAY_HOST`. Resolved ONCE per room
    *  and then remembered, so a later call routes without re-deriving ownership from membership and
-   *  a live room's host can never flip underneath it. Rebuilt lazily after a restart from the
-   *  durable membership, which is the same answer by construction: ownership is fixed at create and
-   *  a membership that would change it is refused (`RoomEndpointMismatch`). */
+   *  a live room's host can never flip underneath it.
+   *
+   *  Rebuilt lazily after a restart from the durable membership, which gives the SAME answer, and
+   *  the reason is stronger than the refusal below: the input is immutable. `bot_groups.members_json`
+   *  is written once by `createBotGroup` and there is no statement anywhere that updates it, and
+   *  deleting a member does not touch it either, because `purgeBot` purges that bot's turns and its
+   *  own rows and never `bot_groups` or `bot_group_members`. A room whose member has been deleted
+   *  therefore still names it and still resolves to the same host.
+   *
+   *  The one input that is NOT immutable is the configured endpoint set. An operator who removes an
+   *  endpoint from `hermesEndpoints` leaves that endpoint's rooms resolving to no endpoint at all,
+   *  so they re-derive to the gateway's own host, which cannot answer for their members and retires
+   *  them. That is a degradation of a room whose Hermes is gone, not a flip underneath a live room,
+   *  but it is the caveat on "same answer": same membership, same answer; same config too. */
   readonly #roomHosts = new Map<string, string>();
   constructor(
     members: FederationMember[],
@@ -235,7 +251,7 @@ export class FederatedBotControlSurface implements BotControlSurface {
       ? resolved.spans.filter((id) => id !== remembered)
       : resolved.host === remembered ? [] : [resolved.host];
     if (foreign.length > 0) {
-      throw new RoomEndpointMismatch(name.trim(), remembered === GATEWAY_HOST ? "(gateway)" : remembered, foreign);
+      throw new RoomEndpointMismatch(name.trim(), hostLabel(remembered), foreign.map(hostLabel));
     }
     return this.#hostById(remembered);
   }
@@ -250,8 +266,13 @@ export class FederatedBotControlSurface implements BotControlSurface {
     return group;
   }
   deleteGroup(name: string): void {
+    // The memo deliberately OUTLIVES the room. `deleteBotGroup` keeps the room's turn rows as
+    // ownership tombstones, because a late terminal event after the DELETE must still be
+    // acknowledged, and the host that should acknowledge it is the one that drove the turn. Dropping
+    // the memo here sent that acknowledgement to the gateway's host instead, which is the same class
+    // of mis-routing this packet exists to remove. A room recreated under the same name overwrites
+    // the entry in `createGroup`, so a stale memo can never outrank a live room.
     this.#hostOf(name).deleteGroup(name);
-    this.#roomHosts.delete(name.trim().toLowerCase());
   }
   groupDetail(name: string): BotGroupDetail { return this.#hostOf(name).groupDetail(name); }
   sendGroupMessage(name: string, text: string, opts?: { clientId?: string }): BotGroupMessage { return this.#hostOf(name).sendGroupMessage(name, text, opts ?? {}); }

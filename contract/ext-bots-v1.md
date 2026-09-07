@@ -1092,7 +1092,7 @@ Committed transcript history remains the recovery source after reconnect.
   all runtime bots is created and run without the Hermes Dashboard being consulted at all, on a
   gateway with no `hermesEndpoints` entry as well as on one with a single plain endpoint
   (capability 52): a room is gateway-owned, so the absence of an endpoint is never a reason to
-  refuse one. On a gateway with two or more endpoints, or a single `namespace: true` endpoint, a
+  refuse one. On a gateway with two or more endpoints, a
   room is hosted by the ONE host its membership resolves to, where a member named
   `<endpoint>:<profile>` resolves to that endpoint and a runtime bot, named bare on every gateway
   shape, resolves to no endpoint at all: a room whose members all live on a single endpoint is
@@ -1102,7 +1102,11 @@ Committed transcript history remains the recovery source after reconnect.
   `503 backend_unavailable`, "cross-endpoint groups are not supported". A room stays on the host
   it was created on for its whole life: it is addressed, listed and deleted there without its
   ownership being re-derived, and a membership that comes to name a bot on a different endpoint is
-  refused `503 backend_unavailable` naming both hosts rather than migrating the room. None of this
+  refused `503 backend_unavailable` naming both hosts rather than migrating the room. A single
+  `namespace: true` endpoint is RESERVED and not configurable: a gateway namespaces its bot names
+  when, and only when, it has two or more endpoints, so a lone endpoint always serves bare names and
+  hosts every room itself. A gateway that ever gains that shape follows the same rule as two or more
+  endpoints. None of this
   moves a route, frame, schema or version; it is which host serves the same bytes. The
   member turn is unchanged in every other respect: the same attach-v1 `turn` command on the same
   gateway-owned `group:<room>:<member>` thread, the same rounds, the same transcript. A member's

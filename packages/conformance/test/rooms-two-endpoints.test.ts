@@ -167,6 +167,35 @@ describe("rooms on a gateway with two Hermes endpoints", () => {
     assertValid(BotGroupDetailSchema, await (await authed("/bots/groups/standup")).json());
   });
 
+  it("splits one runtime bot's room turns between an endpoint host and the gateway's own host", async () => {
+    // `pixel` is a member of `Standup`, hosted by the gateway, and of `Bridge`, hosted by `alpha`.
+    // It answers both on one attach identity, so every room event carries the same `agentId` and
+    // only the per-room thread tells the two hosts apart. A room's events must reach the host
+    // driving that room and no other: the wrong host would settle the turn on a drive that is not
+    // waiting for it.
+    const created = await authed("/bots/groups", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Bridge", members: ["alpha:luna", "pixel"] }),
+    });
+    expect(created.status).toBe(201);
+    assertValid(BotGroupSchema, ((await created.json()) as { group: unknown }).group);
+
+    for (const room of ["bridge", "standup"]) {
+      const sent = await authed(`/bots/groups/${room}/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: `round two in ${room}` }),
+      });
+      expect(sent.status).toBe(202);
+    }
+    await until(async () => (await members("bridge")).length === 2);
+    // Each room heard from its own members only, and both settled: nothing crossed hosts.
+    expect(await members("bridge")).toEqual(["alpha:luna", "pixel"]);
+    expect(await members("standup")).toEqual(["byte", "pixel"]);
+    assertValid(BotGroupDetailSchema, await (await authed("/bots/groups/bridge")).json());
+  });
+
   it("still refuses a room spanning both endpoints", async () => {
     const spanning = await authed("/bots/groups", {
       method: "POST",
@@ -178,13 +207,13 @@ describe("rooms on a gateway with two Hermes endpoints", () => {
       error: { code: "backend_unavailable", message: "cross-endpoint groups are not supported" },
     });
     expect(((await (await authed("/bots/groups")).json()) as { groups: Array<{ name: string }> }).groups.map((group) => group.name).sort())
-      .toEqual(["Launch", "Standup"]);
+      .toEqual(["Bridge", "Launch", "Standup"]);
   });
 
-  it("lists and deletes both rooms", async () => {
+  it("lists and deletes every room", async () => {
     const listed = (await (await authed("/bots/groups")).json()) as { groups: unknown[] };
     for (const group of listed.groups) assertValid(BotGroupSchema, group);
-    for (const room of ["launch", "standup"]) {
+    for (const room of ["bridge", "launch", "standup"]) {
       expect((await authed(`/bots/groups/${room}`, { method: "DELETE" })).status).toBe(204);
     }
     expect(((await (await authed("/bots/groups")).json()) as { groups: unknown[] }).groups).toEqual([]);

@@ -25,7 +25,7 @@ import {
   RoomEndpointMismatch,
   type FederationMember,
 } from "../src/hermes-bridge/federation.ts";
-import type { GatewayRoomHost } from "../src/hermes-bridge/group-rooms.ts";
+import type { GatewayRoomHost, RoomHost } from "../src/hermes-bridge/group-rooms.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
 
 async function until(check: () => boolean | Promise<boolean>, timeout = 5_000): Promise<void> {
@@ -115,6 +115,45 @@ describe("room ownership on a federated control surface", () => {
     expect(hosts.gateway.calls).toEqual([]);
   });
 
+  it("re-derives the same host on a fresh surface over the same durable membership", async () => {
+    // What a restart actually does. The memo is in memory and dies with the process; the membership
+    // rows do not, and `members_json` is insert-only (nothing updates it, and `purgeBot` does not
+    // touch `bot_groups` or `bot_group_members`). So a second surface must land on the same host for
+    // every shape, including a room whose member has since been deleted: the deleted name stays in
+    // the membership row, which is exactly what keeps ownership stable.
+    const rooms = new Map<string, string[]>();
+    const first = surface(rooms);
+    await first.federation.createGroup("Launch", ["home:luna", "home:sage"]);
+    await first.federation.createGroup("Standup", ["pixel", "byte"]);
+    await first.federation.createGroup("Mixed", ["studio:nova", "pixel"]);
+    rooms.set("launch", ["home:luna", "home:sage"]);
+    rooms.set("standup", ["pixel", "byte"]);
+    rooms.set("mixed", ["studio:nova", "pixel"]);
+    // "home:sage" was deleted while the gateway was down. Its membership entry survives the purge.
+    const restarted = surface(rooms);
+    restarted.federation.groupDetail("Launch");
+    restarted.federation.sendGroupMessage("Launch", "still here");
+    restarted.federation.groupDetail("Standup");
+    restarted.federation.groupDetail("Mixed");
+    expect(restarted.hosts.home.calls).toEqual(["detail:Launch", "send:Launch"]);
+    expect(restarted.hosts.gateway.calls).toEqual(["detail:Standup"]);
+    expect(restarted.hosts.studio.calls).toEqual(["detail:Mixed"]);
+  });
+
+  it("keeps a deleted room's host, so a late terminal is acknowledged by the host that drove it", async () => {
+    // `deleteBotGroup` keeps the room's turn rows as ownership tombstones precisely so a late
+    // terminal after the DELETE is still acknowledged. The host that should acknowledge it is the
+    // one that drove the turn, so the memo has to outlive the room it names.
+    const rooms = new Map<string, string[]>();
+    const { federation, hosts } = surface(rooms);
+    await federation.createGroup("Launch", ["home:luna", "home:sage"]);
+    rooms.set("launch", ["home:luna", "home:sage"]);
+    federation.deleteGroup("Launch");
+    rooms.delete("launch");
+    expect(federation.roomHostFor("launch")).toBe(hosts.home as unknown as RoomHost);
+    expect(hosts.gateway.calls).toEqual([]);
+  });
+
   it("refuses by name when a member on another endpoint joins an existing single-endpoint room", async () => {
     const rooms = new Map<string, string[]>();
     const { federation, hosts } = surface(rooms);
@@ -145,7 +184,7 @@ describe("rooms on a gateway with two Hermes endpoints", () => {
     for (const socket of sockets.splice(0)) socket.close();
     await Promise.all(gateways.splice(0).map((gateway) => gateway.close()));
     await Promise.all(servers.splice(0).map((server) => server.close()));
-    for (const key of ["HOME_HERMES", "STUDIO_HERMES", "HOME_LUNA", "HOME_SAGE", "STUDIO_NOVA"]) delete process.env[key];
+    for (const key of ["HOME_HERMES", "STUDIO_HERMES", "HOME_LUNA", "HOME_SAGE", "STUDIO_NOVA", "STUDIO_PIP", "CREW_PIXEL", "CREW_BYTE"]) delete process.env[key];
   });
 
   it("creates and runs a room whose members all live on one endpoint, and still refuses one that spans both", async () => {
@@ -240,4 +279,120 @@ describe("rooms on a gateway with two Hermes endpoints", () => {
 
     expect((await authed("/bots/groups/launch", { method: "DELETE" })).status).toBe(204);
   }, 30_000);
+
+  it("re-derives every room's host after a restart over the same storage, including one whose member was deleted", async () => {
+    // The ruling rests on ownership surviving a restart. The memo dies with the process, so a
+    // restarted gateway rebuilds it from `members_json`, which nothing ever updates: not a member
+    // being deleted (`purgeBot` leaves `bot_groups` and `bot_group_members` alone), not anything
+    // else. Three rooms with three different hosts prove each one lands back where it started, and
+    // a member turn in each proves the routing followed.
+    let homeProfiles = ["luna", "sage"];
+    const list = (names: () => string[]) => (): unknown => ({
+      profiles: names().map((name) => ({ name, description: name, has_avatar: false })),
+      bot_mode_protocol: true,
+    });
+    const home = await startFakeHermesServer({
+      methods: { "profiles.list": list(() => homeProfiles) },
+      dashboard: ({ method, path }) => ({ status: method === "DELETE" && path.startsWith("/api/profiles/") ? 200 : 404, body: {} }),
+    });
+    const studio = await startFakeHermesServer({ methods: { "profiles.list": list(() => ["nova", "pip"]) } });
+    servers.push(home, studio);
+    Object.assign(process.env, {
+      HOME_HERMES: "h", STUDIO_HERMES: "s", HOME_LUNA: "hl", HOME_SAGE: "hs",
+      STUDIO_NOVA: "sn", STUDIO_PIP: "sp", CREW_PIXEL: "px", CREW_BYTE: "bt",
+    });
+    const directory = mkdtempSync(join(tmpdir(), "cozygateway-f8-restart-"));
+    const path = join(directory, "config.json");
+    writeFileSync(path, JSON.stringify({
+      name: "Two Endpoints",
+      port: 8787,
+      dbPath: join(directory, "gateway.sqlite"),
+      turnTimeoutSeconds: 0,
+      hermesEndpoints: [
+        { id: "home", url: home.url, tokenEnv: "HOME_HERMES",
+          profiles: { luna: { tokenEnv: "HOME_LUNA" }, sage: { tokenEnv: "HOME_SAGE" } } },
+        { id: "studio", url: studio.url, tokenEnv: "STUDIO_HERMES",
+          profiles: { nova: { tokenEnv: "STUDIO_NOVA" }, pip: { tokenEnv: "STUDIO_PIP" } } },
+      ],
+      bots: [
+        { id: "pixel", name: "Pixel", tokenEnv: "CREW_PIXEL", runtime: "cozyagents" },
+        { id: "byte", name: "Byte", tokenEnv: "CREW_BYTE", runtime: "cozyagents" },
+      ],
+    }));
+
+    const boot = async (): Promise<{ gateway: RunningGateway; authed: (suffix: string, init?: RequestInit) => Promise<Response> }> => {
+      const config = loadConfig(path);
+      config.port = 0;
+      const gateway = await startGateway(config, { configPath: path });
+      gateways.push(gateway);
+      const pair = await fetch(`${gateway.url}/pair`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ setupCode: gateway.issueSetupCode(), deviceName: "phone" }),
+      });
+      const token = ((await pair.json()) as { deviceToken: string }).deviceToken;
+      return {
+        gateway,
+        authed: (suffix, init) => fetch(`${gateway.url}${suffix}`, { ...init, headers: { ...(init?.headers ?? {}), authorization: `Bearer ${token}` } }),
+      };
+    };
+    const echo = async (gateway: RunningGateway, secret: string): Promise<void> => {
+      const socket = new WebSocket(`${gateway.url.replace("http", "ws")}/attach/v1`, { headers: { authorization: `Bearer ${secret}` } });
+      sockets.push(socket);
+      let sequence = 0;
+      socket.on("message", (data) => {
+        const frame = JSON.parse(String(data)) as { kind: string; sequence: number; commandId?: string; command?: { kind: string; threadId: string; turnId: string } };
+        if (frame.kind !== "command" || frame.command === undefined) return;
+        socket.send(JSON.stringify({ kind: "ack", channel: "command", sequence: frame.sequence, id: frame.commandId }));
+        if (frame.command.kind !== "turn") return;
+        sequence += 1;
+        socket.send(JSON.stringify({
+          kind: "event", sequence, eventId: `${secret}:${sequence}`,
+          event: { kind: "commit", threadId: frame.command.threadId, turnId: frame.command.turnId, messageId: `answer:${frame.command.turnId}`, blocks: [{ type: "paragraph", text: `${secret} here` }] },
+        }));
+      });
+      await once(socket, "open");
+      socket.send(JSON.stringify({ kind: "hello", version: 2, instanceId: `${secret}:${Date.now()}`, capabilities: ["draft"], resume: { eventSequence: 0, commandSequence: 0 } }));
+    };
+    const spoke = async (authed: (suffix: string, init?: RequestInit) => Promise<Response>, room: string): Promise<string[]> => {
+      const detail = (await (await authed(`/bots/groups/${room}`)).json()) as { messages: Array<{ from: { kind: string; name: string } }> };
+      return [...new Set(detail.messages.filter((message) => message.from.kind === "member").map((message) => message.from.name))].sort();
+    };
+
+    const before = await boot();
+    for (const secret of ["hl", "hs", "sn", "sp", "px", "bt"]) await echo(before.gateway, secret);
+    await until(async () => ((await (await before.authed("/bots")).json()) as { bots: unknown[] }).bots.length === 6);
+    const create = (authed: (suffix: string, init?: RequestInit) => Promise<Response>, name: string, members: string[]): Promise<Response> =>
+      authed("/bots/groups", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, members }) });
+    expect((await create(before.authed, "Home", ["home:luna", "home:sage"])).status).toBe(201);
+    expect((await create(before.authed, "Studio", ["studio:nova", "studio:pip"])).status).toBe(201);
+    expect((await create(before.authed, "Crew", ["pixel", "byte"])).status).toBe(201);
+    expect((await create(before.authed, "Spanning", ["home:luna", "studio:nova"])).status).toBe(503);
+
+    // A member deleted BEFORE the restart. The room keeps naming it, which is what keeps ownership
+    // stable, and the room is simply short a member afterwards.
+    expect((await before.authed("/bots/home%3Asage", { method: "DELETE" })).status).toBe(200);
+    homeProfiles = ["luna"];
+
+    for (const socket of sockets.splice(0)) socket.close();
+    await Promise.all(gateways.splice(0).map((gateway) => gateway.close()));
+
+    const after = await boot();
+    for (const secret of ["hl", "sn", "sp", "px", "bt"]) await echo(after.gateway, secret);
+    expect(((await (await after.authed("/bots/groups")).json()) as { groups: Array<{ name: string }> }).groups.map((group) => group.name).sort())
+      .toEqual(["Crew", "Home", "Studio"]);
+    for (const room of ["home", "studio", "crew"]) {
+      const sent = await after.authed(`/bots/groups/${room}/messages`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "who is here" }),
+      });
+      expect(sent.status).toBe(202);
+    }
+    // Each room's turns went to the host that owned it before the restart: the `home` endpoint (now
+    // one member short), the `studio` endpoint, and the gateway's own Hermes-free host.
+    await until(async () => (await spoke(after.authed, "home")).length === 1);
+    expect(await spoke(after.authed, "home")).toEqual(["home:luna"]);
+    await until(async () => (await spoke(after.authed, "studio")).length === 2);
+    expect(await spoke(after.authed, "studio")).toEqual(["studio:nova", "studio:pip"]);
+    await until(async () => (await spoke(after.authed, "crew")).length === 2);
+    expect(await spoke(after.authed, "crew")).toEqual(["byte", "pixel"]);
+  }, 60_000);
 });
