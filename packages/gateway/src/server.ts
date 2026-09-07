@@ -889,17 +889,29 @@ export async function startGateway(
     sendNativeTurn: (agentId, input) =>
       attachV1Ingress.sendNativeTurn(agentId, input),
   });
-  const adapters = new Map(
-    profileEntries.map(([profileId]) => {
-      const adapter = createAttachAdapter({
-        agentId: profileId,
-        endpoint: attachEndpoint,
-        turnTimeoutMs: config.turnTimeoutSeconds * 1000,
-      });
-      router.register(profileId, adapter);
-      return [profileId, adapter] as const;
-    }),
-  );
+  // A runtime bot (capability 45/49) is an attach-v1 identity exactly like a Hermes profile: same
+  // storage row, same `backend: "attach"` shape, same ingress. Rooms already route a member turn
+  // to one through `sendNativeTurn` regardless, so a plain 1:1 `/threads` conversation must reach
+  // the same bot the same way; registering it here, beside the Hermes profiles, is what makes
+  // `POST /threads { agentId: <runtime bot id> }` work on a gateway with no Hermes endpoint at
+  // all instead of leaving every turn 503 `backend_unavailable` for want of an adapter.
+  const adapters = new Map<string, ReturnType<typeof createAttachAdapter>>();
+  /** One place that builds and registers an attach-v1 turn adapter, so a Hermes profile at boot,
+   *  a runtime bot at boot, and a runtime bot created later through `POST /bots` (capability 49)
+   *  all get the exact same adapter shape. `registerRuntimeBotAttachAdapter` below is the capability
+   *  49 half of this; without it, a bot created after boot 503s `backend_unavailable` on its first
+   *  send until the process restarts and this loop runs again. */
+  const registerAttachAdapter = (agentId: string): void => {
+    const adapter = createAttachAdapter({
+      agentId,
+      endpoint: attachEndpoint,
+      turnTimeoutMs: config.turnTimeoutSeconds * 1000,
+    });
+    router.register(agentId, adapter);
+    adapters.set(agentId, adapter);
+  };
+  for (const [profileId] of profileEntries) registerAttachAdapter(profileId);
+  for (const bot of runtimeBots) registerAttachAdapter(bot.id);
   // Capability 37. Every runtime surface that would still answer for a deleted bot, torn down in
   // one place: the token map both public attach surfaces authenticate against (the WebSocket
   // upgrade and HTTP media share this exact Map object, so one delete covers both), the live
@@ -1096,7 +1108,10 @@ export async function startGateway(
     runnerName,
     register: (bot) => {
       // The exact inverse of `killAttachIdentity`: the token map both public attach surfaces
-      // authenticate against, then the sets that decide which bots this gateway serves at all.
+      // authenticate against, then the sets that decide which bots this gateway serves at all,
+      // and (F9 fix round 1) the same attach-v1 turn adapter every other attach identity gets, so
+      // a bot created through this route can take a plain 1:1 thread turn without a restart, the
+      // same way `killAttachIdentity` already tears that adapter back down on delete.
       attachTokens.set(bot.token, bot.id);
       nativePlane.addRuntimeBot({
         id: bot.id,
@@ -1105,6 +1120,7 @@ export async function startGateway(
         runtime: bot.runtime,
         ...(bot.runnerId === undefined || bot.runnerId === null ? {} : { runnerId: bot.runnerId }),
       });
+      registerAttachAdapter(bot.id);
     },
     unregister: (id) => {
       const revoked = killAttachIdentity(id);
@@ -1332,8 +1348,17 @@ export async function startGateway(
     },
     close: async () => {
       clearInterval(attachMediaSweep);
-      const durableAttachShutdown = profileEntries.some(([profileId]) =>
-        attachV1Ingress.hasNegotiated(profileId),
+      // A runtime bot is a durable attach-v1 identity exactly like a Hermes profile (same
+      // ingress, same recovery-in-SQLite story), so it has to be checked here too: skipping it
+      // left a Hermes-free gateway with a negotiated runtime bot connection always falling to
+      // the `runner.closeAll()` branch below, which waits on an in-memory turn promise that
+      // `attachV1Ingress.close()` (a few lines down) can no longer settle, deadlocking shutdown.
+      // Read from the live `adapters` map, not a boot-time snapshot list: a runtime bot created
+      // after boot through `POST /bots` is registered into `adapters` on create (see
+      // `registerAttachAdapter` above), so it must be visible here the same way, or the very same
+      // deadlock returns for a bot the boot-time `runtimeBots` array never knew about.
+      const durableAttachShutdown = [...adapters.keys()].some((agentId) =>
+        attachV1Ingress.hasNegotiated(agentId),
       );
       hub.close();
       // Closing attach sockets fires the disconnect path, which fails in-flight turns, so the
