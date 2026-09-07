@@ -54,18 +54,24 @@ release; everything older is marked pre-release so installers resolve one "lates
   `GET`/`PUT /bots/:name/mobile-requests/preferred-device?sessionId=`, read at admission and nowhere
   else. Which of a person's phones rings is the PERSON'S choice: the preference is written by a
   device-authenticated client, no frame carries a target device, and a `mobile_request` that
-  includes `targetDeviceId` anyway has that key stripped at ingress with one bounded log line
-  rather than being refused, so a request somebody is waiting on is never lost over a field that
-  means nothing. The target is the conversation's stored choice when it still names a paired
-  device, then the device that opened the turn; from that moment capability 68's binding is
-  unchanged, so the target never moves and a second device attaching never becomes one.
+  includes `targetDeviceId` anyway is refused by the closed key set like any other unknown key. The
+  target is the conversation's stored choice when it still names a paired device, then the device
+  that opened the turn; from that moment capability 68's binding is unchanged, so the target never
+  moves and a second device attaching never becomes one. One stated exception: a CozyApp action is
+  answered on the device that tapped it and consults no preference, because a tap's answer belongs
+  on the screen that took it. A read or write naming a bot this gateway does not hold is
+  `404 not_found` rather than a `200` echoing something that was never stored.
   Capability 71 adds `GET`/`PUT /bots/:name/drafts?sessionId=`
   and the `bot_draft_updated` frame: one draft per profile and conversation, per person and never
   per device, last write wins, the empty string is the clear a send writes immediately, and that
   clear crosses devices, so a message sent on one phone can never still be offered on another. A
   draft reaches no bot, peer, runtime or model, and its text is never logged, traced or measured;
   the row does make an unsent draft durable server state, dropped with its conversation's history
-  and swept after thirty days untouched. Both rows are additive: EVERY peer of every backend is
+  and swept on the gateway's own periodic retention pass thirty days after it was last touched, so
+  an idle gateway forgets on the same schedule as a busy one. `updatedAt` moves strictly forward on
+  every stored change, so it is the version a client orders two drafts by and a slow write can
+  never put a sent message back on another phone. A client may now declare `com.cozylabs.bots` on
+  the `auth` frame; one declaring a version below 71 is not sent `bot_draft_updated` at all. Both rows are additive: EVERY peer of every backend is
   byte identical to its pre-70 self, no frame gains a field, and a client that writes neither a
   preference nor a draft behaves exactly as it did before. The attach plugin is unchanged in
   behavior and Hermes needs no agent change.
