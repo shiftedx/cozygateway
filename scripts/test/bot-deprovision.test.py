@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import time
 import subprocess
 import tempfile
 import unittest
@@ -35,7 +37,7 @@ class DeprovisionTest(unittest.TestCase):
                         COZY_PROVISIONER_LOCK=str(self.base / "watch.lock"),
                         COZY_PROVISIONER_RECONCILE_SECONDS="0", VERIFY_TIMEOUT="0", FIXTURE=str(self.base))
         self.executable("hermes", "#!/bin/sh\nexit 0\n")
-        self.executable("ssh", '#!/bin/bash\n[ ! -e "$FIXTURE/ssh-fail" ] || exit 1\nshift 3\nexec /bin/bash -c "$1"\n')
+        self.executable("ssh", '#!/bin/bash\n[ ! -e "$FIXTURE/ssh-fail" ] || exit 1\nif [ -e "$FIXTURE/pause-ssh" ]; then touch "$FIXTURE/ssh-entered"; sleep 30; fi\nshift 3\nexec /bin/bash -c "$1"\n')
         self.executable("docker", '''#!/bin/bash
 if [ "$1" = logs ]; then printf 'attach-v1: profile "deleted-a" negotiated hello\n'; exit 0; fi
 printf 'restart\n' >> "$FIXTURE/restarts"
@@ -255,6 +257,33 @@ os.replace = replace
         self.run_script("provision-bot.sh", "--no-verify", "deleted-a", succeeds=False)
         self.assertEqual(self.envfile.read_bytes(), original)
         self.assertFalse(self.calls.exists())
+
+    def test_advisory_lock_excludes_overlap_and_recovers_after_sigkill(self):
+        pause = self.base / "pause-ssh"
+        pause.touch()
+        # A legacy mkdir lock must not disable the advisory-lock implementation.
+        (self.base / "watch.lock.d").mkdir()
+        command = ["bash", str(self.scripts / "bot-provisioner-watch.sh")]
+        worker = subprocess.Popen(command, env=self.env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not (self.base / "ssh-entered").exists():
+                self.assertIsNone(worker.poll(), "worker exited before reaching fixture SSH")
+                self.assertLess(time.monotonic(), deadline, "worker never reached fixture SSH")
+                time.sleep(0.01)
+            overlapping = subprocess.run(command, env=self.env, capture_output=True, timeout=3)
+            self.assertEqual(overlapping.returncode, 0)
+            self.assertIn("sweep skipped: another sweep still running", (self.base / "watch.log").read_text())
+            self.assertFalse(self.calls.exists())
+        finally:
+            # Kill the whole worker group, including its outstanding SSH child:
+            # no cleanup trap gets to remove or repair a lock file.
+            os.killpg(worker.pid, signal.SIGKILL)
+            worker.communicate(timeout=3)
+            pause.unlink()
+        self.run_script()
+        self.assert_clean()
 
     def test_unavailable_profiles_root_is_not_mass_deletion(self):
         shutil.rmtree(self.profiles)
