@@ -65,6 +65,7 @@ validate_plist() {
 }
 [ -f "$SCRIPT_DIR/bot-provisioner-watch.sh" ] || die "watcher missing from checkout"
 [ -f "$SCRIPT_DIR/provision-bot.sh" ] || die "provisioner missing from checkout"
+[ -f "$SCRIPT_DIR/deprovision-bot.sh" ] || die "deprovisioner missing from checkout"
 [ -d "$REPO_ROOT/integrations/attach-plugin" ] || die "attach plugin missing from checkout"
 [ -f "$PLIST_TEMPLATE" ] || die "LaunchAgent template missing from checkout"
 
@@ -104,11 +105,11 @@ cleanup() { rm -rf "$staging" "$next"; rm -f "$plist_tmp"; rm -rf "$install_lock
 trap cleanup EXIT
 
 mkdir -p "$staging/scripts" "$staging/integrations/attach-plugin" "$(dirname "$PLIST")"
-rsync -a "$SCRIPT_DIR/bot-provisioner-watch.sh" "$SCRIPT_DIR/provision-bot.sh" "$staging/scripts/"
+rsync -a "$SCRIPT_DIR/bot-provisioner-watch.sh" "$SCRIPT_DIR/provision-bot.sh" "$SCRIPT_DIR/deprovision-bot.sh" "$staging/scripts/"
 rsync -a --delete \
   --exclude '__pycache__/' --exclude '.pytest_cache/' --exclude '*.pyc' \
   "$REPO_ROOT/integrations/attach-plugin/" "$staging/integrations/attach-plugin/"
-chmod 700 "$staging/scripts/bot-provisioner-watch.sh" "$staging/scripts/provision-bot.sh"
+chmod 700 "$staging/scripts/bot-provisioner-watch.sh" "$staging/scripts/provision-bot.sh" "$staging/scripts/deprovision-bot.sh"
 {
   printf 'STAGED_AT_UTC=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   printf 'SOURCE_REPO=%s\n' "$REPO_ROOT"
