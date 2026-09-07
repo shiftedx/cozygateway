@@ -16,12 +16,9 @@ let relay: RunningRelay;
 let receiver: Server;
 let receiverUrl: string;
 let plugin: WebSocket;
-/** Every push this device received, decrypted, in arrival order. One settled turn legitimately
- *  produces TWO of them, from two independent fire-and-forget sends: the reply's `message` push
- *  and capability 68's `task_completed` push for the Task that turn is. Neither send waits on the
- *  other, so their arrival ORDER is not a fact about the gateway, and no assertion here may read
- *  it as one. Tests select the push they mean by `kind` instead of taking whichever landed first.
- */
+/** Every push this device received, decrypted, in arrival order. A fast reply records its marker
+ * synchronously before the already-queued completion callback runs, so this turn yields one
+ * `message` payload carrying its Task id rather than a second completion banner. */
 let deliveries: PushDelivery[];
 
 interface PushDelivery {
@@ -136,22 +133,19 @@ describe("push e2e over attach-v1", () => {
     expect(await deliveryOf("message")).toMatchObject({ threadId, agentName: "Echo", preview: "Echo: ping" });
   });
 
-  // The second half of the same turn. Kept as its own test so that a regression in the completion
-  // leg names itself instead of showing up as an ordering surprise in the test above.
-  it("delivers the Task completion push for the same turn, in either order", async () => {
+  it("collapses the same turn's queued completion push into its Task-addressable reply", async () => {
     const token = await pair();
     await register(token);
     const threadId = await thread(token);
     await send(token, threadId);
-    const completion = await deliveryOf("task_completed");
-    expect(completion).toMatchObject({ kind: "task_completed", threadId: "bot:echo", agentId: "echo" });
-    await deliveryOf("message");
-    // Exactly one of each, and nothing else: contract/push-v0.md sends the completion once per
-    // Task. The settle window gives a duplicate a chance to land and be caught.
+    const reply = await deliveryOf("message");
+    expect(reply).toMatchObject({ kind: "message", threadId, agentName: "Echo", preview: "Echo: ping", taskId: expect.any(String) });
+    // Let the queued completion callback and deferred sends run. It must not create a duplicate.
     await new Promise((resolve) => setTimeout(resolve, 150));
-    expect(deliveries.map((delivery) => delivery.kind).sort()).toEqual(["message", "task_completed"]);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.kind).toBe("message");
     // The taskId is a live Task this device can open, which is all the payload carries.
-    const task = await fetch(`${gateway.url}/tasks/${completion.taskId!}`, { headers: { authorization: `Bearer ${token}` } });
+    const task = await fetch(`${gateway.url}/tasks/${reply.taskId!}`, { headers: { authorization: `Bearer ${token}` } });
     expect(task.status).toBe(200);
     expect(((await task.json()) as { view: { state: string; bot: string } }).view).toMatchObject({ state: "completed", bot: "echo" });
   });

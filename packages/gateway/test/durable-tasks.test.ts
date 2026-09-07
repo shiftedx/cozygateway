@@ -3,12 +3,41 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { MobileNodeBroker } from "../src/mobile-node.ts";
+import { REPLY_PUSH_COLLAPSE_WINDOW_MS } from "../src/tasks.ts";
 import { NativeBotDataPlane } from "../src/hermes-bridge/native-data-plane.ts";
 import type { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 import { openStorage } from "../src/storage.ts";
 
 describe("durable Tasks on actual attach storage admission", () => {
+  it("retains a reply-push marker across restart and only collapses its own Task for ten seconds", () => {
+    const root = join(process.cwd(), "../../benchmark-runs/f23-reply-push"); mkdirSync(root, { recursive: true });
+    const directory = mkdtempSync(join(root, "restart-")); const path = join(directory, "gateway.sqlite");
+    let now = 0;
+    let storage = openStorage(path); storage.tasks.clock(() => now);
+    try {
+      const sessionId = storage.nativeBotChat("sage", 1).sessionId;
+      const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "work" }, 2);
+      const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+      storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+      storage.acceptAttachEvent("sage", { kind: "event", sequence: 1, eventId: "final", event: { kind: "commit", threadId: sessionId, turnId: "run", messageId: "reply", blocks: [] } }, 4);
+
+      // Completion state is already durable when a quick reply is pushed, so the lookup must not
+      // filter terminal Tasks. Its marker must survive the process that writes it.
+      expect(storage.tasks.replyPushTask(sessionId)).toBe(taskId);
+      storage.tasks.noteReplyPush(taskId);
+      expect(storage.tasks.replyPushCollapses(taskId)).toBe(true);
+      storage.close();
+
+      now = REPLY_PUSH_COLLAPSE_WINDOW_MS - 1;
+      storage = openStorage(path); storage.tasks.clock(() => now);
+      expect(storage.tasks.replyPushCollapses(taskId)).toBe(true);
+      expect(storage.tasks.replyPushCollapses("other_task")).toBe(false);
+      now += 1;
+      expect(storage.tasks.replyPushCollapses(taskId)).toBe(false);
+    } finally { storage.close(); rmSync(directory, { recursive: true }); }
+  });
+
   it("creates the Task with a direct turn, starts on ack and completes once on its final proof", () => {
     const storage = openStorage(":memory:");
     storage.tasks.clock(() => 0);

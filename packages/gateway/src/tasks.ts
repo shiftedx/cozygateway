@@ -22,6 +22,11 @@ interface RunRow { taskId: string; peer: string; runId: string; sessionId: strin
 const TASK_SELECT = "SELECT task_id AS taskId, bot, session_id AS sessionId, room, originating_turn_id AS originatingTurnId, originating_message_id AS originatingMessageId, goal FROM tasks";
 const RUN_SELECT = "SELECT task_id AS taskId, peer, run_id AS runId, session_id AS sessionId, intent_revision AS intentRevision, predecessor_run_id AS predecessorRunId FROM task_runs";
 
+/** A reply and its Task terminal transition can cross the synchronous notifier and the queued
+ * completion callback in either order. Ten seconds covers that one turn without suppressing a
+ * later Task notification. */
+export const REPLY_PUSH_COLLAPSE_WINDOW_MS = 10_000;
+
 /** The Task stream is authoritative. Execution remains the existing attach command/terminal
  * journal. These writes share Storage's SQLite transaction at each admission boundary. */
 export class Tasks {
@@ -45,6 +50,7 @@ export class Tasks {
       CREATE TABLE IF NOT EXISTS task_intent_revisions (task_id TEXT NOT NULL REFERENCES tasks(task_id), revision INTEGER NOT NULL, goal TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(task_id,revision)) STRICT;
       CREATE TABLE IF NOT EXISTS task_events (task_id TEXT NOT NULL REFERENCES tasks(task_id), seq INTEGER NOT NULL, source_id TEXT NOT NULL, event_json TEXT NOT NULL, PRIMARY KEY(task_id,seq), UNIQUE(task_id,source_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_completion_notifications (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), created_at INTEGER NOT NULL) STRICT;
+      CREATE TABLE IF NOT EXISTS task_reply_pushes (task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), pushed_at INTEGER NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS task_tool_facts (peer TEXT NOT NULL, run_id TEXT NOT NULL, call_id TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY(peer,run_id,call_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_waits (task_id TEXT NOT NULL, run_id TEXT NOT NULL, kind TEXT NOT NULL, record_id TEXT NOT NULL, requested_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, settled_at INTEGER, PRIMARY KEY(task_id,run_id,kind,record_id)) STRICT;
       CREATE TABLE IF NOT EXISTS task_absences (task_id TEXT NOT NULL, run_id TEXT NOT NULL, peer TEXT NOT NULL, episode TEXT NOT NULL, absent_at INTEGER NOT NULL, reattached_at INTEGER, PRIMARY KEY(task_id,run_id,episode)) STRICT;
@@ -116,6 +122,24 @@ export class Tasks {
   observe(observer: (frame: ServerFrame) => void, capabilityVersion = 64): void { this.#observer = capabilityVersion >= 64 ? observer : undefined; }
 
   clock(now: () => number): void { this.#clock = now; this.#bootAt = now(); }
+
+  /** The reply notifier resolves a session to the newest Run without assuming whether its Task
+   * has already reached a terminal projection. The terminal append queues its completion callback
+   * before the synchronous reply notifier returns, so filtering completed Tasks here races. */
+  replyPushTask(sessionId: string): string | undefined {
+    return (this.#db.prepare("SELECT task_id AS taskId FROM task_runs WHERE session_id = ? ORDER BY rowid DESC LIMIT 1").get(sessionId) as { taskId: string } | undefined)?.taskId;
+  }
+
+  /** Written before the fire-and-forget relay send is deferred, so a queued terminal callback in
+   * this process and a later process after restart both observe the same fact. */
+  noteReplyPush(taskId: string, at = this.#clock()): void {
+    this.#db.prepare("INSERT INTO task_reply_pushes (task_id, pushed_at) VALUES (?, ?) ON CONFLICT(task_id) DO UPDATE SET pushed_at = excluded.pushed_at").run(taskId, at);
+  }
+
+  replyPushCollapses(taskId: string, at = this.#clock()): boolean {
+    const row = this.#db.prepare("SELECT pushed_at AS pushedAt FROM task_reply_pushes WHERE task_id = ?").get(taskId) as { pushedAt: number } | undefined;
+    return row !== undefined && at >= row.pushedAt && at - row.pushedAt < REPLY_PUSH_COLLAPSE_WINDOW_MS;
+  }
 
   read(taskId: string, cursor = 0, limit = 100): { view: TaskView; events: TaskEvent[]; nextCursor?: number } | undefined {
     this.reconcile(this.#clock());

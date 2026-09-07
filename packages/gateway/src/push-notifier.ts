@@ -6,6 +6,14 @@ import { encryptPushPayload, type ApprovalPushPayload, type PushPayload, type Ta
 import { emitTrace, traceId, type TraceLog } from "./trace.ts";
 import type { ObservationRing } from "./observe/ring.ts";
 
+/** The small durable seam the notifier needs. Keeping it structural preserves the notifier's
+ * bare-storage unit tests and makes the synchronous write explicit at server assembly. */
+export interface ReplyPushTracker {
+  replyPushTask(sessionId: string): string | undefined;
+  noteReplyPush(taskId: string): void;
+  replyPushCollapses(taskId: string): boolean;
+}
+
 export const PREVIEW_MAX_CHARS = 200;
 const NOTIFY_TIMEOUT_MS = 10_000;
 
@@ -98,6 +106,7 @@ export interface RelayNotifierDeps {
   /** Dashboard packet D2. Push outcomes as a countable series beside the existing `relay_result`
    *  trace, not instead of it: the trace is a line an operator tails, this is what a chart reads. */
   observe?: ObservationRing;
+  replyPushes?: ReplyPushTracker;
 }
 
 /** Posts encrypted notification payloads to each registered device's relay.
@@ -111,6 +120,7 @@ export class RelayNotifier implements Notifier {
   readonly #isDeviceConnected: ((deviceId: string) => boolean) | undefined;
   readonly #trace: TraceLog | undefined;
   readonly #observe: ObservationRing | undefined;
+  readonly #replyPushes: ReplyPushTracker | undefined;
 
   constructor(deps: RelayNotifierDeps) {
     this.#storage = deps.storage;
@@ -120,6 +130,7 @@ export class RelayNotifier implements Notifier {
     this.#isDeviceConnected = deps.isDeviceConnected;
     this.#trace = deps.trace;
     this.#observe = deps.observe?.enabled === true ? deps.observe : undefined;
+    this.#replyPushes = deps.replyPushes;
   }
 
   notify(
@@ -132,11 +143,17 @@ export class RelayNotifier implements Notifier {
     // update over the WS instead, so it is excluded here rather than pushed to redundantly.
     const targets = registrations.filter((registration) => !connectedDeviceIds.has(registration.deviceId));
     if (targets.length === 0) return;
+    const taskId = this.#replyPushes?.replyPushTask(event.threadId);
+    // This is deliberately synchronous and precedes #send's setImmediate. Tasks.append queues
+    // its completion callback before this notifier call, so only a durable write here can make
+    // the callback observe a reply notification for the same turn.
+    if (taskId !== undefined) this.#replyPushes!.noteReplyPush(taskId);
     const payload: PushPayload = {
       kind: "message",
       threadId: event.threadId,
       agentName: event.agentName,
       preview: truncateAtCodePointBoundary(event.preview, PREVIEW_MAX_CHARS),
+      ...(taskId === undefined ? {} : { taskId }),
     };
     for (const registration of targets) {
       void this.#send(registration, payload).catch((err: unknown) => {
@@ -170,11 +187,14 @@ export class RelayNotifier implements Notifier {
     if (registrations === undefined) return;
     const targets = registrations.filter((registration) => !connectedDeviceIds.has(registration.deviceId));
     if (targets.length === 0) return;
+    const taskId = this.#replyPushes?.replyPushTask(event.chatSessionId);
+    if (taskId !== undefined) this.#replyPushes!.noteReplyPush(taskId);
     const payload: PushPayload = {
       kind: "message",
       threadId: `bot:${event.bot}`,
       agentName: event.displayName,
       preview: truncateAtCodePointBoundary(event.preview, PREVIEW_MAX_CHARS),
+      ...(taskId === undefined ? {} : { taskId }),
     };
     const routing = {
       category: CHAT_MESSAGE_CATEGORY,
@@ -232,6 +252,10 @@ export class RelayNotifier implements Notifier {
    *  other half of that deduplication is the caller's: this is invoked only when capability 64's
    *  completion notification record was newly written for the Task, which happens once. */
   notifyTaskCompletion(payload: TaskCompletionPushPayload, connectedDeviceIds: ReadonlySet<string>): void {
+    if (this.#replyPushes?.replyPushCollapses(payload.taskId) === true) {
+      this.#log(`push: task completion suppressed after reply push for ${payload.taskId}`);
+      return;
+    }
     const collapseId = payload.taskId;
     if (!COLLAPSE_ID_RE.test(collapseId)) {
       // Refused rather than truncated, for the reason the approval leg gives: two ids sharing a

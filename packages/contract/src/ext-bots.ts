@@ -3001,4 +3001,6 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * Unknown hello capability names are ignored. Peers offer this lane only after a hello acknowledgement
  * advertises bots version 74 or later, keeping older gateways compatible. */
 /** Capability 75: read-only observer API, bounded subscriptions and content-free live projections. */
-export const BOTS_CAPABILITY_VERSION = 75;
+/** Capability 76: a reply push optionally carries its Task id and suppresses its same-turn
+ * completion banner for ten seconds. */
+export const BOTS_CAPABILITY_VERSION = 76;

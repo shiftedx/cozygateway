@@ -959,6 +959,7 @@ export async function startGateway(
   };
   const notifier = new RelayNotifier({
     storage,
+    replyPushes: storage.tasks,
     ...(config.pushRelayUrl === undefined
       ? {}
       : { relayBaseUrl: config.pushRelayUrl }),
