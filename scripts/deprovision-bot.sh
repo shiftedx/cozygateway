@@ -85,6 +85,7 @@ while [ "$#" -gt 0 ]; do
     --orphans-only) ORPHANS_ONLY=1; shift ;;
     --reconcile-recreated) RECREATED_ONLY=1; shift ;;
     --list-pending) LIST_PENDING=1; shift ;;
+    --check-service-ownership) CHECK_SERVICE=1; shift ;;
     --gateway-url) GATEWAY_URL="$2"; shift 2 ;;
     --box) BOX_SSH="$2"; shift 2 ;;
     --box-repo) BOX_REPO="$2"; shift 2 ;;
@@ -171,6 +172,14 @@ try:
             print(name)
     elif action in {"clean", "clean-recreated"}:
         env = env_path.read_text()  # Failure is not equivalent to absence.
+        # Line-based mutation is safe only when quoted values end on that line.
+        # Preserve complex operator dotenv files for inspection, never rewrite their interiors.
+        for line in env.splitlines():
+            match = re.match(r"^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.*)$", line)
+            if match:
+                quoted_value = match.group(1)
+                if quoted_value[:1] in ("'", '"', chr(96)) and not re.search(r"(?<!\\)" + re.escape(quoted_value[0]), quoted_value[1:]):
+                    raise ValueError("multiline or unterminated dotenv value; environment retained")
         recreated = action == "clean-recreated"
         if recreated:
             names &= set(pending)
@@ -241,6 +250,56 @@ done
 
 # --- steps ----------------------------------------------------------------
 
+# A filename is only a discovery hint. Validate the actual generated Hermes
+# definition before touching either the remote identity or its local service.
+check_service_ownership() {
+  local profile="$1" label="ai.hermes.gateway-$1"
+  local plist="$HOME/Library/LaunchAgents/$label.plist"
+  if [ ! -e "$plist" ] && [ ! -L "$plist" ]; then
+    if have launchctl && launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+      warn "[$profile] loaded service has no ownership definition; preserving it for inspection"
+      return 1
+    fi
+    return 0
+  fi
+  python3 - "$plist" "$HERMES_HOME_ROOT" "$profile" <<'PYSERVICE'
+import os, plistlib, sys
+from pathlib import Path
+try:
+    file, root, profile = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+    if file.is_symlink() or not file.is_file() or file.stat().st_uid != os.getuid():
+        raise ValueError("ownership")
+    data = plistlib.loads(file.read_bytes())
+    home = str(root / "profiles" / profile)
+    if data.get("Label") != "ai.hermes.gateway-" + profile or data.get("WorkingDirectory") != home:
+        raise ValueError("scope")
+    if data.get("EnvironmentVariables", {}).get("HERMES_HOME") != home:
+        raise ValueError("home")
+    args = data.get("ProgramArguments")
+    interpreters = {str(root / "hermes-agent" / "venv" / "bin" / name) for name in ("python", "python3")}
+    if not isinstance(args, list) or not args or args[0] not in interpreters:
+        raise ValueError("interpreter")
+    # launchd executes Program when present, even if argv[0] names Hermes.
+    if "Program" in data and data["Program"] != args[0]:
+        raise ValueError("program override")
+    if args[1:3] == ["-m", "hermes_cli.stderr_timestamp"]:
+        if args[3:6] != ["--error-log", home + "/logs/gateway.error.log", "--"]:
+            raise ValueError("wrapper")
+        args = args[6:]
+    if not args or args[0] not in interpreters or args[1:7] != ["-m", "hermes_cli.main", "--profile", profile, "gateway", "run"]:
+        raise ValueError("command")
+    if args[7:] not in ([], ["--replace"], ["--external-supervisor"]):
+        raise ValueError("flags")
+except Exception:
+    print("Service ownership is ambiguous; plist and loaded job were preserved. Inspect this profile's LaunchAgent before retrying.", file=sys.stderr)
+    sys.exit(1)
+PYSERVICE
+}
+if [ "${CHECK_SERVICE:-0}" = 1 ]; then
+  for profile in "${PROFILES[@]}"; do check_service_ownership "$profile" || exit 1; done
+  exit 0
+fi
+
 # Bring the per-profile launchd job down for good. Boot it OUT first: an
 # uninstall that only removes the plist leaves a loaded job that KeepAlive
 # happily respawns, which is the same "cheerful success, nothing changed" trap
@@ -251,6 +310,7 @@ remove_service() {
     warn "[$profile] profile reappeared; refusing service cleanup"
     return 1
   fi
+  check_service_ownership "$profile" || return 1
   local label="ai.hermes.gateway-$profile"
   local plist="$HOME/Library/LaunchAgents/$label.plist"
   local loaded=0
@@ -338,6 +398,11 @@ if [ "$DRY_RUN" = 1 ]; then
     say "DRY  remove box config/token entries for ${PROFILES[*]}; recreate gateway once if needed"
   fi
   exit 0
+fi
+
+# Ownership must be proven before the remote batch changes as well as at bootout.
+if [ "$RECREATED_ONLY" != 1 ]; then
+  for profile in "${PROFILES[@]}"; do check_service_ownership "$profile" || die "service cleanup refused; existing state retained"; done
 fi
 
 # A failed parse/read prevents local teardown as well as remote mutation.

@@ -607,6 +607,29 @@ sync_plugin() {
   say "  plugin synced -> $dest"
 }
 
+# Existing local setters operate on lines, so refuse ambiguous multiline values
+# before any profile environment field can be rewritten.
+check_profile_env() {
+  [ -f "$1" ] || return 0
+  python3 - "$1" <<'PYENV'
+import re, sys
+from pathlib import Path
+try:
+    text = Path(sys.argv[1]).read_text()
+    # Line-based mutation is safe only when quoted values end on that line.
+    # Preserve complex operator dotenv files for inspection, never rewrite their interiors.
+    for line in text.splitlines():
+        match = re.match(r"^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.*)$", line)
+        if match:
+            quoted_value = match.group(1)
+            if quoted_value[:1] in ("'", '"', chr(96)) and not re.search(r"(?<!\\)" + re.escape(quoted_value[0]), quoted_value[1:]):
+                raise ValueError("multiline or unterminated dotenv value; environment retained")
+except Exception:
+    print("Profile environment has ambiguous multiline values; existing file retained. Inspect it before retrying provisioning.", file=sys.stderr)
+    sys.exit(1)
+PYENV
+}
+
 # Appends KEY=VALUE only when KEY is absent, so a re-run never rotates a secret
 # and never leaves a duplicate line for the loader to pick between.
 ensure_env_line() {
@@ -706,6 +729,14 @@ try:
     if not isinstance(profiles, dict):
         raise ValueError("invalid profiles")
     text = path.read_text()
+    # Line-based mutation is safe only when quoted values end on that line.
+    # Preserve complex operator dotenv files for inspection, never rewrite their interiors.
+    for line in text.splitlines():
+        match = re.match(r"^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.*)$", line)
+        if match:
+            quoted_value = match.group(1)
+            if quoted_value[:1] in ("'", '"', chr(96)) and not re.search(r"(?<!\\)" + re.escape(quoted_value[0]), quoted_value[1:]):
+                raise ValueError("multiline or unterminated dotenv value; environment retained")
     pattern = re.compile(r"^\s*(?:export\s+)?" + re.escape(key) + r"\s*=(.*)$")
     lines = text.splitlines(keepends=True)
     matches = [pattern.match(line.rstrip("\r\n")) for line in lines]
@@ -907,6 +938,7 @@ for profile in "${PROFILES[@]}"; do
   sync_plugin "$profile_dir/plugins/cozygateway"
 
   env_file="$profile_dir/.env"
+  check_profile_env "$env_file" || die "[$profile] profile environment repair refused"
   env_name="$(token_env_name "$profile")"
   say "  box token env var: $env_name"
 

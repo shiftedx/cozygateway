@@ -490,6 +490,7 @@ DEPROVISION="$SCRIPT_DIR/deprovision-bot.sh"
   || { log "sweep aborted: Hermes profiles root unavailable"; exit 1; }
 export HERMES_HOME_ROOT
 orphans=()
+orphan_refused=0
 live_cleanup=()
 add_orphan() {
   local profile="$1"
@@ -498,6 +499,11 @@ add_orphan() {
   [ -e "$HERMES_HOME_ROOT/profiles/$profile" ] && return 0
   [ -L "$HERMES_HOME_ROOT/profiles/$profile" ] && return 0
   case " ${orphans[*]+${orphans[*]}} " in *" $profile "*) return 0 ;; esac
+  if ! "$DEPROVISION" --check-service-ownership "$profile" >> "$LOG_FILE" 2>&1; then
+    log "orphan service preserved: $profile (ownership could not be proven)"
+    orphan_refused=1
+    return 0
+  fi
   orphans+=("$profile")
   log "orphaned: $profile"
 }
@@ -595,3 +601,5 @@ if [ "${#live_cleanup[@]}" -gt 0 ]; then
     exit 1
   fi
 fi
+
+[ "$orphan_refused" = 0 ] || { rm -f "$STAMP"; exit 1; }

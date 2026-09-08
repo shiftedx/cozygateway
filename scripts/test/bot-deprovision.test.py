@@ -2,6 +2,7 @@
 """Exercise the installed watcher and real remote edit against isolated host doubles."""
 import json
 import os
+import plistlib
 from pathlib import Path
 import shutil
 import signal
@@ -88,7 +89,12 @@ esac
         for name in names:
             label = f"ai.hermes.gateway-{name}"
             (self.loaded / label).touch()
-            (self.home / f"Library/LaunchAgents/{label}.plist").write_text("fixture plist")
+            home = str(self.profiles / name)
+            python = str(self.hermes / "hermes-agent/venv/bin/python")
+            (self.home / f"Library/LaunchAgents/{label}.plist").write_bytes(plistlib.dumps({
+                "Label": label, "WorkingDirectory": home, "EnvironmentVariables": {"HERMES_HOME": home},
+                "ProgramArguments": [python, "-m", "hermes_cli.stderr_timestamp", "--error-log", home + "/logs/gateway.error.log", "--",
+                                     python, "-m", "hermes_cli.main", "--profile", name, "gateway", "run", "--external-supervisor"]}))
         (self.base / "ready").write_text(json.dumps({"attach": {"configured": len(names) + 2, "hermes": {"configured": len(names)}}}))
 
     def run_script(self, script="bot-provisioner-watch.sh", *args, succeeds=True):
@@ -119,6 +125,53 @@ esac
         self.assertEqual(self.calls.read_text().splitlines(), ["restart"])
         self.run_script()
         self.assertEqual(self.calls.read_text().splitlines(), ["restart"])
+
+    def test_foreign_service_is_preserved_loaded_or_unloaded(self):
+        label = "ai.hermes.gateway-foreign"
+        plist = self.home / f"Library/LaunchAgents/{label}.plist"
+        payload = plistlib.dumps({"Label": label, "ProgramArguments": ["/usr/bin/true"], "WorkingDirectory": "/unrelated"})
+        plist.write_bytes(payload)
+        for loaded in (False, True):
+            if loaded:
+                (self.loaded / label).touch()
+            self.run_script(succeeds=False)
+            self.assertEqual(plist.read_bytes(), payload)
+            self.assertEqual((self.loaded / label).exists(), loaded)
+        # A misleading plist must also block direct cleanup of a configured name.
+        owned = self.home / "Library/LaunchAgents/ai.hermes.gateway-keeper.plist"
+        owned.write_bytes(payload)
+        before = self.config.read_bytes(), self.envfile.read_bytes()
+        self.run_script("deprovision-bot.sh", "keeper", succeeds=False)
+        self.assertEqual((self.config.read_bytes(), self.envfile.read_bytes()), before)
+        self.assertTrue((self.profiles / "keeper/sessions.db").exists())
+
+    def test_multiline_env_is_retained_by_deletion_and_provisioning(self):
+        custom = 'CUSTOM_NOTE="before\nCOZYGATEWAY_ATTACH_TOKEN_DELETED_A=note content\nafter"\n'
+        self.envfile.write_text(self.envfile.read_text() + custom)
+        before = self.config.read_bytes(), self.envfile.read_bytes()
+        self.run_script(succeeds=False)
+        self.assertEqual((self.config.read_bytes(), self.envfile.read_bytes()), before)
+        self.assertFalse(self.journal.exists())
+        profile = self.enable_real_provisioning()
+        self.run_script("provision-bot.sh", "deleted-a", succeeds=False)
+        self.assertEqual((self.config.read_bytes(), self.envfile.read_bytes()), before)
+        local = profile / ".env"
+        local.write_text(local.read_text() + 'CUSTOM_NOTE="before\nCOZYGATEWAY_TOKEN=note content\nafter"\n')
+        local_before = local.read_bytes()
+        self.run_script("provision-bot.sh", "deleted-a", succeeds=False)
+        self.assertEqual(local.read_bytes(), local_before)
+
+    def test_program_override_blocks_service_cleanup_before_remote_edits(self):
+        plist = self.home / "Library/LaunchAgents/ai.hermes.gateway-deleted-a.plist"
+        data = plistlib.loads(plist.read_bytes())
+        data["Program"] = "/usr/bin/true"
+        plist.write_bytes(plistlib.dumps(data))
+        before = {path: path.read_bytes() for path in (plist, self.config, self.envfile)}
+        self.run_script("deprovision-bot.sh", "deleted-a", succeeds=False)
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertTrue((self.loaded / "ai.hermes.gateway-deleted-a").exists())
+        self.assertFalse(self.journal.exists())
 
     def test_retry_after_failed_restart_without_config_or_service(self):
         failure = self.base / "restart-fail"
