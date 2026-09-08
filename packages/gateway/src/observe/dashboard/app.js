@@ -14,7 +14,7 @@
   const chip = (text, state = '') => `<span class="chip ${esc(state)}">${esc(text)}</span>`;
   const metric = (value, unit = duration) => !value || value.samples === 0 ? 'No samples' : value.belowSampleFloor ? `${number(value.samples)} samples · need 20` : `${unit(value.p50)} · p95 ${unit(value.p95)} · n ${number(value.samples)}`;
   const kv = rows => `<dl class="kv">${rows.map(([key, value]) => `<dt>${esc(key)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>`;
-  const table = (headers, rows) => rows.length ? `<div class="tablewrap"><table><thead><tr>${headers.map(x => `<th scope="col">${esc(x)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${row.map(x => `<td>${x}</td>`).join('')}</tr>`).join('')}</tbody></table></div>` : empty('No records in this window.');
+  const table = (headers, rows) => rows.length ? `<div class="tablewrap" role="region" tabindex="0" aria-label="${esc(headers.join(', '))}"><table><thead><tr>${headers.map(x => `<th scope="col">${esc(x)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${row.map(x => `<td>${x}</td>`).join('')}</tr>`).join('')}</tbody></table></div>` : empty('No records in this window.');
   const state = { window: '24h', bot: null, kind: '', data: {}, errors: new Set(), pending: false, again: false, generation: 0, connected: false, lastUpdate: null, authExpired: false, reconnect: 0, liveBots: new Map() };
   const reduce = matchMedia('(prefers-reduced-motion: reduce)');
   let token;
@@ -113,7 +113,7 @@
   }
   function renderOverview() {
     const data = state.data.overview; if (!data) return;
-    $('gateway-name').textContent = `· ${data.gateway.name}`;
+    $('gateway-name').textContent = data.gateway.name;
     const a = data.attach;
     $('header-strip').innerHTML = [chip(`v${data.gateway.version}`), chip(`up ${duration(data.gateway.uptimeMs)}`), chip(`bridge ${data.gateway.bridge}`, data.gateway.bridge === 'online' ? 'ok' : 'stale'), chip(`attach ${a?.online ?? 'unknown'} online`, a?.online ? 'ok' : ''), chip(`queue ${a?.queueDepth ?? 'not reported'}`), chip(`dead letters ${a?.deadLetters ?? 'not reported'}`, a?.deadLetters ? 'bad' : ''), chip(`tunnel ${data.tunnel.state}`, data.tunnel.state === 'offline' ? 'bad' : data.tunnel.state === 'online' ? 'ok' : 'stale')].join('');
     const spend = data.tiles.spend?.rows;
@@ -122,6 +122,7 @@
     $('glance').innerHTML = tiles.map(([label,value,description,status]) => `<div class="tile ${status}" role="listitem"><div class="k">${esc(label)}</div><div class="v">${esc(value)}</div><div class="d">${esc(description)}</div></div>`).join('');
     const approvals = state.data.approvals?.pending ?? [];
     const repairs = (state.data.cozyagents?.internals ?? []).flatMap(bot => (bot.toolServers ?? []).filter(server => server.state === 'repair_pending').map(server => ({ bot: bot.bot, server: server.server })));
+    $('attention').classList.toggle('calm', !approvals.length && !repairs.length);
     $('attention-items').innerHTML = [...approvals.map(row=>`<li>${chip('Approval','wait')}<span>${esc(row.bot)} has a pending approval. Answer in CozyChat.</span><span class="since">${esc(age(row.createdAt))}</span></li>`), ...repairs.map(row=>`<li>${chip('Repair','wait')}<span>${esc(row.bot)} · ${esc(row.server)} needs a decision in CozyChat.</span></li>`)].join('') || '<li class="empty">No pending decisions reported.</li>';
   }
   function historyNote(data, count, total, label, oldest = false) {
@@ -133,11 +134,11 @@
     if (!valid.length) { $(id).innerHTML = '<div class="chart-empty">No samples in this window.</div>'; return; }
     const width = 580, height = 118, lo = Math.min(...valid.map(p=>p.at)), hi = Math.max(...valid.map(p=>p.at)), max = Math.max(1,...valid.map(p=>p.value));
     const coords = valid.map(p=>`${40+(p.at-lo)/Math.max(1,hi-lo)*width},${140-p.value/max*height}`).join(' ');
-    $(id).innerHTML = `<svg class="chart" viewBox="0 0 640 160" role="img" aria-label="${esc(label)}, ${valid.length} samples"><line class="grid" x1="40" y1="140" x2="620" y2="140"/><polyline class="ctx" fill="none" stroke="var(--sage-ink)" stroke-width="2" points="${coords}"/><text x="40" y="155">${esc(clock(lo))}</text><text x="620" y="155" text-anchor="end">${esc(clock(hi))}</text><text x="40" y="16">${esc(duration(max))} max · n ${valid.length}</text></svg>` + historyNote(data, valid.length, data?.totalPoints, 'samples', true);
+    $(id).innerHTML = `<svg class="chart" viewBox="0 0 640 160" role="img" aria-label="${esc(label)}, ${valid.length} samples"><line class="grid" x1="40" y1="140" x2="620" y2="140"/><polyline class="ctx" fill="none" stroke="var(--primary)" stroke-width="2" points="${coords}"/><text x="40" y="155">${esc(clock(lo))}</text><text x="620" y="155" text-anchor="end">${esc(clock(hi))}</text><text x="40" y="16">${esc(duration(max))} max · n ${valid.length}</text></svg>` + historyNote(data, valid.length, data?.totalPoints, 'samples', true);
   }
   function renderBots() {
     const bots = state.data.bots?.bots; if (!bots) return;
-    $('bots').innerHTML = bots.length ? '<div class="bhead"><span></span><span>Bot · harness</span><span class="ft">First token p50</span><span class="r">Turns</span><span class="r">Failed</span><span>Approvals</span></div>' + bots.map(bot=>`<div class="brow rowbtn" role="button" tabindex="0" data-bot="${esc(bot.name)}" aria-label="Filter to ${esc(bot.name)}"><svg class="big" aria-hidden="true"><use href="#g-${bot.online?'ok':'off'}"/></svg><div class="bname">${esc(bot.name)}<small>${esc(bot.harness)} · ${esc(age(bot.lastTurnAt))}</small></div><div class="bft"><span>${esc(metric(bot.firstToken))}</span></div><div class="bn"><b>${number(bot.turns)}</b><small>turns</small></div><div class="bn ${bot.failures?'bad':''}"><b>${number(bot.failures)}</b><small>failed</small></div>${chip(`${number(bot.openApprovals)} pending`,bot.openApprovals?'wait':'')}</div>`).join('') : empty('No bots match this selection.');
+    $('bots').innerHTML = bots.length ? '<div class="bhead"><span></span><span>Bot · harness</span><span class="ft">First token p50</span><span class="r">Turns</span><span class="r">Failed</span><span>Approvals</span></div>' + bots.map(bot=>`<div class="brow rowbtn" role="button" tabindex="0" aria-pressed="${state.bot===bot.name}" data-bot="${esc(bot.name)}" aria-label="Filter to ${esc(bot.name)}"><svg class="big" aria-hidden="true"><use href="#g-${bot.online?'ok':'off'}"/></svg><div class="bname">${esc(bot.name)}<small>${esc(bot.harness)} · ${esc(age(bot.lastTurnAt))}</small></div><div class="bft"><span>${esc(metric(bot.firstToken))}</span></div><div class="bn"><b>${number(bot.turns)}</b><small>turns</small></div><div class="bn ${bot.failures?'bad':''}"><b>${number(bot.failures)}</b><small>failed</small></div>${chip(`${number(bot.openApprovals)} pending`,bot.openApprovals?'wait':'')}</div>`).join('') : empty('No bots match this selection.');
     $('bots').querySelectorAll('[data-bot]').forEach(row=>{ row.addEventListener('click',()=>applyFilter(row.dataset.bot)); row.addEventListener('keydown',event=>{ if(event.key==='Enter'||event.key===' '){event.preventDefault();applyFilter(row.dataset.bot);} }); });
   }
   function hopRows(hops) {
@@ -168,7 +169,7 @@
   }
   function renderDevices() {
     const data=state.data.devices;if(!data)return;
-    $('devices').innerHTML=`<div><h3>Devices</h3>${table(['Name','Kind','Scope','Last seen'],(data.devices??[]).map(row=>[esc(row.name),esc(row.kind),chip(row.scope,row.scope==='read'?'ok':''),esc(age(row.lastSeenAt))]))}</div><div><h3>Runners</h3>${table(['Name','State','Last contact'],(data.runners??[]).map(row=>[esc(row.name),chip(row.online?'online':'offline',row.online?'ok':'stale'),esc(age(row.lastContactAt))]))}</div>`;
+    $('devices').innerHTML=`<div><h3>Devices</h3>${table(['Name','Kind','Scope','Last seen'],(data.devices??[]).map(row=>[esc(row.name),esc(row.kind),chip(row.scope),esc(age(row.lastSeenAt))]))}</div><div><h3>Runners</h3>${table(['Name','State','Last contact'],(data.runners??[]).map(row=>[esc(row.name),chip(row.online?'online':'offline',row.online?'ok':'stale'),esc(age(row.lastContactAt))]))}</div>`;
   }
   function renderEvents() {
     const all=state.data.events?.events;if(!all)return;
@@ -181,7 +182,7 @@
     $('tab-ca').hidden=!data.available;
     if(!data.available){if($('tab-ca').getAttribute('aria-selected')==='true')select($('tab-gw'));return;}
     const bots=data.internals??[];
-    if(location.hash==='#view-ca' && $('tab-gw').getAttribute('aria-selected')==='true')select($('tab-ca'));
+    if((location.hash==='#view-ca' || document.getElementById(location.hash.slice(1))?.closest('#view-ca')) && $('tab-gw').getAttribute('aria-selected')==='true')select($('tab-ca'));
     const ages=bots.map(row=>row.snapshotAgeMs).filter(value=>typeof value==='number');
     $('agent-glance').innerHTML=[['Peers',number(bots.length),'stored snapshot subjects'],['Snapshot',ages.length?duration(Math.max(...ages)):'Not reported','oldest snapshot age'],['Steps',number(data.model?.stepLatency?.samples),'latency samples in window'],['Checkpoints',bots.some(row=>Number.isFinite(row.checkpoints?.count))?number(sum(bots.map(row=>row.checkpoints?.count))):'Not reported','reported counters'],['Repairs',number(sum(bots.map(row=>(row.toolServers??[]).filter(s=>s.state==='repair_pending').length))),'waiting on a person']].map(([label,value,detail])=>`<div class="tile" role="listitem"><div class="k">${esc(label)}</div><div class="v">${esc(value)}</div><div class="d">${esc(detail)}</div></div>`).join('');
     $('model').innerHTML=kv([['Model step latency',metric(data.model?.stepLatency)],['HTTP status distribution','Not reported'],['Provider usage','See throughput per model below']]);
@@ -210,7 +211,7 @@
     const cy=height/2,defs=svgElement('defs',{},svg),packets=svgElement('g',{id:'packets'},svg);
     const down=overview.tunnel.state==='offline';
     svg.classList.toggle('down',down);
-    function node(x,y,w,label,sub,status='ok',id){const g=svgElement('g',{class:'col'},svg);svgElement('rect',{class:`node ${status}`,x,y:y-30,width:w,height:60,rx:12,...(id?{id}: {})},g);svgElement('text',{x:x+w/2,y:y-4,'text-anchor':'middle'},g,label);svgElement('text',{x:x+w/2,y:y+15,'text-anchor':'middle',class:'mono'},g,sub);return g;}
+    function node(x,y,w,label,sub,status='ok',id){const g=svgElement('g',{class:'col'},svg);svgElement('rect',{class:`node ${status}`,x,y:y-30,width:w,height:60,rx:12,...(id?{id}: {})},g);svgElement('text',{x:x+w/2,y:y-4,'text-anchor':'middle'},g,label);svgElement('text',{x:x+w/2,y:y+15,'text-anchor':'middle',class:'detail'},g,sub);return g;}
     function path(id,d,live=false){svgElement('path',{id,d},defs);svgElement('use',{href:`#${id}`,class:`wire ${live?'':'idle'}`},svg);}
     const devices=state.data.devices?.devices??[];
     node(30,cy,130,'Devices',`${devices.length} paired`,devices.length?'ok':'off','dev-rect');
@@ -222,8 +223,8 @@
       node(720,y,180,bot.name,live?'recent activity':bot.online?'online':'absent',live?'live':bot.online?'ok':'off');
       if(live&&!reduce.matches){const packet=svgElement('use',{href:'#pk-in',class:'pkt in'},packets);const motion=svgElement('animateMotion',{dur:'2.2s',repeatCount:'indefinite',rotate:'auto'},packet);svgElement('mpath',{href:`#p-gw-${index}`},motion);}
     });
-    svgElement('text',{x:1010,y:cy-6,class:'lbl'},svg,'Model boundary');svgElement('text',{x:1010,y:cy+14,class:'mono'},svg,'Topology not reported');
-    if(!rows.length)svgElement('text',{x:720,y:cy,class:'mono'},svg,'No peers reported');
+    svgElement('text',{x:1010,y:cy-6,class:'lbl'},svg,'Model boundary');svgElement('text',{x:1010,y:cy+14,class:'detail'},svg,'Topology not reported');
+    if(!rows.length)svgElement('text',{x:720,y:cy,class:'detail'},svg,'No peers reported');
     const description=`${devices.length} paired devices; tunnel ${overview.tunnel.state}; ${bots.filter(bot=>bot.online).length} of ${bots.length} bots online${bots.length>8?'; first eight shown':''}. Model-server topology is not reported.`;
     svg.setAttribute('aria-label',description);$('flow-narrow').textContent=description;motion();
   }
@@ -277,7 +278,7 @@
     var selected = turn.spans.indexOf(turn.spans.filter(function (x) { return x.kind === 'tool_call'; }).sort(function (a, b) { return b.resultTokens - a.resultTokens; })[0]);
     if (selected < 0) selected = 0;
     function showSpan(i) {
-      var sp = turn.spans[i], kindClass = { prompt: 'live', model_step: 'ok', tool_call: sp.role === 'Mutation' ? 'wait' : 'live', approval_wait: 'wait', stream: 'live', checkpoint: 'ok' }[sp.kind];
+      var sp = turn.spans[i], kindClass = { prompt: 'live', model_step: '', tool_call: sp.role === 'Mutation' ? 'wait' : 'live', approval_wait: 'wait', stream: 'live', checkpoint: 'ok' }[sp.kind];
       inspect.innerHTML = '<div class="ih"><span class="chip ' + kindClass + '">' + esc(sp.kind.replace('_',' ')) + '</span><b>' + esc(spanName(sp)) + '</b></div>' + kv(facts(sp));
       tsvg.querySelectorAll('.span').forEach(function (g) { g.classList.toggle('sel', +g.dataset.i === selected); });
     }

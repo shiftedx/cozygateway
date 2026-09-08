@@ -1,0 +1,15 @@
+{
+  "tool": "built-in image_gen",
+  "useCase": "stylized-concept",
+  "asset": "packages/gateway/src/observe/dashboard/pair-craft.png",
+  "sha256": "ca4f0a4c0e47fc700903b3f77162770db33953ab23a177828c5e07aea151d080",
+  "generatedSource": "/Users/kmcdowell/.codex/generated_images/01a07ebd-37a8-7801-afc4-63b18939e88e/exec-915e3d44-1848-4748-a2b2-137af7397888.png",
+  "approvedDirection": "User selected black craft-paper scene and requested all jellies outside the auth form area.",
+  "characters": [
+    "Ink (quill)",
+    "Galaxy (Orbit)",
+    "Chalk (Chalklet)",
+    "Prism (rounded square-base pyramid)"
+  ],
+  "delivery": "Unmodified generated PNG bytes, embedded in Gateway; fixed same-origin public pairing asset. No runtime image service, third-party request, animation, credential or telemetry in the asset."
+}

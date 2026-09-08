@@ -1,1 +1,29 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pair Observe · CozyGateway</title><link rel="stylesheet" href="/observe/pair/app.css?v=__ASSET_VERSION__"><script src="/observe/pair/app.js?v=__ASSET_VERSION__" defer></script></head><body><main><span class="mark" aria-hidden="true"></span><h1>Pair this browser</h1><p>Observe your gateway’s health, turns and deliveries. Decisions and changes stay in CozyChat.</p><form id="pair-form"><label for="setup-code">Observer pairing code</label><input id="setup-code" name="setupCode" autocomplete="one-time-code" spellcheck="false" required maxlength="128" autofocus><p class="hint">In CozyChat, open Devices and create an observer pairing code.</p><label for="device-name">Browser name</label><input id="device-name" name="deviceName" autocomplete="off" value="Observe browser" required maxlength="128"><button type="submit">Pair read-only browser</button><p id="pair-status" role="status" aria-live="polite"></p></form><small>Your paired credential stays on this origin. The dashboard never sends it in a URL.</small></main></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Pair browser · CozyGateway Observe</title>
+  <link rel="stylesheet" href="/observe/pair/app.css?v=__ASSET_VERSION__">
+  <script src="/observe/pair/app.js?v=__ASSET_VERSION__" defer></script>
+</head>
+<body class="pair-page">
+  <main>
+    <header class="pair-brand"><span class="cozy-wordmark">Cozy</span><span>Observe</span></header>
+    <section class="pair-panel" aria-labelledby="pair-title">
+      <h1 id="pair-title">Pair this browser</h1>
+      <p>See your gateway’s health and agent activity. Approvals and changes stay in CozyChat.</p>
+      <form id="pair-form">
+        <label for="setup-code">Observer pairing code</label>
+        <input id="setup-code" name="setupCode" autocomplete="one-time-code" spellcheck="false" maxlength="128" autofocus required aria-describedby="code-hint pair-status">
+        <p class="hint" id="code-hint">In CozyChat, open Devices and create an observer pairing code.</p>
+        <label for="device-name">Browser name</label>
+        <input id="device-name" name="deviceName" autocomplete="off" value="Observe browser" required maxlength="128" aria-describedby="pair-status">
+        <button type="submit">Pair read-only browser</button>
+        <p id="pair-status" role="status" aria-live="polite"></p>
+      </form>
+    </section>
+    <small class="privacy-note">Your paired credential stays on this origin. The dashboard never sends it in a URL.</small>
+  </main>
+</body>
+</html>
