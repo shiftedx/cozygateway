@@ -439,7 +439,7 @@ public static class $className {
         'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT' = (Join-Path $temp 'answer-enter')
     })
     Assert-True ($enter.ExitCode -eq 0) "the harness question must not fail the dry run: $($enter.Output)"
-    Assert-Contains $enter.Output 'Which harness runs your bots? [1] CozyAgents (recommended) [2] Hermes Agent [3] Both [1]' 'the harness question must be asked'
+    Assert-Contains $enter.Output 'Choose what will run your bots on this computer.' 'the harness question must be asked'
     Assert-Contains $enter.Output 'harness: cozyagents' 'Enter must take the recommended harness'
 
     $two = Invoke-Bootstrap $installer (New-Environment @{
@@ -474,14 +474,14 @@ public static class $className {
         'COZYGATEWAY_INSTALL_DRYRUN' = '1'
         'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT' = (Join-Path $temp 'answer-two')
     }) @('-Harness', 'cozyagents')
-    Assert-Missing $flag.Output 'Which harness runs your bots?' '-Harness must answer the question'
+    Assert-Missing $flag.Output 'Choose what will run your bots on this computer.' '-Harness must answer the question'
     Assert-Contains $flag.Output 'harness: cozyagents (from -Harness)' '-Harness must say where the answer came from'
 
     $silent = Invoke-Bootstrap $installer (New-Environment @{
         'COZYGATEWAY_HOME' = (Join-Path $temp 'Silent Gateway')
         'COZYGATEWAY_INSTALL_DRYRUN' = '1'
     })
-    Assert-Missing $silent.Output 'Which harness runs your bots?' 'a run with no terminal must not ask'
+    Assert-Missing $silent.Output 'Choose what will run your bots on this computer.' 'a run with no terminal must not ask'
     Assert-Contains $silent.Output 'would install or update CozyAgents' 'a run with no terminal must take the recommended harness'
 
     $bad = Invoke-Bootstrap $installer (New-Environment @{
@@ -535,7 +535,7 @@ public static class $className {
     $liveHome = Join-Path $temp 'Live Cozy Gateway'
     $liveAgents = Join-Path $temp 'live-cozyagents'
     $liveCodex = Join-Path $temp 'live-profile\.pi\agent\auth.json'
-    Write-Utf8NoBom $liveCodex "{`"stub`":true}`n"
+    Write-Utf8NoBom $liveCodex '{"openai-codex":{"type":"oauth","access":"fixture-access","refresh":"fixture-refresh","expires":1}}'
     Write-Utf8NoBom (Join-Path $temp 'model-answers') "openai-codex`ngpt-5.6-luna`ny`n"
     Write-Utf8NoBom (Join-Path $temp 'lan-yes') "yes`n"
     $livePathLog = Join-Path $temp 'live-user-path.txt'
@@ -544,6 +544,7 @@ public static class $className {
         'COZYGATEWAY_HOME' = $liveHome
         'COZYAGENTS_HOME' = $liveAgents
         'COZYGATEWAY_CODEX_AUTH_PATH' = $liveCodex
+        'PI_CODING_AGENT_DIR' = (Split-Path -Parent $liveCodex)
         'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' = (Join-Path $temp 'model-answers')
         'COZYGATEWAY_TEST_LAN_PROMPT_INPUT' = (Join-Path $temp 'lan-yes')
         'COZYGATEWAY_TEST_PAIRING_LAN_ADDRESS' = '192.0.2.10'
@@ -556,7 +557,7 @@ public static class $className {
 
     # The questions, in the approved order: harness, model, network, then the QR.
     Assert-Contains $live.Output 'Which provider should new bots use?' 'the provider question must be asked'
-    Assert-Contains $live.Output 'Share the Codex login on this computer' 'a Codex login on this machine must be offered'
+    Assert-Contains $live.Output 'Share the saved Pi model credentials and settings' 'saved model credentials must be offered only with explicit consent'
     Assert-Contains $live.Output 'Allow CozyChat to access this Gateway over your local network? [y/N]' 'the network question must be asked'
     Assert-Contains $live.Output 'default model for new bots: gpt-5.6-luna on openai-codex' 'the model answers must be reported'
 
@@ -622,6 +623,7 @@ public static class $className {
         'COZYGATEWAY_HOME' = $liveHome
         'COZYAGENTS_HOME' = $liveAgents
         'COZYGATEWAY_CODEX_AUTH_PATH' = $liveCodex
+        'PI_CODING_AGENT_DIR' = (Split-Path -Parent $liveCodex)
         'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT' = (Join-Path $temp 'answer-enter')
         'COZYGATEWAY_TEST_PAIR_PROMPT_INPUT' = (Join-Path $temp 'pair-no')
         'COZYGATEWAY_TEST_GATEWAY_STAGE' = (Join-Path $temp 'stage-lan')
@@ -631,7 +633,7 @@ public static class $className {
     })
     Assert-True ($rerun.ExitCode -eq 0) "the second run failed: $($rerun.Output)"
     Assert-Missing (Read-LogText $agentsLog) 'install NoPair=' 'gateway updates must reuse the existing runner without invoking its installer, even elevated'
-    Assert-Missing $rerun.Output 'Which harness runs your bots?' 'existing installs must preserve the recorded harness without prompting'
+    Assert-Missing $rerun.Output 'Choose what will run your bots on this computer.' 'existing installs must preserve the recorded harness without prompting'
     Assert-Contains (Read-LogText $agentsLog).ToLowerInvariant() "argv update --home $liveAgents --json".ToLowerInvariant() 'reruns must update the actual installed runner'
     Assert-Missing $rerun.Output 'Allow CozyChat to access this Gateway over your local network?' 'the network question is asked once'
     Assert-Missing $rerun.Output 'Create a new CozyChat pairing code?' 'an update must not ask to pair another client'
