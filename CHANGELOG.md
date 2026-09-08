@@ -5,6 +5,12 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## 0.7.10 (2026-09-07): direct Observe pairing entry
+
+Opening `/observe` in an unpaired browser now goes directly to the styled pairing
+page instead of a plain error page. Revoked credentials return to pairing, while
+dashboard data and APIs still require authorization. See [#426](https://github.com/shiftedx/cozygateway/pull/426).
+
 ## 0.7.9 (2026-09-07): automatic deletion and installation repair
 
 Bot deletion now removes owned storage, revokes retired attach credentials across restarts and
