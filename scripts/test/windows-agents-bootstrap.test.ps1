@@ -334,6 +334,17 @@ public static class $className {
             'COZYAGENTS_TEST_SCHEMA' = $(if ($initial -eq 'fresh') { '1' } else { '0' })
         }
         $requested = switch ($initial) { 'hermes' { 'cozyagents' }; 'cozyagents' { 'hermes' }; default { 'both' } }
+        if ($initial -eq 'hermes') {
+            Remove-Item -LiteralPath $eventLog, $agentsLog -Force -ErrorAction SilentlyContinue
+            $dualEnvironment['COZYGATEWAY_TEST_ASSUME_ELEVATED'] = '1'
+            $deferred = Invoke-Bootstrap $installer $dualEnvironment @('-Harness', 'cozyagents', '--no-qr')
+            Assert-True ($deferred.ExitCode -eq 0) "adding CozyAgents from an elevated shell must not block the existing Hermes gateway update: $($deferred.Output)"
+            Assert-Contains $deferred.Output 'CozyAgents setup deferred' 'a deferred harness addition must be explained explicitly'
+            Assert-Contains (Read-LogText $eventLog) '--harness hermes' 'the existing Hermes gateway must still be updated'
+            Assert-Missing (Read-LogText $agentsLog) 'install NoPair=' 'deferred addition must not invoke the elevated harness installer'
+            Assert-Missing (Read-LogText (Join-Path $dualHome 'local\install-state')) 'harness=both' 'a deferred addition must not be recorded as installed'
+            $dualEnvironment['COZYGATEWAY_TEST_ASSUME_ELEVATED'] = '0'
+        }
         Remove-Item -LiteralPath $eventLog, $agentsLog -Force -ErrorAction SilentlyContinue
         $dualArguments = @('-Harness', $requested)
         if ($initial -ne 'fresh') { $dualArguments += '--no-qr' }
@@ -388,6 +399,18 @@ public static class $className {
             Assert-Missing $changedEnv 'COZYRUNNER_MODEL_PROVIDER=' 'switching to an endpoint must remove the provider key'
             Assert-Contains $changedEnv 'COZYRUNNER_TOKEN=paired-token' 'changing the model source must preserve runner pairing'
         }
+        # Existing dual installs must update from the same elevated shell in the
+        # reported failure, without touching the harness or its credentials.
+        $runnerBeforeUpdate = Read-LogText (Join-Path $dualAgents 'runner.env')
+        Remove-Item -LiteralPath $agentsLog -Force -ErrorAction SilentlyContinue
+        $dualEnvironment['COZYGATEWAY_TEST_ASSUME_ELEVATED'] = '1'
+        $dualEnvironment['COZYAGENTS_TEST_INSTALL_FAIL'] = '1'
+        $dualUpdate = Invoke-Bootstrap $installer $dualEnvironment @('-Repair', '--no-qr')
+        Assert-True ($dualUpdate.ExitCode -eq 0) "elevated dual repair failed: $($dualUpdate.Output)"
+        Assert-Missing (Read-LogText $agentsLog) 'install NoPair=' 'dual repair must not reinstall CozyAgents'
+        Assert-True ((Read-LogText (Join-Path $dualAgents 'runner.env')) -eq $runnerBeforeUpdate) 'dual repair must preserve runner settings byte for byte'
+        $dualEnvironment['COZYGATEWAY_TEST_ASSUME_ELEVATED'] = '0'
+        $dualEnvironment['COZYAGENTS_TEST_INSTALL_FAIL'] = ''
         Remove-Item -LiteralPath $agentsLog -Force -ErrorAction SilentlyContinue
         $removed = Invoke-Bootstrap $installer $dualEnvironment @('--uninstall')
         Assert-True ($removed.ExitCode -eq 0) "dual uninstall failed: $($removed.Output)"
@@ -584,6 +607,8 @@ public static class $className {
     Remove-Item -LiteralPath $agentsLog, $eventLog -Force -ErrorAction SilentlyContinue
     $rerunPathLog = Join-Path $temp 'rerun-user-path.txt'
     $rerun = Invoke-Bootstrap $installer (New-Environment @{
+        'COZYGATEWAY_TEST_ASSUME_ELEVATED' = '1'
+        'COZYAGENTS_TEST_INSTALL_FAIL' = '1'
         'COZYGATEWAY_HOME' = $liveHome
         'COZYAGENTS_HOME' = $liveAgents
         'COZYGATEWAY_CODEX_AUTH_PATH' = $liveCodex
@@ -595,6 +620,7 @@ public static class $className {
         'COZYGATEWAY_TEST_USER_PATH_LOG' = $rerunPathLog
     })
     Assert-True ($rerun.ExitCode -eq 0) "the second run failed: $($rerun.Output)"
+    Assert-Missing (Read-LogText $agentsLog) 'install NoPair=' 'gateway updates must reuse the existing runner without invoking its installer, even elevated'
     Assert-Contains $rerun.Output 'Which harness runs your bots?' 'interactive reruns must offer adding either harness'
     Assert-Contains $rerun.Output 'harness: cozyagents (selected)' 'Enter must preserve the recorded harness'
     Assert-Missing $rerun.Output 'Allow CozyChat to access this Gateway over your local network?' 'the network question is asked once'
