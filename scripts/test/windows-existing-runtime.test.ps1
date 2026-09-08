@@ -42,10 +42,44 @@ try {
     $failed = $false
     try { Install-CozyAgentsHarness $fixture 'unused' 'unused' $true } catch { $failed = $_.Exception.Message -like '*runtime changed*' }
     if (-not $failed) { throw 'runtime invalidated after preflight must abort instead of downloading an installer' }
+
+    # Real current install records bind the owned bundle to its release size and hash.
+    # Keep the same path and nonzero length when corrupting it: readability is insufficient.
+    $realNode = (Get-Command node -CommandType Application | Select-Object -First 1).Source
+    $original = 'console.log("original");'
+    [IO.File]::WriteAllText($bundle, $original)
+    $asset = @{ name = 'cozyagents.mjs'; path = $bundle; url = 'https://example.invalid/cozyagents.mjs'; size = (Get-Item -LiteralPath $bundle).Length; sha256 = (Get-FileHash -LiteralPath $bundle -Algorithm SHA256).Hash.ToLowerInvariant() }
+    $current = @{ schemaVersion = 1; home = $fixture; version = 'v0.2.15'; installedAt = 1; manifestUrl = 'https://example.invalid/agents-release.json'; node = $realNode; assets = @($asset) }
+    $current | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadata
+    Assert-Runtime $true 'valid current recorded bundle integrity must permit reuse'
+    [IO.File]::WriteAllText($bundle, ('x' * $original.Length))
+    Assert-Runtime $false 'nonempty same-size corruption must fail recorded bundle hash validation'
+    $failed = $false
+    try { Install-CozyAgentsHarness $fixture 'unused' 'unused' $true } catch { $failed = $_.Exception.Message -like '*runtime changed*' }
+    if (-not $failed) { throw 'corrupt reused runtime must abort before setup or download' }
+    [IO.File]::WriteAllText($bundle, $original)
+    $asset.size += 1
+    $current | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadata
+    Assert-Runtime $false 'recorded bundle size mismatch must refuse reuse even when the hash matches'
+    $asset.size -= 1
+    $asset.sha256 = 'invalid'
+    $current | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadata
+    Assert-Runtime $false 'malformed recorded integrity must not fall back to readability'
+    $asset.sha256 = (Get-FileHash -LiteralPath $bundle -Algorithm SHA256).Hash.ToLowerInvariant()
+    $asset.size = $null
+    $current | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadata
+    Assert-Runtime $false 'null recorded size must not be treated as absent'
+    @{ node = $realNode; bundle = @{ path = $bundle; sha256 = $asset.sha256 } } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadata
+    Assert-Runtime $true 'legacy recorded hash without a size must permit the matching bundle'
+    [IO.File]::WriteAllText($bundle, ('x' * $original.Length))
+    Assert-Runtime $false 'legacy recorded hash must also reject nonempty corruption'
+    @{ node = $realNode; bundle = @{ path = $bundle } } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadata
+    Assert-Runtime $true 'legacy metadata without integrity fields must retain readability compatibility'
     Write-Output 'PASS existing Windows runtime validation'
 } finally {
     $resolved = [IO.Path]::GetFullPath($fixture)
-    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+    $separator = [IO.Path]::DirectorySeparatorChar
+    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd($separator) + $separator
     if (-not $resolved.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'unsafe fixture cleanup' }
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }

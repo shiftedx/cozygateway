@@ -222,10 +222,13 @@ if (`$env:COZYAGENTS_TEST_INSTALL_FAIL -eq '1') { throw 'stub CozyAgents install
 `$target = `$InstallHome
 New-Item -ItemType Directory -Force -Path (Join-Path `$target 'bin') | Out-Null
 Copy-Item -LiteralPath '$agentsFixture' -Destination (Join-Path `$target 'bin\cozyagents-fixture.js') -Force
+`$bundlePath = Join-Path `$target 'bin\cozyagents-fixture.js'
+`$bundleSha = (Get-FileHash -LiteralPath `$bundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
+`$bundleSize = (Get-Item -LiteralPath `$bundlePath).Length
 `$state = [ordered]@{
     version = 'v0.0.0-test'
     node = '$node'
-    bundle = [ordered]@{ url = ''; sha256 = ''; path = (Join-Path `$target 'bin\cozyagents-fixture.js') }
+    bundle = [ordered]@{ url = ''; sha256 = `$bundleSha; path = `$bundlePath }
 }
 if (`$env:COZYAGENTS_TEST_SCHEMA -eq '1') {
     `$state = [ordered]@{
@@ -234,7 +237,7 @@ if (`$env:COZYAGENTS_TEST_SCHEMA -eq '1') {
         node = '$node'
         assets = @(
             [ordered]@{ name = 'cozyagents-update.mjs'; path = (Join-Path `$target 'must-not-run-update-worker.js') },
-            [ordered]@{ name = 'cozyagents.mjs'; path = (Join-Path `$target 'bin\cozyagents-fixture.js') }
+            [ordered]@{ name = 'cozyagents.mjs'; path = `$bundlePath; sha256 = `$bundleSha; size = `$bundleSize }
         )
     }
 }
