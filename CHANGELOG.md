@@ -5,6 +5,25 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## 0.8.0 (2026-09-08): CozyChat Observe and reliable Windows setup
+
+Observe now matches CozyChat’s graphite/rust colors and system typography, with clearer
+navigation, keyboard-accessible tables, and readable refresh-error states. Pairing opens
+directly from an unpaired dashboard visit. Its bundled black craft-paper scene keeps Ink,
+Galaxy, Chalk, and pyramid Prism clear of the desktop form; mobile and tall windows use a
+compact craft header. Dashboard data and APIs remain protected by read-only pairing.
+See [#430](https://github.com/shiftedx/cozygateway/pull/430).
+
+Windows one-line setup now continues through the verified same-account desktop session,
+updates selected installed harnesses, and checks Gateway/profile readiness before reporting
+success. Interrupted runs retain harness selection, custom homes, and pending pairing.
+Owned-process recovery, bounded downloads, and verified private Git bootstrap improve repair
+without discarding configuration, pairing, or healthy components.
+See [#428](https://github.com/shiftedx/cozygateway/pull/428).
+
+Update with the published installer or your existing repair/update command. Existing
+configuration, pairings, bot history, and automatic deletion safeguards are retained.
+
 ## 0.7.10 (2026-09-07): direct Observe pairing entry
 
 Opening `/observe` in an unpaired browser now goes directly to the styled pairing
