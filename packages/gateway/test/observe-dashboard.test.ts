@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openStorage, type Storage } from "../src/storage.ts";
 import { createApp } from "../src/http.ts";
@@ -40,7 +41,7 @@ describe("the embedded Observe dashboard", () => {
     expect(html).not.toContain("warm.cozylabs.ai");
   });
   it("answers 404 for the whole dashboard when observability is disabled", async () => {
-    for (const path of ["/observe", "/observe/assets/app.js", "/observe/pair", "/observe/pair/app.css", "/observe/session"]) {
+    for (const path of ["/observe", "/observe/assets/app.js", "/observe/pair", "/observe/pair/app.css", "/observe/pair/craft.png", "/observe/session"]) {
       expect((await app(false).request(path, { headers: bearer() })).status).toBe(404);
     }
   });
@@ -64,7 +65,7 @@ describe("the embedded Observe dashboard", () => {
       const pairing = await gateway.request(response.headers.get("location")!, { headers });
       expect(pairing.status).toBe(200);
       const html = await pairing.text();
-      expect(html).toContain('<h1>Pair this browser</h1>');
+      expect(html).toMatch(/<h1(?:\s[^>]*)?>Pair this browser<\/h1>/);
       expect(html).toContain('/observe/pair/app.css?v=');
       expect(html).toContain('/observe/pair/app.js?v=');
       expect(html).not.toContain('Observer pairing required');
@@ -78,13 +79,27 @@ describe("the embedded Observe dashboard", () => {
     const css = await (await gateway.request("/observe/assets/app.css", { headers: bearer() })).text();
     expect(css).not.toMatch(/fonts\.googleapis|fonts\.gstatic|https:\/\//);
     const fontUrls = [...css.matchAll(/src: url\("([^\"]+\.woff2[^\"]*)"\)/g)].map(match => match[1]!);
-    expect(fontUrls).toHaveLength(7);
+    expect(fontUrls).toHaveLength(2);
+    expect(fontUrls.every(path => path.includes("jetbrains-mono"))).toBe(true);
     for (const path of fontUrls) {
       const font = await gateway.request(path, { headers: bearer() });
       expect(font.status).toBe(200);
       expect(font.headers.get("content-type")).toBe("font/woff2");
       expect(Buffer.from(await font.arrayBuffer()).subarray(0, 4).toString()).toBe("wOF2");
     }
+  });
+  it("serves the bundled craft backdrop without exposing dashboard data", async () => {
+    const gateway = app();
+    const response = await gateway.request(`/observe/pair/craft.png?v=${OBSERVE_ASSET_VERSION}`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("image/png");
+    expect(response.headers.get("content-security-policy")).toBe(OBSERVE_CSP);
+    expect(response.headers.get("cache-control")).toContain("immutable");
+    expect(Buffer.from(await response.arrayBuffer()).equals(readFileSync(new URL("../src/observe/dashboard/pair-craft.png", import.meta.url)))).toBe(true);
+    const html = await (await gateway.request("/observe", { headers: bearer() })).text();
+    expect(html).toContain('/observe/pair/app.css?v=');
+    expect((await gateway.request("/observe/assets/app.js")).status).toBe(401);
+    expect((await gateway.request("/observe/session")).status).toBe(401);
   });
   it("bridges bearer auth to a scoped HttpOnly cookie and checks revocation on every navigation", async () => {
     const gateway = app();

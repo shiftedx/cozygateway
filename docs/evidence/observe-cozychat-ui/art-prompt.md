@@ -1,0 +1,13 @@
+# Pairing backdrop generation
+
+Built-in GPT Image generation used four local visual references from CozyChat's Living Jelly collection: `ink-chalk-galaxy-v1/review/ink-quill-dark.png`, `galaxy-orbit-dark.png`, `chalk-chalklet-dark.png`, and `prism-pyramid-performances-v1/ios-app-assets/beauty/prism-clear-lucid-idle.png`. The approved derivative is decorative auth-page art, not a replacement for the app's canonical 3D assets.
+
+The user rejected an abstract sculptural backdrop in favor of a craft-table scene, selected the black-paper version, then requested clear space around the form. Earlier generation variants remain outside the source repository and are not shipped.
+
+## Scene prompt
+
+Create a tactile craft-table still-life backdrop for CozyChat browser authentication, with Ink, Galaxy, Chalk and square-base pyramid Prism. A welcoming maker's workbench with craft supplies, layered craft paper, paper offcuts, a cutting mat, washi tape, a wooden ruler and small scissors arranged around the perimeter. High three-quarter overhead view of a charcoal-gray craft desk, textured neutral and kraft paper sheets and restrained rust-orange paper accents. Keep the center quiet for an opaque form. Preserve reference silhouettes, minimal bonded eyes and materials; no mouths, limbs, extra characters, text, logos, UI or watermark. Prism must have a square base and one apex. Landscape 1536×1024.
+
+## Final repositioning prompt
+
+Edit this approved black-paper craft-table backdrop ONLY to protect the authentication form's central safe area. Keep the graphite craft paper, supplies, ruler, scissors, tape, rust accents, lighting, tactile textures, and the exact four jelly identities. The form will cover the rectangle from x30% to x70%, y8% to y95%, so absolutely NO part of ANY jelly may enter this rectangle. Keep Ink fully in left x3%-19%, y35%-58%; Galaxy fully in left x4%-24%, y61%-84%. Move Chalk from its current near-center location to the UPPER RIGHT margin, entirely within x77%-95%, y34%-56%, with both eyes clearly visible. Move clear pyramid Prism entirely into the LOWER RIGHT margin x77%-97%, y64%-87%, all of its square base and ONE apex visible. Modestly reduce character size as needed so all four fit cleanly without overlap, without clipping edges, and with generous empty graphite paper between the left and right groups. Preserve Prism's clear square-base pyramid geometry, never a blob or two lobes. Supplies may shift slightly around these right-margin characters but do not become busier. No text, no drawn form, no UI box, no safe-area lines, no logos. This should look like the same approved scene, just rearranged so a centered tall opaque form cannot hide the jellies. Landscape1536x1024.

@@ -38,6 +38,7 @@ export function registerObserveDashboard(app: Hono<{ Variables: { deviceId: stri
   app.get("/observe/pair", c => enabled() ? respond(c, "pair.html", false) : c.notFound());
   app.get("/observe/pair/app.css", c => enabled() ? respond(c, "pair.css") : c.notFound());
   app.get("/observe/pair/app.js", c => enabled() ? respond(c, "pair.js") : c.notFound());
+  app.get("/observe/pair/craft.png", c => enabled() ? respond(c, "pair-craft.png") : c.notFound());
   app.get("/observe/session", c => {
     if (!enabled()) return c.notFound();
     if (!authorized(c, false)) return c.json({ error: { code: "unauthorized" } }, 401);
