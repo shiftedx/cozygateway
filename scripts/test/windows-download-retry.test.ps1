@@ -47,8 +47,9 @@ try {
     Assert-True ($failed -and $script:calls -eq 0 -and $script:delays.Count -eq 0) 'local copy errors must not retry or fall back to network'
     $script:calls=0; $script:failures=0; $script:delays=@()
     $failed=$false
-    try { Get-VerifiedAsset 'asset' (Join-Path $root 'verified') 'https://example.invalid' } catch { $failed=$_.Exception.Message -match 'checksum mismatch' }
-    Assert-True ($failed -and $script:calls -eq 2 -and $script:delays.Count -eq 0) 'checksum mismatch must fail without retrying either completed download'
+    $failureMessage=''
+    try { Get-VerifiedAsset 'asset' (Join-Path $root 'verified') 'https://example.invalid' } catch { $failureMessage=$_.Exception.Message; $failed=$failureMessage -match 'checksum mismatch' }
+    Assert-True ($failed -and $script:calls -eq 2 -and $script:delays.Count -eq 0) "checksum mismatch must fail without retrying either completed download (calls=$script:calls; error=$failureMessage)"
     Write-Host 'Windows download retry tests passed'
 } finally {
     $resolved=[IO.Path]::GetFullPath($root)
