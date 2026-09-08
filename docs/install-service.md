@@ -1,5 +1,13 @@
 # CozyGateway service
 
+Windows PowerShell (install or update):
+
+```powershell
+irm https://cozylabs.ai/install.ps1 | iex
+```
+
+macOS/Linux:
+
 ```sh
 curl -fsSL https://cozylabs.ai/install.sh | bash
 ```
@@ -22,6 +30,14 @@ keeps the existing agent. Both installs the Hermes attach profiles and a paired
 CozyAgents runner; it asks about the listener once and prints one device pairing
 QR after both are ready. Unattended repair keeps the recorded agent selection,
 CozyAgents home, model settings, runner credential, and Hermes profiles.
+Gateway updates reuse the recorded CozyAgents runtime when its Node executable
+and bundle are present and readable. This also allows an update from an elevated
+shell under the same Windows account without invoking CozyAgents' setup, which
+refuses elevation. Missing or damaged runtimes go through setup from a normal
+PowerShell window. Use CozyAgents' own updater to update that harness separately.
+Selecting CozyAgents from an elevated shell on an existing Hermes-only gateway
+updates Hermes' gateway and explicitly defers the harness addition until setup
+is run from a normal PowerShell window; the installer does not record it as installed.
 Uninstall removes the gateway's managed attachments and invokes CozyAgents' own
 uninstaller when that runner was installed.
 
