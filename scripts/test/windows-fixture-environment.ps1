@@ -1,3 +1,26 @@
+function New-IsolatedInstallerFixture {
+    param([string] $Installer, [string] $Root)
+    # Fixture processes must never open an interactive UAC continuation or
+    # depend on CI's token policy. Stub source, not a production security flag.
+    $source = [IO.File]::ReadAllText($Installer)
+    $tokens = $null; $errors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+    if ($errors.Count) { throw ($errors | Out-String) }
+    $stubs = @{
+        'Invoke-CozyInstallerSession' = 'function Invoke-CozyInstallerSession { param([string] $ScriptText, [hashtable] $BoundParameters, [string[]] $InstallerArguments) return [pscustomobject]@{ HandedOff = $false; ExitCode = 0 } }'
+        'Wait-WindowsGatewayReady' = 'function Wait-WindowsGatewayReady { param([string] $InstallRoot, [int] $TimeoutSeconds) }'
+        'Stop-OwnedGatewayForRecovery' = 'function Stop-OwnedGatewayForRecovery { param([string] $InstallRoot) }'
+        'Test-WindowsGitBash' = 'function Test-WindowsGitBash { param([string] $Path) return Test-Path -LiteralPath $Path -PathType Leaf }'
+    }
+    $functions = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $stubs.ContainsKey($node.Name) }, $false) | Sort-Object { $_.Extent.StartOffset } -Descending
+    foreach ($function in $functions) {
+        $source = $source.Remove($function.Extent.StartOffset, $function.Extent.EndOffset - $function.Extent.StartOffset).Insert($function.Extent.StartOffset, $stubs[$function.Name])
+    }
+    $path = Join-Path $Root 'isolated-installer.ps1'
+    [IO.File]::WriteAllText($path, $source, (New-Object Text.UTF8Encoding($false)))
+    return $path
+}
+
 function New-IsolatedBootstrapEnvironment {
     param([hashtable] $Environment, [string] $Root)
     $isolated = $Environment.Clone()

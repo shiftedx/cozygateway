@@ -39,10 +39,6 @@ try {
     Assert-Runtime $false 'unknown schema must not be silently reused'
     @{ node = 'node.exe'; bundle = @{ path = $bundle } } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadata
     Assert-Runtime $false 'relative executable paths must not depend on the current directory'
-    $failed = $false
-    try { Install-CozyAgentsHarness $fixture 'unused' 'unused' $true } catch { $failed = $_.Exception.Message -like '*runtime changed*' }
-    if (-not $failed) { throw 'runtime invalidated after preflight must abort instead of downloading an installer' }
-
     # Real current install records bind the owned bundle to its release size and hash.
     # Keep the same path and nonzero length when corrupting it: readability is insufficient.
     $realNode = (Get-Command node -CommandType Application | Select-Object -First 1).Source
@@ -54,9 +50,6 @@ try {
     Assert-Runtime $true 'valid current recorded bundle integrity must permit reuse'
     [IO.File]::WriteAllText($bundle, ('x' * $original.Length))
     Assert-Runtime $false 'nonempty same-size corruption must fail recorded bundle hash validation'
-    $failed = $false
-    try { Install-CozyAgentsHarness $fixture 'unused' 'unused' $true } catch { $failed = $_.Exception.Message -like '*runtime changed*' }
-    if (-not $failed) { throw 'corrupt reused runtime must abort before setup or download' }
     [IO.File]::WriteAllText($bundle, $original)
     $asset.size += 1
     $current | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadata

@@ -8,13 +8,12 @@ Windows PowerShell 5.1+:
 irm https://cozylabs.ai/install.ps1 | iex
 ```
 
-The Windows bootstrap asks the same harness question the POSIX one asks. A
-machine that already has Hermes keeps it: the bootstrap checks the current
-Hermes provider and default model before any CozyGateway changes, opens
-`hermes model` only when that setup is incomplete, then checksum-verifies the
-CozyGateway release assets and hands off through Hermes-compatible Git Bash. A
-machine with no Hermes is offered CozyAgents first and takes it on Enter, so the
-NousResearch Windows installer now runs only when someone asks for Hermes.
+The Windows bootstrap asks which harness to install on first setup and retains
+the installed selection on later runs. It checksum-verifies Gateway release assets,
+updates selected installed harnesses through their supported updaters, and opens
+model selection only when configuration is incomplete. A machine with no Hermes
+is offered CozyAgents first. The official NousResearch Windows installer runs when
+Hermes is selected and missing.
 
 `-Harness cozyagents` or `-Harness hermes` answers the question for an
 unattended run, and `-CozyAgentsInstaller <path or url>` names the CozyAgents
@@ -28,12 +27,17 @@ Windows installer to use instead of the published `https://cozylabs.ai/agents.ps
 The harness half on Windows is native: the CozyAgents installer is its own
 one-liner (`irm https://cozylabs.ai/agents.ps1 | iex`), needs no POSIX shell, and
 is run in this process, so no execution policy is consulted or changed. The
-gateway half is not yet: on both harnesses it is the shared `agent-install.sh`,
-so a Windows install still needs Git Bash. The Hermes installer brings one; on a
-machine with no Hermes, install Git for Windows from
-<https://git-scm.com/download/win> first. Neither path ever needs administrator,
-and an elevated terminal is refused on the CozyAgents path before anything is
-installed.
+gateway half uses `agent-install.sh` through Git Bash. When a working Bash is
+missing, Windows setup downloads official Portable Git, verifies its published
+SHA-256, and installs it privately under the Gateway home. It does not require a
+machine-wide Git installation. An elevated terminal hands setup to the same
+account's normal desktop context in a new PowerShell window. An account mismatch
+or unavailable normal desktop stops with instructions before product changes.
+
+The one-liner verifies live Gateway readiness and the CozyAgents updater's running
+version result. A failed component leaves its progress recorded for the next run;
+existing pairing and model files remain in place. Each product retains its own
+update and rollback rules.
 
 macOS/Linux:
 

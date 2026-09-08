@@ -561,6 +561,8 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $installer = if ($env:COZYGATEWAY_TEST_INSTALLER_UNDER_TEST) { $env:COZYGATEWAY_TEST_INSTALLER_UNDER_TEST } else { Join-Path $repoRoot 'scripts\install.ps1' }
 $temp = Join-Path ([IO.Path]::GetTempPath()) ("cozygateway-windows-bootstrap-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $temp | Out-Null
+. (Join-Path $PSScriptRoot 'windows-fixture-environment.ps1')
+$installer = New-IsolatedInstallerFixture $installer $temp
 $fakeUserNetTCPIP = $null
 
 try {
@@ -659,9 +661,9 @@ try {
         'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
         'COZYGATEWAY_TEST_HERMES_VERSION' = '0.22.0'
     }
-    Assert-True ($newerStable.ExitCode -eq 0) "newer stable Hermes must proceed without update: $($newerStable.Output)"
+    Assert-True ($newerStable.ExitCode -eq 0) "newer stable Hermes must update successfully: $($newerStable.Output)"
     $newerStableEvents = Get-Content -LiteralPath $eventLog
-    Assert-True ([Array]::IndexOf($newerStableEvents, 'hermes:update --yes') -eq -1) 'newer stable Hermes must not invoke update'
+    Assert-True ([Array]::IndexOf($newerStableEvents, 'hermes:update --yes') -ge 0) 'newer stable Hermes must invoke update for a full-stack refresh'
     Assert-True (($newerStableEvents -join "`n") -match '(?m)^bash:') 'newer stable Hermes must proceed to the CozyGateway Bash handoff'
     Remove-Item -LiteralPath $eventLog -Force -ErrorAction SilentlyContinue
 
@@ -704,7 +706,7 @@ try {
     $persistedBootstrap = Join-Path $temp 'Cozy Gateway\bin\cozygateway-bootstrap.ps1'
     Assert-True (Test-Path -LiteralPath $persistedBootstrap) 'Windows bootstrap must persist its verified repair bootstrap'
     Assert-True (Test-Path -LiteralPath "$persistedBootstrap.sha256") 'Windows bootstrap must persist the repair bootstrap checksum'
-    Assert-True (@(Get-ChildItem -LiteralPath (Join-Path $temp 'Cozy Gateway') -Filter '.bootstrap-*' -Force).Count -eq 0) 'successful bootstrap must remove its staging directory'
+    Assert-True (@(Get-ChildItem -LiteralPath (Join-Path $temp 'Cozy Gateway') -Filter '.bootstrap-*' -Force | Where-Object Name -ne '.bootstrap-lock').Count -eq 0) 'successful bootstrap must remove its staging directory'
 
     $bundleBeforeLateFailure = [IO.File]::ReadAllBytes((Join-Path $temp 'Cozy Gateway\bin\cozygateway.mjs'))
     $pluginBeforeLateFailure = [IO.File]::ReadAllBytes((Join-Path $temp 'Cozy Gateway\bin\cozygateway-hermes-attach-plugin.tar.gz'))
@@ -722,7 +724,7 @@ try {
     Assert-True ([Linq.Enumerable]::SequenceEqual($bundleBeforeLateFailure, [IO.File]::ReadAllBytes((Join-Path $temp 'Cozy Gateway\bin\cozygateway.mjs'))) ) 'late checksum failure must not replace the installed bundle'
     Assert-True ([Linq.Enumerable]::SequenceEqual($pluginBeforeLateFailure, [IO.File]::ReadAllBytes((Join-Path $temp 'Cozy Gateway\bin\cozygateway-hermes-attach-plugin.tar.gz'))) ) 'late checksum failure must not replace the installed plugin'
     Assert-True (-not ((Get-Content -LiteralPath $eventLog -Raw -ErrorAction SilentlyContinue) -match '(?m)^bash:')) 'late checksum failure must not invoke the installer payload'
-    Assert-True (@(Get-ChildItem -LiteralPath (Join-Path $temp 'Cozy Gateway') -Filter '.bootstrap-*' -Force).Count -eq 0) 'failed bootstrap must remove its staging directory'
+    Assert-True (@(Get-ChildItem -LiteralPath (Join-Path $temp 'Cozy Gateway') -Filter '.bootstrap-*' -Force | Where-Object Name -ne '.bootstrap-lock').Count -eq 0) 'failed bootstrap must remove its staging directory'
     Write-Utf8NoBom (Join-Path $fixtures 'install.ps1') $originalInstallPs1
 
     # The public Windows entrypoint journals every release asset. A real hard

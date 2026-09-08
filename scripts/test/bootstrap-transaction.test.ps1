@@ -37,6 +37,8 @@ foreach ($name in $needed) {
 function Fail { param([string] $Message) throw $Message }
 function Write-Info { param([string] $Message) }
 function Write-Ok { param([string] $Message) }
+function Wait-WindowsGatewayReady { param([string] $InstallRoot) $script:TaskOperations += 'ready' }
+function Stop-OwnedGatewayForRecovery { param([string] $InstallRoot) $script:TaskOperations += 'stop-owned' }
 
 $script:FakeTaskXml = $null
 $script:StartupPath = $null
@@ -215,6 +217,7 @@ try {
     Write-TestFile $database 'sqlite-after'; Write-TestFile $log 'log-after'
     Write-TestFile $hermes 'hermes-after'; Write-TestFile $agents 'agents-after'
     Assert-True (Recover-BootstrapTransaction $root (Join-Path $root 'bin') $assets) 'v2 recovery must report restored bytes'
+    Assert-True ([Array]::IndexOf($script:TaskOperations, 'stop-owned') -ge 0 -and [Array]::IndexOf($script:TaskOperations, 'stop-owned') -lt [Array]::IndexOf($script:TaskOperations, 'delete')) 'recovery must stop owned processes before unregistering the current task'
     Assert-True ((Read-TestFile (Join-Path (Join-Path $root 'bin') 'cozygateway.mjs')) -eq 'old:cozygateway.mjs') 'v2 recovery must restore old asset bytes'
     foreach ($id in Get-BootstrapRuntimeFiles) {
         $path = Join-Path $root $id
@@ -233,6 +236,7 @@ try {
     Assert-True ((Read-TestFile $agents) -eq 'agents-after') 'external CozyAgents state must remain outside rollback'
     Restart-OwnedGatewayService $root
     Assert-True ($script:TaskOperations -contains 'start-task') 'only the restored owned Task must be reactivated'
+    Assert-True ([Array]::IndexOf($script:TaskOperations, 'ready') -gt [Array]::IndexOf($script:TaskOperations, 'start-task')) 'restored task must become ready before recovery finishes'
     Finish-BootstrapRecovery $root
     Assert-Absent $journal 'finished v2 recovery must clear its journal'
     Assert-Absent $backup 'finished v2 recovery must clear snapshots'
