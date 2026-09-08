@@ -51,7 +51,7 @@ export function registerObserveDashboard(app: Hono<{ Variables: { deviceId: stri
     if (!authorized(c)) {
       c.header("Content-Security-Policy", OBSERVE_CSP);
       c.header("Cache-Control", "no-store");
-      return c.html('<!doctype html><html lang="en"><title>Pair Observe</title><h1>Observer pairing required</h1><p><a href="/observe/pair">Pair this browser with CozyChat</a></p></html>', 401);
+      return c.redirect("/observe/pair");
     }
     return respond(c, "index.html", false);
   });

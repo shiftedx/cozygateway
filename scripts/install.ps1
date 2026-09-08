@@ -2502,22 +2502,29 @@ function Get-CozyAgentsCommand {
     $nodeProperty = $state.PSObject.Properties['node']
     $node = if ($nodeProperty) { [string]$nodeProperty.Value } else { '' }
     $bundle = ''
+    $bundleRecord = $null
     $schema = $state.PSObject.Properties['schemaVersion']
     if ($schema) {
         if ($schema.Value -ne 1) { Fail 'the CozyAgents install record has an unsupported schema version' }
         $assets = $state.PSObject.Properties['assets']
         if ($assets) {
             $main = @($assets.Value | Where-Object { $_.PSObject.Properties['name'] -and $_.name -eq 'cozyagents.mjs' })
-            if ($main.Count -eq 1 -and $main[0].PSObject.Properties['path']) { $bundle = [string]$main[0].path }
+            if ($main.Count -eq 1 -and $main[0].PSObject.Properties['path']) {
+                $bundleRecord = $main[0]
+                $bundle = [string]$bundleRecord.path
+            }
         }
     } else {
         $legacyBundle = $state.PSObject.Properties['bundle']
-        if ($legacyBundle -and $legacyBundle.Value.PSObject.Properties['path']) { $bundle = [string]$legacyBundle.Value.path }
+        if ($legacyBundle -and $legacyBundle.Value.PSObject.Properties['path']) {
+            $bundleRecord = $legacyBundle.Value
+            $bundle = [string]$bundleRecord.path
+        }
     }
     if ([string]::IsNullOrWhiteSpace($node) -or [string]::IsNullOrWhiteSpace($bundle)) {
         Fail 'the CozyAgents install did not record the node and bundle this computer pairs with'
     }
-    return @{ Node = $node; Bundle = $bundle }
+    return @{ Node = $node; Bundle = $bundle; BundleRecord = $bundleRecord }
 }
 
 function Test-CozyAgentsRuntime {
@@ -2528,7 +2535,22 @@ function Test-CozyAgentsRuntime {
         foreach ($path in @($command.Node, $command.Bundle)) {
             if (-not [IO.Path]::IsPathRooted($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
             $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-            try { if ($stream.Length -eq 0) { return $false } } finally { $stream.Dispose() }
+            try {
+                if ($stream.Length -eq 0) { return $false }
+                if ($path -eq $command.Bundle) {
+                    # Legacy records may omit integrity fields. When recorded, they must
+                    # still match before an elevated update can skip verified setup.
+                    $size = $command.BundleRecord.PSObject.Properties['size']
+                    if ($size -and (($size.Value -isnot [int] -and $size.Value -isnot [long]) -or $size.Value -ne $stream.Length)) { return $false }
+                    $digest = $command.BundleRecord.PSObject.Properties['sha256']
+                    if ($digest) {
+                        if ($digest.Value -isnot [string] -or $digest.Value -notmatch '^[a-fA-F0-9]{64}$') { return $false }
+                        $sha = [Security.Cryptography.SHA256]::Create()
+                        try { $actual = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+                        if ($actual -ne $digest.Value) { return $false }
+                    }
+                }
+            } finally { $stream.Dispose() }
         }
         return $true
     } catch { return $false }

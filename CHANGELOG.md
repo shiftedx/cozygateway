@@ -5,6 +5,12 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## 0.7.10 (2026-09-07): direct Observe pairing entry
+
+Opening `/observe` in an unpaired browser now goes directly to the styled pairing
+page instead of a plain error page. Revoked credentials return to pairing, while
+dashboard data and APIs still require authorization. See [#426](https://github.com/shiftedx/cozygateway/pull/426).
+
 ## 0.7.9 (2026-09-07): automatic deletion and installation repair
 
 Bot deletion now removes owned storage, revokes retired attach credentials across restarts and
@@ -17,6 +23,14 @@ Install and upgrade now reconcile deleted names from owned saved profile scope a
 staged provisioners without discarding retained recovery payloads. Existing custom settings and
 shared credentials are preserved. New repair/update wrappers use the recorded installation scope;
 ambiguous legacy explicit selections receive a direct upgrade instruction instead of being changed.
+
+Windows Gateway updates reuse an intact recorded CozyAgents runtime, preserving runner pairing
+and model settings even in an administrator shell for the same account. Adding a missing runner
+to an existing Hermes installation is deferred explicitly to a normal PowerShell window. Recorded
+runner bundle checksum or size mismatches require repair instead of silently retaining corrupt files.
+
+Deletion review fixes also cancel retired bot timers, clean up delayed Live Activity registrations,
+reject foreign service executable overrides, and preserve ambiguous multiline environment values.
 
 ## 0.7.8 (2026-09-07): responsive task reconciliation on retained histories
 
