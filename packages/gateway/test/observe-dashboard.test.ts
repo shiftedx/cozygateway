@@ -46,11 +46,32 @@ describe("the embedded Observe dashboard", () => {
   });
   it("requires a paired device but accepts both read and write scopes", async () => {
     const gateway = app();
-    expect((await gateway.request("/observe")).status).toBe(401);
-    expect((await gateway.request("/observe", { headers: bearer("unknown") })).status).toBe(401);
+    expect((await gateway.request("/observe")).status).toBe(302);
+    expect((await gateway.request("/observe", { headers: bearer("unknown") })).status).toBe(302);
     expect((await gateway.request("/observe", { headers: bearer(readToken) })).status).toBe(200);
     expect((await gateway.request("/observe", { headers: bearer(writeToken) })).status).toBe(200);
     expect((await gateway.request("/observe/assets/app.js")).status).toBe(401);
+  });
+  it("takes unpaired browser navigation directly to the styled pairing flow", async () => {
+    const gateway = app();
+    const unpairedHeaders: HeadersInit[] = [{}, bearer("unknown"), { cookie: "cozygateway_observe=%invalid" }];
+    for (const headers of unpairedHeaders) {
+      const response = await gateway.request("https://example.test/observe", { headers });
+      expect(response.status).toBe(302);
+      expect(response.headers.get("location")).toBe("/observe/pair");
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("content-security-policy")).toBe(OBSERVE_CSP);
+      const pairing = await gateway.request(response.headers.get("location")!, { headers });
+      expect(pairing.status).toBe(200);
+      const html = await pairing.text();
+      expect(html).toContain('<h1>Pair this browser</h1>');
+      expect(html).toContain('/observe/pair/app.css?v=');
+      expect(html).toContain('/observe/pair/app.js?v=');
+      expect(html).not.toContain('Observer pairing required');
+    }
+    expect((await gateway.request("/observe/pair/app.css")).status).toBe(200);
+    expect((await gateway.request("/observe/pair/app.js")).status).toBe(200);
+    expect((await gateway.request("/observe/session", { headers: bearer("unknown") })).status).toBe(401);
   });
   it("serves embedded fonts as same-origin bytes without remote references", async () => {
     const gateway = app();
@@ -77,7 +98,11 @@ describe("the embedded Observe dashboard", () => {
     expect((await gateway.request("/observe/session", { headers })).status).toBe(401);
     expect((await gateway.request("/devices", { headers })).status).toBe(401);
     storage.deleteDevice("read");
-    expect((await gateway.request("/observe", { headers })).status).toBe(401);
+    const revoked = await gateway.request("/observe", { headers });
+    expect(revoked.status).toBe(302);
+    expect(revoked.headers.get("location")).toBe("/observe/pair");
+    expect((await gateway.request("/observe/assets/app.js", { headers })).status).toBe(401);
+    expect((await gateway.request("/observe/session", { headers: bearer() })).status).toBe(401);
   });
   it("only marks content-addressed assets immutable and keeps the shell private", async () => {
     const gateway=app();
