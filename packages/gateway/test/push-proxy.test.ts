@@ -189,19 +189,21 @@ describe("authenticated push relay proxy", () => {
   });
 
   it.each([false, true])("retires a late relay registration after bot deletion with recreation=%s", async (recreate) => {
-    const entered = Promise.withResolvers<void>();
-    const reply = Promise.withResolvers<Response>();
+    let signalEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { signalEntered = resolve; });
+    let resolveReply!: (response: Response) => void;
+    const reply = new Promise<Response>((resolve) => { resolveReply = resolve; });
     const { authed, calls, storage, sessionId } = await setup([], async (request) => {
       if (request.method === "DELETE") return new Response(null, { status: 503 });
-      entered.resolve();
-      return reply.promise;
+      signalEntered();
+      return reply;
     });
     const pending = authed("/push/live-activities/register", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ activityId: "late-activity", runId: "old-run", conversationId: sessionId,
         bot: "sage", token: "aa".repeat(32), environment: "development" }),
     });
-    await entered.promise;
+    await entered;
     storage.purgeBot("sage");
     if (recreate) {
       storage.restoreBot("sage");
@@ -211,7 +213,7 @@ describe("authenticated push relay proxy", () => {
         conversationId: replacement, bot: "sage", pushId: "new-push", createdAt: 2_000,
       });
     }
-    reply.resolve(new Response('{"pushId":"late-push"}', {
+    resolveReply(new Response('{"pushId":"late-push"}', {
       status: 201, headers: { "content-type": "application/json" },
     }));
     expect((await pending).status).toBe(404);
