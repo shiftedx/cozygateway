@@ -7,6 +7,9 @@ function New-IsolatedInstallerFixture {
     $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
     if ($errors.Count) { throw ($errors | Out-String) }
     $stubs = @{
+        'Find-CozyLocalModels' = 'function Find-CozyLocalModels { return @() }'
+        'Get-WindowsSavedProviderChoices' = 'function Get-WindowsSavedProviderChoices { return @() }'
+        'Get-WindowsSavedProviderCatalog' = 'function Get-WindowsSavedProviderCatalog { return [pscustomobject]@{Provider="";DefaultModel="";Models=@();AuthConfigured=$false;RequiresSharedConfig=$false} }'
         'Invoke-CozyInstallerSession' = 'function Invoke-CozyInstallerSession { param([string] $ScriptText, [hashtable] $BoundParameters, [string[]] $InstallerArguments) return [pscustomobject]@{ HandedOff = $false; ExitCode = 0 } }'
         'Wait-WindowsGatewayReady' = 'function Wait-WindowsGatewayReady { param([string] $InstallRoot, [int] $TimeoutSeconds) }'
         'Stop-OwnedGatewayForRecovery' = 'function Stop-OwnedGatewayForRecovery { param([string] $InstallRoot) }'
@@ -24,6 +27,9 @@ function New-IsolatedInstallerFixture {
 function New-IsolatedBootstrapEnvironment {
     param([hashtable] $Environment, [string] $Root)
     $isolated = $Environment.Clone()
+    if (-not $isolated.ContainsKey('PI_CODING_AGENT_DIR')) {
+        $isolated['PI_CODING_AGENT_DIR'] = Join-Path $Root 'isolated-pi'
+    }
     if (-not $isolated.ContainsKey('HERMES_HOME')) {
         $isolated['HERMES_HOME'] = Join-Path $Root 'isolated-hermes'
     }

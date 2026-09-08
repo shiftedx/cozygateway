@@ -46,6 +46,47 @@ try {
     } finally { $env:COZYAGENTS_HOME = $previousHome }
     Invoke-WindowsSetupStage $fixture 'gateway' { }
     Assert-Equal (Get-WindowsSetupPlan $fixture) $null 'completed setup must not override later selections'
+    $savedModelEnvironment = @{}
+    foreach ($name in @('COZYGATEWAY_RUNNER_MODEL_PROVIDER', 'COZYGATEWAY_RUNNER_MODEL_ENDPOINT', 'COZYGATEWAY_RUNNER_MODEL_ID')) {
+        $savedModelEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+        [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+    }
+    try {
+        function Find-CodexLogin { return '' }
+        # Local discovery has its own fixture suite; never query the user's servers.
+        function Find-CozyLocalModels { return @() }
+        function Get-WindowsSavedProviderCatalog { return [pscustomobject]@{Provider='';DefaultModel='';Models=@();AuthConfigured=$false;RequiresSharedConfig=$false} }
+        function Get-WindowsSavedProviderChoices { return @() }
+        function Get-PromptAnswer {
+            param($Prompt, $InputVariable, $Fallback)
+            if ($script:modelInputs.Count -eq 0) { throw "Unexpected prompt: $Prompt" }
+            $value = [string]$script:modelInputs.Dequeue()
+            if ([string]::IsNullOrWhiteSpace($value)) { return $Fallback }
+            return $value
+        }
+        foreach ($case in @(
+            @{ Inputs = @('1', 'test-model'); Provider = 'openai-codex'; Endpoint = '' },
+            @{ Inputs = @('', 'test-model'); Provider = 'openai-codex'; Endpoint = '' },
+            @{ Inputs = @('2', '', 'test-model'); Provider = ''; Endpoint = 'http://127.0.0.1:1234/v1' },
+            @{ Inputs = @('2', 'https://localhost:9000/v1', 'test-model'); Provider = ''; Endpoint = 'https://localhost:9000/v1' },
+            @{ Inputs = @('3', 'anthropic', 'test-model'); Provider = 'anthropic'; Endpoint = '' },
+            @{ Inputs = @('99', '1', 'test-model'); Provider = 'openai-codex'; Endpoint = '' },
+            @{ Inputs = @('2', 'not-a-url', '1', 'test-model'); Provider = 'openai-codex'; Endpoint = '' },
+            @{ Inputs = @('3', 'not a provider', '1', 'test-model'); Provider = 'openai-codex'; Endpoint = '' },
+            @{ Inputs = @('openai-codex', 'test-model'); Provider = 'openai-codex'; Endpoint = '' },
+            @{ Inputs = @('http://localhost:8000/v1', 'test-model'); Provider = ''; Endpoint = 'http://localhost:8000/v1' }
+        )) {
+            $script:modelInputs = New-Object Collections.Queue
+            foreach ($value in $case.Inputs) { $script:modelInputs.Enqueue($value) }
+            $model = Confirm-CozyAgentsModel (Join-Path $fixture 'missing-runner.env')
+            Assert-Equal $model.Provider $case.Provider 'numbered provider selection'
+            Assert-Equal $model.Endpoint $case.Endpoint 'numbered endpoint selection'
+            Assert-Equal $model.Id 'test-model' 'model answer must remain separate from the menu'
+            Assert-Equal $script:modelInputs.Count 0 'all expected answers must be consumed'
+        }
+    } finally {
+        foreach ($name in $savedModelEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $savedModelEnvironment[$name], 'Process') }
+    }
     Write-Output 'PASS Windows setup selection, pairing and component outcomes'
 } finally {
     $resolved = [IO.Path]::GetFullPath($fixture)
@@ -53,3 +94,5 @@ try {
     if (-not $resolved.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'unsafe fixture cleanup' }
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
+& (Join-Path $PSScriptRoot 'windows-local-model-discovery.test.ps1')
+& (Join-Path $PSScriptRoot 'windows-saved-provider.test.ps1')

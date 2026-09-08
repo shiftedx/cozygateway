@@ -1784,7 +1784,7 @@ function Confirm-HermesModel {
         Write-Ok 'Hermes endpoint and model are configured'
         return
     }
-    Write-Info 'Choose or confirm the Hermes inference provider and model.'
+    Write-Info 'Hermes needs an AI model. Follow its choices below to connect an account or use a model on this computer.'
     & $HermesPath -p default model
     $modelExit = $LASTEXITCODE
     if ($modelExit -ne 0) {
@@ -2205,8 +2205,14 @@ function Select-Harness {
         $source = 'already installed here'
         if (Test-PromptAvailable 'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT') {
             $fallback = switch ($default) { 'hermes' { '2' }; 'both' { '3' }; default { '1' } }
+            Write-Host ''
+            Write-Host 'Choose what will run your bots on this computer.'
+            Write-Host '  1. CozyAgents (recommended for new users)'
+            Write-Host '  2. Hermes Agent'
+            Write-Host '  3. Both'
+            Write-Host 'Setup will install what you need. Press Enter to use the suggested choice.'
             while ($true) {
-                $answer = Get-PromptAnswer "Which harness runs your bots? [1] CozyAgents (recommended) [2] Hermes Agent [3] Both [$fallback]" 'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT' $fallback
+                $answer = Get-PromptAnswer "Pick 1, 2 or 3 [$fallback]" 'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT' $fallback
                 if ($null -eq $answer) { break }
                 $normalized = $answer.ToLowerInvariant()
                 if ($normalized -in @('1', 'c', 'cozyagents')) { $harness = 'cozyagents'; break }
@@ -2217,7 +2223,10 @@ function Select-Harness {
             $source = 'selected'
         }
     }
-    if (($hasHermes -and $harness -eq 'cozyagents') -or ($hasAgents -and $harness -eq 'hermes') -or $recorded -eq 'both') { $harness = 'both' }
+    if (($hasHermes -and $harness -eq 'cozyagents') -or ($hasAgents -and $harness -eq 'hermes') -or $recorded -eq 'both') {
+        $harness = 'both'
+        Write-Info 'Keeping your existing agents as well. Both will use the same Gateway.'
+    }
     Write-Ok "harness: $harness ($source)"
     return $harness
 }
@@ -2238,23 +2247,208 @@ function Test-SafeModelEndpoint {
     return ($Value -cmatch '^https?://[A-Za-z0-9._~:/?#@%+=-]{1,255}$')
 }
 
-# A Codex login already on this machine is the one credential a person can share with their bots
-# without typing a key anywhere. Detection only: nothing is read, copied, or written.
+function Get-WindowsPiAgentHome {
+    if (-not [string]::IsNullOrWhiteSpace($env:PI_CODING_AGENT_DIR)) { return $env:PI_CODING_AGENT_DIR.Trim() }
+    return (Join-Path $env:USERPROFILE '.pi\agent')
+}
+
+# Optional discovery must never modify account files or surface their contents/errors.
+function Read-WindowsModelJson {
+    param([string] $Path)
+    $stream = $null; $reader = $null
+    try {
+        Assert-BootstrapRegularFile $Path 'saved model settings' -MustExist
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        if ($stream.Length -gt 1048576) { return $null }
+        $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true)
+        $value = $reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop
+        if ($value -isnot [pscustomobject]) { return $null }
+        return $value
+    } catch { return $null }
+    finally { if ($reader) { $reader.Dispose() } elseif ($stream) { $stream.Dispose() } }
+}
+
+function Get-WindowsModelProperty {
+    param($Value, [string] $Name)
+    if ($null -eq $Value -or $Value -isnot [pscustomobject]) { return $null }
+    $property = $Value.PSObject.Properties[$Name]
+    if ($null -ne $property) { return $property.Value }
+    return $null
+}
+
+function Test-WindowsSavedProviderAuth {
+    param($Record)
+    $kind = Get-WindowsModelProperty $Record 'type'
+    if ($kind -eq 'oauth') {
+        $access = Get-WindowsModelProperty $Record 'access'
+        $refresh = Get-WindowsModelProperty $Record 'refresh'
+        $expires = Get-WindowsModelProperty $Record 'expires'
+        return ($access -is [string] -and -not [string]::IsNullOrWhiteSpace($access) -and
+            $refresh -is [string] -and -not [string]::IsNullOrWhiteSpace($refresh) -and
+            ($expires -is [long] -or $expires -is [int] -or $expires -is [double] -or $expires -is [decimal]) -and
+            -not [double]::IsNaN([double]$expires) -and -not [double]::IsInfinity([double]$expires))
+    }
+    if ($kind -eq 'api_key') {
+        $key = Get-WindowsModelProperty $Record 'key'
+        return ($key -is [string] -and -not [string]::IsNullOrWhiteSpace($key))
+    }
+    return $false
+}
+
+# This detects a saved Pi Codex account, not an arbitrary auth file or Hermes key.
+# Expired access tokens can still be refreshed by Pi; do not mutate them here.
 function Find-CodexLogin {
     $auth = $env:COZYGATEWAY_CODEX_AUTH_PATH
-    if ([string]::IsNullOrWhiteSpace($auth)) { $auth = Join-Path $env:USERPROFILE '.pi\agent\auth.json' }
-    if (Test-Path -LiteralPath $auth -PathType Leaf) { return $auth }
-    $hermesHome = $env:HERMES_HOME
-    if ([string]::IsNullOrWhiteSpace($hermesHome)) { $hermesHome = Join-Path $env:LOCALAPPDATA 'hermes' }
-    $hermesEnv = Join-Path $hermesHome '.env'
-    if (Test-Path -LiteralPath $hermesEnv -PathType Leaf) {
-        if ((Get-Content -LiteralPath $hermesEnv -Raw) -match '(?m)^\s*(OPENAI_CODEX_[A-Z0-9_]*|CODEX_[A-Z0-9_]*)=\S') { return $hermesEnv }
-    }
+    if ([string]::IsNullOrWhiteSpace($auth)) { $auth = Join-Path (Get-WindowsPiAgentHome) 'auth.json' }
+    $record = Get-WindowsModelProperty (Read-WindowsModelJson $auth) 'openai-codex'
+    if ((Get-WindowsModelProperty $record 'type') -eq 'oauth' -and (Test-WindowsSavedProviderAuth $record)) { return $auth }
     return $null
+}
+
+function Get-WindowsSavedProviderCatalog {
+    param([string] $Provider = '')
+    $piHome = Get-WindowsPiAgentHome
+    $settings = Read-WindowsModelJson (Join-Path $piHome 'settings.json')
+    $savedProvider = Get-WindowsModelProperty $settings 'defaultProvider'
+    if ([string]::IsNullOrWhiteSpace($Provider) -and $savedProvider -is [string] -and (Test-SafeModelWord $savedProvider)) { $Provider = $savedProvider }
+    $result = [pscustomobject]@{ Provider = ''; DefaultModel = ''; Models = @(); AuthConfigured = $false; RequiresSharedConfig = $false }
+    if (-not (Test-SafeModelWord $Provider)) { return $result }
+    $result.Provider = $Provider
+    $savedModel = Get-WindowsModelProperty $settings 'defaultModel'
+    if ($Provider -ceq $savedProvider -and $savedModel -is [string] -and (Test-SafeModelWord $savedModel)) { $result.DefaultModel = $savedModel }
+    $auth = Read-WindowsModelJson (Join-Path $piHome 'auth.json')
+    $result.AuthConfigured = Test-WindowsSavedProviderAuth (Get-WindowsModelProperty $auth $Provider)
+    if ($Provider -eq 'openai-codex') { $result.AuthConfigured = [bool](Find-CodexLogin) }
+    $custom = Get-WindowsModelProperty (Get-WindowsModelProperty (Read-WindowsModelJson (Join-Path $piHome 'models.json')) 'providers') $Provider
+    $result.RequiresSharedConfig = $null -ne $custom
+    $cached = Get-WindowsModelProperty (Read-WindowsModelJson (Join-Path $piHome 'models-store.json')) $Provider
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $models = New-Object 'System.Collections.Generic.List[object]'
+    if ($result.DefaultModel) {
+        $null = $seen.Add($result.DefaultModel)
+        $models.Add([pscustomobject]@{ Id = $result.DefaultModel; Name = $result.DefaultModel; Source = 'saved default' })
+    }
+    foreach ($source in @(@{Value=$custom;Name='saved configuration'}, @{Value=$cached;Name='saved catalog'})) {
+        foreach ($model in @(Get-WindowsModelProperty $source.Value 'models')) {
+            if ($models.Count -ge 200) { break }
+            $id = Get-WindowsModelProperty $model 'id'
+            if ($id -isnot [string] -or -not (Test-SafeModelWord $id) -or -not $seen.Add($id)) { continue }
+            $name = Get-WindowsModelProperty $model 'name'
+            if ($name -isnot [string] -or $name.Length -gt 128 -or $name -match '[\x00-\x1f\x7f]' -or [string]::IsNullOrWhiteSpace($name)) { $name = $id }
+            $models.Add([pscustomobject]@{ Id=$id; Name=$name; Source=$source.Name })
+        }
+    }
+    $result.Models = @($models.ToArray())
+    return $result
+}
+
+function Get-WindowsSavedProviderChoices {
+    $piHome = Get-WindowsPiAgentHome
+    $names = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $default = Get-WindowsModelProperty (Read-WindowsModelJson (Join-Path $piHome 'settings.json')) 'defaultProvider'
+    if ($default -is [string] -and (Test-SafeModelWord $default)) { $null = $names.Add($default) }
+    foreach ($record in @(
+        (Read-WindowsModelJson (Join-Path $piHome 'auth.json')),
+        (Read-WindowsModelJson (Join-Path $piHome 'models-store.json')),
+        (Get-WindowsModelProperty (Read-WindowsModelJson (Join-Path $piHome 'models.json')) 'providers')
+    )) {
+        if ($record -isnot [pscustomobject]) { continue }
+        foreach ($property in $record.PSObject.Properties) {
+            if ($names.Count -ge 50) { break }
+            if (Test-SafeModelWord $property.Name) { $null = $names.Add($property.Name) }
+        }
+    }
+    $ordered = @($names | Sort-Object)
+    if ($default -is [string] -and $names.Contains($default)) { $ordered = @($default) + @($ordered | Where-Object { $_ -cne $default }) }
+    foreach ($name in $ordered) {
+        $catalog = Get-WindowsSavedProviderCatalog $name
+        if ($catalog.Models.Count -gt 0 -or $catalog.AuthConfigured) { $catalog }
+    }
 }
 
 # The CozyAgents half of provider-and-model onboarding: the same pair of questions the Hermes path
 # asks, answered once, and written to the runner env by Write-RunnerModelEnv.
+function Invoke-CozyLocalModelsRequest {
+    param([string] $Endpoint)
+    # Fixed loopback URLs only; no credentials, proxy, or redirects.
+    if ($Endpoint -notin @('http://127.0.0.1:1234/v1', 'http://127.0.0.1:11434/v1')) { return '' }
+    $request = $null; $response = $null; $stream = $null; $buffer = $null
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $request = [Net.HttpWebRequest]::Create($Endpoint + '/models')
+        $request.Method = 'GET'; $request.Accept = 'application/json'
+        $request.AllowAutoRedirect = $false; $request.Proxy = $null
+        $request.UseDefaultCredentials = $false; $request.Credentials = $null
+        $request.Timeout = 800; $request.ReadWriteTimeout = 800
+        $response = $request.GetResponse()
+        if ([int]$response.StatusCode -ne 200 -or $response.ContentLength -gt 65536) { return '' }
+        $stream = $response.GetResponseStream()
+        $buffer = New-Object IO.MemoryStream
+        $chunk = New-Object byte[] 4096
+        while ($true) {
+            $remaining = 1200 - [int]$clock.ElapsedMilliseconds
+            if ($remaining -le 0) { return '' }
+            $stream.ReadTimeout = $remaining
+            $count = $stream.Read($chunk, 0, [Math]::Min($chunk.Length, 65537 - [int]$buffer.Length))
+            if ($count -eq 0) { break }
+            $buffer.Write($chunk, 0, $count)
+            if ($buffer.Length -gt 65536) { return '' }
+        }
+        return (New-Object Text.UTF8Encoding($false, $true)).GetString($buffer.ToArray())
+    } catch { return '' }
+    finally {
+        if ($buffer) { $buffer.Dispose() }; if ($stream) { $stream.Dispose() }
+        if ($response) { $response.Dispose() }; if ($request) { $request.Abort() }
+    }
+}
+
+function Get-CozyLocalModelIds {
+    param([string] $Endpoint)
+    if ($Endpoint -notin @('http://127.0.0.1:1234/v1', 'http://127.0.0.1:11434/v1')) { return @() }
+    try {
+        $text = Invoke-CozyLocalModelsRequest $Endpoint
+        if ([string]::IsNullOrWhiteSpace($text)) { return @() }
+        $catalog = $text | ConvertFrom-Json -ErrorAction Stop
+        if (-not $catalog -or -not $catalog.PSObject.Properties['data']) { return @() }
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($model in @($catalog.data)) {
+            if ($null -eq $model -or -not $model.PSObject.Properties['id'] -or $model.id -isnot [string]) { continue }
+            if ($model.PSObject.Properties['type'] -and [string]$model.type -in @('embedding', 'embeddings')) { continue }
+            if ($model.PSObject.Properties['capabilities'] -and @($model.capabilities).Count -gt 0 -and 'embedding' -in @($model.capabilities) -and 'completion' -notin @($model.capabilities) -and 'chat' -notin @($model.capabilities)) { continue }
+            if ((Test-SafeModelWord $model.id) -and $seen.Add($model.id)) { Write-Output $model.id }
+            if ($seen.Count -ge 64) { break }
+        }
+    } catch { return @() }
+}
+
+function Find-CozyLocalModels {
+    foreach ($server in @(
+        @{ Name = 'LM Studio'; Endpoint = 'http://127.0.0.1:1234/v1' },
+        @{ Name = 'Ollama'; Endpoint = 'http://127.0.0.1:11434/v1' }
+    )) {
+        foreach ($id in @(Get-CozyLocalModelIds $server.Endpoint)) {
+            [pscustomobject]@{ Server = $server.Name; Endpoint = $server.Endpoint; Id = $id }
+        }
+    }
+}
+
+function Select-CozyLocalModel {
+    param([object[]] $Models)
+    if ($Models.Count -eq 0) { return $null }
+    if ($Models.Count -eq 1) { Write-Info "Found $($Models[0].Id) in $($Models[0].Server); using that local model."; return $Models[0] }
+    Write-Host 'Local models found on this computer:'
+    for ($index = 0; $index -lt $Models.Count; $index++) { Write-Host "  $($index + 1). $($Models[$index].Id) ($($Models[$index].Server))" }
+    Write-Host '  0. Enter a different endpoint and model'
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        $choice = Get-PromptAnswer 'Choose a local model number [1]' 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' '1'
+        if ([string]::IsNullOrWhiteSpace($choice) -or $choice -eq '0') { return $null }
+        $number = 0
+        if ([int]::TryParse($choice, [ref]$number) -and $number -ge 1 -and $number -le $Models.Count) { return $Models[$number - 1] }
+        Write-Host "Please choose a number from 1 to $($Models.Count), or 0 for manual setup."
+    }
+    Fail 'No local model selected. Start your model app and rerun setup, or provide its endpoint and model explicitly.'
+}
+
 function Confirm-CozyAgentsModel {
     param([string] $RunnerEnvPath)
     $answers = @{ Provider = ''; Endpoint = ''; Id = ''; ShareHostAuth = $false }
@@ -2292,9 +2486,50 @@ function Confirm-CozyAgentsModel {
         Write-Info "no terminal to ask about a model on; set COZYRUNNER_MODEL_PROVIDER (or COZYRUNNER_MODEL_ENDPOINT) and COZYRUNNER_MODEL_ID in $RunnerEnvPath"
         return $answers
     }
-    while ($true) {
-        $answer = Get-PromptAnswer 'Which provider should new bots use? A provider name (openai-codex) or a local endpoint URL (http://127.0.0.1:1234/v1) [openai-codex]' 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' 'openai-codex'
-        if ($null -eq $answer) { $answer = 'openai-codex' }
+    Write-Info 'Checking for saved AI settings and models running on this computer...'
+    $localModels = @(Find-CozyLocalModels)
+    $savedChoices = @(Get-WindowsSavedProviderChoices | Where-Object { -not $_.RequiresSharedConfig })
+    $defaultChoice = if ($localModels.Count -gt 0) { '2' } else { '1' }
+    for ($index = 0; $index -lt $savedChoices.Count; $index++) {
+        if ($savedChoices[$index].AuthConfigured -and @($savedChoices[$index].Models).Count -gt 0) {
+            $defaultChoice = [string]($index + 4)
+            break
+        }
+    }
+    $numericChoice = $false
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        Write-Host 'Which provider should new bots use?'
+        Write-Host '  1. OpenAI Codex'
+        Write-Host "  2. Local endpoint (LM Studio, Ollama; $($localModels.Count) models found)"
+        Write-Host '  3. Another provider'
+        for ($index = 0; $index -lt $savedChoices.Count; $index++) { Write-Host "  $($index + 4). $($savedChoices[$index].Provider) (saved settings)" }
+        $choice = Get-PromptAnswer "Pick a provider number [$defaultChoice]" 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' $defaultChoice
+        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = $defaultChoice }
+        $numericChoice = $choice -match '^\d+$'
+        if ($numericChoice -and ([double]$choice -lt 1 -or [double]$choice -ge (4 + $savedChoices.Count))) {
+            Write-Host "Please pick a number from 1 to $(3 + $savedChoices.Count)."
+            continue
+        }
+        if ($numericChoice) { $choice = [string][int]$choice }
+        if ($choice -eq '2') {
+            $selected = Select-CozyLocalModel -Models $localModels
+            if ($selected) { $answers.Endpoint = $selected.Endpoint; $answers.Id = $selected.Id; break }
+            Write-Info 'No local model selected. Start or load a model in your local app, or enter its endpoint below.'
+        }
+        $answer = switch ($choice) {
+            '1' { 'openai-codex' }
+            '2' { Get-PromptAnswer 'Local endpoint URL [http://127.0.0.1:1234/v1]' 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' 'http://127.0.0.1:1234/v1' }
+            '3' { Get-PromptAnswer 'Provider name (for example, anthropic or openai)' 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' '' }
+            default { if ($numericChoice) { $savedChoices[[int]$choice - 4].Provider } else { $choice } } # Preserve direct scripted inputs.
+        }
+        if ($choice -eq '2' -and -not (Test-SafeModelEndpoint $answer)) {
+            Write-Host 'That is not a usable endpoint URL.'
+            continue
+        }
+        if ($choice -eq '3' -and -not (Test-SafeModelWord $answer)) {
+            Write-Host 'Enter a provider name using letters, digits, and . _ : / -'
+            continue
+        }
         if ($answer -like 'http://*' -or $answer -like 'https://*') {
             if (Test-SafeModelEndpoint $answer) { $answers.Endpoint = $answer; break }
             Write-Host 'That is not a usable endpoint URL.'
@@ -2303,22 +2538,52 @@ function Confirm-CozyAgentsModel {
             Write-Host 'Provider names are letters, digits, and . _ : / -'
         }
     }
-    while ($true) {
-        $answer = Get-PromptAnswer 'Which model id should new bots use?' 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' ''
+    if (-not $answers.Provider -and -not $answers.Endpoint) { Fail 'No model provider selected. Run setup again and choose a listed provider or local endpoint.' }
+    if ($answers.Provider -and $numericChoice) {
+        $catalog = Get-WindowsSavedProviderCatalog $answers.Provider
+        if (-not $catalog.PSObject.Properties['RequiresSharedConfig'] -or -not $catalog.RequiresSharedConfig) {
+            if ($catalog.DefaultModel) { $answers.Id = $catalog.DefaultModel }
+            elseif (@($catalog.Models).Count -eq 1) { $answers.Id = $catalog.Models[0].Id }
+            elseif (@($catalog.Models).Count -gt 1) {
+                Write-Host 'Saved models (availability has not been checked):'
+                for ($index = 0; $index -lt $catalog.Models.Count; $index++) { Write-Host "  $($index + 1). $($catalog.Models[$index].Id)" }
+                Write-Host '  0. Enter a different model ID'
+                for ($attempt = 0; $attempt -lt 5; $attempt++) {
+                    $modelChoice = Get-PromptAnswer 'Choose a model number [1]' 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' '1'
+                    if ($modelChoice -eq '0') { break }
+                    $number = 0
+                    if ([int]::TryParse($modelChoice, [ref]$number) -and $number -ge 1 -and $number -le $catalog.Models.Count) { $answers.Id = $catalog.Models[$number - 1].Id; break }
+                    Write-Host 'Choose a listed model number, or 0 for manual setup.'
+                }
+            }
+        }
+    }
+    if (-not $answers.Id) { Write-Info 'Copy the model ID from your provider dashboard or local model app.' }
+    for ($attempt = 0; -not $answers.Id -and $attempt -lt 5; $attempt++) {
+        $answer = Get-PromptAnswer 'Which model ID should new bots use?' 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' ''
+        if ([string]::IsNullOrWhiteSpace($answer)) { Fail 'No model selected. Start your model app or check your provider model list, then run setup again.' }
         if ($null -ne $answer -and (Test-SafeModelWord $answer)) { $answers.Id = $answer; break }
         Write-Host 'Model ids are letters, digits, and . _ : / -'
     }
+    if (-not $answers.Id) { Fail 'No valid model selected. Check your model app or provider model list, then run setup again.' }
     if ($answers.Provider) {
-        $codex = Find-CodexLogin
-        if ($codex) {
-            while ($true) {
-                $answer = Get-PromptAnswer "Share the Codex login on this computer ($codex) with the bots that run here, so you never paste an API key? [y/N]" 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' 'n'
+        $selectedCatalog = Get-WindowsSavedProviderCatalog $answers.Provider
+        $hasSavedAuth = $selectedCatalog.AuthConfigured
+        if ($answers.Provider -eq 'openai-codex') { $hasSavedAuth = [bool](Find-CodexLogin) }
+        if ($hasSavedAuth) {
+            for ($attempt = 0; $attempt -lt 5; $attempt++) {
+                $answer = Get-PromptAnswer "Share the saved Pi model credentials and settings in $(Get-WindowsPiAgentHome) with bots on this computer? [y/N]" 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' 'n'
                 if ($null -eq $answer) { break }
                 $normalized = $answer.ToLowerInvariant()
-                if ($normalized -eq 'y' -or $normalized -eq 'yes') { $answers.ShareHostAuth = $true; break }
+                if ($normalized -eq 'y' -or $normalized -eq 'yes') { $answers.ShareHostAuth = $true; $answers.SharedPiAgentDir = Get-WindowsPiAgentHome; break }
                 if ($normalized -eq 'n' -or $normalized -eq 'no') { break }
                 Write-Host 'Please answer y or n.'
             }
+        }
+        if (-not $answers.ShareHostAuth) {
+            $answers.NeedsAccount = $true
+            Write-Info "Model selected. Before a bot can use $($answers.Provider), connect that account in the agent's model settings."
+            Write-Info 'Setup will finish installing the apps; it has not verified access to this AI account.'
         }
     }
     $source = if ($answers.Provider) { $answers.Provider } else { $answers.Endpoint }
@@ -2375,6 +2640,16 @@ function Write-RunnerModelEnv {
     if ($Answers.ContainsKey('PreserveExisting') -and $Answers.PreserveExisting) { return }
     if (-not $Answers.Provider -and -not $Answers.Endpoint) { return }
     if (-not $Answers.Id) { return }
+    $sharedPiDirectory = ''
+    if ($Answers.ShareHostAuth) {
+        $sharedPiDirectory = if ($Answers.ContainsKey('SharedPiAgentDir')) { [string]$Answers.SharedPiAgentDir } else { Get-WindowsPiAgentHome }
+        if ([string]::IsNullOrWhiteSpace($sharedPiDirectory) -or $sharedPiDirectory -match '[\r\n"]' -or -not [IO.Path]::IsPathRooted($sharedPiDirectory)) {
+            Fail 'The saved account directory is not a usable absolute Windows path; model settings were not changed.'
+        }
+        $sharedPiDirectory = [IO.Path]::GetFullPath($sharedPiDirectory)
+        Assert-BootstrapPathAndParents $sharedPiDirectory
+        if (-not (Test-Path -LiteralPath $sharedPiDirectory -PathType Container)) { Fail 'The saved account directory is unavailable; model settings were not changed.' }
+    }
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $RunnerEnvPath) | Out-Null
     Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_ID' $Answers.Id
     if ($Answers.Provider) {
@@ -2384,7 +2659,15 @@ function Write-RunnerModelEnv {
         Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_PROVIDER' '' -Remove
         Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_ENDPOINT' $Answers.Endpoint
     }
-    if ($Answers.ShareHostAuth) { Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_SHARE_HOST_MODEL_AUTH' '1' }
+    if ($Answers.ShareHostAuth) {
+        # Pi reads both account credentials and model configuration from this
+        # directory. Persist the consented directory for future service logins.
+        Set-RunnerEnvValue $RunnerEnvPath 'PI_CODING_AGENT_DIR' ('"' + $sharedPiDirectory + '"')
+        Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_SHARE_HOST_MODEL_AUTH' '1'
+    } else {
+        Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_SHARE_HOST_MODEL_AUTH' '' -Remove
+        Set-RunnerEnvValue $RunnerEnvPath 'PI_CODING_AGENT_DIR' '' -Remove
+    }
     Write-Ok "wrote the default model for new bots to $RunnerEnvPath"
 }
 
@@ -2646,6 +2929,12 @@ function Select-Listener {
     foreach ($flag in @('--bind-host', '--public-url', '--clear-public-url')) {
         if ($ForwardedArguments -contains $flag) { return @() }
     }
+    if (Test-PromptAvailable 'COZYGATEWAY_TEST_LAN_PROMPT_INPUT') {
+        Write-Host ''
+        Write-Host 'Will you use CozyChat from a phone or another computer on the same network?'
+        Write-Host 'Choose yes to allow those devices to connect. They will still need to pair.'
+        Write-Host 'Choose no to keep connections on this computer only.'
+    }
     while ($true) {
         $answer = Get-PromptAnswer 'Allow CozyChat to access this Gateway over your local network? [y/N]' 'COZYGATEWAY_TEST_LAN_PROMPT_INPUT' 'n'
         if ($null -eq $answer) { break }
@@ -2866,6 +3155,10 @@ if ($script:PendingSetupPlan -and (-not $Harness -or ($Repair -and -not $script:
     $Harness = $script:PendingSetupPlan.Harness
     Write-Info "Resuming the incomplete $Harness setup with the saved component homes."
 }
+Write-Host ''
+Write-Host 'CozyGateway setup for Windows'
+Write-Host 'We will check your settings, update the required apps, and connect your bots.'
+Write-Host 'Existing settings and pairings will be kept. Follow any choices below.'
 $harness = Select-Harness $Harness $statePath $configPath
 if ($isDryRun) {
     if ($harness -in @('cozyagents', 'both')) {
@@ -2895,6 +3188,8 @@ Protect-CozyGatewayHome $script:InstallHome
 Acquire-BootstrapLock $script:InstallHome
 $stage = $null
 try {
+    Write-Host ''
+    Write-Info 'Step 1 of 4 - Downloading and checking the update.'
     $assets = @('cozygateway.mjs', 'agent-install.sh', 'gateway-supervisor.cjs', 'cozygateway-bootstrap.ps1')
     if ($harness -ne 'cozyagents') { $assets += 'cozygateway-hermes-attach-plugin.tar.gz' }
     $recovered = Recover-BootstrapTransaction $script:InstallHome $bin $assets
@@ -2922,6 +3217,7 @@ try {
     Set-WindowsSetupStage $script:InstallHome 'gateway' 'started' $harness $agentsHome -PairingPending $pairingPending
     if ($harness -ne 'cozyagents') { Set-WindowsSetupStage $script:InstallHome 'hermes' 'started' }
     if ($harness -ne 'hermes') { Set-WindowsSetupStage $script:InstallHome 'cozyagents' 'started' }
+    Write-Info 'Step 2 of 4 - Checking your agents and AI settings.'
     if ($harness -ne 'cozyagents') {
         Invoke-WindowsSetupStage $script:InstallHome 'hermes' {
             $script:ResolvedHermes = Resolve-Hermes $env:COZYGATEWAY_HERMES_INSTALL_URL
@@ -2946,6 +3242,7 @@ try {
         }
     }
     New-Item -ItemType Directory -Force -Path $bin | Out-Null
+    Write-Info 'Step 3 of 4 - Updating Gateway and connecting your agents. This may take a few minutes.'
     Invoke-WindowsSetupStage $script:InstallHome 'gateway' {
         Invoke-TransactionalRelease $script:InstallHome $bin $stage $assets {
             $gatewayHarness = if ($harness -eq 'cozyagents') { 'cozyagents' } else { 'hermes' }
@@ -2971,9 +3268,13 @@ try {
             $null = Update-CozyAgentsHarness $agentsHome
         }
     }
+    Write-Info 'Step 4 of 4 - Finishing your connection to CozyChat.'
     if ($harness -ne 'hermes' -or $alreadyConfigured) { Complete-Pairing $cliPath (-not $pairingPending) $isNoQr }
     Set-WindowsSetupStage $script:InstallHome 'gateway' 'succeeded' -PairingPending $false
-    Write-Ok "Windows setup complete: CozyGateway and $harness are ready"
+    Write-Ok "Windows setup complete: CozyGateway and $harness are running"
+    if ($model -and $model.ContainsKey('NeedsAccount') -and $model.NeedsAccount) {
+        Write-Info "Next: connect $($model.Provider) in your agent's model settings before starting a bot, or rerun setup to choose a detected local model."
+    }
     $global:LASTEXITCODE = 0
 } finally {
     if ($stage -and (Test-Path -LiteralPath $stage)) {
