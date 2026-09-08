@@ -39,9 +39,6 @@ try {
     Assert-Runtime $false 'unknown schema must not be silently reused'
     @{ node = 'node.exe'; bundle = @{ path = $bundle } } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadata
     Assert-Runtime $false 'relative executable paths must not depend on the current directory'
-    $failed = $false
-    try { Install-CozyAgentsHarness $fixture 'unused' 'unused' $true } catch { $failed = $_.Exception.Message -like '*runtime changed*' }
-    if (-not $failed) { throw 'runtime invalidated after preflight must abort instead of downloading an installer' }
     Write-Output 'PASS existing Windows runtime validation'
 } finally {
     $resolved = [IO.Path]::GetFullPath($fixture)

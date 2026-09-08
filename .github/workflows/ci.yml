@@ -63,6 +63,14 @@ jobs:
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-launcher-stop.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-fresh-prerequisites.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-existing-runtime.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-installer-session.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap-durability.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-download-retry.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-harness-update.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-setup-flow.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-git-bootstrap.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-gateway-health.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-gateway-recovery.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/bootstrap-transaction.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-agents-bootstrap.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-dashboard-owner.test.ps1

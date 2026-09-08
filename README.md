@@ -46,13 +46,18 @@ Use this PowerShell command on Windows; the `curl ... | bash` command above is f
 macOS/Linux. Windows PowerShell aliases `curl` to `Invoke-WebRequest`, which does
 not accept curl's flags.
 
-To update an existing gateway, run `cozygateway update` or repeat the PowerShell
-command. Updates reuse an existing CozyAgents runtime and preserve its pairing
-and model settings, including when run from an administrator shell for the same
-Windows account. Installing a missing or damaged CozyAgents runtime still requires
-a non-administrator PowerShell window. Update CozyAgents itself through its own updater.
-If you select CozyAgents while updating a Hermes-only gateway from an administrator
-shell, the gateway update proceeds and explains how to add CozyAgents afterward.
+Repeat the PowerShell command to update the gateway and its installed harnesses.
+Routine updates retain your harness choices, profiles, pairing, and model settings;
+setup asks for input only when configuration is missing. An administrator shell
+hands setup to a normal PowerShell window for the same Windows account and waits
+for its result. Setup verifies the normal desktop belongs to the same account
+and Windows session before using it to launch the installer.
+
+Setup installs a verified private Git Bash if needed, checks the running gateway
+version and configured Hermes attachments, and checks CozyAgents' updater readiness
+result before reporting completion. If a component fails, rerun the same command;
+the progress record retains incomplete choices and custom homes. `cozygateway update`
+remains available for updating the gateway itself.
 
 Both agents use the same gateway. Repeat the command to add either agent later;
 existing profiles, runner pairing, and gateway settings are preserved. For an
