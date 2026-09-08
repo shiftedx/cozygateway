@@ -1455,10 +1455,8 @@ function Select-Harness {
     return $harness
 }
 
-# CozyAgents installs per user under the profile of whoever runs it and refuses an elevated token
-# when it runs. Refusing here, before anything is installed, is what keeps an elevated paste from
-# leaving a gateway under the administrator profile with no harness and no runner behind it. The
-# Hermes path is untouched: it has always installed whatever token it was given.
+# CozyAgents setup refuses elevation. Gateway updates can reuse its existing runtime
+# without invoking that installer; require a normal token only when setup is needed.
 function Test-ElevatedToken {
     # COZYAGENTS_INSTALL_ASSUME_ELEVATED is the harness installer's own knob, honoured here so one
     # variable elevates both halves of a test run. COZYGATEWAY_TEST_ASSUME_ELEVATED is this side's,
@@ -1683,7 +1681,12 @@ function Get-CozyAgentsInstallerDigest {
 # can mint a runner code without asking anybody to read one off a screen. The installer is run in
 # this process the way irm | iex runs it, so no execution policy is consulted or changed.
 function Install-CozyAgentsHarness {
-    param([string] $AgentsHome, [string] $Source, [string] $ExpectedSha256)
+    param([string] $AgentsHome, [string] $Source, [string] $ExpectedSha256, [bool] $ReuseExisting = $false)
+    if ($ReuseExisting) {
+        if (-not (Test-CozyAgentsRuntime $AgentsHome)) { Fail 'the existing CozyAgents runtime changed during this update; rerun setup from a non-administrator PowerShell window' }
+        Write-Ok 'keeping the installed CozyAgents runtime; updating CozyGateway'
+        return
+    }
     Write-Info 'installing CozyAgents, the harness that runs your bots on this machine.'
     # The scriptblock runs in this script's session state, so its $script: variables are this
     # script's: its $script:Tag, $script:Repo and $script:AssetBase are the same names as $tag,
@@ -1735,6 +1738,20 @@ function Get-CozyAgentsCommand {
     return @{ Node = $node; Bundle = $bundle }
 }
 
+function Test-CozyAgentsRuntime {
+    param([string] $AgentsHome)
+    try {
+        $command = Get-CozyAgentsCommand $AgentsHome
+        # Metadata alone does not mean an interrupted installation is usable.
+        foreach ($path in @($command.Node, $command.Bundle)) {
+            if (-not [IO.Path]::IsPathRooted($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+            $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try { if ($stream.Length -eq 0) { return $false } } finally { $stream.Dispose() }
+        }
+        return $true
+    } catch { return $false }
+}
+
 function Get-GatewayOrigin {
     param([string] $ConfigPath)
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { Fail "CozyGateway did not write its configuration at $ConfigPath" }
@@ -1764,8 +1781,8 @@ function New-RunnerPairCode {
 function Join-RunnerToGateway {
     param([string] $AgentsHome, [string] $Cli, [string] $ConfigPath)
     $runnerEnv = Join-Path $AgentsHome 'runner.env'
-    # A computer that is already paired keeps the runner credential it has: a second run upgrades
-    # the harness and leaves the pairing, exactly as a second run leaves device trust alone.
+    # A computer that is already paired keeps the runner credential it has,
+    # exactly as a second run leaves device trust alone.
     if (Get-RunnerEnvValue $runnerEnv 'COZYRUNNER_TOKEN') {
         Write-Ok 'this computer is already paired to CozyGateway as a runner; keeping that pairing'
         return
@@ -1882,7 +1899,7 @@ function Install-WithCozyAgents {
             Invoke-CozyGatewayInstaller $bash $InstallerPath '' $ForwardedArguments 'cozyagents' $listener
             Save-ExplicitBootstrapSource $script:InstallHome $explicitAssetBase
             Set-CozyGatewayCommandPath $Bin $true
-            Install-CozyAgentsHarness $agentsHome $InstallerSource $script:CozyAgentsInstallerSha256
+            Install-CozyAgentsHarness $agentsHome $InstallerSource $script:CozyAgentsInstallerSha256 $script:ReuseCozyAgents
             Write-RunnerModelEnv (Join-Path $agentsHome 'runner.env') $model
             Join-RunnerToGateway $agentsHome $CliPath $ConfigPath
             Save-CozyAgentsState (Join-Path $script:InstallHome 'local\install-state') 'cozyagents' $agentsHome
@@ -1997,7 +2014,22 @@ if ($isUninstall) {
 
 # Step 1 of the approved order: the harness, before anything is installed.
 $harness = Select-Harness $Harness $statePath $configPath
-if ($harness -in @('cozyagents', 'both')) { Deny-Elevation }
+$script:ReuseCozyAgents = $false
+if ($harness -in @('cozyagents', 'both')) {
+    $recordedHarness = Get-RecordedHarness $statePath
+    $script:ReuseCozyAgents = $alreadyConfigured -and $recordedHarness -in @('cozyagents', 'both') -and (Test-CozyAgentsRuntime (Resolve-CozyAgentsHome))
+    if (-not $script:ReuseCozyAgents -and (Test-ElevatedToken)) {
+        if ($alreadyConfigured -and ($recordedHarness -eq 'hermes' -or ($recordedHarness -eq '' -and (Test-HermesBridge $configPath)))) {
+            # Adding an optional harness must not prevent updating the existing gateway.
+            # Keep the actual installed selection; never persist a deferred addition as both.
+            $harness = 'hermes'
+            Write-Info 'Updating the existing Hermes gateway. CozyAgents setup deferred: adding it requires a non-administrator PowerShell window.'
+            Write-Info 'To add CozyAgents afterward, run in that window: & ([scriptblock]::Create((irm https://cozylabs.ai/install.ps1))) -Harness both'
+        } else {
+            Deny-Elevation
+        }
+    }
+}
 
 if ($isDryRun) {
     if ($harness -in @('cozyagents', 'both')) {
@@ -2006,7 +2038,11 @@ if ($isDryRun) {
         Write-Info 'dry run: would ask whether CozyChat may reach this Gateway over your local network'
         if ($harness -eq 'cozyagents') { Write-Info 'dry run: would resolve and checksum-verify the CozyGateway release assets, and no Hermes attach plugin' }
         Write-Info "dry run: would install CozyGateway under $script:InstallHome without administrator rights"
-        Write-Info "dry run: would install CozyAgents from $cozyAgentsInstaller with -NoPair, then pair this computer as a runner with a code minted here"
+        if ($script:ReuseCozyAgents) {
+            Write-Info 'dry run: would keep the installed CozyAgents runtime and existing runner pairing'
+        } else {
+            Write-Info "dry run: would install CozyAgents from $cozyAgentsInstaller with -NoPair, then pair this computer as a runner with a code minted here"
+        }
         if ($harness -eq 'cozyagents') { return }
     }
     if (Find-Hermes) {
@@ -2067,7 +2103,7 @@ try {
         if ($harness -eq 'both') {
             # Record both before runner setup so the persisted selection remains repairable.
             Save-CozyAgentsState $statePath 'both' $agentsHome
-            Install-CozyAgentsHarness $agentsHome $cozyAgentsInstaller $script:CozyAgentsInstallerSha256
+            Install-CozyAgentsHarness $agentsHome $cozyAgentsInstaller $script:CozyAgentsInstallerSha256 $script:ReuseCozyAgents
             Write-RunnerModelEnv (Join-Path $agentsHome 'runner.env') $model
             Join-RunnerToGateway $agentsHome $cliPath $configPath
             Save-CozyAgentsState $statePath 'both' $agentsHome

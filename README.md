@@ -42,6 +42,18 @@ Choose Hermes, CozyAgents, or both, then configure the selected agents.
 irm https://cozylabs.ai/install.ps1 | iex
 ```
 
+Use this PowerShell command on Windows; the `curl ... | bash` command above is for
+macOS/Linux. Windows PowerShell aliases `curl` to `Invoke-WebRequest`, which does
+not accept curl's flags.
+
+To update an existing gateway, run `cozygateway update` or repeat the PowerShell
+command. Updates reuse an existing CozyAgents runtime and preserve its pairing
+and model settings, including when run from an administrator shell for the same
+Windows account. Installing a missing or damaged CozyAgents runtime still requires
+a non-administrator PowerShell window. Update CozyAgents itself through its own updater.
+If you select CozyAgents while updating a Hermes-only gateway from an administrator
+shell, the gateway update proceeds and explains how to add CozyAgents afterward.
+
 Both agents use the same gateway. Repeat the command to add either agent later;
 existing profiles, runner pairing, and gateway settings are preserved. For an
 unattended selection, use `-Harness hermes`, `-Harness cozyagents`, or `-Harness both`:
