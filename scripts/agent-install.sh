@@ -801,9 +801,25 @@ discover_profiles() {
 
 # Environment values are never command arguments. Keep existing unrelated keys
 # byte-for-byte and replace only an installer-owned key through a mode-600 temp.
+check_line_editable_env() {
+  [ -f "$1" ] || return 0
+  "$NODE_RESOLVED" - "$1" <<'NODE' || die "environment has ambiguous multiline values; existing file retained"
+const fs = require('node:fs');
+const text = fs.readFileSync(process.argv[2], 'utf8');
+for (const line of text.split(/\r?\n/)) {
+  const match = /^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.*)$/.exec(line);
+  if (!match) continue;
+  const value = match[1];
+  if (!["'", '"', '`'].includes(value[0])) continue;
+  const closed = value.slice(1).split('').some((char, index) => char === value[0] && value[index] !== '\\');
+  if (!closed) process.exit(1);
+}
+NODE
+}
 env_put() {
   local file="$1" key="$2" value="$3" temp
   [ "$DRY_RUN" = 1 ] && { say "DRY   set $key in $file (value redacted)"; return; }
+  check_line_editable_env "$file"
   mkdir -p "$(dirname "$file")"; umask 077; temp="$(mktemp "${file}.tmp.XXXXXX")"
   [ -f "$file" ] && grep -v -E "^${key}=" "$file" > "$temp" || true
   printf '%s=%s\n' "$key" "$value" >> "$temp"; chmod 600 "$temp"; mv "$temp" "$file"; chmod 600 "$file"
@@ -841,6 +857,7 @@ preflight_profile_env_ownership() {
   local profile file owner url key
   for profile in "${SELECTED[@]}"; do
     file="$(profile_home "$profile")/.env"
+    check_line_editable_env "$file"
     owner="$(env_get "$file" "$ENV_OWNER_KEY")"
     url="$(env_get "$file" COZYGATEWAY_URL)"
     if [ "$owner" = "$ENV_OWNER_VALUE" ]; then

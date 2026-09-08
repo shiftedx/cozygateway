@@ -161,6 +161,18 @@ esac
         self.run_script("provision-bot.sh", "deleted-a", succeeds=False)
         self.assertEqual(local.read_bytes(), local_before)
 
+    def test_program_override_blocks_service_cleanup_before_remote_edits(self):
+        plist = self.home / "Library/LaunchAgents/ai.hermes.gateway-deleted-a.plist"
+        data = plistlib.loads(plist.read_bytes())
+        data["Program"] = "/usr/bin/true"
+        plist.write_bytes(plistlib.dumps(data))
+        before = {path: path.read_bytes() for path in (plist, self.config, self.envfile)}
+        self.run_script("deprovision-bot.sh", "deleted-a", succeeds=False)
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertTrue((self.loaded / "ai.hermes.gateway-deleted-a").exists())
+        self.assertFalse(self.journal.exists())
+
     def test_retry_after_failed_restart_without_config_or_service(self):
         failure = self.base / "restart-fail"
         failure.touch()

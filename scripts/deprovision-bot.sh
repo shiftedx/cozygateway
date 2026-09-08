@@ -279,6 +279,9 @@ try:
     interpreters = {str(root / "hermes-agent" / "venv" / "bin" / name) for name in ("python", "python3")}
     if not isinstance(args, list) or not args or args[0] not in interpreters:
         raise ValueError("interpreter")
+    # launchd executes Program when present, even if argv[0] names Hermes.
+    if "Program" in data and data["Program"] != args[0]:
+        raise ValueError("program override")
     if args[1:3] == ["-m", "hermes_cli.stderr_timestamp"]:
         if args[3:6] != ["--error-log", home + "/logs/gateway.error.log", "--"]:
             raise ValueError("wrapper")

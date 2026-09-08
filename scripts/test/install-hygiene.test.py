@@ -161,6 +161,14 @@ exec '{real_mv}' "$@"
         for path, content in original.items():
             self.assertEqual(path.read_bytes(), content)
 
+    def test_native_profile_multiline_custom_value_is_retained(self):
+        profile_env = self.profile("keeper") / ".env"
+        profile_env.write_text(profile_env.read_text() + 'CUSTOM_NOTE="before\nCOZYGATEWAY_TOKEN=note content\nafter"\n')
+        original = {path: path.read_bytes() for path in (self.state, self.config, self.envfile, profile_env)}
+        self.run_bootstrap("--no-qr", success=False)
+        for path, content in original.items():
+            self.assertEqual(path.read_bytes(), content)
+
 
 class StagedHygieneTest(unittest.TestCase):
     def setUp(self):
