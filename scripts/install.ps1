@@ -221,10 +221,36 @@ try {
     & (Join-Path $PSScriptRoot 'installer.ps1') @parameters
     exit $global:LASTEXITCODE
 } catch {
-    Write-Host ('FAIL  ' + $_.Exception.Message) -ForegroundColor Red
+    # Preserve only the installer exception, not child output or environment data.
+    # Limit UTF-16 length so its UTF-8 representation stays below the 16 KiB reader cap.
+    $message = [string]$_.Exception.Message
+    if ($message.Length -gt 4096) { $message = $message.Substring(0, 4096) }
+    try { [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'failure.txt'), $message, (New-Object Text.UTF8Encoding($false))) } catch { }
+    Write-Host ('FAIL  ' + $message) -ForegroundColor Red
     exit 1
 }
 '@
+}
+
+function Get-CozySessionError {
+    param([string] $Directory)
+    $path = Join-Path $Directory 'failure.txt'
+    $stream = $null
+    try {
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ($item.Attributes -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint)) { return '' }
+        $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        if ($stream.Length -eq 0 -or $stream.Length -gt 16384) { return '' }
+        $bytes = New-Object byte[] ([int]$stream.Length)
+        $read = 0
+        while ($read -lt $bytes.Length) {
+            $count = $stream.Read($bytes, $read, $bytes.Length - $read)
+            if ($count -eq 0) { return '' }
+            $read += $count
+        }
+        return (New-Object Text.UTF8Encoding($false, $true)).GetString($bytes).Trim()
+    } catch { return '' }
+    finally { if ($null -ne $stream) { $stream.Dispose() } }
 }
 
 function Invoke-CozyInstallerSession {
@@ -261,10 +287,11 @@ function Invoke-CozyInstallerSession {
         Write-Host 'INFO  Continuing setup as your normal Windows account in a new PowerShell window. Complete any prompts there; this window will wait for the result.'
         try { $exitCode = [CozyGateway.DesktopInstallerSession]::Launch($application, $wrapperPath, $launchDirectory) }
         catch { throw "Windows setup handoff failed (launch directory '$launchDirectory'; original directory '$cwd'): $($_.Exception.Message)" }
-        return [pscustomobject]@{ HandedOff = $true; ExitCode = $exitCode }
+        $errorMessage = if ($exitCode -ne 0) { Get-CozySessionError $folder } else { '' }
+        return [pscustomobject]@{ HandedOff = $true; ExitCode = $exitCode; ErrorMessage = $errorMessage }
     } finally {
         # Only these known staging files are removed; never recurse through user-controlled links.
-        foreach ($name in @('continue.ps1', 'parameters.xml', 'native.cs', 'installer.ps1')) {
+        foreach ($name in @('continue.ps1', 'parameters.xml', 'native.cs', 'installer.ps1', 'failure.txt')) {
             Remove-Item -LiteralPath (Join-Path $folder $name) -Force -ErrorAction SilentlyContinue
         }
         try { [IO.Directory]::Delete($folder, $false) } catch { }
@@ -2761,7 +2788,10 @@ $script:InstallerSourceText = Get-CozyInstallerSourceText
 $session = Invoke-CozyInstallerSession -ScriptText $script:InstallerSourceText -BoundParameters $script:InstallerBoundParameters -InstallerArguments $InstallerArguments
 if ($session.HandedOff) {
     $global:LASTEXITCODE = $session.ExitCode
-    if ($session.ExitCode -ne 0) { Fail "Windows setup did not complete in the user window (exit $($session.ExitCode)); review the error there and rerun this one-liner" }
+    if ($session.ExitCode -ne 0) {
+        $detail = if ($session.ErrorMessage) { $session.ErrorMessage } else { 'The setup window exited without error details. Rerun this one-liner to retry.' }
+        Fail "Windows setup did not complete (exit $($session.ExitCode)): $detail"
+    }
     return
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12

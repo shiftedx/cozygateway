@@ -5,7 +5,7 @@ $tokens = $null
 $parseErrors = $null
 $installerAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '../install.ps1'), [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -gt 0) { throw 'Installer must parse before session tests can load its functions' }
-$helperNames = @('Get-CozyInstallerSourceText', 'Get-CozySessionNativeSource', 'Initialize-CozySessionNative', 'New-CozySessionPayload', 'Get-CozySessionContinuation', 'Invoke-CozyInstallerSession')
+$helperNames = @('Get-CozyInstallerSourceText', 'Get-CozySessionNativeSource', 'Initialize-CozySessionNative', 'New-CozySessionPayload', 'Get-CozySessionContinuation', 'Get-CozySessionError', 'Invoke-CozyInstallerSession')
 foreach ($helperName in $helperNames) {
     $definition = $installerAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $helperName }, $true)
     if ($null -eq $definition) { throw "Missing session helper: $helperName" }
@@ -58,6 +58,25 @@ if (-not $elevated) {
         Assert-Session ($nativeExit -eq 37) 'Native shell-parent launch must preserve the payload and exact exit status'
         & $application -NoProfile -ExecutionPolicy Bypass -File $wrapper
         Assert-Session ($LASTEXITCODE -eq 37) 'Continuation must preserve parameters and exit status'
+        Assert-Session ((Get-CozySessionError $folder) -ceq '') 'An explicit exit code must not invent failure details'
+        Set-Content -LiteralPath (Join-Path $folder 'installer.ps1') -Encoding UTF8 -Value 'param([switch]$Repair,[string]$Harness,[string]$CozyAgentsInstaller,[string[]]$InstallerArguments) throw "CozyAgents update failed readiness; retry the Windows one-liner."'
+        $nativeFailure = [CozyGateway.DesktopInstallerSession]::Launch($application, $wrapper, [Environment]::SystemDirectory)
+        Assert-Session ($nativeFailure -eq 1) 'Native child exception must return failure'
+        $failureMessage = Get-CozySessionError $folder
+        Assert-Session ($failureMessage -ceq 'CozyAgents update failed readiness; retry the Windows one-liner.') 'Original terminal must receive the child exception after its console closes'
+        $handoffBranch = $installerAst.Find({ param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Extent.Text -match '^if\s*\(\$session\.HandedOff\)' }, $true)
+        function Fail { param([string]$Message) throw $Message }
+        $session = [pscustomobject]@{ HandedOff = $true; ExitCode = $nativeFailure; ErrorMessage = $failureMessage }
+        $parentError = ''
+        try { . ([scriptblock]::Create($handoffBranch.Extent.Text)) } catch { $parentError = $_.Exception.Message }
+        Assert-Session ($parentError.Contains($failureMessage) -and $global:LASTEXITCODE -eq 1) 'Parent handoff error must display child details and retain its exit code'
+        Set-Content -LiteralPath (Join-Path $folder 'failure.txt') -Value ('x' * 17000) -Encoding UTF8
+        Assert-Session ((Get-CozySessionError $folder) -ceq '') 'Oversized error files must not be read into the handoff result'
+        Remove-Item -LiteralPath (Join-Path $folder 'failure.txt') -Force
+        $null = New-Item -ItemType Directory -Path (Join-Path $folder 'failure.txt')
+        Assert-Session ((Get-CozySessionError $folder) -ceq '') 'Error receipt must be a regular file'
+        [IO.Directory]::Delete((Join-Path $folder 'failure.txt'), $false)
+        Set-Content -LiteralPath (Join-Path $folder 'installer.ps1') -Value $scriptText -Encoding UTF8
         $payload.ExpectedSid = 'S-1-5-18'
         $payload | Export-Clixml -LiteralPath (Join-Path $folder 'parameters.xml') -Depth 8
         $rejectedOutput = (& $application -NoProfile -ExecutionPolicy Bypass -File $wrapper | Out-String)
@@ -108,7 +127,7 @@ Get-Content -LiteralPath (Join-Path $PSScriptRoot 'entry.ps1') -Raw | Invoke-Exp
         [Environment]::SetEnvironmentVariable('COZY_SESSION_TEST_VALUE', $prior)
         [Environment]::SetEnvironmentVariable('COZY_SESSION_TEST_CWD', $priorCwd)
         Remove-Item Env:COZY_SESSION_RESULT -ErrorAction SilentlyContinue
-        foreach ($name in @('continue.ps1', 'native.cs', 'installer.ps1', 'parameters.xml', 'entry.ps1', 'iex-entry.ps1', 'entry-result.xml', 'relative-input.txt')) { Remove-Item -LiteralPath (Join-Path $folder $name) -Force -ErrorAction SilentlyContinue }
+        foreach ($name in @('continue.ps1', 'native.cs', 'installer.ps1', 'parameters.xml', 'entry.ps1', 'iex-entry.ps1', 'entry-result.xml', 'relative-input.txt', 'failure.txt')) { Remove-Item -LiteralPath (Join-Path $folder $name) -Force -ErrorAction SilentlyContinue }
         [IO.Directory]::Delete($folder, $false)
     }
 } elseif (-not $ElevatedIntegration) {
