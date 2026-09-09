@@ -508,6 +508,7 @@ export class HermesSessionManagementAdapter {
     let first = true;
     let finished = false;
     let current: HermesSessionMessage[] = [];
+    let upstreamDone = false;
     const client = this.#client;
     const exportMaxBytes = this.#exportMaxBytes;
     const exportMaxMessages = this.#exportMaxMessages;
@@ -523,7 +524,10 @@ export class HermesSessionManagementAdapter {
         throw new HermesSessionTooLarge("Hermes session export exceeded its size cap");
       return bytes;
     };
-    const fetchPage = async (limit: number): Promise<unknown[]> => {
+    const fetchPage = async (): Promise<void> => {
+      // One extra physical row proves whether a page-aligned transcript exceeds the cap.
+      const remaining = exportMaxMessages - offset;
+      const limit = Math.min(EXPORT_PAGE_SIZE, remaining + 1);
       const raw = await dashboardJson(
         client,
         `/api/sessions/${encodeURIComponent(sessionId)}/messages?limit=${limit}`
@@ -533,22 +537,18 @@ export class HermesSessionManagementAdapter {
       const physical = messageEnvelope(raw, sessionId);
       if (physical.length > limit || physical.length > HERMES_SESSION_MESSAGES_MAX)
         throw new HermesSessionUnavailable("Hermes returned an oversized session page");
-      return physical;
-    };
-
-    let upstreamDone = false;
-    try {
-      const remaining = exportMaxMessages - offset;
-      const requestLimit = Math.min(EXPORT_PAGE_SIZE, remaining + 1);
-      const physical = await fetchPage(requestLimit);
       if (physical.length > remaining)
         throw new HermesSessionTooLarge("Hermes session export exceeded its message cap");
       offset += physical.length;
-      upstreamDone = physical.length < requestLimit;
+      upstreamDone = physical.length < limit;
       current = physical.flatMap((row) => {
         const projected = message(row);
         return projected ? [projected] : [];
       });
+    };
+
+    try {
+      await fetchPage();
     } catch (error) {
       close();
       return mapReadError(error);
@@ -563,21 +563,7 @@ export class HermesSessionManagementAdapter {
         },
         async pull(controller) {
           try {
-            while (current.length === 0 && !upstreamDone) {
-              // Ask for one row beyond the remaining allowance when necessary. That proves an
-              // exact-cap transcript is complete instead of rejecting every page-aligned export.
-              const remaining = exportMaxMessages - offset;
-              const requestLimit = Math.min(EXPORT_PAGE_SIZE, remaining + 1);
-              const physical = await fetchPage(requestLimit);
-              if (physical.length > remaining)
-                throw new HermesSessionTooLarge("Hermes session export exceeded its message cap");
-              offset += physical.length;
-              upstreamDone = physical.length < requestLimit;
-              current = physical.flatMap((row) => {
-                const projected = message(row);
-                return projected ? [projected] : [];
-              });
-            }
+            while (current.length === 0 && !upstreamDone) await fetchPage();
             if (current.length > 0) {
               const item = current.shift()!;
               const bytes = encoder.encode(`${first ? "" : ","}${JSON.stringify(item)}`);

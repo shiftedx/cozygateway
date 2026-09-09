@@ -564,6 +564,26 @@ describe("streamed export", () => {
     await expect(reader.read()).rejects.toThrow(/size cap/i);
   });
 
+  it.each([200, 201])("counts hidden physical rows against the export cap (%i rows)", async (total) => {
+    const pages: string[] = [];
+    const { adapter } = surface((path) => {
+      if (!path.includes("/messages?")) return json(row());
+      const query = new URL(path, "http://hermes.test").searchParams;
+      const offset = Number(query.get("offset"));
+      const limit = Number(query.get("limit"));
+      pages.push(`${offset}:${limit}`);
+      return json({ session_id: "hermes-1", messages: Array.from(
+        { length: Math.min(limit, total - offset) },
+        () => ({ role: "system", content: "hidden" }),
+      ) });
+    }, { exportMaxMessages: 200 });
+    const exported = await adapter.export("sage", "hermes-1", new AbortController().signal);
+    const body = new Response(exported.body).json();
+    if (total === 200) await expect(body).resolves.toMatchObject({ messages: [] });
+    else await expect(body).rejects.toThrow(/message cap/i);
+    expect(pages).toEqual(["0:200", "200:1"]);
+  });
+
   it("rejects an export page above the requested 200-row wire cap", async () => {
     const { adapter } = surface((path) => path.includes("/messages?")
       ? json({ session_id: "hermes-1", messages: Array.from({ length: 201 }, (_, index) => ({
