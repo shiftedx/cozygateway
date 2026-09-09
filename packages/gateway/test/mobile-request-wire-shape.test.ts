@@ -1,9 +1,18 @@
 import { describe, it, expect } from "vitest";
 
-import { check, MobileNodeRequestFrameSchema } from "cozygateway-contract";
+import {
+  check,
+  MobileNodeRequestFrameSchema,
+  type MobileNodeCancelFrame,
+  type MobileNodeRequestFrame,
+} from "cozygateway-contract";
 import { vi } from "vitest";
 
-import { MobileNodeBroker } from "../src/mobile-node.ts";
+import {
+  MobileNodeBroker,
+  type MobileNodeResult,
+  type MobileNodeSendOutcome,
+} from "../src/mobile-node.ts";
 
 /**
  * The phone validates the EXACT key set of a `mobile_node_request` and drops anything carrying an
@@ -49,7 +58,10 @@ describe("the broker's own dispatch", () => {
     commandAdvertised: true, connectedSocketCount: 1, foreground: true,
   });
 
-  function brokerWith(send: ReturnType<typeof vi.fn>, result: ReturnType<typeof vi.fn>) {
+  function brokerWith(
+    send: (deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean | MobileNodeSendOutcome,
+    result: (agentId: string, frame: MobileNodeResult) => void,
+  ) {
     return new MobileNodeBroker({ route, send, result, receipt: () => true, now: () => 1_000 });
   }
 
@@ -60,8 +72,8 @@ describe("the broker's own dispatch", () => {
   };
 
   it("sends a frame the phone can accept", () => {
-    const send = vi.fn((_deviceId: string, _frame: unknown) => true),
-      result = vi.fn((_agentId: string, _frame: unknown) => {});
+    const send = vi.fn<(deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean>(() => true),
+      result = vi.fn<(agentId: string, frame: MobileNodeResult) => void>(() => {});
     brokerWith(send, result).invoke(base);
     const frame = send.mock.calls.at(-1)?.[1];
     expect(frame, "no frame was sent").toBeDefined();
@@ -69,8 +81,8 @@ describe("the broker's own dispatch", () => {
   });
 
   it("refuses to send one carrying a key the contract forbids, and says so", () => {
-    const send = vi.fn((_deviceId: string, _frame: unknown) => true),
-      result = vi.fn((_agentId: string, _frame: unknown) => {});
+    const send = vi.fn<(deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame) => boolean>(() => true),
+      result = vi.fn<(agentId: string, frame: MobileNodeResult) => void>(() => {});
     // `kind` is an attach-envelope key. It reached the wire once, and the phone answered by
     // dropping every request in silence for it.
     brokerWith(send, result).invoke({ ...base, kind: "mobile_request" } as never);
