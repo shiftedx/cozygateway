@@ -13,11 +13,14 @@ the additive ``continues`` field it produces.
 """
 
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 
 from cozygateway.adapter import AttachAdapter
-from cozygateway.attach_client_v1 import AttachV1Client
+from cozygateway.attach_client_v1 import AttachV1Client, AttachV1ClientConfig
+from cozygateway.attach_spool import AttachSpool, TerminalSealed
 
 
 class _SendResult:
@@ -73,6 +76,27 @@ class InterimReplyTests(unittest.IsolatedAsyncioTestCase):
         adapter._client = client
         adapter._active_turn["thread"] = "turn"
         return adapter, client
+
+    async def test_reset_notice_then_reply_survives_the_real_durable_spool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            spool = AttachSpool(str(Path(directory) / "attach.sqlite"))
+            self.addCleanup(spool.close)
+            adapter, _ = self._adapter()
+            client = AttachV1Client(AttachV1ClientConfig(
+                gateway_url="https://gateway.example.test", token="test", spool=spool,
+            ))
+            adapter._client = client
+            await adapter.send("thread", "Session automatically reset (inactive for 24h).")
+            await adapter.send("thread", "Still researching the openings.")
+            await adapter.send("thread", "Research complete.", reply_to="turn", metadata={"notify": True})
+
+            events = [frame["event"] for frame in spool.pending_events(20, 100000)]
+            commits = [event for event in events if event["kind"] == "commit"]
+            self.assertEqual(len(commits), 3, "reset notice must not block subsequent replies")
+            self.assertEqual([event.get("continues", False) for event in commits], [True, True, False])
+            self.assertEqual(commits[-1]["blocks"], [{"type": "paragraph", "text": "Research complete."}])
+            with self.assertRaises(TerminalSealed):
+                spool.enqueue_event({"kind": "draft", "threadId": "thread", "turnId": "turn", "blocks": []})
 
     async def test_a_mid_run_reply_commits_its_message_and_keeps_the_turn(self):
         adapter, client = self._adapter()

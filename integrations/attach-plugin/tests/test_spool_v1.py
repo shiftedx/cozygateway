@@ -39,6 +39,18 @@ class AttachSpoolTests(unittest.TestCase):
             spool.enqueue_event({"kind": "draft", "threadId": "t", "turnId": "u", "blocks": []})
         spool.close()
 
+    def test_interim_commit_stays_open_across_restart_until_real_terminal(self):
+        spool = AttachSpool(self.path)
+        spool.enqueue_event({"kind": "commit", "threadId": "t", "turnId": "u", "messageId": "notice", "blocks": [], "continues": True})
+        spool.close()
+        spool = AttachSpool(self.path)
+        self.addCleanup(spool.close)
+        spool.enqueue_event({"kind": "draft", "threadId": "t", "turnId": "u", "blocks": []})
+        spool.enqueue_event({"kind": "interrupted", "threadId": "t", "turnId": "u"})
+        with self.assertRaises(TerminalSealed):
+            spool.enqueue_event({"kind": "draft", "threadId": "t", "turnId": "u", "blocks": []})
+        self.assertEqual([f["sequence"] for f in spool.pending_events(10, 100000)], [1, 2, 3])
+
     def test_delegation_events_bypass_the_turn_terminal_seal(self):
         # An async delegate_task batch outlives its turn: a child's finish leg after the
         # terminal must still travel, while every other kind stays sealed.

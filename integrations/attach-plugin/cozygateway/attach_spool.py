@@ -302,7 +302,11 @@ class AttachSpool:
             sealed = self._db.execute("SELECT 1 FROM turn_terminals WHERE turn_id = ?", (turn_id,)).fetchone()
             if sealed is not None:
                 raise TerminalSealed(f"turn {turn_id!r} already has a terminal event")
-        terminal = event.get("kind") in {"commit", "failed", "cancelled", "interrupted"}
+        # Interim commits persist a message while the same turn keeps producing events.
+        # Only an actual terminal may fence later drafts, tools, or the final reply.
+        terminal = event.get("kind") in {"failed", "cancelled", "interrupted"} or (
+            event.get("kind") == "commit" and event.get("continues") is not True
+        )
         with self._db:
             sequence = int(self._db.execute("SELECT next_event_sequence FROM state WHERE id = 1").fetchone()[0])
             event_id = str(uuid.uuid4())
