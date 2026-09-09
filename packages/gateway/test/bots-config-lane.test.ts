@@ -168,6 +168,18 @@ describe("attach-v1 config lane", () => {
     peer.ws.close();
   });
 
+  it("carries subagent model reads, selection, and reset over the runtime config lane", async () => {
+    const configured = { ...modelConfig, subagentModel: "provider:child" };
+    const peer = await dial({ "model.read": configured, "model.write": configured });
+    await expect(config.modelConfig("sage")).resolves.toEqual(configured);
+    await expect(config.configureModel("sage", { subagentModel: "provider:child" })).resolves.toEqual(configured);
+    await config.configureModel("sage", { subagentModel: null });
+    expect(peer.requests.filter((request) => request.operation === "model.write").map((request) => request.input)).toEqual([
+      { subagentModel: "provider:child" }, { subagentModel: null },
+    ]);
+    peer.ws.close();
+  });
+
   it("uses the independently negotiated chat configuration capability", async () => {
     const configuration = { sessionId: "session-1", workspace: null, model: null };
     const peer = await dial({

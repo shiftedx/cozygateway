@@ -16,6 +16,7 @@ import {
   BotGroupCreateRequestSchema,
   BotGroupSendRequestSchema,
   BotModelConfigPatchSchema,
+  type BotModelConfig,
   BotModelProviderFieldUpdateSchema,
   BotModelProviderOAuthCodeSchema,
   BotProfilePatchSchema,
@@ -132,6 +133,14 @@ export const PENDING_APPROVALS_LIMIT = 100;
  *  every other rejection gets, so the TOCTOU window between a roster-cache hit and the call behind
  *  it answers what the route promises instead of reading as a backend failure. */
 export const HERMES_PROFILE_NOT_FOUND = 4064;
+
+/** Field presence alone is insufficient: older gateways can forward new fields but cannot write them. */
+function modelConfigResponse(config: BotModelConfig): BotModelConfig {
+  const response = { ...config };
+  delete response.subagentModelConfigurable;
+  if (config.subagentModel !== undefined) response.subagentModelConfigurable = true;
+  return response;
+}
 
 /** Local copy of http.ts's helper, duplicated rather than imported so this module does not close
  *  an import cycle back into the app it is registered on. */
@@ -1230,7 +1239,7 @@ export function registerBotRoutes(
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;
     try {
-      return c.json(await bots.modelConfig(resolved.name));
+      return c.json(modelConfigResponse(await bots.modelConfig(resolved.name)));
     } catch (err) {
       return failure(c, err);
     }
@@ -1253,17 +1262,20 @@ export function registerBotRoutes(
         err instanceof ContractViolation ? err.message : "malformed body";
       return c.json(errorBody("invalid_request", detail), 400);
     }
-    if (parsed.model === undefined && parsed.effort === undefined) {
+    if (parsed.model === undefined && parsed.effort === undefined && parsed.subagentModel === undefined) {
       return c.json(
         errorBody(
           "invalid_request",
-          "at least one of model or effort is required",
+          "at least one of model, effort, or subagentModel is required",
         ),
         400,
       );
     }
     try {
-      return c.json(await bots.configureModel(resolved.name, parsed));
+      if (parsed.subagentModel !== undefined && (await bots.modelConfig(resolved.name)).subagentModel === undefined) {
+        return c.json(errorBody("invalid_request", "subagent model configuration is unavailable for this bot"), 400);
+      }
+      return c.json(modelConfigResponse(await bots.configureModel(resolved.name, parsed)));
     } catch (err) {
       return failure(c, err);
     }

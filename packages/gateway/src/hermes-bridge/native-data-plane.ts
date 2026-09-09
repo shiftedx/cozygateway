@@ -642,7 +642,11 @@ export class NativeBotDataPlane {
   async #hermesModelConfig(name: string): Promise<BotModelConfig> {
     const [builtin, custom] = await Promise.all([this.#control.modelConfig(name), this.#botConfig!.modelConfig(name)]);
     return {
-      model: custom.model ?? builtin.model, effort: custom.model ? custom.effort ?? builtin.effort : builtin.effort,
+      model: custom.model ?? builtin.model,
+      // A custom primary model is owned by the attached runtime, while Hermes owns delegation.
+      // Keep the two selections independent so a custom-primary bot can still pin its children.
+      subagentModel: builtin.subagentModel,
+      effort: custom.model ? custom.effort ?? builtin.effort : builtin.effort,
       catalog: [...builtin.catalog, ...custom.catalog.filter((entry) => !builtin.catalog.some((existing) => existing.id === entry.id))],
       efforts: [...new Set([...builtin.efforts, ...custom.efforts])],
       providers: [...builtin.providers ?? [], ...custom.providers ?? []],
@@ -653,12 +657,19 @@ export class NativeBotDataPlane {
     const current = await this.#botConfig!.modelConfig(name);
     const custom = typeof patch.model === "string" && patch.model.startsWith("custom-")
       || patch.model === undefined && current.model?.startsWith("custom-");
+    const hermesPatch: BotModelConfigPatch = {
+      ...(patch.effort === undefined ? {} : { effort: patch.effort }),
+      ...(patch.subagentModel === undefined ? {} : { subagentModel: patch.subagentModel }),
+    };
+    if (!custom && patch.model !== undefined) hermesPatch.model = patch.model;
     if (custom) {
+      // Validate and apply Hermes-owned settings before the custom-primary write. In particular,
+      // an invalid child model must not leave the primary model changed behind it.
+      if (Object.keys(hermesPatch).length > 0) await this.#control.configureModel(name, hermesPatch);
       if (patch.model !== undefined) await this.#botConfig!.configureModel(name, { model: patch.model });
-      if (patch.effort !== undefined) await this.#control.configureModel(name, { effort: patch.effort });
     }
     else {
-      await this.#control.configureModel(name, patch);
+      if (Object.keys(hermesPatch).length > 0) await this.#control.configureModel(name, hermesPatch);
       if (patch.model !== undefined) await this.#botConfig!.configureModel(name, { model: null });
     }
     return this.#hermesModelConfig(name);

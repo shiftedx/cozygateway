@@ -737,6 +737,15 @@ describe("bot model config", () => {
     expect(check(BotModelConfigPatchSchema, { model: null })).toBe(true);
     expect(check(BotModelConfigPatchSchema, { effort: "low" })).toBe(true);
     expect(check(BotModelConfigPatchSchema, { model: 1 })).toBe(false);
+    expect(check(BotModelConfigPatchSchema, { subagentModel: "provider:child" })).toBe(true);
+    expect(check(BotModelConfigPatchSchema, { subagentModel: null })).toBe(true);
+    for (const subagentModel of [1, "", "   "]) {
+      expect(check(BotModelConfigPatchSchema, { subagentModel })).toBe(false);
+    }
+    expect(check(BotModelConfigSchema, {
+      model: null, effort: null, catalog: [], efforts: [],
+      subagentModel: null, subagentModelConfigurable: true,
+    })).toBe(true);
   });
 
   it("keeps capability 41 provider setup valid without the harness-level models field", () => {
