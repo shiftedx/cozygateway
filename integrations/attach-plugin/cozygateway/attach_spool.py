@@ -302,7 +302,11 @@ class AttachSpool:
             sealed = self._db.execute("SELECT 1 FROM turn_terminals WHERE turn_id = ?", (turn_id,)).fetchone()
             if sealed is not None:
                 raise TerminalSealed(f"turn {turn_id!r} already has a terminal event")
-        terminal = event.get("kind") in {"commit", "failed", "cancelled", "interrupted"}
+        # Interim commits persist a message while the same turn keeps producing events.
+        # Only an actual terminal may fence later drafts, tools, or the final reply.
+        terminal = event.get("kind") in {"failed", "cancelled", "interrupted"} or (
+            event.get("kind") == "commit" and event.get("continues") is not True
+        )
         with self._db:
             sequence = int(self._db.execute("SELECT next_event_sequence FROM state WHERE id = 1").fetchone()[0])
             event_id = str(uuid.uuid4())
@@ -640,6 +644,19 @@ class AttachSpool:
             "eventAckCursor": int(event_cursor),
             "commandInboxDepth": int(command_inbox_depth),
         }
+
+    def terminal_event_id(self, turn_id: str) -> Optional[str]:
+        """Return a turn's durable terminal event id, without reading any event payload.
+
+        This is deliberately a primary-key lookup rather than an outbox search: heartbeat health
+        must remain cheap even when the durable event history is large.
+        """
+        if not isinstance(turn_id, str) or not turn_id:
+            return None
+        row = self._db.execute(
+            "SELECT event_id FROM turn_terminals WHERE turn_id = ?", (turn_id,)
+        ).fetchone()
+        return str(row[0]) if row is not None else None
 
     def record_delivery_receipt(
         self,

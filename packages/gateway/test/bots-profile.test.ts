@@ -346,6 +346,11 @@ describe("GET /bots/:name/profile", () => {
     expect(body["model"]).toEqual({ provider: "nous", default: "hermes-4" });
     expect(body["toolsetsPinned"]).toBe(true);
     expect(server.callsOf("profiles.describe")[0]?.params).toEqual({ name: "scout" });
+    // The existence guard only needs names, so it must not pay the profiles.list state.db
+    // enrichment used by the roster reader.
+    expect(server.callsOf("profiles.list").some((call) =>
+      JSON.stringify(call.params) === JSON.stringify({ include_sessions: false }),
+    )).toBe(true);
     // Scoped to the bot: an unscoped catalog would report the launch profile's install state.
     expect(server.callsOf("mcp.catalog")[0]?.params).toEqual({ profile: "scout" });
   });

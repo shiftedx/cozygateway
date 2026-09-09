@@ -360,6 +360,22 @@ describe("attach-v1 durable transport storage", () => {
     storage.close();
   });
 
+  it("returns only applied exact-turn event evidence for a sealed interim commit", () => {
+    const storage = openStorage(":memory:");
+    const interim = {
+      kind: "event" as const, sequence: 1, eventId: "interim-event",
+      event: { kind: "commit" as const, threadId: "session", turnId: "turn-1", messageId: "message", continues: true, blocks: [] },
+    };
+    expect(storage.acceptAttachEvent("sage", interim, 1)).toEqual({ status: "accepted", acknowledgedSequence: 1 });
+    expect(storage.attachTurnSealEvidence("sage", "turn-1", "interim-event")).toBeUndefined();
+    storage.markAttachEventApplied("sage", "interim-event", 2);
+    expect(storage.attachTurnSealEvidence("sage", "turn-1", "interim-event"))
+      .toEqual({ kind: "commit", continues: true, disposition: "accepted" });
+    expect(storage.attachTurnSealEvidence("sage", "another-turn", "interim-event")).toBeUndefined();
+    expect(storage.attachTurnSealEvidence("other-peer", "turn-1", "interim-event")).toBeUndefined();
+    storage.close();
+  });
+
   it("quarantines an explicit scheduled target that is no longer selected and advances the spool", () => {
     const storage = openStorage(":memory:");
     const historicalSessionId = storage.nativeBotChat("sage", 1).sessionId;

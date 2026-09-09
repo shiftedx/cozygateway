@@ -75,6 +75,10 @@ export interface ReconnectPolicy {
 export const DEFAULT_RECONNECT_POLICY: ReconnectPolicy = { minMs: 500, maxMs: 15_000 };
 export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+/** An application-level liveness check. TCP can stay established while a reverse proxy or a
+ * server worker path stops delivering JSON-RPC replies, so socket state alone is insufficient. */
+export const DEFAULT_APP_HEARTBEAT_INTERVAL_MS = 15_000;
+export const DEFAULT_APP_HEARTBEAT_TIMEOUT_MS = 5_000;
 
 /** Close codes the Hermes gateway uses for a refused connection. Both are terminal for this
  *  client: the credential or the origin will not become valid by retrying. */
@@ -183,6 +187,10 @@ export interface HermesClientOptions {
   /** Bounds a single `request()`. On expiry the promise rejects and the id is dropped; a late
    *  response for it is then ignored. Default 30000. */
   requestTimeoutMs?: number;
+  /** Bounded `gateway.ping` cadence for a connection already promoted to online. The defaults
+   * are intentionally low-cost (15s interval, 5s reply bound); the knobs are test seams. */
+  appHeartbeatIntervalMs?: number;
+  appHeartbeatTimeoutMs?: number;
   /** When false, the socket counts as online the moment it opens instead of waiting for the
    *  `gateway.ready` event. Escape hatch for a Hermes build that does not send it. Default true. */
   requireReadyEvent?: boolean;
@@ -275,6 +283,8 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   const reconnectPolicy = opts.reconnect ?? DEFAULT_RECONNECT_POLICY;
   const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
   const requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const appHeartbeatIntervalMs = opts.appHeartbeatIntervalMs ?? DEFAULT_APP_HEARTBEAT_INTERVAL_MS;
+  const appHeartbeatTimeoutMs = opts.appHeartbeatTimeoutMs ?? DEFAULT_APP_HEARTBEAT_TIMEOUT_MS;
   const requireReadyEvent = opts.requireReadyEvent ?? true;
   const authHttpTimeoutMs = opts.authHttpTimeoutMs ?? DEFAULT_AUTH_HTTP_TIMEOUT_MS;
   const auth = opts.auth;
@@ -309,6 +319,11 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   let generation = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let handshakeTimer: ReturnType<typeof setTimeout> | undefined;
+  let appHeartbeatTimer: ReturnType<typeof setTimeout> | undefined;
+  let appHeartbeatInFlightGeneration: number | undefined;
+  /** An older Hermes may not implement `gateway.ping`. Its normal unknown-method reply proves
+   * the link is alive, so disable this OPTIONAL probe for only that socket generation. */
+  let appHeartbeatDisabledGeneration: number | undefined;
 
   interface Pending {
     resolve: (value: unknown) => void;
@@ -353,6 +368,69 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     reconnectTimer = undefined;
   }
 
+  function clearAppHeartbeat(): void {
+    if (appHeartbeatTimer !== undefined) clearTimeout(appHeartbeatTimer);
+    appHeartbeatTimer = undefined;
+    appHeartbeatInFlightGeneration = undefined;
+    appHeartbeatDisabledGeneration = undefined;
+  }
+
+  function currentSocket(socket: WebSocket, socketGeneration: number): boolean {
+    return ws === socket && generation === socketGeneration && !closed && !refused;
+  }
+
+  /** Schedule one probe at a time. Its captured socket and generation make an old callback a
+   * no-op after reconnect; it can never terminate a fresh connection. */
+  function scheduleAppHeartbeat(socket: WebSocket, socketGeneration: number): void {
+    if (
+      !currentSocket(socket, socketGeneration)
+      || state !== "online"
+      || appHeartbeatDisabledGeneration === socketGeneration
+      || appHeartbeatInFlightGeneration === socketGeneration
+    ) return;
+    if (appHeartbeatTimer !== undefined) clearTimeout(appHeartbeatTimer);
+    appHeartbeatTimer = setTimeout(() => {
+      appHeartbeatTimer = undefined;
+      if (
+        !currentSocket(socket, socketGeneration)
+        || state !== "online"
+        || appHeartbeatDisabledGeneration === socketGeneration
+        || appHeartbeatInFlightGeneration === socketGeneration
+      ) return;
+      appHeartbeatInFlightGeneration = socketGeneration;
+      void request("gateway.ping", {}, { timeoutMs: appHeartbeatTimeoutMs }).then(
+        () => {
+          if (appHeartbeatInFlightGeneration === socketGeneration)
+            appHeartbeatInFlightGeneration = undefined;
+          if (currentSocket(socket, socketGeneration))
+            scheduleAppHeartbeat(socket, socketGeneration);
+        },
+        (error: unknown) => {
+          if (appHeartbeatInFlightGeneration === socketGeneration)
+            appHeartbeatInFlightGeneration = undefined;
+          if (!currentSocket(socket, socketGeneration)) return;
+          if (error instanceof HermesRpcError) {
+            if (/unknown method/i.test(error.message)) {
+              appHeartbeatDisabledGeneration = socketGeneration;
+              log("gateway does not support gateway.ping; application heartbeat disabled for this connection");
+              return;
+            }
+            // Any correlated JSON-RPC error is still a prompt response from this exact socket.
+            // Keep probing: only a missing reply is liveness evidence strong enough to reconnect.
+            scheduleAppHeartbeat(socket, socketGeneration);
+            return;
+          }
+          // A normal RPC timeout does NOT reset the link: it may name a legitimate slow operation.
+          // This dedicated, cheap liveness probe has no such ambiguity, so a missed reply makes
+          // the socket suspect and lets the ordinary reconnect path replace it.
+          log("application heartbeat did not receive a reply; reconnecting");
+          socket.terminate();
+        },
+      );
+    }, appHeartbeatIntervalMs);
+    appHeartbeatTimer.unref();
+  }
+
   function armHandshakeTimer(): void {
     clearHandshakeTimer();
     handshakeTimer = setTimeout(() => {
@@ -363,7 +441,8 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     handshakeTimer.unref();
   }
 
-  function handleMessage(data: unknown): void {
+  function handleMessage(data: unknown, socket: WebSocket, socketGeneration: number): void {
+    if (!currentSocket(socket, socketGeneration)) return;
     let parsed: unknown;
     try {
       parsed = JSON.parse(String(data));
@@ -393,6 +472,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
       reconnectAttempt = 0;
       ticketRetries = 0;
       setState("online");
+      scheduleAppHeartbeat(socket, socketGeneration);
     }
     for (const [i, handler] of eventHandlers.entries()) {
       try {
@@ -421,8 +501,10 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     reconnectTimer.unref();
   }
 
-  function handleClosed(code: number): void {
+  function handleClosed(socket: WebSocket, socketGeneration: number, code: number): void {
+    if (ws !== socket || generation !== socketGeneration) return;
     clearHandshakeTimer();
+    clearAppHeartbeat();
     ws = undefined;
     failAllPending(new HermesUnavailable("hermes bridge disconnected before a response arrived"));
     if (closed) return;
@@ -643,6 +725,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   function connect(): void {
     if (closed || refused) return;
     generation += 1;
+    clearAppHeartbeat();
     const attemptGeneration = generation;
     void (async () => {
       let credential: { param: string; value: string };
@@ -676,18 +759,40 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
 
   function dial(param: string, value: string): void {
     const socket = new WebSocket(connectUrl(opts.url, param, value));
+    const socketGeneration = generation;
     ws = socket;
     armHandshakeTimer();
     socket.on("open", () => {
+      if (!currentSocket(socket, socketGeneration)) return;
       if (requireReadyEvent) return;
       clearHandshakeTimer();
       reconnectAttempt = 0;
       ticketRetries = 0;
       setState("online");
+      scheduleAppHeartbeat(socket, socketGeneration);
     });
-    socket.on("message", (data) => handleMessage(data));
-    socket.on("close", (code: number) => handleClosed(code));
+    socket.on("message", (data) => handleMessage(data, socket, socketGeneration));
+    socket.on("close", (code: number) => handleClosed(socket, socketGeneration, code));
     socket.on("error", (err: Error) => log(`socket error: ${err.message}`));
+  }
+
+  function request(method: string, params: unknown = {}, requestOpts: { timeoutMs?: number } = {}): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      const socket = ws;
+      if (state !== "online" || socket === undefined || socket.readyState !== WebSocket.OPEN) {
+        reject(new HermesUnavailable(`cannot send "${method}": hermes bridge is ${state}, not online`));
+        return;
+      }
+      const bound = requestOpts.timeoutMs ?? requestTimeoutMs;
+      const id = String(nextRequestId++);
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new HermesTimeout(method, bound));
+      }, bound);
+      timer.unref();
+      pending.set(id, { resolve, reject, timer });
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+    });
   }
 
   return {
@@ -695,24 +800,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
 
     liveness: (): HermesLiveness => ({ state, since: stateSince, reconnectAttempt }),
 
-    request(method: string, params: unknown = {}, opts: { timeoutMs?: number } = {}): Promise<unknown> {
-      return new Promise((resolve, reject) => {
-        const socket = ws;
-        if (state !== "online" || socket === undefined || socket.readyState !== WebSocket.OPEN) {
-          reject(new HermesUnavailable(`cannot send "${method}": hermes bridge is ${state}, not online`));
-          return;
-        }
-        const bound = opts.timeoutMs ?? requestTimeoutMs;
-        const id = String(nextRequestId++);
-        const timer = setTimeout(() => {
-          pending.delete(id);
-          reject(new HermesTimeout(method, bound));
-        }, bound);
-        timer.unref();
-        pending.set(id, { resolve, reject, timer });
-        socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-      });
-    },
+    request,
 
     dashboardJson,
     dashboardResponse,
@@ -738,6 +826,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
       closed = true;
       clearReconnectTimer();
       clearHandshakeTimer();
+      clearAppHeartbeat();
       failAllPending(new HermesUnavailable("hermes bridge is closing"));
       const socket = ws;
       if (

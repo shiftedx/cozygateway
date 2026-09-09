@@ -7,7 +7,7 @@ import { check, BOTS_CAPABILITY_ID, BOTS_CAPABILITY_VERSION, type MobileNodeGate
 
 import { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import { AttachV1HelloAckSchema } from "../src/adapters/attach/protocol-v1.ts";
-import type { AttachV1EventFrame, AttachV1MemoryResult, AttachV1MobileRequest, AttachV1ServerFrame } from "../src/adapters/attach/protocol-v1.ts";
+import type { AttachV1EventFrame, AttachV1MemoryResult, AttachV1MobileRequest, AttachV1ServerFrame, AttachV1TurnHealth } from "../src/adapters/attach/protocol-v1.ts";
 import { openStorage, type Storage } from "../src/storage.ts";
 
 const helloAckBase = {
@@ -70,6 +70,8 @@ describe("attach-v1 ingress", () => {
   let memoryResults: AttachV1MemoryResult[];
   let logs: string[];
   let snapshotFrames: unknown[];
+  let turnHealthCalls: Array<readonly AttachV1TurnHealth[] | undefined>;
+  let confirmedTurnHealthFaults: readonly string[];
 
   function makeIngress(maxPendingConnections?: number): AttachV1Ingress {
     return new AttachV1Ingress({
@@ -86,6 +88,10 @@ describe("attach-v1 ingress", () => {
         onMobileRequest: (_agent, frame) => mobileRequests.push(frame),
         onMobileCancel: (_agent, frame) => mobileCancels.push(frame.requestId),
         onMemoryResult: (_agent, frame) => memoryResults.push(frame),
+        onTurnHealth: (_agent, reports) => {
+          turnHealthCalls.push(reports);
+          return confirmedTurnHealthFaults;
+        },
       },
       now: () => clock,
       heartbeatIntervalMs: 1000, heartbeatTimeoutMs: 5000,
@@ -110,6 +116,8 @@ describe("attach-v1 ingress", () => {
     memoryResults = [];
     logs = [];
     snapshotFrames = [];
+    turnHealthCalls = [];
+    confirmedTurnHealthFaults = [];
     ingress = makeIngress();
     server = createServer();
     server.on("upgrade", (req, socket, head) => ingress.handleUpgrade(req, socket, head));
@@ -648,6 +656,46 @@ describe("attach-v1 ingress", () => {
     ws.send(JSON.stringify({ kind: "heartbeat", sentAt: 42 }));
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(frames.filter((frame) => frame.kind === "heartbeat")).toEqual([]);
+    ws.close();
+  });
+
+  it("calls turn-health on each authenticated heartbeat but keeps malformed optional health from dropping a peer", async () => {
+    const { ws } = await dial();
+    ws.send(JSON.stringify({ kind: "heartbeat", sentAt: 42 }));
+    await until(() => turnHealthCalls.length === 1);
+    expect(turnHealthCalls).toEqual([undefined]);
+
+    // Duplicate turns and a bad closed-union member invalidate the whole optional declaration.
+    // The callback gets unknown, never a truncated prefix that could imply a missing turn is idle.
+    ws.send(JSON.stringify({ kind: "heartbeat", sentAt: 43, turnHealth: [
+      { turnId: "turn-1", execution: "active", delivery: "open", rejectedEvents: 0 },
+      { turnId: "turn-1", execution: "unknown", delivery: "sealed", rejectedEvents: 0 },
+    ] }));
+    await until(() => turnHealthCalls.length === 2);
+    expect(turnHealthCalls[1]).toBeUndefined();
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  });
+
+  it("reports confirmed delivery faults separately from transport health and clears them only on callback state", async () => {
+    const { ws } = await dial();
+    confirmedTurnHealthFaults = ["turn-1", "turn-1"];
+    ws.send(JSON.stringify({ kind: "heartbeat", sentAt: 42, turnHealth: [
+      { turnId: "turn-1", execution: "active", delivery: "sealed", terminalEventId: "event-1", rejectedEvents: 2 },
+    ] }));
+    await until(() => ingress.health().deliveryDegraded === 1);
+    expect(ingress.health()).toMatchObject({ online: 1, degraded: 0, deliveryDegraded: 1 });
+    expect(logs.filter((line) => line.includes("confirmed 1 new turn-delivery fault"))).toHaveLength(1);
+
+    ws.send(JSON.stringify({ kind: "heartbeat", sentAt: 43 }));
+    await until(() => turnHealthCalls.length === 2);
+    expect(logs.filter((line) => line.includes("confirmed 1 new turn-delivery fault"))).toHaveLength(1);
+    expect(ingress.health().deliveryDegraded).toBe(1);
+
+    confirmedTurnHealthFaults = [];
+    ws.send(JSON.stringify({ kind: "heartbeat", sentAt: 44 }));
+    await until(() => ingress.health().deliveryDegraded === undefined);
+    expect(ingress.health()).toMatchObject({ online: 1, degraded: 0 });
     ws.close();
   });
 

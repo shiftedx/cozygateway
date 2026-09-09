@@ -523,6 +523,31 @@ export function sanitizeActiveTurns(value: unknown): string[] | undefined {
   return [...ids];
 }
 
+/** Capability 78. A peer's bounded, best-effort report of the one part of an active turn that
+ * the gateway cannot observe: whether its locally-spooled interim commit is still deliverable.
+ * This stays outside the strict heartbeat schema so a malformed optional report cannot tear down
+ * an otherwise healthy attach socket. */
+export const AttachV1TurnHealthSchema = Type.Object({
+  turnId: Id,
+  execution: Type.Union([Type.Literal("active"), Type.Literal("unknown")]),
+  delivery: Type.Union([Type.Literal("open"), Type.Literal("sealed")]),
+  terminalEventId: Type.Optional(Id),
+  rejectedEvents: Type.Integer({ minimum: 0, maximum: 1_000_000 }),
+}, { additionalProperties: false });
+export type AttachV1TurnHealth = Static<typeof AttachV1TurnHealthSchema>;
+
+/** The sole authority on optional heartbeat turn health. A bad entry invalidates the WHOLE
+ * declaration: retaining a prefix would falsely imply every omitted turn is healthy. */
+export function sanitizeTurnHealth(value: unknown): AttachV1TurnHealth[] | undefined {
+  if (!Array.isArray(value) || value.length > 256) return undefined;
+  const turnIds = new Set<string>();
+  for (const report of value) {
+    if (!check(AttachV1TurnHealthSchema, report) || turnIds.has(report.turnId)) return undefined;
+    turnIds.add(report.turnId);
+  }
+  return value as AttachV1TurnHealth[];
+}
+
 /** Capability 56. Matches the C0 and C1 control character ranges (built from character codes
  *  rather than a literal escape, so no NUL or other control byte ever sits in this source file),
  *  plus every Unicode "Format" (Cf) code point: zero-width space and joiners, the bidi override
@@ -828,6 +853,9 @@ export type AttachV1Ack = Static<typeof AttachV1AckSchema>;
 export const AttachV1HeartbeatSchema = Type.Object({
   kind: Type.Literal("heartbeat"), sentAt: Type.Integer({ minimum: 0 }),
   telemetry: Type.Optional(AttachV1TelemetrySchema),
+  /** Capability 78. Untyped here by design: optional malformed health must not make a healthy
+   * peer reconnect-loop. `sanitizeTurnHealth` reads it as one all-or-nothing declaration. */
+  turnHealth: Type.Optional(Type.Unknown()),
 }, { additionalProperties: false });
 export const AttachV1GapSchema = Type.Object({
   kind: Type.Literal("gap"), channel: Type.Union([Type.Literal("event"), Type.Literal("command")]),

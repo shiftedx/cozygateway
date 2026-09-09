@@ -22,6 +22,7 @@ import {
   AttachV1HelloSchema,
   AttachV1ObservationSnapshotSchema,
   sanitizeActiveTurns,
+  sanitizeTurnHealth,
   AttachV1ConfigResultSchema,
   AttachV1HistoryResultSchema,
   AttachV1MemoryResultSchema,
@@ -47,6 +48,7 @@ import {
   type AttachV1ServerFrame,
   type AttachV1SlashCommand,
   type AttachV1Telemetry,
+  type AttachV1TurnHealth,
   type AttachV1TurnContext,
 } from "./protocol-v1.ts";
 import { resolveAttachBearer } from "./token-auth.ts";
@@ -86,6 +88,10 @@ export interface AttachV1Events {
   /** Capability 69. `activeTurns` is what the peer declared it still carries at hello: an empty
    * array is the declaration "none", and `undefined` is a peer that cannot declare. */
   onHello?(agentId: string, activeTurns?: readonly string[]): void;
+  /** Capability 78. Called on every authenticated heartbeat, including an absent or unusable
+   * optional health declaration, so the native owner can apply its soft timeout independently of
+   * peer reporting. Returned ids are confirmed delivery faults for this callback's state. */
+  onTurnHealth?(agentId: string, reports: readonly AttachV1TurnHealth[] | undefined): readonly string[];
   onTaskTurnQueued?(agentId: string, command: Extract<AttachV1Command, { kind: "turn" }>): void;
   /** Dashboard packet D2. The turn command frame HAS BEEN WRITTEN TO THE PEER'S SOCKET, which is the
    * moment section 10 calls dispatch and the zero of `ttft_ms` and `turn_ms`. Distinct from
@@ -127,6 +133,8 @@ interface Connection {
   commandCursor: number;
   lastSeenAt: number;
   heartbeatDegraded: boolean;
+  /** Confirmed delivery faults from the last turn-health callback. Separate from transport state. */
+  deliveryFaults: Set<string>;
   degraded: boolean;
   telemetry?: { eventOutboxDepth: number; lastAckProgressAt: number };
   maxInFlightEvents: number;
@@ -233,6 +241,7 @@ export class AttachV1Ingress implements TurnEndpoint {
     const connection: Connection = {
       socket, hello: false, commandCursor: 0, lastSeenAt: this.#now(), degraded: false,
       heartbeatDegraded: false,
+      deliveryFaults: new Set(),
       maxInFlightEvents: ATTACH_V1_MAX_IN_FLIGHT_EVENTS,
       maxInFlightBytes: ATTACH_V1_MAX_IN_FLIGHT_BYTES,
       sendCursor: 0,
@@ -368,6 +377,20 @@ export class AttachV1Ingress implements TurnEndpoint {
         this.#observe?.peerHeartbeatAcked(agentId);
         if (frame.telemetry !== undefined)
           connection.telemetry = this.#recordTelemetry(agentId, frame.telemetry, receivedAt);
+        const reports = sanitizeTurnHealth(frame.turnHealth);
+        if (frame.turnHealth !== undefined && reports === undefined)
+          this.#log(`attach-v1: profile "${agentId}" sent unusable turn health; treating it as unknown`);
+        const confirmedFaults = new Set(this.#events.onTurnHealth?.(agentId, reports) ?? []);
+        let newFaults = 0;
+        for (const turnId of confirmedFaults) {
+          if (!connection.deliveryFaults.has(turnId)) newFaults += 1;
+        }
+        // The callback is authoritative for this heartbeat only. A later clean callback clears
+        // the marker; socket traffic itself never does, because transport recovery is not proof
+        // that the prior interim delivery was restored.
+        connection.deliveryFaults = confirmedFaults;
+        if (newFaults > 0)
+          this.#log(`attach-v1: profile "${agentId}" confirmed ${newFaults} new turn-delivery fault${newFaults === 1 ? "" : "s"}`);
         this.#refreshDegraded(agentId, connection);
         return;
       }
@@ -580,10 +603,12 @@ export class AttachV1Ingress implements TurnEndpoint {
   connectionHealth(agentIds: ReadonlySet<string> = new Set(this.#tokens.values())) {
     let online = 0;
     let degraded = 0;
+    let deliveryDegraded = 0;
     const now = this.#now();
     for (const [agentId, connection] of this.#current) {
       if (!agentIds.has(agentId)) continue;
       if (!connection.hello || connection.socket.readyState !== WebSocket.OPEN) continue;
+      if (connection.deliveryFaults.size > 0) deliveryDegraded += 1;
       if (connection.degraded || this.#pluginBacklogStalled(connection, now)) degraded += 1;
       else online += 1;
     }
@@ -592,6 +617,7 @@ export class AttachV1Ingress implements TurnEndpoint {
       online,
       degraded,
       absent: Math.max(0, agentIds.size - online - degraded),
+      ...(deliveryDegraded === 0 ? {} : { deliveryDegraded }),
     };
   }
   peerHealth(agentId: string) {
