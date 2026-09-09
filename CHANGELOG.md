@@ -5,6 +5,20 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## 0.8.1 (2026-09-08): subagent model settings and guided Windows setup
+
+CozyChat can now configure a separate subagent model during bot onboarding and in a bot’s
+model settings. Hermes saves the selection in its native delegation configuration and applies
+it to the next delegated task. For CozyAgents, Gateway forwards the selection to a compatible runner;
+update CozyAgents as well to enable this control. Older runners keep their existing behavior
+and do not advertise a writable subagent setting. See [#433](https://github.com/shiftedx/cozygateway/pull/433).
+
+Windows setup now detects configured providers and local models, presents numbered model
+choices, and retains saved provider settings across repair. See [#432](https://github.com/shiftedx/cozygateway/pull/432).
+
+Update Gateway with the published installer or the existing repair/update command, and install
+the latest CozyChat to use the new controls. Existing primary model selections are retained.
+
 ## 0.8.0 (2026-09-08): CozyChat Observe and reliable Windows setup
 
 Observe now matches CozyChat’s graphite/rust colors and system typography, with clearer
