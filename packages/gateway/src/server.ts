@@ -863,6 +863,7 @@ export async function startGateway(
         mobileNode?.disconnectAgent(agentId);
         nativeBotPlane?.handleAttachHello(agentId, activeTurns);
       },
+      onTurnHealth: (agentId, reports) => nativeBotPlane?.handleAttachTurnHealth(agentId, reports) ?? [],
       onTaskTurnQueued: (agentId, command) => nativeBotPlane?.taskTurnQueued(agentId, command),
       // Dashboard packet D2. The turn command is on the wire, which is the zero of the model-side
       // timings; the gateway's own queueing before it is already its own measured series.

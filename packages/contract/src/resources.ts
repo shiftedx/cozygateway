@@ -144,6 +144,9 @@ export const AttachHealthSummarySchema = Type.Object({
   pluginOldestEventAgeMs: Type.Optional(Type.Integer({ minimum: 0 })),
   pluginLastAckProgressAt: Type.Optional(Type.Union([Type.Integer({ minimum: 0 }), Type.Null()])),
   pluginCommandInboxDepth: Type.Optional(Type.Integer({ minimum: 0 })),
+  /** Capability 78. Connected peers with confirmed degraded interim-turn delivery, separate from
+   * ordinary socket/outbox transport liveness. Absent on gateways that do not implement it. */
+  deliveryDegraded: Type.Optional(Type.Integer({ minimum: 0 })),
 });
 export type AttachHealthSummary = Static<typeof AttachHealthSummarySchema>;
 

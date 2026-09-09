@@ -3590,6 +3590,30 @@ export class Storage {
     return undefined;
   }
 
+  /** Applied evidence for a reported sealed interim commit. The `(agent_id, event_id)` lookup is
+   * exact and indexed; matching the embedded turn id prevents a peer from using another turn's
+   * event as terminal proof. Health reports alone never mutate terminal state. */
+  attachTurnSealEvidence(agentId: string, turnId: string, eventId: string): {
+    kind: string;
+    continues?: boolean;
+    disposition: string;
+  } | undefined {
+    const row = this.#db.prepare(
+      `SELECT json_extract(frame_json, '$.event.kind') AS kind,
+              json_extract(frame_json, '$.event.continues') AS continues,
+              disposition
+         FROM attach_event_inbox
+        WHERE agent_id = ? AND event_id = ? AND applied_at IS NOT NULL
+          AND json_extract(frame_json, '$.event.turnId') = ?`,
+    ).get(agentId, eventId, turnId) as { kind: string | null; continues: number | null; disposition: string } | undefined;
+    if (row?.kind === null || row === undefined) return undefined;
+    return {
+      kind: row.kind,
+      ...(row.continues === null ? {} : { continues: row.continues === 1 }),
+      disposition: row.disposition,
+    };
+  }
+
   /** Durable delivery evidence for one native turn. ACK proves the plugin accepted the command;
    * absent ACK keeps the user-visible state queued without inventing a timeout. */
   nativeBotTurnDelivery(agentId: string, turnId: string): {

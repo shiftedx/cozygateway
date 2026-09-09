@@ -587,6 +587,9 @@ export const BotChatStateFrameSchema = Type.Object({
   running: Type.Boolean(),
   inflight: Type.Boolean(),
   status: Type.Optional(BotChatStatusSchema),
+  /** Capability 78. A soft delivery watchdog is checking an active turn's interim commit. This
+   * does not alter its execution lifecycle (`phase`, `running`, or `inflight`). */
+  deliveryStatus: Type.Optional(Type.Literal("checking")),
   cause: Type.Optional(BotChatStateCauseSchema),
   /** Gateway-clock time when an offline command entered the durable outbox. The existing gateway
    * turn-timeout bound applies from this instant, then the command is discarded or interrupted. */
@@ -3019,5 +3022,8 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
 /** Capability 76: a reply push optionally carries its Task id and suppresses its same-turn
  * completion banner for ten seconds. */
 /** Capability 77: room pending approvals expose the durable writing turn cause before a reply
- * exists. Delivery approval pushes alone may request the time-sensitive APNs interruption level. */
-export const BOTS_CAPABILITY_VERSION = 77;
+ * exists. Delivery approval pushes alone may request the time-sensitive APNs interruption level.
+ * Capability 78: optional attach heartbeat turn-health reports let the gateway detect an interim
+ * delivery seal while a turn remains active; native chat state may expose `deliveryStatus` as
+ * `checking` without changing its execution lifecycle. */
+export const BOTS_CAPABILITY_VERSION = 78;

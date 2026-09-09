@@ -14,6 +14,7 @@ import re
 import ssl
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, NotRequired, Optional, TypedDict, Union
 from urllib.error import HTTPError
@@ -80,12 +81,22 @@ HELLO_VERSION = 2
 # failed.reason "unknown_turn"). A gateway below it must see exactly its pre-69 frames.
 BOTS_EXTENSION = "com.cozylabs.bots"
 STALE_TURN_RECONCILIATION_VERSION = 69
+# Capability 78: heartbeat-level turn delivery diagnostics.  This is sent only after a
+# hello_ack advertises the extension, because heartbeat is a strict control-frame contract.
+TURN_HEALTH_VERSION = 78
 # Capability 66: the gateway version at which a scoped-approval block is admitted at all.
 SCOPED_APPROVALS_VERSION = 66
 # Closed set of refusal reasons this peer may put on a failed frame.
 FAILED_REASONS = frozenset({"unknown_turn"})
 # The contract's cap on the ids one hello may declare.
 ACTIVE_TURNS_MAX = 256
+TURN_ID_MAX_CHARS = 256
+# Do not let a pathological callback make a control-frame snapshot walk an unbounded list just
+# to fill its 256-row wire contract.  Four candidates per row preserves useful de-duplication
+# without turning every heartbeat into a transcript-sized scan.
+TURN_HEALTH_SOURCE_MAX = ACTIVE_TURNS_MAX * 4
+TERMINAL_REJECTION_MAX = 1_000_000
+TERMINAL_REJECTION_LOGS_MAX = 8
 HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
     "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "delivery_receipts",
@@ -192,6 +203,11 @@ class AttachV1Client:
         self._sent_event_bytes = 0
         self._latest_blocks: Dict[str, List[Dict[str, Any]]] = {}
         self._latest_tools: Dict[str, Dict[str, tuple[str, str, Optional[str]]]] = {}
+        # This process-only, bounded memory covers the failure that matters operationally: a
+        # later event was rejected because a previous event sealed the durable turn.  The spool
+        # remains authoritative for the terminal event id and is never modified by this report.
+        self._terminal_rejections: OrderedDict[str, int] = OrderedDict()
+        self._terminal_rejection_log_count = 0
         # One re-dial per connect, so a stalled handshake gets a second chance without spinning.
         self._hello_retried = False
         # Mobile requests are intentionally outside the durable spool: a phone action
@@ -281,6 +297,93 @@ class AttachV1Client:
         if not isinstance(turns, (list, tuple)):
             return None
         return [str(turn) for turn in turns if isinstance(turn, str) and turn][:ACTIVE_TURNS_MAX]
+
+    @staticmethod
+    def _bounded_turn_ids(turns: List[str] | tuple[str, ...]) -> List[str]:
+        """Return at most the wire-contract's unique ids without scanning an arbitrary report."""
+        result: List[str] = []
+        seen: set[str] = set()
+        for turn in turns[:TURN_HEALTH_SOURCE_MAX]:
+            if not isinstance(turn, str) or not turn or len(turn) > TURN_ID_MAX_CHARS or turn in seen:
+                continue
+            seen.add(turn)
+            result.append(turn)
+            if len(result) == ACTIVE_TURNS_MAX:
+                break
+        return result
+
+    def _turn_health_active_turns(self) -> Optional[List[str]]:
+        """Read a bounded active-turn report without changing hello's established declaration."""
+        provider = self._config.active_turns
+        if provider is None:
+            return None
+        try:
+            turns = provider()
+        except Exception:  # noqa: BLE001 - a heartbeat must not fail on a declaration
+            logger.debug("attach-v1: could not read active turns for health", exc_info=True)
+            return None
+        if not isinstance(turns, (list, tuple)):
+            return None
+        return self._bounded_turn_ids(turns)
+
+    def _remember_terminal_rejection(self, event: Dict[str, Any]) -> None:
+        """Remember one rejected post-terminal event using only its safe turn id and a counter."""
+        turn_id = event.get("turnId")
+        if not isinstance(turn_id, str) or not turn_id or len(turn_id) > TURN_ID_MAX_CHARS:
+            return
+        prior = self._terminal_rejections.get(turn_id, 0)
+        if turn_id in self._terminal_rejections:
+            self._terminal_rejections.move_to_end(turn_id)
+        elif len(self._terminal_rejections) >= ACTIVE_TURNS_MAX:
+            self._terminal_rejections.popitem(last=False)
+        self._terminal_rejections[turn_id] = min(TERMINAL_REJECTION_MAX, prior + 1)
+        if prior == 0 and self._terminal_rejection_log_count < TERMINAL_REJECTION_LOGS_MAX:
+            self._terminal_rejection_log_count += 1
+            logger.warning("attach-v1: rejected post-terminal event for turn %s", turn_id)
+        elif prior == 0 and self._terminal_rejection_log_count == TERMINAL_REJECTION_LOGS_MAX:
+            self._terminal_rejection_log_count += 1
+            logger.warning("attach-v1: further post-terminal event rejections are reported in turn health")
+
+    def _turn_health_snapshot(self) -> Optional[List[Dict[str, Any]]]:
+        """Build the bounded heartbeat-only view of active and delivery-sealed turns.
+
+        A missing or malformed active-turn callback is intentionally not translated into an empty
+        report: there is no safe inference that the process is idle.  Remembered rejections still
+        report with execution ``unknown`` so a sealed delivery remains diagnosable.
+        """
+        active_turns = self._turn_health_active_turns()
+        if active_turns is None and not self._terminal_rejections:
+            return None
+
+        rows: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for turn_id in active_turns or []:
+            seen.add(turn_id)
+            terminal_event_id = self._spool.terminal_event_id(turn_id)
+            row: Dict[str, Any] = {
+                "turnId": turn_id,
+                "execution": "active",
+                "delivery": "sealed" if terminal_event_id is not None else "open",
+                "rejectedEvents": self._terminal_rejections.get(turn_id, 0),
+            }
+            if terminal_event_id is not None:
+                row["terminalEventId"] = terminal_event_id
+            rows.append(row)
+
+        for turn_id, rejected_events in self._terminal_rejections.items():
+            if turn_id in seen or len(rows) == ACTIVE_TURNS_MAX:
+                continue
+            terminal_event_id = self._spool.terminal_event_id(turn_id)
+            row = {
+                "turnId": turn_id,
+                "execution": "unknown",
+                "delivery": "sealed" if terminal_event_id is not None else "open",
+                "rejectedEvents": rejected_events,
+            }
+            if terminal_event_id is not None:
+                row["terminalEventId"] = terminal_event_id
+            rows.append(row)
+        return rows
 
     def extension_version(self, capability: str) -> int:
         """The version the gateway advertised for one vendor extension, 0 when it advertised none."""
@@ -449,6 +552,7 @@ class AttachV1Client:
         try:
             frame = self._spool.enqueue_event(event)
         except TerminalSealed:
+            self._remember_terminal_rejection(event)
             return None
         await self._drain_events()
         return frame
@@ -787,6 +891,7 @@ class AttachV1Client:
         try:
             frame = self._spool.enqueue_event(event)
         except TerminalSealed:
+            self._remember_terminal_rejection(event)
             return None
         try:
             await self._drain_events()
@@ -1187,10 +1292,15 @@ class AttachV1Client:
             elif status == "gap":
                 await self._send({"kind": "gap", "channel": "command", "requestedAfter": self._spool.command_cursor, "earliestAvailable": self._spool.command_cursor + 1, "latestAvailable": frame["sequence"]})
         elif kind == "heartbeat":
-            await self._send({
+            heartbeat: Dict[str, Any] = {
                 "kind": "heartbeat", "sentAt": frame.get("sentAt", 0),
                 "telemetry": self._spool.health_snapshot(),
-            })
+            }
+            if self.extension_version(BOTS_EXTENSION) >= TURN_HEALTH_VERSION:
+                turn_health = self._turn_health_snapshot()
+                if turn_health is not None:
+                    heartbeat["turnHealth"] = turn_health
+            await self._send(heartbeat)
             await self._drain_events()
         elif kind == "gap" and frame.get("channel") == "event":
             # A gap the spool cannot fill is a durable hole, not a transient one: replaying alone

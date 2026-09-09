@@ -645,6 +645,19 @@ class AttachSpool:
             "commandInboxDepth": int(command_inbox_depth),
         }
 
+    def terminal_event_id(self, turn_id: str) -> Optional[str]:
+        """Return a turn's durable terminal event id, without reading any event payload.
+
+        This is deliberately a primary-key lookup rather than an outbox search: heartbeat health
+        must remain cheap even when the durable event history is large.
+        """
+        if not isinstance(turn_id, str) or not turn_id:
+            return None
+        row = self._db.execute(
+            "SELECT event_id FROM turn_terminals WHERE turn_id = ?", (turn_id,)
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
     def record_delivery_receipt(
         self,
         delivery_id: str,

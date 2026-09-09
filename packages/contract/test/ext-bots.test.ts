@@ -933,7 +933,7 @@ describe("capability advertisement", () => {
     // originals, tombstoned deletion, supersession, and an independent delivery lifecycle.
     // Capability 66 adds the typed scoped-approval block, payload-hash binding, standing once and
     // category grants, the always-require list no grant may cover, and the revocation view.
-    expect(BOTS_CAPABILITY_VERSION).toBe(77);
+    expect(BOTS_CAPABILITY_VERSION).toBe(78);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {
@@ -1179,6 +1179,11 @@ describe("capability advertisement", () => {
       phase: "polling", running: true, inflight: true,
       status: "queued", cause: "attach_absent", queuedAt: 1,
       updatedAt: 2,
+    })).toBe(true);
+    expect(check(BotChatStateFrameSchema, {
+      type: "bot_chat_state", bot: "sage", sessionId: "local-1",
+      phase: "polling", running: true, inflight: true,
+      deliveryStatus: "checking", updatedAt: 2,
     })).toBe(true);
   });
 

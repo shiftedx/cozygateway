@@ -1047,7 +1047,9 @@ export class HermesBridge implements BotControlSurface {
   }
   async #freshProfileNames(): Promise<Set<string>> {
     const { profiles } = parseProfilesList(
-      await this.#client.request("profiles.list", {}),
+      // Membership needs names only. Avoid a state.db walk per profile on hot route checks; the
+      // roster refresh remains the one reader that requests session previews and activity.
+      await this.#client.request("profiles.list", { include_sessions: false }),
     );
     return new Set(profiles.map((profile) => profile.name));
   }

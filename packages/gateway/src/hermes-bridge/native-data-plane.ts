@@ -50,7 +50,7 @@ import type {
 import type { AttachV1Ingress } from "../adapters/attach/ingress-v1.ts";
 import { blocksToText } from "../adapters/attach/blocks-to-text.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
-import { sanitizeApprovalDetail, sanitizeApprovalRepair, sanitizeApprovalScope, type AttachV1EventFrame, type AttachV1MobileRequest } from "../adapters/attach/protocol-v1.ts";
+import { sanitizeApprovalDetail, sanitizeApprovalRepair, sanitizeApprovalScope, type AttachV1EventFrame, type AttachV1MobileRequest, type AttachV1TurnHealth } from "../adapters/attach/protocol-v1.ts";
 import { resolveMobileTargetDevice, type MobileNodeBroker, type MobileNodeReceiptInput } from "../mobile-node.ts";
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import type { Storage } from "../storage.ts";
@@ -330,6 +330,15 @@ function liveTurnFrameKey(frame: LiveTurnFrame): string {
 
 const LIVE_TURN_FLUSH_MS = 100;
 const DESKTOP_RESUME_CONFIRM_MS = 2_000;
+/** Automatic Desktop/TUI/CLI recency is a convenience, never a prerequisite for local chat. */
+const AUTOMATIC_SESSION_RECONCILIATION_MS = 750;
+/** A missing progress frame is worth showing, but never enough to cancel healthy slow work. */
+const DELIVERY_CHECKING_AFTER_MS = 30_000;
+const MAX_TURN_HEALTH_REPORTS = 256;
+
+/** Stable native transcript marker for an attach peer that sealed a still-live reply spool. */
+export const TURN_DELIVERY_FAILED_MARKER = "delivery.failed";
+export const TURN_DELIVERY_FAILED_TEXT = "Reply delivery failed. This request may have performed actions. It was not retried automatically.";
 
 /** Kept structural at this assembly seam so `pnpm --filter cozygateway typecheck` does not depend
  * on a prior contract build. The public wire shape is owned and schema-checked in ext-bots.ts. */
@@ -343,6 +352,24 @@ interface NativeTurnState {
   status: BotChatStatus;
   cause?: BotChatStateCause;
   queuedAt?: number;
+}
+
+/** A deadline token fences automatic remote reads. The remote read has no cancellation API, so
+ * its late result is made inert before it can stage or enqueue a desktop resume. */
+interface AutomaticSessionReconciliation {
+  expired: boolean;
+  /** Set synchronously immediately before the durable resume command is queued. From that point
+   * the normal bounded confirmation owns the operation; releasing chat would race its selection. */
+  resumeQueued: boolean;
+  /** A normal chat can join an explicit resume while its transcript is still reading. Keep the
+   * operation itself, rather than sampling `resumeQueued` at join time, because it may enqueue
+   * before this automatic deadline fires. */
+  joinedResume?: DesktopResumeOperation;
+}
+
+interface DesktopResumeOperation {
+  operation: Promise<BotDesktopHermesResumeResponse>;
+  resumeQueued: boolean;
 }
 
 /** The exact fields `#nativeOverlay` writes onto a roster row. */
@@ -428,8 +455,15 @@ export class NativeBotDataPlane {
   readonly #tracedTurnStates = new Map<string, string>();
   readonly #attachPresence = new Map<string, "online" | "degraded" | "absent">();
   readonly #desktopResumeWaiters = new Map<string, (sessionId: string) => void>();
-  readonly #desktopResumeOperations = new Map<string, Promise<BotDesktopHermesResumeResponse>>();
-  readonly #latestSessionResolutions = new Map<string, Promise<void>>();
+  /** An operation exists before its transcript returns; `resumeQueued` becomes true only at the
+   * exact durable-command boundary. Automatic callers must distinguish those two states. */
+  readonly #desktopResumeOperations = new Map<string, DesktopResumeOperation>();
+  /** One raw automatic lookup per bot. `completion` is bounded for callers, while `work` stays
+   * registered until the uncancellable remote read settles so repeated chat reads cannot pile up
+   * new Hermes RPCs during a timeout. */
+  readonly #latestSessionResolutions = new Map<string, {
+    completion: Promise<void>; work: Promise<void>; automatic: AutomaticSessionReconciliation;
+  }>();
   /** A durable binding proves identity; this process-local proof additionally proves the currently
    * attached plugin switched its private raw-session map during this data-plane lifetime. */
   readonly #liveDesktopResumeProofs = new Map<
@@ -451,6 +485,9 @@ export class NativeBotDataPlane {
   /** Last gateway-observed frame from this turn. Unlike #turnActivity, dispatch and hello never
    *  seed it, so it is valid evidence for the bounded detached-lease extension. */
   readonly #turnLastFrame = new Map<string, number>();
+  /** Soft transport diagnosis. It is deliberately process-local: one later real turn frame clears
+   * it, and a fresh heartbeat recomputes it after reconnect. */
+  readonly #turnDeliveryChecking = new Set<string>();
   /** When an interrupt for this turn was accepted by the plugin. */
   readonly #interruptAcked = new Map<string, number>();
   /** Capability 69. When the gateway last learned that no peer is carrying this turn: the peer
@@ -1216,6 +1253,77 @@ export class NativeBotDataPlane {
     }
   }
 
+  /**
+   * Attach-v1's per-turn health is advisory until it proves a contradiction in durable gateway
+   * state. An old plugin could mark its local spool terminal after an *interim* commit, leaving
+   * an ACKed gateway turn running forever. We only fail that exact shape: this peer owns the
+   * still-active turn, the command was ACKed, and its claimed terminal event is the gateway's
+   * already-applied interim commit. No spool depth, heartbeat, malformed row, or foreign turn is
+   * allowed to end a person's request.
+   */
+  handleAttachTurnHealth(peer: string, reports: readonly AttachV1TurnHealth[] | undefined): readonly string[] {
+    const identity = normalize(peer);
+    const bot = this.#peerBot(peer);
+    if (bot === undefined) return [];
+    const now = this.#now();
+    const reported = new Map<string, AttachV1TurnHealth>();
+    if (Array.isArray(reports) && reports.length <= MAX_TURN_HEALTH_REPORTS) {
+      for (const report of reports) {
+        if (!isAttachTurnHealth(report) || reported.has(report.turnId)) continue;
+        reported.set(report.turnId, report);
+      }
+    }
+    const faults: string[] = [];
+    for (const turn of this.#storage.nativeBotActiveTurns(bot)) {
+      const owner = this.#executionPeer(bot, turn.sessionId);
+      if (owner === undefined || normalize(owner) !== identity) continue;
+      const key = this.#nativeTurnKey(bot, turn.sessionId, turn.turnId);
+      const delivery = this.#storage.nativeBotTurnDelivery(owner, turn.turnId);
+      if (delivery?.acknowledgedAt === null || delivery === undefined) continue;
+
+      const waiting = this.#storage.tasks.waiting(owner, turn.turnId);
+      // The command ACK is the gateway-clock zero when a peer has emitted no turn frame yet.
+      // It is not progress; it merely gives the "no frame for 30s" observation a safe start.
+      const lastFrame = this.#turnLastFrame.get(key) ?? delivery.acknowledgedAt;
+      const suspended = this.#storage.tasks.suspended(owner, turn.turnId, lastFrame, now);
+      if (waiting === undefined && now - lastFrame - suspended >= DELIVERY_CHECKING_AFTER_MS) {
+        if (!this.#turnDeliveryChecking.has(key)) {
+          this.#turnDeliveryChecking.add(key);
+          this.#state(bot, turn.sessionId, "polling", true);
+        }
+      }
+
+      const report = reported.get(turn.turnId);
+      if (report?.execution !== "active" || report.delivery !== "sealed" || report.terminalEventId === undefined) continue;
+      const evidence = this.#storage.attachTurnSealEvidence(owner, turn.turnId, report.terminalEventId);
+      if (evidence?.kind !== "commit" || evidence.continues !== true || evidence.disposition !== "accepted") continue;
+
+      // The row is stable across duplicate heartbeats and process restarts. Append before the
+      // terminal state so the diagnosis survives an interrupted process between the two actions.
+      const notice = this.#storage.appendNativeBotMessage({
+        bot,
+        sessionId: turn.sessionId,
+        messageId: `turn-delivery-failed:${turn.turnId}`,
+        role: "system",
+        authorBot: bot,
+        marker: TURN_DELIVERY_FAILED_MARKER,
+        text: TURN_DELIVERY_FAILED_TEXT,
+        at: now,
+      });
+      this.#broadcast({ type: "bot_chat", bot, sessionId: turn.sessionId, messages: [notice], updatedAt: now });
+      // The peer may still have work attached to the stale local turn. Interrupt it first, but
+      // local failure remains authoritative even if that best-effort wire action cannot be queued.
+      this.#ingress.sendNativeInterrupt(owner, { threadId: turn.sessionId, turnId: turn.turnId });
+      this.#log(`failing turn ${turn.turnId} for ${bot}: peer sealed its applied interim reply`);
+      emitTrace(this.#trace, "native_turn_delivery_fault", {
+        profile: traceId(bot), session: traceId(turn.sessionId), turn: traceId(turn.turnId),
+      });
+      this.#finish(bot, turn.sessionId, turn.turnId, { phase: "failed", status: "failed" });
+      faults.push(turn.turnId);
+    }
+    return faults;
+  }
+
   /** The turns one attach identity can speak for: the sessions it actually runs, and among those
    * only the turns whose command it has already taken off the wire. */
   #reconcilableTurns(bot: string, peer: string): { sessionId: string; turnId: string }[] {
@@ -1413,6 +1521,7 @@ export class NativeBotDataPlane {
     for (const batch of this.#liveTurnBatches.values()) clearTimeout(batch.timer);
     this.#liveTurnBatches.clear();
     this.#desktopResumeOperations.clear();
+    for (const resolution of this.#latestSessionResolutions.values()) resolution.automatic.expired = true;
     this.#latestSessionResolutions.clear();
     this.#liveDesktopResumeProofs.clear();
   }
@@ -1561,6 +1670,7 @@ export class NativeBotDataPlane {
       // a safe staleness signal rather than a race against slow work.
       this.#turnActivity.set(this.#nativeTurnKey(key, sessionId, event.turnId), this.#now());
       this.#turnLastFrame.set(this.#nativeTurnKey(key, sessionId, event.turnId), this.#now());
+      this.#clearDeliveryChecking(key, sessionId, event.turnId);
       // Capability 69. The same proof answers the owner question: a peer that is emitting frames
       // for this turn is carrying it, whatever a hello or a dropped socket suggested. The one
       // exception is the typed unknown-turn failure, which is the peer saying the opposite, so it
@@ -1693,18 +1803,39 @@ export class NativeBotDataPlane {
    * index, then performs the existing exact resume proof only when another session is newer. */
   async #resolveLatestSession(bot: string): Promise<void> {
     const inflight = this.#latestSessionResolutions.get(bot);
-    if (inflight !== undefined) return inflight;
-    const resolution = this.#resolveLatestSessionOnce(bot);
-    this.#latestSessionResolutions.set(bot, resolution);
-    try {
-      await resolution;
-    } finally {
-      if (this.#latestSessionResolutions.get(bot) === resolution)
+    if (inflight !== undefined) return inflight.completion;
+    const automatic: AutomaticSessionReconciliation = { expired: false, resumeQueued: false };
+    const work = this.#resolveLatestSessionOnce(bot, automatic);
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    // Do not race an unfenced reconciliation against a timeout: the index request cannot be
+    // cancelled, so `automatic.expired` travels with its continuation and prevents every later
+    // adoption/resume mutation before this caller is released.
+    const resolution = new Promise<void>((resolve) => {
+      const finish = () => {
+        if (deadline !== undefined) clearTimeout(deadline);
+        resolve();
+      };
+      deadline = setTimeout(() => {
+        // Remote reads are optional and may be abandoned. A resume command already in the durable
+        // outbox is different: wait for its established 2s proof so a normal send cannot land on
+        // the old session just before the confirmed selection.
+        if (automatic.resumeQueued || automatic.joinedResume?.resumeQueued === true) return;
+        automatic.expired = true;
+        finish();
+      }, AUTOMATIC_SESSION_RECONCILIATION_MS);
+      deadline.unref?.();
+      void work.then(finish, finish);
+    });
+    this.#latestSessionResolutions.set(bot, { completion: resolution, work, automatic });
+    const clearRawLookup = () => {
+      if (this.#latestSessionResolutions.get(bot)?.work === work)
         this.#latestSessionResolutions.delete(bot);
-    }
+    };
+    void work.then(clearRawLookup, clearRawLookup);
+    return resolution;
   }
 
-  async #resolveLatestSessionOnce(bot: string): Promise<void> {
+  async #resolveLatestSessionOnce(bot: string, automatic: AutomaticSessionReconciliation): Promise<void> {
     // A runtime bot has no Hermes profile, so the Desktop/TUI/CLI index cannot hold a session for
     // it. Asking anyway would issue a profile RPC on every chat read and send whose failure this
     // method's catch would silently swallow.
@@ -1715,6 +1846,7 @@ export class NativeBotDataPlane {
     if (current.activeTurnId !== undefined) return;
     try {
       const latest = latestDesktopSession(await this.#control.desktopSessions(bot));
+      if (automatic.expired) return;
       if (!this.#native.has(bot) || !this.#storage.nativeBotHasSession(bot, current.sessionId)) return;
       if (latest === undefined) return;
       const binding = this.#storage.nativeDesktopResumeBinding(bot, current.sessionId);
@@ -1724,12 +1856,12 @@ export class NativeBotDataPlane {
             && proof.sessionId === current.sessionId) return;
         // The durable selection is already right, but a restarted plugin needs a fresh private
         // raw-session proof. Confirmation deliberately emits no adoption frame for this no-op.
-        await this.#resumeEligibleDesktopSession(bot, latest.hermesSessionId);
+        await this.#resumeEligibleDesktopSession(bot, latest.hermesSessionId, automatic);
         return;
       }
       const localActivity = this.#storage.nativeBotSessionActivityAt(bot, current.sessionId) ?? 0;
       if (localActivity >= desktopActivityStamp(latest)) return;
-      await this.#resumeEligibleDesktopSession(bot, latest.hermesSessionId);
+      await this.#resumeEligibleDesktopSession(bot, latest.hermesSessionId, automatic);
     } catch {
       // Cross-surface continuity is enhancement-only. An unavailable index, transcript, or attach
       // proof leaves the existing gateway chat readable and sendable rather than failing the chat.
@@ -1754,16 +1886,29 @@ export class NativeBotDataPlane {
   async #resumeEligibleDesktopSession(
     bot: string,
     hermesSessionId: string,
+    automatic?: AutomaticSessionReconciliation,
   ): Promise<BotDesktopHermesResumeResponse> {
     const key = `${bot}\u0000${hermesSessionId}`;
     const inflight = this.#desktopResumeOperations.get(key);
-    if (inflight !== undefined) return inflight;
-    const operation = this.#performDesktopSessionResume(bot, hermesSessionId);
-    this.#desktopResumeOperations.set(key, operation);
+    if (inflight !== undefined) {
+      // A picker action may still be waiting on its remote transcript. Only a command already in
+      // the durable outbox may hold normal chat past 750ms; a pre-queue read remains optional.
+      if (automatic !== undefined) automatic.joinedResume = inflight;
+      return inflight.operation;
+    }
+    const state: { operation?: Promise<BotDesktopHermesResumeResponse>; resumeQueued: boolean } = {
+      resumeQueued: false,
+    };
+    const operation = this.#performDesktopSessionResume(bot, hermesSessionId, automatic, () => {
+      state.resumeQueued = true;
+      if (automatic !== undefined) automatic.resumeQueued = true;
+    });
+    state.operation = operation;
+    this.#desktopResumeOperations.set(key, state as DesktopResumeOperation);
     try {
       return await operation;
     } finally {
-      if (this.#desktopResumeOperations.get(key) === operation)
+      if (this.#desktopResumeOperations.get(key) === state)
         this.#desktopResumeOperations.delete(key);
     }
   }
@@ -1771,14 +1916,25 @@ export class NativeBotDataPlane {
   async #performDesktopSessionResume(
     bot: string,
     hermesSessionId: string,
+    automatic?: AutomaticSessionReconciliation,
+    onResumeQueued?: () => void,
   ): Promise<BotDesktopHermesResumeResponse> {
     const current = this.#storage.nativeBotChat(bot, this.#now());
     if (current.activeTurnId !== undefined)
       throw new BackendUnavailable("cannot resume a desktop session while this bot has a running native turn");
-    const staged = this.#storage.stageNativeDesktopResume(bot, hermesSessionId, this.#now());
-    // Read and sanitize the desktop transcript before the plugin can confirm. The staged local
-    // session is not selected yet, so a failed/slow source read cannot redirect a normal send.
+    // Read before staging. A stalled automatic source read may outlive its caller, but it cannot
+    // leave a late continuation that creates a native session or changes the selected chat.
     const imported = await this.#control.desktopSessionTranscript(bot, hermesSessionId);
+    if (automatic?.expired === true)
+      return { name: bot, source: "hermes_desktop", hermesSessionId, status: "pending" };
+    // Do this before `nativeBotChat`, whose create-if-absent behavior would otherwise resurrect a
+    // profile deleted while the remote transcript was in flight.
+    if (!this.#native.has(bot) || !this.#storage.nativeBotHasSession(bot, current.sessionId))
+      throw new BotSessionNotFound(current.sessionId);
+    const afterImport = this.#storage.nativeBotChat(bot, this.#now());
+    if (afterImport.activeTurnId !== undefined || afterImport.sessionId !== current.sessionId)
+      return { name: bot, source: "hermes_desktop", hermesSessionId, status: "pending" };
+    const staged = this.#storage.stageNativeDesktopResume(bot, hermesSessionId, this.#now());
     if (!this.#native.has(bot) || !this.#storage.nativeBotHasSession(bot, staged.sessionId))
       throw new BotSessionNotFound(staged.sessionId);
     for (const [index, message] of imported.entries()) {
@@ -1796,6 +1952,7 @@ export class NativeBotDataPlane {
     // session map. Every explicit adoption therefore queues a fresh command/proof before this
     // gateway may report it resumed or (re)select the local chat.
     const confirmed = new Promise<string>((resolve) => this.#desktopResumeWaiters.set(staged.resumeId, resolve));
+    onResumeQueued?.();
     if (!this.#ingress.sendNativeDesktopResume(bot, {
       threadId: staged.sessionId,
       hermesSessionId,
@@ -2577,6 +2734,7 @@ export class NativeBotDataPlane {
     this.#tracedTurnStates.delete(this.#nativeTurnKey(bot, sessionId, turnId));
     this.#turnActivity.delete(this.#nativeTurnKey(bot, sessionId, turnId));
     this.#turnLastFrame.delete(this.#nativeTurnKey(bot, sessionId, turnId));
+    this.#turnDeliveryChecking.delete(this.#nativeTurnKey(bot, sessionId, turnId));
     this.#interruptAcked.delete(this.#nativeTurnKey(bot, sessionId, turnId));
     this.#turnOwnerLost.delete(this.#nativeTurnKey(bot, sessionId, turnId));
     this.#turnContexts.delete(this.#nativeTurnKey(bot, sessionId, turnId));
@@ -3510,6 +3668,7 @@ export class NativeBotDataPlane {
     // longer the active turn is bookkeeping this sweep should not carry (or watch) any further.
     for (const map of [this.#turnActivity, this.#turnLastFrame, this.#interruptAcked, this.#turnOwnerLost])
       for (const key of map.keys()) if (!live.has(key)) map.delete(key);
+    for (const key of this.#turnDeliveryChecking) if (!live.has(key)) this.#turnDeliveryChecking.delete(key);
     this.#stopStaleTurnSweepWhenIdle();
   }
 
@@ -4125,6 +4284,9 @@ export class NativeBotDataPlane {
       inflight: running,
       ...(state === undefined ? {} : state),
       ...(waitingOn === undefined ? {} : { waitingOn }),
+      ...(Array.from(this.#turnDeliveryChecking).some((key) => key.startsWith(`${bot}:${sessionId}:`))
+        ? { deliveryStatus: "checking" as const }
+        : {}),
       updatedAt: this.#now(),
     };
   }
@@ -4138,6 +4300,22 @@ export class NativeBotDataPlane {
   ): void {
     this.#broadcast(this.#stateFrame(bot, sessionId, phase, running, terminal));
   }
+
+  #clearDeliveryChecking(bot: string, sessionId: string, turnId: string): void {
+    const key = this.#nativeTurnKey(bot, sessionId, turnId);
+    if (!this.#turnDeliveryChecking.delete(key)) return;
+    this.#state(bot, sessionId, "polling", true);
+  }
+}
+
+function isAttachTurnHealth(value: unknown): value is AttachV1TurnHealth {
+  if (value === null || typeof value !== "object") return false;
+  const report = value as Record<string, unknown>;
+  return typeof report.turnId === "string" && report.turnId.length > 0
+    && (report.execution === "active" || report.execution === "unknown")
+    && (report.delivery === "open" || report.delivery === "sealed")
+    && (report.terminalEventId === undefined || typeof report.terminalEventId === "string")
+    && typeof report.rejectedEvents === "number";
 }
 
 /** Capability 31's only marker value. */

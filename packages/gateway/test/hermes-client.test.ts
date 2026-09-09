@@ -6,6 +6,7 @@ import {
   computeReconnectDelay,
   MAX_TICKET_RETRIES,
   HermesRpcError,
+  HermesTimeout,
   HermesUnavailable,
   type HermesClient,
 } from "../src/hermes-bridge/client.ts";
@@ -467,6 +468,99 @@ describe("reconnect", () => {
     await until(() => c.state() !== "online");
     await until(() => c.state() === "online", 4_000);
     expect(server.totalConnections()).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("application heartbeat", () => {
+  it("keeps a healthy link online while an unrelated profiles request reaches its own timeout", async () => {
+    const server = await fakeServer({
+      methods: {
+        "profiles.list": () => NO_REPLY,
+        "gateway.ping": () => ({ ok: true }),
+      },
+    });
+    const c = client(server.url, {
+      requestTimeoutMs: 35,
+      appHeartbeatIntervalMs: 15,
+      appHeartbeatTimeoutMs: 25,
+    });
+    c.start();
+    await until(() => c.state() === "online");
+    await expect(c.request("profiles.list", {})).rejects.toBeInstanceOf(HermesTimeout);
+    await until(() => server.callsOf("gateway.ping").length >= 1);
+    expect(c.state()).toBe("online");
+    expect(server.totalConnections()).toBe(1);
+  });
+
+  it("terminates and reconnects when its dedicated ping receives no reply", async () => {
+    const server = await fakeServer({ methods: { "gateway.ping": () => NO_REPLY } });
+    const c = client(server.url, { appHeartbeatIntervalMs: 15, appHeartbeatTimeoutMs: 25 });
+    c.start();
+    await until(() => server.totalConnections() >= 2);
+    await until(() => c.state() === "online");
+    expect(server.callsOf("gateway.ping").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("ignores a stale probe after its socket has been replaced", async () => {
+    let pings = 0;
+    const server = await fakeServer({
+      methods: {
+        "gateway.ping": () => (pings++ === 0 ? NO_REPLY : { ok: true }),
+      },
+    });
+    const c = client(server.url, { appHeartbeatIntervalMs: 15, appHeartbeatTimeoutMs: 40 });
+    c.start();
+    await until(() => server.callsOf("gateway.ping").length === 1);
+    server.dropAll();
+    await until(() => server.totalConnections() === 2);
+    await until(() => c.state() === "online");
+    // This extends beyond the old probe's dedicated timeout. It must not terminate connection 2.
+    await new Promise((resolve) => setTimeout(resolve, 65));
+    expect(c.state()).toBe("online");
+    expect(server.totalConnections()).toBe(2);
+  });
+
+  it("cleans the pending probe when the client closes", async () => {
+    const server = await fakeServer({ methods: { "gateway.ping": () => NO_REPLY } });
+    const c = client(server.url, { appHeartbeatIntervalMs: 15, appHeartbeatTimeoutMs: 40 });
+    c.start();
+    await until(() => server.callsOf("gateway.ping").length === 1);
+    await c.close();
+    await new Promise((resolve) => setTimeout(resolve, 65));
+    expect(server.totalConnections()).toBe(1);
+    expect(c.state()).toBe("absent");
+  });
+
+  it("disables the optional probe without reconnecting when an older gateway rejects it", async () => {
+    const server = await fakeServer();
+    const lines: string[] = [];
+    const c = client(server.url, {
+      appHeartbeatIntervalMs: 15,
+      appHeartbeatTimeoutMs: 25,
+      logSink: (line) => lines.push(line),
+    });
+    c.start();
+    await until(() => server.callsOf("gateway.ping").length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 65));
+    expect(c.state()).toBe("online");
+    expect(server.totalConnections()).toBe(1);
+    expect(server.callsOf("gateway.ping")).toHaveLength(1);
+    expect(lines.join("")).toContain("application heartbeat disabled");
+  });
+
+  it("keeps probing on a correlated non-unknown ping error", async () => {
+    const server = await fakeServer({
+      methods: {
+        "gateway.ping": () => {
+          throw { code: -32000, message: "temporary ping error" };
+        },
+      },
+    });
+    const c = client(server.url, { appHeartbeatIntervalMs: 15, appHeartbeatTimeoutMs: 25 });
+    c.start();
+    await until(() => server.callsOf("gateway.ping").length >= 2);
+    expect(c.state()).toBe("online");
+    expect(server.totalConnections()).toBe(1);
   });
 });
 
