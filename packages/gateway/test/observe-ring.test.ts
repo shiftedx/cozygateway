@@ -1,4 +1,5 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { performance } from "node:perf_hooks";
 
 import { openStorage, type Storage } from "../src/storage.ts";
 import {
@@ -507,16 +508,22 @@ describe("the tunnel self probe", () => {
 
   it("records the public minus loopback difference as a tunnel round trip", async () => {
     const observe = ring();
-    await probe(async (url) => {
-      if (url.startsWith("https://")) await new Promise((resolve) => setTimeout(resolve, 25));
-      return new Response("{}", { status: 200 });
-    }, observe).probe();
+    const monotonic = vi.spyOn(performance, "now")
+      .mockReturnValueOnce(100)
+      .mockReturnValueOnce(108)
+      .mockReturnValueOnce(108)
+      .mockReturnValueOnce(133);
+    try {
+      await probe(async () => new Response("{}", { status: 200 }), observe).probe();
 
-    const samples = storage.observe.samples({ series: "tunnel_rtt_ms", from: 0, to: clock + 1 });
-    expect(samples).toHaveLength(1);
-    expect(samples[0]?.value).toBeGreaterThan(10);
-    expect(samples[0]?.bot).toBeNull();
-    expect(eventRows()).toHaveLength(0);
+      const samples = storage.observe.samples({ series: "tunnel_rtt_ms", from: 0, to: clock + 1 });
+      expect(samples).toHaveLength(1);
+      expect(samples[0]?.value).toBe(17);
+      expect(samples[0]?.bot).toBeNull();
+      expect(eventRows()).toHaveLength(0);
+    } finally {
+      monotonic.mockRestore();
+    }
   });
 
   it("drops the sample rather than clamping when the loopback leg was the slower of the two", async () => {
