@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { testHermes } from "./support/test-config.ts";
 import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
@@ -118,6 +118,7 @@ async function setup() {
   });
   return {
     app,
+    bridge,
     dashboardCalls,
     authed: (path: string, init?: RequestInit) =>
       app.request(path, { ...init, headers: { ...(init?.headers ?? {}), authorization: `Bearer ${token}` } }),
@@ -125,6 +126,53 @@ async function setup() {
 }
 
 describe("bot model config", () => {
+  it("exposes supported subagent selection, forwards child-only writes, and preserves null reset", async () => {
+    const { authed, bridge } = await setup();
+    const state = { model: "provider:primary", effort: "high", catalog: [], efforts: [], subagentModel: null as string | null };
+    vi.spyOn(bridge, "modelConfig").mockImplementation(async () => ({ ...state }));
+    const write = vi.spyOn(bridge, "configureModel").mockImplementation(async (_name, patch) => {
+      if (patch.subagentModel !== undefined) state.subagentModel = patch.subagentModel;
+      return { ...state };
+    });
+    expect(await (await authed("/bots/scout/model-config")).json()).toMatchObject({
+      subagentModel: null, subagentModelConfigurable: true,
+    });
+    for (const selection of ["provider:child", null]) {
+      const response = await authed("/bots/scout/model-config", {
+        method: "PUT", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ subagentModel: selection }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        model: "provider:primary", effort: "high", subagentModel: selection, subagentModelConfigurable: true,
+      });
+      expect(write).toHaveBeenLastCalledWith("scout", { subagentModel: selection });
+    }
+  });
+
+  it("does not advertise or mutate subagent settings for an older runtime", async () => {
+    const { authed, bridge } = await setup();
+    vi.spyOn(bridge, "modelConfig").mockResolvedValue({ model: null, effort: null, catalog: [], efforts: [] });
+    const write = vi.spyOn(bridge, "configureModel");
+    expect(await (await authed("/bots/scout/model-config")).json()).not.toHaveProperty("subagentModelConfigurable");
+    const response = await authed("/bots/scout/model-config", {
+      method: "PUT", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "provider:primary", subagentModel: null }),
+    });
+    expect(response.status).toBe(400);
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it.each([{}, { subagentModel: 1 }, { subagentModel: "" }, { subagentModel: "   " }])("refuses invalid model writes %j", async (body) => {
+    const { authed, bridge } = await setup();
+    const write = vi.spyOn(bridge, "configureModel");
+    const response = await authed("/bots/scout/model-config", {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+    });
+    expect(response.status).toBe(400);
+    expect(write).not.toHaveBeenCalled();
+  });
+
   it("is device-authenticated and reads Hermes' configured picker authority", async () => {
     const { app, authed, dashboardCalls } = await setup();
     expect((await app.request("/bots/scout/model-config")).status).toBe(401);
@@ -133,6 +181,8 @@ describe("bot model config", () => {
     expect(await response.json()).toEqual({
       model: "openrouter:anthropic/claude-sonnet-4",
       effort: "high",
+      subagentModel: null,
+      subagentModelConfigurable: true,
       catalog: [
         { id: "openrouter:anthropic/claude-sonnet-4", displayName: "OpenRouter: anthropic/claude-sonnet-4" },
         { id: "openrouter:google/gemini-2.5-flash", displayName: "OpenRouter: google/gemini-2.5-flash" },

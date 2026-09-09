@@ -16,6 +16,11 @@ export const HERMES_REASONING_EFFORTS = [
   "ultra",
 ] as const;
 
+// Keep this in sync with Hermes' delegate_tool_config._NATIVE_SDK_PROVIDERS. A base URL is a
+// direct-endpoint override for every other provider, so its model identity cannot be recovered
+// from the Dashboard picker catalog.
+const HERMES_DELEGATION_NATIVE_SDK_PROVIDERS = new Set(["bedrock", "vertex", "google", "google-genai"]);
+
 export class ModelConfigInvalid extends Error {
   constructor(message: string) {
     super(message);
@@ -40,6 +45,7 @@ interface HermesModelOptions {
 
 interface HermesWebConfig {
   agent?: unknown;
+  delegation?: unknown;
   model?: unknown;
 }
 
@@ -230,7 +236,7 @@ async function readHermesModelState(
   // Hermes dashboard REST is the profile-aware edit-screen authority. Its JSON-RPC equivalents
   // are `model.options` and `config.get {key:"full"}`, but those handlers are not profile-scoped
   // in the surveyed checkout. The persisted keys beneath these REST routes are
-  // `model.provider`, `model.default`, and `agent.reasoning_effort`.
+  // `model.provider`, `model.default`, `agent.reasoning_effort`, and the `delegation` block.
   const [config, options] = await Promise.all([
     client.dashboardJson<HermesWebConfig>(`/api/config?${query}`),
     client.dashboardJson<HermesModelOptions>(`/api/model/options?${query}&explicit_only=1`),
@@ -257,8 +263,33 @@ function responseOf(state: {
   const agent = asRecord(state.config.agent);
   const rawEffort = agent?.["reasoning_effort"];
   const effort = typeof rawEffort === "string" && rawEffort.trim() ? rawEffort.trim().toLowerCase() : null;
+  const delegation = asRecord(state.config.delegation);
+  const delegatedModel = typeof delegation?.["model"] === "string" ? delegation["model"].trim() : "";
+  const delegatedProvider = typeof delegation?.["provider"] === "string" ? delegation["provider"].trim() : "";
+  const delegatedBaseUrl = typeof delegation?.["base_url"] === "string" ? delegation["base_url"].trim() : "";
+  const delegationUsesDirectEndpoint = delegatedBaseUrl !== "" &&
+    !HERMES_DELEGATION_NATIVE_SDK_PROVIDERS.has(delegatedProvider.toLowerCase());
+  // Hermes gives delegation.base_url precedence over delegation.provider and takes its actual
+  // provider from URL heuristics. The Dashboard model catalog has no corresponding identity, so
+  // returning a catalog-shaped string would misstate a live direct-endpoint pin as selectable.
+  // A provider-only pin resolves the provider's own default model at delegation time. It is not
+  // inheritance, but that model is likewise absent from the profile picker response.
+  const delegationModelIsRepresentable = !delegationUsesDirectEndpoint &&
+    (delegatedModel !== "" || delegatedProvider === "");
+  // Hermes treats an empty provider/model pair as inherit-parent. A model with no provider is
+  // still a real override: Hermes retains the parent provider, which we qualify on the wire.
+  const effectiveDelegatedProvider = delegatedProvider || provider;
+  const delegated = delegatedModel && effectiveDelegatedProvider
+    ? state.choices.find((choice) => choice.model === delegatedModel &&
+        (choice.provider === effectiveDelegatedProvider || choice.aliases.includes(effectiveDelegatedProvider)))
+    : undefined;
   return {
     model: configuredModel && provider && model ? (selected?.id ?? `${provider}:${model}`) : null,
+    ...(delegationModelIsRepresentable ? {
+      subagentModel: delegatedModel && effectiveDelegatedProvider
+        ? (delegated?.id ?? `${effectiveDelegatedProvider}:${delegatedModel}`)
+        : null,
+    } : {}),
     effort,
     catalog: state.choices.map(({ id, displayName, unauthenticated }) => ({
       id,
@@ -283,8 +314,14 @@ export async function writeBotModelConfig(
 ): Promise<BotModelConfig> {
   const state = await readHermesModelState(client, name);
   const choice = patch.model == null ? undefined : state.choices.find((entry) => entry.id === patch.model);
+  const subagentChoice = patch.subagentModel == null
+    ? undefined
+    : state.choices.find((entry) => entry.id === patch.subagentModel);
   if (patch.model !== undefined && patch.model !== null && choice === undefined) {
     throw new ModelConfigInvalid(`unknown model: ${patch.model}`);
+  }
+  if (patch.subagentModel !== undefined && patch.subagentModel !== null && subagentChoice === undefined) {
+    throw new ModelConfigInvalid(`unknown subagent model: ${patch.subagentModel}`);
   }
   if (
     patch.effort !== undefined &&
@@ -300,6 +337,15 @@ export async function writeBotModelConfig(
     configPatch["agent"] = { reasoning_effort: patch.effort ?? "" };
   }
   if (patch.model === null) configPatch["model"] = "";
+  if (patch.subagentModel !== undefined) {
+    // Hermes has no delegation scope on /api/model/set (only main and auxiliary). Its
+    // profile-aware config endpoint deep-merges this leaf, leaving limits, approval policy and
+    // delegation reasoning effort untouched. Clear base_url as well: Hermes gives it precedence
+    // over a provider pin, and retaining it would make an apparent reset/select a silent no-op.
+    configPatch["delegation"] = patch.subagentModel === null
+      ? { provider: "", model: "", base_url: "" }
+      : { provider: subagentChoice!.provider, model: subagentChoice!.model, base_url: "" };
+  }
   if (Object.keys(configPatch).length > 0) {
     await client.dashboardJson(`/api/config?${query}`, { method: "PUT", body: { config: configPatch } });
   }

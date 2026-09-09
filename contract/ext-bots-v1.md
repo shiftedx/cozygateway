@@ -952,8 +952,8 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `GET /bots/catalog` | optional `q` | `BotCatalog` | Hermes profile/catalog read. |
 | `GET /bots/:name/profile` | — | `BotProfile` | Hermes profile read. Capability 57: for a runtime bot this is the peer's `profile.read` answer over the `bot_config` lane, and `guardrailLevel` rides along exactly as the peer sent it, absent for a Hermes bot and for a peer below 57. Capability 58: `guardrailCeiling` rides along the same way, read-only, absent for a Hermes bot and for a peer below 58. Capability 63: each `mcpServers` row may carry `repair`, the peer's own per-server repair policy, read-only in the same sense. It is absent for Hermes and peers below 63, or when a peer does not project it. A known CozyAgents peer may project its effective `approve_once` default after negotiating 63. |
 | `PATCH /bots/:name/profile` | `BotProfilePatch` | `BotProfileConfigureResponse` | Hermes profile update. Capability 57: `guardrailLevel` in the body is forwarded to a runtime bot's peer over the `bot_config` lane unchanged and is not acted on for a Hermes bot. Capability 58: `guardrailCeiling` is never accepted in the body; a body naming it is `400 invalid_request` naming the field. Capability 63: the per-server `repair` policy has no representation in this body at all, because `enabledMcpServers` names servers by name; it is changed on the harness, never here. |
-| `GET /bots/:name/model-config` | — | `BotModelConfig` | Hermes profile model read. |
-| `PUT /bots/:name/model-config` | `BotModelConfigPatch` | `BotModelConfig` | Hermes profile model update. |
+| `GET /bots/:name/model-config` | — | `BotModelConfig` | Owning runtime's primary, effort, and supported subagent model settings. |
+| `PUT /bots/:name/model-config` | `BotModelConfigPatch` | `BotModelConfig` | Validated model settings update in the owning runtime. |
 | `GET /bots/:name/model-providers` | — | `BotModelProviderSetupCatalog` | Capability 41 compatibility route. New clients use `com.cozylabs.harness-settings`. For a runtime bot, the `cozyagents` harness's read-only projection of the peer's `model.read`. |
 | `PUT /bots/:name/model-providers/:provider/fields/:field` | `BotModelProviderFieldUpdate` | `BotModelProviderSetupCatalog` | Writes one field through Hermes after re-validating that the field belongs to the provider. |
 | `DELETE /bots/:name/model-providers/:provider/fields/:field` | — | `BotModelProviderSetupCatalog` | Clears one Hermes-owned provider field and returns refreshed state. |
@@ -1082,6 +1082,42 @@ answers from runtime bots' config lanes, one read-only scope per runtime bot, wi
 Hermes. `/health` and `/ready` report `bridges: {"hermes": "absent"}`
 and `/ready` answers `200`: there is no bridge to alarm on or de-route from, and restarting the
 process would fix nothing.
+
+### Subagent model configuration
+
+`GET /bots/:name/model-config` may include `subagentModel`, a qualified model ID
+or `null` for the owning runtime's default. Its absence means the runtime does
+not expose this setting. The HTTP route adds `subagentModelConfigurable: true`
+only when Gateway supports the write and the runtime exposes the field. Clients
+must gate editing on this marker, because an older Gateway can pass through an
+additive read field while rejecting the corresponding write.
+
+`PUT /bots/:name/model-config` accepts a child-only `{ "subagentModel": "provider:model" }`
+patch. Omission preserves the selection; `null` clears the override. Unknown
+models are rejected by the owning runtime's catalog validation. An unsupported
+runtime rejects the patch before any accompanying primary setting is changed.
+Credentials never cross this contract.
+
+CozyAgents serves this over the existing `model.read` / `model.write` attach
+config lane and persists the selection in its state directory. An unset child
+override inherits the effective parent chat model, including custom endpoints.
+Hermes reads and updates its profile-scoped native `delegation` configuration;
+clearing it restores Hermes's own primary-model inheritance. Gateway-only
+custom primary models use a session override and are not that native default.
+Hermes child selections currently use its built-in catalog, excluding Gateway
+`custom-*` provider entries.
+Hermes reloads profile delegation configuration at the next child spawn; already
+running children keep their creation-time model. No process restart is required
+under normal profile configuration.
+Legacy Hermes provider-only or direct-endpoint delegation configurations cannot
+be represented by this picker and omit `subagentModel`; existing primary model
+settings remain editable and preserve that delegation configuration.
+
+Onboarding creates the bot first and waits for runtime readiness, then reads
+this model configuration and offers a child model when supported. The same
+setting remains editable afterward. Retrying this setup step uses the created
+bot's identity rather than creating a duplicate bot. Older servers and runtimes
+continue onboarding without the new control.
 
 ## Interactive Hermes session continuation
 

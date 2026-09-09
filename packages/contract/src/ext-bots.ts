@@ -1531,13 +1531,17 @@ export const BotModelProviderSchema = Type.Object({
 });
 export type BotModelProvider = Static<typeof BotModelProviderSchema>;
 
-/** `GET /bots/:name/model-config`. Null means the profile follows Hermes' default for that axis.
- *  The catalog is the configured Hermes picker catalog, not a gateway-maintained model list.
+/** `GET /bots/:name/model-config`. Null follows the owning runtime's default for that axis.
+ *  The catalog comes from the owning runtime, not a gateway-maintained model list.
  *  `providers` (capability 36) is the additive per-provider summary; a client below 36 ignores
  *  it and keeps rendering `catalog` alone. */
 export const BotModelConfigSchema = Type.Object({
   model: Type.Union([Type.String(), Type.Null()]),
   effort: Type.Union([Type.String(), Type.Null()]),
+  /** Absent on older runtimes; null clears the runtime's delegation override. */
+  subagentModel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  /** Added by the HTTP route only when both Gateway and runtime support writes. */
+  subagentModelConfigurable: Type.Optional(Type.Boolean()),
   catalog: Type.Array(BotModelCatalogEntrySchema),
   efforts: Type.Array(Type.String()),
   providers: Type.Optional(Type.Array(BotModelProviderSchema)),
@@ -1548,6 +1552,7 @@ export type BotModelConfig = Static<typeof BotModelConfigSchema>;
 export const BotModelConfigPatchSchema = Type.Object({
   model: Type.Optional(Type.Union([Type.String(), Type.Null()])),
   effort: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  subagentModel: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 512, pattern: "\\S" }), Type.Null()])),
 });
 export type BotModelConfigPatch = Static<typeof BotModelConfigPatchSchema>;
 
