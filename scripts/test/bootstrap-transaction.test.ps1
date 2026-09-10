@@ -24,7 +24,7 @@ $needed = @(
     'Copy-BootstrapSnapshotFile', 'Restore-BootstrapFile',
     'Set-BootstrapTransactionState', 'Get-GatewayTaskExec',
     'Test-BootstrapPathEquals', 'Test-OwnedGatewayStartupEntry',
-    'Test-OwnedGatewayTask', 'Get-GatewayRegistrationForRecovery',
+    'Resolve-WindowsGatewayNodePath','Test-OwnedGatewayTask', 'Get-GatewayRegistrationForRecovery',
     'Restore-GatewayRegistration', 'Restart-OwnedGatewayService',
     'Start-BootstrapTransaction', 'Recover-BootstrapTransaction',
     'Finish-BootstrapRecovery', 'Commit-BootstrapTransaction'

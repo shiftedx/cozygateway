@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Resolve-Path $Installer),[ref]$tokens,[ref]$errors)
-foreach($name in @('Copy-OrDownload','Test-TransientBootstrapDownloadError','Get-VerifiedAsset','Fail','Write-Ok')) {
+foreach($name in @('Copy-OrDownload','Test-TransientBootstrapDownloadError','Get-VerifiedAsset','Install-CozyAgentsHarness','Fail','Write-Ok','Write-Info')) {
     $fn=$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true) | Select-Object -First 1
     if($fn) { Invoke-Expression $fn.Extent.Text }
 }
@@ -50,6 +50,10 @@ try {
     $failureMessage=''
     try { Get-VerifiedAsset 'asset' (Join-Path $root 'verified') 'https://example.invalid' } catch { $failureMessage=$_.Exception.Message; $failed=$failureMessage -match 'checksum mismatch' }
     Assert-True ($failed -and $script:calls -eq 2 -and $script:delays.Count -eq 0) "checksum mismatch must fail without retrying either completed download (calls=$script:calls; error=$failureMessage)"
+    $script:calls=0; $failureMessage=''
+    try { Install-CozyAgentsHarness (Join-Path $root 'agents') 'https://example.invalid/agents.ps1' ('0' * 64) } catch {$failureMessage=$_.Exception.Message}
+    Assert-True ($script:calls -eq 1 -and $failureMessage -match 'CozyAgents installer checksum mismatch') 'a mismatched harness installer must be refused before execution'
+    Assert-True ($failureMessage -match 'does not match this Gateway release' -and $failureMessage -match 'not an administrator-permissions error') 'checksum refusal must explain the release mismatch instead of suggesting administrator permissions'
     Write-Host 'Windows download retry tests passed'
 } finally {
     $resolved=[IO.Path]::GetFullPath($root)

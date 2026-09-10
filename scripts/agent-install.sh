@@ -357,7 +357,14 @@ resolve_node() {
   fi
   if case "$candidate" in */*) [ -x "$candidate" ] ;; *) have "$candidate" ;; esac; then
     major="$(node_major "$candidate")"
-    if [ "${major:-0}" -ge 24 ]; then case "$candidate" in /*) printf '%s' "$candidate" ;; *) command -v "$candidate" ;; esac; return; fi
+    if [ "${major:-0}" -ge 24 ]; then
+      case "$candidate" in /*) ;; *) candidate="$(command -v "$candidate")" ;; esac
+      # MSYS executes node as node.exe, but native readiness and recovery check
+      # literal files. Persist the executable name shared by both shells.
+      if is_windows && [ -f "$candidate.exe" ]; then candidate="$candidate.exe"; fi
+      printf '%s' "$candidate"
+      return
+    fi
   fi
   [ "${COZYGATEWAY_NODE+x}" = x ] && return 1
   return 1
