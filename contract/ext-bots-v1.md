@@ -952,7 +952,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `GET /bots/catalog` | optional `q` | `BotCatalog` | Hermes profile/catalog read. |
 | `GET /bots/:name/profile` | — | `BotProfile` | Hermes profile read. Capability 57: for a runtime bot this is the peer's `profile.read` answer over the `bot_config` lane, and `guardrailLevel` rides along exactly as the peer sent it, absent for a Hermes bot and for a peer below 57. Capability 58: `guardrailCeiling` rides along the same way, read-only, absent for a Hermes bot and for a peer below 58. Capability 63: each `mcpServers` row may carry `repair`, the peer's own per-server repair policy, read-only in the same sense. It is absent for Hermes and peers below 63, or when a peer does not project it. A known CozyAgents peer may project its effective `approve_once` default after negotiating 63. |
 | `PATCH /bots/:name/profile` | `BotProfilePatch` | `BotProfileConfigureResponse` | Hermes profile update. Capability 57: `guardrailLevel` in the body is forwarded to a runtime bot's peer over the `bot_config` lane unchanged and is not acted on for a Hermes bot. Capability 58: `guardrailCeiling` is never accepted in the body; a body naming it is `400 invalid_request` naming the field. Capability 63: the per-server `repair` policy has no representation in this body at all, because `enabledMcpServers` names servers by name; it is changed on the harness, never here. |
-| `GET /bots/:name/model-config` | — | `BotModelConfig` | Owning runtime's primary, effort, and supported subagent model settings. |
+| `GET /bots/:name/model-config` | — | `BotModelConfig` | Owning runtime's primary, effort, and supported subagent and vision model settings. |
 | `PUT /bots/:name/model-config` | `BotModelConfigPatch` | `BotModelConfig` | Validated model settings update in the owning runtime. |
 | `GET /bots/:name/model-providers` | — | `BotModelProviderSetupCatalog` | Capability 41 compatibility route. New clients use `com.cozylabs.harness-settings`. For a runtime bot, the `cozyagents` harness's read-only projection of the peer's `model.read`. |
 | `PUT /bots/:name/model-providers/:provider/fields/:field` | `BotModelProviderFieldUpdate` | `BotModelProviderSetupCatalog` | Writes one field through Hermes after re-validating that the field belongs to the provider. |
@@ -1118,6 +1118,49 @@ this model configuration and offers a child model when supported. The same
 setting remains editable afterward. Retrying this setup step uses the created
 bot's identity rather than creating a duplicate bot. Older servers and runtimes
 continue onboarding without the new control.
+
+### Vision model configuration
+
+`GET /bots/:name/model-config` may include `visionModel`, a qualified model ID
+or `null` for "no separate vision model". Its absence means the runtime does not
+expose this setting. The HTTP route adds `visionModelConfigurable: true` only
+when Gateway supports the write and the runtime exposes the field, and clients
+gate editing on that marker for the same reason they gate the subagent picker:
+an older Gateway can pass an additive read field through while rejecting the
+corresponding write.
+
+`PUT /bots/:name/model-config` accepts a vision-only
+`{ "visionModel": "provider:model" }` patch. Omission preserves the selection;
+`null` clears it. Unknown models are rejected by the owning runtime's catalog
+validation. A patch naming this field on a bot whose fresh read omits it is
+refused `400 invalid_request "vision model configuration is unavailable for this
+bot"` before anything is written, so a refused vision write never leaves a
+changed primary model behind it. Credentials never cross this contract.
+
+The vision model is the model that analyzes an image when the bot's primary
+model cannot accept one. Unset means "the primary model, if it can see;
+otherwise no image analysis at all".
+
+CozyAgents serves this over the existing `model.read` / `model.write` attach
+config lane and persists the selection in its state directory beside the
+subagent selection. Its `image_analyze` tool is offered when the primary model
+accepts images or a vision model is set; with a set vision model and a
+text-only primary, the tool answers with that model's description of the picture
+instead of the picture itself.
+
+Hermes reads and updates its profile-scoped native `auxiliary.vision`
+configuration, which is what its `vision_analyze` path asks. Clearing it
+restores Hermes' own behaviour. The patch never carries `auxiliary.vision.api_key`,
+so the credential configured in Hermes survives every write, and it clears
+`base_url` for the same precedence reason the delegation patch does. Hermes
+vision selections use its built-in catalog, excluding Gateway `custom-*`
+provider entries. A legacy provider-only or direct-endpoint `auxiliary.vision`
+configuration cannot be represented by this picker and omits `visionModel`;
+existing primary model settings remain editable and preserve that configuration.
+
+Direct connections have no vision setting: the Hermes API Server exposes no
+configuration endpoint, and OpenClaw's `agents.defaults.imageModel` is writable
+only under `operator.admin` scope, which a direct client does not request.
 
 ## Interactive Hermes session continuation
 
