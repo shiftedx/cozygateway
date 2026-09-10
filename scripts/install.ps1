@@ -37,7 +37,8 @@ $ProgressPreference = 'SilentlyContinue'
 $PSNativeCommandUseErrorActionPreference = $false
 
 $script:CozyAgentsInstallUrlDefault = 'https://cozylabs.ai/agents.ps1'
-$script:CozyAgentsInstallSha256Default = '75cde8d569226a6ee2b5f198392fed9a7adb3ac0aab47c2ed3f5b2c165bb0abc'
+# CozyAgents v0.2.15 agents.ps1; verified against the release asset digest.
+$script:CozyAgentsInstallSha256Default = 'e20c60eeaa763757daa48479fed10405a9be11caa9ca7bd8698dfaaa92cec3cd'
 $script:PromptAnswers = @{}
 $script:PromptIndex = @{}
 
@@ -2741,7 +2742,7 @@ function Install-CozyAgentsHarness {
     try {
         Copy-OrDownload $Source $staged
         $actual = (Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($actual -ne $ExpectedSha256) { Fail 'CozyAgents installer checksum mismatch' }
+        if ($actual -ne $ExpectedSha256) { Fail 'CozyAgents installer checksum mismatch. The downloaded installer does not match this Gateway release; no CozyAgents installer code was run. This is a release/download verification failure, not an administrator-permissions error.' }
         Write-Ok 'verified CozyAgents installer SHA-256'
         $content = [IO.File]::ReadAllText($staged).TrimStart([char]0xFEFF)
         $env:COZYAGENTS_HOME = $AgentsHome
