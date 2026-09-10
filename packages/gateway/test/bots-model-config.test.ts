@@ -163,7 +163,53 @@ describe("bot model config", () => {
     expect(write).not.toHaveBeenCalled();
   });
 
-  it.each([{}, { subagentModel: 1 }, { subagentModel: "" }, { subagentModel: "   " }])("refuses invalid model writes %j", async (body) => {
+  it("exposes supported vision selection, forwards vision-only writes, and preserves null reset", async () => {
+    const { authed, bridge } = await setup();
+    const state = {
+      model: "provider:primary", effort: "high", catalog: [], efforts: [],
+      visionModel: null as string | null,
+    };
+    vi.spyOn(bridge, "modelConfig").mockImplementation(async () => ({ ...state }));
+    const write = vi.spyOn(bridge, "configureModel").mockImplementation(async (_name, patch) => {
+      if (patch.visionModel !== undefined) state.visionModel = patch.visionModel;
+      return { ...state };
+    });
+    expect(await (await authed("/bots/scout/model-config")).json()).toMatchObject({
+      visionModel: null, visionModelConfigurable: true,
+    });
+    for (const selection of ["provider:vision", null]) {
+      const response = await authed("/bots/scout/model-config", {
+        method: "PUT", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ visionModel: selection }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        model: "provider:primary", effort: "high", visionModel: selection, visionModelConfigurable: true,
+      });
+      expect(write).toHaveBeenLastCalledWith("scout", { visionModel: selection });
+    }
+  });
+
+  it("does not advertise or mutate vision settings for a runtime that does not expose them", async () => {
+    const { authed, bridge } = await setup();
+    vi.spyOn(bridge, "modelConfig").mockResolvedValue({
+      model: null, effort: null, catalog: [], efforts: [], subagentModel: null,
+    });
+    const write = vi.spyOn(bridge, "configureModel");
+    const read = await (await authed("/bots/scout/model-config")).json();
+    expect(read).toHaveProperty("subagentModelConfigurable", true);
+    expect(read).not.toHaveProperty("visionModelConfigurable");
+    const response = await authed("/bots/scout/model-config", {
+      method: "PUT", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "provider:primary", visionModel: null }),
+    });
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.message).toBe("vision model configuration is unavailable for this bot");
+    // The primary model must not have moved behind a refused vision write.
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it.each([{}, { subagentModel: 1 }, { subagentModel: "" }, { subagentModel: "   " }, { visionModel: 1 }, { visionModel: "" }, { visionModel: "   " }])("refuses invalid model writes %j", async (body) => {
     const { authed, bridge } = await setup();
     const write = vi.spyOn(bridge, "configureModel");
     const response = await authed("/bots/scout/model-config", {
@@ -186,6 +232,7 @@ describe("bot model config", () => {
       // The Hermes fixture pins no auxiliary.vision block, which is the default, not an
       // unrepresentable pin, so the additive field reads null rather than being omitted.
       visionModel: null,
+      visionModelConfigurable: true,
       catalog: [
         { id: "openrouter:anthropic/claude-sonnet-4", displayName: "OpenRouter: anthropic/claude-sonnet-4" },
         { id: "openrouter:google/gemini-2.5-flash", displayName: "OpenRouter: google/gemini-2.5-flash" },
