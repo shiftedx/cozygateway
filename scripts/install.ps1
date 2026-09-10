@@ -37,7 +37,7 @@ $ProgressPreference = 'SilentlyContinue'
 $PSNativeCommandUseErrorActionPreference = $false
 
 $script:CozyAgentsInstallUrlDefault = 'https://cozylabs.ai/agents.ps1'
-# CozyAgents v0.2.15 agents.ps1; verified against the release asset digest.
+# CozyAgents v0.2.16 agents.ps1; verified against the release asset digest.
 $script:CozyAgentsInstallSha256Default = 'e20c60eeaa763757daa48479fed10405a9be11caa9ca7bd8698dfaaa92cec3cd'
 $script:PromptAnswers = @{}
 $script:PromptIndex = @{}

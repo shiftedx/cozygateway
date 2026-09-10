@@ -55,9 +55,9 @@ HERMES_FOUND=""
 NO_QR=0
 COZYAGENTS_HOME_DIR="${COZYAGENTS_HOME:-$HOME/.cozyagents}"
 COZYAGENTS_INSTALL_URL_DEFAULT="https://cozylabs.ai/agents.sh"
-# Published alongside the reviewed CozyAgents release on 2026-09-04. This pins the secondary
+# Published alongside the reviewed CozyAgents v0.2.16 release candidate. This pins the secondary
 # installer before it is executed; its own bundle verification starts only after that boundary.
-COZYAGENTS_INSTALL_SHA256_DEFAULT="3aadbed6776d495e68c14ff47f1cde04ae5b702f62e083d65f433fa648328dd1"
+COZYAGENTS_INSTALL_SHA256_DEFAULT="3f25318a52dc3cea55663377c3a53b14461b7d56797e91137a1a0fe9518d7b88"
 RUNNER_MODEL_PROVIDER="${COZYGATEWAY_RUNNER_MODEL_PROVIDER:-}"
 RUNNER_MODEL_ENDPOINT="${COZYGATEWAY_RUNNER_MODEL_ENDPOINT:-}"
 RUNNER_MODEL_ID="${COZYGATEWAY_RUNNER_MODEL_ID:-}"
