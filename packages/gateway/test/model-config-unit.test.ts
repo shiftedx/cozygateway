@@ -304,6 +304,9 @@ describe("Hermes model config", () => {
             providers: [{
               slug: "openrouter", name: "OpenRouter", authenticated: true,
               models: ["anthropic/claude-sonnet-4", "google/gemini-2.5-flash"],
+            }, {
+              slug: "vertex", name: "Vertex AI", authenticated: true,
+              models: ["gemini-2.5-flash"],
             }],
           },
     }) as HermesClient;
@@ -318,6 +321,13 @@ describe("Hermes model config", () => {
       clientFor({ base_url: "https://vision.example.test/v1", model: "google/gemini-2.5-flash" }), "scout",
     );
     expect(direct.visionModel).toBeUndefined();
+    // A base_url on a native-SDK provider is not a direct-endpoint override: Hermes routes it by
+    // provider/model through its own SDK, so the pin keeps its catalog identity.
+    const nativeSdk = await readBotModelConfig(
+      clientFor({ provider: "vertex", base_url: "https://vertex.example.test/v1", model: "gemini-2.5-flash" }),
+      "scout",
+    );
+    expect(nativeSdk.visionModel).toBe("vertex:gemini-2.5-flash");
     // A profile with no auxiliary block at all is not a pin: it is the default, and it is editable.
     const none = await readBotModelConfig({
       dashboardJson: async (path: string) => path.startsWith("/api/config?")

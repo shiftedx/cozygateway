@@ -1157,6 +1157,9 @@ vision selections use its built-in catalog, excluding Gateway `custom-*`
 provider entries. A legacy provider-only or direct-endpoint `auxiliary.vision`
 configuration cannot be represented by this picker and omits `visionModel`;
 existing primary model settings remain editable and preserve that configuration.
+Hermes reads `auxiliary.vision` when its `vision_analyze` path next runs, so a
+changed selection applies to the next image, not to a description already in
+progress.
 
 Direct connections have no vision setting: the Hermes API Server exposes no
 configuration endpoint, and OpenClaw's `agents.defaults.imageModel` is writable
