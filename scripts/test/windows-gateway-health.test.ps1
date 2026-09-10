@@ -1,7 +1,7 @@
 $ErrorActionPreference='Stop'
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '..\install.ps1'),[ref]$tokens,[ref]$errors)
-foreach($name in @('Fail','Assert-BootstrapPath','Assert-BootstrapPathAndParents','Assert-BootstrapRegularFile','Get-WindowsGatewayBundleVersion','Wait-WindowsGatewayReady')) {
+foreach($name in @('Fail','Assert-BootstrapPath','Assert-BootstrapPathAndParents','Assert-BootstrapRegularFile','Resolve-WindowsGatewayNodePath','Get-WindowsGatewayBundleVersion','Wait-WindowsGatewayReady')) {
     $fn=$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true) | Select-Object -First 1
     Invoke-Expression $fn.Extent.Text
 }
@@ -51,6 +51,24 @@ server.listen(0,'127.0.0.1',function(){fs.writeFileSync(path.join(root,'port'),S
     $port=[int][IO.File]::ReadAllText((Join-Path $root 'port'))
     [IO.File]::WriteAllText($config,(@{host='0.0.0.0';port=$port;hermesEndpoints=@(@{id='default';url='http://unused/1';profiles=@{default=@{tokenEnv='DEFAULT'};work=@{tokenEnv='WORK'}}})}|ConvertTo-Json -Depth 6))
     Wait-WindowsGatewayReady $root -TimeoutSeconds 4
+    # Git Bash's `command -v node` omits .exe even though only node.exe exists.
+    # Replay that persisted identity through the real readiness probe.
+    $extensionlessNode = $node.Substring(0, $node.Length - '.exe'.Length)
+    Assert-True (-not (Test-Path -LiteralPath $extensionlessNode)) 'fixture must reproduce the missing extensionless file'
+    $msysNode = '/' + $extensionlessNode.Substring(0,1).ToLowerInvariant() + $extensionlessNode.Substring(2).Replace('\','/')
+    foreach ($recordedNode in @($msysNode, $extensionlessNode)) {
+        [IO.File]::WriteAllText($state,"node_resolved=$recordedNode`n")
+        Wait-WindowsGatewayReady $root -TimeoutSeconds 2
+    }
+    foreach ($invalid in @('node', 'C:node', (Join-Path $root 'missing-node'), ($extensionlessNode + '.cmd'))) {
+        [IO.File]::WriteAllText($state,"node_resolved=$invalid`n")
+        $failed=$false; try { Wait-WindowsGatewayReady $root -TimeoutSeconds 1 } catch {$failed=$true}
+        Assert-True $failed 'missing or relative runtime must not fall back to Node on PATH'
+    }
+    [IO.File]::WriteAllText($state,"node_resolved=$msysNode`nnode_resolved=$node`n")
+    $failed=$false; try { Wait-WindowsGatewayReady $root -TimeoutSeconds 1 } catch {$failed=$true}
+    Assert-True $failed 'extension normalization must not accept duplicate runtime records'
+    [IO.File]::WriteAllText($state,"node_resolved=$node`n")
     foreach($mode in @('wrong','offline','count','dead','malformed','oversized')) {
         [IO.File]::WriteAllText((Join-Path $root 'mode'),$mode)
         $failed=$false;try {Wait-WindowsGatewayReady $root -TimeoutSeconds 1} catch {$failed=$true}

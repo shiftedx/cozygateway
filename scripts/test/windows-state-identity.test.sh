@@ -25,6 +25,15 @@ expected_bundle="$(cygpath -u "$native_bundle")"
 NODE_BIN="$native_node" COZYGATEWAY_NODE="$native_node"
 resolved="$(resolve_node)"
 test "$resolved" = "$expected_node"
+# Git Bash hides .exe when resolving a command on PATH, and accepts explicit
+# extensionless paths too. Native consumers need the actual file name.
+for candidate in "${expected_node%.exe}" "$(cygpath -w "${expected_node%.exe}")" node; do
+  resolved="$(PATH="$(dirname "$expected_node"):$PATH" NODE_BIN="$candidate" COZYGATEWAY_NODE="$candidate" resolve_node)"
+  if [ "$resolved" != "$expected_node" ]; then
+    echo "extensionless Node resolved to $resolved; expected $expected_node" >&2
+    exit 1
+  fi
+done
 printf 'node_resolved=%s\nbundle_path=%s\n' "$native_node" "$native_bundle" > "$STATE_FILE"
 load_windows_state_identity
 test "$NODE_RESOLVED" = "$expected_node"

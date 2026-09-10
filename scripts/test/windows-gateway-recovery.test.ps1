@@ -1,7 +1,7 @@
 $ErrorActionPreference='Stop'
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '..\install.ps1'),[ref]$tokens,[ref]$errors)
-foreach($name in @('Fail','Assert-BootstrapPath','Assert-BootstrapPathAndParents','Assert-BootstrapRegularFile','Test-BootstrapPathEquals','Test-OwnedGatewayTask','Test-OwnedGatewayStartupEntry','Split-WindowsRecoveryCommandLine','Test-WindowsRecoveryProcess','Invoke-WindowsRecoveryTaskkill','Get-WindowsRecoveryOrphanDescriptors','Stop-OwnedGatewayForRecovery')) {
+foreach($name in @('Fail','Assert-BootstrapPath','Assert-BootstrapPathAndParents','Assert-BootstrapRegularFile','Test-BootstrapPathEquals','Resolve-WindowsGatewayNodePath','Test-OwnedGatewayTask','Test-OwnedGatewayStartupEntry','Split-WindowsRecoveryCommandLine','Test-WindowsRecoveryProcess','Invoke-WindowsRecoveryTaskkill','Get-WindowsRecoveryOrphanDescriptors','Stop-OwnedGatewayForRecovery')) {
     $fn=$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true) | Select-Object -First 1
     Invoke-Expression $fn.Extent.Text
 }
@@ -48,6 +48,36 @@ try {
     [IO.File]::WriteAllText($state,"node_resolved=C:\Runtime\node.exe`n")
     $args=@((Join-Path $root 'local\gateway-supervisor.cjs'),'--platform','Windows','--gateway-env',(Join-Path $root 'local\gateway.env'),'--bundle',(Join-Path $root 'bin\cozygateway.mjs'),'--config',(Join-Path $root 'local\cozygateway.config.json'),'--maintenance-socket','\\.\pipe\cozygateway-maintenance','--maintenance-worker',(Join-Path $root 'local\maintenance-worker.cjs'),'--database',(Join-Path $root 'local\cozygateway.sqlite'))
     $supervisorArgs=($args|ForEach-Object{'"'+$_+'"'})-join ' '
+    # Both old Tasks and their state can name extensionless Node, while CIM
+    # reports node.exe. Recovery must still stop only the exact owned processes.
+    $runtime=Join-Path $root 'Runtime With Spaces\node.exe'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $runtime) | Out-Null
+    [IO.File]::WriteAllText($runtime,'fixture executable identity')
+    $extensionless=$runtime.Substring(0,$runtime.Length-4)
+    $msys='/' + $extensionless.Substring(0,1).ToLowerInvariant() + $extensionless.Substring(2).Replace('\','/')
+    [IO.File]::WriteAllText($state,"node_resolved=$msys`n")
+    foreach ($command in @($extensionless,$runtime)) {
+        $script:task='<Task><Actions><Exec><Command>'+ $command +'</Command><Arguments>'+ $supervisorArgs +'</Arguments></Exec></Actions></Task>'
+        Assert-True (Test-OwnedGatewayTask $root $script:task) 'historical and canonical Tasks must match the same recorded Node executable'
+        $script:processes=@(New-Process -Executable $runtime -Arguments $supervisorArgs);$script:current=$script:processes[0];$script:killed=@()
+        Stop-OwnedGatewayForRecovery $root
+        Assert-True ($script:killed.Count -eq 1) 'extensionless registered runtime must match its native process'
+        $script:processes=@(New-Process -Executable $runtime -Arguments $supervisorArgs)
+        $script:processes[0].CommandLine='"'+$extensionless+'" '+$supervisorArgs
+        $script:current=$script:processes[0];$script:killed=@()
+        Stop-OwnedGatewayForRecovery $root
+        Assert-True ($script:killed.Count -eq 1) 'native process command line can retain the extensionless launch path'
+    }
+    $script:task=''
+    foreach ($arguments in @($supervisorArgs,('"'+(Join-Path $root 'bin\cozygateway.mjs')+'" serve --config "'+(Join-Path $root 'local\cozygateway.config.json')+'"'))) {
+        $script:processes=@(New-Process -Executable $runtime -Arguments $arguments);$script:current=$script:processes[0];$script:killed=@()
+        Stop-OwnedGatewayForRecovery $root
+        Assert-True ($script:killed.Count -eq 1) 'historical identity must locate the owned orphan supervisor and child'
+    }
+    $script:processes=@(New-Process -Executable $runtime -Arguments ($supervisorArgs+' --foreign value'));$script:current=$script:processes[0];$script:killed=@()
+    Stop-OwnedGatewayForRecovery $root
+    Assert-True ($script:killed.Count -eq 0) 'normalizing the runtime must not broaden argument ownership'
+    [IO.File]::WriteAllText($state,"node_resolved=C:\Runtime\node.exe`n")
     foreach($arguments in @($supervisorArgs,('"'+(Join-Path $root 'bin\cozygateway.mjs')+'" serve --config "'+(Join-Path $root 'local\cozygateway.config.json')+'"'))) {
         $script:processes=@(New-Process -Arguments $arguments);$script:current=$script:processes[0];$script:killed=@()
         Stop-OwnedGatewayForRecovery $root

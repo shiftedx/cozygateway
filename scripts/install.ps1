@@ -718,6 +718,18 @@ function Test-OwnedGatewayStartupEntry {
     return $false
 }
 
+function Resolve-WindowsGatewayNodePath {
+    param([string] $Path)
+    if ($Path -match '^/([A-Za-z])/(.*)$') { $Path = $Matches[1] + ':\' + $Matches[2].Replace('/', '\') }
+    # Older Git Bash installs recorded `command -v node` without .exe. Resolve
+    # only that exact sibling, never a different runtime from PATH.
+    if ($Path -match '^[A-Za-z]:[\\/]' -and [IO.Path]::GetExtension($Path) -eq '' -and
+        -not (Test-Path -LiteralPath $Path) -and (Test-Path -LiteralPath ($Path + '.exe') -PathType Leaf)) {
+        $Path += '.exe'
+    }
+    return $Path
+}
+
 function Test-OwnedGatewayTask {
     param([string] $InstallRoot, [string] $TaskXml, [string] $LauncherPath = (Join-Path $InstallRoot 'local\run-gateway.vbs'), [string] $StatePath = (Join-Path $InstallRoot 'local\install-state'))
     $exec = Get-GatewayTaskExec $TaskXml
@@ -734,14 +746,13 @@ function Test-OwnedGatewayTask {
         $recordedNodes = @(Get-Content -LiteralPath $statePath | Where-Object { $_ -like 'node_resolved=*' })
         if ($recordedNodes.Count -gt 1) { return $false }
         if ($recordedNodes.Count -eq 1) {
-            $recordedNode = $recordedNodes[0].Substring(14)
-            if ($recordedNode -match '^/([A-Za-z])/(.*)$') { $recordedNode = $matches[1] + ':\' + $matches[2].Replace('/', '\') }
+            $recordedNode = Resolve-WindowsGatewayNodePath $recordedNodes[0].Substring(14)
             if ($recordedNode -notmatch '^[A-Za-z]:[\\/]') { return $false }
             $node = [IO.Path]::GetFullPath($recordedNode)
         }
     }
     $supervisor = [IO.Path]::GetFullPath((Join-Path $InstallRoot 'local\gateway-supervisor.cjs'))
-    if (-not (Test-BootstrapPathEquals $exec.Command $node) -or $values.Count -lt 1 -or -not (Test-BootstrapPathEquals $values[0] $supervisor)) { return $false }
+    if (-not (Test-BootstrapPathEquals (Resolve-WindowsGatewayNodePath $exec.Command) $node) -or $values.Count -lt 1 -or -not (Test-BootstrapPathEquals $values[0] $supervisor)) { return $false }
     $required = @{
         '--platform' = 'Windows'
         '--gateway-env' = (Join-Path $InstallRoot 'local\gateway.env')
@@ -910,8 +921,7 @@ function Wait-WindowsGatewayReady {
         $records = @(Get-Content -LiteralPath $state | Where-Object { $_ -match '^node_resolved=' })
         if ($records.Count -gt 1) { throw 'Gateway runtime identity is ambiguous.' }
         if ($records.Count -eq 1) {
-            $node = $records[0].Substring('node_resolved='.Length)
-            if ($node -match '^/([A-Za-z])/(.*)$') { $node = $Matches[1] + ':\' + $Matches[2].Replace('/', '\') }
+            $node = Resolve-WindowsGatewayNodePath $records[0].Substring('node_resolved='.Length)
         }
     }
     if (-not [IO.Path]::IsPathRooted($node) -or -not (Test-Path -LiteralPath $node -PathType Leaf)) { throw 'Gateway runtime is unavailable for its readiness check.' }
@@ -1065,7 +1075,7 @@ function Test-WindowsRecoveryProcess {
     if (-not [string]::Equals([string]$Process.ExecutablePath, $Descriptor.Executable, [StringComparison]::OrdinalIgnoreCase)) { return $false }
     $tokens = @(Split-WindowsRecoveryCommandLine ([string]$Process.CommandLine))
     if ($tokens.Count -ne $Descriptor.Arguments.Count + 1) { return $false }
-    if (-not [string]::Equals($tokens[0], $Descriptor.Executable, [StringComparison]::OrdinalIgnoreCase) -and
+    if (-not [string]::Equals((Resolve-WindowsGatewayNodePath $tokens[0]), $Descriptor.Executable, [StringComparison]::OrdinalIgnoreCase) -and
         -not [string]::Equals($tokens[0], [IO.Path]::GetFileName($Descriptor.Executable), [StringComparison]::OrdinalIgnoreCase)) { return $false }
     for ($index = 0; $index -lt $Descriptor.Arguments.Count; $index++) {
         if ($tokens[$index + 1] -cne $Descriptor.Arguments[$index]) { return $false }
@@ -1097,8 +1107,7 @@ function Get-WindowsRecoveryOrphanDescriptors {
         $records = @(Get-Content -LiteralPath $state | Where-Object { $_ -like 'node_resolved=*' })
         if ($records.Count -gt 1) { throw 'Gateway recovery runtime identity is ambiguous.' }
         if ($records.Count -eq 1) {
-            $node = $records[0].Substring(14)
-            if ($node -match '^/([A-Za-z])/(.*)$') { $node = $Matches[1] + ':\' + $Matches[2].Replace('/', '\') }
+            $node = Resolve-WindowsGatewayNodePath $records[0].Substring(14)
             if ($node -notmatch '^[A-Za-z]:[\\/]') { throw 'Gateway recovery runtime identity is invalid.' }
             $node = [IO.Path]::GetFullPath($node)
         }
@@ -1140,7 +1149,7 @@ function Stop-OwnedGatewayForRecovery {
     if (-not [string]::IsNullOrWhiteSpace($registration.TaskXml)) {
         $exec = Get-GatewayTaskExec $registration.TaskXml
         if ($null -eq $exec) { throw 'Gateway recovery task identity is unavailable.' }
-        $executable = $exec.Command
+        $executable = Resolve-WindowsGatewayNodePath $exec.Command
         if ($executable -ieq 'wscript.exe') { $executable = Join-Path ([Environment]::SystemDirectory) 'wscript.exe' }
         if (-not [IO.Path]::IsPathRooted($executable)) { throw 'Gateway recovery task executable is not absolute.' }
         $arguments = @(Split-WindowsRecoveryCommandLine ('placeholder.exe ' + $exec.Arguments) | Select-Object -Skip 1)
