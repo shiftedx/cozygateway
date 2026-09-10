@@ -23,6 +23,11 @@ function modelClient() {
   let delegationBaseUrl = "";
   let delegationEffort = "medium";
   let delegationLimit = 12;
+  let visionModel = "google/gemini-2.5-flash";
+  let visionProvider = "openrouter";
+  let visionBaseUrl = "";
+  let visionApiKey = "vision-secret";
+  let visionCompression = "on";
   const calls: Array<{ path: string; method: string; body: unknown }> = [];
   const client = {
     dashboardJson: async (path: string, init: { method?: "GET" | "POST" | "PUT"; body?: unknown } = {}) => {
@@ -35,6 +40,7 @@ function modelClient() {
               model?: unknown;
               agent?: { reasoning_effort?: unknown };
               delegation?: { model?: unknown; provider?: unknown; base_url?: unknown };
+              auxiliary?: { vision?: { model?: unknown; provider?: unknown; base_url?: unknown; api_key?: unknown } };
             };
           }).config;
           if (patch.model === "") {
@@ -47,6 +53,13 @@ function modelClient() {
             if (typeof patch.delegation.provider === "string") subagentProvider = patch.delegation.provider;
             if (typeof patch.delegation.base_url === "string") delegationBaseUrl = patch.delegation.base_url;
           }
+          if (patch.auxiliary?.vision !== undefined) {
+            const vision = patch.auxiliary.vision;
+            if (typeof vision.model === "string") visionModel = vision.model;
+            if (typeof vision.provider === "string") visionProvider = vision.provider;
+            if (typeof vision.base_url === "string") visionBaseUrl = vision.base_url;
+            if (typeof vision.api_key === "string") visionApiKey = vision.api_key;
+          }
           return { ok: true };
         }
         return {
@@ -58,6 +71,10 @@ function modelClient() {
             base_url: delegationBaseUrl,
             reasoning_effort: delegationEffort,
             max_iterations: delegationLimit,
+          },
+          auxiliary: {
+            vision: { model: visionModel, provider: visionProvider, base_url: visionBaseUrl, api_key: visionApiKey },
+            compression: visionCompression,
           },
         };
       }
@@ -88,6 +105,7 @@ function modelClient() {
     client,
     calls,
     delegation: () => ({ model: subagentModel, provider: subagentProvider, baseUrl: delegationBaseUrl, effort: delegationEffort, limit: delegationLimit }),
+    vision: () => ({ model: visionModel, provider: visionProvider, baseUrl: visionBaseUrl, apiKey: visionApiKey, compression: visionCompression }),
   };
 }
 
@@ -248,6 +266,96 @@ describe("Hermes model config", () => {
     expect(updated.subagentModel).toBeUndefined();
     // Editing the primary must not erase an unsupported direct delegation override.
     expect(configWrites).toBe(0);
+  });
+
+  it("reads, selects and clears the auxiliary vision pin without touching its credential", async () => {
+    const { client, calls, vision } = modelClient();
+    expect(await readBotModelConfig(client, "scout")).toMatchObject({
+      visionModel: "openrouter:google/gemini-2.5-flash",
+    });
+
+    await expect(writeBotModelConfig(client, "scout", { visionModel: "missing:model" })).rejects.toBeInstanceOf(
+      ModelConfigInvalid,
+    );
+    expect(calls.filter((call) => call.method !== "GET")).toHaveLength(0);
+
+    const chosen = await writeBotModelConfig(client, "scout", {
+      visionModel: "openrouter:anthropic/claude-sonnet-4",
+    });
+    expect(chosen.visionModel).toBe("openrouter:anthropic/claude-sonnet-4");
+    // base_url cleared for the same precedence reason delegation clears it; api_key and the
+    // sibling auxiliary settings are never in the patch, so Hermes keeps them.
+    expect(vision()).toEqual({
+      model: "anthropic/claude-sonnet-4", provider: "openrouter", baseUrl: "",
+      apiKey: "vision-secret", compression: "on",
+    });
+
+    expect(await writeBotModelConfig(client, "scout", { visionModel: null })).toMatchObject({ visionModel: null });
+    expect(vision()).toEqual({ model: "", provider: "", baseUrl: "", apiKey: "vision-secret", compression: "on" });
+  });
+
+  it("omits an unrepresentable vision pin instead of misstating it as selectable", async () => {
+    const clientFor = (vision: Record<string, unknown>) => ({
+      dashboardJson: async (path: string) => path.startsWith("/api/config?")
+        ? { model: "anthropic/claude-sonnet-4", auxiliary: { vision } }
+        : {
+            model: "anthropic/claude-sonnet-4",
+            provider: "openrouter",
+            providers: [{
+              slug: "openrouter", name: "OpenRouter", authenticated: true,
+              models: ["anthropic/claude-sonnet-4", "google/gemini-2.5-flash"],
+            }, {
+              slug: "vertex", name: "Vertex AI", authenticated: true,
+              models: ["gemini-2.5-flash"],
+            }],
+          },
+    }) as HermesClient;
+
+    // A provider-only pin resolves that provider's own default vision model, which
+    // /api/model/options does not report.
+    const providerOnly = await readBotModelConfig(clientFor({ provider: "openrouter", model: "" }), "scout");
+    expect(providerOnly.model).toBe("openrouter:anthropic/claude-sonnet-4");
+    expect(providerOnly.visionModel).toBeUndefined();
+    // A non-native base_url takes precedence and carries its own credential.
+    const direct = await readBotModelConfig(
+      clientFor({ base_url: "https://vision.example.test/v1", model: "google/gemini-2.5-flash" }), "scout",
+    );
+    expect(direct.visionModel).toBeUndefined();
+    // A base_url on a native-SDK provider is not a direct-endpoint override: Hermes routes it by
+    // provider/model through its own SDK, so the pin keeps its catalog identity.
+    const nativeSdk = await readBotModelConfig(
+      clientFor({ provider: "vertex", base_url: "https://vertex.example.test/v1", model: "gemini-2.5-flash" }),
+      "scout",
+    );
+    expect(nativeSdk.visionModel).toBe("vertex:gemini-2.5-flash");
+    // A profile with no auxiliary block at all is not a pin: it is the default, and it is editable.
+    const none = await readBotModelConfig({
+      dashboardJson: async (path: string) => path.startsWith("/api/config?")
+        ? { model: "anthropic/claude-sonnet-4" }
+        : {
+            model: "anthropic/claude-sonnet-4", provider: "openrouter",
+            providers: [{ slug: "openrouter", name: "OpenRouter", authenticated: true, models: ["anthropic/claude-sonnet-4"] }],
+          },
+    } as HermesClient, "scout");
+    expect(none.visionModel).toBeNull();
+  });
+
+  it("qualifies a provider-inheriting vision model with the primary provider", async () => {
+    const client = {
+      dashboardJson: async (path: string) => path.startsWith("/api/config?")
+        ? {
+            model: "anthropic/claude-sonnet-4",
+            auxiliary: { vision: { model: "google/gemini-2.5-flash", provider: "" } },
+          }
+        : {
+            model: "anthropic/claude-sonnet-4", provider: "openrouter",
+            providers: [{
+              slug: "openrouter", name: "OpenRouter", authenticated: true,
+              models: ["anthropic/claude-sonnet-4", "google/gemini-2.5-flash"],
+            }],
+          },
+    } as HermesClient;
+    expect((await readBotModelConfig(client, "scout")).visionModel).toBe("openrouter:google/gemini-2.5-flash");
   });
 
   it("keeps every configured provider visible: unauthenticated rows stay marked, empty rows stay summarized", async () => {

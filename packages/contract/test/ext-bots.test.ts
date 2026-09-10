@@ -746,6 +746,15 @@ describe("bot model config", () => {
       model: null, effort: null, catalog: [], efforts: [],
       subagentModel: null, subagentModelConfigurable: true,
     })).toBe(true);
+    expect(check(BotModelConfigPatchSchema, { visionModel: "provider:vision" })).toBe(true);
+    expect(check(BotModelConfigPatchSchema, { visionModel: null })).toBe(true);
+    for (const visionModel of [1, "", "   "]) {
+      expect(check(BotModelConfigPatchSchema, { visionModel })).toBe(false);
+    }
+    expect(check(BotModelConfigSchema, {
+      model: null, effort: null, catalog: [], efforts: [],
+      visionModel: null, visionModelConfigurable: true,
+    })).toBe(true);
   });
 
   it("keeps capability 41 provider setup valid without the harness-level models field", () => {

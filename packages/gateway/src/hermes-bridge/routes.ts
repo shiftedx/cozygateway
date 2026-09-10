@@ -138,7 +138,9 @@ export const HERMES_PROFILE_NOT_FOUND = 4064;
 function modelConfigResponse(config: BotModelConfig): BotModelConfig {
   const response = { ...config };
   delete response.subagentModelConfigurable;
+  delete response.visionModelConfigurable;
   if (config.subagentModel !== undefined) response.subagentModelConfigurable = true;
+  if (config.visionModel !== undefined) response.visionModelConfigurable = true;
   return response;
 }
 
@@ -1262,18 +1264,28 @@ export function registerBotRoutes(
         err instanceof ContractViolation ? err.message : "malformed body";
       return c.json(errorBody("invalid_request", detail), 400);
     }
-    if (parsed.model === undefined && parsed.effort === undefined && parsed.subagentModel === undefined) {
+    if (parsed.model === undefined && parsed.effort === undefined
+        && parsed.subagentModel === undefined && parsed.visionModel === undefined) {
       return c.json(
         errorBody(
           "invalid_request",
-          "at least one of model, effort, or subagentModel is required",
+          "at least one of model, effort, subagentModel, or visionModel is required",
         ),
         400,
       );
     }
     try {
-      if (parsed.subagentModel !== undefined && (await bots.modelConfig(resolved.name)).subagentModel === undefined) {
-        return c.json(errorBody("invalid_request", "subagent model configuration is unavailable for this bot"), 400);
+      // One fresh read answers for both additive fields, and it happens BEFORE any write: a runtime
+      // that does not expose a setting must not have its primary model changed by a request whose
+      // real subject was refused.
+      if (parsed.subagentModel !== undefined || parsed.visionModel !== undefined) {
+        const current = await bots.modelConfig(resolved.name);
+        if (parsed.subagentModel !== undefined && current.subagentModel === undefined) {
+          return c.json(errorBody("invalid_request", "subagent model configuration is unavailable for this bot"), 400);
+        }
+        if (parsed.visionModel !== undefined && current.visionModel === undefined) {
+          return c.json(errorBody("invalid_request", "vision model configuration is unavailable for this bot"), 400);
+        }
       }
       return c.json(modelConfigResponse(await bots.configureModel(resolved.name, parsed)));
     } catch (err) {

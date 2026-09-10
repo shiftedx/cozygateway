@@ -18,8 +18,8 @@ export const HERMES_REASONING_EFFORTS = [
 
 // Keep this in sync with Hermes' delegate_tool_config._NATIVE_SDK_PROVIDERS. A base URL is a
 // direct-endpoint override for every other provider, so its model identity cannot be recovered
-// from the Dashboard picker catalog.
-const HERMES_DELEGATION_NATIVE_SDK_PROVIDERS = new Set(["bedrock", "vertex", "google", "google-genai"]);
+// from the Dashboard picker catalog. The same rule governs `auxiliary.vision`.
+const HERMES_NATIVE_SDK_PROVIDERS = new Set(["bedrock", "vertex", "google", "google-genai"]);
 
 export class ModelConfigInvalid extends Error {
   constructor(message: string) {
@@ -45,6 +45,7 @@ interface HermesModelOptions {
 
 interface HermesWebConfig {
   agent?: unknown;
+  auxiliary?: unknown;
   delegation?: unknown;
   model?: unknown;
 }
@@ -227,6 +228,38 @@ function providersOf(options: HermesModelOptions, choices: ModelChoice[]): BotMo
   });
 }
 
+/** One Hermes sub-model pin — the `delegation` block or `auxiliary.vision` — read as a catalog id.
+ *
+ *  `representable: false` means the pin exists but has no identity in the Dashboard picker catalog,
+ *  so the field is omitted from the response entirely and the client hides its control rather than
+ *  misstating a live pin as selectable. Two shapes are unrepresentable: a non-empty `base_url` on
+ *  anything but a native-SDK provider (Hermes gives the URL precedence and routes it by
+ *  heuristics, and its credential is live), and a provider-only pin (Hermes resolves that
+ *  provider's own default model, which `/api/model/options` does not report).
+ *
+ *  `id` is `null` for an empty block, which is Hermes' "inherit"/"unset" and this contract's
+ *  "default". A model with no provider is still a real override: Hermes keeps the parent provider,
+ *  so the id is qualified with `primaryProvider` here. */
+function pinOf(
+  block: Record<string, unknown> | undefined,
+  primaryProvider: string,
+  choices: readonly ModelChoice[],
+): { representable: boolean; id: string | null } {
+  const model = typeof block?.["model"] === "string" ? block["model"].trim() : "";
+  const provider = typeof block?.["provider"] === "string" ? block["provider"].trim() : "";
+  const baseUrl = typeof block?.["base_url"] === "string" ? block["base_url"].trim() : "";
+  const usesDirectEndpoint = baseUrl !== "" && !HERMES_NATIVE_SDK_PROVIDERS.has(provider.toLowerCase());
+  const effectiveProvider = provider || primaryProvider;
+  const matched = model && effectiveProvider
+    ? choices.find((choice) => choice.model === model &&
+        (choice.provider === effectiveProvider || choice.aliases.includes(effectiveProvider)))
+    : undefined;
+  return {
+    representable: !usesDirectEndpoint && (model !== "" || provider === ""),
+    id: model && effectiveProvider ? (matched?.id ?? `${effectiveProvider}:${model}`) : null,
+  };
+}
+
 async function readHermesModelState(
   client: HermesClient,
   name: string,
@@ -263,33 +296,12 @@ function responseOf(state: {
   const agent = asRecord(state.config.agent);
   const rawEffort = agent?.["reasoning_effort"];
   const effort = typeof rawEffort === "string" && rawEffort.trim() ? rawEffort.trim().toLowerCase() : null;
-  const delegation = asRecord(state.config.delegation);
-  const delegatedModel = typeof delegation?.["model"] === "string" ? delegation["model"].trim() : "";
-  const delegatedProvider = typeof delegation?.["provider"] === "string" ? delegation["provider"].trim() : "";
-  const delegatedBaseUrl = typeof delegation?.["base_url"] === "string" ? delegation["base_url"].trim() : "";
-  const delegationUsesDirectEndpoint = delegatedBaseUrl !== "" &&
-    !HERMES_DELEGATION_NATIVE_SDK_PROVIDERS.has(delegatedProvider.toLowerCase());
-  // Hermes gives delegation.base_url precedence over delegation.provider and takes its actual
-  // provider from URL heuristics. The Dashboard model catalog has no corresponding identity, so
-  // returning a catalog-shaped string would misstate a live direct-endpoint pin as selectable.
-  // A provider-only pin resolves the provider's own default model at delegation time. It is not
-  // inheritance, but that model is likewise absent from the profile picker response.
-  const delegationModelIsRepresentable = !delegationUsesDirectEndpoint &&
-    (delegatedModel !== "" || delegatedProvider === "");
-  // Hermes treats an empty provider/model pair as inherit-parent. A model with no provider is
-  // still a real override: Hermes retains the parent provider, which we qualify on the wire.
-  const effectiveDelegatedProvider = delegatedProvider || provider;
-  const delegated = delegatedModel && effectiveDelegatedProvider
-    ? state.choices.find((choice) => choice.model === delegatedModel &&
-        (choice.provider === effectiveDelegatedProvider || choice.aliases.includes(effectiveDelegatedProvider)))
-    : undefined;
+  const delegation = pinOf(asRecord(state.config.delegation), provider, state.choices);
+  const vision = pinOf(asRecord(asRecord(state.config.auxiliary)?.["vision"]), provider, state.choices);
   return {
     model: configuredModel && provider && model ? (selected?.id ?? `${provider}:${model}`) : null,
-    ...(delegationModelIsRepresentable ? {
-      subagentModel: delegatedModel && effectiveDelegatedProvider
-        ? (delegated?.id ?? `${effectiveDelegatedProvider}:${delegatedModel}`)
-        : null,
-    } : {}),
+    ...(delegation.representable ? { subagentModel: delegation.id } : {}),
+    ...(vision.representable ? { visionModel: vision.id } : {}),
     effort,
     catalog: state.choices.map(({ id, displayName, unauthenticated }) => ({
       id,
@@ -317,11 +329,17 @@ export async function writeBotModelConfig(
   const subagentChoice = patch.subagentModel == null
     ? undefined
     : state.choices.find((entry) => entry.id === patch.subagentModel);
+  const visionChoice = patch.visionModel == null
+    ? undefined
+    : state.choices.find((entry) => entry.id === patch.visionModel);
   if (patch.model !== undefined && patch.model !== null && choice === undefined) {
     throw new ModelConfigInvalid(`unknown model: ${patch.model}`);
   }
   if (patch.subagentModel !== undefined && patch.subagentModel !== null && subagentChoice === undefined) {
     throw new ModelConfigInvalid(`unknown subagent model: ${patch.subagentModel}`);
+  }
+  if (patch.visionModel !== undefined && patch.visionModel !== null && visionChoice === undefined) {
+    throw new ModelConfigInvalid(`unknown vision model: ${patch.visionModel}`);
   }
   if (
     patch.effort !== undefined &&
@@ -345,6 +363,19 @@ export async function writeBotModelConfig(
     configPatch["delegation"] = patch.subagentModel === null
       ? { provider: "", model: "", base_url: "" }
       : { provider: subagentChoice!.provider, model: subagentChoice!.model, base_url: "" };
+  }
+  if (patch.visionModel !== undefined) {
+    // `auxiliary.vision` is what Hermes' `vision_analyze` asks when the primary model cannot accept
+    // an image. `api_key` is deliberately absent from this patch: the profile-aware config endpoint
+    // deep-merges the leaf, so an omitted key keeps the credential the operator configured, and the
+    // sibling auxiliary settings (compression, web_extract, image_gen) are untouched. `base_url` is
+    // cleared for the same precedence reason delegation clears it — Hermes gives it precedence over
+    // the provider pin, so retaining it would make an apparent select or reset a silent no-op.
+    configPatch["auxiliary"] = {
+      vision: patch.visionModel === null
+        ? { provider: "", model: "", base_url: "" }
+        : { provider: visionChoice!.provider, model: visionChoice!.model, base_url: "" },
+    };
   }
   if (Object.keys(configPatch).length > 0) {
     await client.dashboardJson(`/api/config?${query}`, { method: "PUT", body: { config: configPatch } });

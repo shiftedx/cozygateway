@@ -180,6 +180,18 @@ describe("attach-v1 config lane", () => {
     peer.ws.close();
   });
 
+  it("carries vision model reads, selection, and reset over the runtime config lane", async () => {
+    const configured = { ...modelConfig, visionModel: "provider:vision" };
+    const peer = await dial({ "model.read": configured, "model.write": configured });
+    await expect(config.modelConfig("sage")).resolves.toEqual(configured);
+    await expect(config.configureModel("sage", { visionModel: "provider:vision" })).resolves.toEqual(configured);
+    await config.configureModel("sage", { visionModel: null });
+    expect(peer.requests.filter((request) => request.operation === "model.write").map((request) => request.input)).toEqual([
+      { visionModel: "provider:vision" }, { visionModel: null },
+    ]);
+    peer.ws.close();
+  });
+
   it("uses the independently negotiated chat configuration capability", async () => {
     const configuration = { sessionId: "session-1", workspace: null, model: null };
     const peer = await dial({
