@@ -183,6 +183,9 @@ describe("bot model config", () => {
       effort: "high",
       subagentModel: null,
       subagentModelConfigurable: true,
+      // The Hermes fixture pins no auxiliary.vision block, which is the default, not an
+      // unrepresentable pin, so the additive field reads null rather than being omitted.
+      visionModel: null,
       catalog: [
         { id: "openrouter:anthropic/claude-sonnet-4", displayName: "OpenRouter: anthropic/claude-sonnet-4" },
         { id: "openrouter:google/gemini-2.5-flash", displayName: "OpenRouter: google/gemini-2.5-flash" },
