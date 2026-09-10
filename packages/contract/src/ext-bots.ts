@@ -1545,6 +1545,11 @@ export const BotModelConfigSchema = Type.Object({
   subagentModel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
   /** Added by the HTTP route only when both Gateway and runtime support writes. */
   subagentModelConfigurable: Type.Optional(Type.Boolean()),
+  /** Absent on older runtimes; null clears the runtime's vision override, leaving image analysis
+   *  to the primary model when it can see one and absent when it cannot. */
+  visionModel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  /** Added by the HTTP route only when both Gateway and runtime support writes. */
+  visionModelConfigurable: Type.Optional(Type.Boolean()),
   catalog: Type.Array(BotModelCatalogEntrySchema),
   efforts: Type.Array(Type.String()),
   providers: Type.Optional(Type.Array(BotModelProviderSchema)),
@@ -1556,6 +1561,7 @@ export const BotModelConfigPatchSchema = Type.Object({
   model: Type.Optional(Type.Union([Type.String(), Type.Null()])),
   effort: Type.Optional(Type.Union([Type.String(), Type.Null()])),
   subagentModel: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 512, pattern: "\\S" }), Type.Null()])),
+  visionModel: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 512, pattern: "\\S" }), Type.Null()])),
 });
 export type BotModelConfigPatch = Static<typeof BotModelConfigPatchSchema>;
 
