@@ -683,6 +683,9 @@ export class NativeBotDataPlane {
       // A custom primary model is owned by the attached runtime, while Hermes owns delegation.
       // Keep the two selections independent so a custom-primary bot can still pin its children.
       subagentModel: builtin.subagentModel,
+      // Hermes owns `auxiliary.vision` exactly as it owns delegation: a gateway-only custom primary
+      // model changes neither, so a custom-primary bot can still pin the model that reads its images.
+      visionModel: builtin.visionModel,
       effort: custom.model ? custom.effort ?? builtin.effort : builtin.effort,
       catalog: [...builtin.catalog, ...custom.catalog.filter((entry) => !builtin.catalog.some((existing) => existing.id === entry.id))],
       efforts: [...new Set([...builtin.efforts, ...custom.efforts])],
@@ -697,6 +700,7 @@ export class NativeBotDataPlane {
     const hermesPatch: BotModelConfigPatch = {
       ...(patch.effort === undefined ? {} : { effort: patch.effort }),
       ...(patch.subagentModel === undefined ? {} : { subagentModel: patch.subagentModel }),
+      ...(patch.visionModel === undefined ? {} : { visionModel: patch.visionModel }),
     };
     if (!custom && patch.model !== undefined) hermesPatch.model = patch.model;
     if (custom) {

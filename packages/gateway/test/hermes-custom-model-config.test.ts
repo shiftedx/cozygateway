@@ -8,11 +8,13 @@ import { openStorage } from "../src/storage.ts";
 it("combines Hermes builtin and saved endpoint models and writes defaults to their owner", async () => {
   const storage = openStorage(":memory:");
   const builtin: BotModelConfig = {
-    model: "openai:example", subagentModel: "openai:child", effort: "medium",
+    model: "openai:example", subagentModel: "openai:child", visionModel: "openai:eyes", effort: "medium",
     catalog: [
       { id: "openai:example", displayName: "Example" },
       { id: "openai:child", displayName: "Child" },
       { id: "openai:child-next", displayName: "Child next" },
+      { id: "openai:eyes", displayName: "Eyes" },
+      { id: "openai:eyes-next", displayName: "Eyes next" },
     ],
     efforts: ["medium"],
   };
@@ -21,6 +23,7 @@ it("combines Hermes builtin and saved endpoint models and writes defaults to the
   const configureModel = vi.fn(async (_bot: string, patch: BotModelConfigPatch) => {
     if (patch.model !== undefined) builtin.model = patch.model;
     if (patch.subagentModel !== undefined) builtin.subagentModel = patch.subagentModel;
+    if (patch.visionModel !== undefined) builtin.visionModel = patch.visionModel;
     if (patch.effort !== undefined) builtin.effort = patch.effort;
     return builtin;
   });
@@ -33,7 +36,7 @@ it("combines Hermes builtin and saved endpoint models and writes defaults to the
     ingress: { negotiatedCapabilities: () => new Set(["provider_connections"]) } as never,
   });
   try {
-    expect((await plane.surface().modelConfig("sage")).catalog).toHaveLength(4);
+    expect((await plane.surface().modelConfig("sage")).catalog).toHaveLength(6);
     expect((await plane.surface().configureModel("sage", { model: customModel, effort: "high" })).model).toBe(customModel);
     expect(configureModel).toHaveBeenCalledWith("sage", { effort: "high" });
     expect(customWrite).toHaveBeenCalledWith("sage", { model: customModel });
@@ -41,6 +44,11 @@ it("combines Hermes builtin and saved endpoint models and writes defaults to the
       .toBe("openai:child-next");
     expect(configureModel).toHaveBeenLastCalledWith("sage", { subagentModel: "openai:child-next" });
     // Child-only changes route to Hermes even while the primary stays on the attached runtime.
+    expect(customWrite).toHaveBeenCalledTimes(1);
+    expect((await plane.surface().configureModel("sage", { visionModel: "openai:eyes-next" })).visionModel)
+      .toBe("openai:eyes-next");
+    expect(configureModel).toHaveBeenLastCalledWith("sage", { visionModel: "openai:eyes-next" });
+    // Hermes owns auxiliary.vision even while the primary stays on the attached runtime.
     expect(customWrite).toHaveBeenCalledTimes(1);
     expect((await plane.surface().configureModel("sage", { model: "openai:example" })).model).toBe("openai:example");
     expect(selected).toBeNull();
