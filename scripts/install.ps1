@@ -37,8 +37,9 @@ $ProgressPreference = 'SilentlyContinue'
 $PSNativeCommandUseErrorActionPreference = $false
 
 $script:CozyAgentsInstallUrlDefault = 'https://cozylabs.ai/agents.ps1'
-# CozyAgents v0.2.16 agents.ps1; verified against the release asset digest.
-$script:CozyAgentsInstallSha256Default = 'e20c60eeaa763757daa48479fed10405a9be11caa9ca7bd8698dfaaa92cec3cd'
+# CozyAgents v0.2.17 agents.ps1; verified against the release asset digest. v0.2.16 is the one
+# release this must never be left pointing at: it could not install on Windows at all.
+$script:CozyAgentsInstallSha256Default = '0c6b7980928cf3171ef6e3909e24c14c120ff76d99a52d41e294e1ee7fcbd8bb'
 # Initialized here so Release-BootstrapLock can read them under StrictMode without a cmdlet,
 # including on a path where the lock was never acquired.
 $script:BootstrapLockHandle = $null
