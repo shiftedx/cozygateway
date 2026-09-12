@@ -39,6 +39,10 @@ $PSNativeCommandUseErrorActionPreference = $false
 $script:CozyAgentsInstallUrlDefault = 'https://cozylabs.ai/agents.ps1'
 # CozyAgents v0.2.16 agents.ps1; verified against the release asset digest.
 $script:CozyAgentsInstallSha256Default = 'e20c60eeaa763757daa48479fed10405a9be11caa9ca7bd8698dfaaa92cec3cd'
+# Initialized here so Release-BootstrapLock can read them under StrictMode without a cmdlet,
+# including on a path where the lock was never acquired.
+$script:BootstrapLockHandle = $null
+$script:BootstrapLockOwnerPath = ''
 $script:PromptAnswers = @{}
 $script:PromptIndex = @{}
 
@@ -462,14 +466,49 @@ function Acquire-BootstrapLock {
     # Keep the file after releasing it. Unlinking a lock allows separate owners
     # to hold handles to different files. Windows releases this handle on crash.
     Assert-BootstrapRegularFile $script:BootstrapLockPath 'lock'
+    # The lock itself is opened FileShare::None, so a blocked run cannot read it to learn who
+    # holds it. The owner's process id goes in a readable sidecar instead: without it the only
+    # way to identify the holder is a handle-table scan, and the usual answers -- Restart Manager,
+    # FileProcessIdsUsingFileInformation -- report nothing at all for this handle.
+    $ownerPath = "$($script:BootstrapLockPath).owner"
     try { $script:BootstrapLockHandle = [IO.File]::Open($script:BootstrapLockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
-    catch { Fail 'another CozyGateway bootstrap is running or its lock is unavailable; wait for it to finish and rerun' }
+    catch {
+        $owner = Get-BootstrapLockOwner $ownerPath
+        if ($owner) { Fail "another CozyGateway bootstrap is running in process $owner; wait for it to finish, or close that window, and rerun" }
+        Fail 'another CozyGateway bootstrap is running or its lock is unavailable; wait for it to finish and rerun'
+    }
+    Assert-BootstrapRegularFile $ownerPath 'lock owner'
+    try { [IO.File]::WriteAllText($ownerPath, "$PID`n") } catch { }
+    $script:BootstrapLockOwnerPath = $ownerPath
 }
 
+# The recorded owner, but only if that process is still alive: a lock file outlives a crash, and
+# naming a process id that has since been reused would send someone after the wrong window.
+function Get-BootstrapLockOwner {
+    param([string] $OwnerPath)
+    try {
+        $recorded = 0
+        if (-not [int]::TryParse(([IO.File]::ReadAllText($OwnerPath)).Trim(), [ref] $recorded)) { return '' }
+        if ($recorded -le 0 -or $recorded -eq $PID) { return '' }
+        if ($null -eq (Get-Process -Id $recorded -ErrorAction SilentlyContinue)) { return '' }
+        return "$recorded"
+    } catch { return '' }
+}
+
+# Runs from `finally`, including while a Ctrl+C is unwinding the pipeline. A cmdlet called there
+# throws PipelineStoppedException and abandons the rest of the block, which is how an interrupted
+# install used to leave this handle open for the life of the shell -- every later install and
+# `cozygateway repair`, in any window, then failed with "another CozyGateway bootstrap is running"
+# until that window was closed. So this touches nothing but .NET and swallows what it cannot fix.
 function Release-BootstrapLock {
-    if (Get-Variable -Name BootstrapLockHandle -Scope Script -ErrorAction SilentlyContinue) {
-        if ($null -ne $script:BootstrapLockHandle) { $script:BootstrapLockHandle.Dispose(); $script:BootstrapLockHandle = $null }
-    }
+    # Read through the session state rather than $script:Name so an unset variable is $null
+    # instead of a StrictMode error: this function must not be able to throw.
+    $handle = $ExecutionContext.SessionState.PSVariable.GetValue('script:BootstrapLockHandle')
+    $script:BootstrapLockHandle = $null
+    if ($null -ne $handle) { try { $handle.Dispose() } catch { } }
+    $ownerPath = $ExecutionContext.SessionState.PSVariable.GetValue('script:BootstrapLockOwnerPath')
+    $script:BootstrapLockOwnerPath = ''
+    if ($ownerPath) { try { [IO.File]::Delete($ownerPath) } catch { } }
 }
 
 function Assert-BootstrapPath {
@@ -3287,9 +3326,11 @@ try {
     }
     $global:LASTEXITCODE = 0
 } finally {
+    # The lock goes first. Everything below it is cmdlets, and a cmdlet that throws while the
+    # pipeline is stopping takes the rest of this block with it -- leaving the lock held.
+    Release-BootstrapLock
     if ($stage -and (Test-Path -LiteralPath $stage)) {
         Assert-BootstrapTreeSafe $stage
         Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     }
-    Release-BootstrapLock
 }
