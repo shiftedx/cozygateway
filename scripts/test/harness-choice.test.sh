@@ -212,6 +212,17 @@ expect_contains "$live_output" 'default model for new bots: gpt-5.6-luna on open
 config="$tmp/gw-live/local/cozygateway.config.json"
 grep -Fq '"host": "0.0.0.0"' "$config"
 if grep -q 'hermesEndpoints' "$config"; then echo 'a CozyAgents gateway must have no hermesEndpoints' >&2; exit 1; fi
+node - "$config" <<'NODE'
+const fs = require('node:fs');
+const path = process.argv[2];
+const config = JSON.parse(fs.readFileSync(path, 'utf8'));
+// This is the exact config presence gate used by gatewayInfoForConfig for
+// com.cozylabs.push-proxy. Docker supplies it by environment; fresh native
+// configs must carry the hosted relay themselves.
+if (config.pushRelayUrl !== 'https://push.cozylabs.ai') process.exit(1);
+config.pushRelayUrl = 'https://push.operator.example';
+fs.writeFileSync(path, JSON.stringify(config));
+NODE
 grep -Fq 'harness=cozyagents' "$tmp/gw-live/local/install-state"
 
 # The model answers landed in the runner env CozyAgents reads, at 0600, with no key.
@@ -262,6 +273,10 @@ expect_contains "$rerun_output" 'no new pairing code created'
 expect_missing "$rerun_output" 'fake-qr'
 expect_contains "$rerun_output" 'already paired to CozyGateway as a runner'
 if grep -Fq 'runner pair' "$tmp/agents.log"; then echo 'a rerun must not re-pair the runner' >&2; exit 1; fi
+node - "$config" <<'NODE'
+const fs = require('node:fs');
+if (JSON.parse(fs.readFileSync(process.argv[2], 'utf8')).pushRelayUrl !== 'https://push.operator.example') process.exit(1);
+NODE
 
 # The QR question answered yes mints a new code; --no-qr never asks or prints one.
 printf 'yes\n' > "$tmp/pair-yes"

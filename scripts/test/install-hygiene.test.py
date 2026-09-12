@@ -98,9 +98,23 @@ esac
         self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
         return result
 
+    def assert_push_proxy_capability(self):
+        result = subprocess.run([
+            self.node, "--input-type=module", "--eval", '''
+import { readFileSync } from "node:fs";
+import { gatewayInfoForConfig, PUSH_PROXY_CAPABILITY_ID, PUSH_PROXY_CAPABILITY_VERSION } from "./packages/gateway/dist/server.js";
+const config = JSON.parse(readFileSync(process.argv[1], "utf8"));
+if (gatewayInfoForConfig(config).capabilities?.[PUSH_PROXY_CAPABILITY_ID] !== PUSH_PROXY_CAPABILITY_VERSION) process.exit(1);
+''', str(self.config),
+        ], cwd=ROOT, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def assert_repaired(self):
         config = json.loads(self.config.read_text())
         self.assertEqual(list(config["hermesEndpoints"][0]["profiles"]), ["keeper"])
+        # The generated native config is the push-proxy capability boundary.
+        # Docker supplies this via its own env; native installers must write it.
+        self.assertIn("pushRelayUrl", config)
         self.assertEqual(config["operatorSetting"], {"preserve": True})
         self.assertNotIn("COZYGATEWAY_ATTACH_TOKEN_RETIRED=", self.envfile.read_text())
         self.assertIn("COZYGATEWAY_ATTACH_TOKEN_KEEPER=" + self.keeper_token, self.envfile.read_text())
@@ -132,6 +146,41 @@ exec '{real_mv}' "$@"
             result = subprocess.run([str(self.gateway / "bin/cozygateway"), command], env=self.env, capture_output=True, text=True, timeout=40)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assert_repaired()
+
+    def test_native_push_relay_default_and_custom_operator_relay_survive_reruns(self):
+        config = json.loads(self.config.read_text())
+        self.assertEqual(config.get("pushRelayUrl"), "https://push.cozylabs.ai")
+        self.assert_push_proxy_capability()
+
+        # This models a native install from before the relay was materialized.
+        # A normal one-line rerun repairs the generated config; runtime-only is
+        # deliberately excluded because it promises not to touch config.
+        del config["pushRelayUrl"]
+        self.config.write_text(json.dumps(config))
+        self.run_bootstrap("--no-qr")
+        self.assertEqual(json.loads(self.config.read_text())["pushRelayUrl"], "https://push.cozylabs.ai")
+        self.assert_push_proxy_capability()
+
+        # The installed CLI must repair the same legacy omission too, through
+        # both supported wrapper verbs rather than only through a new paste.
+        for command in ("repair", "update"):
+            config = json.loads(self.config.read_text())
+            del config["pushRelayUrl"]
+            self.config.write_text(json.dumps(config))
+            result = subprocess.run([str(self.gateway / "bin/cozygateway"), command], env=self.env, capture_output=True, text=True, timeout=40)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(json.loads(self.config.read_text())["pushRelayUrl"], "https://push.cozylabs.ai")
+            self.assert_push_proxy_capability()
+
+        config = json.loads(self.config.read_text())
+        config["pushRelayUrl"] = "https://push.operator.example"
+        self.config.write_text(json.dumps(config))
+        self.run_bootstrap("--no-qr")
+        self.assertEqual(json.loads(self.config.read_text())["pushRelayUrl"], "https://push.operator.example")
+        for command in ("repair", "update"):
+            result = subprocess.run([str(self.gateway / "bin/cozygateway"), command], env=self.env, capture_output=True, text=True, timeout=40)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(json.loads(self.config.read_text())["pushRelayUrl"], "https://push.operator.example")
 
     def test_zero_survivors_and_explicit_missing_scope_preserve_state(self):
         original = {path: path.read_bytes() for path in (self.state, self.config, self.envfile)}

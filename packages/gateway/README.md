@@ -78,6 +78,20 @@ or reverse proxy you set up and control remains a perfectly good alternative.
 | `publicUrl` | string | absent | Strict HTTPS origin advertised by `cozygateway pair` for a user-managed tunnel or reverse proxy. Requires an exact loopback `host`; startup fails before storage or the listener when either invariant is broken. |
 | `tls` | object | absent (plain HTTP) | `{ "certFile", "keyFile" }`, paths to a PEM certificate chain and its matching unencrypted key. Present means the listener serves HTTPS and `/ws` and `/attach/v1` become `wss`; absent means plain HTTP, unchanged. Overridable with `COZY_TLS_CERT_FILE` / `COZY_TLS_KEY_FILE`. Present-but-unusable (missing file, garbage PEM, encrypted key, key that does not match the certificate, only one of the two set) fails startup before the port binds rather than falling back to plaintext. See [`docs/tls.md`](../../docs/tls.md). |
 
+The native installer and Docker setup configure the CozyLabs hosted push relay at
+`https://push.cozylabs.ai`. Full native install and its normal repair/update commands
+fill in a missing relay setting while preserving a saved custom relay. Runtime-only
+repair/update deliberately leave configuration untouched. Hand-written configurations still need
+`pushRelayUrl` or `COZYGATEWAY_PUSH_RELAY_URL` to advertise push support.
+
+If CozyChat reports **Push unavailable**, check the gateway's `/health` response for
+`com.cozylabs.push-proxy: 1`. A missing capability means the gateway has no relay
+configured; notification permission on the phone cannot fix that. Rerun the current
+full installer or use a full installation’s repair/update command, then reconnect CozyChat and enable
+notifications. Remote Live Activity updates use the same relay, with a separate
+ActivityKit token. A local Live Activity starts during Bot Chat and also needs Live
+Activities enabled on the phone; it is independent of ordinary notification permission.
+
 ## Global Hermes skills
 
 When a gateway manages Hermes profiles and has proved the required Dashboard and

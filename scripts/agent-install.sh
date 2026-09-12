@@ -75,6 +75,11 @@ SERVICE_ACTIONS=()
 PLUGIN_CHANGED_PROFILES=()
 ENV_OWNER_KEY="COZYGATEWAY_INSTALLER_OWNER"
 ENV_OWNER_VALUE="cozylabs-v1"
+# Native installs have no compose environment to supply the hosted relay. Keep
+# this in the installer instead of the library config defaults: an operator who
+# writes a relay URL keeps that deployment choice, and an unconfigured library
+# instance still advertises no push proxy.
+PUSH_RELAY_URL_DEFAULT="https://push.cozylabs.ai"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'FAIL  %s\n' "$*" >&2; exit 1; }
@@ -1377,9 +1382,9 @@ write_cozyagents_gateway_config() {
   # kept bridge to the Hermes path before this runs, so reaching it with one still in the file is a
   # bug rather than a default; the check below fails closed either way.
   umask 077
-  "$NODE_RESOLVED" - "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$PUBLIC_URL" "$COZYAGENTS_CHOSEN" <<'NODE'
+  "$NODE_RESOLVED" - "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$PUBLIC_URL" "$COZYAGENTS_CHOSEN" "$PUSH_RELAY_URL_DEFAULT" <<'NODE'
 const fs = require('node:fs');
-const [output, host, port, dbPath, publicUrl, chosen] = process.argv.slice(2);
+const [output, host, port, dbPath, publicUrl, chosen, pushRelayUrl] = process.argv.slice(2);
 let existing = {};
 try {
   existing = JSON.parse(fs.readFileSync(output, 'utf8'));
@@ -1389,6 +1394,7 @@ try {
 }
 const managed = { name: 'cozygateway', host, port: Number(port), dbPath, ...(publicUrl === '' ? {} : { publicUrl }) };
 delete existing.publicUrl;
+if (existing.pushRelayUrl === undefined) managed.pushRelayUrl = pushRelayUrl;
 if (chosen === '1') {
   delete existing.hermesEndpoints;
   delete existing.hermes;
@@ -1440,9 +1446,9 @@ write_gateway_config() {
   umask 077; printf '{' > "$map"
   for p in "${SELECTED[@]}"; do env_name="$(token_env_name "$p")"; printf '%s\n' "$comma\"$p\":{\"tokenEnv\":\"$env_name\"}" >> "$map"; comma=,; done
   printf '}\n' >> "$map"
-  "$NODE_RESOLVED" - "$map" "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$DASHBOARD_PORT" "$PUBLIC_URL" <<'NODE'
+  "$NODE_RESOLVED" - "$map" "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$DASHBOARD_PORT" "$PUBLIC_URL" "$PUSH_RELAY_URL_DEFAULT" <<'NODE'
 const fs = require('node:fs');
-const [mapPath, output, host, port, dbPath, dashboardPort, publicUrl] = process.argv.slice(2);
+const [mapPath, output, host, port, dbPath, dashboardPort, publicUrl, pushRelayUrl] = process.argv.slice(2);
 const profiles = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
 let existing = {};
 try {
@@ -1456,6 +1462,7 @@ const managed = {
   hermesEndpoints: [{ id: 'default', url: `ws://127.0.0.1:${dashboardPort}/api/ws`, authMode: 'token', tokenEnv: 'COZYGATEWAY_HERMES_TOKEN', profile: 'default', profiles }],
 };
 delete existing.publicUrl;
+if (existing.pushRelayUrl === undefined) managed.pushRelayUrl = pushRelayUrl;
 const temporary = `${output}.new`;
 fs.writeFileSync(temporary, JSON.stringify({ ...existing, ...managed }, null, 2) + '\n', { mode: 0o600 });
 fs.renameSync(temporary, output);

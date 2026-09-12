@@ -5,6 +5,18 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## 0.8.4 (2026-09-12): enable push for native installations
+
+Native installations now configure the same hosted push relay as Docker. Previously,
+installing on a computer without an existing relay setting could leave CozyChat showing
+“Push unavailable” and prevent remote Live Activity updates. Full native install and its normal repair/update commands now fill in the missing
+setting while preserving a custom relay. Runtime-only repair leaves configuration untouched.
+
+Rerun the published installer (or the repair/update command for a full native install), reconnect CozyChat,
+and enable notifications when prompted. Live Activities also require the phone's Live
+Activities setting and an active Bot Chat run. This fixes the Gateway configuration path;
+it does not add background push to direct Hermes or OpenClaw connections.
+
 ## 0.8.1 (2026-09-08): subagent model settings and guided Windows setup
 
 CozyChat can now configure a separate subagent model during bot onboarding and in a bot’s
