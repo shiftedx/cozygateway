@@ -16,6 +16,7 @@ Rerun the published installer (or the repair/update command for a full native in
 and enable notifications when prompted. Live Activities also require the phone's Live
 Activities setting and an active Bot Chat run. This fixes the Gateway configuration path;
 it does not add background push to direct Hermes or OpenClaw connections.
+See [#448](https://github.com/shiftedx/cozygateway/pull/448).
 
 ## 0.8.1 (2026-09-08): subagent model settings and guided Windows setup
 
