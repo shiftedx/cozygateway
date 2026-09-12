@@ -542,6 +542,33 @@ describe("cozygateway terminal menu", () => {
     }
   });
 
+  // A gateway with no Hermes endpoint configured -- a CozyAgents-only install -- reported
+  // "Hermes attach needs attention: no Hermes profiles configured" and sent the user to
+  // `cozygateway repair`, which cannot configure a Hermes nobody asked for.
+  it("does not report a Hermes problem on a gateway that has no Hermes configured", async () => {
+    const lines = await statusLinesForHealth({
+      version: "0.5.5",
+      bridges: { hermes: "absent" },
+      attach: { configured: 0, online: 0, deadLetters: 0 },
+    });
+    const output = lines.join("\n");
+    expect(output).toContain("Status:   Ready");
+    expect(output).not.toContain("Hermes");
+    expect(output).not.toContain("cozygateway repair");
+  });
+
+  it("still reports dead letters on a gateway with no Hermes configured", async () => {
+    const lines = await statusLinesForHealth({
+      version: "0.5.5",
+      bridges: { hermes: "absent" },
+      attach: { configured: 0, online: 0, deadLetters: 2 },
+    });
+    const output = lines.join("\n");
+    expect(output).toContain("Needs attention: 2 dead letters");
+    expect(output).not.toContain("Hermes");
+    expect(output).toContain("Run cozygateway repair");
+  });
+
   it("reports a reachable, fully ready gateway without a repair prompt", async () => {
     const lines = await statusLinesForHealth({
       version: "0.5.5",
