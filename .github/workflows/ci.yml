@@ -65,6 +65,9 @@ jobs:
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-existing-runtime.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-installer-session.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap-durability.test.ps1
+      # Also runs under pwsh 7 in test:installer; here it runs on Windows PowerShell 5.1,
+      # which is the shell the interrupted-install lock actually wedged.
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/bootstrap-lock-units.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-download-retry.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-harness-update.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-setup-flow.test.ps1

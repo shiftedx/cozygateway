@@ -47,7 +47,10 @@ Assert-True ($finallyBlock -match '(?ms)finally \{[^\}]*?Release-BootstrapLock')
 # Fully resolved, component by component: the installer refuses a bootstrap path that passes
 # through a reparse point, and on macOS the temp directory reaches it through a symlinked /var.
 # On Windows, where this matters in production, %TEMP% is already a real path and this is a no-op.
+# ResolveLinkTarget is .NET 6+, so it is absent under Windows PowerShell 5.1 -- which is exactly
+# the host where there is nothing to resolve, so fall through to the path as given.
 function Resolve-RealPath([string] $Path) {
+    if ($null -eq [IO.Directory].GetMethod('ResolveLinkTarget')) { return $Path.TrimEnd('/', '\') }
     $resolved = ''
     foreach ($part in ($Path.TrimEnd('/', '\') -split '[/\\]')) {
         if ($part -eq '') { continue }
