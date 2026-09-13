@@ -9,6 +9,8 @@ import {
   BOTS_CAPABILITY_VERSION,
   CHAT_CONFIGURATION_CAPABILITY_ID,
   CHAT_CONFIGURATION_CAPABILITY_VERSION,
+  CHAT_CONTEXT_CAPABILITY_ID,
+  CHAT_CONTEXT_CAPABILITY_VERSION,
   PROVIDER_CONNECTIONS_CAPABILITY_ID,
   PROVIDER_CONNECTIONS_CAPABILITY_VERSION,
   HERMES_DESKTOP_SESSIONS_CAPABILITY_ID,
@@ -280,6 +282,7 @@ export function gatewayInfoForConfig(
       // behind them.
       [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION,
       [CHAT_CONFIGURATION_CAPABILITY_ID]: CHAT_CONFIGURATION_CAPABILITY_VERSION,
+      [CHAT_CONTEXT_CAPABILITY_ID]: CHAT_CONTEXT_CAPABILITY_VERSION,
       [PROVIDER_CONNECTIONS_CAPABILITY_ID]: PROVIDER_CONNECTIONS_CAPABILITY_VERSION,
       [HARNESS_SETTINGS_CAPABILITY_ID]: HARNESS_SETTINGS_CAPABILITY_VERSION,
       ...(hermesEndpoints(config).length === 0
@@ -775,6 +778,9 @@ export async function startGateway(
       onObservationSnapshot: (agentId, payload, bytes) => {
         const bot = storage.chatExecutionById(agentId)?.bot ?? agentId;
         return observationSnapshots.accept(bot, payload, bytes);
+      },
+      onChatContext: (agentId, frame) => {
+        nativeBotPlane?.handleChatContext(agentId, frame);
       },
       canAcceptEvent: (agentId, frame) => {
         if (storage.chatExecutionById(agentId)) return nativeBotPlane?.canAccept(agentId, frame) === true;

@@ -62,6 +62,8 @@ export const AttachV1CapabilitySchema = Type.Union([
   /** Capability 60: durable metadata-only local search tombstone. */
   Type.Literal("session_deletion"),
   Type.Literal("observation_snapshot"),
+  /** An unsequenced latest-only current-context report after a native turn. */
+  Type.Literal("chat_context"),
 ]);
 export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
 
@@ -882,8 +884,28 @@ export const AttachV1ObservationSnapshotSchema = Type.Object({
   payload: Type.Optional(Type.Unknown()),
 }, { additionalProperties: false });
 
+/** Latest-only current prompt occupancy, deliberately outside the durable transcript spool.
+ * An absent report means unavailable; runtime lifetime token totals never travel on this lane. */
+export const AttachV1ChatContextFrameSchema = Type.Object({
+  kind: Type.Literal("chat_context"),
+  threadId: Id,
+  turnId: Id,
+  usedTokens: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+  windowTokens: Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+  measurement: Type.Union([Type.Literal("reported"), Type.Literal("estimated")]),
+  source: Type.Union([
+    Type.Literal("provider_usage"),
+    Type.Literal("provider_usage_plus_estimate"),
+    Type.Literal("local_estimate"),
+  ]),
+  model: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  effort: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+}, { additionalProperties: false });
+export type AttachV1ChatContextFrame = Static<typeof AttachV1ChatContextFrameSchema>;
+
 export const AttachV1ClientFrameSchema = Type.Union([
   AttachV1ObservationSnapshotSchema,
+  AttachV1ChatContextFrameSchema,
   AttachV1HelloSchema,
   AttachV1EventFrameSchema,
   AttachV1AckSchema,

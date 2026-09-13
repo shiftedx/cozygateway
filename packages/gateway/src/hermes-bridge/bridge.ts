@@ -11,6 +11,7 @@ import type {
   BotDesktopHermesSession,
   BotDesktopHermesResumeResponse,
   BotChatMessage,
+  BotChatContextReading,
   BotChatStateCause,
   BotMobileReceipt,
   BotChatStatus,
@@ -324,6 +325,10 @@ export interface BotsSurface extends BotControlSurface {
   ): Promise<BotSessionAdoption>;
   deleteSession(name: string, sessionId: string): Promise<BotSessionDeletion>;
   chatHistory(name: string): Promise<BotChatHistory>;
+  /** Optional runtime context reading. `null` means the selected runtime does not report one. */
+  chatContext?(name: string): Promise<{ sessionId: string; context: BotChatContextReading | null }>;
+  /** A successful chat-configuration write may change the next context window or model. */
+  contextConfigurationChanged?(name: string, sessionId?: string): void;
   sendChatMessage(
     name: string,
     text: string,

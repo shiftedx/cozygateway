@@ -1487,7 +1487,11 @@ export function registerBotRoutes(
           return c.json(errorBody("invalid_request", "vision model configuration is unavailable for this bot"), 400);
         }
       }
-      return c.json(modelConfigResponse(await bots.configureModel(resolved.name, parsed)));
+      const configured = await bots.configureModel(resolved.name, parsed);
+      // A profile-default model can become the next session's effective window even when this
+      // session has no explicit picker value yet. Its older reading therefore remains historical.
+      chat.contextConfigurationChanged?.(resolved.name);
+      return c.json(modelConfigResponse(configured));
     } catch (err) {
       return failure(c, err);
     }
@@ -1624,7 +1628,11 @@ export function registerBotRoutes(
       try { body = await c.req.json(); } catch { body = undefined; }
       try {
         const patch = assertValid(ChatSessionConfigurationPatchSchema, body);
-        return c.json(await chatConfiguration.configure(resolved.name, patch));
+        const snapshot = await chatConfiguration.configure(resolved.name, patch);
+        // A model or workspace change can alter the next prompt's budget. Keep the latest sample
+        // visible as historical evidence, but never fresh until the runtime reports again.
+        chat.contextConfigurationChanged?.(resolved.name, snapshot.configuration.sessionId);
+        return c.json(snapshot);
       } catch (error) { return chatConfigurationFailure(c, error); }
     });
     app.get("/bots/:name/chat/computers", requireDevice, async (c) => {
@@ -1720,6 +1728,19 @@ export function registerBotRoutes(
     try {
       const history = await chat.chatHistory(name);
       return c.json({ name, ...history });
+    } catch (err) {
+      return failure(c, err);
+    }
+  });
+
+  // A separate best-effort read keeps transcript recovery independent of a runtime context probe.
+  app.get("/bots/:name/chat/context", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    if (chat.chatContext === undefined)
+      return c.json(errorBody("not_found", "chat context is unavailable"), 404);
+    try {
+      return c.json({ name: resolved.name, ...await chat.chatContext(resolved.name) });
     } catch (err) {
       return failure(c, err);
     }

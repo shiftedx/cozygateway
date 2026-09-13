@@ -20,6 +20,7 @@ export * from "./harness-update.ts";
 export * from "./hermes-session-management.ts";
 export * from "./cozyapps.ts";
 export * from "./chat-configuration.ts";
+export * from "./chat-context.ts";
 export * from "./provider-connections.ts";
 export * from "./integrations.ts";
 export * from "./tasks.ts";
