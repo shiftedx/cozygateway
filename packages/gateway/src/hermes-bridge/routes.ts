@@ -20,6 +20,10 @@ import {
   BotModelProviderFieldUpdateSchema,
   BotModelProviderOAuthCodeSchema,
   BotProfilePatchSchema,
+  IntegrationCreateRequestSchema,
+  IntegrationCatalogInstallRequestSchema,
+  IntegrationEnabledRequestSchema,
+  IntegrationUpdateRequestSchema,
   BotRoutineCreateRequestSchema,
   BotRoutinePatchSchema,
   BotMemoryWriteRequestSchema,
@@ -55,6 +59,12 @@ import {
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
 import { ModelConfigInvalid } from "./model-config.ts";
 import { ProviderSetupInvalid } from "./provider-setup.ts";
+import {
+  HermesDashboardIntegrations,
+  IntegrationFlowNotFound,
+  IntegrationInvalid,
+  IntegrationNotFound,
+} from "./integrations.ts";
 import {
   BotSessionConflict,
   BotSessionNotFound,
@@ -271,6 +281,10 @@ function failure(c: Context<Env>, err: unknown) {
   // configured `/bots/:name/*` route.
   if (err instanceof BotNotFound)
     return c.json(errorBody("not_found", err.message), 404);
+  if (err instanceof IntegrationNotFound || err instanceof IntegrationFlowNotFound)
+    return c.json(errorBody("not_found", err.message), 404);
+  if (err instanceof IntegrationInvalid)
+    return c.json(errorBody("invalid_request", err.message), 400);
   if (err instanceof BotSessionNotFound)
     return c.json(errorBody("not_found", err.message), 404);
   if (err instanceof ModelConfigInvalid)
@@ -434,6 +448,9 @@ export function registerBotRoutes(
   /** Capability com.cozylabs.chat-configuration v1. It is assembled only with an adapter that
    * can prepare a context; a connected but older peer remains unavailable per bot. */
   chatConfiguration?: GatewayChatConfiguration,
+  /** Capability com.cozylabs.integrations v1. It exists only after one configured Dashboard
+   * launch profile passed a live, schema-checked integration-list probe at startup. */
+  integrations?: HermesDashboardIntegrations,
 ): void {
   const chat = bots as BotsSurface;
   // One limiter per registered app, created here rather than at module scope so two gateways in one
@@ -1148,6 +1165,189 @@ export function registerBotRoutes(
     bots.setFocus(c.get("deviceId"), parsed.screen);
     return c.json({ ok: true });
   });
+
+  if (integrations !== undefined) {
+    /** A native data plane can serve a real runtime bot through `botProfile`, so profile existence
+     * alone is insufficient for a Dashboard-only route. Its runtime projection is the authoritative
+     * discriminator; ordinary Hermes names then use the adapter's narrow membership probe. */
+    const dashboardBot = async (name: string): Promise<void> => {
+      if (chat.botRuntime !== undefined) {
+        try {
+          chat.botRuntime(name);
+          throw new UnsupportedForRuntime(name, "integrations", "cozyagents");
+        } catch (err) {
+          if (!(err instanceof UnsupportedForRuntime && err.feature === "botRuntime")) throw err;
+        }
+        // A regular Hermes bot has no runtime projection and falls through to the selected
+        // Dashboard's name-only probe.
+      }
+      await integrations.assertProfileExists(name);
+    };
+    const integrationName = (c: Context<Env>, parameter = "name"): string | Response => {
+      const value = c.req.param(parameter) ?? "";
+      if (value.length === 0 || value.length > 120 || /[\u0000-\u001f\u007f]/.test(value))
+        return c.json(errorBody("invalid_request", "invalid integration name"), 400);
+      return value;
+    };
+    const jsonBody = async (c: Context<Env>): Promise<unknown> => {
+      try { return await c.req.json(); } catch { return undefined; }
+    };
+    const invalidBody = (c: Context<Env>, err: unknown): Response =>
+      c.json(errorBody("invalid_request", err instanceof Error ? err.message : "malformed body"), 400);
+
+    app.get("/integrations", requireDevice, async (c) => {
+      try { return c.json({ servers: await integrations.list() }); }
+      catch (err) { return failure(c, err); }
+    });
+
+    app.get("/integrations/catalog", requireDevice, async (c) => {
+      try { return c.json(await integrations.catalog()); }
+      catch (err) { return failure(c, err); }
+    });
+
+    app.post("/integrations/catalog/:name/install", requireDevice, async (c) => {
+      const name = integrationName(c);
+      if (name instanceof Response) return name;
+      let body;
+      try { body = assertValid(IntegrationCatalogInstallRequestSchema, await jsonBody(c)); }
+      catch (err) { return invalidBody(c, err); }
+      try { return c.json(await integrations.installCatalog(name, body)); }
+      catch (err) { return failure(c, err); }
+    });
+
+    app.post("/integrations", requireDevice, async (c) => {
+      let body;
+      try { body = assertValid(IntegrationCreateRequestSchema, await jsonBody(c)); }
+      catch (err) { return invalidBody(c, err); }
+      try { return c.json(await integrations.create(body), 201); }
+      catch (err) { return failure(c, err); }
+    });
+
+    app.put("/integrations/:name", requireDevice, async (c) => {
+      const name = integrationName(c);
+      if (name instanceof Response) return name;
+      let body;
+      try { body = assertValid(IntegrationUpdateRequestSchema, await jsonBody(c)); }
+      catch (err) { return invalidBody(c, err); }
+      try { return c.json(await integrations.update(name, body)); }
+      catch (err) { return failure(c, err); }
+    });
+
+    app.delete("/integrations/:name", requireDevice, async (c) => {
+      const name = integrationName(c);
+      if (name instanceof Response) return name;
+      try {
+        await integrations.remove(name);
+        return c.json({ ok: true });
+      } catch (err) { return failure(c, err); }
+    });
+
+    app.post("/integrations/:name/test", requireDevice, async (c) => {
+      const name = integrationName(c);
+      if (name instanceof Response) return name;
+      try { return c.json(await integrations.test(name)); }
+      catch (err) { return failure(c, err); }
+    });
+
+    app.post("/integrations/:name/auth", requireDevice, async (c) => {
+      const name = integrationName(c);
+      if (name instanceof Response) return name;
+      try { return c.json(await integrations.startOAuth(name, c.get("deviceId"))); }
+      catch (err) { return failure(c, err); }
+    });
+
+    app.get("/integrations/:name/auth/:flowId", requireDevice, async (c) => {
+      const name = integrationName(c);
+      if (name instanceof Response) return name;
+      const flowId = c.req.param("flowId") ?? "";
+      if (flowId.length === 0 || flowId.length > 256) return c.json(errorBody("invalid_request", "invalid authorization flow id"), 400);
+      try { return c.json(await integrations.oauthStatus(name, flowId, c.get("deviceId"))); }
+      catch (err) { return failure(c, err); }
+    });
+
+    app.delete("/integrations/:name/auth/:flowId", requireDevice, async (c) => {
+      const name = integrationName(c);
+      if (name instanceof Response) return name;
+      const flowId = c.req.param("flowId") ?? "";
+      if (flowId.length === 0 || flowId.length > 256) return c.json(errorBody("invalid_request", "invalid authorization flow id"), 400);
+      try {
+        await integrations.cancelOAuth(name, flowId, c.get("deviceId"));
+        return c.json({ ok: true });
+      } catch (err) { return failure(c, err); }
+    });
+
+    app.get("/bots/:name/integrations", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        await dashboardBot(resolved.name);
+        return c.json({ servers: await integrations.listForBot(resolved.name) });
+      } catch (err) { return failure(c, err); }
+    });
+
+    app.put("/bots/:name/integrations/:server", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      const server = integrationName(c, "server");
+      if (server instanceof Response) return server;
+      let body;
+      try { body = assertValid(IntegrationEnabledRequestSchema, await jsonBody(c)); }
+      catch (err) { return invalidBody(c, err); }
+      try {
+        await dashboardBot(resolved.name);
+        return c.json(await integrations.setEnabledForBot(resolved.name, server, body.enabled));
+      } catch (err) { return failure(c, err); }
+    });
+
+    app.post("/bots/:name/integrations/:server/test", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      const server = integrationName(c, "server");
+      if (server instanceof Response) return server;
+      try {
+        await dashboardBot(resolved.name);
+        return c.json(await integrations.testForProfile(resolved.name, server));
+      } catch (err) { return failure(c, err); }
+    });
+
+    app.post("/bots/:name/integrations/:server/auth", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      const server = integrationName(c, "server");
+      if (server instanceof Response) return server;
+      try {
+        await dashboardBot(resolved.name);
+        return c.json(await integrations.startOAuthForProfile(resolved.name, server, c.get("deviceId")));
+      } catch (err) { return failure(c, err); }
+    });
+
+    app.get("/bots/:name/integrations/:server/auth/:flowId", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      const server = integrationName(c, "server");
+      if (server instanceof Response) return server;
+      const flowId = c.req.param("flowId") ?? "";
+      if (flowId.length === 0 || flowId.length > 256) return c.json(errorBody("invalid_request", "invalid authorization flow id"), 400);
+      try {
+        await dashboardBot(resolved.name);
+        return c.json(await integrations.oauthStatus(server, flowId, c.get("deviceId"), resolved.name));
+      } catch (err) { return failure(c, err); }
+    });
+
+    app.delete("/bots/:name/integrations/:server/auth/:flowId", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      const server = integrationName(c, "server");
+      if (server instanceof Response) return server;
+      const flowId = c.req.param("flowId") ?? "";
+      if (flowId.length === 0 || flowId.length > 256) return c.json(errorBody("invalid_request", "invalid authorization flow id"), 400);
+      try {
+        await dashboardBot(resolved.name);
+        await integrations.cancelOAuth(server, flowId, c.get("deviceId"), resolved.name);
+        return c.json({ ok: true });
+      } catch (err) { return failure(c, err); }
+    });
+  }
 
   // Nothing here is per-bot: it is the menu the edit screen offers for ALL bots, which is why it is
   // one cached aggregate rather than three calls a client makes per screen open. There is no

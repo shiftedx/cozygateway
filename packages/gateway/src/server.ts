@@ -26,6 +26,8 @@ import {
   HARNESS_WORKSPACE_CAPABILITY_VERSION,
   HARNESS_UPDATE_CAPABILITY_ID,
   HARNESS_UPDATE_CAPABILITY_VERSION,
+  INTEGRATIONS_CAPABILITY_ID,
+  INTEGRATIONS_CAPABILITY_VERSION,
   COZYAPPS_CAPABILITY_ID,
   COZYAPPS_CAPABILITY_VERSION,
   assertValidCozyAppTree,
@@ -89,6 +91,7 @@ import {
 import { createHermesClient } from "./hermes-bridge/client.ts";
 import { DEFAULT_CHAT_SUGGESTION, parseHermesOptions } from "./hermes-bridge/config.ts";
 import { HermesBridge, type BotsSurface } from "./hermes-bridge/bridge.ts";
+import { HermesDashboardIntegrations } from "./hermes-bridge/integrations.ts";
 import { FederatedBotControlSurface, endpointStorage } from "./hermes-bridge/federation.ts";
 import { GatewayRoomHost, type RoomHost } from "./hermes-bridge/group-rooms.ts";
 import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
@@ -250,6 +253,7 @@ export function gatewayInfoForConfig(
   hermesSessionManagementVersion?: number,
   hermesGlobalSkills = false,
   maintenance = false,
+  integrations = false,
 ): GatewayInfo {
   const configuredCapabilities = Object.fromEntries(
     Object.entries(config.capabilities ?? {})
@@ -257,7 +261,8 @@ export function gatewayInfoForConfig(
         && id !== GATEWAY_MANAGEMENT_CAPABILITY_ID
         && id !== HERMES_SESSION_MANAGEMENT_CAPABILITY_ID
         && id !== HERMES_GLOBAL_SKILLS_CAPABILITY_ID
-        && id !== GATEWAY_MAINTENANCE_CAPABILITY_ID),
+        && id !== GATEWAY_MAINTENANCE_CAPABILITY_ID
+        && id !== INTEGRATIONS_CAPABILITY_ID),
   );
   return {
     name: config.name,
@@ -300,6 +305,9 @@ export function gatewayInfoForConfig(
         : {}),
       ...(maintenance
         ? { [GATEWAY_MAINTENANCE_CAPABILITY_ID]: GATEWAY_MAINTENANCE_CAPABILITY_VERSION }
+        : {}),
+      ...(integrations
+        ? { [INTEGRATIONS_CAPABILITY_ID]: INTEGRATIONS_CAPABILITY_VERSION }
         : {}),
     },
   };
@@ -459,12 +467,23 @@ export async function startGateway(
       }))),
       storage,
     );
+  // The integrations surface has one gateway-managed source profile. A federated gateway has no
+  // unambiguous launch profile for a global setup route, and an unset bridge profile is explicitly
+  // not guessed from a phone request, so neither shape advertises this capability.
+  const candidateIntegrations = clientMembers.length === 1
+    && clientMembers[0]!.options.bridgeProfile !== undefined
+    ? new HermesDashboardIntegrations({
+      client: clientMembers[0]!.client,
+      sourceProfile: clientMembers[0]!.options.bridgeProfile,
+      now: () => Date.now(),
+    })
+    : undefined;
   const harnessModelAdapters = clientMembers.map(
     ({ endpoint, client }) => new HermesHarnessModelSettingsAdapter(endpoint, client),
   );
   // Optional Hermes surfaces are evidence-gated, not configuration-gated. A missing,
   // malformed, or unreachable pinned response yields no adapter and no advertised route.
-  const [workspaceResults, updateResults, sessionResults, hermesGlobalSkills] = await Promise.all([
+  const [workspaceResults, updateResults, sessionResults, hermesGlobalSkills, integrations] = await Promise.all([
     Promise.all(clientMembers.map(({ client }, index) =>
       discoverHermesWorkspace(client, harnessModelAdapters[index]!.descriptor()))),
     Promise.all(clientMembers.map(({ client }, index) =>
@@ -474,6 +493,9 @@ export async function startGateway(
     candidateGlobalSkills === undefined
       ? Promise.resolve(undefined)
       : candidateGlobalSkills.probe().then(() => candidateGlobalSkills).catch(() => undefined),
+    candidateIntegrations === undefined
+      ? Promise.resolve(undefined)
+      : candidateIntegrations.probe().then((available) => available ? candidateIntegrations : undefined),
   ]);
   const discoveredWorkspaceAdapters = workspaceResults.filter((adapter) => adapter !== undefined);
   const discoveredSessionAdapters = sessionResults.filter((adapter) => adapter !== undefined);
@@ -500,6 +522,7 @@ export async function startGateway(
     hermesSessions.capabilityVersion,
     hermesGlobalSkills !== undefined,
     maintenance !== undefined,
+    integrations !== undefined,
   );
   // Dashboard packet D2. The observation ring: what the gateway already measures on every turn,
   // heartbeat and sweep, kept for a week instead of thrown away. OFF BY DEFAULT; constructed
@@ -1261,6 +1284,7 @@ export async function startGateway(
     ...(harnessUpdates.available ? { harnessUpdates } : {}),
     ...(hermesSessions.available ? { hermesSessions } : {}),
     ...(hermesGlobalSkills === undefined ? {} : { hermesGlobalSkills }),
+    ...(integrations === undefined ? {} : { integrations }),
     hermesGlobalSkillsLog: traceLog,
     ...(harnessWorkspace.available ? { harnessWorkspace } : {}),
     ...(options.pairingAdmission === undefined ? {} : { pairingAdmission: options.pairingAdmission }),
