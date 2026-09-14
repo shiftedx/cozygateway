@@ -5,6 +5,18 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## 0.8.5 (2026-09-14): durable attach batching and bounded gateway work
+
+Attach ingestion now batches durable writes and yields between incoming frames while preserving
+ACK/replay durability. Indexed hot paths, bounded prepared-statement reuse, and bounded transport
+queues reduce overhead. Tool details are summarized after seven days; raw transport copies and
+completed tool summaries age out after fourteen days. Logs are bounded, while messages, files,
+and unresolved approvals are retained.
+
+This release also includes native integration setup, current chat-context reporting, and the
+uninstall command with owned runner cleanup. Upgrade through the published installer to receive
+the matched Gateway and Hermes plugin. Existing pairings and bot history are retained.
+
 ## 0.8.4 (2026-09-12): enable push for native installations
 
 Native installations now configure the same hosted push relay as Docker. Previously,
