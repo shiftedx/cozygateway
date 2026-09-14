@@ -1761,11 +1761,9 @@ CLI
       printf 'exit /b 1\r\n'
       printf ':uninstallRun\r\n'
       printf 'set "COZYGATEWAY_HOME=%s"\r\n' "$(to_windows_path "$GATEWAY_DIR")"
-      # Read the exit branch before PowerShell deletes this .cmd file.
-      printf '(\r\n'
-      printf '"%s" -NoProfile -ExecutionPolicy Bypass -File "%s" -Uninstall %%uninstallOptions%%\r\n' "$WINDOWS_POWERSHELL" "$bootstrap_native"
-      printf 'if errorlevel 1 (exit /b 1) else (exit /b 0)\r\n'
-      printf ')\r\n'
+      # End this batch context before uninstall deletes the command file.
+      # The command following & is already parsed and retains PowerShell's status.
+      printf '(goto) 2>nul & "%s" -NoProfile -ExecutionPolicy Bypass -File "%s" -Uninstall %%uninstallOptions%%\r\n' "$WINDOWS_POWERSHELL" "$bootstrap_native"
       printf ':repair\r\n'
       printf 'if not "%%~2"=="" (echo FAIL  repair does not accept extra arguments & exit /b 1)\r\n'
       printf 'if not exist "%s" (echo FAIL  repair bootstrap is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 ^| iex & exit /b 1)\r\n' "$bootstrap_native"

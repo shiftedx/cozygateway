@@ -1016,7 +1016,7 @@ write_cli_wrapper
     Assert-True ($LASTEXITCODE -ne 0 -and $tamperedRepair -match 'repair bootstrap checksum mismatch' -and @((Get-Content -LiteralPath $repairMarker)).Count -eq 2) 'generated repair shim must reject a tampered bootstrap before execution'
 
     # Exercise the generated uninstall command in cmd.exe, including its own
-    # deletion while PowerShell runs. The parenthesized exit must remain usable.
+    # deletion while PowerShell runs. Batch processing must end before deletion.
     $uninstallMarker = Join-Path $temp 'uninstall-command-marker.txt'
     Write-Utf8NoBom $repairBootstrap @"
 param([switch]`$Uninstall, [switch]`$Purge, [switch]`$DryRun)

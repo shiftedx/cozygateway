@@ -156,7 +156,7 @@ rm -rf "$COZYAGENTS_HOME/bin"
         self.assertEqual(arguments[-1], str(self.gateway))
         cmd = (self.gateway / 'bin/cozygateway.cmd').read_text()
         self.assertIn('goto uninstall', cmd)
-        self.assertIn('if errorlevel 1 (exit /b 1) else (exit /b 0)', cmd)
+        self.assertIn('(goto) 2>nul &', cmd)
         self.assertTrue(self.gateway.exists())
 
     def test_missing_install_is_repeat_safe(self):
