@@ -13,6 +13,7 @@ import type {
   BotApprovalResolutionRequestedFrame,
   BotApprovalResolvedFrame,
   BotChatDeltaFrame,
+  BotChatContextReading,
   BotChatMessage,
   BotChatStateCause,
   BotChatStateFrame,
@@ -50,7 +51,7 @@ import type {
 import type { AttachV1Ingress } from "../adapters/attach/ingress-v1.ts";
 import { blocksToText } from "../adapters/attach/blocks-to-text.ts";
 import { emitTrace, traceId, type TraceLog } from "../trace.ts";
-import { sanitizeApprovalDetail, sanitizeApprovalRepair, sanitizeApprovalScope, type AttachV1EventFrame, type AttachV1MobileRequest, type AttachV1TurnHealth } from "../adapters/attach/protocol-v1.ts";
+import { sanitizeApprovalDetail, sanitizeApprovalRepair, sanitizeApprovalScope, type AttachV1ChatContextFrame, type AttachV1EventFrame, type AttachV1MobileRequest, type AttachV1TurnHealth } from "../adapters/attach/protocol-v1.ts";
 import { resolveMobileTargetDevice, type MobileNodeBroker, type MobileNodeReceiptInput } from "../mobile-node.ts";
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import type { Storage } from "../storage.ts";
@@ -503,6 +504,16 @@ export class NativeBotDataPlane {
    *  best effort: the durable copy rides on the pending steer row, which is what survives a
    *  restart. */
   readonly #turnContexts = new Map<string, unknown>();
+  /** Latest actual context reading by canonical chat. This stays process-local: it survives an
+   * attach reconnect without pretending a stale reading is durable state after a gateway reboot. */
+  readonly #chatContextReadings = new Map<string, Omit<BotChatContextReading, "stale">>();
+  /** A new admitted turn invalidates its prior reading until the runtime reports the new one. */
+  readonly #chatContextDirty = new Set<string>();
+  /** The only turn allowed to replace the reading for a session. Terminal history is not enough:
+   * a delayed report from turn 1 must never overwrite a completed turn 2. */
+  readonly #chatContextLatestTurns = new Map<string, string>();
+  /** A model/workspace write makes the current generation historical even while it is idle. */
+  readonly #chatContextInvalidatedTurns = new Map<string, string>();
   readonly #observe: ObservationRing | undefined;
   #staleTurnSweep: ReturnType<typeof setInterval> | undefined;
 
@@ -605,6 +616,8 @@ export class NativeBotDataPlane {
         this.#adoptSession(name, sessionId, limit),
       deleteSession: (name, sessionId) => this.#deleteSession(name, sessionId),
       chatHistory: (name) => this.#history(name),
+      chatContext: (name) => this.#chatContext(name),
+      contextConfigurationChanged: (name, sessionId) => this.#invalidateChatContext(name, sessionId),
       sendChatMessage: (name, text, opts) => this.#send(name, text, opts),
       sendChatPhoto: (name, photo, opts) => this.#sendPhoto(name, photo, opts),
       sendChatAttachment: (name, file, opts) => this.#sendFile(name, file, opts),
@@ -1016,6 +1029,22 @@ export class NativeBotDataPlane {
     const execution = this.#storage.chatExecution(bot, sessionId);
     if (execution === undefined) return bot;
     return execution.stage === "ready" ? execution.executionId : undefined;
+  }
+
+  /** Translate an authenticated context reporter back to its source bot only for its bound
+   * session. This mirrors event routing, including the rule that an execution peer supersedes
+   * its source profile for the one conversation it owns. */
+  #chatContextRoute(agentId: string, sessionId: string): { bot: string; peer: string } | undefined {
+    const direct = normalize(agentId);
+    if (this.handles(direct)) {
+      if (this.#storage.chatExecution(direct, sessionId) !== undefined) return undefined;
+      return this.#storage.nativeBotHasSession(direct, sessionId)
+        ? { bot: direct, peer: agentId }
+        : undefined;
+    }
+    const execution = this.#storage.chatExecutionById(agentId);
+    if (execution === undefined || execution.stage !== "ready" || !this.handles(execution.bot)) return undefined;
+    return execution.sessionId === sessionId ? { bot: execution.bot, peer: agentId } : undefined;
   }
 
   /** Translate an authenticated execution peer back to its source bot only for its bound session.
@@ -1507,6 +1536,43 @@ export class NativeBotDataPlane {
     this.#state(bot, command.threadId, "polling", true);
   }
 
+  /** Accept a latest-only report only from the peer that owns this exact native session. It has no
+   * event sequence or durable side effect, so a reconnect can never replay it into a transcript. */
+  handleChatContext(agentId: string, frame: AttachV1ChatContextFrame): void {
+    const route = this.#chatContextRoute(agentId, frame.threadId);
+    if (route === undefined) return;
+    const command = this.#storage.attachTurnCommand(route.peer, frame.turnId);
+    const terminal = this.#storage.nativeBotTurnTerminal(route.bot, frame.threadId, frame.turnId);
+    const current = this.#storage.nativeBotChat(route.bot, this.#now());
+    if (current.sessionId !== frame.threadId) return;
+    const currentTurn = current.sessionId === frame.threadId ? current.activeTurnId : undefined;
+    // The current in-memory turn is sufficient before the ingress has durably indexed its command
+    // in tests and in the narrow dispatch window; a completed turn needs the durable evidence.
+    if (command?.threadId !== frame.threadId && terminal === undefined && currentTurn !== frame.turnId) return;
+
+    const key = this.#chatContextKey(route.bot, frame.threadId);
+    if (this.#chatContextLatestTurns.get(key) !== frame.turnId) return;
+    // A configuration write changes the token window/model for this generation. Its in-flight
+    // report is historical even if it arrives after the turn has otherwise settled.
+    if (this.#chatContextInvalidatedTurns.get(key) === frame.turnId) return;
+    this.#chatContextReadings.set(key, {
+      usedTokens: frame.usedTokens,
+      windowTokens: frame.windowTokens,
+      measurement: frame.measurement,
+      source: frame.source,
+      observedAt: this.#now(),
+      ...(frame.model === undefined ? {} : { model: frame.model }),
+      ...(frame.effort === undefined ? {} : { effort: frame.effort }),
+    });
+    // A late report for the preceding turn must not make the reading look fresh while the next
+    // request is already running. Once that next turn ends, only its own report can clear dirty.
+    if (current.activeTurnId !== undefined && current.activeTurnId !== frame.turnId)
+      this.#chatContextDirty.add(key);
+    else
+      this.#chatContextDirty.delete(key);
+    this.#broadcastChatContext(route.bot, frame.threadId);
+  }
+
   close(): void {
     if (this.#staleTurnSweep !== undefined) clearInterval(this.#staleTurnSweep);
     this.#staleTurnSweep = undefined;
@@ -1515,6 +1581,10 @@ export class NativeBotDataPlane {
     this.#interruptAcked.clear();
     this.#turnOwnerLost.clear();
     this.#turnContexts.clear();
+    this.#chatContextReadings.clear();
+    this.#chatContextDirty.clear();
+    this.#chatContextLatestTurns.clear();
+    this.#chatContextInvalidatedTurns.clear();
     for (const timer of this.#interactionTimers.values()) clearTimeout(timer);
     this.#interactionTimers.clear();
     for (const { timer } of this.#turnTimers.values()) clearTimeout(timer);
@@ -2118,6 +2188,28 @@ export class NativeBotDataPlane {
     };
   }
 
+  /** A context read is intentionally local-only: resolving a Desktop/TUI session or waiting for
+   * an attach round trip would make opening a transcript depend on an optional meter. */
+  async #chatContext(name: string): Promise<{ sessionId: string; context: BotChatContextReading | null }> {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    const chat = this.#storage.nativeBotChat(bot, this.#now());
+    return { sessionId: chat.sessionId, context: this.#chatContextReading(bot, chat.sessionId) };
+  }
+
+  #invalidateChatContext(name: string, sessionId?: string): void {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) return;
+    const current = this.#storage.nativeBotChat(bot, this.#now());
+    const selected = sessionId ?? current.sessionId;
+    if (current.sessionId !== selected || !this.#storage.nativeBotHasSession(bot, selected)) return;
+    const key = this.#chatContextKey(bot, selected);
+    this.#chatContextDirty.add(key);
+    const latestTurn = this.#chatContextLatestTurns.get(key);
+    if (latestTurn !== undefined) this.#chatContextInvalidatedTurns.set(key, latestTurn);
+    this.#broadcastChatContext(bot, selected);
+  }
+
   async #send(
     name: string,
     text: string,
@@ -2701,6 +2793,11 @@ export class NativeBotDataPlane {
    * admission paths (a send, a routine, a promoted steer) impossible to get out of step. */
   #admitNativeTurn(bot: string, sessionId: string, turnId: string, at: number): void {
     this.#storage.setNativeBotTurn(bot, sessionId, turnId, at);
+    const contextKey = this.#chatContextKey(bot, sessionId);
+    this.#chatContextDirty.add(contextKey);
+    this.#chatContextLatestTurns.set(contextKey, turnId);
+    this.#chatContextInvalidatedTurns.delete(contextKey);
+    this.#broadcastChatContext(bot, sessionId);
     this.#observe?.turnAdmitted(bot, turnId);
   }
 
@@ -4306,6 +4403,29 @@ export class NativeBotDataPlane {
     terminal?: NativeTurnState,
   ): void {
     this.#broadcast(this.#stateFrame(bot, sessionId, phase, running, terminal));
+  }
+
+  #chatContextKey(bot: string, sessionId: string): string {
+    return `${bot}\u0000${sessionId}`;
+  }
+
+  #chatContextReading(bot: string, sessionId: string): BotChatContextReading | null {
+    const key = this.#chatContextKey(bot, sessionId);
+    const reading = this.#chatContextReadings.get(key);
+    return reading === undefined ? null : { ...reading, stale: this.#chatContextDirty.has(key) };
+  }
+
+  #broadcastChatContext(bot: string, sessionId: string): void {
+    // A late report from a session the person has left remains cached only for its source turn;
+    // it must not make another device switch its selected conversation back to that session.
+    const current = this.#storage.nativeBotChat(bot, this.#now());
+    if (current.sessionId !== sessionId) return;
+    this.#broadcast({
+      type: "bot_chat_context",
+      bot,
+      sessionId,
+      context: this.#chatContextReading(bot, sessionId),
+    });
   }
 
   #clearDeliveryChecking(bot: string, sessionId: string, turnId: string): void {

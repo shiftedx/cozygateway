@@ -102,6 +102,7 @@ HELLO_CAPABILITIES = (
     "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "delivery_receipts",
     "delegation", "thinking", "desktop_session_sync", "bot_config", "chat_configuration", "provider_connections",
     "desktop_session_resume", "cozyapps",
+    "chat_context",
 )
 # Terminal states a delivery_receipt command may carry, and the stages a failure may name.
 RECEIPT_STATES = frozenset({"displayed", "failed"})
@@ -573,6 +574,50 @@ class AttachV1Client:
                 event["detail"] = chip.detail
             if await self._queue_event(event) is not None:
                 tool_states[chip.id] = state
+
+    async def send_chat_context(
+        self,
+        thread_id: str,
+        turn_id: str,
+        *,
+        used_tokens: int,
+        window_tokens: int,
+        measurement: str,
+        source: str,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+    ) -> bool:
+        """Send one current-context sample outside the durable event spool.
+
+        A transport loss simply leaves the Gateway's last sample stale or unavailable; it must
+        never replay a prior turn's occupancy into a later transcript.
+        """
+        if (not self._negotiated or "chat_context" not in self._capabilities
+                or not isinstance(used_tokens, int) or isinstance(used_tokens, bool) or used_tokens < 0
+                or not isinstance(window_tokens, int) or isinstance(window_tokens, bool) or window_tokens < 1
+                or measurement not in {"reported", "estimated"}
+                or source not in {"provider_usage", "provider_usage_plus_estimate", "local_estimate"}
+                or not isinstance(thread_id, str) or not thread_id or len(thread_id) > TURN_ID_MAX_CHARS
+                or not isinstance(turn_id, str) or not turn_id or len(turn_id) > TURN_ID_MAX_CHARS):
+            return False
+        frame: Dict[str, Any] = {
+            "kind": "chat_context",
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "usedTokens": used_tokens,
+            "windowTokens": window_tokens,
+            "measurement": measurement,
+            "source": source,
+        }
+        if isinstance(model, str) and 0 < len(model) <= 256:
+            frame["model"] = model
+        if isinstance(effort, str) and 0 < len(effort) <= 64:
+            frame["effort"] = effort
+        try:
+            await self._send(frame)
+            return True
+        except Exception:
+            return False
 
     async def upsert_cozyapp(self, app_id: str, name: str, tree: Dict[str, Any]) -> bool:
         """Journal a complete app tree; Gateway remains the authoritative validator."""
