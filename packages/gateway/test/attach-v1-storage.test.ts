@@ -533,4 +533,89 @@ describe("attach-v1 durable transport storage", () => {
     expect(steps.find((step) => step.turnId === "active-turn")).toMatchObject({ status: "running", endedAt: null });
     storage.close();
   });
+
+  it("rolls an admission batch back atomically when one journal write fails", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "attach-v1-batch-admission-")), "gateway.sqlite");
+    let storage = openStorage(path);
+    const raw = new DatabaseSync(path);
+    raw.exec(`CREATE TRIGGER reject_batch_event BEFORE INSERT ON attach_event_inbox
+      WHEN NEW.event_id = 'reject' BEGIN SELECT RAISE(ABORT, 'forced admission rollback'); END`);
+    raw.close();
+    const first = { kind: "event" as const, sequence: 1, eventId: "first", event: { kind: "draft" as const, threadId: "thread", turnId: "turn", blocks: [] } };
+    const rejected = { kind: "event" as const, sequence: 2, eventId: "reject", event: { kind: "draft" as const, threadId: "thread", turnId: "turn", blocks: [] } };
+    expect(() => storage.acceptAttachEvents("sage", [{ frame: first, receivedAt: 1 }, { frame: rejected, receivedAt: 2 }]))
+      .toThrow("forced admission rollback");
+    expect(storage.attachEventCursor("sage")).toBe(0);
+    expect(storage.unappliedAttachEvents("sage")).toEqual([]);
+    storage.close();
+
+    storage = openStorage(path);
+    expect(storage.attachEventCursor("sage")).toBe(0);
+    expect(storage.unappliedAttachEvents("sage")).toEqual([]);
+    storage.close();
+  });
+
+  it("returns only the durable prefix through gaps and conflicts", () => {
+    const storage = openStorage(":memory:");
+    const first = { kind: "event" as const, sequence: 1, eventId: "first", event: { kind: "draft" as const, threadId: "thread", turnId: "turn", blocks: [] } };
+    const gap = { kind: "event" as const, sequence: 3, eventId: "gap", event: { kind: "draft" as const, threadId: "thread", turnId: "turn", blocks: [] } };
+    const skipped = { kind: "event" as const, sequence: 2, eventId: "second", event: { kind: "draft" as const, threadId: "thread", turnId: "turn", blocks: [] } };
+    expect(storage.acceptAttachEvents("sage", [{ frame: first, receivedAt: 1 }, { frame: gap, receivedAt: 2 }, { frame: skipped, receivedAt: 3 }]))
+      .toEqual([{ status: "accepted", acknowledgedSequence: 1 }, { status: "gap", expectedSequence: 2, receivedSequence: 3 }]);
+    expect(storage.attachEventCursor("sage")).toBe(1);
+    expect(storage.unappliedAttachEvents("sage").map((frame) => frame.eventId)).toEqual(["first"]);
+    expect(storage.acceptAttachEvents("sage", [{ frame: skipped, receivedAt: 4 }]))
+      .toEqual([{ status: "accepted", acknowledgedSequence: 2 }]);
+    const conflict = { ...skipped, sequence: 3 };
+    expect(storage.acceptAttachEvents("sage", [{ frame: conflict, receivedAt: 5 }, { frame: gap, receivedAt: 6 }]))
+      .toEqual([{ status: "conflict", acknowledgedSequence: 2 }]);
+    expect(storage.attachEventCursor("sage")).toBe(2);
+    storage.close();
+  });
+
+  it("keeps terminal and scheduled batch admission semantics", () => {
+    const storage = openStorage(":memory:");
+    const commit = { kind: "event" as const, sequence: 1, eventId: "commit", event: { kind: "commit" as const, threadId: "thread", turnId: "turn", messageId: "message", blocks: [] } };
+    const lateDraft = { kind: "event" as const, sequence: 2, eventId: "late-draft", event: { kind: "draft" as const, threadId: "thread", turnId: "turn", blocks: [] } };
+    const scheduled = { kind: "event" as const, sequence: 3, eventId: "scheduled", event: { kind: "scheduled" as const, threadId: "thread", deliveryId: "delivery", messageId: "message", blocks: [] } };
+    const replay = { ...scheduled, sequence: 4, eventId: "scheduled-replay" };
+    expect(storage.acceptAttachEvents("sage", [
+      { frame: commit, receivedAt: 1 }, { frame: lateDraft, receivedAt: 2 },
+      { frame: scheduled, receivedAt: 3 }, { frame: replay, receivedAt: 4 },
+    ])).toEqual([
+      { status: "accepted", acknowledgedSequence: 1 },
+      { status: "ignored_terminal", acknowledgedSequence: 2 },
+      { status: "accepted", acknowledgedSequence: 3 },
+      { status: "ignored_delivery", acknowledgedSequence: 4 },
+    ]);
+    expect(storage.attachScheduledDelivery("sage", "delivery")).toMatchObject({ threadId: "thread", messageId: "message" });
+    storage.close();
+  });
+
+  it("rolls marker batches back and retains completed markers after reopen", () => {
+    const path = join(mkdtempSync(join(tmpdir(), "attach-v1-batch-markers-")), "gateway.sqlite");
+    let storage = openStorage(path);
+    const first = { kind: "event" as const, sequence: 1, eventId: "first", event: { kind: "draft" as const, threadId: "thread", turnId: "turn", blocks: [] } };
+    const second = { kind: "event" as const, sequence: 2, eventId: "second", event: { kind: "draft" as const, threadId: "thread", turnId: "turn", blocks: [] } };
+    storage.acceptAttachEvents("sage", [{ frame: first, receivedAt: 1 }, { frame: second, receivedAt: 2 }]);
+    const raw = new DatabaseSync(path);
+    raw.exec(`CREATE TRIGGER reject_batch_marker BEFORE UPDATE ON attach_event_inbox
+      WHEN NEW.event_id = 'second' BEGIN SELECT RAISE(ABORT, 'forced marker rollback'); END`);
+    raw.close();
+    expect(() => storage.markAttachEventsApplied("sage", ["first", "second"], 3)).toThrow("forced marker rollback");
+    expect(storage.unappliedAttachEvents("sage").map((frame) => frame.eventId)).toEqual(["first", "second"]);
+    storage.close();
+
+    const cleanup = new DatabaseSync(path);
+    cleanup.exec("DROP TRIGGER reject_batch_marker");
+    cleanup.close();
+    storage = openStorage(path);
+    storage.markAttachEventsApplied("sage", ["first", "second"], 4);
+    storage.close();
+
+    storage = openStorage(path);
+    expect(storage.unappliedAttachEvents("sage")).toEqual([]);
+    expect(storage.attachEventCursor("sage")).toBe(2);
+    storage.close();
+  });
 });

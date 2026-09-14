@@ -63,6 +63,12 @@ import type {
   AttachV1Telemetry,
 } from "./adapters/attach/protocol-v1.ts";
 
+export type AttachEventAdmission =
+  | { status: "accepted" | "duplicate" | "ignored_terminal" | "ignored_delivery"; acknowledgedSequence: number }
+  | { status: "discarded"; acknowledgedSequence: number; reason: AttachV1DiscardReason }
+  | { status: "gap"; expectedSequence: number; receivedSequence: number }
+  | { status: "conflict"; acknowledgedSequence: number };
+
 /** Result of atomically recording a device decision and enqueueing its attach command. This is
  * deliberately internal: only the bot plane derives the outward REST/frame state. */
 export type NativeInteractionResolutionRequest =
@@ -3502,154 +3508,172 @@ export class Storage {
     frame: AttachV1EventFrame,
     receivedAt: number,
     discardReason?: AttachV1DiscardReason,
-  ):
-    | { status: "accepted" | "duplicate" | "ignored_terminal" | "ignored_delivery"; acknowledgedSequence: number }
-    | { status: "discarded"; acknowledgedSequence: number; reason: AttachV1DiscardReason }
-    | { status: "gap"; expectedSequence: number; receivedSequence: number }
-    | { status: "conflict"; acknowledgedSequence: number } {
+  ): AttachEventAdmission {
+    return this.acceptAttachEvents(agentId, [{ frame, receivedAt, ...(discardReason === undefined ? {} : { discardReason }) }])[0]!;
+  }
+
+  /** Admits a contiguous prefix in one durable commit. A gap or conflict ends the prefix, so no
+   * later frame is accepted beyond the result the peer must repair. */
+  acceptAttachEvents(
+    agentId: string,
+    entries: readonly { frame: AttachV1EventFrame; receivedAt: number; discardReason?: AttachV1DiscardReason }[],
+  ): AttachEventAdmission[] {
+    if (entries.length === 0) return [];
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      const duplicate = this.#db
-        .prepare("SELECT sequence FROM attach_event_inbox WHERE agent_id = ? AND event_id = ?")
-        .get(agentId, frame.eventId) as { sequence: number } | undefined;
-      if (duplicate !== undefined) {
-        this.#db.exec("COMMIT");
-        return duplicate.sequence === frame.sequence
-          ? { status: "duplicate", acknowledgedSequence: duplicate.sequence }
-          : { status: "conflict", acknowledgedSequence: duplicate.sequence };
+      const outcomes: AttachEventAdmission[] = [];
+      for (const entry of entries) {
+        const outcome = this.#acceptAttachEvent(agentId, entry.frame, entry.receivedAt, entry.discardReason);
+        outcomes.push(outcome);
+        if (outcome.status === "gap" || outcome.status === "conflict") break;
       }
-      this.#db
-        .prepare(
-          `INSERT INTO attach_streams (agent_id, next_command_sequence, last_event_sequence, updated_at)
-           VALUES (?, 1, 0, ?) ON CONFLICT(agent_id) DO NOTHING`,
-        )
-        .run(agentId, receivedAt);
-      const stream = this.#db
-        .prepare("SELECT last_event_sequence AS sequence FROM attach_streams WHERE agent_id = ?")
-        .get(agentId) as { sequence: number };
-      if (frame.sequence !== stream.sequence + 1) {
-        this.#db.exec("COMMIT");
-        if (frame.sequence <= stream.sequence) return { status: "conflict", acknowledgedSequence: stream.sequence };
-        return { status: "gap", expectedSequence: stream.sequence + 1, receivedSequence: frame.sequence };
-      }
-      const quarantine = (reason: AttachV1DiscardReason) => {
-        this.#db
-          .prepare(
-            `INSERT INTO attach_event_inbox
-               (agent_id, sequence, event_id, frame_json, received_at, disposition,
-                projection_error, applied_at, dead_lettered_at)
-             VALUES (?, ?, ?, ?, ?, 'discarded', ?, ?, ?)`,
-          )
-          .run(
-            agentId, frame.sequence, frame.eventId, JSON.stringify(frame), receivedAt,
-            reason, receivedAt, receivedAt,
-          );
-        this.#db
-          .prepare("UPDATE attach_streams SET last_event_sequence = ?, updated_at = ? WHERE agent_id = ?")
-          .run(frame.sequence, receivedAt, agentId);
-        this.#db.exec("COMMIT");
-        return {
-          status: "discarded" as const,
-          acknowledgedSequence: frame.sequence,
-          reason,
-        };
-      };
-      if (discardReason !== undefined) return quarantine(discardReason);
-      const event = frame.event;
-      const turnId = "turnId" in event ? event.turnId : undefined;
-      const terminal = (event.kind === "commit" && event.continues !== true) || event.kind === "failed" || event.kind === "cancelled" || event.kind === "interrupted";
-      const sealed = turnId === undefined
-        ? undefined
-        : (this.#db.prepare("SELECT event_id AS eventId FROM attach_turn_terminals WHERE agent_id = ? AND turn_id = ?").get(agentId, turnId) as { eventId: string } | undefined);
-      let disposition: "accepted" | "ignored_terminal" | "ignored_delivery" =
-        sealed === undefined || event.kind === "delegation" ? "accepted" : "ignored_terminal";
-      if (event.kind === "scheduled") {
-        const prior = this.#db
-          .prepare(
-            `SELECT delivery.thread_id AS threadId, delivery.message_id AS messageId,
-                    inbox.frame_json AS frameJson
-             FROM attach_scheduled_deliveries AS delivery
-             JOIN attach_event_inbox AS inbox
-               ON inbox.agent_id = delivery.agent_id AND inbox.event_id = delivery.event_id
-             WHERE delivery.agent_id = ? AND delivery.delivery_id = ?`,
-          )
-          .get(agentId, event.deliveryId) as { threadId: string; messageId: string; frameJson: string } | undefined;
-        if (prior !== undefined) {
-          const first = JSON.parse(prior.frameJson) as AttachV1EventFrame;
-          const firstScheduled = first.event.kind === "scheduled" ? first.event : undefined;
-          const sameTarget = firstScheduled !== undefined
-            && ("target" in firstScheduled) === ("target" in event)
-            && ("target" in event || ("threadId" in firstScheduled && firstScheduled.threadId === event.threadId));
-          if (prior.messageId !== event.messageId || !sameTarget) {
-            this.#db.exec("COMMIT");
-            return { status: "conflict", acknowledgedSequence: stream.sequence };
-          }
-          disposition = "ignored_delivery";
-        } else {
-          // `agentId` is the authenticated attach identity. Check the active native-session
-          // pointer while this same IMMEDIATE transaction holds admission, not only in ingress:
-          // a /new selection between a precheck and this write must not deliver to the old chat.
-          if (!("target" in event)) {
-            const selected = this.#db
-              .prepare("SELECT session_id AS sessionId FROM bot_native_chats WHERE bot = ?")
-              .get(agentId) as { sessionId: string } | undefined;
-            // Core threads share this attach identity but are authorized by the server's core
-            // thread lookup. Only a known native-session id is constrained by this local pointer.
-            if (
-              selected !== undefined &&
-              selected.sessionId !== event.threadId &&
-              this.nativeBotHasSession(agentId, event.threadId)
-            ) {
-              return quarantine("unauthorized_target");
-            }
-          }
-          // This is inside the admission transaction, so /new cannot race a semantic home event
-          // between its selection and its durable delivery binding.
-          const threadId = "target" in event
-            ? this.nativeBotChat(agentId, receivedAt).sessionId
-            : event.threadId;
-          this.#db
-            .prepare(
-              `INSERT INTO attach_scheduled_deliveries
-                 (agent_id, delivery_id, thread_id, message_id, event_id, projected_at)
-               VALUES (?, ?, ?, ?, ?, NULL)`,
-            )
-            .run(agentId, event.deliveryId, threadId, event.messageId, frame.eventId);
-        }
-      }
-      this.#db
-        .prepare(
-          `INSERT INTO attach_event_inbox
-             (agent_id, sequence, event_id, frame_json, received_at, disposition, applied_at)
-           VALUES (?, ?, ?, ?, ?, ?, NULL)`,
-        )
-        .run(agentId, frame.sequence, frame.eventId, JSON.stringify(frame), receivedAt, disposition);
-      if (terminal && sealed === undefined) {
-        this.#db
-          .prepare(
-            `INSERT INTO attach_turn_terminals
-               (agent_id, turn_id, event_id, terminal_kind, message_id, sequence, received_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .run(agentId, event.turnId, frame.eventId, event.kind, event.messageId, frame.sequence, receivedAt);
-      }
-      this.#db
-        .prepare("UPDATE attach_streams SET last_event_sequence = ?, updated_at = ? WHERE agent_id = ?")
-        .run(frame.sequence, receivedAt, agentId);
-      if (disposition === "accepted") this.tasks.event(agentId, frame, receivedAt);
       this.#db.exec("COMMIT");
-      return { status: disposition, acknowledgedSequence: frame.sequence };
+      return outcomes;
     } catch (err) {
       this.#db.exec("ROLLBACK");
       throw err;
     }
   }
 
+  #acceptAttachEvent(
+    agentId: string,
+    frame: AttachV1EventFrame,
+    receivedAt: number,
+    discardReason?: AttachV1DiscardReason,
+  ): AttachEventAdmission {
+    const duplicate = this.#db
+      .prepare("SELECT sequence FROM attach_event_inbox WHERE agent_id = ? AND event_id = ?")
+      .get(agentId, frame.eventId) as { sequence: number } | undefined;
+    if (duplicate !== undefined)
+      return duplicate.sequence === frame.sequence
+        ? { status: "duplicate", acknowledgedSequence: duplicate.sequence }
+        : { status: "conflict", acknowledgedSequence: duplicate.sequence };
+    this.#db
+      .prepare(
+        `INSERT INTO attach_streams (agent_id, next_command_sequence, last_event_sequence, updated_at)
+         VALUES (?, 1, 0, ?) ON CONFLICT(agent_id) DO NOTHING`,
+      )
+      .run(agentId, receivedAt);
+    const stream = this.#db
+      .prepare("SELECT last_event_sequence AS sequence FROM attach_streams WHERE agent_id = ?")
+      .get(agentId) as { sequence: number };
+    if (frame.sequence !== stream.sequence + 1)
+      return frame.sequence <= stream.sequence
+        ? { status: "conflict", acknowledgedSequence: stream.sequence }
+        : { status: "gap", expectedSequence: stream.sequence + 1, receivedSequence: frame.sequence };
+    const quarantine = (reason: AttachV1DiscardReason): AttachEventAdmission => {
+      this.#db
+        .prepare(
+          `INSERT INTO attach_event_inbox
+             (agent_id, sequence, event_id, frame_json, received_at, disposition,
+              projection_error, applied_at, dead_lettered_at)
+           VALUES (?, ?, ?, ?, ?, 'discarded', ?, ?, ?)`,
+        )
+        .run(
+          agentId, frame.sequence, frame.eventId, JSON.stringify(frame), receivedAt,
+          reason, receivedAt, receivedAt,
+        );
+      this.#db
+        .prepare("UPDATE attach_streams SET last_event_sequence = ?, updated_at = ? WHERE agent_id = ?")
+        .run(frame.sequence, receivedAt, agentId);
+      return { status: "discarded", acknowledgedSequence: frame.sequence, reason };
+    };
+    if (discardReason !== undefined) return quarantine(discardReason);
+    const event = frame.event;
+    const turnId = "turnId" in event ? event.turnId : undefined;
+    const terminal = (event.kind === "commit" && event.continues !== true) || event.kind === "failed" || event.kind === "cancelled" || event.kind === "interrupted";
+    const sealed = turnId === undefined
+      ? undefined
+      : (this.#db.prepare("SELECT event_id AS eventId FROM attach_turn_terminals WHERE agent_id = ? AND turn_id = ?").get(agentId, turnId) as { eventId: string } | undefined);
+    let disposition: "accepted" | "ignored_terminal" | "ignored_delivery" =
+      sealed === undefined || event.kind === "delegation" ? "accepted" : "ignored_terminal";
+    if (event.kind === "scheduled") {
+      const prior = this.#db
+        .prepare(
+          `SELECT delivery.thread_id AS threadId, delivery.message_id AS messageId,
+                  inbox.frame_json AS frameJson
+           FROM attach_scheduled_deliveries AS delivery
+           JOIN attach_event_inbox AS inbox
+             ON inbox.agent_id = delivery.agent_id AND inbox.event_id = delivery.event_id
+           WHERE delivery.agent_id = ? AND delivery.delivery_id = ?`,
+        )
+        .get(agentId, event.deliveryId) as { threadId: string; messageId: string; frameJson: string } | undefined;
+      if (prior !== undefined) {
+        const first = JSON.parse(prior.frameJson) as AttachV1EventFrame;
+        const firstScheduled = first.event.kind === "scheduled" ? first.event : undefined;
+        const sameTarget = firstScheduled !== undefined
+          && ("target" in firstScheduled) === ("target" in event)
+          && ("target" in event || ("threadId" in firstScheduled && firstScheduled.threadId === event.threadId));
+        if (prior.messageId !== event.messageId || !sameTarget)
+          return { status: "conflict", acknowledgedSequence: stream.sequence };
+        disposition = "ignored_delivery";
+      } else {
+        // `agentId` is the authenticated attach identity. Check the active native-session
+        // pointer while this same IMMEDIATE transaction holds admission, not only in ingress:
+        // a /new selection between a precheck and this write must not deliver to the old chat.
+        if (!("target" in event)) {
+          const selected = this.#db
+            .prepare("SELECT session_id AS sessionId FROM bot_native_chats WHERE bot = ?")
+            .get(agentId) as { sessionId: string } | undefined;
+          // Core threads share this attach identity but are authorized by the server's core
+          // thread lookup. Only a known native-session id is constrained by this local pointer.
+          if (
+            selected !== undefined &&
+            selected.sessionId !== event.threadId &&
+            this.nativeBotHasSession(agentId, event.threadId)
+          ) return quarantine("unauthorized_target");
+        }
+        // This is inside the admission transaction, so /new cannot race a semantic home event
+        // between its selection and its durable delivery binding.
+        const threadId = "target" in event
+          ? this.nativeBotChat(agentId, receivedAt).sessionId
+          : event.threadId;
+        this.#db
+          .prepare(
+            `INSERT INTO attach_scheduled_deliveries
+               (agent_id, delivery_id, thread_id, message_id, event_id, projected_at)
+             VALUES (?, ?, ?, ?, ?, NULL)`,
+          )
+          .run(agentId, event.deliveryId, threadId, event.messageId, frame.eventId);
+      }
+    }
+    this.#db
+      .prepare(
+        `INSERT INTO attach_event_inbox
+           (agent_id, sequence, event_id, frame_json, received_at, disposition, applied_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+      )
+      .run(agentId, frame.sequence, frame.eventId, JSON.stringify(frame), receivedAt, disposition);
+    if (terminal && sealed === undefined) {
+      this.#db
+        .prepare(
+          `INSERT INTO attach_turn_terminals
+             (agent_id, turn_id, event_id, terminal_kind, message_id, sequence, received_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(agentId, event.turnId, frame.eventId, event.kind, event.messageId, frame.sequence, receivedAt);
+    }
+    this.#db
+      .prepare("UPDATE attach_streams SET last_event_sequence = ?, updated_at = ? WHERE agent_id = ?")
+      .run(frame.sequence, receivedAt, agentId);
+    if (disposition === "accepted") this.tasks.event(agentId, frame, receivedAt);
+    return { status: disposition, acknowledgedSequence: frame.sequence };
+  }
+
   markAttachEventApplied(agentId: string, eventId: string, appliedAt: number): void {
+    this.markAttachEventsApplied(agentId, [eventId], appliedAt);
+  }
+
+  markAttachEventsApplied(agentId: string, eventIds: readonly string[], appliedAt: number): void {
+    if (eventIds.length === 0) return;
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      this.#db.prepare("UPDATE attach_event_inbox SET applied_at = ? WHERE agent_id = ? AND event_id = ?").run(appliedAt, agentId, eventId);
-      this.#db.prepare("UPDATE attach_scheduled_deliveries SET projected_at = COALESCE(projected_at, ?) WHERE agent_id = ? AND event_id = ?").run(appliedAt, agentId, eventId);
+      const markInbox = this.#db.prepare("UPDATE attach_event_inbox SET applied_at = ? WHERE agent_id = ? AND event_id = ?");
+      const markDelivery = this.#db.prepare("UPDATE attach_scheduled_deliveries SET projected_at = COALESCE(projected_at, ?) WHERE agent_id = ? AND event_id = ?");
+      for (const eventId of eventIds) {
+        markInbox.run(appliedAt, agentId, eventId);
+        markDelivery.run(appliedAt, agentId, eventId);
+      }
       this.#db.exec("COMMIT");
     } catch (err) {
       this.#db.exec("ROLLBACK");
@@ -6431,6 +6455,8 @@ function nativeBotMessage(row: NativeBotMessageDbRow): BotChatMessage {
 export function openStorage(dbPath: string): Storage {
   const db = new CachedDatabaseSync(dbPath);
   db.exec("PRAGMA journal_mode = WAL");
+  // The attach ACK boundary is a durable SQLite commit, not merely a WAL append.
+  db.exec("PRAGMA synchronous = FULL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
   // The original tool table predates detail/error_text. Migrate before creating their index.

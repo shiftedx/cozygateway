@@ -61,6 +61,8 @@ import { monotonicNow, type ObservationRing } from "../../observe/ring.ts";
 
 export const ATTACH_V1_MAX_IN_FLIGHT_EVENTS = 64;
 export const ATTACH_V1_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
+const ATTACH_V1_EVENT_ADMISSION_BATCH = 32;
+const ATTACH_V1_EVENT_BATCH_KINDS = new Set<AttachV1EventFrame["event"]["kind"]>(["draft", "tool", "thinking"]);
 export const ATTACH_V1_HEARTBEAT_INTERVAL_MS = 15_000;
 export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
 /** Every capability the gateway will negotiate. `satisfies` proves each entry is a real
@@ -125,6 +127,12 @@ export interface AttachV1Events {
   ): void;
 }
 
+interface BufferedEvent {
+  frame: AttachV1EventFrame;
+  receivedAt: number;
+  bytes: number;
+}
+
 interface Connection {
   socket: WebSocket;
   hello: boolean;
@@ -142,6 +150,9 @@ interface Connection {
   sentCommands: Map<number, { commandId: string; bytes: number }>;
   sentCommandBytes: number;
   capabilities: Set<AttachV1Capability>;
+  events: BufferedEvent[];
+  eventBytes: number;
+  eventFlush?: ReturnType<typeof setTimeout>;
 }
 
 /** Storage-backed attach-v1 ingress. Socket loss changes availability but never deletes commands
@@ -165,6 +176,8 @@ export class AttachV1Ingress implements TurnEndpoint {
   readonly #projectionRetryMs: number;
   readonly #projectionMaxAttempts: number;
   readonly #projectionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly #projectionYields = new Map<string, ReturnType<typeof setImmediate>>();
+  readonly #projectionMarkers = new Map<string, { eventIds: readonly string[]; attempts: number }>();
   readonly #trace: TraceLog | undefined;
   readonly #log: (line: string) => void;
   readonly #pendingConnections: PendingWebsocketLimiter;
@@ -205,7 +218,7 @@ export class AttachV1Ingress implements TurnEndpoint {
     this.#trace = deps.trace;
     this.#log = deps.log ?? ((line) => console.warn(line));
     this.#pendingConnections = new PendingWebsocketLimiter(deps.maxPendingConnections ?? PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS);
-    this.#wss = new WebSocketServer({ noServer: true, maxPayload: PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES });
+    this.#wss = new WebSocketServer({ noServer: true, maxPayload: PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES, allowSynchronousEvents: false });
     this.#wss.on("error", () => {});
     this.#wss.on("connection", (socket: WebSocket, req: IncomingMessage, releasePending: () => void) => this.#onConnection(socket, req, releasePending));
     this.#heartbeat = setInterval(() => this.#tick(), this.#heartbeatIntervalMs);
@@ -248,6 +261,8 @@ export class AttachV1Ingress implements TurnEndpoint {
       sentCommands: new Map(),
       sentCommandBytes: 0,
       capabilities: new Set(),
+      events: [],
+      eventBytes: 0,
     };
     const helloTimer = setTimeout(() => {
       if (!connection.hello) socket.close(1002, "attach-v1 hello required");
@@ -257,9 +272,16 @@ export class AttachV1Ingress implements TurnEndpoint {
     socket.on("message", (data) => {
       // Includes sockets accepted before deletion that have not sent hello yet: those are not
       // in #current, but must never recreate their stream/catalog once the credential is revoked.
-      if (this.#agentFor(req) !== agentId) { socket.close(1008, "identity revoked"); return; }
+      if (this.#agentFor(req) !== agentId) {
+        this.#discardEventQueue(connection);
+        socket.close(1008, "identity revoked");
+        return;
+      }
       // A replaced socket may still deliver already-buffered frames before close completes.
-      if (connection.hello && this.#current.get(agentId) !== connection) return;
+      if (connection.hello && this.#current.get(agentId) !== connection) {
+        this.#discardEventQueue(connection);
+        return;
+      }
       const receivedAt = this.#now();
       connection.lastSeenAt = receivedAt;
       connection.heartbeatDegraded = false;
@@ -302,7 +324,10 @@ export class AttachV1Ingress implements TurnEndpoint {
         }
         clearTimeout(helloTimer);
         const previous = this.#current.get(agentId);
-        if (previous !== undefined && previous.socket !== socket) previous.socket.close(4000, "superseded");
+        if (previous !== undefined && previous.socket !== socket) {
+          this.#discardEventQueue(previous);
+          previous.socket.close(4000, "superseded");
+        }
         const resumedEventsThrough = frame.resume?.eventSequence ?? 0;
         const resumedCommandsThrough = frame.resume?.commandSequence ?? 0;
         if (!this.#storage.reconcileAttachResume(agentId, resumedEventsThrough, resumedCommandsThrough, this.#now())) {
@@ -362,9 +387,16 @@ export class AttachV1Ingress implements TurnEndpoint {
         if (frame.activeTurns !== undefined && activeTurns === undefined)
           this.#log(`attach-v1: profile "${agentId}" sent an unusable activeTurns declaration on hello; treating it as undeclared`);
         this.#events.onHello?.(agentId, activeTurns);
+        // A prior marker write can fail after admission. Replaying after the canonical session is
+        // ready makes reconnect recovery independent of a later new event.
+        this.#projectPending(agentId);
+        this.flushTaskCommands();
         return;
       }
       if (frame.kind === "hello") return;
+      // An inbound control frame can change turn/session state. It therefore cannot overtake a
+      // buffered event on the same socket; this drain is bounded by the per-connection FIFO.
+      if (frame.kind !== "event" && !this.#drainEventQueue(agentId, connection, req)) return;
       if (frame.kind === "heartbeat") {
         // Gateway is the sole heartbeat initiator. The inbound frame is its one acknowledgement,
         // not a request for another response; echoing it makes two healthy peers amplify heartbeats.
@@ -469,47 +501,21 @@ export class AttachV1Ingress implements TurnEndpoint {
         }
         return;
       }
-      const missingCapability = eventCapabilities(frame).find((capability) => !connection.capabilities.has(capability));
-      const discardReason: AttachV1DiscardReason | undefined = missingCapability !== undefined
-        ? "capability_not_negotiated"
-        : this.#events.canAcceptEvent?.(agentId, frame) === false
-          ? "unauthorized_target"
-          : undefined;
-      const admission = this.#storage.acceptAttachEvent(agentId, frame, this.#now(), discardReason);
-      if (admission.status === "gap") {
-        this.#send(connection, {
-          kind: "gap", channel: "event", requestedAfter: admission.expectedSequence - 1,
-          earliestAvailable: admission.expectedSequence, latestAvailable: this.#storage.attachEventCursor(agentId),
-        });
+      const queued = { frame, receivedAt, bytes: Buffer.byteLength(String(data)) };
+      if (ATTACH_V1_EVENT_BATCH_KINDS.has(frame.event.kind)) {
+        this.#queueEvent(agentId, connection, req, queued);
         return;
       }
-      if (admission.status === "conflict") {
-        socket.close(1008, "event sequence conflict");
-        return;
-      }
-      if (admission.status === "accepted") {
-        this.#projectPending(agentId);
-        this.flushTaskCommands();
-      }
-      if (admission.status === "discarded" && frame.event.kind === "scheduled") {
-        this.#deliveryFailed(agentId, {
-          deliveryId: frame.event.deliveryId,
-          messageId: frame.event.messageId,
-          stage: "authorization",
-          reason: admission.reason,
-        });
-      }
-      this.#traceAttach("attach_event", agentId, { eventCursor: admission.acknowledgedSequence, outcome: admission.status });
-      this.#send(connection, {
-        kind: "ack", channel: "event", sequence: admission.acknowledgedSequence,
-        id: frame.eventId, ...(admission.status === "duplicate" ? { duplicate: true } : {}),
-        ...(admission.status === "discarded" ? { discarded: true as const, reason: admission.reason } : {}),
-      });
+      // A terminal, delivery, or other side-effecting event remains a wire-order boundary. Its
+      // preceding ephemeral prefix is durably admitted and projected before this one proceeds.
+      if (!this.#drainEventQueue(agentId, connection, req)) return;
+      this.#admitEvents(agentId, connection, req, [queued]);
     });
 
     socket.on("close", (code) => {
       clearTimeout(helloTimer);
       releasePending?.();
+      this.#discardEventQueue(connection);
       if (this.#current.get(agentId) === connection) {
         this.#current.delete(agentId);
         this.#presence(agentId, "absent");
@@ -521,6 +527,130 @@ export class AttachV1Ingress implements TurnEndpoint {
       this.#observe?.peerForgotten(agentId);
       this.#traceAttach("attach_close", agentId, { code, commandCursor: connection.commandCursor });
     });
+  }
+
+  #connectionIsCurrent(agentId: string, connection: Connection, req: IncomingMessage): boolean {
+    return this.#agentFor(req) === agentId
+      && this.#current.get(agentId) === connection
+      && connection.hello
+      && connection.socket.readyState === WebSocket.OPEN;
+  }
+
+  #discardEventQueue(connection: Connection): void {
+    if (connection.eventFlush !== undefined) clearTimeout(connection.eventFlush);
+    connection.eventFlush = undefined;
+    connection.events = [];
+    connection.eventBytes = 0;
+  }
+
+  #queueEvent(agentId: string, connection: Connection, req: IncomingMessage, event: BufferedEvent): void {
+    if (!this.#connectionIsCurrent(agentId, connection, req)) {
+      this.#discardEventQueue(connection);
+      return;
+    }
+    const countLimit = Math.max(1, Math.min(ATTACH_V1_EVENT_ADMISSION_BATCH, connection.maxInFlightEvents));
+    const byteLimit = Math.max(1, connection.maxInFlightBytes);
+    if ((connection.events.length >= countLimit || (connection.events.length > 0 && connection.eventBytes + event.bytes > byteLimit))
+      && !this.#drainEventQueue(agentId, connection, req)) return;
+    if (!this.#connectionIsCurrent(agentId, connection, req)) return;
+    connection.events.push(event);
+    connection.eventBytes += event.bytes;
+    if (connection.eventFlush === undefined) {
+      const flush = setTimeout(() => {
+        connection.eventFlush = undefined;
+        this.#drainEventQueue(agentId, connection, req);
+      }, 0);
+      flush.unref();
+      connection.eventFlush = flush;
+    } else connection.eventFlush.refresh();
+  }
+
+  /** Drains at most the connection's bounded FIFO before a later wire frame observes state. */
+  #drainEventQueue(agentId: string, connection: Connection, req: IncomingMessage): boolean {
+    if (!this.#connectionIsCurrent(agentId, connection, req)) {
+      this.#discardEventQueue(connection);
+      return false;
+    }
+    if (connection.eventFlush !== undefined) clearTimeout(connection.eventFlush);
+    connection.eventFlush = undefined;
+    return connection.events.length === 0 || this.#admitQueuedEvents(agentId, connection, req);
+  }
+
+  #admitQueuedEvents(agentId: string, connection: Connection, req: IncomingMessage): boolean {
+    const entries = connection.events;
+    connection.events = [];
+    connection.eventBytes = 0;
+    return this.#admitEvents(agentId, connection, req, entries);
+  }
+
+  #admitEvents(agentId: string, connection: Connection, req: IncomingMessage, entries: readonly BufferedEvent[]): boolean {
+    if (!this.#connectionIsCurrent(agentId, connection, req)) {
+      this.#discardEventQueue(connection);
+      return false;
+    }
+    const admissions = (() => {
+      try {
+        return this.#storage.acceptAttachEvents(agentId, entries.map((entry) => {
+          const missingCapability = eventCapabilities(entry.frame).find((capability) => !connection.capabilities.has(capability));
+          const discardReason: AttachV1DiscardReason | undefined = missingCapability !== undefined
+            ? "capability_not_negotiated"
+            : this.#events.canAcceptEvent?.(agentId, entry.frame) === false
+              ? "unauthorized_target"
+              : undefined;
+          return { frame: entry.frame, receivedAt: entry.receivedAt, ...(discardReason === undefined ? {} : { discardReason }) };
+        }));
+      } catch (error) {
+        this.#log(`attach-v1: event admission for profile "${agentId}" failed (${error instanceof Error ? error.message : String(error)})`);
+        this.#discardEventQueue(connection);
+        connection.socket.close(1011, "event admission failed");
+        return undefined;
+      }
+    })();
+    if (admissions === undefined) return false;
+    const accepted = admissions.some((admission) => admission.status === "accepted" || admission.status === "duplicate");
+    // The durable batch is already committed. Projection stays outside it, but runs before the
+    // corresponding ACKs just as the former one-frame path did.
+    if (accepted) {
+      this.#projectPending(agentId);
+      this.flushTaskCommands();
+    }
+    for (let index = 0; index < admissions.length; index += 1) {
+      const admission = admissions[index]!;
+      const entry = entries[index]!;
+      if (admission.status === "gap") {
+        this.#send(connection, {
+          kind: "gap", channel: "event", requestedAfter: admission.expectedSequence - 1,
+          earliestAvailable: admission.expectedSequence, latestAvailable: this.#storage.attachEventCursor(agentId),
+        });
+        continue;
+      }
+      if (admission.status === "conflict") {
+        this.#discardEventQueue(connection);
+        connection.socket.close(1008, "event sequence conflict");
+        return false;
+      }
+      if (admission.status === "discarded" && entry.frame.event.kind === "scheduled") {
+        this.#deliveryFailed(agentId, {
+          deliveryId: entry.frame.event.deliveryId,
+          messageId: entry.frame.event.messageId,
+          stage: "authorization",
+          reason: admission.reason,
+        });
+      }
+      this.#traceAttach("attach_event", agentId, { eventCursor: admission.acknowledgedSequence, outcome: admission.status });
+      this.#send(connection, {
+        kind: "ack", channel: "event", sequence: admission.acknowledgedSequence,
+        id: entry.frame.eventId, ...(admission.status === "duplicate" ? { duplicate: true } : {}),
+        ...(admission.status === "discarded" ? { discarded: true as const, reason: admission.reason } : {}),
+      });
+    }
+    // A gap/conflict ends the storage prefix. Buffered later frames have no durable receipt, so
+    // discard them for peer replay instead of trying to invent a new ordering after the repair.
+    if (admissions.length < entries.length || admissions.some((admission) => admission.status === "gap")) {
+      this.#discardEventQueue(connection);
+      return false;
+    }
+    return true;
   }
 
   #send(connection: Connection, frame: AttachV1ServerFrame): boolean {
@@ -909,8 +1039,25 @@ export class AttachV1Ingress implements TurnEndpoint {
   #projectPending(agentId: string): void {
     // New later events must not accelerate an earlier event through its retry budget. The one
     // active timer is the ordering barrier for this identity until it fires or the event applies.
+    const yieldTimer = this.#projectionYields.get(agentId);
+    if (yieldTimer !== undefined) {
+      clearImmediate(yieldTimer);
+      this.#projectionYields.delete(agentId);
+    }
     if (this.#projectionTimers.has(agentId)) return;
-    for (const frame of this.#storage.unappliedAttachEvents(agentId)) {
+    if (!this.#finishProjectionMarkers(agentId)) return;
+    const frames = this.#storage.unappliedAttachEvents(agentId, ATTACH_V1_EVENT_ADMISSION_BATCH);
+    const applied: string[] = [];
+    const commitAppliedPrefix = (): boolean => {
+      if (applied.length === 0) return true;
+      if (!this.#markProjected(agentId, applied)) return false;
+      applied.length = 0;
+      return true;
+    };
+    for (const frame of frames) {
+      // Durable callbacks may have side effects. Commit their preceding ephemeral prefix first so
+      // a marker failure cannot leave a successful callback ahead of an unmarked draft/tool run.
+      if (!ATTACH_V1_EVENT_BATCH_KINDS.has(frame.event.kind) && !commitAppliedPrefix()) return;
       let projected = false;
       let error = "projection declined event";
       try {
@@ -919,10 +1066,16 @@ export class AttachV1Ingress implements TurnEndpoint {
         error = err instanceof Error ? err.message : "projection threw";
       }
       if (projected) {
-        this.#storage.markAttachEventApplied(agentId, frame.eventId, this.#now());
-        this.#traceAttach("attach_projection", agentId, { outcome: "applied" });
+        if (ATTACH_V1_EVENT_BATCH_KINDS.has(frame.event.kind)) {
+          applied.push(frame.eventId);
+        } else {
+          if (!this.#markProjected(agentId, [frame.eventId])) return;
+        }
         continue;
       }
+      // Persist every successful prefix before recording this failure. A callback never shares a
+      // transaction with another callback, and a retry sees exactly the remaining head.
+      if (!commitAppliedPrefix()) return;
       // A draft or tool frame is ephemeral rendering state: superseded in seconds and worthless
       // once its turn ends. It gets the same bounded retries, but exhaustion SKIPS it (stamped
       // applied, said out loud) instead of dead-lettering: in production two declined drafts
@@ -938,7 +1091,7 @@ export class AttachV1Ingress implements TurnEndpoint {
       if (failure.attempts === 1)
         this.#log(`attach-v1: projecting ${frame.event.kind} event ${frame.sequence} for profile "${agentId}" failed (${error}); retrying`);
       if (ephemeral && failure.attempts >= this.#projectionMaxAttempts) {
-        this.#storage.markAttachEventApplied(agentId, frame.eventId, this.#now());
+        if (!this.#markProjected(agentId, [frame.eventId])) return;
         this.#log(`attach-v1: skipped undeliverable ${frame.event.kind} event ${frame.sequence} for profile "${agentId}" after ${failure.attempts} attempts (${error}); ephemeral events never dead-letter the stream`);
         continue;
       }
@@ -970,6 +1123,56 @@ export class AttachV1Ingress implements TurnEndpoint {
       this.#projectionTimers.set(agentId, timer);
       break;
     }
+    if (!commitAppliedPrefix()) return;
+    if (frames.length === ATTACH_V1_EVENT_ADMISSION_BATCH && !this.#projectionTimers.has(agentId)
+      && this.#storage.unappliedAttachEvents(agentId, 1).length > 0) {
+      const timer = setImmediate(() => {
+        this.#projectionYields.delete(agentId);
+        this.#projectPending(agentId);
+        this.flushTaskCommands();
+      });
+      timer.unref();
+      this.#projectionYields.set(agentId, timer);
+    }
+  }
+
+  #markProjected(agentId: string, eventIds: readonly string[]): boolean {
+    this.#projectionMarkers.set(agentId, { eventIds: [...eventIds], attempts: 0 });
+    return this.#finishProjectionMarkers(agentId);
+  }
+
+  #finishProjectionMarkers(agentId: string): boolean {
+    const pending = this.#projectionMarkers.get(agentId);
+    if (pending === undefined) return true;
+    try {
+      this.#storage.markAttachEventsApplied(agentId, pending.eventIds, this.#now());
+    } catch (error) {
+      this.#retryProjectionMarker(agentId, pending, error);
+      return false;
+    }
+    this.#projectionMarkers.delete(agentId);
+    for (const eventId of pending.eventIds) this.#traceAttach("attach_projection", agentId, { outcome: "applied" });
+    return true;
+  }
+
+  #retryProjectionMarker(agentId: string, pending: { eventIds: readonly string[]; attempts: number }, error: unknown): void {
+    const attempts = pending.attempts + 1;
+    this.#projectionMarkers.set(agentId, { ...pending, attempts });
+    const reason = error instanceof Error ? error.message : String(error);
+    if (attempts >= this.#projectionMaxAttempts) {
+      this.#log(`attach-v1: marking projected events for profile "${agentId}" failed ${attempts} times (${reason}); closing its connection for durable replay`);
+      this.#current.get(agentId)?.socket.close(1011, "projection state update failed");
+      return;
+    }
+    this.#log(`attach-v1: marking projected events for profile "${agentId}" failed (${reason}); retrying`);
+    const delay = Math.min(this.#projectionRetryMs * 2 ** Math.max(0, attempts - 1), 30_000);
+    const timer = setTimeout(() => {
+      this.#projectionTimers.delete(agentId);
+      this.#projectPending(agentId);
+      this.flushTaskCommands();
+    }, delay);
+    timer.unref();
+    this.#projectionTimers.set(agentId, timer);
   }
 
   #tick(): void {
@@ -1031,8 +1234,13 @@ export class AttachV1Ingress implements TurnEndpoint {
     const timer = this.#projectionTimers.get(agentId);
     if (timer !== undefined) clearTimeout(timer);
     this.#projectionTimers.delete(agentId);
+    const yieldTimer = this.#projectionYields.get(agentId);
+    if (yieldTimer !== undefined) clearImmediate(yieldTimer);
+    this.#projectionYields.delete(agentId);
+    this.#projectionMarkers.delete(agentId);
     const connection = this.#current.get(agentId);
     if (connection !== undefined) {
+      this.#discardEventQueue(connection);
       connection.socket.close(1008, "identity revoked");
       this.#current.delete(agentId);
     }
@@ -1044,7 +1252,13 @@ export class AttachV1Ingress implements TurnEndpoint {
     clearInterval(this.#heartbeat);
     for (const timer of this.#projectionTimers.values()) clearTimeout(timer);
     this.#projectionTimers.clear();
-    for (const connection of this.#current.values()) connection.socket.close(1001, "server shutdown");
+    for (const timer of this.#projectionYields.values()) clearImmediate(timer);
+    this.#projectionYields.clear();
+    this.#projectionMarkers.clear();
+    for (const connection of this.#current.values()) {
+      this.#discardEventQueue(connection);
+      connection.socket.close(1001, "server shutdown");
+    }
     this.#current.clear();
     this.#wss.close();
   }
