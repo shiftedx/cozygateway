@@ -828,6 +828,10 @@ if (`$env:COZYGATEWAY_POWERSHELL -cne 'preexisting-powershell-value') { exit 32 
 
     $uninstallPathLog = Join-Path $temp 'uninstall-user-path.txt'
     $managedBin = Join-Path $temp 'Cozy Gateway\bin'
+    # A completed uninstall now deletes the entire install. Keep a separate
+    # disposable installation for the following no-mutation preview check.
+    $dryUninstallHome = Join-Path $temp 'Dry Uninstall Gateway'
+    Copy-Item -LiteralPath (Join-Path $temp 'Cozy Gateway') -Destination $dryUninstallHome -Recurse
     $mustNotRunHermesInstaller = Join-Path $temp 'must-not-run-hermes-installer.ps1'
     Write-Utf8NoBom $mustNotRunHermesInstaller "throw 'uninstall must not install Hermes'`n"
     Remove-Item -LiteralPath $eventLog -Force
@@ -845,12 +849,13 @@ if (`$env:COZYGATEWAY_POWERSHELL -cne 'preexisting-powershell-value') { exit 32 
     $uninstalledPath = Get-Content -LiteralPath $uninstallPathLog -Raw
     Assert-True (-not ($uninstalledPath -match [regex]::Escape($managedBin))) 'uninstall must remove the managed command directory from the user PATH'
     Assert-True (-not ((Get-Content -LiteralPath $eventLog -Raw) -match 'hermes:-p default model')) 'uninstall must not open Hermes model selection'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $temp 'Cozy Gateway'))) 'uninstall must remove the full Gateway directory'
 
     $dryUninstallPathLog = Join-Path $temp 'dry-uninstall-user-path.txt'
     Remove-Item -LiteralPath $eventLog -Force
     $dryUninstall = Invoke-Bootstrap $installer @{
         'PATH' = "$fakeBin;$env:PATH"
-        'COZYGATEWAY_HOME' = (Join-Path $temp 'Cozy Gateway')
+        'COZYGATEWAY_HOME' = $dryUninstallHome
         'COZYGATEWAY_GIT_BASH' = $fakeBash
         'COZYGATEWAY_INSTALL_DRYRUN' = '1'
         'COZYGATEWAY_TEST_USER_PATH' = "C:\Existing Tools;$managedBin"
@@ -858,6 +863,7 @@ if (`$env:COZYGATEWAY_POWERSHELL -cne 'preexisting-powershell-value') { exit 32 
     } @('--uninstall')
     Assert-True ($dryUninstall.ExitCode -eq 0) "bootstrap uninstall dry run failed: $($dryUninstall.Output)"
     Assert-True (-not (Test-Path -LiteralPath $dryUninstallPathLog)) 'uninstall dry run must not mutate the user PATH'
+    Assert-True (Test-Path -LiteralPath $dryUninstallHome) 'uninstall dry run must keep the Gateway directory'
     Assert-True ((Get-Content -LiteralPath $eventLog -Raw) -match '--uninstall.*--dry-run|--dry-run.*--uninstall') 'bootstrap must forward dry run to uninstall'
 
     $dryRunPathLog = Join-Path $temp 'dry-run-user-path.txt'
