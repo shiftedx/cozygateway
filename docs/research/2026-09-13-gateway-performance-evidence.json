@@ -1,0 +1,305 @@
+{
+  "date": "2026-09-13",
+  "timezone": "America/Chicago",
+  "baselineCommit": "5785d30053a14acff685eda964bcb294ce548817",
+  "branch": "codex/gateway-performance-audit",
+  "runtime": {
+    "node": "24.19.0",
+    "pnpm": "10.30.1",
+    "vitest": "4.1.11"
+  },
+  "productionReadOnly": {
+    "gatewayVersion": "0.8.1",
+    "cleoInboxRows": 127757,
+    "totalInboxRows": 147907,
+    "pendingQueryMs": [
+      120.24,
+      115.05,
+      113.05
+    ],
+    "recentEventKinds": {
+      "draft": 907,
+      "tool": 67,
+      "thinking": 19,
+      "commit": 3
+    }
+  },
+  "localGateway": {
+    "toolBursts": [
+      {
+        "historyTools": 0,
+        "trailingCommands": 0,
+        "burstMs": 59.73,
+        "eventLoopDelayMs": 59.79,
+        "historyMs": 1.31,
+        "toolSteps": 40,
+        "appliedEvents": 80,
+        "activityFrames": 2,
+        "emittedStepObjects": 41
+      },
+      {
+        "historyTools": 400,
+        "trailingCommands": 0,
+        "burstMs": 40.52,
+        "eventLoopDelayMs": 40.57,
+        "historyMs": 1.62,
+        "toolSteps": 40,
+        "appliedEvents": 80,
+        "activityFrames": 2,
+        "emittedStepObjects": 41
+      },
+      {
+        "historyTools": 2000,
+        "trailingCommands": 0,
+        "burstMs": 41.47,
+        "eventLoopDelayMs": 47.52,
+        "historyMs": 5.2,
+        "toolSteps": 40,
+        "appliedEvents": 80,
+        "activityFrames": 2,
+        "emittedStepObjects": 41
+      },
+      {
+        "historyTools": 400,
+        "trailingCommands": 0,
+        "burstMs": 39.8,
+        "eventLoopDelayMs": 39.86,
+        "historyMs": 1.06,
+        "toolSteps": 40,
+        "appliedEvents": 80,
+        "activityFrames": 2,
+        "emittedStepObjects": 41
+      },
+      {
+        "historyTools": 400,
+        "trailingCommands": 512,
+        "burstMs": 50.46,
+        "eventLoopDelayMs": 50.51,
+        "historyMs": 1.71,
+        "toolSteps": 40,
+        "appliedEvents": 80,
+        "activityFrames": 2,
+        "emittedStepObjects": 41
+      }
+    ],
+    "inboxQueries": {
+      "historyRows": 127757,
+      "baselineMs": 15.96,
+      "indexedMs": 0.03,
+      "storageMs": 0.03,
+      "peerHealthBaselineMs": 7.93,
+      "peerHealthIndexedMs": 0.01,
+      "releaseBaselineMs": 7.96,
+      "releaseIndexedMs": 0.01
+    },
+    "healthEndpoints": {
+      "inboxRows": 127757,
+      "latestEventBaselineMs": 3.11,
+      "latestEventIndexedMs": 0.01,
+      "attachTerminalRows": 24000,
+      "nativeTerminalRows": 24000,
+      "latestTerminalBaselineMs": 14.34,
+      "latestTerminalIndexedMs": 0.01
+    },
+    "protectedRetentionWindows": {
+      "historyRows": 127757,
+      "toolFirstMs": 0.71,
+      "toolResumedMs": 0.65,
+      "rawFirstMs": 1.48,
+      "rawResumedMs": 1.45
+    },
+    "websocketStress": {
+      "retainedRows": 128000,
+      "liveEvents": 1000,
+      "toolEvents": 40,
+      "idlePeers": 6,
+      "apps": 1,
+      "ackCompletionMs": 377.31,
+      "maxTimerGapMs": 357.59,
+      "abnormalCloses": 0,
+      "exactProductionReproduction": false
+    }
+  },
+  "localCozyAgentsSpool": [
+    {
+      "historyRows": 0,
+      "tools": 40,
+      "frames": 80,
+      "elapsedMs": 54.8,
+      "heartbeatMs": 25.4,
+      "maxEventLoopDelayMs": 10,
+      "spoolBytes": 108679,
+      "rssMiB": 89.8
+    },
+    {
+      "historyRows": 1000,
+      "tools": 40,
+      "frames": 80,
+      "elapsedMs": 364.6,
+      "heartbeatMs": 177.3,
+      "maxEventLoopDelayMs": 11.4,
+      "spoolBytes": 1413486,
+      "rssMiB": 108.8
+    },
+    {
+      "historyRows": 10000,
+      "tools": 40,
+      "frames": 80,
+      "elapsedMs": 3099.9,
+      "heartbeatMs": 1649.4,
+      "maxEventLoopDelayMs": 25.3,
+      "spoolBytes": 13203653,
+      "rssMiB": 320.3
+    }
+  ],
+  "limits": [
+    "Synthetic local workloads; not an end-to-end production benchmark.",
+    "Production and local timings are separate hardware/data samples.",
+    "Spool timings are single-run characterizations; RSS includes seed/runtime allocations.",
+    "No production deployment or exact 1006 reproduction."
+  ],
+  "localHermesSpool": {
+    "retainedRows": 128000,
+    "unacknowledgedRows": 64,
+    "pendingReadMedianMs": 0.111,
+    "healthMedianMs": 0.007,
+    "alreadyIndexedInProduction": true
+  },
+  "localCozyAgentsSpoolComparison": {
+    "historyRows": 10000,
+    "tools": 40,
+    "runs": {
+      "baseline": [
+        {
+          "historyRows": 10000,
+          "tools": 40,
+          "frames": 80,
+          "elapsedMs": 2811.2,
+          "heartbeatMs": 1408.5,
+          "maxEventLoopDelayMs": 23.1,
+          "startupMs": 32.7,
+          "startupEventLoopDelayMs": 14.4,
+          "spoolBytes": 13203653,
+          "rssMiB": 245
+        },
+        {
+          "historyRows": 10000,
+          "tools": 40,
+          "frames": 80,
+          "elapsedMs": 2780.8,
+          "heartbeatMs": 1380.8,
+          "maxEventLoopDelayMs": 22.5,
+          "startupMs": 33.1,
+          "startupEventLoopDelayMs": 14,
+          "spoolBytes": 13203653,
+          "rssMiB": 247
+        },
+        {
+          "historyRows": 10000,
+          "tools": 40,
+          "frames": 80,
+          "elapsedMs": 2740.8,
+          "heartbeatMs": 1386.5,
+          "maxEventLoopDelayMs": 22.5,
+          "startupMs": 32.2,
+          "startupEventLoopDelayMs": 13.9,
+          "spoolBytes": 13203653,
+          "rssMiB": 271.6
+        }
+      ],
+      "sqlite": [
+        {
+          "historyRows": 10000,
+          "tools": 40,
+          "frames": 80,
+          "elapsedMs": 32.6,
+          "heartbeatMs": 15.3,
+          "maxEventLoopDelayMs": null,
+          "startupMs": 115.1,
+          "startupEventLoopDelayMs": 72.4,
+          "spoolBytes": 14262272,
+          "rssMiB": 215
+        },
+        {
+          "historyRows": 10000,
+          "tools": 40,
+          "frames": 80,
+          "elapsedMs": 33.2,
+          "heartbeatMs": 15.4,
+          "maxEventLoopDelayMs": null,
+          "startupMs": 107.1,
+          "startupEventLoopDelayMs": 70.5,
+          "spoolBytes": 14262272,
+          "rssMiB": 215.1
+        },
+        {
+          "historyRows": 10000,
+          "tools": 40,
+          "frames": 80,
+          "elapsedMs": 34.1,
+          "heartbeatMs": 16.1,
+          "maxEventLoopDelayMs": null,
+          "startupMs": 109.7,
+          "startupEventLoopDelayMs": 73.3,
+          "spoolBytes": 14262272,
+          "rssMiB": 215.1
+        }
+      ]
+    },
+    "medians": {
+      "baseline": {
+        "elapsedMs": 2780.8,
+        "heartbeatMs": 1386.5,
+        "maxEventLoopDelayMs": 22.5,
+        "startupMs": 32.7,
+        "startupEventLoopDelayMs": 14,
+        "rssMiB": 247,
+        "spoolBytes": 13203653
+      },
+      "sqlite": {
+        "elapsedMs": 33.2,
+        "heartbeatMs": 15.4,
+        "maxEventLoopDelayMs": null,
+        "startupMs": 109.7,
+        "startupEventLoopDelayMs": 72.4,
+        "rssMiB": 215.1,
+        "spoolBytes": 14262272
+      }
+    },
+    "measurementNotes": [
+      "Burst and heartbeat times begin after the handshake.",
+      "Startup includes one-time JSON-to-SQLite migration.",
+      "Null event-loop delay means insufficient histogram samples for this short burst; not zero delay.",
+      "RSS includes the synthetic history seed and runtime allocations."
+    ]
+  },
+  "validation": {
+    "gateway": {
+      "passed": 2417,
+      "skipped": 26
+    },
+    "cozyagents": {
+      "passed": 3629,
+      "skipped": 12
+    },
+    "hermesPython": {
+      "passed": 598,
+      "skipped": 3
+    },
+    "additionalPassed": [
+      "gateway build/typecheck",
+      "gateway installer gate",
+      "gateway contract package lint",
+      "gateway production dependency audit",
+      "CozyAgents typecheck/bundle",
+      "CozyAgents portable PowerShell units",
+      "CozyAgents bundle smoke",
+      "CozyAgents POSIX lifecycle",
+      "CozyAgents dependency audit"
+    ],
+    "notRun": [
+      "Native Windows suites: macOS host",
+      "Docker smoke: local Docker daemon unavailable"
+    ]
+  }
+}

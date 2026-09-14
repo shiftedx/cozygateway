@@ -3,7 +3,7 @@
 Serializes ``{name: {"text": text, "blocks": [block-as-dict, ...]}}`` for every fixture in
 ``tests.test_text_blocks_incremental.FIXTURES`` to
 ``packages/gateway/test/fixtures/markdown-blocks-vectors.json``, so the TypeScript port
-(``packages/gateway/src/markdown-blocks.ts``) can assert byte-identical parity with the Python
+(``packages/gateway/test/support/markdown-blocks.ts``) can assert byte-identical parity with the Python
 reference (``cozygateway.text_blocks.normalize_text_to_blocks``).
 
 Run with ``--write`` to regenerate the vectors file after a fixture or normalizer change:

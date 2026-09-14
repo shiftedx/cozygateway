@@ -424,7 +424,7 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
             "draft", "media", "tools", "approvals", "clarify", "scheduled",
             "mobile_node", "mobile_location", "mobile_media", "mobile_notifications",
             "memory_management", "memory_setup", "delivery_receipts", "delegation", "thinking",
-            "desktop_session_resume", "desktop_session_sync", "cozyapps", "bot_config", "chat_configuration", "provider_connections",
+            "desktop_session_resume", "desktop_session_sync", "cozyapps", "bot_config", "chat_configuration", "provider_connections", "chat_context",
         })
 
     async def test_provider_handoff_uses_the_attach_bearer_without_a_socket_frame(self):

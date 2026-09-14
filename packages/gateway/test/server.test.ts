@@ -166,9 +166,21 @@ describe("startGateway end to end", () => {
       const timer = setIntervalSpy.mock.results[index]?.value as NodeJS.Timeout;
       expect(timer.hasRef()).toBe(false);
 
+      const chatIndex = setIntervalSpy.mock.calls.findLastIndex(([, interval]) => interval === 15_000);
+      expect(chatIndex).toBeGreaterThanOrEqual(0);
+      const chatTimer = setIntervalSpy.mock.results[chatIndex]?.value as NodeJS.Timeout;
+      expect(chatTimer.hasRef()).toBe(false);
+      const toolRetention = vi.spyOn(gw.storage, "compactBotChatToolDetails");
+      const payloadRetention = vi.spyOn(gw.storage, "compactAttachPayloads");
+      const retain = setIntervalSpy.mock.calls[chatIndex]![0] as () => void;
+      retain();
+      expect(toolRetention).toHaveBeenCalledOnce();
+      expect(payloadRetention).toHaveBeenCalledOnce();
+
       await gw.close();
       gw = undefined;
       expect(clearIntervalSpy).toHaveBeenCalledWith(timer);
+      expect(clearIntervalSpy).toHaveBeenCalledWith(chatTimer);
     } finally {
       await gw?.close();
       clearIntervalSpy.mockRestore();

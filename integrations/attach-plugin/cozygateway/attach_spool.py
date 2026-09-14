@@ -62,6 +62,9 @@ class ResumeConflict(RuntimeError):
 
 
 _TELEMETRY_MAX_EVENT_AGE_MS = 7 * 24 * 60 * 60 * 1_000
+_ACKED_PAYLOAD_RETENTION_MS = 14 * 24 * 60 * 60 * 1_000
+_ACKED_PAYLOAD_COMPACTION_BATCH = 256
+_ACKED_PAYLOAD_COMPACTION_BYTES = 4 * 1024 * 1024
 
 # The one event the gateway admits with no negotiated capability and applies to nothing: it needs
 # no thread, seals no turn, and its projection is a bare `return true`. That makes it the frame a
@@ -96,6 +99,15 @@ CREATE TABLE IF NOT EXISTS event_outbox (
 -- `frame_json` in the file just to learn a row is already answered for: a 73 MB read per send tick
 -- that blocks the event loop. The index is over the unacked rows alone.
 CREATE INDEX IF NOT EXISTS event_outbox_unacked ON event_outbox (sequence) WHERE acked = 0;
+-- Raw copies of these ACKed transient/terminal event bodies may expire without creating a
+-- sequence hole. The predicate removes an inert replacement from this index, so each bounded
+-- retention pass advances rather than revisiting old history.
+CREATE INDEX IF NOT EXISTS event_outbox_acked_compaction_candidates
+  ON event_outbox (created_at, sequence)
+  WHERE acked = 1
+    AND json_valid(frame_json)
+    AND json_extract(frame_json, '$.event.kind') IN
+      ('draft', 'tool', 'thinking', 'commit', 'failed', 'cancelled', 'interrupted');
 CREATE TABLE IF NOT EXISTS command_inbox (
   sequence INTEGER PRIMARY KEY,
   command_id TEXT NOT NULL UNIQUE,
@@ -513,6 +525,41 @@ class AttachSpool:
             result.append(json.loads(str(encoded)))
             used += size
         return result
+
+    def compact_acked_payloads(self) -> int:
+        """Replace one bounded batch of expired copied event bodies with inert sequence proof.
+
+        ACKed rows are never selected by ``pending_events``. The gateway's own durable inbox is
+        the authority for projection, while this local row retains its sequence, event id, ACK and
+        terminal seal. Media and interaction/delivery event kinds deliberately stay out of the
+        candidate index because local lifecycle cleanup still needs their raw payloads.
+        """
+        cutoff = self._now_ms() - _ACKED_PAYLOAD_RETENTION_MS
+        rows = self._db.execute(
+            "SELECT sequence, event_id, length(CAST(frame_json AS BLOB)) "
+            "FROM event_outbox WHERE acked = 1 AND created_at < ? AND json_valid(frame_json) "
+            "AND json_extract(frame_json, '$.event.kind') IN "
+            "('draft', 'tool', 'thinking', 'commit', 'failed', 'cancelled', 'interrupted') "
+            "ORDER BY created_at, sequence LIMIT ?",
+            (cutoff, _ACKED_PAYLOAD_COMPACTION_BATCH),
+        ).fetchall()
+        replacements: List[tuple[str, int, int]] = []
+        source_bytes = 0
+        for sequence, event_id, byte_count in rows:
+            size = int(byte_count)
+            if replacements and source_bytes + size > _ACKED_PAYLOAD_COMPACTION_BYTES:
+                break
+            replacement, replacement_bytes = self._inert_frame(int(sequence), str(event_id))
+            replacements.append((replacement, replacement_bytes, int(sequence)))
+            source_bytes += size
+        if not replacements:
+            return 0
+        with self._db:
+            self._db.executemany(
+                "UPDATE event_outbox SET frame_json = ?, byte_count = ? WHERE sequence = ? AND acked = 1",
+                replacements,
+            )
+        return len(replacements)
 
     def _inert_frame(self, sequence: int, event_id: str) -> tuple[str, int]:
         """Encode the same-sequence placeholder that stands in for a withdrawn or absent frame."""

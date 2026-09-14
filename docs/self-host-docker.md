@@ -94,6 +94,34 @@ For token-based Dashboard auth instead, replace the password fields with
 `"tokenEnv": "COZYGATEWAY_HERMES_TOKEN"` and add that variable to the secret file. See
 [`packages/gateway/README.md`](../packages/gateway/README.md) for the control-auth variants.
 
+## Chat activity and diagnostic retention
+
+Completed tool activity keeps full detail for seven days, then only the tool name, outcome,
+ordering, and timing. Completed summaries expire after 14 days. Active work and turns without
+terminal evidence remain protected. Applied transport copies lose expendable payload content after
+14 days, while cursor identities and delivery/media/task proofs remain available for recovery.
+Chat messages, files, and unresolved approvals are preserved.
+
+Harness-side copies are bounded separately. CozyAgents expires acknowledged event payloads after
+14 days from ACK, keeping stable sequence/id rows; legacy ACKs start that clock at migration.
+Hermes expires ACKed draft/tool/thinking and terminal copies older than 14 days. It retains raw
+media, interaction, scheduled-delivery and other specialized payloads needed by its recovery paths.
+Processed command bodies and tiny replay identities are not covered by this event-payload cleanup.
+The existing attach heartbeat runs one small harness cleanup pass after responding, with no extra
+watchdog. A cleanup error is logged without interrupting the connection.
+
+Maintenance runs in small batches every 15 seconds, so a large old backlog drains gradually.
+SQLite reuses freed pages; cleanup does not run a blocking `VACUUM` or immediately shrink the
+database file. Diagnostic observations default to seven days and are capped at 14 days even when
+an older configuration requests more.
+
+The reference Compose deployment rotates stdout/stderr through three 10 MB files per container,
+with a 1 MB nonblocking log-delivery buffer. Overflow drops diagnostic log lines, not durable chat.
+Docker's local driver limits bytes and file count, not age; a quiet old log may remain past 14 days.
+Configure a 14-day expiry in any external collector or host/Hermes log manager. Do not manually
+delete Docker-owned log files. Logging changes apply when containers are recreated through the
+normal release process. [Docker logging options](https://docs.docker.com/engine/logging/drivers/local/)
+
 ## Artifact retention and the store ceiling
 
 From capability 65 the gateway keeps a durable Artifact record for every file a bot delivers,

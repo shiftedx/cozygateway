@@ -7,7 +7,7 @@ import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 import type { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { AttachV1EventFrame } from "../src/adapters/attach/protocol-v1.ts";
 import { openStorage } from "../src/storage.ts";
-import { ObservationRing } from "../src/observe/index.ts";
+import { ObservationRing } from "../src/observe/ring.ts";
 
 /** A scheduled delivery that dies is invisible by construction: nothing arrives, and nothing says
  *  why. These cover the two halves of making it visible again, to the plugin and to the user. */

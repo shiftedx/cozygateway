@@ -9,7 +9,7 @@ import { WsHub } from "../src/ws-hub.ts";
 import { mintDeviceToken } from "../src/auth.ts";
 import { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { AttachV1ServerFrame } from "../src/adapters/attach/protocol-v1.ts";
-import { ObservationRing } from "../src/observe/index.ts";
+import { ObservationRing } from "../src/observe/ring.ts";
 import { RelayNotifier } from "../src/push-notifier.ts";
 
 let storage: Storage;

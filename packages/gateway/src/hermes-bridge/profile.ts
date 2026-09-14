@@ -8,6 +8,7 @@ import type {
 } from "cozygateway-contract";
 
 import { HermesRpcError, HermesTimeout } from "./client.ts";
+import { asRecord, asString } from "./rpc.ts";
 import type { HermesRpc } from "./rpc.ts";
 
 /** The edit-profile surface: everything the desktop's `EditProfileDialog` reads and everything its
@@ -93,16 +94,6 @@ export interface ProfileConfigureResult {
   /** The request fields this call carried, in request order, so a client can pair a missing
    *  `applied` key with the field that asked for it. */
   requested: (keyof BotProfilePatch)[];
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function asString(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
 }
 
 function asArray(value: unknown): unknown[] {

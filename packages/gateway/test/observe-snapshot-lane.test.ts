@@ -5,16 +5,18 @@ import { join } from "node:path";
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 
 import { openStorage, type Storage } from "../src/storage.ts";
+import { ObservationRing } from "../src/observe/ring.ts";
+import { ObservationSnapshotLane } from "../src/observe/lane.ts";
 import {
-  ObservationRing,
-  ObservationSnapshotLane,
   OBSERVATION_SNAPSHOT_LANE_SCHEMA,
   OBSERVATION_SNAPSHOT_MAX_BYTES,
-  OBSERVE_DEFAULT_PRICES,
-  observeCostMicros,
-  observeModelPrice,
   validateObservationSnapshotPayload,
-} from "../src/observe/index.ts";
+} from "../src/observe/snapshot.ts";
+import {
+  OBSERVE_DEFAULT_PRICES,
+  costMicros as observeCostMicros,
+  priceOf as observeModelPrice,
+} from "../src/observe/prices.ts";
 import { observability, observabilityPrices } from "../src/config.ts";
 
 const DAY = 86_400_000;

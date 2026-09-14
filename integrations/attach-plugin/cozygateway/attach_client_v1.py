@@ -1346,6 +1346,10 @@ class AttachV1Client:
                 if turn_health is not None:
                     heartbeat["turnHealth"] = turn_health
             await self._send(heartbeat)
+            try:
+                self._spool.compact_acked_payloads()
+            except Exception:
+                logger.warning("attach-v1: spool retention failed", exc_info=True)
             await self._drain_events()
         elif kind == "gap" and frame.get("channel") == "event":
             # A gap the spool cannot fill is a durable hole, not a transient one: replaying alone

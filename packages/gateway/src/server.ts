@@ -124,7 +124,7 @@ import {
   HERMES_GLOBAL_SKILLS_CAPABILITY_VERSION,
 } from "./hermes-bridge/global-skills.ts";
 
-export const GATEWAY_VERSION = "0.8.4";
+export const GATEWAY_VERSION = "0.8.5";
 export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
 export const PUSH_PROXY_CAPABILITY_VERSION = 1;
 
@@ -1436,6 +1436,18 @@ export async function startGateway(
     }
   }, PHOTO_SWEEP_MS);
   attachMediaSweep.unref?.();
+  // Small indexed batches keep busy-bot history bounded without an hourly deletion burst.
+  // These expire completed activity only; durable chat and replay identities remain intact.
+  const chatRetentionSweep = setInterval(() => {
+    try {
+      const now = Date.now();
+      storage.compactBotChatToolDetails(now);
+      storage.compactAttachPayloads(now);
+    } catch (error) {
+      console.error(`chat retention sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, 15_000);
+  chatRetentionSweep.unref?.();
   // Dashboard packet D2. Three periodic jobs, all following the retention sweep's shape above so
   // they start and stop with the gateway process the same way, and all skipped entirely when
   // observability is off. Every callback absorbs its own failure: a metric that can terminate the
@@ -1504,6 +1516,7 @@ export async function startGateway(
     },
     close: async () => {
       clearInterval(attachMediaSweep);
+      clearInterval(chatRetentionSweep);
       if (observationSweep !== undefined) clearInterval(observationSweep);
       clearInterval(observationTrim);
       tunnelProbe?.stop();

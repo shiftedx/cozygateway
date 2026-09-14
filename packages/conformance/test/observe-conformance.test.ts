@@ -145,6 +145,7 @@ describe("D6 observation conformance", () => {
     expect(peer.received.some(frame => JSON.parse(frame).kind === "observation_snapshot")).toBe(false);
     const closed = once(peer.socket, "close");
     peer.socket.send(JSON.stringify({ kind: "observation_snapshot", payload: snapshot() }));
+    await vi.waitFor(() => expect(peer.socket.readyState).toBe(WebSocket.CLOSED));
     expect((await closed)[0]).toBe(1008);
     expect(running.storage.observe.snapshotSubjects()).toEqual([]);
     expect(running.storage.observe.lifetime()).toEqual([]);

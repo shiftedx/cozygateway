@@ -72,6 +72,9 @@ describe("attach-v1 ingress", () => {
   let snapshotFrames: unknown[];
   let turnHealthCalls: Array<readonly AttachV1TurnHealth[] | undefined>;
   let confirmedTurnHealthFaults: readonly string[];
+  let eventCursorsAtAck: number[];
+  let canAcceptBuffered: ((frame: AttachV1EventFrame) => boolean) | undefined;
+  let projectBuffered: ((frame: AttachV1EventFrame) => boolean) | undefined;
 
   function makeIngress(maxPendingConnections?: number): AttachV1Ingress {
     return new AttachV1Ingress({
@@ -82,8 +85,8 @@ describe("attach-v1 ingress", () => {
       ]), storage,
       events: {
         onObservationSnapshot: (_agent, payload) => { snapshotFrames.push(payload); return "refused"; },
-        onEvent: (_agent, frame) => { accepted.push(frame); return projectionSucceeds; },
-        canAcceptEvent: () => acceptsTarget,
+        onEvent: (_agent, frame) => { accepted.push(frame); return projectBuffered?.(frame) ?? projectionSucceeds; },
+        canAcceptEvent: (_agent, frame) => acceptsTarget && (canAcceptBuffered?.(frame) ?? true),
         onPresence: (_agent, state) => presence.push(state),
         onMobileRequest: (_agent, frame) => mobileRequests.push(frame),
         onMobileCancel: (_agent, frame) => mobileCancels.push(frame.requestId),
@@ -118,6 +121,9 @@ describe("attach-v1 ingress", () => {
     snapshotFrames = [];
     turnHealthCalls = [];
     confirmedTurnHealthFaults = [];
+    eventCursorsAtAck = [];
+    canAcceptBuffered = undefined;
+    projectBuffered = undefined;
     ingress = makeIngress();
     server = createServer();
     server.on("upgrade", (req, socket, head) => ingress.handleUpgrade(req, socket, head));
@@ -144,6 +150,8 @@ describe("attach-v1 ingress", () => {
     ws.on("message", (data) => {
       const frame = JSON.parse(String(data)) as AttachV1ServerFrame;
       frames.push(frame);
+      if (frame.kind === "ack" && frame.channel === "event")
+        eventCursorsAtAck.push(storage.attachEventCursor("sage"));
       if (frame.kind === "heartbeat" && acknowledgedHeartbeats < (peer.heartbeatAckLimit ?? 0)) {
         acknowledgedHeartbeats += 1;
         ws.send(JSON.stringify({ kind: "heartbeat", sentAt: frame.sentAt }));
@@ -153,6 +161,22 @@ describe("attach-v1 ingress", () => {
     ws.send(JSON.stringify({ kind: "hello", version: 2, instanceId: peer.instanceId ?? "plugin", capabilities, resume, ...(limits === undefined ? {} : { limits }), ...(peer.commands === undefined ? {} : { commands: peer.commands }) }));
     await until(() => frames.some((frame) => frame.kind === "hello_ack"));
     return { ws, frames };
+  }
+
+  function holdBatchTimers(): { held: Array<() => void>; restore: () => void } {
+    const held: Array<() => void> = [];
+    const original = globalThis.setTimeout;
+    const delayed = vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, delay?: number) =>
+      delay === 0 ? original(() => held.push(callback), 0) : original(callback, delay)) as typeof setTimeout);
+    return { held, restore: () => delayed.mockRestore() };
+  }
+
+  function holdProjectionYields(): { held: Array<() => void>; restore: () => void } {
+    const held: Array<() => void> = [];
+    const original = globalThis.setImmediate;
+    const delayed = vi.spyOn(globalThis, "setImmediate").mockImplementation(((callback: () => void) =>
+      original(() => held.push(callback))) as typeof setImmediate);
+    return { held, restore: () => delayed.mockRestore() };
   }
 
   it("ignores unknown hello capabilities while granting supported ones", async () => {
@@ -194,7 +218,7 @@ describe("attach-v1 ingress", () => {
     const current = await dial();
     try {
       const before = accepted.length;
-      old.ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "stale", event: { kind: "commit", threadId: "session", turnId: "old", messageId: "reply", blocks: [] } }));
+      old.ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "stale", event: { kind: "draft", threadId: "session", turnId: "old", blocks: [] } }));
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(accepted).toHaveLength(before);
       current.ws.close();
@@ -203,6 +227,210 @@ describe("attach-v1 ingress", () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(presence.at(-1)).toBe("absent");
     } finally { delayedClose.mockRestore(); old.ws.close(); current.ws.close(); }
+  });
+
+  it("batches ephemeral admission, projects before ACKs, and drains before a terminal boundary", async () => {
+    const admit = vi.spyOn(storage, "acceptAttachEvents");
+    const marked = vi.spyOn(storage, "markAttachEventsApplied");
+    const { ws, frames } = await dial();
+    const held = holdBatchTimers();
+    try {
+      ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "draft-1", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+      ws.send(JSON.stringify({ kind: "event", sequence: 2, eventId: "draft-2", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+      ws.send(JSON.stringify({ kind: "event", sequence: 3, eventId: "commit-3", event: { kind: "commit", threadId: "t", turnId: "u", messageId: "m", blocks: [] } }));
+      await until(() => frames.filter((frame) => frame.kind === "ack" && frame.channel === "event").length === 3);
+      expect(accepted.map((frame) => frame.eventId)).toEqual(["draft-1", "draft-2", "commit-3"]);
+      expect(admit.mock.calls.map(([, entries]) => entries.length)).toEqual([2, 1]);
+      expect(marked).toHaveBeenCalledTimes(2);
+      expect(storage.unappliedAttachEvents("sage")).toEqual([]);
+      expect(frames.flatMap((frame) => frame.kind === "ack" && frame.channel === "event" ? [frame.sequence] : [])).toEqual([1, 2, 3]);
+      expect(eventCursorsAtAck.every((cursor, index) => cursor >= index + 1)).toBe(true);
+    } finally {
+      held.restore();
+      ws.close();
+    }
+  });
+
+  it("drains queued drafts before an authenticated heartbeat", async () => {
+    const admit = vi.spyOn(storage, "acceptAttachEvents");
+    const { ws, frames } = await dial();
+    const held = holdBatchTimers();
+    try {
+      ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "heartbeat-draft-1", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+      ws.send(JSON.stringify({ kind: "event", sequence: 2, eventId: "heartbeat-draft-2", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+      ws.send(JSON.stringify({ kind: "heartbeat", sentAt: 1 }));
+      await until(() => turnHealthCalls.length === 1);
+      expect(admit).toHaveBeenCalledTimes(1);
+      expect(admit.mock.calls[0]![1]).toHaveLength(2);
+      expect(accepted.map((frame) => frame.eventId)).toEqual(["heartbeat-draft-1", "heartbeat-draft-2"]);
+      await until(() => frames.filter((frame) => frame.kind === "ack" && frame.channel === "event").length === 2);
+    } finally {
+      held.restore();
+      ws.close();
+    }
+  });
+
+  it("keeps drafts together across a check-phase tick", async () => {
+    const admitted = vi.spyOn(storage, "acceptAttachEvents");
+    const { ws, frames } = await dial();
+    const held = holdBatchTimers();
+    try {
+      ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "fair-1", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      ws.send(JSON.stringify({ kind: "event", sequence: 2, eventId: "fair-2", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+      ws.send(JSON.stringify({ kind: "heartbeat", sentAt: 1 }));
+      await until(() => frames.filter((frame) => frame.kind === "ack" && frame.channel === "event").length === 2);
+      expect(admitted.mock.calls.map(([, entries]) => entries.length)).toEqual([2]);
+    } finally {
+      held.restore();
+      ws.close();
+    }
+  });
+
+  it("does not ACK a gap before its repair", async () => {
+    const { ws, frames } = await dial();
+    ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "gap-1", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+    ws.send(JSON.stringify({ kind: "event", sequence: 3, eventId: "gap-3", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+    await until(() => frames.some((frame) => frame.kind === "gap"));
+    expect(frames.flatMap((frame) => frame.kind === "ack" && frame.channel === "event" ? [frame.sequence] : [])).toEqual([1]);
+    expect(storage.attachEventCursor("sage")).toBe(1);
+    ws.send(JSON.stringify({ kind: "event", sequence: 2, eventId: "gap-2", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+    await until(() => frames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 2));
+    expect(storage.attachEventCursor("sage")).toBe(2);
+    ws.close();
+  });
+
+  it("does not ACK queued drafts when their durable batch fails", async () => {
+    const fail = vi.spyOn(storage, "acceptAttachEvents").mockImplementationOnce(() => {
+      throw new Error("disk unavailable");
+    });
+    const { ws, frames } = await dial();
+    const closed = once(ws, "close");
+    ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "failed-batch", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+    expect((await closed)[0]).toBe(1011);
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(frames.some((frame) => frame.kind === "ack" && frame.channel === "event")).toBe(false);
+    expect(storage.attachEventCursor("sage")).toBe(0);
+  });
+
+  it("retries a projection marker failure without losing an admitted event", async () => {
+    const mark = vi.spyOn(storage, "markAttachEventsApplied").mockImplementationOnce(() => {
+      throw new Error("marker write failed");
+    });
+    const { ws, frames } = await dial();
+    ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "marker-retry", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+    await until(() => frames.some((frame) => frame.kind === "ack" && frame.channel === "event"));
+    await until(() => storage.unappliedAttachEvents("sage").length === 0);
+    expect(mark).toHaveBeenCalledTimes(2);
+    expect(accepted.map((frame) => frame.eventId)).toEqual(["marker-retry"]);
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  });
+
+  it("replays an unmarked event after marker retries exhaust and the peer reconnects with only its duplicate", async () => {
+    vi.spyOn(storage, "markAttachEventsApplied").mockImplementationOnce(() => { throw new Error("marker write failed"); })
+      .mockImplementationOnce(() => { throw new Error("marker write failed"); })
+      .mockImplementationOnce(() => { throw new Error("marker write failed"); });
+    const first = await dial();
+    const closed = once(first.ws, "close");
+    const frame = { kind: "event", sequence: 1, eventId: "marker-reconnect", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } };
+    first.ws.send(JSON.stringify(frame));
+    await closed;
+    expect(storage.unappliedAttachEvents("sage").map((event) => event.eventId)).toEqual(["marker-reconnect"]);
+
+    const second = await dial(undefined, ["draft"], { eventSequence: 1, commandSequence: 0 });
+    second.ws.send(JSON.stringify(frame));
+    await until(() => second.frames.some((candidate) => candidate.kind === "ack" && candidate.channel === "event" && candidate.duplicate === true));
+    expect(storage.unappliedAttachEvents("sage")).toEqual([]);
+    expect(accepted.map((event) => event.eventId)).toEqual(["marker-reconnect"]);
+    second.ws.close();
+  });
+
+  it("bounds a draft queue by the negotiated count", async () => {
+    const admitted = vi.spyOn(storage, "acceptAttachEvents");
+    const countBound = await dial({ maxInFlightEvents: 2, maxInFlightBytes: 4096 });
+    for (let sequence = 1; sequence <= 3; sequence += 1)
+      countBound.ws.send(JSON.stringify({ kind: "event", sequence, eventId: `count-${sequence}`, event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+    await until(() => countBound.frames.filter((frame) => frame.kind === "ack" && frame.channel === "event").length === 3);
+    expect(admitted.mock.calls.map(([, entries]) => entries.length)).toEqual([2, 1]);
+    countBound.ws.close();
+  });
+
+  it("lets one oversized draft make progress from an empty queue", async () => {
+    const oversized = await dial({ maxInFlightEvents: 32, maxInFlightBytes: 4096 });
+    oversized.ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "oversized", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [{ type: "paragraph", text: "x".repeat(5000) }] } }));
+    await until(() => oversized.frames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 1));
+    expect(storage.attachEventCursor("sage")).toBe(1);
+    oversized.ws.close();
+  });
+
+  it("discards a queued draft when the authenticated connection is revoked before its flush", async () => {
+    const admitted = vi.spyOn(storage, "acceptAttachEvents");
+    const peer = await dial();
+    const held = holdBatchTimers();
+    peer.ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "revoked-queued", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+    await until(() => held.held.length > 0);
+    ingress.disconnectAgent("sage");
+    held.restore();
+    held.held.forEach((flush) => flush());
+    await once(peer.ws, "close");
+    expect(admitted).not.toHaveBeenCalled();
+    expect(storage.attachEventCursor("sage")).toBe(0);
+  });
+
+  it("discards a queued draft when a replacement supersedes its socket", async () => {
+    const admitted = vi.spyOn(storage, "acceptAttachEvents");
+    const old = await dial();
+    const held = holdBatchTimers();
+    old.ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "superseded-queued", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+    await until(() => held.held.length > 0);
+    held.restore();
+    const current = await dial();
+    held.held.forEach((flush) => flush());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(admitted).not.toHaveBeenCalled();
+    expect(storage.attachEventCursor("sage")).toBe(0);
+    old.ws.close();
+    current.ws.close();
+  });
+
+  it("discards a queued draft during shutdown", async () => {
+    const admitted = vi.spyOn(storage, "acceptAttachEvents");
+    const peer = await dial();
+    const held = holdBatchTimers();
+    peer.ws.send(JSON.stringify({ kind: "event", sequence: 1, eventId: "shutdown-queued", event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
+    await until(() => held.held.length > 0);
+    const closed = once(peer.ws, "close");
+    ingress.close();
+    held.restore();
+    held.held.forEach((flush) => flush());
+    await closed;
+    expect(admitted).not.toHaveBeenCalled();
+    expect(storage.attachEventCursor("sage")).toBe(0);
+  });
+
+  it("projects a resumed desktop session before accepting its following session message", async () => {
+    const peer = await dial(undefined, ["draft", "desktop_session_resume", "desktop_session_sync"]);
+    let resumed = false;
+    projectBuffered = (frame) => {
+      if (frame.event.kind === "desktop_session_resumed") resumed = true;
+      return true;
+    };
+    canAcceptBuffered = (frame) => frame.event.kind !== "desktop_session_message" || resumed;
+    storage.acceptAttachEvents("sage", Array.from({ length: 33 }, (_, index) => ({
+      frame: { kind: "event" as const, sequence: index + 1, eventId: `prefix-${index + 1}`, event: { kind: "draft" as const, threadId: "t", turnId: "u", blocks: [] } },
+      receivedAt: clock,
+    })));
+    const held = holdProjectionYields();
+    ingress.replayUnapplied("sage");
+    await until(() => held.held.length > 0);
+    held.restore();
+    peer.ws.send(JSON.stringify({ kind: "event", sequence: 34, eventId: "resumed", event: { kind: "desktop_session_resumed", threadId: "t", hermesSessionId: "h", resumeId: "r" } }));
+    peer.ws.send(JSON.stringify({ kind: "event", sequence: 35, eventId: "message", event: { kind: "desktop_session_message", threadId: "t", hermesSessionId: "h", source: "cozygateway", rowId: "row", role: "assistant", text: "ready", at: 1 } }));
+    await until(() => peer.frames.some((frame) => frame.kind === "ack" && frame.channel === "event" && frame.sequence === 35));
+    expect(accepted.slice(-3).map((frame) => frame.eventId)).toEqual(["prefix-33", "resumed", "message"]);
+    expect(storage.unappliedAttachEvents("sage")).toEqual([]);
+    peer.ws.close();
   });
 
   async function rejectedUpgrade(token = "secret"): Promise<number> {
@@ -649,6 +877,9 @@ describe("attach-v1 ingress", () => {
     clock = 6_000;
     await until(() => presence.includes("absent"), 1_500);
     await until(() => ws.readyState !== WebSocket.OPEN, 1_500);
+    expect(traces.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({
+      event: "attach_heartbeat_timeout", silenceMs: 6_000, timeoutMs: 5_000,
+    }));
   });
 
   it("treats plugin heartbeats as acknowledgements instead of echoing them", async () => {

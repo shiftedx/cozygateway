@@ -940,17 +940,15 @@ class HermesPluginContextTests(unittest.TestCase):
             try:
                 self.assertEqual(
                     json.loads(model_tools.handle_function_call(
-                        "tool_call",
-                        {"name": "cozy_device_status", "arguments": {"purpose": "Report phone readiness"}},
-                        enabled_toolsets=["cozygateway"],
+                        "cozy_device_status", {"purpose": "Report phone readiness"},
+                        enabled_tools=["cozy_device_status"],
                     )),
                     {"status": "ok", "result": GATEWAY_STATUS},
                 )
                 self.assertEqual(
                     json.loads(model_tools.handle_function_call(
-                        "tool_call",
-                        {"name": "cozy_request_location", "arguments": {"purpose": "Find coffee"}},
-                        enabled_toolsets=["cozygateway"],
+                        "cozy_request_location", {"purpose": "Find coffee"},
+                        enabled_tools=["cozy_request_location"],
                     )),
                     {"status": "ok", "result": {"latitude": 41.88, "longitude": -87.63}},
                 )
@@ -960,11 +958,10 @@ class HermesPluginContextTests(unittest.TestCase):
                 })()
                 with mock.patch.object(adapter_module, "_cache_mobile_artifact_bytes", return_value=cached):
                     artifact = model_tools.handle_function_call(
-                        "tool_call",
-                        {"name": "cozy_capture_camera", "arguments": {
+                        "cozy_capture_camera", {
                             "purpose": "Read the label", "camera": "rear", "capture": "photo",
-                        }},
-                        enabled_toolsets=["cozygateway"],
+                        },
+                        enabled_tools=["cozy_capture_camera"],
                     )
                 self.assertTrue(artifact["_multimodal"])
                 self.assertEqual(artifact["content"][1]["type"], "image_url")

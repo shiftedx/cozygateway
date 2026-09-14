@@ -159,6 +159,7 @@ class SessionKeyBindingTests(_BindingHarness):
         self.assertEqual(adapter.dropped, [])
         self.assertEqual(len(adapter.delivered), 1)
         self.assertEqual(adapter.delivered[0].metadata, {
+            "cozygateway_context_turn": True,
             "gateway_session_key": RUNNER_KEY,
             "gateway_session_id": PINNED,
             "gateway_session_strict": True,
@@ -209,7 +210,7 @@ class SessionKeyBindingTests(_BindingHarness):
 
         self.assertEqual(adapter.dropped, [])
         self.assertEqual(len(adapter.delivered), 1)
-        self.assertEqual(adapter.delivered[0].metadata, {})
+        self.assertEqual(adapter.delivered[0].metadata, {"cozygateway_context_turn": True})
 
 
 class RefusedFrameTerminalTests(_BindingHarness):

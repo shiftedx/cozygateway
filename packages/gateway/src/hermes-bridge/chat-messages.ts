@@ -1,6 +1,7 @@
 import type { BotChatMessage } from "cozygateway-contract";
 
 import { chatRowFingerprint, syntheticChatId } from "./chat-identity.ts";
+import { asRecord } from "./rpc.ts";
 
 /** Decoding one `session.resume` reply into a stable wire shape, defensively.
  *
@@ -26,12 +27,6 @@ export interface ChatSnapshot {
   messageCount: number;
   running: boolean;
   inflight: boolean;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
 }
 
 function asId(value: unknown): string | undefined {

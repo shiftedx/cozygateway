@@ -1,6 +1,7 @@
 import type { BotModelConfig, BotModelConfigPatch, BotModelProvider } from "cozygateway-contract";
 
 import type { HermesClient } from "./client.ts";
+import { asRecord } from "./rpc.ts";
 
 /** Hermes' accepted profile/invocation vocabulary. Surveyed from
  * `hermes_constants.VALID_REASONING_EFFORTS` plus the `none` branch in
@@ -70,12 +71,6 @@ const discoveryCache = new Map<string, { expiresAt: number; succeeded: boolean; 
 
 export function clearModelDiscoveryCache(): void {
   discoveryCache.clear();
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
 }
 
 function profileQuery(name: string): string {

@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 # The health gate runs in the plugin's stdlib-only test environment. The real websocket client is
 # lazy; this tiny import shim only makes the two client modules importable when the optional runtime
@@ -116,6 +117,36 @@ class AttachV1FederatedHealthTests(unittest.IsolatedAsyncioTestCase):
             spool.enqueue_event({"kind": "draft", "threadId": "t", "turnId": "u", "blocks": []})
             now[0] += 8 * 24 * 60 * 60 * 1_000
             self.assertEqual(spool.health_snapshot()["oldestEventAgeMs"], 7 * 24 * 60 * 60 * 1_000)
+            spool.close()
+
+    async def test_heartbeat_compacts_expired_acked_payload_after_responding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            now = [1_000]
+            spool = AttachSpool(os.path.join(directory, "spool.sqlite"), now_ms=lambda: now[0])
+            old = spool.enqueue_event({
+                "kind": "draft", "threadId": "t", "turnId": "u",
+                "blocks": [{"type": "paragraph", "text": "expired copied payload"}],
+            })
+            self.assertTrue(spool.ack_event(old["sequence"], old["eventId"]))
+            now[0] += 14 * 24 * 60 * 60 * 1_000 + 1
+            socket = FakeSocket()
+            client = AttachV1Client(AttachV1ClientConfig(
+                gateway_url="http://gateway.example", token="secret", spool=spool,
+            ))
+            client._ws = socket
+            client._negotiated = True
+
+            await client._dispatch_inbound(json.dumps({"kind": "heartbeat", "sentAt": 1}))
+
+            self.assertEqual(socket.sent[0]["kind"], "heartbeat")
+            stored = spool._db.execute(
+                "SELECT frame_json FROM event_outbox WHERE sequence = ?", (old["sequence"],)
+            ).fetchone()
+            self.assertEqual(json.loads(str(stored[0]))["event"], {"kind": "presence", "state": "online"})
+            with patch.object(spool, "compact_acked_payloads", side_effect=RuntimeError("maintenance failed")):
+                with self.assertLogs("cozygateway.attach_client_v1", level="WARNING"):
+                    await client._dispatch_inbound(json.dumps({"kind": "heartbeat", "sentAt": 2}))
+            self.assertEqual(socket.sent[-1]["sentAt"], 2)
             spool.close()
 
     async def test_telemetry_rides_every_hello_and_heartbeat(self):

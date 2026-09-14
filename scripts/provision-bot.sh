@@ -741,7 +741,21 @@ try:
     lines = text.splitlines(keepends=True)
     matches = [pattern.match(line.rstrip("\r\n")) for line in lines]
     current = [match.group(1) for match in matches if match]
-    if current == [value]:
+    # Dotenv quotes are syntax, not bearer-token bytes. Preserve either spelling
+    # when a conventional literal token is the same so a normal local quoted
+    # value does not rewrite the box file and force-recreate the gateway on every
+    # watcher sweep. Escapes, interpolation, and embedded quotes stay on the
+    # existing conservative rewrite path rather than pretending to parse dotenv.
+    def literal_token_scalar(raw):
+        raw = raw.strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+            raw = raw[1:-1]
+        return raw if re.fullmatch(r"[A-Za-z0-9._~+/\\-]+={0,2}", raw) else None
+    if current == [value] or (
+        len(current) == 1
+        and literal_token_scalar(current[0]) is not None
+        and literal_token_scalar(current[0]) == literal_token_scalar(value)
+    ):
         print("unchanged")
         sys.exit(0)
     if any(not isinstance(entry, dict) or (name != profile and entry.get("tokenEnv") == key)

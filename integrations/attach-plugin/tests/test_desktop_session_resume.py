@@ -367,6 +367,7 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
         event = adapter.injected[0]
         self.assertEqual(event.source.chat_id, "native:sage:1")
         self.assertEqual(event.metadata, {
+            "cozygateway_context_turn": True,
             "gateway_session_key": "agent:main:cozygateway:dm:native:sage:1",
             "gateway_session_id": "desktop-tip",
             "gateway_session_strict": True,
