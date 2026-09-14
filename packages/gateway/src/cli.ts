@@ -24,7 +24,7 @@ import {
   validateListenerHost,
 } from "./configure.ts";
 
-const USAGE = `usage: cozygateway [status|configure|serve|pair] --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>] [--kind device|runner|observer]`;
+const USAGE = `usage: cozygateway [status|configure|serve|pair] --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>] [--kind device|runner|observer]\nInstalled service commands: cozygateway repair | update | uninstall [--purge] [--dry-run]`;
 
 export interface CliIo {
   interactive: boolean;

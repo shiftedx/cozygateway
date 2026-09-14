@@ -98,10 +98,50 @@ supported service host and is rejected before prerequisite installation.
 Update or repair with `cozygateway repair` (`cozygateway update` is an alias),
 or repeat the one-paste line when the installed command itself is damaged. Both
 paths fetch and verify one matched release while preserving the recorded profile
-scope and operator-owned gateway settings. Remove only installer-owned state:
+scope and operator-owned gateway settings.
+
+## Uninstall
+
+The same command works in Terminal on macOS/Linux and PowerShell on Windows:
 
 ```sh
-bash ~/.cozygateway/bin/agent-install.sh --uninstall --gateway-dir ~/.cozygateway
+cozygateway uninstall --purge
 ```
+
+`--purge` permanently deletes the bots and files belonging to the CozyAgents
+runner installed with this Gateway. Without it, that runner's bot files remain.
+Both forms delete Gateway conversations, pairing credentials, configuration,
+logs, caches, backups, private tools, and the install directory. The command
+removes its service and PATH entry, managed Hermes plugins, generated credentials,
+and attachment database files. Cleanup failures return an error and retain the
+remaining files for retry; inspect the error before retrying.
+
+Preview the cleanup without changing files or services:
+
+```sh
+cozygateway uninstall --purge --dry-run
+```
+
+Hermes and its profiles/history, shared tools and model credentials, user projects,
+independently installed CozyAgents runners, and other apps such as CozyChat are
+separate installations and remain. Runtime-only installs remove only their
+Gateway; they do not claim independently managed Hermes connections.
+
+If the command is unavailable, use the installed script (adjust the directory for
+an installation in a custom location):
+
+```sh
+bash ~/.cozygateway/bin/agent-install.sh --uninstall --purge --gateway-dir ~/.cozygateway
+```
+
+Windows PowerShell:
+
+```powershell
+& "$env:LOCALAPPDATA\cozygateway\bin\cozygateway-bootstrap.ps1" -Uninstall -Purge
+```
+
+If those scripts are missing, rerun the original install command to restore them,
+then uninstall. No downloads are needed when the installed uninstall scripts and
+runtimes are intact. Close and reopen your terminal to refresh its PATH afterward.
 
 No network overlay, tunnel, DNS record, or firewall rule is created or changed.
