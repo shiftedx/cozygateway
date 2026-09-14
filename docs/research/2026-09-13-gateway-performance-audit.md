@@ -1,6 +1,6 @@
 # Gateway durability, performance, and complexity audit
 
-Date: 2026-09-13, America/Chicago. Source baseline: `5785d30053a14acff685eda964bcb294ce548817` (gateway 0.8.4). Production reported 0.8.1. Changes are local on `codex/gateway-performance-audit`; production was inspected read-only.
+Date: 2026-09-13, America/Chicago. Source baseline: `5785d30053a14acff685eda964bcb294ce548817` (gateway 0.8.4). Production reported 0.8.1. The initial audit inspected production read-only. The user subsequently authorized deployment; the final rollout and additional CPU work are documented in [deployment and focused performance results](2026-09-13-gateway-deployment-performance.md).
 
 ## Decision
 
