@@ -707,6 +707,31 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         self.assertEqual(self.spool.pending_events(10, 100000), [])
 
+    async def test_chat_context_is_a_latest_only_capability_gated_frame(self):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({
+            "kind": "hello_ack", "capabilities": ["chat_context"],
+            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
+        }))
+        self.assertTrue(await self.client.send_chat_context(
+            "native:sage:session", "turn-2", used_tokens=0, window_tokens=128_000,
+            measurement="reported", source="provider_usage", model="provider/model",
+        ))
+        self.assertEqual(self.socket.sent[-1], {
+            "kind": "chat_context", "threadId": "native:sage:session", "turnId": "turn-2",
+            "usedTokens": 0, "windowTokens": 128_000, "measurement": "reported",
+            "source": "provider_usage", "model": "provider/model",
+        })
+        self.assertEqual(self.spool.pending_events(10, 100000), [])
+
+        # Old peers do not receive a durable substitute that could replay into a later turn.
+        self.client._capabilities.clear()
+        self.assertFalse(await self.client.send_chat_context(
+            "native:sage:session", "turn-2", used_tokens=1, window_tokens=128_000,
+            measurement="estimated", source="local_estimate",
+        ))
+        self.assertEqual(len(self.socket.sent), 2)  # hello plus the one live-only sample
+
     async def test_device_status_is_ephemeral_and_settles_once(self):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({"kind": "hello_ack", "capabilities": ["draft", "mobile_node"], "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304}}))

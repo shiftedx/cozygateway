@@ -1075,6 +1075,26 @@ class AttachAdapter:
 
         self._message_handler = wrapped  # harness-defined callback slot
 
+    async def on_processing_complete(self, event: Any, outcome: Any) -> None:
+        """Sample an injected turn only after Hermes finished its background task."""
+        await super().on_processing_complete(event, outcome)  # type: ignore[misc]
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict) or metadata.get("cozygateway_context_turn") is not True:
+            return
+        outcome_name = str(getattr(outcome, "value", outcome)).lower()
+        if outcome_name != "success":
+            return
+        source = getattr(event, "source", None)
+        chat_id = getattr(source, "chat_id", None)
+        turn_id = getattr(event, "message_id", None)
+        session_key = self._dispatch_session_key(source)
+        if (not isinstance(chat_id, str) or not chat_id or not isinstance(turn_id, str) or not turn_id
+                or not isinstance(session_key, str) or not session_key):
+            return
+        # BasePlatformAdapter invokes this before it releases the session guard or starts a queued
+        # successor, so `turn.agent` still belongs to this exact completed turn.
+        await self._report_turn_context(chat_id, turn_id, session_key)
+
     async def _seal_consumed_command(
         self,
         chat_id: str,
@@ -2158,15 +2178,15 @@ class AttachAdapter:
                 except Exception:  # noqa: BLE001 - one bad attachment must not drop the turn
                     logger.debug("attach: could not materialize inbound media %s", media_id, exc_info=True)
         binding = self._desktop_session_bindings.get(turn.thread_id)
-        metadata: Dict[str, Any] = {}
+        metadata: Dict[str, Any] = {"cozygateway_context_turn": True}
         if binding is not None:
             # The runner validates this strict binding immediately before dispatch, so a stale
             # replay cannot fall through to get_or_create_session and land in a new context.
-            metadata = {
+            metadata.update({
                 "gateway_session_key": binding[0],
                 "gateway_session_id": binding[1],
                 "gateway_session_strict": True,
-            }
+            })
         event = MessageEvent(
             text=turn.text,
             source=source,
@@ -2195,6 +2215,56 @@ class AttachAdapter:
         finally:
             await self._baseline_mobile_mirror_link(turn.thread_id, source)
             self._desktop_mirror_injections.discard(turn.thread_id)
+
+    async def _report_turn_context(self, chat_id: str, turn_id: str, session_key: str) -> None:
+        """Report the runtime's current prompt occupancy after a completed injected turn.
+
+        Hermes' cumulative input/output counters are intentionally never read here. The upstream
+        context-breakdown helper combines its provider anchor with the final persisted response,
+        so this is the next-prompt occupancy after the turn rather than the last API request.
+        """
+        client = self._client
+        if not isinstance(client, AttachV1Client):
+            return
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        state_for = getattr(runner, "_session_state", None)
+        if (not isinstance(session_key, str) or not session_key or not callable(state_for)
+                or store is None):
+            return
+        try:
+            state = state_for(session_key)
+            agent = getattr(getattr(state, "turn", None), "agent", None)
+            if agent is None:
+                return
+            entry = await store.lookup_by_session_key(session_key)
+            session_id = getattr(entry, "session_id", None)
+            db = self._sync_session_db(runner, store)
+            if not isinstance(session_id, str) or not session_id or db is None:
+                return
+            history = await asyncio.to_thread(db.get_messages, session_id, limit=10_000)
+            if not isinstance(history, list):
+                return
+            from agent.context_breakdown import compute_session_context_breakdown
+            reading = await asyncio.to_thread(compute_session_context_breakdown, agent, history)
+            used_tokens = reading.get("context_used")
+            window_tokens = reading.get("context_max")
+            source_name = reading.get("context_source")
+            if (not isinstance(used_tokens, int) or isinstance(used_tokens, bool) or used_tokens < 0
+                    or not isinstance(window_tokens, int) or isinstance(window_tokens, bool) or window_tokens < 1
+                    or source_name not in {"provider_usage", "provider_usage_plus_estimate", "local_estimate"}):
+                return
+            await client.send_chat_context(
+                chat_id,
+                turn_id,
+                used_tokens=used_tokens,
+                window_tokens=window_tokens,
+                measurement="reported" if source_name == "provider_usage" else "estimated",
+                source=source_name,
+                model=reading.get("model").strip() if isinstance(reading.get("model"), str) else None,
+            )
+        except Exception:  # noqa: BLE001 - an optional meter must not change turn outcome
+            logger.debug("attach: could not report current chat context", exc_info=True)
 
     def _on_desktop_resume_command(self, command: Dict[str, Any]) -> None:
         """Schedule one explicit, source-qualified Desktop/TUI session adoption."""

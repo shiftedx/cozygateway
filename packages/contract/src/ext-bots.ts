@@ -416,6 +416,38 @@ export const BotChatFrameSchema = Type.Object({
 });
 export type BotChatFrame = Static<typeof BotChatFrameSchema>;
 
+/** The latest runtime measurement for one native conversation. This is deliberately separate from
+ * transcript rows: a provider may not report it, and a later turn makes an older sample stale
+ * without changing any durable message. `input`/`output`/`total` lifetime counters never belong
+ * here. */
+export const BotChatContextReadingSchema = Type.Object({
+  // A provider can truthfully report an empty prompt. The window remains positive, so callers
+  // never have to invent a denominator or turn this into a percentage on the wire.
+  usedTokens: Type.Integer({ minimum: 0 }),
+  windowTokens: Type.Integer({ minimum: 1 }),
+  measurement: Type.Union([Type.Literal("reported"), Type.Literal("estimated")]),
+  source: Type.Union([
+    Type.Literal("provider_usage"),
+    Type.Literal("provider_usage_plus_estimate"),
+    Type.Literal("local_estimate"),
+  ]),
+  /** Gateway receipt time, never a clock value asserted by the runtime. */
+  observedAt: Type.Integer({ minimum: 0 }),
+  stale: Type.Boolean(),
+  model: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  effort: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+}, { additionalProperties: false });
+export type BotChatContextReading = Static<typeof BotChatContextReadingSchema>;
+
+/** Full replacement of the optional context reading for one canonical bot conversation. */
+export const BotChatContextFrameSchema = Type.Object({
+  type: Type.Literal("bot_chat_context"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  context: Type.Union([BotChatContextReadingSchema, Type.Null()]),
+}, { additionalProperties: false });
+export type BotChatContextFrame = Static<typeof BotChatContextFrameSchema>;
+
 /** Durable metadata describing one successful phone-node share. Capability 39.
  * The lease, originating device, and shared payload are deliberately absent. */
 export const BotMobileReceiptSchema = Type.Object({

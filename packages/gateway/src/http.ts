@@ -82,6 +82,7 @@ import {
 import type { MemorySurface } from "./hermes-bridge/memory.ts";
 import type { HistorySurface } from "./hermes-bridge/bot-history.ts";
 import type { GatewayChatConfiguration } from "./chat-configuration.ts";
+import type { HermesDashboardIntegrations } from "./hermes-bridge/integrations.ts";
 import type { GatewayProviderConnections } from "./provider-connections.ts";
 import { providerConnectionRoutes } from "./provider-connection-routes.ts";
 import type { RunRoutineSurface } from "./hermes-bridge/native-data-plane.ts";
@@ -268,6 +269,9 @@ export interface AppDeps {
   hermesGlobalSkills?: GatewayHermesGlobalSkills;
   /** Privacy-safe audit sink for global skill changes. */
   hermesGlobalSkillsLog?: (line: string) => void;
+  /** Capability com.cozylabs.integrations v1. Constructed only after a real Dashboard list probe
+   * against the configured launch profile, so its route group and health capability agree. */
+  integrations?: HermesDashboardIntegrations;
   /** Synchronous, aggregate attach-v1 state for operator health routes only. */
   attachHealth?: () => AttachHealthSummary;
   observeBotForPeer?: (id: string) => string;
@@ -1892,6 +1896,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
       deps.history,
       deps.runRoutine,
       deps.chatConfiguration,
+      deps.integrations,
     );
   }
 

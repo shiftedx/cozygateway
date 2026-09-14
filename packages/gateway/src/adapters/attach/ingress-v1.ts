@@ -3,7 +3,7 @@ import type { TSchema } from "@sinclair/typebox";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 
-import { check, ContractViolation, assertValid, BOTS_CAPABILITY_ID, BOTS_CAPABILITY_VERSION, type AttachHealthSummary } from "cozygateway-contract";
+import { check, ContractViolation, assertValid, BOTS_CAPABILITY_ID, BOTS_CAPABILITY_VERSION, CHAT_CONTEXT_CAPABILITY_ID, CHAT_CONTEXT_CAPABILITY_VERSION, type AttachHealthSummary } from "cozygateway-contract";
 import { WebSocket, WebSocketServer } from "ws";
 
 import type { NativeInteractionResolutionRequest, Storage } from "../../storage.ts";
@@ -16,6 +16,7 @@ import type {
 import {
   AttachV1AckSchema,
   AttachV1ClientFrameSchema,
+  AttachV1ChatContextFrameSchema,
   AttachV1EventFrameSchema,
   AttachV1GapSchema,
   AttachV1HeartbeatSchema,
@@ -32,6 +33,7 @@ import {
   AttachV1MobileResultSchema,
   type AttachV1Capability,
   type AttachV1ClientFrame,
+  type AttachV1ChatContextFrame,
   type AttachV1Command,
   type AttachV1CommandFrame,
   type AttachV1DiscardReason,
@@ -68,7 +70,7 @@ export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
  *  capability; it does NOT prove the list is complete, so adding one to the schema and forgetting
  *  it here type-checks cleanly and silently refuses the surface at negotiation. A test compares
  *  this list against the schema for exactly that reason. */
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "memory_ownership", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "cozyapps_dashboard", "bot_config", "chat_configuration", "provider_connections", "bot_history", "session_deletion", "observation_snapshot"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "memory_ownership", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "cozyapps_dashboard", "bot_config", "chat_configuration", "provider_connections", "bot_history", "session_deletion", "observation_snapshot", "chat_context"] as const satisfies readonly AttachV1Capability[];
 
 /** Why a memory request did or did not reach the attached plugin. */
 export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
@@ -81,6 +83,8 @@ export type HistorySendOutcome = MemorySendOutcome;
 
 export interface AttachV1Events {
   onObservationSnapshot?(agentId: string, payload: unknown, bytes: number): "stored" | "refused" | "too_large" | "disabled";
+  /** Current prompt occupancy is latest-only and never enters the durable event spool. */
+  onChatContext?(agentId: string, frame: AttachV1ChatContextFrame): void;
   /** True only after the event was durably projected into its owning app/transcript state. */
   onEvent(agentId: string, frame: AttachV1EventFrame): boolean;
   /** Authorization/canonical-target check performed before inbox admission. */
@@ -347,7 +351,10 @@ export class AttachV1Ingress implements TurnEndpoint {
           resume: { eventSequence: this.#storage.attachEventCursor(agentId), commandSequence: this.#storage.attachCommandCursor(agentId) },
           limits: { maxInFlightEvents: connection.maxInFlightEvents, maxInFlightBytes: connection.maxInFlightBytes },
           heartbeatIntervalMs: this.#heartbeatIntervalMs,
-          extensions: { [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION },
+          extensions: {
+            [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION,
+            [CHAT_CONTEXT_CAPABILITY_ID]: CHAT_CONTEXT_CAPABILITY_VERSION,
+          },
         });
         this.#presence(agentId, "online");
         this.#storage.tasks.hello(agentId, receivedAt);
@@ -402,6 +409,14 @@ export class AttachV1Ingress implements TurnEndpoint {
         const outcome = this.#events.onObservationSnapshot?.(agentId, frame.payload, Buffer.byteLength(String(data)));
         if (outcome === "refused" || outcome === "too_large")
           this.#log(`attach-v1: observation_snapshot dropped (${outcome})`);
+        return;
+      }
+      if (frame.kind === "chat_context") {
+        if (!connection.capabilities.has("chat_context")) {
+          socket.close(1008, "attach-v1 capability not negotiated: chat_context");
+          return;
+        }
+        this.#events.onChatContext?.(agentId, frame);
         return;
       }
       if (frame.kind === "mobile_request") {
@@ -1043,7 +1058,7 @@ export class AttachV1Ingress implements TurnEndpoint {
 
 /** The peer's claimed frame kind, constrained to the known set. An unknown or absent kind is
  *  reported as "unknown" rather than echoed, so the log line stays bounded and content-free. */
-const KNOWN_FRAME_KINDS = new Set(["hello", "event", "ack", "gap", "heartbeat", "mobile_request", "mobile_cancel", "memory_result", "config_result", "history_result", "observation_snapshot"]);
+const KNOWN_FRAME_KINDS = new Set(["hello", "event", "ack", "gap", "heartbeat", "mobile_request", "mobile_cancel", "memory_result", "config_result", "history_result", "observation_snapshot", "chat_context"]);
 function frameKind(decoded: unknown): string {
   const kind = typeof decoded === "object" && decoded !== null ? (decoded as { kind?: unknown }).kind : undefined;
   return typeof kind === "string" && KNOWN_FRAME_KINDS.has(kind) ? kind : "unknown";
@@ -1055,6 +1070,7 @@ function frameKind(decoded: unknown): string {
 const KIND_SCHEMAS: Record<string, TSchema> = {
   hello: AttachV1HelloSchema,
   observation_snapshot: AttachV1ObservationSnapshotSchema,
+  chat_context: AttachV1ChatContextFrameSchema,
   event: AttachV1EventFrameSchema,
   ack: AttachV1AckSchema,
   gap: AttachV1GapSchema,
