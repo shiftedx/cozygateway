@@ -15,6 +15,9 @@ never offers to change it.
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [switch] $Repair,
+    [switch] $Uninstall,
+    [switch] $Purge,
+    [switch] $DryRun,
     # Skips the harness question. Adding a harness preserves the other installed harness.
     # Invoke-Expression adds this attribute before binding defaults; its empty initial value is valid.
     [ValidateSet('', 'cozyagents', 'hermes', 'both')]
@@ -28,6 +31,10 @@ param(
 )
 
 $script:InstallerBoundParameters = @{} + $PSBoundParameters
+if ($Uninstall) { $InstallerArguments = @('--uninstall') + @($InstallerArguments) }
+if ($Purge) { $InstallerArguments = @('--purge') + @($InstallerArguments) }
+if ($DryRun) { $InstallerArguments = @('--dry-run') + @($InstallerArguments) }
+if ($Purge -and $InstallerArguments -notcontains '--uninstall') { throw '-Purge requires -Uninstall' }
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 $ProgressPreference = 'SilentlyContinue'
@@ -2722,8 +2729,9 @@ function Write-RunnerModelEnv {
 }
 
 function Resolve-CozyAgentsHome {
-    $candidate = $env:COZYAGENTS_HOME
-    if ([string]::IsNullOrWhiteSpace($candidate) -and (Get-Variable -Name PendingSetupPlan -Scope Script -ErrorAction SilentlyContinue) -and $script:PendingSetupPlan) {
+    param([switch] $RecordedOnly)
+    $candidate = if ($RecordedOnly) { '' } else { $env:COZYAGENTS_HOME }
+    if (-not $RecordedOnly -and [string]::IsNullOrWhiteSpace($candidate) -and (Get-Variable -Name PendingSetupPlan -Scope Script -ErrorAction SilentlyContinue) -and $script:PendingSetupPlan) {
         $candidate = [string]$script:PendingSetupPlan.AgentsHome
     }
     if ([string]::IsNullOrWhiteSpace($candidate)) {
@@ -3013,6 +3021,7 @@ function Complete-Pairing {
         if ($LASTEXITCODE -ne 0) { Fail "could not create a pairing code; the gateway is installed, so retry with: $Cli pair" }
     }
     Write-Info "codes expire after 10 minutes; mint a fresh QR and code with: $Cli pair"
+    Write-Info 'remove: cozygateway uninstall --purge (also deletes paired CozyAgents bots and files)'
     Write-Info 'for a tunnel, rerun the installer with: --public-url https://gateway.example.com'
 }
 
@@ -3094,7 +3103,7 @@ function Invoke-WindowsSetupStage {
 
 function Uninstall-WithCozyAgents {
     param([string] $Bin, [string] $InstallerPath, [string[]] $ForwardedArguments, [bool] $IsDryRun)
-    $agentsHome = Resolve-CozyAgentsHome
+    $agentsHome = Resolve-CozyAgentsHome -RecordedOnly
     $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH 'Install Git for Windows from https://git-scm.com/download/win, then paste this command again.'
     if (-not (Test-Path -LiteralPath $InstallerPath)) { Fail "no CozyGateway installer was found at $InstallerPath" }
     $arguments = @($InstallerPath, '--service-platform', 'Windows', '--gateway-dir', $script:InstallHome) + @($ForwardedArguments)
@@ -3108,18 +3117,44 @@ function Uninstall-WithCozyAgents {
         [Environment]::SetEnvironmentVariable('COZYGATEWAY_WINDOWS_HARNESS_OWNER', $previousOwner, 'Process')
     }
     if ($IsDryRun) {
-        Write-Info "dry run: would remove the CozyAgents harness through its own uninstaller at $agentsHome"
+        Write-Info "dry run: would remove the CozyAgents harness through its own uninstaller at $agentsHome (delete bot files: $($ForwardedArguments -contains '--purge'))"
         return
     }
-    Set-CozyGatewayCommandPath $Bin $false
     if (Test-Path -LiteralPath (Join-Path $agentsHome 'install.json') -PathType Leaf) {
         $command = Get-CozyAgentsCommand $agentsHome
-        & $command.Node $command.Bundle uninstall --home $agentsHome --yes
-        if ($LASTEXITCODE -ne 0) { Fail "the CozyAgents harness could not be removed; run: cozyagents uninstall --home $agentsHome" }
+        $agentArguments = @('uninstall', '--home', $agentsHome, '--yes')
+        if ($ForwardedArguments -contains '--purge') { $agentArguments += '--purge' }
+        # Windows locks the running executable. Run a temporary copy so the
+        # harness can delete its own private Node along with the install.
+        $uninstallNode = $command.Node
+        $temporaryRuntime = $null
+        try {
+            if ([IO.Path]::GetFullPath($command.Node).StartsWith($agentsHome.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                $temporaryRuntime = Join-Path ([IO.Path]::GetTempPath()) ('cozyagents-uninstall-' + [guid]::NewGuid().ToString('N'))
+                New-Item -ItemType Directory -Path $temporaryRuntime | Out-Null
+                $uninstallNode = Join-Path $temporaryRuntime 'node.exe'
+                Copy-Item -LiteralPath $command.Node -Destination $uninstallNode
+            }
+            & $uninstallNode $command.Bundle @agentArguments
+            if ($LASTEXITCODE -ne 0) { Fail "the CozyAgents harness could not be removed; remaining Gateway files were retained. Retry: cozygateway uninstall$(if ($ForwardedArguments -contains '--purge') { ' --purge' })" }
+        } finally {
+            if ($temporaryRuntime) { Remove-Item -LiteralPath $temporaryRuntime -Recurse -Force }
+        }
         Write-Ok 'removed the CozyAgents harness through its own uninstaller'
     } else {
-        Write-Host "WARN  the cozyagents command is gone; leaving $agentsHome untouched"
+        Fail "CozyAgents ownership metadata is missing at $agentsHome; remaining Gateway files were retained. Restore CozyAgents before retrying uninstall."
     }
+    Set-CozyGatewayCommandPath $Bin $false
+    Complete-WindowsUninstall $script:InstallHome
+}
+
+# Git Bash can itself live below the Gateway home. Delete that private runtime
+# only after Bash and the harness uninstaller have exited, retaining receipts on failure.
+function Complete-WindowsUninstall {
+    param([string] $InstallRoot)
+    Assert-BootstrapPathAndParents $InstallRoot
+    if (Test-Path -LiteralPath $InstallRoot) { Remove-Item -LiteralPath $InstallRoot -Recurse -Force }
+    Write-Ok 'removed CozyGateway files, private tools, and local data'
 }
 
 if ($PSVersionTable.PSVersion.Major -lt 5) { Fail 'Windows PowerShell 5.1 or newer is required' }
@@ -3193,9 +3228,18 @@ if ($isUninstall) {
     if (-not (Test-Path -LiteralPath $installerPath)) { Fail "no CozyGateway installer was found at $installerPath" }
     $uninstallArguments = @($installerPath, '--service-platform', 'Windows', '--gateway-dir', $script:InstallHome) + @($InstallerArguments)
     if ($isDryRun -and -not ($uninstallArguments -contains '--dry-run')) { $uninstallArguments += '--dry-run' }
-    & $bash @uninstallArguments
-    if ($LASTEXITCODE -ne 0) { Fail "CozyGateway installer exited $LASTEXITCODE" }
-    if (-not $isDryRun) { Set-CozyGatewayCommandPath $bin $false }
+    $previousOwner = [Environment]::GetEnvironmentVariable('COZYGATEWAY_WINDOWS_HARNESS_OWNER', 'Process')
+    try {
+        $env:COZYGATEWAY_WINDOWS_HARNESS_OWNER = '1'
+        & $bash @uninstallArguments
+        if ($LASTEXITCODE -ne 0) { Fail "CozyGateway installer exited $LASTEXITCODE" }
+    } finally {
+        [Environment]::SetEnvironmentVariable('COZYGATEWAY_WINDOWS_HARNESS_OWNER', $previousOwner, 'Process')
+    }
+    if (-not $isDryRun) {
+        Set-CozyGatewayCommandPath $bin $false
+        Complete-WindowsUninstall $script:InstallHome
+    }
     return
 }
 
