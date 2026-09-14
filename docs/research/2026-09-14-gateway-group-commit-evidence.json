@@ -1,0 +1,740 @@
+{
+  "baselineCommit": "18939c2",
+  "baselineImage": "sha256:7597892c1e35b7d6989c4a2d8ce8729f81d090f99d2ce16054b36074026e1b20",
+  "candidateCompiledHashes": {
+    "adapters/attach/ingress-v1.js": "6aa0e6035588858f2d19a30065725868337d6c4259ea437d6dae9ed80edb0e10",
+    "storage.js": "98f8b48024d7fdf6e7c24f6835982350be353f986c88b9a1a232d11e6d98e17b"
+  },
+  "benchmarkSha256": "9511e1dcb58e1bc70de93bd2276d620e6fee803c251440ac1c543a6f4d1f6831",
+  "method": "Three alternating before/after runs on production Linux host using isolated synthetic database and network-disabled containers; same benchmark, Node and dependency image. No real model/harness invoked. One additional paced before/after pair.",
+  "burst": {
+    "before": [
+      {
+        "ok": true,
+        "node": "v24.20.0",
+        "buildRoot": "/app/dist",
+        "historyRows": 128000,
+        "eventWindow": 64,
+        "events": {
+          "tools": 40,
+          "drafts": 920,
+          "total": 1001
+        },
+        "pacing": {
+          "draftIntervalMs": 0
+        },
+        "metrics": {
+          "burstAckMs": 4847.32,
+          "burstMs": 4849.94,
+          "eventAckLatency": {
+            "count": 1001,
+            "medianMs": 295.23,
+            "p95Ms": 467.71,
+            "maxMs": 469.64
+          },
+          "draftAckLatency": {
+            "count": 920,
+            "medianMs": 295.02,
+            "p95Ms": 341.5,
+            "maxMs": 342.94
+          },
+          "cpuMs": {
+            "user": 840.63,
+            "system": 247.16,
+            "total": 1087.79
+          },
+          "rssBytes": {
+            "before": 97816576,
+            "after": 100962304,
+            "peak": 100962304,
+            "delta": 3145728
+          },
+          "app": {
+            "frames": 39,
+            "bytes": 22337
+          },
+          "timerMaximumGapMs": 396.38,
+          "freshHistoryReadMs": 1.85
+        },
+        "validation": {
+          "attachHello": true,
+          "commandAcks": true,
+          "heartbeatAcks": true,
+          "eventAcks": true,
+          "finalToolSteps": true,
+          "terminalPersisted": true,
+          "messagePersisted": true,
+          "appTerminal": true,
+          "socketCloses": true,
+          "unappliedRows": true,
+          "deadLetters": true,
+          "commandQueue": true
+        },
+        "profile": null,
+        "limitations": [
+          "CPU and RSS are process-wide measurements for the burst window, including gateway timer and heartbeat work.",
+          "App bytes count UTF-8 JSON payload bytes, not WebSocket framing or TCP bytes.",
+          "The attach worker is a synthetic local peer; no real bot, provider, or external network is used.",
+          "CPU profiling is disabled unless CPU_PROFILE is set to an absolute path."
+        ]
+      },
+      {
+        "ok": true,
+        "node": "v24.20.0",
+        "buildRoot": "/app/dist",
+        "historyRows": 128000,
+        "eventWindow": 64,
+        "events": {
+          "tools": 40,
+          "drafts": 920,
+          "total": 1001
+        },
+        "pacing": {
+          "draftIntervalMs": 0
+        },
+        "metrics": {
+          "burstAckMs": 4805.76,
+          "burstMs": 4808.33,
+          "eventAckLatency": {
+            "count": 1001,
+            "medianMs": 288.65,
+            "p95Ms": 467.79,
+            "maxMs": 469.63
+          },
+          "draftAckLatency": {
+            "count": 920,
+            "medianMs": 288.12,
+            "p95Ms": 338.22,
+            "maxMs": 339.67
+          },
+          "cpuMs": {
+            "user": 777.94,
+            "system": 275.07,
+            "total": 1053.01
+          },
+          "rssBytes": {
+            "before": 97370112,
+            "after": 100909056,
+            "peak": 100909056,
+            "delta": 3538944
+          },
+          "app": {
+            "frames": 39,
+            "bytes": 22337
+          },
+          "timerMaximumGapMs": 397.07,
+          "freshHistoryReadMs": 1.8
+        },
+        "validation": {
+          "attachHello": true,
+          "commandAcks": true,
+          "heartbeatAcks": true,
+          "eventAcks": true,
+          "finalToolSteps": true,
+          "terminalPersisted": true,
+          "messagePersisted": true,
+          "appTerminal": true,
+          "socketCloses": true,
+          "unappliedRows": true,
+          "deadLetters": true,
+          "commandQueue": true
+        },
+        "profile": null,
+        "limitations": [
+          "CPU and RSS are process-wide measurements for the burst window, including gateway timer and heartbeat work.",
+          "App bytes count UTF-8 JSON payload bytes, not WebSocket framing or TCP bytes.",
+          "The attach worker is a synthetic local peer; no real bot, provider, or external network is used.",
+          "CPU profiling is disabled unless CPU_PROFILE is set to an absolute path."
+        ]
+      },
+      {
+        "ok": true,
+        "node": "v24.20.0",
+        "buildRoot": "/app/dist",
+        "historyRows": 128000,
+        "eventWindow": 64,
+        "events": {
+          "tools": 40,
+          "drafts": 920,
+          "total": 1001
+        },
+        "pacing": {
+          "draftIntervalMs": 0
+        },
+        "metrics": {
+          "burstAckMs": 5055.59,
+          "burstMs": 5057.34,
+          "eventAckLatency": {
+            "count": 1001,
+            "medianMs": 307.62,
+            "p95Ms": 463.24,
+            "maxMs": 464.61
+          },
+          "draftAckLatency": {
+            "count": 920,
+            "medianMs": 307.08,
+            "p95Ms": 349.71,
+            "maxMs": 351.1
+          },
+          "cpuMs": {
+            "user": 885.91,
+            "system": 215.04,
+            "total": 1100.95
+          },
+          "rssBytes": {
+            "before": 98242560,
+            "after": 101781504,
+            "peak": 101781504,
+            "delta": 3538944
+          },
+          "app": {
+            "frames": 39,
+            "bytes": 22337
+          },
+          "timerMaximumGapMs": 395.46,
+          "freshHistoryReadMs": 1.61
+        },
+        "validation": {
+          "attachHello": true,
+          "commandAcks": true,
+          "heartbeatAcks": true,
+          "eventAcks": true,
+          "finalToolSteps": true,
+          "terminalPersisted": true,
+          "messagePersisted": true,
+          "appTerminal": true,
+          "socketCloses": true,
+          "unappliedRows": true,
+          "deadLetters": true,
+          "commandQueue": true
+        },
+        "profile": null,
+        "limitations": [
+          "CPU and RSS are process-wide measurements for the burst window, including gateway timer and heartbeat work.",
+          "App bytes count UTF-8 JSON payload bytes, not WebSocket framing or TCP bytes.",
+          "The attach worker is a synthetic local peer; no real bot, provider, or external network is used.",
+          "CPU profiling is disabled unless CPU_PROFILE is set to an absolute path."
+        ]
+      }
+    ],
+    "after": [
+      {
+        "ok": true,
+        "node": "v24.20.0",
+        "buildRoot": "/app/dist",
+        "historyRows": 128000,
+        "eventWindow": 64,
+        "events": {
+          "tools": 40,
+          "drafts": 920,
+          "total": 1001
+        },
+        "pacing": {
+          "draftIntervalMs": 0
+        },
+        "metrics": {
+          "burstAckMs": 894.41,
+          "burstMs": 894.54,
+          "eventAckLatency": {
+            "count": 1001,
+            "medianMs": 40.88,
+            "p95Ms": 140.96,
+            "maxMs": 231.67
+          },
+          "draftAckLatency": {
+            "count": 920,
+            "medianMs": 40.49,
+            "p95Ms": 61.7,
+            "maxMs": 202.93
+          },
+          "cpuMs": {
+            "user": 590.36,
+            "system": 52.91,
+            "total": 643.27
+          },
+          "rssBytes": {
+            "before": 96886784,
+            "after": 102490112,
+            "peak": 102490112,
+            "delta": 5603328
+          },
+          "app": {
+            "frames": 25,
+            "bytes": 22528
+          },
+          "timerMaximumGapMs": 99.62,
+          "freshHistoryReadMs": 1.82
+        },
+        "validation": {
+          "attachHello": true,
+          "commandAcks": true,
+          "heartbeatAcks": true,
+          "eventAcks": true,
+          "finalToolSteps": true,
+          "terminalPersisted": true,
+          "messagePersisted": true,
+          "appTerminal": true,
+          "socketCloses": true,
+          "unappliedRows": true,
+          "deadLetters": true,
+          "commandQueue": true
+        },
+        "profile": null,
+        "limitations": [
+          "CPU and RSS are process-wide measurements for the burst window, including gateway timer and heartbeat work.",
+          "App bytes count UTF-8 JSON payload bytes, not WebSocket framing or TCP bytes.",
+          "The attach worker is a synthetic local peer; no real bot, provider, or external network is used.",
+          "CPU profiling is disabled unless CPU_PROFILE is set to an absolute path."
+        ]
+      },
+      {
+        "ok": true,
+        "node": "v24.20.0",
+        "buildRoot": "/app/dist",
+        "historyRows": 128000,
+        "eventWindow": 64,
+        "events": {
+          "tools": 40,
+          "drafts": 920,
+          "total": 1001
+        },
+        "pacing": {
+          "draftIntervalMs": 0
+        },
+        "metrics": {
+          "burstAckMs": 942.62,
+          "burstMs": 942.72,
+          "eventAckLatency": {
+            "count": 1001,
+            "medianMs": 44.44,
+            "p95Ms": 149.87,
+            "maxMs": 213.31
+          },
+          "draftAckLatency": {
+            "count": 920,
+            "medianMs": 43.35,
+            "p95Ms": 75.73,
+            "maxMs": 174.28
+          },
+          "cpuMs": {
+            "user": 633.4,
+            "system": 55.03,
+            "total": 688.43
+          },
+          "rssBytes": {
+            "before": 99131392,
+            "after": 103456768,
+            "peak": 103456768,
+            "delta": 4325376
+          },
+          "app": {
+            "frames": 23,
+            "bytes": 19204
+          },
+          "timerMaximumGapMs": 105.17,
+          "freshHistoryReadMs": 1.91
+        },
+        "validation": {
+          "attachHello": true,
+          "commandAcks": true,
+          "heartbeatAcks": true,
+          "eventAcks": true,
+          "finalToolSteps": true,
+          "terminalPersisted": true,
+          "messagePersisted": true,
+          "appTerminal": true,
+          "socketCloses": true,
+          "unappliedRows": true,
+          "deadLetters": true,
+          "commandQueue": true
+        },
+        "profile": null,
+        "limitations": [
+          "CPU and RSS are process-wide measurements for the burst window, including gateway timer and heartbeat work.",
+          "App bytes count UTF-8 JSON payload bytes, not WebSocket framing or TCP bytes.",
+          "The attach worker is a synthetic local peer; no real bot, provider, or external network is used.",
+          "CPU profiling is disabled unless CPU_PROFILE is set to an absolute path."
+        ]
+      },
+      {
+        "ok": true,
+        "node": "v24.20.0",
+        "buildRoot": "/app/dist",
+        "historyRows": 128000,
+        "eventWindow": 64,
+        "events": {
+          "tools": 40,
+          "drafts": 920,
+          "total": 1001
+        },
+        "pacing": {
+          "draftIntervalMs": 0
+        },
+        "metrics": {
+          "burstAckMs": 843.04,
+          "burstMs": 843.24,
+          "eventAckLatency": {
+            "count": 1001,
+            "medianMs": 37.64,
+            "p95Ms": 145.43,
+            "maxMs": 238.98
+          },
+          "draftAckLatency": {
+            "count": 920,
+            "medianMs": 36.78,
+            "p95Ms": 56.44,
+            "maxMs": 187.43
+          },
+          "cpuMs": {
+            "user": 549.63,
+            "system": 53.17,
+            "total": 602.8
+          },
+          "rssBytes": {
+            "before": 98414592,
+            "after": 102666240,
+            "peak": 102666240,
+            "delta": 4251648
+          },
+          "app": {
+            "frames": 23,
+            "bytes": 17961
+          },
+          "timerMaximumGapMs": 92.63,
+          "freshHistoryReadMs": 1.63
+        },
+        "validation": {
+          "attachHello": true,
+          "commandAcks": true,
+          "heartbeatAcks": true,
+          "eventAcks": true,
+          "finalToolSteps": true,
+          "terminalPersisted": true,
+          "messagePersisted": true,
+          "appTerminal": true,
+          "socketCloses": true,
+          "unappliedRows": true,
+          "deadLetters": true,
+          "commandQueue": true
+        },
+        "profile": null,
+        "limitations": [
+          "CPU and RSS are process-wide measurements for the burst window, including gateway timer and heartbeat work.",
+          "App bytes count UTF-8 JSON payload bytes, not WebSocket framing or TCP bytes.",
+          "The attach worker is a synthetic local peer; no real bot, provider, or external network is used.",
+          "CPU profiling is disabled unless CPU_PROFILE is set to an absolute path."
+        ]
+      }
+    ]
+  },
+  "paced": {
+    "before": {
+      "ok": true,
+      "node": "v24.20.0",
+      "buildRoot": "/app/dist",
+      "historyRows": 128000,
+      "eventWindow": 64,
+      "events": {
+        "tools": 40,
+        "drafts": 80,
+        "total": 161
+      },
+      "pacing": {
+        "draftIntervalMs": 50
+      },
+      "metrics": {
+        "burstAckMs": 4485.94,
+        "burstMs": 4486.02,
+        "eventAckLatency": {
+          "count": 161,
+          "medianMs": 123.63,
+          "p95Ms": 473.18,
+          "maxMs": 473.57
+        },
+        "draftAckLatency": {
+          "count": 80,
+          "medianMs": 4.93,
+          "p95Ms": 7.07,
+          "maxMs": 123.63
+        },
+        "cpuMs": {
+          "user": 225.6,
+          "system": 71.36,
+          "total": 296.96
+        },
+        "rssBytes": {
+          "before": 96694272,
+          "after": 98660352,
+          "peak": 98660352,
+          "delta": 1966080
+        },
+        "app": {
+          "frames": 89,
+          "bytes": 32368
+        },
+        "timerMaximumGapMs": 398.81,
+        "freshHistoryReadMs": 1.8
+      },
+      "validation": {
+        "attachHello": true,
+        "commandAcks": true,
+        "heartbeatAcks": true,
+        "eventAcks": true,
+        "finalToolSteps": true,
+        "terminalPersisted": true,
+        "messagePersisted": true,
+        "appTerminal": true,
+        "socketCloses": true,
+        "unappliedRows": true,
+        "deadLetters": true,
+        "commandQueue": true
+      },
+      "profile": null,
+      "limitations": [
+        "CPU and RSS are process-wide measurements for the burst window, including gateway timer and heartbeat work.",
+        "App bytes count UTF-8 JSON payload bytes, not WebSocket framing or TCP bytes.",
+        "The attach worker is a synthetic local peer; no real bot, provider, or external network is used.",
+        "CPU profiling is disabled unless CPU_PROFILE is set to an absolute path."
+      ]
+    },
+    "after": {
+      "ok": true,
+      "node": "v24.20.0",
+      "buildRoot": "/app/dist",
+      "historyRows": 128000,
+      "eventWindow": 64,
+      "events": {
+        "tools": 40,
+        "drafts": 80,
+        "total": 161
+      },
+      "pacing": {
+        "draftIntervalMs": 50
+      },
+      "metrics": {
+        "burstAckMs": 4151.44,
+        "burstMs": 4151.53,
+        "eventAckLatency": {
+          "count": 161,
+          "medianMs": 101.91,
+          "p95Ms": 197.85,
+          "maxMs": 198.04
+        },
+        "draftAckLatency": {
+          "count": 80,
+          "medianMs": 6.52,
+          "p95Ms": 9.02,
+          "maxMs": 145.12
+        },
+        "cpuMs": {
+          "user": 236.81,
+          "system": 53.36,
+          "total": 290.17
+        },
+        "rssBytes": {
+          "before": 97697792,
+          "after": 99270656,
+          "peak": 99270656,
+          "delta": 1572864
+        },
+        "app": {
+          "frames": 89,
+          "bytes": 32368
+        },
+        "timerMaximumGapMs": 96.07,
+        "freshHistoryReadMs": 1.74
+      },
+      "validation": {
+        "attachHello": true,
+        "commandAcks": true,
+        "heartbeatAcks": true,
+        "eventAcks": true,
+        "finalToolSteps": true,
+        "terminalPersisted": true,
+        "messagePersisted": true,
+        "appTerminal": true,
+        "socketCloses": true,
+        "unappliedRows": true,
+        "deadLetters": true,
+        "commandQueue": true
+      },
+      "profile": null,
+      "limitations": [
+        "CPU and RSS are process-wide measurements for the burst window, including gateway timer and heartbeat work.",
+        "App bytes count UTF-8 JSON payload bytes, not WebSocket framing or TCP bytes.",
+        "The attach worker is a synthetic local peer; no real bot, provider, or external network is used.",
+        "CPU profiling is disabled unless CPU_PROFILE is set to an absolute path."
+      ]
+    }
+  },
+  "medians": {
+    "before": {
+      "burstAckMs": 4847.32,
+      "cpuMs": 1087.79,
+      "maximumTimerGapMs": 396.38,
+      "rssGrowthBytes": 3538944
+    },
+    "after": {
+      "burstAckMs": 894.41,
+      "cpuMs": 643.27,
+      "maximumTimerGapMs": 99.62,
+      "rssGrowthBytes": 4325376
+    }
+  },
+  "candidateCommit": "198e478f0e551d98c9fd0c646b6e612d4ea6882f",
+  "validation": {
+    "workspace": {
+      "passed": 2440,
+      "skipped": 26,
+      "command": "pnpm -r --workspace-concurrency=1 exec vitest run --maxWorkers=2"
+    },
+    "build": "passed",
+    "workspaceTypecheck": "passed",
+    "installerSuite": "passed",
+    "dockerSmoke": "passed: startup, pairing, settings mutation, restart and persistence",
+    "compiledArtifactHashesMatchBenchmark": true,
+    "unchangedSuitesPreviouslyPassed": {
+      "cozyagents": {
+        "passed": 3629,
+        "skipped": 12
+      },
+      "hermes": {
+        "passed": 598,
+        "skipped": 3
+      }
+    },
+    "nativeWindowsInstallerSuites": "not run: Windows host unavailable"
+  },
+  "deployment": {
+    "imageTag": "cozygateway-gateway:perf-198e478",
+    "imageId": "sha256:d98277029fc567e7ea1d6f9c2f34e1cfeda42724f98534a04daad9838fd3836f",
+    "startedAt": "2026-09-14T04:48:48.273028666Z",
+    "restartCount": 0,
+    "publicEndpoint": "https://warm.cozylabs.ai",
+    "before": {
+      "at": 1789361291633,
+      "activeTurns": [],
+      "messages": 1951,
+      "devices": 38,
+      "runners": 1,
+      "streams": [
+        {
+          "agent_id": "breezy-aster",
+          "last_event_sequence": 39
+        },
+        {
+          "agent_id": "breezy-ivy",
+          "last_event_sequence": 3817
+        },
+        {
+          "agent_id": "cleo",
+          "last_event_sequence": 127998
+        },
+        {
+          "agent_id": "drowsy-lark",
+          "last_event_sequence": 5001
+        },
+        {
+          "agent_id": "honeyed-birch",
+          "last_event_sequence": 607
+        },
+        {
+          "agent_id": "night-owl",
+          "last_event_sequence": 6043
+        },
+        {
+          "agent_id": "polished-satellite",
+          "last_event_sequence": 4823
+        }
+      ],
+      "pending": 0
+    },
+    "after": {
+      "at": 1789361395406,
+      "activeTurns": [],
+      "messages": 1951,
+      "devices": 38,
+      "runners": 1,
+      "streams": [
+        {
+          "agent_id": "breezy-aster",
+          "last_event_sequence": 39
+        },
+        {
+          "agent_id": "breezy-ivy",
+          "last_event_sequence": 3817
+        },
+        {
+          "agent_id": "cleo",
+          "last_event_sequence": 127998
+        },
+        {
+          "agent_id": "drowsy-lark",
+          "last_event_sequence": 5001
+        },
+        {
+          "agent_id": "honeyed-birch",
+          "last_event_sequence": 607
+        },
+        {
+          "agent_id": "night-owl",
+          "last_event_sequence": 6043
+        },
+        {
+          "agent_id": "polished-satellite",
+          "last_event_sequence": 4823
+        }
+      ],
+      "pending": 0
+    },
+    "readiness": {
+      "ready": true,
+      "bridges": {
+        "hermes": {
+          "online": true,
+          "since": 1789361329523,
+          "reconnectAttempt": 0
+        }
+      },
+      "attach": {
+        "configured": 7,
+        "online": 7,
+        "degraded": 0,
+        "absent": 0,
+        "lastHeartbeatAt": 1789361469885,
+        "lastEventAt": 1789359786078,
+        "lastTerminalAt": 1789359786094,
+        "queueDepth": 0,
+        "deadLetters": 0,
+        "pluginOutboxDepth": 0,
+        "pluginOldestEventAgeMs": 0,
+        "pluginLastAckProgressAt": 1789359787479,
+        "pluginCommandInboxDepth": 0,
+        "hermes": {
+          "configured": 4,
+          "online": 4,
+          "degraded": 0,
+          "absent": 0
+        }
+      }
+    },
+    "backup": {
+      "path": "/Users/kmcdowell/.cozylabs-backups/gateway-group-commit-20260914/gateway-before.db",
+      "bytes": 782856192,
+      "sha256": "819410ea16fd4d9f13f6be3bfb525e58f17f48c3c7c1771283f4d2c7ed429df2",
+      "checks": [
+        "SQLite quick_check ok",
+        "source and copied SHA-256 match"
+      ]
+    },
+    "rollbackImage": "cozygateway-gateway:perf-18939c2"
+  },
+  "cleoIncident": {
+    "rootCause": "Hermes preflight context compression",
+    "compressionMs": 113439,
+    "commandAckMs": 21,
+    "finalApplyMs": 29,
+    "restarted": false,
+    "report": "2026-09-14-cleo-response-delay.md"
+  }
+}
