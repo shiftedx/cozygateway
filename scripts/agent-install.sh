@@ -1743,7 +1743,6 @@ CLI
     bootstrap_b64="$(printf '%s' "$bootstrap_native" | base64 | tr -d '\r\n')"
     {
       printf '@echo off\r\n'
-      printf 'setlocal\r\n'
       printf 'if /I "%%~1"=="uninstall" goto uninstall\r\n'
       printf 'if /I "%%~1"=="repair" goto repair\r\n'
       printf 'if /I "%%~1"=="update" goto repair\r\n'
