@@ -1,5 +1,6 @@
 import type { BotRoutine, BotRoutineCreateRequest, BotRoutinePatch } from "cozygateway-contract";
 
+import { asRecord, asString } from "./rpc.ts";
 import type { HermesRpc } from "./rpc.ts";
 import { redactHermesSessionPaths } from "./session-management.ts";
 
@@ -117,16 +118,6 @@ export interface CronJob {
   repeat?: unknown;
   continuity?: unknown;
   [key: string]: unknown;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function asString(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
 }
 
 /** The bot a cron job belongs to, lowercased, or null for a job that carries no tag. */

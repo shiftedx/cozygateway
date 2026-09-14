@@ -3693,9 +3693,11 @@ export class NativeBotDataPlane {
   }
 
   #restoreToolFrames(bot: string): void {
-    for (const session of this.#storage.nativeBotSessions(bot, 10_000)) {
-      for (const row of this.#storage.botChatToolSteps(session.id, 0)) {
-        const key = this.#nativeTurnKey(bot, session.id, row.turnId);
+    // Completed history is read from SQLite on demand; only active turns need live state.
+    for (const turn of this.#storage.nativeBotActiveTurns(bot)) {
+      for (const row of this.#storage.botChatToolSteps(turn.sessionId, 0)) {
+        if (row.turnId !== turn.turnId) continue;
+        const key = this.#nativeTurnKey(bot, turn.sessionId, row.turnId);
         const current = this.#toolFrames.get(key) ?? {
           seq: 0,
           steps: new Map<string, BotToolStep>(),
@@ -3756,6 +3758,7 @@ export class NativeBotDataPlane {
     emitTrace(this.#trace, "native_tool_terminalization", {
       profile: traceId(bot), session: traceId(sessionId), turn: traceId(turnId), reason: status,
     });
+    this.#toolFrames.delete(this.#nativeTurnKey(bot, sessionId, turnId));
   }
 
   #approval(

@@ -834,6 +834,29 @@ describe("attach-v1 native Bot Mode plane", () => {
     plane.close(); storage.close();
   });
 
+  it("keeps completed tool history on disk instead of restoring it into live turn state", async () => {
+    const storage = openStorage(":memory:");
+    const chat = storage.nativeBotChat("sage", 1);
+    storage.upsertBotChatToolStep({
+      bot: "sage", sessionId: chat.sessionId, turnId: "completed", stepId: "call", seq: 1,
+      name: "search", status: "ok", startedAt: 1, endedAt: 2,
+    });
+    const readTools = vi.spyOn(storage, "botChatToolSteps");
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage, ingress: {} as AttachV1Ingress,
+      nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined, now: () => 100,
+    });
+    try {
+      expect(readTools).not.toHaveBeenCalled();
+      expect(await plane.surface().chatHistory("sage")).toMatchObject({
+        toolSteps: [{ turnId: "completed", steps: [{ stepId: "call", status: "ok" }] }],
+      });
+    } finally {
+      plane.close();
+      storage.close();
+    }
+  });
+
   it("reconstructs an active turn and its running tool after a gateway restart", async () => {
     const path = join(mkdtempSync(join(tmpdir(), "native-tools-restart-")), "gateway.sqlite");
     let storage = openStorage(path);

@@ -1,4 +1,5 @@
 import type { BotPreview, BotSummary } from "cozygateway-contract";
+import { asRecord, asString } from "./rpc.ts";
 
 /** Pure roster construction: everything the bridge derives from a `profiles.list` response, with
  *  no sockets, no clock of its own, and no storage. Kept pure so the desktop conventions it
@@ -25,16 +26,6 @@ export interface ParsedProfile {
   /** Milliseconds, converted from the wire's seconds. Null when the profile has no session. */
   lastActiveAt: number | null;
   preview: string | null;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function asString(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
 }
 
 /** Pulls the bot blob out of the current `ui_meta["hermes-bots"]` namespace. */

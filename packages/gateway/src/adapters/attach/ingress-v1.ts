@@ -33,7 +33,6 @@ import {
   type AttachV1Capability,
   type AttachV1ClientFrame,
   type AttachV1Command,
-  type AttachV1CommandFrame,
   type AttachV1DiscardReason,
   type AttachV1EventFrame,
   type AttachV1MobileCancel,
@@ -58,7 +57,7 @@ import {
   PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS,
   PendingWebsocketLimiter,
 } from "../../websocket-limits.ts";
-import type { ObservationRing } from "../../observe/ring.ts";
+import { monotonicNow, type ObservationRing } from "../../observe/ring.ts";
 
 export const ATTACH_V1_MAX_IN_FLIGHT_EVENTS = 64;
 export const ATTACH_V1_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
@@ -170,6 +169,7 @@ export class AttachV1Ingress implements TurnEndpoint {
   readonly #log: (line: string) => void;
   readonly #pendingConnections: PendingWebsocketLimiter;
   #lastHeartbeatAt: number | null = null;
+  #lastTickAt = monotonicNow();
 
   constructor(deps: {
     tokens: Map<string, string>;
@@ -975,10 +975,19 @@ export class AttachV1Ingress implements TurnEndpoint {
   #tick(): void {
     this.#storage.tasks.reconcile(this.#now());
     this.flushTaskCommands();
+    const tickAt = monotonicNow();
+    const tickDelayMs = Math.max(0, tickAt - this.#lastTickAt - this.#heartbeatIntervalMs);
+    this.#lastTickAt = tickAt;
+    // Reuse the heartbeat cadence: no extra watchdog timer or per-event metric writes.
+    if (tickDelayMs >= this.#heartbeatIntervalMs)
+      emitTrace(this.#trace, "attach_heartbeat_tick_delayed", { tickDelayMs: Math.round(tickDelayMs) });
     const now = this.#now();
     for (const [agentId, connection] of this.#current) {
       const age = now - connection.lastSeenAt;
       if (age >= this.#heartbeatTimeoutMs) {
+        this.#traceAttach("attach_heartbeat_timeout", agentId, {
+          silenceMs: age, timeoutMs: this.#heartbeatTimeoutMs, tickDelayMs: Math.round(tickDelayMs),
+        });
         connection.socket.terminate();
       } else {
         connection.heartbeatDegraded = age >= this.#heartbeatIntervalMs * 2;

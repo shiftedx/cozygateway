@@ -1,3 +1,5 @@
+import { asRecord } from "./rpc.ts";
+
 export interface SessionRow {
   id: string;
   title: string;
@@ -22,12 +24,6 @@ export function interactiveHermesSessionSource(row: SessionRow): HermesInteracti
  * deliberately excluded, including cron/routine/group/machine and gateway-created rows. */
 export function isDesktopHermesSession(row: SessionRow): boolean {
   return interactiveHermesSessionSource(row) !== undefined && sessionKind(row) === "conversation";
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
 }
 
 function sessionTime(item: Record<string, unknown>, fields: readonly string[]): number {

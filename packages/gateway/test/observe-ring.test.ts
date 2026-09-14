@@ -2,16 +2,16 @@ import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { performance } from "node:perf_hooks";
 
 import { openStorage, type Storage } from "../src/storage.ts";
+import { ObservationRing } from "../src/observe/ring.ts";
+import { TunnelSelfProbe } from "../src/observe/self-probe.ts";
 import {
-  ObservationRing,
-  TunnelSelfProbe,
   OBSERVE_SERIES,
   OBSERVE_EVENT_KINDS,
   OBSERVE_EVENT_DETAIL,
   isIdentityHash,
   serializeDetail,
   seriesName,
-} from "../src/observe/index.ts";
+} from "../src/observe/privacy.ts";
 import { deviceOriginVia, publicHostOf } from "../src/observe/origin.ts";
 import { observability } from "../src/config.ts";
 
@@ -199,6 +199,10 @@ describe("observability disabled", () => {
       name: "g", port: 1, dbPath: "x", turnTimeoutSeconds: 0,
       observability: { enabled: true, retentionDays: 3 },
     })).toEqual({ enabled: true, retentionDays: 3 });
+    expect(observability({
+      name: "g", port: 1, dbPath: "x", turnTimeoutSeconds: 0,
+      observability: { enabled: true, retentionDays: 365 },
+    })).toEqual({ enabled: true, retentionDays: 14 });
   });
 });
 

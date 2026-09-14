@@ -59,7 +59,6 @@ import {
   botDisplayName,
   botHandle,
   buildRoster,
-  classifyPreview,
   parseProfilesList,
   UI_META_KEY,
 } from "./roster.ts";
@@ -444,9 +443,6 @@ export interface HermesBridgeOptions {
    *  prefix to strip, every membership check would answer "not a bot on this gateway" for a bot
    *  the roster is visibly listing. */
   roomMemberNamespace?: string;
-  rosterPollMs?: number;
-  routinesPollMs?: number;
-  focusTtlMs?: number;
   catalogTtlMs?: number;
   catalogDegradedTtlMs?: number;
   onGroupEscalation?: (event: {

@@ -131,6 +131,31 @@ export function cozyAppPhysicalId(creatorBot: string, logicalId: string): string
 const MOBILE_REQUEST_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 /** Capability 71. An abandoned composer must not hold a person's words forever. */
 const COMPOSER_DRAFT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+/** Completed tool detail expires after a week; compact summaries expire after two weeks. */
+export const BOT_CHAT_TOOL_DETAIL_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+export const BOT_CHAT_TOOL_SUMMARY_RETENTION_MS = 14 * 24 * 60 * 60 * 1_000;
+const BOT_CHAT_TOOL_DETAIL_COMPACTION_BATCH = 256;
+const ATTACH_PAYLOAD_RETENTION_MS = 14 * 24 * 60 * 60 * 1_000;
+const ATTACH_PAYLOAD_COMPACTION_BATCH = 256;
+const ATTACH_PAYLOAD_COMPACTION_MAX_BYTES = 4 * 1024 * 1024;
+const ATTACH_PAYLOAD_COMPACTION_FIELDS = {
+  draft: ["$.event.blocks", "$.event.replace"],
+  thinking: ["$.event.text", "$.event.seq", "$.event.lastActiveAt"],
+  tool: ["$.event.callId", "$.event.name", "$.event.status", "$.event.role", "$.event.detail"],
+  commit: ["$.event.blocks", "$.event.mediaPositions"],
+  scheduled: ["$.event.blocks", "$.event.mediaPositions"],
+  failed: ["$.event.message", "$.event.reason"],
+  delegation: ["$.event.index", "$.event.label", "$.event.aliasId", "$.event.currentTool", "$.event.apiCalls", "$.event.toolCount", "$.event.costUsd", "$.event.costStatus", "$.event.schemaValidation", "$.event.durationMs", "$.event.lastActiveAt"],
+  media: ["$.event.media"],
+  desktop_session_message: ["$.event.text"],
+  cozyapp_upsert: ["$.event.name", "$.event.tree"],
+  cozyapp_dashboard_upsert: ["$.event.documentVersion", "$.event.document", "$.event.data"],
+  cozyapp_action_receipt: ["$.event.data"],
+} as const;
+type AttachPayloadCompactionKind = keyof typeof ATTACH_PAYLOAD_COMPACTION_FIELDS;
+const ATTACH_PAYLOAD_COMPACTION_CANDIDATE = Object.entries(ATTACH_PAYLOAD_COMPACTION_FIELDS)
+  .map(([kind, fields]) => `(json_extract(frame_json, '$.event.kind') = '${kind}' AND (${fields.map((field) => `json_type(frame_json, '${field}') IS NOT NULL`).join(" OR ")}))`)
+  .join(" OR ");
 const MOBILE_REQUEST_TERMINAL_PLACEHOLDERS = MOBILE_REQUEST_TERMINAL_STATES.map(() => "?").join(", ");
 
 const BOT_MOBILE_REQUEST_SELECT = `
@@ -346,6 +371,19 @@ CREATE TABLE IF NOT EXISTS bot_chat_tool_steps (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bot_chat_tool_steps_session
   ON bot_chat_tool_steps (session_id, started_at);
+-- Hard deletion uses the same terminal proof but includes already-compacted summaries, so it
+-- needs a time-ordered candidate index separate from the detail-only partial index.
+CREATE INDEX IF NOT EXISTS bot_chat_tool_steps_terminal_retention
+  ON bot_chat_tool_steps (ended_at, bot, turn_id, step_id);
+-- A protected or orphaned historical row must not make every retention pass walk the same
+-- lifetime prefix. Each bounded pass resumes from its source index's ordered key.
+CREATE TABLE IF NOT EXISTS storage_retention_cursors (
+  pass TEXT PRIMARY KEY CHECK (pass IN ('delete', 'compact', 'attach_payload')),
+  at INTEGER NOT NULL,
+  key_1 TEXT NOT NULL,
+  key_2 TEXT NOT NULL,
+  key_3 TEXT NOT NULL
+) STRICT, WITHOUT ROWID;
 -- Capability 34 delegation children. Same shape of honesty as bot_chat_tool_steps: a child
 -- belongs to a TURN's batch, keyed by (batch, child) where child_id is the Hermes child session
 -- id that joins the spawn and finish legs of one delegation, and the only text here is the
@@ -495,6 +533,17 @@ CREATE TABLE IF NOT EXISTS attach_command_outbox (
   PRIMARY KEY (agent_id, sequence),
   UNIQUE (agent_id, command_id)
 ) STRICT, WITHOUT ROWID;
+-- A turn can emit many progress events after later commands have been queued. Looking it up by
+-- decoding every newer command blocks the gateway's event loop; the journal stores only gateway
+-- JSON, and the valid-row predicate keeps a manually corrupted legacy row out of this index.
+CREATE INDEX IF NOT EXISTS attach_command_outbox_turn_lookup
+  ON attach_command_outbox (
+    agent_id,
+    json_extract(command_json, '$.kind'),
+    json_extract(command_json, '$.turnId'),
+    sequence DESC
+  )
+  WHERE cancelled_at IS NULL AND json_valid(command_json);
 CREATE TABLE IF NOT EXISTS attach_event_inbox (
   agent_id TEXT NOT NULL,
   sequence INTEGER NOT NULL,
@@ -509,6 +558,27 @@ CREATE TABLE IF NOT EXISTS attach_event_inbox (
   PRIMARY KEY (agent_id, sequence),
   UNIQUE (agent_id, event_id)
 ) STRICT, WITHOUT ROWID;
+-- Projection only needs accepted rows that have not been applied or dead-lettered. The primary
+-- key is ordered by sequence, so without this partial index every new event walks the peer's full
+-- acknowledged history before reaching its one unapplied tail row.
+CREATE INDEX IF NOT EXISTS attach_event_inbox_unapplied
+  ON attach_event_inbox (agent_id, sequence)
+  WHERE disposition = 'accepted' AND applied_at IS NULL AND dead_lettered_at IS NULL;
+-- The ordered projection barrier asks for the earliest accepted dead letter independently of
+-- whether it was applied later. Keep that lookup off the full inbox too.
+CREATE INDEX IF NOT EXISTS attach_event_inbox_dead_letter_barrier
+  ON attach_event_inbox (agent_id, sequence)
+  WHERE disposition = 'accepted' AND dead_lettered_at IS NOT NULL;
+-- Global health needs only the newest durable ingress timestamp, not a scan of every tombstone.
+CREATE INDEX IF NOT EXISTS attach_event_inbox_received_at_desc
+  ON attach_event_inbox (received_at DESC);
+-- Historical attach rows retain their cursor and dedupe tombstone, but not their duplicate raw
+-- payload after the durable projection and retention window. This partial index finds only rows
+-- with a field the compactor can remove, rather than walking an agent's whole journal each pass.
+CREATE INDEX IF NOT EXISTS attach_event_inbox_payload_compaction
+  ON attach_event_inbox (applied_at, agent_id, sequence)
+  WHERE disposition = 'accepted' AND applied_at IS NOT NULL AND dead_lettered_at IS NULL
+    AND json_valid(frame_json) AND (${ATTACH_PAYLOAD_COMPACTION_CANDIDATE});
 CREATE TABLE IF NOT EXISTS attach_turn_terminals (
   agent_id TEXT NOT NULL,
   turn_id TEXT NOT NULL,
@@ -516,6 +586,7 @@ CREATE TABLE IF NOT EXISTS attach_turn_terminals (
   terminal_kind TEXT NOT NULL,
   message_id TEXT NOT NULL,
   sequence INTEGER NOT NULL,
+  received_at INTEGER NOT NULL,
   PRIMARY KEY (agent_id, turn_id)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS attach_media (
@@ -774,6 +845,8 @@ CREATE TABLE IF NOT EXISTS bot_native_turn_terminals (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bot_native_turn_terminals_session
   ON bot_native_turn_terminals (bot, session_id, completed_at DESC);
+CREATE INDEX IF NOT EXISTS bot_native_turn_terminals_completed_at_desc
+  ON bot_native_turn_terminals (completed_at DESC);
 -- Capability 69. A steer's words, kept from the moment the steer is dispatched until something
 -- proves they were heard: a frame from the peer on that turn, a rescued reply in that session, a
 -- promotion into a new durable turn, or a visible failed-delivery row. DURABLE, because the whole
@@ -2465,10 +2538,96 @@ export class Storage {
     return { outcome: "written", dashboard: this.cozyAppDashboard(input.appId)! };
   }
 
-  /** Drops every tool step older than the TTL. Returns how many went, so a caller can log it. */
-  sweepBotChatToolSteps(now: number, ttlMs: number): number {
-    return this.#db.prepare("DELETE FROM bot_chat_tool_steps WHERE started_at < ?").run(now - ttlMs)
-      .changes as number;
+  /** In one bounded pass, hard-deletes terminal summaries older than fourteen days, then converts
+   * up to the remaining capacity of seven-day-old terminal diagnostics into summaries. A terminal
+   * receipt and an ended step are both required, so active or unresolved work is never touched.
+   * Messages, media, approvals, and attach journals are deliberately outside this operation. */
+  compactBotChatToolDetails(now: number): { compacted: number; deleted: number } {
+    const detailCutoff = now - BOT_CHAT_TOOL_DETAIL_RETENTION_MS;
+    const summaryCutoff = now - BOT_CHAT_TOOL_SUMMARY_RETENTION_MS;
+    type Cursor = { endedAt: number; bot: string; turnId: string; stepId: string };
+    type Candidate = Cursor;
+    const cursor = this.#db.prepare(
+      `SELECT at AS endedAt, key_1 AS bot, key_2 AS turnId, key_3 AS stepId
+       FROM storage_retention_cursors WHERE pass = ?`,
+    );
+    const saveCursor = this.#db.prepare(
+      `INSERT INTO storage_retention_cursors (pass, at, key_1, key_2, key_3)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(pass) DO UPDATE SET at = excluded.at, key_1 = excluded.key_1,
+         key_2 = excluded.key_2, key_3 = excluded.key_3`,
+    );
+    const clearCursor = this.#db.prepare(
+      "DELETE FROM storage_retention_cursors WHERE pass = ?",
+    );
+    const scan = (pass: "delete" | "compact", index: string, cutoff: number, limit: number, extraPredicate = ""): Candidate[] => {
+      if (limit === 0) return [];
+      const after = cursor.get(pass) as Cursor | undefined;
+      const afterClause = after === undefined ? "" : " AND (ended_at, bot, turn_id, step_id) > (?, ?, ?, ?)";
+      const rows = this.#db.prepare(
+        `SELECT ended_at AS endedAt, bot, turn_id AS turnId, step_id AS stepId
+         FROM bot_chat_tool_steps INDEXED BY ${index}
+         WHERE ended_at < ?${extraPredicate}${afterClause}
+         ORDER BY ended_at, bot, turn_id, step_id
+         LIMIT ?`,
+      ).all(
+        cutoff,
+        ...(after === undefined ? [] : [after.endedAt, after.bot, after.turnId, after.stepId]),
+        limit,
+      ) as Candidate[];
+      if (rows.length === 0) {
+        clearCursor.run(pass);
+      } else {
+        const tail = rows.at(-1)!;
+        saveCursor.run(pass, tail.endedAt, tail.bot, tail.turnId, tail.stepId);
+      }
+      return rows;
+    };
+    const settled = this.#db.prepare(
+      `SELECT 1
+       FROM bot_chat_tool_steps AS step
+       JOIN bot_native_turn_terminals AS terminal
+         ON terminal.bot = step.bot AND terminal.session_id = step.session_id
+           AND terminal.turn_id = step.turn_id
+       WHERE step.bot = ? AND step.turn_id = ? AND step.step_id = ?
+         AND step.ended_at IS NOT NULL AND step.status <> 'running'
+         AND terminal.completed_at < ?
+         AND NOT EXISTS (
+           SELECT 1 FROM bot_native_sessions AS active
+           WHERE active.bot = step.bot AND active.session_id = step.session_id
+             AND active.active_turn_id = step.turn_id
+         )`,
+    );
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const deleteRow = this.#db.prepare(
+        "DELETE FROM bot_chat_tool_steps WHERE bot = ? AND turn_id = ? AND step_id = ?",
+      );
+      let deleted = 0;
+      for (const row of scan("delete", "bot_chat_tool_steps_terminal_retention", summaryCutoff, BOT_CHAT_TOOL_DETAIL_COMPACTION_BATCH)) {
+        if (settled.get(row.bot, row.turnId, row.stepId, summaryCutoff) !== undefined)
+          deleted += Number(deleteRow.run(row.bot, row.turnId, row.stepId).changes);
+      }
+      const detailCapacity = BOT_CHAT_TOOL_DETAIL_COMPACTION_BATCH - deleted;
+      const compactRow = this.#db.prepare(
+        `UPDATE bot_chat_tool_steps SET detail = NULL, error_text = NULL
+         WHERE bot = ? AND turn_id = ? AND step_id = ?
+           AND (detail IS NOT NULL OR error_text IS NOT NULL)`,
+      );
+      let compacted = 0;
+      for (const row of scan(
+        "compact", "bot_chat_tool_steps_detail_compaction", detailCutoff, detailCapacity,
+        " AND (detail IS NOT NULL OR error_text IS NOT NULL)",
+      )) {
+        if (settled.get(row.bot, row.turnId, row.stepId, detailCutoff) !== undefined)
+          compacted += Number(compactRow.run(row.bot, row.turnId, row.stepId).changes);
+      }
+      this.#db.exec("COMMIT");
+      return { compacted, deleted };
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   /** Upserts one delegation child by (bot, turn, batch, child). `child_index` and `started_at`
@@ -3230,13 +3389,21 @@ export class Storage {
   } {
     return this.#db.prepare(
       `SELECT
-         (SELECT MAX(received_at) FROM attach_event_inbox) AS lastEventAt,
+         (SELECT received_at FROM attach_event_inbox
+          INDEXED BY attach_event_inbox_received_at_desc
+          ORDER BY received_at DESC LIMIT 1) AS lastEventAt,
          (SELECT MAX(at) FROM (
-            SELECT inbox.received_at AS at
-              FROM attach_turn_terminals AS terminal
-              JOIN attach_event_inbox AS inbox
-                ON inbox.agent_id = terminal.agent_id AND inbox.event_id = terminal.event_id
-            UNION ALL SELECT completed_at AS at FROM bot_native_turn_terminals
+            SELECT received_at AS at FROM (
+              SELECT received_at FROM attach_turn_terminals
+              INDEXED BY attach_turn_terminals_received_at_desc
+              WHERE received_at IS NOT NULL
+              ORDER BY received_at DESC LIMIT 1
+            )
+            UNION ALL SELECT completed_at AS at FROM (
+              SELECT completed_at FROM bot_native_turn_terminals
+              INDEXED BY bot_native_turn_terminals_completed_at_desc
+              ORDER BY completed_at DESC LIMIT 1
+            )
          )) AS lastTerminalAt,
          (SELECT COUNT(*) FROM attach_command_outbox WHERE acked_at IS NULL) AS queueDepth,
          (SELECT COUNT(*) FROM attach_event_inbox
@@ -3261,7 +3428,8 @@ export class Storage {
   attachPeerHealth(agentId: string) {
     return this.#db.prepare(`SELECT
       (SELECT COUNT(*) FROM attach_command_outbox WHERE agent_id = ? AND acked_at IS NULL) AS queueDepth,
-      (SELECT COUNT(*) FROM attach_event_inbox WHERE agent_id = ? AND disposition = 'accepted' AND dead_lettered_at IS NOT NULL) AS deadLetters,
+      (SELECT COUNT(*) FROM attach_event_inbox INDEXED BY attach_event_inbox_dead_letter_barrier
+       WHERE agent_id = ? AND disposition = 'accepted' AND dead_lettered_at IS NOT NULL) AS deadLetters,
       (SELECT plugin_event_outbox_depth FROM attach_streams WHERE agent_id = ?) AS pluginOutboxDepth,
       (SELECT plugin_oldest_event_age_ms FROM attach_streams WHERE agent_id = ?) AS pluginOldestEventAgeMs,
       (SELECT plugin_last_ack_progress_at FROM attach_streams WHERE agent_id = ?) AS pluginLastAckProgressAt,
@@ -3459,10 +3627,10 @@ export class Storage {
         this.#db
           .prepare(
             `INSERT INTO attach_turn_terminals
-               (agent_id, turn_id, event_id, terminal_kind, message_id, sequence)
-             VALUES (?, ?, ?, ?, ?, ?)`,
+               (agent_id, turn_id, event_id, terminal_kind, message_id, sequence, received_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
           )
-          .run(agentId, event.turnId, frame.eventId, event.kind, event.messageId, frame.sequence);
+          .run(agentId, event.turnId, frame.eventId, event.kind, event.messageId, frame.sequence, receivedAt);
       }
       this.#db
         .prepare("UPDATE attach_streams SET last_event_sequence = ?, updated_at = ? WHERE agent_id = ?")
@@ -3485,6 +3653,113 @@ export class Storage {
     } catch (err) {
       this.#db.exec("ROLLBACK");
       throw err;
+    }
+  }
+
+  /** Reclaims copied attach transport payloads after their projected facts have aged out of the
+   * diagnostic window. Rows themselves remain as sequence/event-id tombstones. A bounded pass
+   * reads at most 256 source keys before proving terminal/active safety, then permits at most 4 MiB
+   * of selected source JSON (or one larger valid row) before rewriting its removable fields. */
+  compactAttachPayloads(now: number): number {
+    const cutoff = now - ATTACH_PAYLOAD_RETENTION_MS;
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      type Cursor = { appliedAt: number; agentId: string; sequence: number };
+      type Source = Cursor & { eventId: string };
+      const cursor = this.#db.prepare(
+        `SELECT at AS appliedAt, key_1 AS agentId, CAST(key_2 AS INTEGER) AS sequence
+         FROM storage_retention_cursors WHERE pass = 'attach_payload'`,
+      ).get() as Cursor | undefined;
+      const after = cursor === undefined ? "" : " AND (applied_at, agent_id, sequence) > (?, ?, CAST(? AS INTEGER))";
+      const source = this.#db.prepare(
+        `SELECT applied_at AS appliedAt, agent_id AS agentId, sequence, event_id AS eventId
+         FROM attach_event_inbox INDEXED BY attach_event_inbox_payload_compaction
+         WHERE disposition = 'accepted' AND applied_at < ? AND dead_lettered_at IS NULL
+           AND json_valid(frame_json) AND (${ATTACH_PAYLOAD_COMPACTION_CANDIDATE})${after}
+         ORDER BY applied_at, agent_id, sequence
+         LIMIT ?`,
+      ).all(
+        cutoff,
+        ...(cursor === undefined ? [] : [cursor.appliedAt, cursor.agentId, String(cursor.sequence)]),
+        ATTACH_PAYLOAD_COMPACTION_BATCH,
+      ) as Source[];
+      if (source.length === 0) {
+        this.#db.prepare("DELETE FROM storage_retention_cursors WHERE pass = 'attach_payload'").run();
+      }
+      const eligible = this.#db.prepare(
+        `SELECT json_extract(frame_json, '$.event.kind') AS kind,
+                length(CAST(frame_json AS BLOB)) AS bytes
+           FROM attach_event_inbox
+          WHERE agent_id = ? AND event_id = ?
+            AND disposition = 'accepted' AND applied_at < ? AND dead_lettered_at IS NULL
+            AND json_valid(frame_json) AND (${ATTACH_PAYLOAD_COMPACTION_CANDIDATE})
+            AND (
+              json_type(frame_json, '$.event.turnId') IS NULL
+              OR (
+                EXISTS (
+                  SELECT 1 FROM attach_turn_terminals AS terminal
+                   WHERE terminal.agent_id = attach_event_inbox.agent_id
+                     AND terminal.turn_id = json_extract(attach_event_inbox.frame_json, '$.event.turnId')
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM bot_native_chats AS active
+                   WHERE active.bot = attach_event_inbox.agent_id
+                     AND active.active_turn_id = json_extract(attach_event_inbox.frame_json, '$.event.turnId')
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM bot_native_sessions AS active
+                   WHERE active.bot = attach_event_inbox.agent_id
+                     AND active.active_turn_id = json_extract(attach_event_inbox.frame_json, '$.event.turnId')
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM chat_executions AS execution
+                  JOIN bot_native_sessions AS active
+                    ON active.bot = execution.bot AND active.session_id = execution.session_id
+                   WHERE execution.execution_id = attach_event_inbox.agent_id
+                     AND active.active_turn_id = json_extract(attach_event_inbox.frame_json, '$.event.turnId')
+                )
+              )
+            )`,
+      );
+      let compacted = 0;
+      let selectedBytes = 0;
+      let inspected: Source | undefined;
+      const updates = new Map<AttachPayloadCompactionKind, ReturnType<DatabaseSync["prepare"]>>();
+      for (const row of source) {
+        const candidate = eligible.get(row.agentId, row.eventId, cutoff) as {
+          kind: string; bytes: number;
+        } | undefined;
+        if (candidate === undefined) {
+          inspected = row;
+          continue;
+        }
+        if (selectedBytes > 0 && selectedBytes + candidate.bytes > ATTACH_PAYLOAD_COMPACTION_MAX_BYTES) break;
+        const kind = candidate.kind as AttachPayloadCompactionKind;
+        const fields = ATTACH_PAYLOAD_COMPACTION_FIELDS[kind];
+        let update = updates.get(kind);
+        if (update === undefined) {
+          update = this.#db.prepare(
+            `UPDATE attach_event_inbox SET frame_json = json_remove(frame_json, ${fields.map((field) => `'${field}'`).join(", ")}) WHERE agent_id = ? AND event_id = ?`,
+          );
+          updates.set(kind, update);
+        }
+        compacted += Number(update.run(row.agentId, row.eventId).changes);
+        selectedBytes += candidate.bytes;
+        inspected = row;
+      }
+      if (inspected !== undefined) {
+        this.#db.prepare(
+          `INSERT INTO storage_retention_cursors (pass, at, key_1, key_2, key_3)
+           VALUES ('attach_payload', ?, ?, ?, '')
+           ON CONFLICT(pass) DO UPDATE SET at = excluded.at, key_1 = excluded.key_1,
+             key_2 = excluded.key_2, key_3 = excluded.key_3`,
+        ).run(inspected.appliedAt, inspected.agentId, String(inspected.sequence));
+      }
+      this.#db.exec("COMMIT");
+      return compacted;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
     }
   }
 
@@ -3522,6 +3797,7 @@ export class Storage {
     const earliest = this.#db
       .prepare(
         `SELECT event_id AS eventId FROM attach_event_inbox
+         INDEXED BY attach_event_inbox_dead_letter_barrier
          WHERE agent_id = ? AND disposition = 'accepted' AND dead_lettered_at IS NOT NULL
          ORDER BY sequence LIMIT 1`,
       )
@@ -3540,10 +3816,12 @@ export class Storage {
     const rows = this.#db
       .prepare(
         `SELECT frame_json AS frameJson FROM attach_event_inbox
+         INDEXED BY attach_event_inbox_unapplied
          WHERE agent_id = ? AND disposition = 'accepted' AND applied_at IS NULL
            AND dead_lettered_at IS NULL
            AND sequence < COALESCE(
              (SELECT MIN(blocked.sequence) FROM attach_event_inbox AS blocked
+              INDEXED BY attach_event_inbox_dead_letter_barrier
               WHERE blocked.agent_id = ? AND blocked.disposition = 'accepted'
                 AND blocked.dead_lettered_at IS NOT NULL),
              9223372036854775807
@@ -3576,18 +3854,19 @@ export class Storage {
   }
 
   attachTurnCommand(agentId: string, turnId: string): { threadId: string; messageId: string } | undefined {
-    const rows = this.#db
+    const row = this.#db
       .prepare(
-        `SELECT command_json AS commandJson, cancelled_at AS cancelledAt FROM attach_command_outbox
-         WHERE agent_id = ? ORDER BY sequence DESC`,
+        `SELECT command_json AS commandJson FROM attach_command_outbox
+         INDEXED BY attach_command_outbox_turn_lookup
+         WHERE agent_id = ? AND cancelled_at IS NULL AND json_valid(command_json)
+           AND json_extract(command_json, '$.kind') = 'turn'
+           AND json_extract(command_json, '$.turnId') = ?
+         ORDER BY sequence DESC LIMIT 1`,
       )
-      .all(agentId) as unknown as Array<{ commandJson: string; cancelledAt: number | null }>;
-    for (const row of rows) {
-      if (row.cancelledAt !== null) continue;
-      const command = JSON.parse(row.commandJson) as AttachV1Command;
-      if (command.kind === "turn" && command.turnId === turnId) return { threadId: command.threadId, messageId: command.messageId };
-    }
-    return undefined;
+      .get(agentId, turnId) as { commandJson: string } | undefined;
+    if (row === undefined) return undefined;
+    const command = JSON.parse(row.commandJson) as Extract<AttachV1Command, { kind: "turn" }>;
+    return { threadId: command.threadId, messageId: command.messageId };
   }
 
   /** Applied evidence for a reported sealed interim commit. The `(agent_id, event_id)` lookup is
@@ -6153,6 +6432,30 @@ export function openStorage(dbPath: string): Storage {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
+  // The original tool table predates detail/error_text. Migrate before creating their index.
+  const toolColumns = new Set(
+    (db.prepare("PRAGMA table_info(bot_chat_tool_steps)").all() as Array<{ name: string }>).map(row => row.name),
+  );
+  for (const column of ["detail", "error_text"])
+    if (!toolColumns.has(column)) db.exec(`ALTER TABLE bot_chat_tool_steps ADD COLUMN ${column} TEXT`);
+  db.exec(`CREATE INDEX IF NOT EXISTS bot_chat_tool_steps_detail_compaction
+    ON bot_chat_tool_steps (ended_at, bot, turn_id, step_id)
+    WHERE detail IS NOT NULL OR error_text IS NOT NULL`);
+  // Terminal receipts originally joined back to the inbox for their timestamp. Copy that durable
+  // fact once onto older receipts before creating the ordered endpoint index used by health.
+  const attachTerminalColumns = new Set(
+    (db.prepare("PRAGMA table_info(attach_turn_terminals)").all() as Array<{ name: string }>).map(row => row.name),
+  );
+  if (!attachTerminalColumns.has("received_at"))
+    db.exec("ALTER TABLE attach_turn_terminals ADD COLUMN received_at INTEGER");
+  db.exec(`UPDATE attach_turn_terminals AS terminal
+    SET received_at = (
+      SELECT inbox.received_at FROM attach_event_inbox AS inbox
+      WHERE inbox.agent_id = terminal.agent_id AND inbox.event_id = terminal.event_id
+    )
+    WHERE received_at IS NULL`);
+  db.exec(`CREATE INDEX IF NOT EXISTS attach_turn_terminals_received_at_desc
+    ON attach_turn_terminals (received_at DESC)`);
   const observeLifetimeColumns = new Set(
     (db.prepare("PRAGMA table_info(observe_lifetime)").all() as unknown as Array<{ name: string }>).map(row => row.name),
   );

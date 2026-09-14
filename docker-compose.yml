@@ -2,6 +2,14 @@
 # relay is in the local-push profile for developers with their own publisher-team APNs key.
 services:
   gateway:
+    # Bound stdout/stderr even when a bot floods traces. Docker owns rotation and compression.
+    logging: &bounded-logs
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+        mode: non-blocking
+        max-buffer-size: "1m"
     build:
       context: .
       dockerfile: packages/gateway/Dockerfile
@@ -52,6 +60,7 @@ services:
     restart: unless-stopped
 
   relay:
+    logging: *bounded-logs
     # A self-hosted relay cannot push to the store app: APNs keys are scoped to the publisher team.
     # This profile is for developers signing their own app with their own Apple team.
     profiles: ["local-push"]

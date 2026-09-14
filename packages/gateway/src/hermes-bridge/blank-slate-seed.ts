@@ -1,5 +1,6 @@
 import type { HermesClient } from "./client.ts";
 import { mapProfileDescribe, normalizeNames } from "./profile.ts";
+import { asRecord } from "./rpc.ts";
 
 /** The toolset floor a newly created bot starts with. It is the same pair Hermes' own "Blank
  *  Slate" install mode keeps (`hermes_cli/setup.py::_blank_slate_minimal_toolsets`): enough to
@@ -148,12 +149,6 @@ export interface BlankSlateSeedOutcome {
    *  from half a catalog silently leaves the other half armed, which is worse than not writing it
    *  and saying so. */
   skillCatalogUnavailable: boolean;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
 }
 
 function profilePath(name: string): string {

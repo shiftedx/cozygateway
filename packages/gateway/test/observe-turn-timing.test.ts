@@ -5,7 +5,7 @@ import { NativeBotDataPlane } from "../src/hermes-bridge/native-data-plane.ts";
 import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 import type { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import { openStorage, type Storage } from "../src/storage.ts";
-import { ObservationRing } from "../src/observe/index.ts";
+import { ObservationRing } from "../src/observe/ring.ts";
 
 /** Dashboard packet D2, the per-turn half of section 10. Everything here rides on hooks that
  *  already fired before the ring existed, so the point of these tests is as much that the turn

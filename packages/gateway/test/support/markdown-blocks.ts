@@ -5,9 +5,8 @@ import type { ListItem, RichBlock } from "cozygateway-contract";
  *  A TypeScript port of the reference Python normalizer
  *  (`integrations/attach-plugin/cozygateway/text_blocks.py`, `normalize_text_to_blocks`),
  *  byte-identical to it per the cross-language parity vectors in
- *  `test/fixtures/markdown-blocks-vectors.json`. Converts a run of accumulated model text
- *  (markdown) into the closed `RichBlock` union before the gateway or the client sees it; the
- *  renderer runs no markdown parser of its own, it renders only the typed blocks this produces.
+ *  `test/fixtures/markdown-blocks-vectors.json`. It exists only to check parity with the
+ *  reference normalizer.
  *
  *  Deliberately NOT a general CommonMark engine: it emits only the closed set, never HTML, never
  *  resolves links or images, and treats inline emphasis / links / inline code as inert literal

@@ -69,6 +69,8 @@ function understands(client: Client, frame: ServerFrame): boolean {
 }
 
 const HEARTBEAT_MS = 5_000;
+/** A disconnected app must reconnect and sync rather than grow this process's `ws` sender queue. */
+const MAX_SOCKET_BUFFERED_BYTES = 4 * 1024 * 1024;
 
 export class WsHub {
   readonly #storage: Storage;
@@ -161,8 +163,27 @@ export class WsHub {
     }
   }
 
-  #send(socket: WebSocket, frame: ServerFrame): void {
-    if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(frame));
+  #send(socket: WebSocket, frame: ServerFrame): boolean {
+    if (socket.readyState !== WebSocket.OPEN) return false;
+    return this.#sendEncoded(socket, JSON.stringify(frame));
+  }
+
+  /** One bounded write path for direct replies and broadcasts. The REST/`sync` recovery paths
+   * make a slow consumer retryable; retaining its unbounded `ws` queue does not. The 4 MiB
+   * high-water mark limits queued backlog, so the actual queue is less than 4 MiB plus one
+   * protocol-valid frame; once it reaches the mark, the next send closes it. */
+  #sendEncoded(socket: WebSocket, payload: string): boolean {
+    if (socket.readyState !== WebSocket.OPEN) return false;
+    if (socket.bufferedAmount >= MAX_SOCKET_BUFFERED_BYTES) {
+      socket.close(1013, "client is behind");
+      return false;
+    }
+    try {
+      socket.send(payload);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   #onConnection(socket: WebSocket, req?: IncomingMessage, releasePending?: () => void): void {
@@ -245,7 +266,7 @@ export class WsHub {
         emitTrace(this.#trace, "app_ws_auth", { connection, device: traceId(device.id) });
         this.#clients.add(client);
         this.#deviceCounts.set(device.id, (this.#deviceCounts.get(device.id) ?? 0) + 1);
-        this.#send(socket, { type: "ready", deviceId: device.id, gateway: this.#gatewayInfo });
+        if (!this.#send(socket, { type: "ready", deviceId: device.id, gateway: this.#gatewayInfo })) return;
         if (client.scope === "write") this.#send(socket, { type: "cozyapps_snapshot", ...this.#storage.cozyAppsSnapshot() });
         return;
       }
@@ -324,7 +345,7 @@ export class WsHub {
 
       for (const [threadId, sinceSeq] of Object.entries(client.scope === "write" ? frame.threads : {})) {
         for (const message of this.#storage.messagesSince(threadId, sinceSeq)) {
-          this.#send(socket, { type: "committed", threadId, seq: message.seq, message });
+          if (!this.#send(socket, { type: "committed", threadId, seq: message.seq, message })) return;
         }
       }
       emitTrace(this.#trace, "app_ws_sync", { connection, device: traceId(client.deviceId), threadCount: Object.keys(frame.threads).length });
@@ -424,7 +445,10 @@ export class WsHub {
         }
         const queue = client.observeQueue ?? [];
         while (queue.length > 0 && client.socket.bufferedAmount < 64 * 1024) {
-          client.socket.send(queue.shift()!);
+          if (!this.#sendEncoded(client.socket, queue.shift()!)) {
+            this.#clearObserveQueue(client);
+            return;
+          }
         }
       }
       if ((client.observeQueue?.length ?? 0) > 0) this.#scheduleObserve(client);
@@ -457,7 +481,7 @@ export class WsHub {
         continue;
       }
       if (frame.type.startsWith("observe_")) continue;
-      client.socket.send(payload);
+      this.#sendEncoded(client.socket, payload);
     }
   }
 

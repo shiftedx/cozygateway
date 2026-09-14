@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import vectors from "./fixtures/markdown-blocks-vectors.json" with { type: "json" };
-import { normalizeMarkdownToBlocks } from "../src/markdown-blocks.ts";
+import { normalizeMarkdownToBlocks } from "./support/markdown-blocks.ts";
 import type { RichBlock } from "cozygateway-contract";
 
 describe("normalizeMarkdownToBlocks parity", () => {

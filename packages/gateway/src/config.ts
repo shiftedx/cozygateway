@@ -164,7 +164,8 @@ const GatewayConfigSchema = Type.Object({
    *  counts about their own machine; nobody opts them in.
    *
    *  `retentionDays` bounds the ring rather than the disk: the nightly trim deletes anything
-   *  older. Config-file only, following turnTimeoutSeconds and artifactStoreBytes above. */
+   *  older. Effective retention is capped at 14 days; longer legacy values still load.
+   *  Config-file only, following turnTimeoutSeconds and artifactStoreBytes above. */
   observability: Type.Optional(Type.Object({
     enabled: Type.Boolean({ default: false }),
     retentionDays: Type.Integer({ minimum: 1, maximum: 365, default: 7 }),
@@ -214,7 +215,8 @@ export function observability(config: GatewayConfig): { enabled: boolean; retent
   const configured = config.observability;
   return {
     enabled: configured?.enabled ?? false,
-    retentionDays: configured?.retentionDays ?? 7,
+    // Accept legacy config values, but diagnostic history never outlives the 14-day policy.
+    retentionDays: Math.min(configured?.retentionDays ?? 7, 14),
   };
 }
 

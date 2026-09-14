@@ -25,7 +25,7 @@ import {
 import { createApp } from "../src/http.ts";
 import { gatewayInfoForConfig } from "../src/server.ts";
 import { openStorage } from "../src/storage.ts";
-import { ObservationRing } from "../src/observe/index.ts";
+import { ObservationRing } from "../src/observe/ring.ts";
 
 const TOKEN = "paired-device-token";
 const CONFIG: GatewayConfig = {

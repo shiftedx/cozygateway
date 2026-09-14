@@ -649,6 +649,9 @@ describe("attach-v1 ingress", () => {
     clock = 6_000;
     await until(() => presence.includes("absent"), 1_500);
     await until(() => ws.readyState !== WebSocket.OPEN, 1_500);
+    expect(traces.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({
+      event: "attach_heartbeat_timeout", silenceMs: 6_000, timeoutMs: 5_000,
+    }));
   });
 
   it("treats plugin heartbeats as acknowledgements instead of echoing them", async () => {
