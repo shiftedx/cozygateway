@@ -92,6 +92,24 @@ cozygateway repair   # `cozygateway update` is an alias
 
 `status` reports the next safe action when the service needs attention. `repair` downloads and verifies one matched release while retaining the recorded listener, public origin, and selected profiles. If the command itself is unavailable, run the relevant installation command again. Do not remove the gateway directory or reset pairing as a first recovery step: that can discard the state recovery preserves. Read [reliable operation and recovery](docs/reliable-operation.md) before a host migration or deployment repair.
 
+## Uninstall
+
+Open Terminal or PowerShell and run:
+
+```sh
+cozygateway uninstall --purge
+```
+
+This deletes the installed Gateway, its local data (including conversations and pairing),
+background service, command, and managed Hermes connections. It also removes the
+CozyAgents runner installed with this Gateway, including its bots and their files.
+Deletion is permanent. Preview with `cozygateway uninstall --purge --dry-run`.
+Omit `--purge` to keep CozyAgents bot files.
+
+Hermes itself, its profiles and history, independently installed apps such as
+CozyChat, shared model credentials, and your projects remain. See
+[uninstall details and fallback commands](docs/install-service.md#uninstall).
+
 ## Documentation
 
 | Need | Start here |

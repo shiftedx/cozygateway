@@ -828,6 +828,10 @@ if (`$env:COZYGATEWAY_POWERSHELL -cne 'preexisting-powershell-value') { exit 32 
 
     $uninstallPathLog = Join-Path $temp 'uninstall-user-path.txt'
     $managedBin = Join-Path $temp 'Cozy Gateway\bin'
+    # A completed uninstall now deletes the entire install. Keep a separate
+    # disposable installation for the following no-mutation preview check.
+    $dryUninstallHome = Join-Path $temp 'Dry Uninstall Gateway'
+    Copy-Item -LiteralPath (Join-Path $temp 'Cozy Gateway') -Destination $dryUninstallHome -Recurse
     $mustNotRunHermesInstaller = Join-Path $temp 'must-not-run-hermes-installer.ps1'
     Write-Utf8NoBom $mustNotRunHermesInstaller "throw 'uninstall must not install Hermes'`n"
     Remove-Item -LiteralPath $eventLog -Force
@@ -845,12 +849,13 @@ if (`$env:COZYGATEWAY_POWERSHELL -cne 'preexisting-powershell-value') { exit 32 
     $uninstalledPath = Get-Content -LiteralPath $uninstallPathLog -Raw
     Assert-True (-not ($uninstalledPath -match [regex]::Escape($managedBin))) 'uninstall must remove the managed command directory from the user PATH'
     Assert-True (-not ((Get-Content -LiteralPath $eventLog -Raw) -match 'hermes:-p default model')) 'uninstall must not open Hermes model selection'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $temp 'Cozy Gateway'))) 'uninstall must remove the full Gateway directory'
 
     $dryUninstallPathLog = Join-Path $temp 'dry-uninstall-user-path.txt'
     Remove-Item -LiteralPath $eventLog -Force
     $dryUninstall = Invoke-Bootstrap $installer @{
         'PATH' = "$fakeBin;$env:PATH"
-        'COZYGATEWAY_HOME' = (Join-Path $temp 'Cozy Gateway')
+        'COZYGATEWAY_HOME' = $dryUninstallHome
         'COZYGATEWAY_GIT_BASH' = $fakeBash
         'COZYGATEWAY_INSTALL_DRYRUN' = '1'
         'COZYGATEWAY_TEST_USER_PATH' = "C:\Existing Tools;$managedBin"
@@ -858,6 +863,7 @@ if (`$env:COZYGATEWAY_POWERSHELL -cne 'preexisting-powershell-value') { exit 32 
     } @('--uninstall')
     Assert-True ($dryUninstall.ExitCode -eq 0) "bootstrap uninstall dry run failed: $($dryUninstall.Output)"
     Assert-True (-not (Test-Path -LiteralPath $dryUninstallPathLog)) 'uninstall dry run must not mutate the user PATH'
+    Assert-True (Test-Path -LiteralPath $dryUninstallHome) 'uninstall dry run must keep the Gateway directory'
     Assert-True ((Get-Content -LiteralPath $eventLog -Raw) -match '--uninstall.*--dry-run|--dry-run.*--uninstall') 'bootstrap must forward dry run to uninstall'
 
     $dryRunPathLog = Join-Path $temp 'dry-run-user-path.txt'
@@ -966,6 +972,7 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
 set -euo pipefail
 GATEWAY_DIR="`$(cygpath -u "`$1")"
 WINDOWS_POWERSHELL="`$2"
+SERVICE_PLATFORM=Windows
 DRY_RUN=0
 NODE_RESOLVED="`$GATEWAY_DIR/runtime/node/node.exe"
 BUNDLE_PATH="`$GATEWAY_DIR/bin/cozygateway.mjs"
@@ -1007,6 +1014,23 @@ write_cli_wrapper
     Add-Content -LiteralPath $repairBootstrap -Value '# tampered'
     $tamperedRepair = (& cmd.exe /c $repairCmd repair 2>&1 | Out-String)
     Assert-True ($LASTEXITCODE -ne 0 -and $tamperedRepair -match 'repair bootstrap checksum mismatch' -and @((Get-Content -LiteralPath $repairMarker)).Count -eq 2) 'generated repair shim must reject a tampered bootstrap before execution'
+
+    # Exercise the generated uninstall command in cmd.exe, including its own
+    # deletion while PowerShell runs. Batch processing must end before deletion.
+    $uninstallMarker = Join-Path $temp 'uninstall-command-marker.txt'
+    Write-Utf8NoBom $repairBootstrap @"
+param([switch]`$Uninstall, [switch]`$Purge, [switch]`$DryRun)
+if (-not `$Uninstall -or -not `$Purge) { exit 2 }
+[IO.File]::AppendAllText('$uninstallMarker', [string]`$env:COZYGATEWAY_HOME + [Environment]::NewLine)
+if (-not `$DryRun) { Remove-Item -LiteralPath `$env:COZYGATEWAY_HOME -Recurse -Force }
+"@
+    $invalidUninstall = (& cmd.exe /c $repairCmd uninstall unexpected 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -ne 0 -and -not (Test-Path -LiteralPath $uninstallMarker)) 'uninstall shim must reject unknown arguments before bootstrap execution'
+    $previewUninstall = (& cmd.exe /c $repairCmd uninstall --purge --dry-run 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $repairCmd)) "uninstall preview must forward flags and retain the command: $previewUninstall"
+    $actualUninstall = (& cmd.exe /c $repairCmd uninstall --purge 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -eq 0 -and -not (Test-Path -LiteralPath $repairHome)) "uninstall must exit successfully after deleting its own command: $actualUninstall"
+    Assert-True (@(Get-Content -LiteralPath $uninstallMarker).Count -eq 2 -and (Get-Content -LiteralPath $uninstallMarker)[0] -eq $repairHome) 'uninstall must pass the installed custom home'
 
     # A foreign Windows registration must stop the CozyAgents branch before it
     # can replace any live state or configuration.

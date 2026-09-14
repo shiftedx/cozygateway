@@ -42,6 +42,7 @@ WINDOWS_OWNED_BUNDLE_PATH=""
 WINDOWS_OWNED_CONFIG_JSON=""
 DRY_RUN=0
 UNINSTALL=0
+PURGE=0
 STATUS=0
 RUNTIME_ONLY=0
 # Which harness runs the bots. Empty until choose_harness scans the machine or --harness answers
@@ -110,6 +111,7 @@ usage: agent-install.sh --bundle PATH --plugin-archive PATH [options]
   --status                report persistence and live gateway health
   --runtime-only          update only CozyGateway-owned runtime, service, and CLI
   --uninstall             remove only CozyGateway-owned service, plugins, env keys and state
+  --purge                 with --uninstall, also delete the paired CozyAgents bots and files
 
 The gateway and attach plugin both stay on this machine. This installer never
 configures remote networking, DNS, routers, or firewalls.
@@ -137,11 +139,14 @@ while [ "$#" -gt 0 ]; do
     --status) STATUS=1 ;;
     --runtime-only) RUNTIME_ONLY=1 ;;
     --uninstall) UNINSTALL=1 ;;
+    --purge) PURGE=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
   shift
 done
+
+[ "$PURGE" = 0 ] || [ "$UNINSTALL" = 1 ] || die "--purge requires --uninstall"
 
 [ "$PUBLIC_URL_EXPLICIT" = 0 ] || [ "$CLEAR_PUBLIC_URL" = 0 ] || \
   die "--public-url and --clear-public-url are mutually exclusive"
@@ -1672,6 +1677,21 @@ write_cli_wrapper() {
   cat > "$CLI_WRAPPER" <<CLI
 #!/usr/bin/env bash
 set -euo pipefail
+if [ "\${1:-}" = uninstall ]; then
+  shift
+  for option in "\$@"; do
+    case "\$option" in --purge|--dry-run) ;; *) printf 'usage: cozygateway uninstall [--purge] [--dry-run]\n' >&2; exit 1 ;; esac
+  done
+  if [ $(printf %q "$SERVICE_PLATFORM") = Windows ]; then
+    options=(-Uninstall)
+    for option in "\$@"; do
+      case "\$option" in --purge) options+=(-Purge) ;; --dry-run) options+=(-DryRun) ;; esac
+    done
+    export COZYGATEWAY_HOME=$(printf %q "$(to_windows_path "$GATEWAY_DIR")")
+    exec $(printf %q "$WINDOWS_POWERSHELL") -NoProfile -ExecutionPolicy Bypass -File $(printf %q "$(to_windows_path "$WINDOWS_BOOTSTRAP")") "\${options[@]}"
+  fi
+  exec bash $(printf %q "$GATEWAY_DIR/bin/agent-install.sh") --gateway-dir $(printf %q "$GATEWAY_DIR") --service-platform $(printf %q "$SERVICE_PLATFORM") --uninstall "\$@"
+fi
 if [ "\${1:-}" = repair ] || [ "\${1:-}" = update ]; then
   [ "\$#" = 1 ] || { printf 'FAIL  repair does not accept extra arguments\n' >&2; exit 1; }
   bootstrap=$(printf %q "$POSIX_BOOTSTRAP")
@@ -1723,11 +1743,26 @@ CLI
     bootstrap_b64="$(printf '%s' "$bootstrap_native" | base64 | tr -d '\r\n')"
     {
       printf '@echo off\r\n'
+      printf 'if /I "%%~1"=="uninstall" goto uninstall\r\n'
       printf 'if /I "%%~1"=="repair" goto repair\r\n'
       printf 'if /I "%%~1"=="update" goto repair\r\n'
       printf 'cd /d "%s"\r\n' "$local_native"
       printf '"%s" "%s" %%*\r\n' "$node_native" "$bundle_native"
       printf 'exit /b %%errorlevel%%\r\n'
+      printf ':uninstall\r\n'
+      printf 'set "uninstallOptions="\r\n'
+      printf ':uninstallNext\r\n'
+      printf 'shift\r\n'
+      printf 'if "%%~1"=="" goto uninstallRun\r\n'
+      printf 'if "%%~1"=="--purge" (set "uninstallOptions=%%uninstallOptions%% -Purge" & goto uninstallNext)\r\n'
+      printf 'if "%%~1"=="--dry-run" (set "uninstallOptions=%%uninstallOptions%% -DryRun" & goto uninstallNext)\r\n'
+      printf 'echo usage: cozygateway uninstall [--purge] [--dry-run]\r\n'
+      printf 'exit /b 1\r\n'
+      printf ':uninstallRun\r\n'
+      printf 'set "COZYGATEWAY_HOME=%s"\r\n' "$(to_windows_path "$GATEWAY_DIR")"
+      # End this batch context before uninstall deletes the command file.
+      # The command following & is already parsed and retains PowerShell's status.
+      printf '(goto) 2>nul & "%s" -NoProfile -ExecutionPolicy Bypass -File "%s" -Uninstall %%uninstallOptions%%\r\n' "$WINDOWS_POWERSHELL" "$bootstrap_native"
       printf ':repair\r\n'
       printf 'if not "%%~2"=="" (echo FAIL  repair does not accept extra arguments & exit /b 1)\r\n'
       printf 'if not exist "%s" (echo FAIL  repair bootstrap is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 ^| iex & exit /b 1)\r\n' "$bootstrap_native"
@@ -2980,9 +3015,16 @@ remove_owned_posix_service() {
     return 1
   fi
   if [ "$SERVICE_PLATFORM" = Darwin ]; then
-    launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null || true; rm -f "$path"
+    if ! launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" 2>/dev/null; then
+      if launchctl print "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1; then return 1; fi
+    fi
+    rm -f "$path"
   else
-    systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1 || true; rm -f "$path"; systemctl --user daemon-reload >/dev/null 2>&1 || true
+    if ! systemctl --user disable --now "$SERVICE_UNIT" >/dev/null 2>&1; then
+      if systemctl --user is-active --quiet "$SERVICE_UNIT" || systemctl --user is-enabled --quiet "$SERVICE_UNIT"; then return 1; fi
+    fi
+    rm -f "$path"
+    systemctl --user daemon-reload >/dev/null 2>&1 || return 1
   fi
 }
 install_service() {
@@ -3188,8 +3230,17 @@ start_dashboard() {
 # A CozyAgents uninstall takes back exactly what this installer put there: the gateway service and
 # its state here, and the harness through CozyAgents' own uninstaller, which owns its launcher, its
 # PATH line, its service and its runner state.
+remove_gateway_home() {
+  if windows_harness_owner && [ "$DRY_RUN" = 0 ]; then
+    say "INFO  the Windows bootstrap will remove Gateway files after its private tools exit"
+  else
+    run rm -rf "$GATEWAY_DIR"
+  fi
+}
 uninstall_cozyagents() {
   local home launcher
+  local agent_options=(--yes)
+  [ "$PURGE" = 0 ] || agent_options+=(--purge)
   home="$(sed -n 's/^cozyagents_home=//p' "$STATE_FILE" | tail -1)"
   [ -n "$home" ] || home="$COZYAGENTS_HOME_DIR"
   load_windows_state_identity || die "installer state has conflicting Windows supervisor identity"
@@ -3198,10 +3249,10 @@ uninstall_cozyagents() {
   HARNESS=cozyagents
   if [ "$SERVICE_PLATFORM" = Darwin ]; then
     if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
-    else remove_owned_posix_service "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" && remove_posix_cli || true; fi
+    else remove_owned_posix_service "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" || die "could not remove CozyGateway service or command; remaining files were retained"; fi
   elif [ "$SERVICE_PLATFORM" = Linux ]; then
     if [ "$DRY_RUN" = 1 ]; then run systemctl --user disable --now "$SERVICE_UNIT"; run rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; run systemctl --user daemon-reload
-    else remove_owned_posix_service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT" && remove_posix_cli || true; fi
+    else remove_owned_posix_service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT" || die "could not remove CozyGateway service or command; remaining files were retained"; fi
   elif windows_harness_owner; then
     # The native bootstrap installed the harness and removes it through the CozyAgents Windows
     # uninstaller; what is left here is the gateway task, its Startup fallback and its PATH entry.
@@ -3216,10 +3267,9 @@ uninstall_cozyagents() {
       fi
       [ -z "$task_xml" ] || windows_recorded_task_is_owned || die "CozyGateway Scheduled Task ownership could not be verified; preserving installed Gateway state"
       [ ! -f "$startup_entry" ] || windows_startup_entry_is_owned "$startup_entry" || die "CozyGateway Startup entry ownership could not be verified; preserving installed Gateway state"
-      [ -z "$task_xml" ] || MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
+      [ -z "$task_xml" ] || MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || die "could not remove owned CozyGateway Scheduled Task"
       [ ! -f "$startup_entry" ] || rm -f "$startup_entry"
       stop_owned_windows_gateway 0 || true
-      remove_windows_cli_path
     fi
   else
     die "the CozyAgents harness is not installed by this script on Windows"
@@ -3228,12 +3278,13 @@ uninstall_cozyagents() {
   if windows_harness_owner; then
     say "INFO  the Windows bootstrap removes the CozyAgents harness through its own uninstaller"
   elif [ -x "$launcher" ]; then
-    run "$launcher" uninstall --home "$home" --yes
+    run "$launcher" uninstall --home "$home" "${agent_options[@]}"
     say "OK    removed the CozyAgents harness through its own uninstaller"
   else
-    say "WARN  the cozyagents command is gone; leaving $home untouched"
+    die "the cozyagents command is gone; remaining files were retained. Restore CozyAgents at $home before retrying uninstall"
   fi
-  run rm -rf "$GATEWAY_DIR"
+  is_windows || remove_posix_cli
+  remove_gateway_home
   say "OK    removed only CozyGateway-owned state; nothing else on this machine was changed"
 }
 uninstall() {
@@ -3241,7 +3292,7 @@ uninstall() {
   if [ ! -f "$STATE_FILE" ]; then
     resolve_platform
     say "WARN  CozyGateway install state is missing; removing recoverable current-user files only"
-    if [ "$DRY_RUN" = 1 ]; then run rm -rf "$GATEWAY_DIR"; return; fi
+    if [ "$DRY_RUN" = 1 ]; then remove_gateway_home; return; fi
     if [ "$SERVICE_PLATFORM" = Windows ]; then
       local startup_entry task_xml owned=0 task_owned=0 startup_owned=0
       startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
@@ -3251,19 +3302,19 @@ uninstall() {
       if [ -f "$startup_entry" ] && windows_startup_entry_is_owned "$startup_entry"; then startup_owned=1
       elif [ -f "$startup_entry" ]; then die "CozyGateway Startup entry ownership could not be verified; preserving partial Gateway state"; fi
       if [ "$task_owned" = 1 ]; then
-        MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true; owned=1
+        MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || die "could not remove owned CozyGateway Scheduled Task"; owned=1
       fi
       if [ "$startup_owned" = 1 ]; then rm -f "$startup_entry"; owned=1; fi
       if [ "$owned" = 1 ]; then remove_windows_cli_path
       else say "WARN  CozyGateway Windows launcher ownership could not be verified; leaving task, Startup entry, and PATH untouched"; fi
     elif [ "$SERVICE_PLATFORM" = Darwin ]; then
       posix_service_is_owned_or_absent "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" || die "CozyGateway launchd ownership could not be verified; preserving partial Gateway state"
-      remove_owned_posix_service "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" && remove_posix_cli || true
+      remove_owned_posix_service "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" && remove_posix_cli || die "could not remove CozyGateway service or command; remaining files were retained"
     elif [ "$SERVICE_PLATFORM" = Linux ]; then
       posix_service_is_owned_or_absent "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT" || die "CozyGateway systemd ownership could not be verified; preserving partial Gateway state"
-      remove_owned_posix_service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT" && remove_posix_cli || true
+      remove_owned_posix_service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT" && remove_posix_cli || die "could not remove CozyGateway service or command; remaining files were retained"
     fi
-    rm -rf "$GATEWAY_DIR"; say "OK    removed partial CozyGateway state; Hermes was not changed"
+    remove_gateway_home; say "OK    removed partial CozyGateway state; Hermes was not changed"
     return
   fi
   # install-state contains only profile names, paths, and lifecycle state; no secrets.
@@ -3302,7 +3353,7 @@ uninstall() {
         remove_posix_cli || die "could not remove the CozyGateway command"
       fi
     fi
-    run rm -rf "$GATEWAY_DIR"
+    remove_gateway_home
     say "OK    removed CozyGateway runtime-only state; Hermes profiles, plugins, services, and environment were preserved"
     return
   fi
@@ -3338,7 +3389,7 @@ uninstall() {
       fi
       [ -z "$task_xml" ] || windows_recorded_task_is_owned || die "CozyGateway Scheduled Task ownership could not be verified; preserving installed Gateway state"
       [ ! -f "$startup_entry" ] || windows_startup_entry_is_owned "$startup_entry" || die "CozyGateway Startup entry ownership could not be verified; preserving installed Gateway state"
-      [ -z "$task_xml" ] || MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || true
+      [ -z "$task_xml" ] || MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || die "could not remove owned CozyGateway Scheduled Task"
       [ ! -f "$startup_entry" ] || rm -f "$startup_entry"
       stop_owned_windows_gateway 0 || true
     fi
@@ -3346,10 +3397,10 @@ uninstall() {
     [ "$DRY_RUN" = 1 ] || remove_windows_cli_path
   elif [ "$SERVICE_PLATFORM" = Darwin ]; then
     if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
-    else remove_owned_posix_service "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" && remove_posix_cli || true; fi
+    else remove_owned_posix_service "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" && remove_posix_cli || die "could not remove CozyGateway service or command; remaining files were retained"; fi
   else
     if [ "$DRY_RUN" = 1 ]; then run systemctl --user disable --now "$SERVICE_UNIT"; run rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; run systemctl --user daemon-reload
-    else remove_owned_posix_service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT" && remove_posix_cli || true; fi
+    else remove_owned_posix_service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT" && remove_posix_cli || die "could not remove CozyGateway service or command; remaining files were retained"; fi
   fi
   IFS=',' read -r -a SELECTED <<<"$profiles"
   for p in "${SELECTED[@]}"; do
@@ -3386,8 +3437,13 @@ uninstall() {
         *) die "could not remove the CozyGateway spool for profile $p" ;;
       esac
     fi
+    if [ "$DRY_RUN" = 1 ]; then
+      say "DRY   remove the empty CozyGateway plugin-data directory at $home/plugin-data/cozygateway"
+    else
+      rmdir "$home/plugin-data/cozygateway" 2>/dev/null || true
+    fi
   done
-  run rm -rf "$GATEWAY_DIR"; say "OK    removed only CozyGateway-owned state; Hermes profiles and Hermes services remain"
+  remove_gateway_home; say "OK    removed only CozyGateway-owned state; Hermes profiles and Hermes services remain"
 }
 # What a CozyAgents harness has instead of attach health: the runner's own row, asked for with the
 # runner's own token, which is the only thing that token opens. The token goes in through stdin, not
@@ -3454,6 +3510,7 @@ announce_listener() {
 # First setup ends ready to scan. Updates preserve existing device trust and ask before creating
 # any new credential; unattended updates take the default No, and --no-qr never prints one at all.
 pairing_and_finish() {
+  say "INFO  remove: cozygateway uninstall --purge (also deletes paired CozyAgents bots and files)"
   if [ "$NO_QR" = 1 ]; then
     say "INFO  no pairing QR was printed (--no-qr); run $CLI_WRAPPER pair when you want to add a device"
   elif [ "$DRY_RUN" = 1 ]; then
