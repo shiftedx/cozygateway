@@ -1,7 +1,8 @@
 import { Artifacts } from "./artifacts.ts";
 import { ObserveStore } from "./observe/store.ts";
 import { Tasks } from "./tasks.ts";
-import { DatabaseSync } from "node:sqlite";
+import { CachedDatabaseSync } from "./sqlite.ts";
+import type { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 
 import {
@@ -6428,7 +6429,7 @@ function nativeBotMessage(row: NativeBotMessageDbRow): BotChatMessage {
 }
 
 export function openStorage(dbPath: string): Storage {
-  const db = new DatabaseSync(dbPath);
+  const db = new CachedDatabaseSync(dbPath);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
