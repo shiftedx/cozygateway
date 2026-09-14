@@ -27,7 +27,7 @@ function Assert([bool] $Condition, [string] $Message) { if (-not $Condition) { t
 $root = Join-Path ([IO.Path]::GetTempPath()) ('cozygateway-uninstall-test-' + [guid]::NewGuid().ToString('N'))
 $originalOwner = $env:COZYGATEWAY_WINDOWS_HARNESS_OWNER
 $originalFailure = $env:COZY_UNINSTALL_TEST_FAIL
-$node = (Get-Command node -ErrorAction Stop).Source
+$fixtureNodeSource = (Get-Command node -ErrorAction Stop).Source
 try {
     foreach ($mode in @('purge', 'keep', 'preview', 'failure')) {
         $script:InstallHome = Join-Path $root "$mode/gateway"
@@ -54,10 +54,10 @@ for (const entry of fs.readdirSync(home)) {
 }
 if (args.includes('--purge')) fs.rmdirSync(home);
 '@
-        $script:Node = $node
+        $script:Node = $fixtureNodeSource
         if ($env:OS -eq 'Windows_NT') {
             $script:Node = Join-Path $script:AgentsHome 'node.exe'
-            Copy-Item -LiteralPath $node -Destination $script:Node
+            Copy-Item -LiteralPath $fixtureNodeSource -Destination $script:Node
         }
         $env:COZY_UNINSTALL_TEST_FAIL = if ($mode -eq 'failure') { '1' } else { '0' }
         $forwarded = @('--uninstall')
