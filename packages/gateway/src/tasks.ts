@@ -91,9 +91,9 @@ export class Tasks {
     ), updated_at) + 600000 WHERE expires_at IS NULL AND status = 'pending'`);
     // Presence absence time is unknowable across process loss. Preserve the episode identity,
     // but start its provisional lease at this boot unless its loss was already projected.
-    for (const row of db.prepare("SELECT task_id AS taskId FROM tasks").all() as unknown as { taskId: string }[]) {
-      const view = this.#read(row.taskId)?.view;
-      if (view !== undefined && ["running", "verifying", ...WAIT].includes(view.state)) db.prepare("UPDATE task_absences SET absent_at = ? WHERE task_id = ? AND run_id = ? AND reattached_at IS NULL").run(this.#bootAt, row.taskId, view.currentRun.runId);
+    for (const taskId of this.#nonterminalTaskIds()) {
+      const view = this.#read(taskId)?.view;
+      if (view !== undefined && ["running", "verifying", ...WAIT].includes(view.state)) db.prepare("UPDATE task_absences SET absent_at = ? WHERE task_id = ? AND run_id = ? AND reattached_at IS NULL").run(this.#bootAt, taskId, view.currentRun.runId);
     }
   }
 
@@ -222,7 +222,11 @@ export class Tasks {
   hello(peer: string, at: number): void {
     if (this.#closed()) return;
     this.presence(peer, true, at);
-    for (const view of this.list()) {
+    // Preserve the list's second reconciliation: `at` can differ from the clock.
+    this.reconcile(this.#clock());
+    for (const taskId of this.#nonterminalTaskIds()) {
+      const view = this.#read(taskId)?.view;
+      if (view === undefined) continue;
       const run = this.#taskRun(view.taskId, view.currentRun.runId);
       if (run.peer === peer && view.state === "waiting_for_device" && view.waitingOn !== undefined) this.atomic(() => this.wait(view.taskId, run.runId, "device", view.waitingOn!.id, view.waitingOn!.expiresAt, "lost", at));
     }
@@ -233,8 +237,9 @@ export class Tasks {
     if (live) this.#live.add(peer); else this.#live.delete(peer);
     // Mark absence only on a transition. A repeated absent callback cannot renew the lease.
     if (!live) {
-      for (const row of this.#db.prepare("SELECT task_id AS taskId FROM tasks").all() as unknown as { taskId: string }[]) {
-        const view = this.#read(row.taskId)!.view;
+      for (const taskId of this.#nonterminalTaskIds()) {
+        const view = this.#read(taskId)?.view;
+        if (view === undefined) continue;
         const run = this.#taskRun(view.taskId, view.currentRun.runId);
         if (run.peer === peer && ["running", "verifying", ...WAIT].includes(view.state)) this.#absence(view.taskId, run.runId, peer, at);
       }
@@ -267,8 +272,9 @@ export class Tasks {
           this.#expireDevice?.(run.peer, run.runId, device.id, at);
           this.wait(device.taskId, run.runId, "device", device.id, device.expiresAt, "expired", at);
         }
-        for (const view of this.list()) {
-          if (TERMINAL.has(view.state)) continue;
+        for (const taskId of this.#nonterminalTaskIds()) {
+          const view = this.#read(taskId)?.view;
+          if (view === undefined || TERMINAL.has(view.state)) continue;
           const run = this.#taskRun(view.taskId, view.currentRun.runId);
           if (view.state === "blocked" && this.#executionEnded(run.peer, run.runId)) {
             const decision = this.#recoveryDecision?.({ taskId: view.taskId, bot: view.bot, runId: run.runId });
@@ -671,6 +677,23 @@ export class Tasks {
 
   events(taskId: string): TaskEvent[] {
     return (this.#db.prepare("SELECT event_json AS json FROM task_events WHERE task_id = ? ORDER BY seq").all(taskId) as unknown as { json: string }[]).map((row) => JSON.parse(row.json) as TaskEvent);
+  }
+
+  /** Terminal task streams never change under periodic reconciliation. Read each task's latest
+   * event through the existing `(task_id, seq)` primary key so heartbeats and reconnect loops do
+   * not rebuild completed history merely to skip it. */
+  #nonterminalTaskIds(): string[] {
+    // ponytail: one indexed latest-event read per task; persist an active-task index if this scan becomes costly.
+    return (this.#db.prepare(
+      `SELECT task_id AS taskId
+       FROM tasks AS task
+       WHERE json_extract((
+         SELECT event_json FROM task_events
+         WHERE task_id = task.task_id
+         ORDER BY seq DESC LIMIT 1
+       ), '$.to') NOT IN ('completed', 'failed', 'cancelled')
+       ORDER BY task.rowid DESC`,
+    ).all() as unknown as { taskId: string }[]).map((row) => row.taskId);
   }
 
   #read(taskId: string, cursor = 0, limit = 100): { view: TaskView; events: TaskEvent[]; nextCursor?: number } | undefined {

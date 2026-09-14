@@ -258,6 +258,95 @@ test_provisioner_restarts_loaded_service_after_sync() {
     || fail 'provisioner did not replace stale plugin content'
 }
 
+test_provisioner_does_not_rewrite_a_semantically_matching_quoted_token() {
+  local hermes="$TMP/quoted-token-hermes" bin="$TMP/quoted-token-bin" remote="$TMP/quoted-token-remote"
+  local launch_log="$TMP/quoted-token-launchctl" ssh_log="$TMP/quoted-token-ssh" before="$TMP/quoted-token-before"
+  make_fake_bin "$bin"
+  make_profile "$hermes" quoted-token
+  make_fake_python "$hermes" ''
+  mkdir -p "$hermes/profiles/quoted-token/plugins" "$remote/local/config"
+  cp -R "$ROOT/integrations/attach-plugin" "$hermes/profiles/quoted-token/plugins/cozygateway"
+  cat > "$hermes/profiles/quoted-token/.env" <<EOF
+COZYGATEWAY_TOKEN='test-token'
+COZYGATEWAY_SPOOL_PATH=$hermes/profiles/quoted-token/plugin-data/cozygateway/attach-v1.sqlite
+EOF
+  cat > "$remote/.env" <<'EOF'
+COZYGATEWAY_ATTACH_TOKEN_QUOTED_TOKEN=test-token
+EOF
+  cat > "$remote/local/config/cozygateway.config.json" <<'JSON'
+{"hermesEndpoints":[{"profiles":{"quoted-token":{"tokenEnv":"COZYGATEWAY_ATTACH_TOKEN_QUOTED_TOKEN"}}}]}
+JSON
+  cp "$remote/.env" "$before"
+  cat > "$bin/ssh" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "$COZY_TEST_SSH_LOG"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) shift 2 ;;
+    *) shift; break ;;
+  esac
+done
+exec sh -c "$1"
+SH
+  chmod +x "$bin/ssh"
+
+  HOME="$TMP/quoted-token-home" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$ssh_log" \
+    "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake --box-repo "$remote" quoted-token >/dev/null
+
+  cmp "$before" "$remote/.env" || fail 'provisioner rewrote a remote token whose dotenv scalar matched the quoted local token'
+  if grep -Fq 'docker compose up -d --force-recreate gateway' "$ssh_log"; then
+    fail 'provisioner recreated the gateway for a semantically matching quoted token'
+  fi
+}
+
+test_provisioner_does_not_normalize_an_escaped_quoted_token() {
+  local hermes="$TMP/escaped-token-hermes" bin="$TMP/escaped-token-bin" remote="$TMP/escaped-token-remote"
+  local ssh_log="$TMP/escaped-token-ssh"
+  make_fake_bin "$bin"
+  make_profile "$hermes" escaped-token
+  make_fake_python "$hermes" ''
+  mkdir -p "$hermes/profiles/escaped-token/plugins" "$remote/local/config"
+  cp -R "$ROOT/integrations/attach-plugin" "$hermes/profiles/escaped-token/plugins/cozygateway"
+  cat > "$hermes/profiles/escaped-token/.env" <<EOF
+COZYGATEWAY_TOKEN="test\\-token"
+COZYGATEWAY_SPOOL_PATH=$hermes/profiles/escaped-token/plugin-data/cozygateway/attach-v1.sqlite
+EOF
+  cat > "$remote/.env" <<'EOF'
+COZYGATEWAY_ATTACH_TOKEN_ESCAPED_TOKEN=test-token
+EOF
+  cat > "$remote/local/config/cozygateway.config.json" <<'JSON'
+{"hermesEndpoints":[{"profiles":{"escaped-token":{"tokenEnv":"COZYGATEWAY_ATTACH_TOKEN_ESCAPED_TOKEN"}}}]}
+JSON
+  cat > "$bin/ssh" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "$COZY_TEST_SSH_LOG"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) shift 2 ;;
+    *) shift; break ;;
+  esac
+done
+exec sh -c "$1"
+SH
+  cat > "$bin/docker" <<'SH'
+#!/bin/sh
+exit 0
+SH
+  chmod +x "$bin/ssh" "$bin/docker"
+
+  HOME="$TMP/escaped-token-home" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOG="$TMP/escaped-token-launchctl" COZY_TEST_SSH_LOG="$ssh_log" \
+    "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake --box-repo "$remote" escaped-token >/dev/null
+
+  if grep -Fxq 'COZYGATEWAY_ATTACH_TOKEN_ESCAPED_TOKEN=test-token' "$remote/.env"; then
+    fail 'provisioner treated an escaped quoted token as the plain unquoted scalar'
+  fi
+  assert_contains "$ssh_log" 'docker compose up -d --force-recreate gateway'
+}
+
 test_provisioner_copies_existing_chat_registry_to_new_profile() {
   local hermes="$TMP/chat-registry-hermes" bin="$TMP/chat-registry-bin"
   make_fake_bin "$bin"
@@ -783,6 +872,8 @@ test_provisioner_keeps_sweeping_when_a_write_fails
 test_watcher_ignores_checkout_pytest_cache
 test_provisioner_ignores_checkout_pytest_cache
 test_provisioner_restarts_loaded_service_after_sync
+test_provisioner_does_not_rewrite_a_semantically_matching_quoted_token
+test_provisioner_does_not_normalize_an_escaped_quoted_token
 test_provisioner_copies_existing_chat_registry_to_new_profile
 test_provisioner_preserves_partial_chat_registry
 test_deploy_discovers_every_opted_in_profile

@@ -271,6 +271,33 @@ describe("durable Tasks on actual attach storage admission", () => {
     storage.close();
   });
 
+  it("skips unrelated terminal streams while boot, presence, hello, and reconciliation handle a live Task", () => {
+    const root = join(process.cwd(), "../../benchmark-runs/2b-durable-task"); mkdirSync(root, { recursive: true });
+    const directory = mkdtempSync(join(root, "terminal-candidate-")); const path = join(directory, "gateway.sqlite");
+    let storage = openStorage(path); storage.tasks.clock(() => 0);
+    try {
+      const sessionId = storage.nativeBotChat("sage", 1).sessionId;
+      const command = storage.enqueueAttachCommand("sage", "command", { kind: "turn", threadId: sessionId, turnId: "run", messageId: "user", text: "work" }, 2);
+      const taskId = storage.tasks.list({ bot: "sage" })[0]!.taskId;
+      storage.ackAttachCommand("sage", command.sequence, command.commandId, 3);
+      storage.close();
+
+      // This terminal stream intentionally has no Run. Every candidate loop must leave it
+      // unread; attempting to hydrate it would throw before the live Task can reconcile.
+      const db = new DatabaseSync(path);
+      db.prepare("INSERT INTO tasks VALUES (?, ?, ?, NULL, ?, ?, ?)").run("terminal", "other", "terminal-session", "terminal-run", "terminal-message", "done");
+      db.prepare("INSERT INTO task_events VALUES (?, 1, ?, ?)").run("terminal", "terminal", JSON.stringify({ taskId: "terminal", seq: 1, at: 0, from: null, to: "completed", reason: "run_completed", actor: "harness", ref: { kind: "run", id: "terminal-run" } }));
+      db.close();
+
+      storage = openStorage(path); storage.tasks.clock(() => 0);
+      storage.tasks.presence("sage", false, 10);
+      storage.tasks.reconcile(120010);
+      expect(storage.tasks.read(taskId)?.view.state).toBe("blocked");
+      storage.tasks.hello("sage", 120011);
+      expect(storage.tasks.read(taskId)?.view.state).toBe("running");
+    } finally { storage.close(); rmSync(directory, { recursive: true }); }
+  });
+
   it("starts the provisional owner lease at gateway boot without duplicating an absence episode", () => {
     vi.useFakeTimers(); vi.setSystemTime(0);
     const root = join(process.cwd(), "../../benchmark-runs/2b-durable-task");
