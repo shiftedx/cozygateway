@@ -972,6 +972,7 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
 set -euo pipefail
 GATEWAY_DIR="`$(cygpath -u "`$1")"
 WINDOWS_POWERSHELL="`$2"
+SERVICE_PLATFORM=Windows
 DRY_RUN=0
 NODE_RESOLVED="`$GATEWAY_DIR/runtime/node/node.exe"
 BUNDLE_PATH="`$GATEWAY_DIR/bin/cozygateway.mjs"
@@ -1013,6 +1014,23 @@ write_cli_wrapper
     Add-Content -LiteralPath $repairBootstrap -Value '# tampered'
     $tamperedRepair = (& cmd.exe /c $repairCmd repair 2>&1 | Out-String)
     Assert-True ($LASTEXITCODE -ne 0 -and $tamperedRepair -match 'repair bootstrap checksum mismatch' -and @((Get-Content -LiteralPath $repairMarker)).Count -eq 2) 'generated repair shim must reject a tampered bootstrap before execution'
+
+    # Exercise the generated uninstall command in cmd.exe, including its own
+    # deletion while PowerShell runs. The parenthesized exit must remain usable.
+    $uninstallMarker = Join-Path $temp 'uninstall-command-marker.txt'
+    Write-Utf8NoBom $repairBootstrap @"
+param([switch]`$Uninstall, [switch]`$Purge, [switch]`$DryRun)
+if (-not `$Uninstall -or -not `$Purge) { exit 2 }
+[IO.File]::AppendAllText('$uninstallMarker', [string]`$env:COZYGATEWAY_HOME + [Environment]::NewLine)
+if (-not `$DryRun) { Remove-Item -LiteralPath `$env:COZYGATEWAY_HOME -Recurse -Force }
+"@
+    $invalidUninstall = (& cmd.exe /c $repairCmd uninstall unexpected 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -ne 0 -and -not (Test-Path -LiteralPath $uninstallMarker)) 'uninstall shim must reject unknown arguments before bootstrap execution'
+    $previewUninstall = (& cmd.exe /c $repairCmd uninstall --purge --dry-run 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $repairCmd)) "uninstall preview must forward flags and retain the command: $previewUninstall"
+    $actualUninstall = (& cmd.exe /c $repairCmd uninstall --purge 2>&1 | Out-String)
+    Assert-True ($LASTEXITCODE -eq 0 -and -not (Test-Path -LiteralPath $repairHome)) "uninstall must exit successfully after deleting its own command: $actualUninstall"
+    Assert-True (@(Get-Content -LiteralPath $uninstallMarker).Count -eq 2 -and (Get-Content -LiteralPath $uninstallMarker)[0] -eq $repairHome) 'uninstall must pass the installed custom home'
 
     # A foreign Windows registration must stop the CozyAgents branch before it
     # can replace any live state or configuration.
