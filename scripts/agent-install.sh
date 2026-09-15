@@ -48,6 +48,8 @@ UNINSTALL=0
 # removed so this run can write its own.
 REPLACE_GATEWAY=0
 REPLACE_BACKUP_DIR=""
+# The live attach target the last mismatch check read out of a profile's gateway log.
+ATTACH_OBSERVED_ORIGIN=""
 # Profiles this run stopped purely so their env could be written, to be started again after.
 ENV_RESTART_PROFILES=()
 PURGE=0
@@ -234,6 +236,10 @@ CLI_WINDOWS="$GATEWAY_DIR/bin/cozygateway.cmd"
 POSIX_BOOTSTRAP="$GATEWAY_DIR/bin/cozygateway-bootstrap.sh"
 WINDOWS_BOOTSTRAP="$GATEWAY_DIR/bin/cozygateway-bootstrap.ps1"
 GW_LOG="$LOCAL_DIR/cozygateway.log"
+# Processes this run started detached, by pid, so a rollback can stop exactly
+# what this run left behind instead of leaving a Dashboard and a gateway holding
+# the ports every retry then fails on.
+RUN_PIDS_FILE="$LOCAL_DIR/run-pids"
 SERVICE_LABEL="ai.cozylabs.cozygateway"
 SERVICE_UNIT="cozygateway.service"
 WINDOWS_TASK="CozyGateway"
@@ -1068,6 +1074,26 @@ $source_files
 EOF
 }
 
+record_run_pid() {
+  local kind="$1" pid="$2"
+  [ "$DRY_RUN" = 1 ] && return 0
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$pid" -gt 1 ] || return 0
+  (umask 077; mkdir -p "$LOCAL_DIR")
+  umask 077; printf '%s=%s\n' "$kind" "$pid" >> "$RUN_PIDS_FILE"
+  chmod 600 "$RUN_PIDS_FILE" 2>/dev/null || true
+  return 0
+}
+# A finished run owns everything it started; only an unfinished one leaves work
+# for a rollback. Clearing the ledger at both ends keeps a later failure from
+# stopping a healthy Dashboard.
+clear_run_pids() { [ "$DRY_RUN" = 1 ] || rm -f "$RUN_PIDS_FILE"; return 0; }
+record_profile_gateway_pid() {
+  local profile="$1" pid
+  [ "$DRY_RUN" = 1 ] && return 0
+  pid="$("$HERMES_BIN" -p "$profile" gateway status 2>/dev/null | sed -n 's/.*PID: \([0-9][0-9]*\).*/\1/p' | tail -1)"
+  record_run_pid "gateway-$profile" "$pid"
+}
 install_plugin() {
   local profile="$1" home="$2" target stage source
   target="$home/plugins/cozygateway"
@@ -1788,6 +1814,37 @@ record_service_action() {
   done
   SERVICE_PROFILES+=("$1"); SERVICE_ACTIONS+=("$2")
 }
+# What a profile's loaded gateway is actually attached to. The attach plugin logs
+# `attach-v1: connected and writable at <origin>` on every successful dial and
+# `attach-v1: re-dialed <origin>` on every reconnect, so the newest such line in
+# the profile's gateway log is the live target. Files alone cannot answer this:
+# a running gateway holds its target in memory and a rewritten .env changes
+# nothing until it restarts. The gateway's own /health is deliberately aggregate
+# only (it never names profiles), so there is no roster to ask instead.
+profile_attach_log_origin() {
+  local home="$1" candidate newest="" match
+  for candidate in "$home"/logs/gateway.log "$home"/logs/gateway.err.log "$home"/logs/hermes.log "$home"/gateway.log; do
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
+    grep -q 'attach-v1: ' "$candidate" 2>/dev/null || continue
+    [ -z "$newest" ] || [ "$candidate" -nt "$newest" ] || continue
+    newest="$candidate"
+  done
+  [ -n "$newest" ] || return 1
+  match="$(grep -oE 'attach-v1: (connected and writable at|re-dialed) (https?|wss?)://[A-Za-z0-9._:%-]+' "$newest" | tail -1)"
+  [ -n "$match" ] || return 1
+  printf '%s' "${match##* }"
+}
+origin_authority() { local rest="${1#*://}"; printf '%s' "${rest%%/*}"; }
+# True only with evidence of a DIFFERENT target. No log is no answer, and a
+# rerun must not bounce healthy profiles on a guess.
+profile_attached_elsewhere() {
+  local profile="$1" observed
+  ATTACH_OBSERVED_ORIGIN=""
+  observed="$(profile_attach_log_origin "$(profile_home "$profile")")" || return 1
+  [ "$(origin_authority "$observed")" != "$(origin_authority "$(gateway_origin)")" ] || return 1
+  ATTACH_OBSERVED_ORIGIN="$observed"
+  return 0
+}
 ensure_hermes_gateways() {
   local profile state prior action
   for profile in "${SELECTED[@]}"; do
@@ -1797,6 +1854,9 @@ ensure_hermes_gateways() {
         if profile_changed_for "$profile"; then
           run "$HERMES_BIN" -p "$profile" gateway restart
           say "OK    restarted Hermes gateway service for profile $profile"
+        elif profile_attached_elsewhere "$profile"; then
+          run "$HERMES_BIN" -p "$profile" gateway restart
+          say "OK    restarted Hermes gateway service for profile $profile; its live attach target was $ATTACH_OBSERVED_ORIGIN, not $(gateway_origin)"
         else
           say "OK    Hermes gateway service for profile $profile is already running with the current attach plugin and config"
         fi
@@ -1813,6 +1873,7 @@ ensure_hermes_gateways() {
         say "OK    installed and started Hermes gateway service for profile $profile"
         ;;
     esac
+    record_profile_gateway_pid "$profile"
     record_service_action "$profile" "$action"
   done
 }
@@ -3169,8 +3230,12 @@ attach_health_diagnosis() {
 }
 wait_attach_ready() {
   [ "$DRY_RUN" = 1 ] && { say "DRY   require every selected Hermes profile online and zero dead letters (legacy health: attach.configured > 0, attach.online == attach.configured)"; return; }
+  # A profile restarted into a gateway that is not up yet re-dials on the
+  # plugin's jittered exponential backoff: 0.5s doubling to a 30s cap, so a dial
+  # can land 16 seconds after the previous one. A 30-second window can expire
+  # inside one of those gaps on a healthy machine.
   local attempt diagnosis
-  for attempt in $(seq 1 30); do attach_ready && return; sleep 1; done
+  for attempt in $(seq 1 45); do attach_ready && return; sleep 1; done
   diagnosis="$(attach_health_diagnosis || true)"
   [ "$diagnosis" = __cozygateway_attach_healthy__ ] && return
   [ -n "$diagnosis" ] || diagnosis="Hermes attach health could not be read"
@@ -3335,7 +3400,8 @@ dashboard_credentials_work() {
 launch_dashboard() {
   local hermes_root_arg="$HERMES_ROOT" windows_dashboard_profile=0
   if is_windows; then hermes_root_arg="$(to_windows_path "$hermes_root_arg")"; windows_dashboard_profile=1; fi
-  "$NODE_RESOLVED" - "$DASHBOARD_ENV" "$hermes_root_arg" "$HERMES_RESOLVED" "$DASHBOARD_PORT" "$windows_dashboard_profile" <<'NODE'
+  local dashboard_pid
+  dashboard_pid="$("$NODE_RESOLVED" - "$DASHBOARD_ENV" "$hermes_root_arg" "$HERMES_RESOLVED" "$DASHBOARD_PORT" "$windows_dashboard_profile" <<'NODE'
 const { readFileSync } = require('node:fs');
 const { spawn } = require('node:child_process');
 const { parseEnv } = require('node:util');
@@ -3349,7 +3415,10 @@ const child = spawn(hermes, dashboardArgs, {
   env: { ...process.env, HERMES_HOME: hermesRoot, HERMES_DASHBOARD_SESSION_TOKEN: dashboard.DASHBOARD_SESSION_TOKEN },
 });
 child.unref();
+process.stdout.write(String(child.pid ?? ''));
 NODE
+)"
+  record_run_pid dashboard "$dashboard_pid"
 }
 stop_stubborn_windows_dashboard() {
   local hermes_native launcher_native owner_helper_native elevation_helper_native root_native code
@@ -3779,6 +3848,7 @@ install_with_cozyagents() {
     return
   fi
   install_cozyagents_harness
+  clear_run_pids
   announce_listener
   pairing_and_finish
 }
@@ -3828,6 +3898,7 @@ runtime_only_repair() {
   write_runtime_only_state
   write_cli_wrapper
   is_windows || install_posix_cli
+  clear_run_pids
   say "OK    updated CozyGateway runtime and supervisor without changing Hermes profiles, plugins, services, or tokens"
 }
 main() {
@@ -3885,6 +3956,7 @@ main() {
   for profile in "${SELECTED[@]}"; do action="$(prior_service_action "$profile")"; record_service_action "$profile" "${action:-unknown}"; done
   # Retain the old ownership inventory until its obsolete keys are reconciled.
   # A crash before this state write must remain discoverable on the next repair.
+  clear_run_pids
   write_gateway_env; write_state
   # Stage every profile before enabling any of them. Hermes can materialize inherited global
   # plugins into profile-local directories when the default profile is enabled; enabling first
@@ -3895,6 +3967,7 @@ main() {
   write_dashboard_port_state; write_gateway_config; write_cli_wrapper; write_dashboard_owner_helper; is_windows && write_dashboard_elevation_helper; start_dashboard; install_service; wait_gateway_ready
   ensure_hermes_gateways; write_state; wait_attach_ready
   is_windows || install_posix_cli
+  clear_run_pids
   announce_listener
   pairing_and_finish
 }

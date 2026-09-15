@@ -55,14 +55,26 @@ profile_home() { if [ "$1" = default ]; then printf '%s' "$root"; else printf '%
 state_file() { printf '%s/gateway-%s.state' "$root" "$1"; }
 state() { [ -f "$(state_file "$1")" ] && cat "$(state_file "$1")" || printf 'absent'; }
 set_state() { printf '%s\n' "$2" > "$(state_file "$1")"; }
+# A loaded gateway holds the target it read at startup and writes THAT back
+# over its .env, whatever the file says now. The snapshot below is that memory.
+remember_target() {
+  local name="$1" home url
+  home="$(profile_home "$name")"
+  url="${COZYGATEWAY_TEST_REMOTE_ORIGIN:-https://warm.example.test}"
+  [ ! -f "$home/.env" ] || url="$(sed -n 's/^COZYGATEWAY_URL=//p' "$home/.env" | tail -1)"
+  [ -n "$url" ] || url="${COZYGATEWAY_TEST_REMOTE_ORIGIN:-https://warm.example.test}"
+  printf '%s\n' "$url" > "$root/gateway-$name.target"
+}
 rewrite_env() {
-  local name="$1" home
+  local name="$1" home url
   case " ${COZYGATEWAY_TEST_PROVISIONER_PROFILES:-} " in *" $name "*) ;; *) return 0 ;; esac
   [ "$(state "$name")" = running ] || return 0
   home="$(profile_home "$name")"
   [ -f "$home/.env" ] || return 0
+  if [ -f "$root/gateway-$name.target" ]; then url="$(cat "$root/gateway-$name.target")"
+  else url="${COZYGATEWAY_TEST_REMOTE_ORIGIN:-https://warm.example.test}"; fi
   grep -v -E '^COZYGATEWAY_URL=' "$home/.env" > "$home/.env.provisioner" || true
-  printf 'COZYGATEWAY_URL=%s\n' "${COZYGATEWAY_TEST_REMOTE_ORIGIN:-https://warm.example.test}" >> "$home/.env.provisioner"
+  printf 'COZYGATEWAY_URL=%s\n' "$url" >> "$home/.env.provisioner"
   mv "$home/.env.provisioner" "$home/.env"
   printf '%s\n' "$name:provisioner-rewrote-env" >> "${COZYGATEWAY_TEST_COMMAND_LOG:?}"
 }
@@ -75,7 +87,10 @@ if [ "$1" = config ] && [ "$2" = path ]; then
   exit 0
 fi
 if [ "$1" = status ]; then printf 'Current model: test/model\nActive provider: test-provider\n'; exit 0; fi
-if [ "$1" = dashboard ]; then exit 0; fi
+if [ "$1" = dashboard ]; then
+  [ -z "${COZYGATEWAY_TEST_DASHBOARD_LAUNCH_MARKER:-}" ] || : > "$COZYGATEWAY_TEST_DASHBOARD_LAUNCH_MARKER"
+  exit 0
+fi
 
 if [ "$1" = "-p" ]; then
   profile="$2"
@@ -94,9 +109,9 @@ if [ "$1" = "-p" ]; then
         esac
         ;;
       stop) [ "$(state "$profile")" = running ] || exit 2; log_command "$profile:gateway:stop"; set_state "$profile" stopped ;;
-      start) [ "$(state "$profile")" = stopped ] || exit 2; log_command "$profile:gateway:start"; set_state "$profile" running ;;
-      restart) [ "$(state "$profile")" = running ] || exit 2; log_command "$profile:gateway:restart"; set_state "$profile" running ;;
-      install) [ "$(state "$profile")" = absent ] || exit 2; log_command "$profile:gateway:install"; set_state "$profile" running ;;
+      start) [ "$(state "$profile")" = stopped ] || exit 2; log_command "$profile:gateway:start"; remember_target "$profile"; set_state "$profile" running ;;
+      restart) [ "$(state "$profile")" = running ] || exit 2; log_command "$profile:gateway:restart"; remember_target "$profile"; set_state "$profile" running ;;
+      install) [ "$(state "$profile")" = absent ] || exit 2; log_command "$profile:gateway:install"; remember_target "$profile"; set_state "$profile" running ;;
       *) exit 2 ;;
     esac
     exit 0
@@ -109,12 +124,20 @@ chmod 700 "$tmp/bin/hermes"
 # The gateway and Dashboard endpoints the installer probes.
 cat > "$tmp/bin/curl" <<'CURL'
 #!/usr/bin/env bash
+# Snapshot the installer's process ledger the first time the gateway is probed:
+# a finished run deletes it, and the test still has to see what it held.
+if [ -n "${COZYGATEWAY_TEST_PID_SNAPSHOT:-}" ] && [ -f "${COZYGATEWAY_TEST_PID_SOURCE:-}" ]; then
+  cp "$COZYGATEWAY_TEST_PID_SOURCE" "$COZYGATEWAY_TEST_PID_SNAPSHOT"
+fi
 case "$*" in
   *8787/health*)
     if [[ "$*" == *"-o /dev/null"* ]]; then printf '200'
     else printf '%s' "${COZYGATEWAY_TEST_ATTACH_HEALTH:-{\"attach\":{\"configured\":4,\"online\":4,\"deadLetters\":0}}}"; fi
     ;;
-  *api/health*) printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_HEALTH_CODE:-401}" ;;
+  *api/health*)
+    if [ -n "${COZYGATEWAY_TEST_DASHBOARD_LAUNCH_MARKER:-}" ] && [ ! -f "$COZYGATEWAY_TEST_DASHBOARD_LAUNCH_MARKER" ]; then printf '000'
+    else printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_HEALTH_CODE:-401}"; fi
+    ;;
   *api/config*) cat >/dev/null; printf '%s' "${COZYGATEWAY_TEST_DASHBOARD_TOKEN_CODE:-200}" ;;
   *) printf '401' ;;
 esac
@@ -419,5 +442,96 @@ if ! pinned_unsafe_output="$(COZYGATEWAY_TEST_ACTIVE_PROFILE=cleo run_installer 
 fi
 expect_contains "$pinned_unsafe_output" 'pins HERMES_DASHBOARD_SESSION_TOKEN'
 expect_absent "$pinned_unsafe_output" 'a token with spaces'
+
+##############################################################################
+# Gap 6: a running profile still attached to the old gateway from memory.
+##############################################################################
+
+# Three profiles were "already running with the current attach plugin and
+# config", judged from files, while their processes were still serving the
+# remote gateway. The log the plugin writes on every dial is the evidence.
+make_rehome_root "$tmp/stale-attach-hermes"
+for profile in cleo drowsy-lark; do
+  home="$tmp/stale-attach-hermes/profiles/$profile"
+  rm -f "$home/.env"
+  mkdir -p "$home/logs"
+  printf 'attach-v1: connected and writable at %s\n' "$REMOTE_ORIGIN" > "$home/logs/gateway.log"
+done
+# This one is already serving the local gateway and must not be interrupted.
+home="$tmp/stale-attach-hermes/profiles/night-owl"
+rm -f "$home/.env"
+mkdir -p "$home/logs"
+printf 'attach-v1: connected and writable at http://127.0.0.1:8787\n' > "$home/logs/gateway.log"
+rm -f "$tmp/stale-attach-hermes/profiles/polished-satellite/.env"
+# Give every profile an owned, current plugin so nothing restarts for a plugin
+# change: the only reason to restart here is the live attach target.
+for profile in cleo drowsy-lark night-owl polished-satellite; do
+  home="$tmp/stale-attach-hermes/profiles/$profile"
+  mkdir -p "$home/plugins"
+  cp -R "$repo_root/integrations/attach-plugin" "$home/plugins/cozygateway"
+  printf 'installed by cozygateway agent-install.sh\n' > "$home/plugins/cozygateway/.cozygateway-installer-owned"
+done
+COMMAND_LOG="$tmp/stale-attach-commands"
+: > "$COMMAND_LOG"
+if ! stale_attach_output="$(run_installer "$tmp/stale-attach-hermes" "$tmp/stale-attach-gateway" \
+    "$tmp/stale-attach-home" --profiles cleo,drowsy-lark,night-owl,polished-satellite)"; then
+  fail "a profile still attached elsewhere must be restarted, not skipped:\n$stale_attach_output"
+fi
+expect_contains "$stale_attach_output" "its live attach target was $REMOTE_ORIGIN"
+grep -Fxq 'cleo:gateway:restart' "$COMMAND_LOG" || fail 'the stale cleo gateway was not restarted'
+grep -Fxq 'drowsy-lark:gateway:restart' "$COMMAND_LOG" || fail 'the stale drowsy-lark gateway was not restarted'
+grep -Fxq 'night-owl:gateway:restart' "$COMMAND_LOG" \
+  && fail 'a profile already attached to this gateway was restarted anyway'
+expect_contains "$stale_attach_output" 'Hermes gateway service for profile night-owl is already running'
+# No log at all is no evidence, and never a reason to bounce a profile.
+expect_contains "$stale_attach_output" 'Hermes gateway service for profile polished-satellite is already running'
+
+# The readiness window has to outlast the plugin's backoff, whose steps reach
+# 16 seconds before the 30-second cap.
+grep -Fq 'for attempt in $(seq 1 45); do attach_ready && return; sleep 1; done' "$installer" \
+  || fail 'the attach readiness window is still the 30-second one'
+
+##############################################################################
+# Gap 7: a rollback that leaves the failed run's processes holding the ports.
+##############################################################################
+
+# The installer records what it starts; the bootstrap rollback stops exactly
+# that. Exercised against this test's own harmless background process.
+(
+  set +e
+  eval "$(awk '
+    $0 == "stop_recorded_run_processes() {" { capture = 1 }
+    capture { print }
+    capture && $0 == "}" { exit }
+  ' "$repo_root/scripts/install.sh")"
+  HOME_DIR="$tmp/rollback-home"
+  mkdir -p "$HOME_DIR/local"
+  sleep 300 &
+  victim=$!
+  printf 'dashboard=%s\ngateway-cleo=not-a-pid\n' "$victim" > "$HOME_DIR/local/run-pids"
+  report="$(stop_recorded_run_processes 2>&1)"
+  case "$report" in *"stopped the dashboard process (pid $victim)"*) ;; *) printf '%s\n' "$report" >&2; exit 2 ;; esac
+  [ -e "$HOME_DIR/local/run-pids" ] && exit 3
+  for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$victim" 2>/dev/null || exit 0; sleep 0.2; done
+  kill -KILL "$victim" 2>/dev/null
+  exit 4
+) || fail 'the recorded processes of a failed run were not stopped'
+grep -Fq 'stop_recorded_run_processes; recover_bootstrap_transaction' "$repo_root/scripts/install.sh" \
+  || fail 'the bootstrap rollback does not stop the failed run processes'
+
+# A run that starts a Dashboard writes its pid down, and a run that finishes
+# clears the ledger so a later failure cannot stop a healthy Dashboard.
+make_rehome_root "$tmp/pids-hermes"
+rm -f "$tmp/pids-hermes/profiles/cleo/.env"
+COMMAND_LOG="$tmp/pids-commands"
+if ! pids_output="$(COZYGATEWAY_TEST_DASHBOARD_LAUNCH_MARKER="$tmp/dashboard-launched" \
+    COZYGATEWAY_TEST_PID_SOURCE="$tmp/pids-gateway/local/run-pids" \
+    COZYGATEWAY_TEST_PID_SNAPSHOT="$tmp/dashboard-launched.pids" \
+    run_installer "$tmp/pids-hermes" "$tmp/pids-gateway" "$tmp/pids-home" --profiles cleo)"; then
+  fail "the Dashboard-launching run failed:\n$pids_output"
+fi
+test -f "$tmp/dashboard-launched" || fail 'the run did not launch a Dashboard'
+grep -Eq '^dashboard=[0-9]+$' "$tmp/dashboard-launched.pids" || fail 'the launched Dashboard pid was not recorded'
+test ! -e "$tmp/pids-gateway/local/run-pids" || fail 'a finished run left its process ledger behind'
 
 printf 'installer re-home tests passed\n'
