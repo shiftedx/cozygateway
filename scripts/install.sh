@@ -136,7 +136,7 @@ prepare_owned_dir() {
 # previous release does not stop them. Only pids this installation recorded are
 # ever signalled, and only while they are still alive.
 stop_recorded_run_processes() {
-  local file="$HOME_DIR/local/run-pids" entry kind pid stopped=0
+  local file="$HOME_DIR/local/run-pids" kind pid
   [ -f "$file" ] && [ ! -L "$file" ] || return 0
   while IFS='=' read -r kind pid || [ -n "$kind" ]; do
     case "$pid" in ''|*[!0-9]*) continue ;; esac
@@ -145,10 +145,8 @@ stop_recorded_run_processes() {
     kill -0 "$pid" 2>/dev/null || continue
     kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
     printf 'OK    stopped the %s process (pid %s) the failed run started\n' "${kind:-unknown}" "$pid" >&2
-    stopped=1
   done < "$file"
   rm -f "$file"
-  [ "$stopped" = 0 ] || printf 'OK    released the ports the failed CozyGateway run was holding\n' >&2
   return 0
 }
 recover_bootstrap_transaction() {

@@ -48,8 +48,6 @@ UNINSTALL=0
 # removed so this run can write its own.
 REPLACE_GATEWAY=0
 REPLACE_BACKUP_DIR=""
-# The live attach target the last mismatch check read out of a profile's gateway log.
-ATTACH_OBSERVED_ORIGIN=""
 # Profiles this run stopped purely so their env could be written, to be started again after.
 ENV_RESTART_PROFILES=()
 PURGE=0
@@ -964,7 +962,7 @@ backup_profile_env_keys() {
   if [ "$wrote" = 0 ]; then rm -f "$dir/env-keys"; return 0; fi
   check_line_editable_env "$file"
   temp="$(mktemp "${file}.tmp.XXXXXX")"
-  grep -v -E '^(COZYGATEWAY_URL|COZYGATEWAY_TOKEN|COZYGATEWAY_SPOOL_PATH|COZYGATEWAY_HOME_CHANNEL|COZYGATEWAY_INSTALLER_OWNER)=' "$file" > "$temp" || true
+  grep -v -E "^($(IFS='|'; printf '%s' "${REHOME_ENV_KEYS[*]}"))=" "$file" > "$temp" || true
   chmod 600 "$temp"; mv "$temp" "$file"; chmod 600 "$file"
   say "OK    backed up the previous CozyGateway keys for Hermes profile $profile to $dir/env-keys and removed them"
 }
@@ -981,12 +979,12 @@ backup_profile_plugin() {
   mv "$target" "$dir/cozygateway"
   say "OK    backed up the previous attach plugin for Hermes profile $profile to $dir/cozygateway and removed it"
 }
+# The plugin half is left to install_plugin, which is already the one place that
+# decides what to do with a folder it does not own.
 rehome_profile() {
-  local profile="$1" home
-  home="$(profile_home "$profile")"
+  local profile="$1"
   stop_profile_gateway "$profile"
-  backup_profile_env_keys "$profile" "$home/.env"
-  backup_profile_plugin "$profile" "$home"
+  backup_profile_env_keys "$profile" "$(profile_home "$profile")/.env"
 }
 preflight_profile_env_ownership() {
   local profile file owner url key
@@ -1007,16 +1005,6 @@ preflight_profile_env_ownership() {
       [ "$REPLACE_GATEWAY" = 0 ] || { rehome_profile "$profile"; break; }
       die "$file has an existing Gateway configuration; rerun with --replace-gateway to re-home it to this Gateway, or --runtime-only to keep the existing attachment"
     done
-  done
-  # Even a profile with a clean .env can carry an unowned plugin folder from an
-  # older install. Under --replace-gateway that folder is backed up here, before
-  # any state is written, so the whole re-home decision is made in one place.
-  [ "$REPLACE_GATEWAY" = 0 ] && return 0
-  for profile in "${SELECTED[@]}"; do
-    file="$(profile_home "$profile")/plugins/cozygateway"
-    [ -e "$file" ] || continue
-    [ -f "$file/.cozygateway-installer-owned" ] && continue
-    backup_profile_plugin "$profile" "$(profile_home "$profile")"
   done
   return 0
 }
@@ -1104,7 +1092,6 @@ record_run_pid() {
   [ "$pid" -gt 1 ] || return 0
   (umask 077; mkdir -p "$LOCAL_DIR")
   umask 077; printf '%s=%s\n' "$kind" "$pid" >> "$RUN_PIDS_FILE"
-  chmod 600 "$RUN_PIDS_FILE" 2>/dev/null || true
   return 0
 }
 # A finished run owns everything it started; only an unfinished one leaves work
@@ -1706,22 +1693,13 @@ profile_env_needs_rewrite() {
 }
 # The write is only real if the file still says so afterwards. A provisioner or
 # a gateway this run failed to stop rewrites the file within seconds, and a
-# silent loss here is an install that looks complete and attaches nowhere.
+# silent loss here is an install that looks complete and attaches nowhere. The
+# question is the same one that decided to write, asked again.
 verify_profile_env() {
-  local profile="$1" file="$2" token="$3" spool_path="$4" key expected actual
+  local profile="$1" file="$2" token="$3" spool_path="$4"
   [ "$DRY_RUN" = 1 ] && return 0
-  for key in COZYGATEWAY_URL COZYGATEWAY_TOKEN COZYGATEWAY_SPOOL_PATH COZYGATEWAY_HOME_CHANNEL; do
-    case "$key" in
-      COZYGATEWAY_URL) expected="$(gateway_origin)" ;;
-      COZYGATEWAY_TOKEN) expected="$token" ;;
-      COZYGATEWAY_SPOOL_PATH) expected="$spool_path" ;;
-      COZYGATEWAY_HOME_CHANNEL) expected=thread ;;
-    esac
-    actual="$(env_get "$file" "$key")"
-    [ "$actual" = "$expected" ] || \
-      die "$file did not keep the CozyGateway keys written for profile $profile ($key changed underneath the installer); stop whatever rewrites it, such as a provisioner service or a running Hermes gateway, and rerun"
-  done
-  return 0
+  profile_env_needs_rewrite "$file" "$token" "$spool_path" || return 0
+  die "$file did not keep the CozyGateway keys written for profile $profile; stop whatever rewrites it, such as a provisioner service or a running Hermes gateway, and rerun"
 }
 write_gateway_env() {
   local p token env_name profile_env spool_path seen_token seen_name
@@ -1846,7 +1824,7 @@ record_service_action() {
 # only (it never names profiles), so there is no roster to ask instead.
 profile_attach_log_origin() {
   local home="$1" candidate newest="" match
-  for candidate in "$home"/logs/gateway.log "$home"/logs/gateway.err.log "$home"/logs/hermes.log "$home"/gateway.log; do
+  for candidate in "$home"/logs/*.log "$home"/*.log; do
     [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
     grep -q 'attach-v1: ' "$candidate" 2>/dev/null || continue
     [ -z "$newest" ] || [ "$candidate" -nt "$newest" ] || continue
@@ -1858,28 +1836,20 @@ profile_attach_log_origin() {
   printf '%s' "${match##* }"
 }
 origin_authority() { local rest="${1#*://}"; printf '%s' "${rest%%/*}"; }
-# True only with evidence of a DIFFERENT target. No log is no answer, and a
-# rerun must not bounce healthy profiles on a guess.
-profile_attached_elsewhere() {
-  local profile="$1" observed
-  ATTACH_OBSERVED_ORIGIN=""
-  observed="$(profile_attach_log_origin "$(profile_home "$profile")")" || return 1
-  [ "$(origin_authority "$observed")" != "$(origin_authority "$(gateway_origin)")" ] || return 1
-  ATTACH_OBSERVED_ORIGIN="$observed"
-  return 0
-}
 ensure_hermes_gateways() {
-  local profile state prior action
+  local profile state prior action observed
   for profile in "${SELECTED[@]}"; do
     state="$(gateway_state "$profile")"; prior="$(prior_service_action "$profile")"
+    # No log is no answer: a rerun must not bounce healthy profiles on a guess.
+    observed="$(profile_attach_log_origin "$(profile_home "$profile")" || true)"
     case "$state" in
       running)
         if profile_changed_for "$profile"; then
           run "$HERMES_BIN" -p "$profile" gateway restart
           say "OK    restarted Hermes gateway service for profile $profile"
-        elif profile_attached_elsewhere "$profile"; then
+        elif [ -n "$observed" ] && [ "$(origin_authority "$observed")" != "$(origin_authority "$(gateway_origin)")" ]; then
           run "$HERMES_BIN" -p "$profile" gateway restart
-          say "OK    restarted Hermes gateway service for profile $profile; its live attach target was $ATTACH_OBSERVED_ORIGIN, not $(gateway_origin)"
+          say "OK    restarted Hermes gateway service for profile $profile; its live attach target was $observed, not $(gateway_origin)"
         else
           say "OK    Hermes gateway service for profile $profile is already running with the current attach plugin and config"
         fi
@@ -3399,7 +3369,6 @@ dashboard_owner_report() {
   command="$(ps -o command= -p "$pid" 2>/dev/null | head -1 || true)"
   [ -n "$command" ] || command=unknown
   profile="$(printf '%s' "$command" | sed -n 's/.*[[:space:]]-p[[:space:]][[:space:]]*\([A-Za-z0-9._-][A-Za-z0-9._-]*\).*/\1/p')"
-  [ -n "$profile" ] || profile="$(printf '%s' "$command" | sed -n 's/.*--profile[[:space:]=][[:space:]]*\([A-Za-z0-9._-][A-Za-z0-9._-]*\).*/\1/p')"
   [ -n "$profile" ] || profile='unknown (no -p on its command line)'
   say "INFO  127.0.0.1:$port is held by pid $pid, profile $profile: $command"
   return 0

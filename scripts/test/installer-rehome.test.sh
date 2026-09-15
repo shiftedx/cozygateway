@@ -330,15 +330,18 @@ extract_function() {
 (
   set +e
   eval "$(extract_function env_get)"
+  eval "$(extract_function profile_env_needs_rewrite)"
   eval "$(extract_function verify_profile_env)"
+  ENV_OWNER_KEY=COZYGATEWAY_INSTALLER_OWNER
+  ENV_OWNER_VALUE=cozylabs-v1
   NODE_RESOLVED="$real_node"
   DRY_RUN=0
   gateway_origin() { printf 'http://127.0.0.1:8787'; }
   die() { printf 'FAIL  %s\n' "$*" >&2; exit 9; }
   mkdir -p "$tmp/verify"
-  printf 'COZYGATEWAY_URL=http://127.0.0.1:8787\nCOZYGATEWAY_TOKEN=abc\nCOZYGATEWAY_SPOOL_PATH=/spool\nCOZYGATEWAY_HOME_CHANNEL=thread\n' > "$tmp/verify/.env"
+  printf 'COZYGATEWAY_INSTALLER_OWNER=cozylabs-v1\nCOZYGATEWAY_URL=http://127.0.0.1:8787\nCOZYGATEWAY_TOKEN=abc\nCOZYGATEWAY_SPOOL_PATH=/spool\nCOZYGATEWAY_HOME_CHANNEL=thread\n' > "$tmp/verify/.env"
   verify_profile_env cleo "$tmp/verify/.env" abc /spool >/dev/null 2>&1 || exit 1
-  printf 'COZYGATEWAY_URL=%s\nCOZYGATEWAY_TOKEN=abc\nCOZYGATEWAY_SPOOL_PATH=/spool\nCOZYGATEWAY_HOME_CHANNEL=thread\n' "$REMOTE_ORIGIN" > "$tmp/verify/.env"
+  printf 'COZYGATEWAY_INSTALLER_OWNER=cozylabs-v1\nCOZYGATEWAY_URL=%s\nCOZYGATEWAY_TOKEN=abc\nCOZYGATEWAY_SPOOL_PATH=/spool\nCOZYGATEWAY_HOME_CHANNEL=thread\n' "$REMOTE_ORIGIN" > "$tmp/verify/.env"
   message="$(verify_profile_env cleo "$tmp/verify/.env" abc /spool 2>&1)"
   case "$message" in *'did not keep the CozyGateway keys'*) exit 0 ;; *) printf '%s\n' "$message" >&2; exit 2 ;; esac
 ) || fail 'an env write that did not survive must fail loudly'
