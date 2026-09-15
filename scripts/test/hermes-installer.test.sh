@@ -2416,7 +2416,7 @@ if preflight_output="$(HOME="$tmp/preflight-home" PATH="$tmp/service-bin:$tmp/bi
   echo 'a profile with this installer marker but a foreign Gateway URL must fail closed' >&2
   exit 1
 fi
-expect_contains "$preflight_output" 'targets another Gateway; use --runtime-only to preserve it'
+expect_contains "$preflight_output" 'targets another Gateway; rerun with --replace-gateway to re-home it to this Gateway, or --runtime-only to keep the existing attachment'
 test "$preflight_state_before" = "$(file_sha256 "$preflight_gateway/local/install-state")"
 test "$preflight_env_before" = "$(file_sha256 "$preflight_gateway/local/gateway.env")"
 
