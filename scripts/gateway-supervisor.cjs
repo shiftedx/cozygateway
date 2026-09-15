@@ -133,9 +133,14 @@ async function startDashboardIfNeeded(options) {
     HERMES_HOME: options.hermesRoot,
     HERMES_DASHBOARD_SESSION_TOKEN: dashboard.DASHBOARD_SESSION_TOKEN,
   };
-  const start = async (port) => {
+  // `--isolated` is what makes a fallback Dashboard a SEPARATE server. Hermes'
+  // unified server otherwise routes `hermes dashboard --port N` to the existing
+  // machine-level Dashboard, so the fallback never listens on the port it was
+  // given and the supervisor waits out its whole verification window against a
+  // server that was never started.
+  const start = async (port, isolated = false) => {
     const profile = options.windowsDashboardProfile ? ['-p', 'default'] : [];
-    const child = spawn(options.hermes, ['dashboard', ...profile, '--host', '127.0.0.1', '--port', String(port), '--no-open', '--skip-build'], {
+    const child = spawn(options.hermes, ['dashboard', ...profile, '--host', '127.0.0.1', '--port', String(port), '--no-open', '--skip-build', ...(isolated ? ['--isolated'] : [])], {
       detached: true, windowsHide: true, stdio: 'ignore', env: environment,
     });
     await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
@@ -174,7 +179,7 @@ async function startDashboardIfNeeded(options) {
   }
   for (let port = preferred + 1; port <= Math.min(preferred + 64, 65535); port += 1) {
     if (!await portIsAvailable(port)) continue;
-    child = await start(port);
+    child = await start(port, true);
     try {
       await verify(port);
       persistDashboardEndpoint(options, preferred, port);
@@ -277,7 +282,9 @@ async function main() {
     : await runGatewayOnce(options, gatewayEnv);
 }
 
-main().catch(() => {
-  console.error('CozyGateway supervisor could not start.');
+main().catch((error) => {
+  // The reason is the whole value of this line. A bare "could not start" sends
+  // an operator to the logs of a process that never produced any.
+  console.error(`CozyGateway supervisor could not start: ${error?.message ?? error}`);
   process.exitCode = 1;
 });

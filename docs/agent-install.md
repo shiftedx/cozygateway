@@ -138,6 +138,46 @@ mints it its own attach token and spool rather than reusing the copied ones.
 Narrow the scope with `--profiles default,ops` only when that isolation is
 intentional.
 
+## Re-homing an install to a different Gateway
+
+A machine whose Hermes profiles already point at another CozyGateway is not
+adopted by accident. An ordinary run refuses each profile that carries a
+CozyGateway URL it does not own, and the refusal names both ways forward:
+`--runtime-only` keeps the existing attachment and updates only the runtime,
+and `--replace-gateway` moves those profiles to the Gateway being installed.
+
+`--replace-gateway` does that per selected profile: it stops the profile's
+Hermes gateway, copies the five `COZYGATEWAY_*` keys out of its `.env` and the
+whole `plugins/cozygateway` folder into
+`~/.cozygateway/local/backups/<timestamp>/profiles/<profile>/`, removes both,
+and continues with an ordinary install. Nothing else in the profile is read or
+moved, and the backup stays until someone deletes it. It cannot be combined
+with `--uninstall` or `--runtime-only`.
+
+A loaded Hermes gateway holds its attach target in memory and writes it back
+over its profile `.env`, so an edit made while it runs is undone seconds later.
+The installer stops a profile before changing its CozyGateway keys, reads the
+file back afterwards, and stops with a named failure when the write did not
+survive — a dev-box provisioner that re-attaches profiles is the usual cause,
+and it has to be unloaded first. A profile whose keys are already correct is
+never stopped.
+
+A `plugins/cozygateway` folder with no ownership marker is adopted when its
+`plugin.yaml` is byte-identical to the shipped archive's: that is this release
+installed before the marker existed. Any other unowned folder still fails
+closed and says that `--replace-gateway` is what moves it aside.
+
+Before a profile that is already running is left alone, the installer compares
+the attach target in its gateway log with the Gateway being configured, and
+restarts it when they differ. A profile whose process is still serving the old
+Gateway looks perfectly healthy in every file on disk.
+
+On a machine with an `active_profile`, a plain `hermes gateway run` means that
+profile rather than `default`, so a `default` profile gateway would be a second
+gateway for the active profile. The installer resolves `default` through
+`hermes config path` and skips it when it aliases a profile already selected;
+it never starts a profile gateway without naming the profile.
+
 The release bootstrap downloads and SHA-256 verifies three versioned release
 assets before execution: the gateway bundle, the complete Hermes attach plugin
 archive, and the installer payload. It never executes the mutable raw installer
