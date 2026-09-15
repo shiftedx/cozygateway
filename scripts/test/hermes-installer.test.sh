@@ -1275,7 +1275,11 @@ if (hermesArgs[0] === 'dashboard') {
   // gateway-live is intentionally generated with service platform Darwin,
   // even when this fixture itself runs on Windows.
   const port = hermesArgs[hermesArgs.indexOf('--port') + 1];
-  const expectedLauncherArgs = ['dashboard', '-p', 'default', '--host', '127.0.0.1', '--port', port, '--no-open', '--skip-build'];
+  // Hermes' unified server routes a plain `dashboard --port N` to the existing
+  // machine-level Dashboard, so the supervisor's PRIVATE fallback asks for a
+  // separate server with --isolated. The preferred port deliberately does not.
+  const isolated = hermesArgs[hermesArgs.length - 1] === '--isolated';
+  const expectedLauncherArgs = ['dashboard', '-p', 'default', '--host', '127.0.0.1', '--port', port, '--no-open', '--skip-build', ...(isolated ? ['--isolated'] : [])];
   const descendantProfileArgs = ['-p', 'default'];
   const descendantArgs = [process.env.COZYGATEWAY_TEST_DASHBOARD_SCRIPT, 'dashboard', ...descendantProfileArgs, '--host', '127.0.0.1', '--port', port, '--no-open', '--skip-build'];
   const expectedToken = parseEnv(readFileSync(process.env.COZYGATEWAY_TEST_DASHBOARD_ENV, 'utf8')).DASHBOARD_SESSION_TOKEN;
@@ -1283,6 +1287,7 @@ if (hermesArgs[0] === 'dashboard') {
   writeFileSync(process.env.COZYGATEWAY_TEST_HERMES_STUB_TRACE, JSON.stringify({
     args: hermesArgs,
     descendantArgs,
+    isolated,
     launcherPid: process.pid,
     launcherMode: windowsLauncher ? 'exited-descendant' : 'live-process-group',
     tokenMatches: process.env.HERMES_DASHBOARD_SESSION_TOKEN === expectedToken,
@@ -1535,6 +1540,12 @@ if [ ! -s "$tmp/foreign-reload.log" ]; then
   [ ! -f "$tmp/hermes-stub-trace" ] || cat "$tmp/hermes-stub-trace" >&2
   exit 1
 fi
+# The fallback is only a fallback if Hermes was asked for a separate server.
+grep -Fq '"isolated":true' "$hermes_stub_trace" || {
+  echo 'the private Dashboard fallback did not pass --isolated' >&2
+  cat "$hermes_stub_trace" >&2
+  exit 1
+}
 "$real_node" - "$tmp/gateway-live/local/cozygateway.config.json" "$tmp/gateway-live/local/dashboard-port" "$foreign_dashboard_port" <<'NODE'
 const { readFileSync } = require('node:fs');
 const [configPath, statePath, foreignPort] = process.argv.slice(2);

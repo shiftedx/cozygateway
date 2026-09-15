@@ -349,4 +349,75 @@ fi
 expect_contains "$foreign_plugin_output" 'not owned by this installer'
 expect_contains "$foreign_plugin_output" '--replace-gateway'
 
+##############################################################################
+# Gap 4: a foreign Dashboard on the port, refused with no evidence.
+##############################################################################
+
+# The supervisor's private fallback must ask Hermes for a SEPARATE server.
+# Without --isolated, Hermes 0.21.3 routes `hermes dashboard --port N` to the
+# existing machine-level server and the fallback never listens.
+grep -Fq "'--isolated'" "$repo_root/scripts/gateway-supervisor.cjs" \
+  || fail 'the supervisor fallback does not pass --isolated'
+"$real_node" - "$repo_root/scripts/gateway-supervisor.cjs" <<'NODE' || fail 'the supervisor fallback launch is not the isolated one'
+const { readFileSync } = require('node:fs');
+const source = readFileSync(process.argv[2], 'utf8');
+// The preferred port reuses the machine Dashboard on purpose; only the private
+// fallback in the port-scan loop is isolated.
+if (!/child = await start\(port, true\);/.test(source)) process.exit(1);
+if (!/child = await start\(preferred\);/.test(source)) process.exit(1);
+NODE
+# A supervisor that cannot start says why.
+grep -Fq 'CozyGateway supervisor could not start: ' "$repo_root/scripts/gateway-supervisor.cjs" \
+  || fail 'the supervisor still swallows the underlying error'
+
+# The installer names the process holding the Dashboard port instead of only
+# reporting that it refused one.
+make_rehome_root "$tmp/foreign-dashboard-hermes"
+rm -f "$tmp/foreign-dashboard-hermes/profiles/cleo/.env"
+COMMAND_LOG="$tmp/foreign-dashboard-commands"
+if ! foreign_dashboard_output="$(COZYGATEWAY_TEST_DASHBOARD_TOKEN_CODE=401 \
+    COZYGATEWAY_TEST_DASHBOARD_OWNER_PID=31337 \
+    COZYGATEWAY_TEST_DASHBOARD_OWNER_COMMAND='/opt/hermes/bin/hermes dashboard -p polished-satellite --port 9119' \
+    run_installer "$tmp/foreign-dashboard-hermes" "$tmp/foreign-dashboard-gateway" "$tmp/foreign-dashboard-home" \
+    --profiles cleo)"; then
+  fail "a foreign Dashboard must be preserved, not fatal:\n$foreign_dashboard_output"
+fi
+expect_contains "$foreign_dashboard_output" 'preserving it and letting the CozyGateway supervisor provision a private loopback Dashboard'
+expect_contains "$foreign_dashboard_output" 'pid 31337'
+expect_contains "$foreign_dashboard_output" 'profile polished-satellite'
+expect_contains "$foreign_dashboard_output" 'hermes dashboard -p polished-satellite --port 9119'
+
+##############################################################################
+# Gap 5: a session token pinned in the active profile env.
+##############################################################################
+
+# Hermes loads .env with override, so a token handed to it in the process
+# environment loses to that line and every authenticated probe gets a 401.
+# Adopt the pinned token as the Dashboard token instead, and say so.
+make_rehome_root "$tmp/pinned-hermes"
+rm -f "$tmp/pinned-hermes/profiles/cleo/.env"
+printf 'HERMES_DASHBOARD_SESSION_TOKEN=pinned-token-0123456789abcdef\n' > "$tmp/pinned-hermes/profiles/cleo/.env"
+COMMAND_LOG="$tmp/pinned-commands"
+if ! pinned_output="$(COZYGATEWAY_TEST_ACTIVE_PROFILE=cleo run_installer "$tmp/pinned-hermes" \
+    "$tmp/pinned-gateway" "$tmp/pinned-home" --profiles cleo)"; then
+  fail "a pinned Dashboard session token must be adopted:\n$pinned_output"
+fi
+expect_contains "$pinned_output" 'adopted the Hermes Dashboard session token pinned in'
+expect_contains "$pinned_output" 'loads .env with override'
+grep -Fq 'DASHBOARD_SESSION_TOKEN=pinned-token-0123456789abcdef' "$tmp/pinned-gateway/local/dashboard.env" \
+  || fail 'the adopted token did not reach the supervisor Dashboard environment'
+
+# A pinned value this installer cannot put in an environment file unquoted is
+# reported rather than silently ignored or unsafely written.
+make_rehome_root "$tmp/pinned-unsafe-hermes"
+rm -f "$tmp/pinned-unsafe-hermes/profiles/cleo/.env"
+printf 'HERMES_DASHBOARD_SESSION_TOKEN="a token with spaces"\n' > "$tmp/pinned-unsafe-hermes/profiles/cleo/.env"
+COMMAND_LOG="$tmp/pinned-unsafe-commands"
+if ! pinned_unsafe_output="$(COZYGATEWAY_TEST_ACTIVE_PROFILE=cleo run_installer "$tmp/pinned-unsafe-hermes" \
+    "$tmp/pinned-unsafe-gateway" "$tmp/pinned-unsafe-home" --profiles cleo)"; then
+  fail "an unusable pinned token must not fail the install:\n$pinned_unsafe_output"
+fi
+expect_contains "$pinned_unsafe_output" 'pins HERMES_DASHBOARD_SESSION_TOKEN'
+expect_absent "$pinned_unsafe_output" 'a token with spaces'
+
 printf 'installer re-home tests passed\n'

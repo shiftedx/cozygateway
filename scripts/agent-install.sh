@@ -806,6 +806,16 @@ discover_root() {
   dirname "$default_config"
 }
 profile_home() { if [ "$1" = default ]; then printf '%s' "$HERMES_ROOT"; else printf '%s/profiles/%s' "$HERMES_ROOT" "$1"; fi; }
+# The profile a bare `hermes` command means on this machine. `hermes config path`
+# with no -p answers it, and on a machine with an `active_profile` that is NOT
+# the default profile. It decides which .env Hermes' own Dashboard will load.
+active_profile_home() {
+  local path
+  path="$("$HERMES_BIN" config path 2>/dev/null)" || return 1
+  [ -n "$path" ] || return 1
+  path="$(to_posix_path "$path")"
+  dirname "$path"
+}
 discover_profiles() {
   local p home actual
   DISCOVERED=()
@@ -1580,9 +1590,29 @@ fs.renameSync(temporary, output);
 NODE
   chmod 600 "$CONFIG_JSON" "$map"
 }
+# A token this installer can write into an environment file without quoting,
+# which is the only shape `env_write` accepts. A pinned value outside it is
+# reported rather than reshaped: it is the operator's credential, not ours.
+dashboard_token_is_safe() { [[ "$1" =~ ^[A-Za-z0-9_-]{16,200}$ ]]; }
 prepare_dashboard_credential() {
+  local pinned pinned_file home
   DASHBOARD_SESSION_TOKEN="$(env_get "$DASHBOARD_ENV" DASHBOARD_SESSION_TOKEN)"
   safe_secret "$DASHBOARD_SESSION_TOKEN" || DASHBOARD_SESSION_TOKEN="$(new_token)"
+  # Hermes loads the active profile's .env with override, so a token handed to
+  # `hermes dashboard` in the process environment loses to a pinned line there
+  # and every authenticated probe comes back 401. Adopt the pinned token as the
+  # Dashboard token instead of passing one Hermes will discard.
+  if home="$(active_profile_home)"; then pinned_file="$home/.env"; else pinned_file="$HERMES_ROOT/.env"; fi
+  pinned="$(env_get "$pinned_file" HERMES_DASHBOARD_SESSION_TOKEN)"
+  if [ -n "$pinned" ]; then
+    if dashboard_token_is_safe "$pinned"; then
+      DASHBOARD_SESSION_TOKEN="$pinned"
+      say "OK    adopted the Hermes Dashboard session token pinned in $pinned_file"
+      say "INFO  Hermes loads .env with override, so a token passed to it in the environment would lose to that line; the supervisor now uses the pinned one"
+    else
+      say "WARN  $pinned_file pins HERMES_DASHBOARD_SESSION_TOKEN in a shape this installer will not copy; remove that line if the Dashboard rejects the installer-owned token"
+    fi
+  fi
   [ "$DRY_RUN" = 1 ] && { say "DRY   reuse or mint local Hermes Dashboard credential in $DASHBOARD_ENV (value redacted)"; return; }
   umask 077
   : > "$DASHBOARD_ENV"
@@ -3270,6 +3300,22 @@ UNIT
     systemctl --user daemon-reload; systemctl --user enable --now "$SERVICE_UNIT"; systemctl --user restart "$SERVICE_UNIT"
   fi
 }
+# Who actually holds the Dashboard port. Refusing a listener without naming it
+# leaves an operator with a port number and nothing to act on.
+dashboard_owner_report() {
+  local port="$1" pid command profile
+  is_windows && return 0
+  if ! have lsof; then say "INFO  install lsof to have the installer name the process listening on 127.0.0.1:$port"; return 0; fi
+  pid="$(lsof -nP -sTCP:LISTEN -t -i "@127.0.0.1:$port" 2>/dev/null | head -1 || true)"
+  case "$pid" in ''|*[!0-9]*) say "INFO  no owning process for 127.0.0.1:$port could be identified"; return 0 ;; esac
+  command="$(ps -o command= -p "$pid" 2>/dev/null | head -1 || true)"
+  [ -n "$command" ] || command=unknown
+  profile="$(printf '%s' "$command" | sed -n 's/.*[[:space:]]-p[[:space:]][[:space:]]*\([A-Za-z0-9._-][A-Za-z0-9._-]*\).*/\1/p')"
+  [ -n "$profile" ] || profile="$(printf '%s' "$command" | sed -n 's/.*--profile[[:space:]=][[:space:]]*\([A-Za-z0-9._-][A-Za-z0-9._-]*\).*/\1/p')"
+  [ -n "$profile" ] || profile='unknown (no -p on its command line)'
+  say "INFO  127.0.0.1:$port is held by pid $pid, profile $profile: $command"
+  return 0
+}
 dashboard_ready() {
   local code
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$DASHBOARD_PORT/api/health" 2>/dev/null || true)"
@@ -3386,6 +3432,7 @@ start_dashboard() {
   if dashboard_ready; then
     dashboard_credentials_work && return
     say "WARN  existing Hermes Dashboard rejected the configured local session token; preserving it and letting the CozyGateway supervisor provision a private loopback Dashboard"
+    dashboard_owner_report "$DASHBOARD_PORT"
     return
   fi
   launch_dashboard
@@ -3394,8 +3441,8 @@ start_dashboard() {
   code="$(dashboard_credentials_status)"
   case "$code" in
     200) return ;;
-    401|403) die "Hermes Dashboard rejected the installer-owned local session token (HTTP $code)" ;;
-    *) die "Hermes Dashboard session-token verification failed with HTTP ${code:-000} on 127.0.0.1:$DASHBOARD_PORT" ;;
+    401|403) dashboard_owner_report "$DASHBOARD_PORT"; die "Hermes Dashboard rejected the installer-owned local session token (HTTP $code)" ;;
+    *) dashboard_owner_report "$DASHBOARD_PORT"; die "Hermes Dashboard session-token verification failed with HTTP ${code:-000} on 127.0.0.1:$DASHBOARD_PORT" ;;
   esac
 }
 # A CozyAgents uninstall takes back exactly what this installer put there: the gateway service and
