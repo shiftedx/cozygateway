@@ -587,4 +587,68 @@ for (const line of source.split('\n')) {
 }
 NODE
 
+##############################################################################
+# The whole machine, in one run.
+##############################################################################
+
+# 2026-09-14, the owner's Mac: four profiles attached to a remote CozyGateway, a
+# provisioner rewriting one of their envs, an unowned plugin folder from an
+# older install, an active profile that `default` aliases, somebody else's
+# Dashboard on 9119, and a session token pinned in the active profile's env.
+# Seven runs of the installer were needed. This is the one run that has to work.
+machine="$tmp/machine-hermes"
+make_rehome_root "$machine"
+# The active profile, with a pinned Dashboard session token beside its old keys.
+printf 'HERMES_DASHBOARD_SESSION_TOKEN=pinned-session-token-abcdef01\n' >> "$machine/profiles/cleo/.env"
+# An older install's plugin folder, with no ownership marker.
+mkdir -p "$machine/profiles/night-owl/plugins/cozygateway"
+printf 'name: cozygateway\n# from an install made before the ownership marker\n' \
+  > "$machine/profiles/night-owl/plugins/cozygateway/plugin.yaml"
+# One profile whose running gateway keeps rewriting its .env from memory.
+COMMAND_LOG="$tmp/machine-commands"
+: > "$COMMAND_LOG"
+if ! machine_output="$(INSTALLER_QR=1 \
+    COZYGATEWAY_TEST_ACTIVE_PROFILE=cleo \
+    COZYGATEWAY_TEST_PROVISIONER_PROFILES='drowsy-lark' \
+    COZYGATEWAY_TEST_DASHBOARD_TOKEN_CODE=401 \
+    COZYGATEWAY_TEST_DASHBOARD_OWNER_PID=31337 \
+    COZYGATEWAY_TEST_DASHBOARD_OWNER_COMMAND='/opt/hermes/bin/hermes dashboard -p cleo --port 9119' \
+    run_installer "$machine" "$tmp/machine-gateway" "$tmp/machine-home" \
+    --replace-gateway --profiles cleo,drowsy-lark,night-owl,polished-satellite)"; then
+  fail "the whole-machine re-home run failed:"$'\n'"$machine_output"
+fi
+# It finishes on the pairing finale.
+expect_contains "$machine_output" 'fake-qr'
+expect_contains "$machine_output" '"setupCode":"TEST-CODE"'
+expect_contains "$machine_output" '"gatewayUrl":"http://127.0.0.1:8787"'
+# Every selected profile is attached here, with its old state kept.
+machine_stamp="$(ls "$tmp/machine-gateway/local/backups")"
+for profile in cleo drowsy-lark night-owl polished-satellite; do
+  test "$(sed -n 's/^COZYGATEWAY_URL=//p' "$machine/profiles/$profile/.env")" = 'http://127.0.0.1:8787' \
+    || fail "profile $profile is not attached to the local gateway"
+  grep -Fq "COZYGATEWAY_URL=$REMOTE_ORIGIN" \
+    "$tmp/machine-gateway/local/backups/$machine_stamp/profiles/$profile/env-keys" \
+    || fail "profile $profile has no backup of its previous attachment"
+done
+test -f "$tmp/machine-gateway/local/backups/$machine_stamp/profiles/night-owl/plugins/cozygateway/plugin.yaml" \
+  || fail 'the unowned plugin folder was not backed up'
+grep -Fq 'from an install made before the ownership marker' \
+  "$tmp/machine-gateway/local/backups/$machine_stamp/profiles/night-owl/plugins/cozygateway/plugin.yaml" \
+  || fail 'the backed-up plugin folder is not the one that was there'
+# The default profile aliases cleo and was never configured or started.
+grep -q '^default:gateway:' "$COMMAND_LOG" && fail 'the aliased default profile got a gateway'
+grep -Fq 'COZYGATEWAY_URL=' "$machine/.env" 2>/dev/null && fail 'the aliased default profile was configured'
+# The pinned token became the Dashboard token, and the foreign Dashboard was
+# preserved and named rather than fought over.
+expect_contains "$machine_output" 'adopted the Hermes Dashboard session token pinned in'
+grep -Fq 'DASHBOARD_SESSION_TOKEN=pinned-session-token-abcdef01' "$tmp/machine-gateway/local/dashboard.env" \
+  || fail 'the pinned token did not reach the supervisor Dashboard environment'
+expect_contains "$machine_output" 'pid 31337'
+# The provisioner did rewrite an env during the run, and the run still ended
+# with that profile attached here.
+grep -Fq 'drowsy-lark:provisioner-rewrote-env' "$COMMAND_LOG" \
+  || fail 'the provisioner fixture never ran, so this case proves nothing'
+# A finished run leaves no process ledger for a later rollback to act on.
+test ! -e "$tmp/machine-gateway/local/run-pids" || fail 'the finished run left a process ledger'
+
 printf 'installer re-home tests passed\n'
