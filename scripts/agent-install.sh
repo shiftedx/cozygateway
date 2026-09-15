@@ -822,6 +822,28 @@ active_profile_home() {
   path="$(to_posix_path "$path")"
   dirname "$path"
 }
+# A Hermes profile gateway service runs `hermes gateway run`, and on a machine
+# with an `active_profile` that means the ACTIVE profile, not `default`. Keeping
+# `default` selected alongside the profile it resolves to therefore installs a
+# second gateway for that one profile, and its own service check then fails.
+# `hermes config path` with no -p names the active profile; when it is another
+# selected profile, `default` is that profile under a second name and is dropped.
+resolve_default_profile_alias() {
+  local active_home profile survivor kept=()
+  printf '%s\n' "${SELECTED[@]}" | grep -qx default || return 0
+  active_home="$(active_profile_home)" || return 0
+  [ -n "$active_home" ] || return 0
+  [ "$active_home" != "$HERMES_ROOT" ] || return 0
+  for profile in "${SELECTED[@]}"; do
+    [ "$profile" = default ] && continue
+    [ "$(profile_home "$profile")" = "$active_home" ] || continue
+    for survivor in "${SELECTED[@]}"; do [ "$survivor" = default ] || kept+=("$survivor"); done
+    SELECTED=("${kept[@]}")
+    say "OK    skipping the default profile: Hermes' active profile is $profile, so a default profile gateway would be a second gateway for it"
+    return 0
+  done
+  return 0
+}
 discover_profiles() {
   local p home actual
   DISCOVERED=()
@@ -836,6 +858,7 @@ discover_profiles() {
   [ "${#DISCOVERED[@]}" -gt 0 ] || die "no Hermes profiles with config.yaml were found under $HERMES_ROOT"
   if [ "$PROFILE_SPEC" = all ]; then SELECTED=("${DISCOVERED[@]}"); else IFS=',' read -r -a SELECTED <<<"$PROFILE_SPEC"; fi
   [ "${#SELECTED[@]}" -gt 0 ] || die "--profiles cannot be empty"
+  resolve_default_profile_alias
   for p in "${SELECTED[@]}"; do
     valid_profile "$p" || die "invalid Hermes profile name: $p"
     home="$(profile_home "$p")"; [ -f "$home/config.yaml" ] || die "Hermes profile $p has no config at $home/config.yaml. To repair an older saved selection automatically, update with: curl -fsSL https://cozylabs.ai/install.sh | bash; an explicit --profiles request is never silently changed"

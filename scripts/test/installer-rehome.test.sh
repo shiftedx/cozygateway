@@ -223,6 +223,10 @@ make_rehome_root() {
 
 run_installer() {
   local root="$1" gateway="$2" home="$3"; shift 3
+  local qr_flag=(--no-qr)
+  # One case has to reach the pairing finale; every other case keeps its output
+  # free of pairing material.
+  [ -z "${INSTALLER_QR:-}" ] || qr_flag=()
   HOME="$home" \
     PATH="$tmp/service-bin:$tmp/bin:$PATH" \
     COZYGATEWAY_TEST_HERMES_ROOT="$root" \
@@ -232,8 +236,8 @@ run_installer() {
     COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" \
     COZYGATEWAY_NODE="$fake_node" \
     COZYGATEWAY_SERVICE_PLATFORM=Darwin \
-    bash "$installer" --no-qr --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" \
-      --gateway-dir "$gateway" "$@" 2>&1
+    bash "$installer" ${qr_flag[@]+"${qr_flag[@]}"} --bundle "$tmp/gateway.mjs" \
+      --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$gateway" "$@" 2>&1
 }
 
 ##############################################################################
@@ -533,5 +537,54 @@ fi
 test -f "$tmp/dashboard-launched" || fail 'the run did not launch a Dashboard'
 grep -Eq '^dashboard=[0-9]+$' "$tmp/dashboard-launched.pids" || fail 'the launched Dashboard pid was not recorded'
 test ! -e "$tmp/pids-gateway/local/run-pids" || fail 'a finished run left its process ledger behind'
+
+##############################################################################
+# Gap 8: `default` aliasing the active profile.
+##############################################################################
+
+# A profile gateway service runs `hermes gateway run`, which on a machine with
+# an active_profile means THAT profile, not `default`. Selecting both installs a
+# second gateway for the active profile and breaks its own service check.
+make_rehome_root "$tmp/alias-hermes"
+for profile in cleo drowsy-lark night-owl polished-satellite; do
+  rm -f "$tmp/alias-hermes/profiles/$profile/.env"
+done
+COMMAND_LOG="$tmp/alias-commands"
+: > "$COMMAND_LOG"
+if ! alias_output="$(COZYGATEWAY_TEST_ACTIVE_PROFILE=cleo run_installer "$tmp/alias-hermes" \
+    "$tmp/alias-gateway" "$tmp/alias-home" --profiles all)"; then
+  fail "an install whose default profile aliases the active one failed:\n$alias_output"
+fi
+expect_contains "$alias_output" 'Profiles: cleo drowsy-lark night-owl polished-satellite'
+expect_contains "$alias_output" "Hermes' active profile is cleo"
+grep -q '^default:gateway:' "$COMMAND_LOG" && fail 'a gateway was installed for the aliased default profile'
+grep -Fq 'COZYGATEWAY_URL=' "$tmp/alias-hermes/.env" 2>/dev/null \
+  && fail 'the aliased default profile was configured anyway'
+
+# With no active profile, or with the default profile itself active, `default`
+# is an ordinary profile and stays selected.
+make_rehome_root "$tmp/no-alias-hermes"
+for profile in cleo drowsy-lark night-owl polished-satellite; do
+  rm -f "$tmp/no-alias-hermes/profiles/$profile/.env"
+done
+COMMAND_LOG="$tmp/no-alias-commands"
+: > "$COMMAND_LOG"
+if ! no_alias_output="$(run_installer "$tmp/no-alias-hermes" "$tmp/no-alias-gateway" \
+    "$tmp/no-alias-home" --profiles all)"; then
+  fail "an install with no active profile failed:\n$no_alias_output"
+fi
+expect_contains "$no_alias_output" 'Profiles: default cleo drowsy-lark night-owl polished-satellite'
+grep -Fxq 'default:gateway:install' "$COMMAND_LOG" || fail 'the default profile gateway was not installed'
+
+# Every profile gateway command names its profile. A bare `hermes gateway ...`
+# would be the active profile, whichever profile the installer meant.
+"$real_node" - "$installer" <<'NODE' || fail 'a profile gateway command is missing -p'
+const { readFileSync } = require('node:fs');
+const source = readFileSync(process.argv[2], 'utf8');
+for (const line of source.split('\n')) {
+  if (!/HERMES_BIN"? gateway /.test(line)) continue;
+  if (!/-p "\$profile"/.test(line)) { console.error(line); process.exit(1); }
+}
+NODE
 
 printf 'installer re-home tests passed\n'
