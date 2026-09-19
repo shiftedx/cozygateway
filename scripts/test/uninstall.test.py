@@ -8,6 +8,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / 'scripts/agent-install.sh'
+WINDOWS_INSTALLER = ROOT / 'scripts/install.ps1'
 
 
 class UninstallTests(unittest.TestCase):
@@ -86,6 +87,61 @@ write_cli_wrapper
         self.run_uninstall('--gateway-dir', str(self.home), success=False)
         self.assertTrue((self.gateway / 'local/history.sqlite').exists())
         self.assertFalse((self.root / 'calls').exists())
+
+    def test_legacy_cozyagents_state_refuses_update_and_uninstall_without_mutation(self):
+        state = self.gateway / 'local/install-state'
+        config = self.gateway / 'local/cozygateway.config.json'
+        config.write_text('{"sentinel":"preserve"}\n')
+        for harness in ('cozyagents', 'both'):
+            state.write_text(f'harness={harness}\nrepair_mode=runtime-only\n')
+            before_state = state.read_bytes()
+            before_config = config.read_bytes()
+            for arguments in ((), ('--uninstall', '--purge')):
+                result = subprocess.run(
+                    ['bash', str(INSTALLER), '--gateway-dir', str(self.gateway),
+                     '--service-platform', 'Darwin', *arguments],
+                    env=self.env, text=True, capture_output=True,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('retired CozyAgents gateway', result.stdout + result.stderr)
+                self.assertEqual(state.read_bytes(), before_state)
+                self.assertEqual(config.read_bytes(), before_config)
+                self.assertFalse((self.root / 'calls').exists())
+
+    def test_powershell_legacy_cozyagents_state_refuses_before_uninstall_or_upgrade(self):
+        powershell = shutil.which('powershell.exe') or shutil.which('pwsh')
+        if powershell is None:
+            self.skipTest('PowerShell is unavailable')
+        state = self.gateway / 'local/install-state'
+        config = self.gateway / 'local/cozygateway.config.json'
+        config.write_text('{"sentinel":"preserve"}\n')
+        script = self.root / 'legacy-state-guard.ps1'
+        source = str(WINDOWS_INSTALLER).replace("'", "''")
+        state_path = str(state).replace("'", "''")
+        config_path = str(config).replace("'", "''")
+        script.write_text(f'''$ErrorActionPreference = 'Stop'
+$source = [IO.File]::ReadAllText('{source}')
+$tokens = $null; $errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+if ($errors.Count) {{ throw ($errors | Out-String) }}
+$guard = $ast.Find({{ param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Extent.Text -match '\\$legacyHarness -in @\\(''cozyagents'', ''both''\\)' }}, $true)
+$uninstall = $ast.Find({{ param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Extent.Text -match '^if \\(\\$isUninstall\\)' }}, $true)
+$transaction = $ast.Find({{ param($node) $node -is [Management.Automation.Language.CommandAst] -and $node.Extent.Text -match '^Protect-CozyGatewayHome ' }}, $true)
+if (-not $guard -or -not $uninstall -or -not $transaction -or $guard.Extent.StartOffset -ge $uninstall.Extent.StartOffset -or $guard.Extent.StartOffset -ge $transaction.Extent.StartOffset) {{ throw 'legacy state guard must precede uninstall and upgrade mutation' }}
+function Fail {{ param([string] $Message) throw $Message }}
+$statePath = '{state_path}'
+$configPath = '{config_path}'
+foreach ($harness in @('cozyagents', 'both')) {{
+    [IO.File]::WriteAllText($statePath, "harness=$harness`nrepair_mode=runtime-only`n")
+    $beforeState = (Get-FileHash -LiteralPath $statePath).Hash
+    $beforeConfig = (Get-FileHash -LiteralPath $configPath).Hash
+    $blocked = $false
+    try {{ . ([scriptblock]::Create($guard.Extent.Text)) }} catch {{ $blocked = $_.Exception.Message -match 'retired CozyAgents gateway' }}
+    if (-not $blocked -or (Get-FileHash -LiteralPath $statePath).Hash -ne $beforeState -or (Get-FileHash -LiteralPath $configPath).Hash -ne $beforeConfig) {{ throw "legacy $harness state was not refused without mutation" }}
+}}
+''')
+        result = subprocess.run([powershell, '-NoProfile', '-File', str(script)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_live_service_stop_failure_retains_retry_files(self):
         self.env['FAIL_STOP'] = '1'
