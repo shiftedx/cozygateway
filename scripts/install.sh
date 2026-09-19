@@ -130,6 +130,25 @@ prepare_owned_dir() {
   fi
   chmod 700 "$path" || die "could not secure installer directory: $path"
 }
+# The installer records every process it starts detached under
+# local/run-pids. A failed run leaves its Dashboard and its profile gateways
+# holding the ports, and each retry then fails at the same step; restoring the
+# previous release does not stop them. Only pids this installation recorded are
+# ever signalled, and only while they are still alive.
+stop_recorded_run_processes() {
+  local file="$HOME_DIR/local/run-pids" kind pid
+  [ -f "$file" ] && [ ! -L "$file" ] || return 0
+  while IFS='=' read -r kind pid || [ -n "$kind" ]; do
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    [ "$pid" -gt 1 ] || continue
+    [ "$pid" != "$$" ] || continue
+    kill -0 "$pid" 2>/dev/null || continue
+    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    printf 'OK    stopped the %s process (pid %s) the failed run started\n' "${kind:-unknown}" "$pid" >&2
+  done < "$file"
+  rm -f "$file"
+  return 0
+}
 recover_bootstrap_transaction() {
   local asset_dir="$1"; shift
   local journal="$HOME_DIR/.bootstrap-transaction" backup="$HOME_DIR/.bootstrap-previous"
@@ -312,7 +331,7 @@ restart_existing_owned_service() {
     bootstrap_systemd_service_is_owned "$unit" || return 1; systemctl --user daemon-reload && systemctl --user restart cozygateway.service
   fi
 }
-rollback_bootstrap_transaction() { local asset_dir="$1"; shift; recover_bootstrap_transaction "$asset_dir" "$@"; }
+rollback_bootstrap_transaction() { local asset_dir="$1"; shift; stop_recorded_run_processes; recover_bootstrap_transaction "$asset_dir" "$@"; }
 commit_bootstrap_transaction() { local journal="$HOME_DIR/.bootstrap-transaction" backup="$HOME_DIR/.bootstrap-previous"; printf 'commit=installer-succeeded\n' > "$journal.next" && mv -f "$journal.next" "$journal" || die "could not record bootstrap commit"; rm -rf "$backup" || die "could not remove bootstrap rollback directory"; rm -f "$journal" || die "could not clear bootstrap transaction marker"; }
 record_explicit_bootstrap_source() {
   local source_file="$HOME_DIR/local/bootstrap-source" staged
@@ -347,6 +366,7 @@ main() {
     acquire_bootstrap_lock
     trap 'release_bootstrap_lock' EXIT
     trap 'handle_bootstrap_signal' HUP INT TERM
+    stop_recorded_run_processes
     recover_bootstrap_transaction "$asset_dir" "$@"
     stage="$(mktemp -d "$HOME_DIR/.bootstrap.XXXXXX")"
   fi

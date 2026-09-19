@@ -24,20 +24,14 @@ import { PHOTO_SWEEP_MS } from "../src/hermes-bridge/photos.ts";
 let gateway: RunningGateway;
 
 describe("gateway maintenance runtime health wiring", () => {
-  it("projects only the co-located CozyAgents runner", () => {
+  it("projects Hermes attach health", () => {
     expect(maintenanceRuntimeHealth({
-      harness: "cozyagents",
-      coLocatedRunnerId: "local",
-      connectedRunners: ["local", "secondary"],
-    })).toEqual({ harness: "cozyagents", localRunnerAttached: true });
-  });
-
-  it("ignores an offline secondary runner", () => {
-    expect(maintenanceRuntimeHealth({
-      harness: "cozyagents",
-      coLocatedRunnerId: "local",
-      connectedRunners: ["secondary"],
-    })).toEqual({ harness: "cozyagents", localRunnerAttached: false });
+      attach: { configured: 2, online: 1 },
+      deadLetters: 3,
+    })).toEqual({
+      harness: "hermes",
+      attach: { configured: 2, online: 1, deadLetters: 3 },
+    });
   });
 });
 
@@ -347,6 +341,115 @@ describe("GatewayInfo.capabilities wiring", () => {
     try {
       const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
       expect(health.capabilities).toMatchObject({ approvals: 1, "com.cozylabs.bots": expect.any(Number) });
+      expect(health.botRuntimes).toEqual(["hermes"]);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  it("keeps CozyAgents runtime provisioning out of a Hermes gateway", async () => {
+    const gw = await startGateway({
+      name: "hermes-only",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermesEndpoints: [{ id: "default", ...testHermes() }],
+    });
+    try {
+      const paired = await fetch(`${gw.url}/pair`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ setupCode: gw.issueSetupCode(), deviceName: "phone" }),
+      });
+      const { deviceToken } = (await paired.json()) as { deviceToken: string };
+      const created = await fetch(`${gw.url}/bots`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${deviceToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ name: "sage", runtime: "cozyagents" }),
+      });
+      expect(created.status).toBe(503);
+      expect(await created.json()).toMatchObject({ error: { code: "backend_unavailable" } });
+      expect(gw.storage.runtimeBot("sage")).toBeUndefined();
+      expect(gw.routes()).toEqual(expect.arrayContaining([expect.objectContaining({ path: "/runners" })]));
+      const runners = await fetch(`${gw.url}/runners`, { headers: { authorization: `Bearer ${deviceToken}` } });
+      expect(runners.status).toBe(200);
+      expect(await runners.json()).toEqual({ runners: [] });
+    } finally {
+      await gw.close();
+    }
+  });
+
+  it("does not expose CozyAgents provisioning when no Hermes endpoint is configured", async () => {
+    const gw = await startGateway({
+      name: "unconfigured-hermes",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+    });
+    try {
+      const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
+      expect(health.botRuntimes).toEqual([]);
+      const paired = await fetch(`${gw.url}/pair`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ setupCode: gw.issueSetupCode(), deviceName: "phone" }),
+      });
+      const { deviceToken } = (await paired.json()) as { deviceToken: string };
+      const created = await fetch(`${gw.url}/bots`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${deviceToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ name: "sage", runtime: "cozyagents" }),
+      });
+      expect(created.status).toBe(503);
+      expect(gw.storage.runtimeBot("sage")).toBeUndefined();
+      expect((await fetch(`${gw.url}/runners`, { headers: { authorization: `Bearer ${deviceToken}` } })).status).toBe(200);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  it("pairs and manages Hermes remote computers without provisioning a bot runtime", async () => {
+    const device = await fetch(`${gateway.url}/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ setupCode: gateway.issueSetupCode(), deviceName: "phone" }) });
+    const deviceToken = ((await device.json()) as { deviceToken: string }).deviceToken;
+    const codeResponse = await fetch(`${gateway.url}/runners/pair-code`, { method: "POST", headers: { authorization: `Bearer ${deviceToken}` } });
+    const { setupCode } = (await codeResponse.json()) as { setupCode: string };
+    const paired = await fetch(`${gateway.url}/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ setupCode, deviceName: "work mac", kind: "runner" }) });
+    expect(paired.status).toBe(200);
+    const { runnerToken, runner: pairedRunner } = (await paired.json()) as { runnerToken: string; runner: { id: string } };
+    expect(runnerToken).toEqual(expect.any(String));
+    expect(pairedRunner.id).toEqual(expect.any(String));
+    const listed = await fetch(`${gateway.url}/runners`, { headers: { authorization: `Bearer ${deviceToken}` } });
+    const id = ((await listed.json()) as { runners: Array<{ id: string; name: string }> }).runners[0]!.id;
+    expect((await fetch(`${gateway.url}/runners/${id}`, { method: "PATCH", headers: { authorization: `Bearer ${deviceToken}`, "content-type": "application/json" }, body: JSON.stringify({ name: "Desk Mac", default: true }) })).status).toBe(200);
+    expect((await fetch(`${gateway.url}/runners/${id}`, { method: "DELETE", headers: { authorization: `Bearer ${deviceToken}` } })).status).toBe(200);
+    expect(gateway.storage.runtimeBots()).toEqual([]);
+  });
+
+  it("keeps legacy CozyAgents records inert in the public gateway", async () => {
+    const gw = await startGateway({
+      name: "legacy-runtime-rows",
+      port: 0,
+      dbPath: ":memory:",
+      turnTimeoutSeconds: 0,
+      hermesEndpoints: [{ id: "default", ...testHermes() }],
+      observability: { enabled: true, retentionDays: 7 },
+    });
+    try {
+      gw.storage.insertRuntimeBot({
+        id: "legacy-agent", name: "Legacy Agent", avatar: null, token: "legacy-token",
+        runtime: "cozyagents", specGeneration: 1, createdAt: Date.now(),
+      });
+      const paired = await fetch(`${gw.url}/pair`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ setupCode: gw.issueSetupCode(), deviceName: "phone" }),
+      });
+      const { deviceToken } = (await paired.json()) as { deviceToken: string };
+      const auth = { authorization: `Bearer ${deviceToken}` };
+      const bots = (await (await fetch(`${gw.url}/bots`, { headers: auth })).json()) as { bots: Array<{ name: string }> };
+      expect(bots.bots.map((bot) => bot.name)).not.toContain("legacy-agent");
+      for (const path of ["/observe/api/cozyagents", "/observe/api/cozyagents/spend", "/observe/api/cozyagents/tools"])
+        expect((await fetch(`${gw.url}${path}`, { headers: auth })).status).toBe(404);
     } finally {
       await gw.close();
     }
@@ -397,6 +500,7 @@ describe("GatewayInfo.capabilities wiring", () => {
         "com.cozylabs.chat-configuration": 1,
         "com.cozylabs.chat-context": 1,
         "com.cozylabs.provider-connections": 1,
+        "com.cozylabs.runners": 1,
         "com.cozylabs.mobile-node": MOBILE_NODE_CAPABILITY_VERSION,
       });
 
@@ -408,6 +512,7 @@ describe("GatewayInfo.capabilities wiring", () => {
       });
       const paired = (await pairRes.json()) as { deviceToken: string; gateway: GatewayInfo };
       expect(paired.gateway.capabilities).toEqual(health.capabilities);
+      expect(paired.gateway.botRuntimes).toEqual(health.botRuntimes);
 
       const frames: ServerFrame[] = [];
       const ws = new WebSocket(`${gw.url.replace("http", "ws")}/ws`);
@@ -422,6 +527,7 @@ describe("GatewayInfo.capabilities wiring", () => {
       ws.close();
       const ready = frames.find((f) => f.type === "ready");
       expect(ready?.type === "ready" ? ready.gateway.capabilities : undefined).toEqual(health.capabilities);
+      expect(ready?.type === "ready" ? ready.gateway.botRuntimes : undefined).toEqual(health.botRuntimes);
     } finally {
       await gw.close();
     }

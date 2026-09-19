@@ -28,112 +28,7 @@ export interface ObserveAggregate {
   belowSampleFloor: boolean;
 }
 
-// ------------------------------------------------------------------ the D5 seam
-
-/** THE D5 SEAM.
- *
- *  D5 owns the `observation_snapshot` lane, the latest-snapshot store, the per-bot and per-tool
- *  lifetime tables, the operator's price sheet and the cost-per-tool-call attribution. D3 owns the
- *  route surface those panels are served on, and nothing else: these routes call this reader and
- *  serve what it returns, so D5 plugs in by supplying one and changes no route.
- *
- *  With no reader the CozyAgents panels answer `{ available: false, reason: "no_snapshot_lane" }`
- *  rather than 404, so the dashboard renders an empty state instead of treating a gateway with no
- *  CozyAgents peer as an error. */
-export interface ObserveSnapshotReader {
-  /** Whether a CozyAgents peer is attached and publishing. Gates the CozyAgents tab. */
-  attached(): boolean;
-  internals(query: { bot?: string; from: number; to: number }): readonly ObserveAgentInternals[];
-  throughput(query: { bot?: string; from: number; to: number }): ObserveThroughput;
-  toolCosts(query: { bot?: string; from: number; to: number }): ObserveToolCosts;
-}
-
-export interface ObserveAgentInternals {
-  bot: string;
-  runtimeStage: string;
-  generationsWanted: number | null;
-  generationsObserved: number | null;
-  bundleVersion: string | null;
-  runnerName: string | null;
-  runnerLastContactAt: number | null;
-  snapshotAgeMs: number | null;
-  toolFamilies: readonly { family: string; calls: number }[];
-  toolServers: readonly {
-    server: string; layers: number; healthy: number; fingerprint: string | null; state: string;
-  }[];
-  policy: {
-    permitted: number | null; asked: number | null; denied: number | null; expired: number | null; egressRefused: number | null;
-    level: string | null;
-  };
-  context: {
-    inUseTokens: number | null; windowTokens: number | null; rollovers: number | null; lastRolloverAt: number | null;
-    cardsAttached: number | null; cardsTotal: number | null;
-  };
-  memory: {
-    recallDocs: number | null; recallBytes: number | null; lastConsolidationAt: number | null;
-    evicted: number | null; tombstoned: number | null;
-  };
-  prompt?: Record<string, unknown> | null;
-  cache?: Record<string, unknown>;
-  recall?: Record<string, unknown> | null;
-  guardrails?: Record<string, unknown> | null;
-  steps?: readonly import("./snapshot.ts").ObservationSnapshotStepRow[];
-  toolCalls?: readonly import("./snapshot.ts").ObservationSnapshotToolRow[];
-  checkpoints: { count: number | null; restores: number | null; lastRestoreResult: string | null };
-}
-
-/** Section 12. `costMicros` is null until the operator enters a price sheet, which is what makes
- *  the panel say "tokens only" rather than print a zero somebody could mistake for free. */
-export interface ObserveThroughput {
-  priceSheetConfigured: boolean;
-  rows: readonly {
-    bot: string;
-    model: string;
-    prefix?: string;
-    speedsByPrefix?: readonly { prefix: string; prefill: ObserveAggregate; decode: ObserveAggregate }[];
-    prefill: ObserveAggregate;
-    decode: ObserveAggregate;
-    tokens: { prompt: number; completion: number; cached: number };
-    costMicros: number | null;
-    costPerTurn?: ObserveAggregate;
-    lifetime: {
-      prompt: number; completion: number; cached: number; costMicros: number | null; turns: number;
-    };
-  }[];
-}
-
-/** Section 13. `attributed` says the tokens of a step were split across the calls it made, which is
- *  an attribution rule rather than a measurement and is labelled as one. */
-export interface ObserveToolCosts {
-  retryDetectionAvailable?: boolean;
-  heavyDetectionAvailable?: boolean;
-  priceSheetConfigured: boolean;
-  rows: readonly {
-    tool: string;
-    family: string;
-    calls: number;
-    errors: number;
-    medianResultTokens: number | null;
-    resultSize?: ObserveAggregate;
-    drivingTurns?: readonly { bot: string; turn: string; calls: number; inducedTokens: number | null }[];
-    inducedTokens: number | null;
-    costMicros: number | null;
-    duration: ObserveAggregate;
-    flags: readonly string[];
-    attributed: boolean;
-  }[];
-}
-
-/** The reader a gateway with no CozyAgents peer has. Every panel it feeds answers empty, and no
- *  route has to know whether D5 landed. */
-export const ABSENT_SNAPSHOT_READER: ObserveSnapshotReader = {
-  attached: () => false,
-  internals: () => [],
-  throughput: () => ({ priceSheetConfigured: false, rows: [] }),
-  toolCosts: () => ({ priceSheetConfigured: false, rows: [] }),
-};
-
-import { createObserveSnapshotReader, observeReceiptDistributions } from "./reader.ts";
+import { observeReceiptDistributions } from "./reader.ts";
 import { Hono } from "hono";
 import type { AppDeps } from "../http.ts";
 import { isAllowedEventKind, isAllowedSeries, OBSERVE_SERIES_TAGS } from "./privacy.ts";
@@ -150,11 +45,10 @@ function aggregate(summary: ObserveSummary, speed = false): ObserveAggregate {
 export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["observe"]> }): Hono {
   const app = new Hono();
   const ring = deps.observe;
-  const reader = deps.observeSnapshots ?? createObserveSnapshotReader(deps);
   const startedAt = deps.now();
   const windows = { "1h": 3_600_000, "24h": 86_400_000, "7d": 604_800_000 };
   const paths = ["overview", "bots", "turns", "roundtrip", "attach", "approvals", "deliveries",
-    "devices", "events", "series", "cozyagents", "cozyagents/spend", "cozyagents/tools"] as const;
+    "devices", "events", "series"] as const;
   for (const path of paths) app.get(`/observe/api/${path}`, (c) => {
     const window = c.req.query("window") ?? "24h";
     if (!Object.hasOwn(windows, window)) return c.json({ error: { code: "invalid_request", message: "invalid window" } }, 400);
@@ -163,7 +57,6 @@ export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["ob
     const to = now + 1; // Store windows are half-open; include measurements made on this millisecond.
     const bot = c.req.query("bot");
     const query = { from, to, ...(bot === undefined ? {} : { bot: ring.identify(bot) }) };
-    const readerQuery = { from, to, ...(bot === undefined ? {} : { bot }) };
     const roster = deps.bots?.roster().bots ?? [];
     const selected = roster.filter((row) => bot === undefined || row.name === bot);
     const names = new Map(roster.map((row) => [ring.identify(row.name), row.name]));
@@ -200,18 +93,18 @@ export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["ob
       }
       case "overview": {
         const flaps = events("tunnel_flap", null);
-        const repairs = reader.attached() ? reader.internals(readerQuery).reduce((n, row) => n + row.toolServers.filter((server) => server.state === "repair_pending").length, 0) : 0;
+        const repairs = 0;
         return c.json({ gateway: { name: deps.gatewayInfo.name, version: deps.gatewayInfo.version,
           uptimeMs: Math.max(0, now - startedAt), bridge: deps.hermesBridgeAbsent ? "absent" : deps.bots?.health().online ? "online" : "offline" },
           attach, tunnel: { lastFlapAt: flaps[0]?.at ?? null, state: flaps[0]?.detail?.reason === "recovered" ? "online" : flaps.length ? "offline" : "unknown" },
           needsAPerson: { total: pending.length + repairs, approvals: pending.length, repairs },
           tiles: { firstToken: summary("ttft_ms"), roundTrip: summary("device_rtt_ms", false, null), turns: ring.store.countEvents({ ...query, kind: "turn_terminal" }),
-            spend: reader.attached() ? reader.throughput(readerQuery) : null } });
+            spend: null } });
       }
       case "bots": return c.json({ bots: selected.map((row) => {
         const hash = ring.identify(row.name);
         const turns = ring.store.events({ from, to, bot: hash, kind: "turn_terminal", limit: 5_000 });
-        return { id: hash, name: row.name, harness: row.runtime === "cozyagents" ? "cozyagents" : "hermes",
+        return { id: hash, name: row.name, harness: "hermes",
           online: deps.presenceOf(row.name) === "online", lastTurnAt: turns[0]?.at ?? null,
           firstToken: summary("ttft_ms", false, hash), sparkline: points("ttft_ms", hash), turns: ring.store.countEvents({ from, to, bot: hash, kind: "turn_terminal" }),
           failures: ring.store.countEvents({ from, to, bot: hash, kind: "turn_terminal", status: "failed" }),
@@ -230,7 +123,7 @@ export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["ob
       }
       case "roundtrip": return c.json({ byDevice: observeReceiptDistributions(ring, query), vpnComparisonSampleFloor: 30, hops: [
         ["device", "device_rtt_ms"], ["tunnel", "tunnel_rtt_ms"], ["gateway", "gateway_handle_ms"],
-        ["peer", "peer_rtt_ms"], ["model", "model_step_ms"], ["turn", "turn_ms"],
+        ["peer", "peer_rtt_ms"], ["turn", "turn_ms"],
       ].map(([hop, series]) => ({ hop, scope: hop === "device" || hop === "tunnel" ? "gateway" : "selected_bots",
         ...(hop === "peer" && bot !== undefined && deps.observeAttachPeers !== undefined
           ? aggregate(ring.store.summarize({ series: series!, from, to, includeTags: true,
@@ -254,21 +147,7 @@ export function observeRoutes(deps: AppDeps & { observe: NonNullable<AppDeps["ob
           state: row.state, sizeBytes: row.sizeBytes, createdAt: row.createdAt, committedAt: row.committedAt ?? null })),
         push: summary("push_result", false, null), events: events("push_result", null), pushScope: "gateway" });
       case "devices": return c.json({ devices: deps.storage.listDevices().map((row) => ({ id: ring.identify(row.id), name: row.name,
-        kind: row.kind, scope: row.scope, createdAt: row.createdAt, lastSeenAt: row.lastSeenAt })),
-        runners: (deps.runners?.list() ?? []).map((row) => ({ id: ring.identify(row.id), name: row.displayName ?? row.name,
-          online: deps.runnerPresence?.online(row.id) ?? false, lastContactAt: deps.runnerPresence?.lastContactAt(row.id) ?? row.lastSeenAt })) });
-      case "cozyagents": return c.json(reader.attached() ? { available: true, internals: reader.internals(readerQuery),
-        model: { stepLatency: summary("model_step_ms", true) } } : { available: false, reason: "no_snapshot_lane" });
-      case "cozyagents/spend": {
-        if (!reader.attached()) return c.json({ available: false, reason: "no_snapshot_lane" });
-        const result = reader.throughput(readerQuery);
-        return c.json({ available: true, priceSheet: { configured: result.priceSheetConfigured }, rows: result.rows });
-      }
-      case "cozyagents/tools": {
-        if (!reader.attached()) return c.json({ available: false, reason: "no_snapshot_lane" });
-        const result = reader.toolCosts(readerQuery);
-        return c.json({ available: true, priceSheet: { configured: result.priceSheetConfigured }, retryDetectionAvailable: result.retryDetectionAvailable ?? false, heavyDetectionAvailable: result.heavyDetectionAvailable ?? false, rows: result.rows });
-      }
+        kind: row.kind, scope: row.scope, createdAt: row.createdAt, lastSeenAt: row.lastSeenAt })) });
     }
   });
   return app;

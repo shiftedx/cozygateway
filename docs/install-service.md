@@ -24,22 +24,10 @@ ownership of those services; uninstall reverses only lifecycle work it caused.
 It also makes `cozygateway` available in new terminal sessions without a global
 package installation.
 
-The Windows bootstrap offers CozyAgents, Hermes Agent, or Both on interactive
-installs and reruns. Selecting a second agent adds it to the same gateway and
-keeps the existing agent. Both installs the Hermes attach profiles and a paired
-CozyAgents runner; it asks about the listener once and prints one device pairing
-QR after both are ready. Unattended repair keeps the recorded agent selection,
-CozyAgents home, model settings, runner credential, and Hermes profiles.
-Gateway updates reuse the recorded CozyAgents runtime when its Node executable
-and bundle are present and readable. This also allows an update from an elevated
-shell under the same Windows account without invoking CozyAgents' setup, which
-refuses elevation. Missing or damaged runtimes go through setup from a normal
-PowerShell window. Use CozyAgents' own updater to update that harness separately.
-Selecting CozyAgents from an elevated shell on an existing Hermes-only gateway
-updates Hermes' gateway and explicitly defers the harness addition until setup
-is run from a normal PowerShell window; the installer does not record it as installed.
-Uninstall removes the gateway's managed attachments and invokes CozyAgents' own
-uninstaller when that runner was installed.
+The Windows bootstrap installs or updates Hermes Agent and its selected attach
+profiles. Unattended repair keeps the recorded Hermes profile scope and gateway
+settings. An administrator shell hands setup to the same account's normal desktop
+context before product changes.
 
 On Windows, macOS, and Linux, missing Node.js 24+ is installed as a private,
 checksum-verified runtime under the CozyGateway home. Missing Hermes is
@@ -108,9 +96,7 @@ The same command works in Terminal on macOS/Linux and PowerShell on Windows:
 cozygateway uninstall --purge
 ```
 
-`--purge` permanently deletes the bots and files belonging to the CozyAgents
-runner installed with this Gateway. Without it, that runner's bot files remain.
-Both forms delete Gateway conversations, pairing credentials, configuration,
+`--purge` permanently deletes Gateway conversations, pairing credentials, configuration,
 logs, caches, backups, private tools, and the install directory. The command
 removes its service and PATH entry, managed Hermes plugins, generated credentials,
 and attachment database files. Cleanup failures return an error and retain the
@@ -123,8 +109,7 @@ cozygateway uninstall --purge --dry-run
 ```
 
 Hermes and its profiles/history, shared tools and model credentials, user projects,
-independently installed CozyAgents runners, and other apps such as CozyChat are
-separate installations and remain. Runtime-only installs remove only their
+and other apps such as CozyChat are separate installations and remain. Runtime-only installs remove only their
 Gateway; they do not claim independently managed Hermes connections.
 
 If the command is unavailable, use the installed script (adjust the directory for

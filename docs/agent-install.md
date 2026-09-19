@@ -8,36 +8,18 @@ Windows PowerShell 5.1+:
 irm https://cozylabs.ai/install.ps1 | iex
 ```
 
-The Windows bootstrap asks which harness to install on first setup and retains
-the installed selection on later runs. It checksum-verifies Gateway release assets,
-updates selected installed harnesses through their supported updaters, and opens
-model selection only when configuration is incomplete. A machine with no Hermes
-is offered CozyAgents first. The official NousResearch Windows installer runs when
-Hermes is selected and missing.
+The Windows bootstrap checksum-verifies the Gateway release assets, installs or
+updates Hermes Agent, and opens model selection only when configuration is
+incomplete. The official NousResearch Windows installer runs when Hermes is
+missing. The Gateway payload runs through Git Bash; when Bash is missing, setup
+installs a checksum-verified private Portable Git under the Gateway home. An
+elevated terminal hands setup to the same account's normal desktop context in a
+new PowerShell window. An account mismatch or unavailable normal desktop stops
+before product changes.
 
-`-Harness cozyagents` or `-Harness hermes` answers the question for an
-unattended run, and `-CozyAgentsInstaller <path or url>` names the CozyAgents
-Windows installer to use instead of the published `https://cozylabs.ai/agents.ps1`.
-`irm | iex` takes no parameters, so pass them like this:
-
-```powershell
-& ([scriptblock]::Create((irm https://cozylabs.ai/install.ps1))) -Harness cozyagents
-```
-
-The harness half on Windows is native: the CozyAgents installer is its own
-one-liner (`irm https://cozylabs.ai/agents.ps1 | iex`), needs no POSIX shell, and
-is run in this process, so no execution policy is consulted or changed. The
-gateway half uses `agent-install.sh` through Git Bash. When a working Bash is
-missing, Windows setup downloads official Portable Git, verifies its published
-SHA-256, and installs it privately under the Gateway home. It does not require a
-machine-wide Git installation. An elevated terminal hands setup to the same
-account's normal desktop context in a new PowerShell window. An account mismatch
-or unavailable normal desktop stops with instructions before product changes.
-
-The one-liner verifies live Gateway readiness and the CozyAgents updater's running
-version result. A failed component leaves its progress recorded for the next run;
-existing pairing and model files remain in place. Each product retains its own
-update and rollback rules.
+The one-liner verifies Gateway readiness and its selected Hermes attachments. A
+failed component leaves the existing pairing and model files in place for the
+next run.
 
 macOS/Linux:
 
@@ -45,78 +27,18 @@ macOS/Linux:
 curl -fsSL https://cozylabs.ai/install.sh | bash
 ```
 
-## The harness
+## Hermes Agent
 
-A bot needs a harness to run in. The installer scans for Hermes Agent first: a
-machine that already has one keeps it, with no question asked. A machine with
-none is asked which harness runs its bots, with CozyAgents recommended and
-chosen by Enter, by `--harness cozyagents`, and whenever there is no terminal to
-ask on. `--harness hermes` asks for the Hermes path on a machine with no Hermes,
-and the installer then fetches the official Hermes installer as it always has.
+The installer discovers Hermes Agent with `hermes -p <profile> config path`.
+When Hermes is absent, it verifies and runs the official Hermes installer before
+resuming. Each run keeps the configured Hermes profile scope unless an explicit
+`--profiles` value replaces it. `--uninstall` removes only CozyGateway-owned
+service registration, plugins, environment keys, spools, and state. `--no-qr`
+never prints a pairing QR. The installer refuses to run as root.
 
-On Windows the same choice is made by `-Harness`, by the same question, and by
-the same recorded `harness=` state; the shared installer is then told that the
-native bootstrap owns the harness half, so it installs the gateway alone and
-`scripts/install.ps1` asks the questions, runs `agents.ps1`, writes the runner
-model keys, mints the code and prints the QR.
-
-The CozyAgents path installs the same gateway with no Hermes bridge at all: no
-plugin, no profiles, no Hermes Dashboard, no attach-health wait, and a config
-with no `hermesEndpoints`. It then runs the CozyAgents installer from
-`https://cozylabs.ai/agents.sh` (`https://cozylabs.ai/agents.ps1` on Windows,
-with `-NoPair`) with `--no-pair`, mints a runner pairing code
-through the gateway's own storage (`cozygateway pair --kind runner --ttl 10`),
-and hands that code to `cozyagents runner pair`, so nobody types a code to pair
-the computer they are standing at. A second run upgrades the harness and keeps
-the pairing.
-
-Before that, the CozyAgents path asks the same two questions the Hermes path
-asks: a model provider (or a local endpoint URL) and a model id. They are
-written to `~/.cozyagents/runner.env` at 0600 (on Windows, an ACL granting only
-the owning user and SYSTEM, with inheritance disabled, because Windows ignores
-the POSIX mode) as `COZYRUNNER_MODEL_PROVIDER` or
-`COZYRUNNER_MODEL_ENDPOINT` plus `COZYRUNNER_MODEL_ID`, which is where the
-runner already reads its default model for every bot it creates. Naming both a
-provider and an endpoint is refused by name. No API key is ever written by the
-installer. When a Codex login is already on the machine
-(`~/.pi/agent/auth.json`, `%USERPROFILE%\.pi\agent\auth.json` on Windows, or a
-Codex token in the Hermes `.env`), the installer
-offers to share it with the bots that run here, so nobody has to paste a key;
-answering yes writes `COZYRUNNER_SHARE_HOST_MODEL_AUTH=1`.
-
-The minted pairing code reaches `cozyagents runner pair` in the environment, as
-`COZYAGENTS_PAIR_CODE`, and never in argv, where any process on this machine
-could read it. That command takes the code from argv first, from
-`COZYAGENTS_PAIR_CODE` next, and from its prompt last, so the installer's code
-is the one it uses without a terminal being involved.
-
-An install made before the harness question existed records a Hermes root and no
-harness line. It is read as a Hermes install, even when its Hermes binary has
-since moved and the scan finds nothing, and its `hermesEndpoints` are never
-removed. A Hermes bridge is taken out of a config only when CozyAgents was
-actually chosen: `--harness cozyagents`, the answer to the question, or a
-CozyAgents harness already recorded in this install's state. Anything else keeps
-the bridge and says so, and the run is then a Hermes install end to end: no
-CozyAgents harness is fetched, no runner is paired, no `COZYRUNNER_MODEL_*` key
-is written, the install records `harness=hermes`, and `--status` reports Hermes.
-The path stays frozen until someone passes `--harness cozyagents` or answers the
-question. On Windows the flag is `-Harness cozyagents`, which the `irm | iex`
-one-liner cannot carry: use the `[scriptblock]::Create` form shown above.
-
-`--uninstall` removes the CozyGateway service and state, and hands the harness
-back to its own uninstaller (`cozyagents uninstall`) rather than reimplementing
-it; on Windows the bootstrap does the same, removing the Scheduled Task, the
-Startup fallback and the PATH entry through the shared installer and the harness
-through the CozyAgents uninstaller. `--status` names the harness this install owns, and for a CozyAgents harness
-reports the runner's name, its last-seen time and whether it is attached, from
-`GET /runners/self` with the runner's own token sent on stdin rather than argv;
-with the gateway unreachable it reports the local runner state instead. `--no-qr`
-never prints a pairing QR, whatever the run is. The installer refuses to run as
-root on every path.
-
-The CozyAgents installer itself is not shipped from this repository: CozyAgents
-owns its own one-liner and payload, and the website pins their bytes. This
-installer only fetches and runs it.
+An existing install record marked `cozyagents` or `both` is preserved and the
+installer stops without changing it. Use the [CozyAgents embedded gateway](https://github.com/shiftedx/cozyagents)
+for that product, or install this Hermes gateway in a new gateway directory.
 
 If Node.js 24+ is unavailable, the Windows/macOS/Linux installer downloads the current
 Node.js 24 archive from nodejs.org, verifies it against that release's official
@@ -138,6 +60,46 @@ mints it its own attach token and spool rather than reusing the copied ones.
 Narrow the scope with `--profiles default,ops` only when that isolation is
 intentional.
 
+## Re-homing an install to a different Gateway
+
+A machine whose Hermes profiles already point at another CozyGateway is not
+adopted by accident. An ordinary run refuses each profile that carries a
+CozyGateway URL it does not own, and the refusal names both ways forward:
+`--runtime-only` keeps the existing attachment and updates only the runtime,
+and `--replace-gateway` moves those profiles to the Gateway being installed.
+
+`--replace-gateway` does that per selected profile: it stops the profile's
+Hermes gateway, copies the five `COZYGATEWAY_*` keys out of its `.env` and the
+whole `plugins/cozygateway` folder into
+`~/.cozygateway/local/backups/<timestamp>/profiles/<profile>/`, removes both,
+and continues with an ordinary install. Nothing else in the profile is read or
+moved, and the backup stays until someone deletes it. It cannot be combined
+with `--uninstall` or `--runtime-only`.
+
+A loaded Hermes gateway holds its attach target in memory and writes it back
+over its profile `.env`, so an edit made while it runs is undone seconds later.
+The installer stops a profile before changing its CozyGateway keys, reads the
+file back afterwards, and stops with a named failure when the write did not
+survive — a dev-box provisioner that re-attaches profiles is the usual cause,
+and it has to be unloaded first. A profile whose keys are already correct is
+never stopped.
+
+A `plugins/cozygateway` folder with no ownership marker is adopted when its
+`plugin.yaml` is byte-identical to the shipped archive's: that is this release
+installed before the marker existed. Any other unowned folder still fails
+closed and says that `--replace-gateway` is what moves it aside.
+
+Before a profile that is already running is left alone, the installer compares
+the attach target in its gateway log with the Gateway being configured, and
+restarts it when they differ. A profile whose process is still serving the old
+Gateway looks perfectly healthy in every file on disk.
+
+On a machine with an `active_profile`, a plain `hermes gateway run` means that
+profile rather than `default`, so a `default` profile gateway would be a second
+gateway for the active profile. The installer resolves `default` through
+`hermes config path` and skips it when it aliases a profile already selected;
+it never starts a profile gateway without naming the profile.
+
 The release bootstrap downloads and SHA-256 verifies three versioned release
 assets before execution: the gateway bundle, the complete Hermes attach plugin
 archive, and the installer payload. It never executes the mutable raw installer
@@ -148,12 +110,8 @@ matches the tagged script's Git blob identity from the GitHub Contents API
 before execution; downloads performed by that official installer remain under
 the NousResearch installer trust boundary.
 
-When the CozyAgents harness is selected, the shared installer verifies its secondary installer
-against the pinned release SHA-256 before executing it. A custom `COZYAGENTS_INSTALL_URL` requires
-an explicit `COZYAGENTS_INSTALL_SHA256` (64 hexadecimal characters); there is no unverified
-override. The pin establishes integrity for the reviewed release bytes. The public one-line
-bootstrap itself still relies on HTTPS delivery until a release-attestation-aware bootstrap is
-available; release workflows publish GitHub build attestations that operators can verify with
+The public one-line bootstrap relies on HTTPS delivery until a release-attestation-aware bootstrap
+is available; release workflows publish GitHub build attestations that operators can verify with
 `gh attestation verify` before using downloaded artifacts.
 
 For each selected profile it installs and enables the archive, writes only the

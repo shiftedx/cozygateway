@@ -3,11 +3,9 @@ The CozyGateway one-liner for Windows:
 
   irm https://cozylabs.ai/install.ps1 | iex
 
-It installs one CozyGateway for the person running it, under their own profile and with no
-administrator rights, and it offers Hermes Agent, CozyAgents, or both. Adding either harness
-preserves the other one on the same gateway. A machine with none is offered CozyAgents first, which installs
-the harness through its own native one-liner, pairs this computer as a runner with a code minted
-here, and never asks anybody to read a code off a screen.
+It installs one Hermes-compatible CozyGateway for the person running it, under their own profile
+and with no administrator rights. It installs or updates Hermes Agent, then connects the selected
+Hermes profiles through the matching attach plugin.
 
 `irm | iex` runs in the current process, so the execution policy is not consulted and this script
 never offers to change it.
@@ -18,14 +16,6 @@ param(
     [switch] $Uninstall,
     [switch] $Purge,
     [switch] $DryRun,
-    # Skips the harness question. Adding a harness preserves the other installed harness.
-    # Invoke-Expression adds this attribute before binding defaults; its empty initial value is valid.
-    [ValidateSet('', 'cozyagents', 'hermes', 'both')]
-    [string] $Harness,
-    # The CozyAgents Windows installer, as a path or a URL. Defaults to the published one-liner.
-    [string] $CozyAgentsInstaller,
-    # Required for a custom CozyAgents installer source. The default is pinned below.
-    [string] $CozyAgentsInstallerSha256,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]] $InstallerArguments
 )
@@ -43,10 +33,6 @@ $ProgressPreference = 'SilentlyContinue'
 # on. Windows PowerShell 5.1 has no such variable, and assigning it there is harmless.
 $PSNativeCommandUseErrorActionPreference = $false
 
-$script:CozyAgentsInstallUrlDefault = 'https://cozylabs.ai/agents.ps1'
-# CozyAgents v0.2.17 agents.ps1; verified against the release asset digest. v0.2.16 is the one
-# release this must never be left pointing at: it could not install on Windows at all.
-$script:CozyAgentsInstallSha256Default = '0c6b7980928cf3171ef6e3909e24c14c120ff76d99a52d41e294e1ee7fcbd8bb'
 # Initialized here so Release-BootstrapLock can read them under StrictMode without a cmdlet,
 # including on a path where the lock was never acquired.
 $script:BootstrapLockHandle = $null
@@ -532,7 +518,7 @@ function Test-BootstrapWindows {
 }
 
 # These are the small, durable Gateway runtime contract. They deliberately omit
-# databases, logs, sockets, Hermes profiles, and CozyAgents state: a bootstrap
+# databases, logs, sockets, and Hermes profiles: a bootstrap
 # rollback must restore the Gateway launcher without trying to rewind user data.
 function Get-BootstrapRuntimeFiles {
     return @(
@@ -2084,47 +2070,29 @@ function Resolve-GitBash {
     return Ensure-WindowsGitBash -InstallHome $script:InstallHome
 }
 
-# The shared installer owns the gateway on every platform. On the CozyAgents harness it owns only
-# the gateway: COZYGATEWAY_WINDOWS_HARNESS_OWNER tells it that this script asks the model and
-# network questions, installs the harness, pairs the runner and prints the QR.
+# The shared installer owns the Hermes gateway and its matching attach plugin.
 function Invoke-CozyGatewayInstaller {
     param(
         [string] $BashPath,
         [string] $InstallerPath,
         [string] $HermesPath,
-        [string[]] $ForwardedArguments,
-        [string] $HarnessName = 'hermes',
-        [string[]] $HarnessArguments = @()
+        [string[]] $ForwardedArguments
     )
-    $arguments = @($InstallerPath, '--service-platform', 'Windows', '--gateway-dir', $script:InstallHome, '--bundle', $script:BundlePath, '--harness', $HarnessName)
-    if ($HarnessName -eq 'hermes') {
-        $arguments += @('--plugin-archive', $script:PluginPath)
-    }
-    if ($HarnessArguments) { $arguments += $HarnessArguments }
+    $arguments = @($InstallerPath, '--service-platform', 'Windows', '--gateway-dir', $script:InstallHome, '--bundle', $script:BundlePath, '--plugin-archive', $script:PluginPath)
     if ($env:COZYGATEWAY_INSTALL_DRYRUN -eq '1') { $arguments += '--dry-run' }
     if ($ForwardedArguments) { $arguments += $ForwardedArguments }
     $previousHermes = [Environment]::GetEnvironmentVariable('COZYGATEWAY_HERMES_BIN', 'Process')
     $previousPowerShell = [Environment]::GetEnvironmentVariable('COZYGATEWAY_POWERSHELL', 'Process')
-    $previousOwner = [Environment]::GetEnvironmentVariable('COZYGATEWAY_WINDOWS_HARNESS_OWNER', 'Process')
-    $previousAgentsHome = [Environment]::GetEnvironmentVariable('COZYAGENTS_HOME', 'Process')
     $trustedPowerShell = [IO.Path]::Combine([Environment]::SystemDirectory, 'WindowsPowerShell', 'v1.0', 'powershell.exe')
     if (-not (Test-Path -LiteralPath $trustedPowerShell -PathType Leaf)) { Fail 'native Windows PowerShell is unavailable' }
     try {
         $env:COZYGATEWAY_HERMES_BIN = $HermesPath
         $env:COZYGATEWAY_POWERSHELL = $trustedPowerShell
-        if ($HarnessName -eq 'cozyagents') {
-            $env:COZYGATEWAY_WINDOWS_HARNESS_OWNER = '1'
-            # The shared installer records the harness home as a POSIX path it can act on later.
-            # A native path handed to it here would be recorded as one, and read back as unsafe.
-            [Environment]::SetEnvironmentVariable('COZYAGENTS_HOME', $null, 'Process')
-        }
         & $BashPath @arguments
         if ($LASTEXITCODE -ne 0) { Fail "CozyGateway installer exited $LASTEXITCODE" }
     } finally {
         [Environment]::SetEnvironmentVariable('COZYGATEWAY_HERMES_BIN', $previousHermes, 'Process')
         [Environment]::SetEnvironmentVariable('COZYGATEWAY_POWERSHELL', $previousPowerShell, 'Process')
-        [Environment]::SetEnvironmentVariable('COZYGATEWAY_WINDOWS_HARNESS_OWNER', $previousOwner, 'Process')
-        [Environment]::SetEnvironmentVariable('COZYAGENTS_HOME', $previousAgentsHome, 'Process')
     }
 }
 
@@ -2180,7 +2148,7 @@ function Set-CozyGatewayCommandPath {
 }
 
 # ---------------------------------------------------------------------------
-# The harness choice, and the CozyAgents half of it
+# Hermes setup helpers
 # ---------------------------------------------------------------------------
 
 # The supported one-liner is pasted into a terminal, where Read-Host is the person. An unattended
@@ -2243,744 +2211,6 @@ function Test-HermesBridge {
 }
 
 # Each selection adds to the harnesses already registered with this gateway.
-function Select-Harness {
-    param([string] $Requested, [string] $StatePath, [string] $ConfigPath)
-    $recorded = Get-RecordedHarness $StatePath
-    if ($recorded -notin @('', 'hermes', 'cozyagents', 'both')) { Fail 'installer state has an invalid harness' }
-    $hasHermes = $recorded -in @('hermes', 'both') -or (Test-HermesBridge $ConfigPath)
-    $hasAgents = $recorded -in @('cozyagents', 'both')
-    if (-not $Requested -and (Test-Path -LiteralPath $ConfigPath -PathType Leaf) -and ($recorded -or $hasHermes)) {
-        $existing = if ($hasHermes -and $hasAgents) { 'both' } elseif ($hasAgents) { 'cozyagents' } else { 'hermes' }
-        Write-Ok "harness: $existing (already installed here)"
-        return $existing
-    }
-    $default = if ($hasHermes -and $hasAgents) { 'both' } elseif ($hasAgents) { 'cozyagents' } elseif ($hasHermes -or (Find-Hermes)) { 'hermes' } else { 'cozyagents' }
-    $harness = $Requested
-    $source = 'from -Harness'
-    if (-not $harness) {
-        $harness = $default
-        $source = 'already installed here'
-        if (Test-PromptAvailable 'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT') {
-            $fallback = switch ($default) { 'hermes' { '2' }; 'both' { '3' }; default { '1' } }
-            Write-Host ''
-            Write-Host 'Choose what will run your bots on this computer.'
-            Write-Host '  1. CozyAgents (recommended for new users)'
-            Write-Host '  2. Hermes Agent'
-            Write-Host '  3. Both'
-            Write-Host 'Setup will install what you need. Press Enter to use the suggested choice.'
-            while ($true) {
-                $answer = Get-PromptAnswer "Pick 1, 2 or 3 [$fallback]" 'COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT' $fallback
-                if ($null -eq $answer) { break }
-                $normalized = $answer.ToLowerInvariant()
-                if ($normalized -in @('1', 'c', 'cozyagents')) { $harness = 'cozyagents'; break }
-                if ($normalized -in @('2', 'h', 'hermes')) { $harness = 'hermes'; break }
-                if ($normalized -in @('3', 'b', 'both')) { $harness = 'both'; break }
-                Write-Host 'Please answer 1, 2 or 3.'
-            }
-            $source = 'selected'
-        }
-    }
-    if (($hasHermes -and $harness -eq 'cozyagents') -or ($hasAgents -and $harness -eq 'hermes') -or $recorded -eq 'both') {
-        $harness = 'both'
-        Write-Info 'Keeping your existing agents as well. Both will use the same Gateway.'
-    }
-    Write-Ok "harness: $harness ($source)"
-    return $harness
-}
-
-# CozyAgents setup refuses elevation. Gateway updates can reuse its existing runtime
-# without invoking that installer; require a normal token only when setup is needed.
-
-
-
-
-function Test-SafeModelWord {
-    param([string] $Value)
-    return ($Value -cmatch '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$')
-}
-
-function Test-SafeModelEndpoint {
-    param([string] $Value)
-    return ($Value -cmatch '^https?://[A-Za-z0-9._~:/?#@%+=-]{1,255}$')
-}
-
-function Get-WindowsPiAgentHome {
-    if (-not [string]::IsNullOrWhiteSpace($env:PI_CODING_AGENT_DIR)) { return $env:PI_CODING_AGENT_DIR.Trim() }
-    return (Join-Path $env:USERPROFILE '.pi\agent')
-}
-
-# Optional discovery must never modify account files or surface their contents/errors.
-function Read-WindowsModelJson {
-    param([string] $Path)
-    $stream = $null; $reader = $null
-    try {
-        Assert-BootstrapRegularFile $Path 'saved model settings' -MustExist
-        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-        if ($stream.Length -gt 1048576) { return $null }
-        $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true)
-        $value = $reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop
-        if ($value -isnot [pscustomobject]) { return $null }
-        return $value
-    } catch { return $null }
-    finally { if ($reader) { $reader.Dispose() } elseif ($stream) { $stream.Dispose() } }
-}
-
-function Get-WindowsModelProperty {
-    param($Value, [string] $Name)
-    if ($null -eq $Value -or $Value -isnot [pscustomobject]) { return $null }
-    $property = $Value.PSObject.Properties[$Name]
-    if ($null -ne $property) { return $property.Value }
-    return $null
-}
-
-function Test-WindowsSavedProviderAuth {
-    param($Record)
-    $kind = Get-WindowsModelProperty $Record 'type'
-    if ($kind -eq 'oauth') {
-        $access = Get-WindowsModelProperty $Record 'access'
-        $refresh = Get-WindowsModelProperty $Record 'refresh'
-        $expires = Get-WindowsModelProperty $Record 'expires'
-        return ($access -is [string] -and -not [string]::IsNullOrWhiteSpace($access) -and
-            $refresh -is [string] -and -not [string]::IsNullOrWhiteSpace($refresh) -and
-            ($expires -is [long] -or $expires -is [int] -or $expires -is [double] -or $expires -is [decimal]) -and
-            -not [double]::IsNaN([double]$expires) -and -not [double]::IsInfinity([double]$expires))
-    }
-    if ($kind -eq 'api_key') {
-        $key = Get-WindowsModelProperty $Record 'key'
-        return ($key -is [string] -and -not [string]::IsNullOrWhiteSpace($key))
-    }
-    return $false
-}
-
-# This detects a saved Pi Codex account, not an arbitrary auth file or Hermes key.
-# Expired access tokens can still be refreshed by Pi; do not mutate them here.
-function Find-CodexLogin {
-    $auth = $env:COZYGATEWAY_CODEX_AUTH_PATH
-    if ([string]::IsNullOrWhiteSpace($auth)) { $auth = Join-Path (Get-WindowsPiAgentHome) 'auth.json' }
-    $record = Get-WindowsModelProperty (Read-WindowsModelJson $auth) 'openai-codex'
-    if ((Get-WindowsModelProperty $record 'type') -eq 'oauth' -and (Test-WindowsSavedProviderAuth $record)) { return $auth }
-    return $null
-}
-
-function Get-WindowsSavedProviderCatalog {
-    param([string] $Provider = '')
-    $piHome = Get-WindowsPiAgentHome
-    $settings = Read-WindowsModelJson (Join-Path $piHome 'settings.json')
-    $savedProvider = Get-WindowsModelProperty $settings 'defaultProvider'
-    if ([string]::IsNullOrWhiteSpace($Provider) -and $savedProvider -is [string] -and (Test-SafeModelWord $savedProvider)) { $Provider = $savedProvider }
-    $result = [pscustomobject]@{ Provider = ''; DefaultModel = ''; Models = @(); AuthConfigured = $false; RequiresSharedConfig = $false }
-    if (-not (Test-SafeModelWord $Provider)) { return $result }
-    $result.Provider = $Provider
-    $savedModel = Get-WindowsModelProperty $settings 'defaultModel'
-    if ($Provider -ceq $savedProvider -and $savedModel -is [string] -and (Test-SafeModelWord $savedModel)) { $result.DefaultModel = $savedModel }
-    $auth = Read-WindowsModelJson (Join-Path $piHome 'auth.json')
-    $result.AuthConfigured = Test-WindowsSavedProviderAuth (Get-WindowsModelProperty $auth $Provider)
-    if ($Provider -eq 'openai-codex') { $result.AuthConfigured = [bool](Find-CodexLogin) }
-    $custom = Get-WindowsModelProperty (Get-WindowsModelProperty (Read-WindowsModelJson (Join-Path $piHome 'models.json')) 'providers') $Provider
-    $result.RequiresSharedConfig = $null -ne $custom
-    $cached = Get-WindowsModelProperty (Read-WindowsModelJson (Join-Path $piHome 'models-store.json')) $Provider
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
-    $models = New-Object 'System.Collections.Generic.List[object]'
-    if ($result.DefaultModel) {
-        $null = $seen.Add($result.DefaultModel)
-        $models.Add([pscustomobject]@{ Id = $result.DefaultModel; Name = $result.DefaultModel; Source = 'saved default' })
-    }
-    foreach ($source in @(@{Value=$custom;Name='saved configuration'}, @{Value=$cached;Name='saved catalog'})) {
-        foreach ($model in @(Get-WindowsModelProperty $source.Value 'models')) {
-            if ($models.Count -ge 200) { break }
-            $id = Get-WindowsModelProperty $model 'id'
-            if ($id -isnot [string] -or -not (Test-SafeModelWord $id) -or -not $seen.Add($id)) { continue }
-            $name = Get-WindowsModelProperty $model 'name'
-            if ($name -isnot [string] -or $name.Length -gt 128 -or $name -match '[\x00-\x1f\x7f]' -or [string]::IsNullOrWhiteSpace($name)) { $name = $id }
-            $models.Add([pscustomobject]@{ Id=$id; Name=$name; Source=$source.Name })
-        }
-    }
-    $result.Models = @($models.ToArray())
-    return $result
-}
-
-function Get-WindowsSavedProviderChoices {
-    $piHome = Get-WindowsPiAgentHome
-    $names = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
-    $default = Get-WindowsModelProperty (Read-WindowsModelJson (Join-Path $piHome 'settings.json')) 'defaultProvider'
-    if ($default -is [string] -and (Test-SafeModelWord $default)) { $null = $names.Add($default) }
-    foreach ($record in @(
-        (Read-WindowsModelJson (Join-Path $piHome 'auth.json')),
-        (Read-WindowsModelJson (Join-Path $piHome 'models-store.json')),
-        (Get-WindowsModelProperty (Read-WindowsModelJson (Join-Path $piHome 'models.json')) 'providers')
-    )) {
-        if ($record -isnot [pscustomobject]) { continue }
-        foreach ($property in $record.PSObject.Properties) {
-            if ($names.Count -ge 50) { break }
-            if (Test-SafeModelWord $property.Name) { $null = $names.Add($property.Name) }
-        }
-    }
-    $ordered = @($names | Sort-Object)
-    if ($default -is [string] -and $names.Contains($default)) { $ordered = @($default) + @($ordered | Where-Object { $_ -cne $default }) }
-    foreach ($name in $ordered) {
-        $catalog = Get-WindowsSavedProviderCatalog $name
-        if ($catalog.Models.Count -gt 0 -or $catalog.AuthConfigured) { $catalog }
-    }
-}
-
-# The CozyAgents half of provider-and-model onboarding: the same pair of questions the Hermes path
-# asks, answered once, and written to the runner env by Write-RunnerModelEnv.
-function Invoke-CozyLocalModelsRequest {
-    param([string] $Endpoint)
-    # Fixed loopback URLs only; no credentials, proxy, or redirects.
-    if ($Endpoint -notin @('http://127.0.0.1:1234/v1', 'http://127.0.0.1:11434/v1')) { return '' }
-    $request = $null; $response = $null; $stream = $null; $buffer = $null
-    $clock = [Diagnostics.Stopwatch]::StartNew()
-    try {
-        $request = [Net.HttpWebRequest]::Create($Endpoint + '/models')
-        $request.Method = 'GET'; $request.Accept = 'application/json'
-        $request.AllowAutoRedirect = $false; $request.Proxy = $null
-        $request.UseDefaultCredentials = $false; $request.Credentials = $null
-        $request.Timeout = 800; $request.ReadWriteTimeout = 800
-        $response = $request.GetResponse()
-        if ([int]$response.StatusCode -ne 200 -or $response.ContentLength -gt 65536) { return '' }
-        $stream = $response.GetResponseStream()
-        $buffer = New-Object IO.MemoryStream
-        $chunk = New-Object byte[] 4096
-        while ($true) {
-            $remaining = 1200 - [int]$clock.ElapsedMilliseconds
-            if ($remaining -le 0) { return '' }
-            $stream.ReadTimeout = $remaining
-            $count = $stream.Read($chunk, 0, [Math]::Min($chunk.Length, 65537 - [int]$buffer.Length))
-            if ($count -eq 0) { break }
-            $buffer.Write($chunk, 0, $count)
-            if ($buffer.Length -gt 65536) { return '' }
-        }
-        return (New-Object Text.UTF8Encoding($false, $true)).GetString($buffer.ToArray())
-    } catch { return '' }
-    finally {
-        if ($buffer) { $buffer.Dispose() }; if ($stream) { $stream.Dispose() }
-        if ($response) { $response.Dispose() }; if ($request) { $request.Abort() }
-    }
-}
-
-function Get-CozyLocalModelIds {
-    param([string] $Endpoint)
-    if ($Endpoint -notin @('http://127.0.0.1:1234/v1', 'http://127.0.0.1:11434/v1')) { return @() }
-    try {
-        $text = Invoke-CozyLocalModelsRequest $Endpoint
-        if ([string]::IsNullOrWhiteSpace($text)) { return @() }
-        $catalog = $text | ConvertFrom-Json -ErrorAction Stop
-        if (-not $catalog -or -not $catalog.PSObject.Properties['data']) { return @() }
-        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
-        foreach ($model in @($catalog.data)) {
-            if ($null -eq $model -or -not $model.PSObject.Properties['id'] -or $model.id -isnot [string]) { continue }
-            if ($model.PSObject.Properties['type'] -and [string]$model.type -in @('embedding', 'embeddings')) { continue }
-            if ($model.PSObject.Properties['capabilities'] -and @($model.capabilities).Count -gt 0 -and 'embedding' -in @($model.capabilities) -and 'completion' -notin @($model.capabilities) -and 'chat' -notin @($model.capabilities)) { continue }
-            if ((Test-SafeModelWord $model.id) -and $seen.Add($model.id)) { Write-Output $model.id }
-            if ($seen.Count -ge 64) { break }
-        }
-    } catch { return @() }
-}
-
-function Find-CozyLocalModels {
-    foreach ($server in @(
-        @{ Name = 'LM Studio'; Endpoint = 'http://127.0.0.1:1234/v1' },
-        @{ Name = 'Ollama'; Endpoint = 'http://127.0.0.1:11434/v1' }
-    )) {
-        foreach ($id in @(Get-CozyLocalModelIds $server.Endpoint)) {
-            [pscustomobject]@{ Server = $server.Name; Endpoint = $server.Endpoint; Id = $id }
-        }
-    }
-}
-
-function Select-CozyLocalModel {
-    param([object[]] $Models)
-    if ($Models.Count -eq 0) { return $null }
-    if ($Models.Count -eq 1) { Write-Info "Found $($Models[0].Id) in $($Models[0].Server); using that local model."; return $Models[0] }
-    Write-Host 'Local models found on this computer:'
-    for ($index = 0; $index -lt $Models.Count; $index++) { Write-Host "  $($index + 1). $($Models[$index].Id) ($($Models[$index].Server))" }
-    Write-Host '  0. Enter a different endpoint and model'
-    for ($attempt = 0; $attempt -lt 5; $attempt++) {
-        $choice = Get-PromptAnswer 'Choose a local model number [1]' 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' '1'
-        if ([string]::IsNullOrWhiteSpace($choice) -or $choice -eq '0') { return $null }
-        $number = 0
-        if ([int]::TryParse($choice, [ref]$number) -and $number -ge 1 -and $number -le $Models.Count) { return $Models[$number - 1] }
-        Write-Host "Please choose a number from 1 to $($Models.Count), or 0 for manual setup."
-    }
-    Fail 'No local model selected. Start your model app and rerun setup, or provide its endpoint and model explicitly.'
-}
-
-function Confirm-CozyAgentsModel {
-    param([string] $RunnerEnvPath)
-    $answers = @{ Provider = ''; Endpoint = ''; Id = ''; ShareHostAuth = $false }
-    $provider = $env:COZYGATEWAY_RUNNER_MODEL_PROVIDER
-    $endpoint = $env:COZYGATEWAY_RUNNER_MODEL_ENDPOINT
-    $id = $env:COZYGATEWAY_RUNNER_MODEL_ID
-    if (-not [string]::IsNullOrWhiteSpace($provider) -and -not [string]::IsNullOrWhiteSpace($endpoint)) {
-        Fail 'COZYGATEWAY_RUNNER_MODEL_PROVIDER and COZYGATEWAY_RUNNER_MODEL_ENDPOINT are mutually exclusive; a bot has one model source'
-    }
-    if ((-not [string]::IsNullOrWhiteSpace($provider)) -or (-not [string]::IsNullOrWhiteSpace($endpoint))) {
-        if ([string]::IsNullOrWhiteSpace($id)) { Fail 'a model provider or endpoint needs COZYGATEWAY_RUNNER_MODEL_ID as well' }
-        $answers.Provider = [string]$provider
-        $answers.Endpoint = [string]$endpoint
-        $answers.Id = [string]$id
-        $source = if ($answers.Provider) { $answers.Provider } else { $answers.Endpoint }
-        Write-Ok "default model for new bots: $($answers.Id) on $source"
-        return $answers
-    }
-    if (-not [string]::IsNullOrWhiteSpace($id)) { Fail 'COZYGATEWAY_RUNNER_MODEL_ID needs COZYGATEWAY_RUNNER_MODEL_PROVIDER or COZYGATEWAY_RUNNER_MODEL_ENDPOINT' }
-    $savedProvider = Get-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_PROVIDER'
-    $savedEndpoint = Get-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_ENDPOINT'
-    $savedId = Get-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_ID'
-    $validProvider = $savedProvider -and -not $savedEndpoint -and (Test-SafeModelWord $savedProvider)
-    $validEndpoint = $savedEndpoint -and -not $savedProvider -and (Test-SafeModelEndpoint $savedEndpoint)
-    if ((Test-SafeModelWord $savedId) -and ($validProvider -or $validEndpoint)) {
-        $answers.Provider = $savedProvider
-        $answers.Endpoint = $savedEndpoint
-        $answers.Id = $savedId
-        $answers.ShareHostAuth = (Get-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_SHARE_HOST_MODEL_AUTH') -eq '1'
-        $answers.PreserveExisting = $true
-        Write-Ok 'CozyAgents provider and model are already configured; keeping the saved model settings'
-        return $answers
-    }
-    if (-not (Test-PromptAvailable 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT')) {
-        Write-Info "no terminal to ask about a model on; set COZYRUNNER_MODEL_PROVIDER (or COZYRUNNER_MODEL_ENDPOINT) and COZYRUNNER_MODEL_ID in $RunnerEnvPath"
-        return $answers
-    }
-    Write-Info 'Checking for saved AI settings and models running on this computer...'
-    $localModels = @(Find-CozyLocalModels)
-    $savedChoices = @(Get-WindowsSavedProviderChoices | Where-Object { -not $_.RequiresSharedConfig })
-    $defaultChoice = if ($localModels.Count -gt 0) { '2' } else { '1' }
-    for ($index = 0; $index -lt $savedChoices.Count; $index++) {
-        if ($savedChoices[$index].AuthConfigured -and @($savedChoices[$index].Models).Count -gt 0) {
-            $defaultChoice = [string]($index + 4)
-            break
-        }
-    }
-    $numericChoice = $false
-    for ($attempt = 0; $attempt -lt 5; $attempt++) {
-        Write-Host 'Which provider should new bots use?'
-        Write-Host '  1. OpenAI Codex'
-        Write-Host "  2. Local endpoint (LM Studio, Ollama; $($localModels.Count) models found)"
-        Write-Host '  3. Another provider'
-        for ($index = 0; $index -lt $savedChoices.Count; $index++) { Write-Host "  $($index + 4). $($savedChoices[$index].Provider) (saved settings)" }
-        $choice = Get-PromptAnswer "Pick a provider number [$defaultChoice]" 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' $defaultChoice
-        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = $defaultChoice }
-        $numericChoice = $choice -match '^\d+$'
-        if ($numericChoice -and ([double]$choice -lt 1 -or [double]$choice -ge (4 + $savedChoices.Count))) {
-            Write-Host "Please pick a number from 1 to $(3 + $savedChoices.Count)."
-            continue
-        }
-        if ($numericChoice) { $choice = [string][int]$choice }
-        if ($choice -eq '2') {
-            $selected = Select-CozyLocalModel -Models $localModels
-            if ($selected) { $answers.Endpoint = $selected.Endpoint; $answers.Id = $selected.Id; break }
-            Write-Info 'No local model selected. Start or load a model in your local app, or enter its endpoint below.'
-        }
-        $answer = switch ($choice) {
-            '1' { 'openai-codex' }
-            '2' { Get-PromptAnswer 'Local endpoint URL [http://127.0.0.1:1234/v1]' 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' 'http://127.0.0.1:1234/v1' }
-            '3' { Get-PromptAnswer 'Provider name (for example, anthropic or openai)' 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' '' }
-            default { if ($numericChoice) { $savedChoices[[int]$choice - 4].Provider } else { $choice } } # Preserve direct scripted inputs.
-        }
-        if ($choice -eq '2' -and -not (Test-SafeModelEndpoint $answer)) {
-            Write-Host 'That is not a usable endpoint URL.'
-            continue
-        }
-        if ($choice -eq '3' -and -not (Test-SafeModelWord $answer)) {
-            Write-Host 'Enter a provider name using letters, digits, and . _ : / -'
-            continue
-        }
-        if ($answer -like 'http://*' -or $answer -like 'https://*') {
-            if (Test-SafeModelEndpoint $answer) { $answers.Endpoint = $answer; break }
-            Write-Host 'That is not a usable endpoint URL.'
-        } else {
-            if (Test-SafeModelWord $answer) { $answers.Provider = $answer; break }
-            Write-Host 'Provider names are letters, digits, and . _ : / -'
-        }
-    }
-    if (-not $answers.Provider -and -not $answers.Endpoint) { Fail 'No model provider selected. Run setup again and choose a listed provider or local endpoint.' }
-    if ($answers.Provider -and $numericChoice) {
-        $catalog = Get-WindowsSavedProviderCatalog $answers.Provider
-        if (-not $catalog.PSObject.Properties['RequiresSharedConfig'] -or -not $catalog.RequiresSharedConfig) {
-            if ($catalog.DefaultModel) { $answers.Id = $catalog.DefaultModel }
-            elseif (@($catalog.Models).Count -eq 1) { $answers.Id = $catalog.Models[0].Id }
-            elseif (@($catalog.Models).Count -gt 1) {
-                Write-Host 'Saved models (availability has not been checked):'
-                for ($index = 0; $index -lt $catalog.Models.Count; $index++) { Write-Host "  $($index + 1). $($catalog.Models[$index].Id)" }
-                Write-Host '  0. Enter a different model ID'
-                for ($attempt = 0; $attempt -lt 5; $attempt++) {
-                    $modelChoice = Get-PromptAnswer 'Choose a model number [1]' 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' '1'
-                    if ($modelChoice -eq '0') { break }
-                    $number = 0
-                    if ([int]::TryParse($modelChoice, [ref]$number) -and $number -ge 1 -and $number -le $catalog.Models.Count) { $answers.Id = $catalog.Models[$number - 1].Id; break }
-                    Write-Host 'Choose a listed model number, or 0 for manual setup.'
-                }
-            }
-        }
-    }
-    if (-not $answers.Id) { Write-Info 'Copy the model ID from your provider dashboard or local model app.' }
-    for ($attempt = 0; -not $answers.Id -and $attempt -lt 5; $attempt++) {
-        $answer = Get-PromptAnswer 'Which model ID should new bots use?' 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' ''
-        if ([string]::IsNullOrWhiteSpace($answer)) { Fail 'No model selected. Start your model app or check your provider model list, then run setup again.' }
-        if ($null -ne $answer -and (Test-SafeModelWord $answer)) { $answers.Id = $answer; break }
-        Write-Host 'Model ids are letters, digits, and . _ : / -'
-    }
-    if (-not $answers.Id) { Fail 'No valid model selected. Check your model app or provider model list, then run setup again.' }
-    if ($answers.Provider) {
-        $selectedCatalog = Get-WindowsSavedProviderCatalog $answers.Provider
-        $hasSavedAuth = $selectedCatalog.AuthConfigured
-        if ($answers.Provider -eq 'openai-codex') { $hasSavedAuth = [bool](Find-CodexLogin) }
-        if ($hasSavedAuth) {
-            for ($attempt = 0; $attempt -lt 5; $attempt++) {
-                $answer = Get-PromptAnswer "Share the saved Pi model credentials and settings in $(Get-WindowsPiAgentHome) with bots on this computer? [y/N]" 'COZYGATEWAY_TEST_MODEL_PROMPT_INPUT' 'n'
-                if ($null -eq $answer) { break }
-                $normalized = $answer.ToLowerInvariant()
-                if ($normalized -eq 'y' -or $normalized -eq 'yes') { $answers.ShareHostAuth = $true; $answers.SharedPiAgentDir = Get-WindowsPiAgentHome; break }
-                if ($normalized -eq 'n' -or $normalized -eq 'no') { break }
-                Write-Host 'Please answer y or n.'
-            }
-        }
-        if (-not $answers.ShareHostAuth) {
-            $answers.NeedsAccount = $true
-            Write-Info "Model selected. Before a bot can use $($answers.Provider), connect that account in the agent's model settings."
-            Write-Info 'Setup will finish installing the apps; it has not verified access to this AI account.'
-        }
-    }
-    $source = if ($answers.Provider) { $answers.Provider } else { $answers.Endpoint }
-    Write-Ok "default model for new bots: $($answers.Id) on $source"
-    return $answers
-}
-
-# Windows ignores the POSIX mode on a file, so a 0600 there is a lie. This resets the ACL to the
-# owning user plus SYSTEM with inheritance disabled, and throws when it cannot.
-function Protect-FileToOwner {
-    param([string] $Path)
-    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
-    $system = New-Object Security.Principal.SecurityIdentifier([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
-    $acl = New-Object Security.AccessControl.FileSecurity
-    $acl.SetAccessRuleProtection($true, $false)
-    foreach ($identity in @($currentUser, $system)) {
-        $rule = New-Object Security.AccessControl.FileSystemAccessRule(
-            $identity,
-            [Security.AccessControl.FileSystemRights]::FullControl,
-            [Security.AccessControl.AccessControlType]::Allow
-        )
-        [void]$acl.AddAccessRule($rule)
-    }
-    if ($PSVersionTable.PSEdition -eq 'Core') {
-        [IO.FileSystemAclExtensions]::SetAccessControl((Get-Item -LiteralPath $Path), $acl)
-    } else {
-        (Get-Item -LiteralPath $Path).SetAccessControl($acl)
-    }
-}
-
-function Get-RunnerEnvValue {
-    param([string] $Path, [string] $Name)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
-    $line = Get-Content -LiteralPath $Path | Where-Object { $_ -like "$Name=*" } | Select-Object -Last 1
-    if (-not $line) { return '' }
-    return ([string]$line).Substring($Name.Length + 1).Trim()
-}
-
-function Set-RunnerEnvValue {
-    param([string] $Path, [string] $Name, [string] $Value, [switch] $Remove)
-    $lines = @()
-    if (Test-Path -LiteralPath $Path -PathType Leaf) {
-        $lines = @(Get-Content -LiteralPath $Path | Where-Object { -not ($_ -like "$Name=*") })
-    }
-    if (-not $Remove) { $lines += "$Name=$Value" }
-    [IO.File]::WriteAllText($Path, (($lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
-    Protect-FileToOwner $Path
-}
-
-# The answers land in the runner env CozyAgents already reads, next to the pairing token and never
-# in this installer's own state. No key is ever written here.
-function Write-RunnerModelEnv {
-    param([string] $RunnerEnvPath, [hashtable] $Answers)
-    if ($Answers.ContainsKey('PreserveExisting') -and $Answers.PreserveExisting) { return }
-    if (-not $Answers.Provider -and -not $Answers.Endpoint) { return }
-    if (-not $Answers.Id) { return }
-    $sharedPiDirectory = ''
-    if ($Answers.ShareHostAuth) {
-        $sharedPiDirectory = if ($Answers.ContainsKey('SharedPiAgentDir')) { [string]$Answers.SharedPiAgentDir } else { Get-WindowsPiAgentHome }
-        if ([string]::IsNullOrWhiteSpace($sharedPiDirectory) -or $sharedPiDirectory -match '[\r\n"]' -or -not [IO.Path]::IsPathRooted($sharedPiDirectory)) {
-            Fail 'The saved account directory is not a usable absolute Windows path; model settings were not changed.'
-        }
-        $sharedPiDirectory = [IO.Path]::GetFullPath($sharedPiDirectory)
-        Assert-BootstrapPathAndParents $sharedPiDirectory
-        if (-not (Test-Path -LiteralPath $sharedPiDirectory -PathType Container)) { Fail 'The saved account directory is unavailable; model settings were not changed.' }
-    }
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $RunnerEnvPath) | Out-Null
-    Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_ID' $Answers.Id
-    if ($Answers.Provider) {
-        Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_ENDPOINT' '' -Remove
-        Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_PROVIDER' $Answers.Provider
-    } else {
-        Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_PROVIDER' '' -Remove
-        Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_MODEL_ENDPOINT' $Answers.Endpoint
-    }
-    if ($Answers.ShareHostAuth) {
-        # Pi reads both account credentials and model configuration from this
-        # directory. Persist the consented directory for future service logins.
-        Set-RunnerEnvValue $RunnerEnvPath 'PI_CODING_AGENT_DIR' ('"' + $sharedPiDirectory + '"')
-        Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_SHARE_HOST_MODEL_AUTH' '1'
-    } else {
-        Set-RunnerEnvValue $RunnerEnvPath 'COZYRUNNER_SHARE_HOST_MODEL_AUTH' '' -Remove
-        Set-RunnerEnvValue $RunnerEnvPath 'PI_CODING_AGENT_DIR' '' -Remove
-    }
-    Write-Ok "wrote the default model for new bots to $RunnerEnvPath"
-}
-
-function Resolve-CozyAgentsHome {
-    param([switch] $RecordedOnly)
-    $candidate = if ($RecordedOnly) { '' } else { $env:COZYAGENTS_HOME }
-    if (-not $RecordedOnly -and [string]::IsNullOrWhiteSpace($candidate) -and (Get-Variable -Name PendingSetupPlan -Scope Script -ErrorAction SilentlyContinue) -and $script:PendingSetupPlan) {
-        $candidate = [string]$script:PendingSetupPlan.AgentsHome
-    }
-    if ([string]::IsNullOrWhiteSpace($candidate)) {
-        $record = Join-Path $script:InstallHome 'local\install-state'
-        if (Test-Path -LiteralPath $record -PathType Leaf) {
-            $line = Get-Content -LiteralPath $record | Where-Object { $_ -like 'cozyagents_home=*' } | Select-Object -Last 1
-            if ($line) {
-                $candidate = $line.Substring(16)
-                if ($candidate -match '^/([A-Za-z])/(.*)$') { $candidate = $matches[1] + ':\' + $matches[2].Replace('/', '\') }
-                elseif ($candidate -notmatch '^//[^/]+/[^/]+') { Fail 'installer state has an unsafe CozyAgents home' }
-            }
-        }
-    }
-    if ([string]::IsNullOrWhiteSpace($candidate)) { $candidate = Join-Path $env:USERPROFILE '.cozyagents' }
-    return ([IO.Path]::GetFullPath($candidate)).TrimEnd('\')
-}
-
-function Save-CozyAgentsState {
-    param([string] $StatePath, [string] $HarnessName, [string] $AgentsHome)
-    if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) { Fail 'the gateway did not write installation metadata' }
-    $homePosix = $AgentsHome.Replace('\', '/')
-    if ($homePosix -match '^([A-Za-z]):/(.*)$') { $homePosix = '/' + $matches[1].ToLowerInvariant() + '/' + $matches[2] }
-    if ($homePosix -match '[\r\n]') { Fail 'CozyAgents home must not contain a newline' }
-    $lines = @(Get-Content -LiteralPath $StatePath | Where-Object { $_ -notmatch '^(harness|cozyagents_home)=' })
-    $lines += @("harness=$HarnessName", "cozyagents_home=$homePosix")
-    [IO.File]::WriteAllText($StatePath, (($lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
-}
-
-function Get-CozyAgentsInstallerSource {
-    param([string] $Requested)
-    if (-not [string]::IsNullOrWhiteSpace($Requested)) { return $Requested }
-    if (-not [string]::IsNullOrWhiteSpace($env:COZYAGENTS_INSTALL_URL)) { return $env:COZYAGENTS_INSTALL_URL }
-    return $script:CozyAgentsInstallUrlDefault
-}
-
-function Get-CozyAgentsInstallerDigest {
-    param([string] $Source, [string] $Requested)
-    $expected = if (-not [string]::IsNullOrWhiteSpace($Requested)) { $Requested } elseif (-not [string]::IsNullOrWhiteSpace($env:COZYAGENTS_INSTALL_SHA256)) { $env:COZYAGENTS_INSTALL_SHA256 } elseif ($Source -eq $script:CozyAgentsInstallUrlDefault) { $script:CozyAgentsInstallSha256Default } else { $null }
-    if ([string]::IsNullOrWhiteSpace($expected)) { Fail 'COZYAGENTS_INSTALL_SHA256 is required for a custom CozyAgents installer source' }
-    if ($expected -notmatch '^[A-Fa-f0-9]{64}$') { Fail 'COZYAGENTS_INSTALL_SHA256 must be a SHA-256 digest' }
-    return $expected.ToLowerInvariant()
-}
-
-# The CozyAgents half of the install: its own verified one-liner does the bundle, the private Node,
-# the launcher and the scheduled task, and this script pairs it, because it is the one side that
-# can mint a runner code without asking anybody to read one off a screen. The installer is run in
-# this process the way irm | iex runs it, so no execution policy is consulted or changed.
-function Install-CozyAgentsHarness {
-    param([string] $AgentsHome, [string] $Source, [string] $ExpectedSha256)
-    Write-Info 'installing CozyAgents, the harness that runs your bots on this machine.'
-    # The scriptblock runs in this script's session state, so its $script: variables are this
-    # script's: its $script:Tag, $script:Repo and $script:AssetBase are the same names as $tag,
-    # $repo and $base here. Nothing reads those after this point; do not start.
-    $staged = Join-Path ([IO.Path]::GetTempPath()) ('cozyagents-install-' + [guid]::NewGuid().ToString('N') + '.ps1')
-    $previousAgentsHome = [Environment]::GetEnvironmentVariable('COZYAGENTS_HOME', 'Process')
-    try {
-        Copy-OrDownload $Source $staged
-        $actual = (Get-FileHash -LiteralPath $staged -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($actual -ne $ExpectedSha256) { Fail 'CozyAgents installer checksum mismatch. The downloaded installer does not match this Gateway release; no CozyAgents installer code was run. This is a release/download verification failure, not an administrator-permissions error.' }
-        Write-Ok 'verified CozyAgents installer SHA-256'
-        $content = [IO.File]::ReadAllText($staged).TrimStart([char]0xFEFF)
-        $env:COZYAGENTS_HOME = $AgentsHome
-        & ([scriptblock]::Create($content)) -NoPair -InstallHome $AgentsHome
-    } finally {
-        [Environment]::SetEnvironmentVariable('COZYAGENTS_HOME', $previousAgentsHome, 'Process')
-        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
-    }
-    if (-not (Test-Path -LiteralPath (Join-Path $AgentsHome 'install.json') -PathType Leaf)) {
-        Fail 'the CozyAgents install did not complete successfully'
-    }
-}
-
-# node plus the bundle rather than the cozyagents.cmd launcher this install also writes: PowerShell
-# runs a .cmd through cmd.exe, which parses the command line a second time, and a computer name or
-# a gateway URL carrying an ampersand would then split it.
-# Functions staged for inclusion in the published single-file Windows bootstrap.
-function Update-CozyAgentsHarness {
-    param([string] $AgentsHome, [bool] $DryRun = $false)
-    if ($DryRun) { Write-Info 'dry run: would update CozyAgents from its saved verified release source and require its running version to attach'; return }
-    $command = Get-CozyAgentsCommand $AgentsHome
-    Write-Info 'Updating CozyAgents and restarting its runner with the existing pairing and model settings.'
-    # Keep raw child output private: failures can include paths, URLs or environment values.
-    $output = ''
-    $exitCode = -1
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        # Node may write nonfatal runtime warnings to stderr before its JSON result.
-        # Only stdout is the protocol; never surface raw diagnostics or mistake them for JSON.
-        $ErrorActionPreference = 'Continue'
-        $output = (& $command.Node $command.Bundle update --home $AgentsHome --json 2>$null | Out-String)
-        $exitCode = $LASTEXITCODE
-    } catch { Fail 'CozyAgents update could not run; the update was not verified. Repair CozyAgents with its official Windows installer, then retry.' }
-    finally { $ErrorActionPreference = $previousErrorActionPreference }
-    $result = $null
-    try { $result = $output | ConvertFrom-Json -ErrorAction Stop } catch { }
-    $status = if ($result -and $result.PSObject.Properties['status']) { [string]$result.status } else { '' }
-    if ($exitCode -ne 0 -or $status -ne 'succeeded') {
-        if ($status -eq 'rolled_back') { Fail 'CozyAgents update failed readiness and restored its previous release; the overall update did not complete.' }
-        $code = if ($result -and $result.PSObject.Properties['code']) { [string]$result.code } else { '' }
-        if ($code -eq 'rollback_failed') { Fail 'CozyAgents update and recovery failed. Keep its pairing and bot files and repair with the official Windows installer.' }
-        Fail 'CozyAgents update did not report verified success. Repair CozyAgents with its official Windows installer, then retry.'
-    }
-    $version = if ($result.PSObject.Properties['resultingVersion']) { [string]$result.resultingVersion } else { '' }
-    if ($version -notmatch '^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$' -or
-        -not $result.PSObject.Properties['restarted'] -or $result.restarted -isnot [bool] -or -not $result.restarted) {
-        Fail 'CozyAgents update returned incomplete running-version evidence; the overall update was not verified.'
-    }
-    Write-Ok "CozyAgents $version updated and attached on its verified running release"
-    return [pscustomobject]@{ Status = 'succeeded'; Version = $version }
-}
-
-function Update-HermesHarness {
-    param([string] $HermesPath, [bool] $DryRun = $false)
-    if ($DryRun) { Write-Info 'dry run: would run the Hermes updater and verify its version and launcher'; return }
-    $before = Get-HermesVersion $HermesPath
-    Write-Info 'Updating Hermes Agent with its supported Windows updater.'
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        & $HermesPath update --yes 2>&1 | ForEach-Object { Write-Host ([string]$_) }
-        $exitCode = $LASTEXITCODE
-    } catch { Fail 'Hermes update could not complete; resolve the Hermes updater error and retry. The overall update was not verified.' }
-    finally { $ErrorActionPreference = $previousErrorActionPreference }
-    if ($exitCode -ne 0) { Fail 'Hermes update failed or was refused; close other Hermes sessions, resolve the updater error, and retry. The overall update did not complete.' }
-    Ensure-HermesLauncherInterpreter $HermesPath
-    $after = Get-HermesVersion $HermesPath
-    if (-not (Test-CompatibleHermesVersion $after)) { Fail "Hermes update did not install a compatible stable version (found v$($after.Text); v0.21.0 or newer is required)" }
-    Write-Ok "updated Hermes from v$($before.Text) to v$($after.Text); gateway attachment will be checked after restart"
-    return [pscustomobject]@{ Status = 'succeeded'; Version = $after.Text }
-}
-
-function Get-CozyAgentsCommand {
-    param([string] $AgentsHome)
-    $statePath = Join-Path $AgentsHome 'install.json'
-    $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-    $nodeProperty = $state.PSObject.Properties['node']
-    $node = if ($nodeProperty) { [string]$nodeProperty.Value } else { '' }
-    $bundle = ''
-    $bundleRecord = $null
-    $schema = $state.PSObject.Properties['schemaVersion']
-    if ($schema) {
-        if ($schema.Value -ne 1) { Fail 'the CozyAgents install record has an unsupported schema version' }
-        $assets = $state.PSObject.Properties['assets']
-        if ($assets) {
-            $main = @($assets.Value | Where-Object { $_.PSObject.Properties['name'] -and $_.name -eq 'cozyagents.mjs' })
-            if ($main.Count -eq 1 -and $main[0].PSObject.Properties['path']) {
-                $bundleRecord = $main[0]
-                $bundle = [string]$bundleRecord.path
-            }
-        }
-    } else {
-        $legacyBundle = $state.PSObject.Properties['bundle']
-        if ($legacyBundle -and $legacyBundle.Value.PSObject.Properties['path']) {
-            $bundleRecord = $legacyBundle.Value
-            $bundle = [string]$bundleRecord.path
-        }
-    }
-    if ([string]::IsNullOrWhiteSpace($node) -or [string]::IsNullOrWhiteSpace($bundle)) {
-        Fail 'the CozyAgents install did not record the node and bundle this computer pairs with'
-    }
-    return @{ Node = $node; Bundle = $bundle; BundleRecord = $bundleRecord }
-}
-
-function Test-CozyAgentsRuntime {
-    param([string] $AgentsHome)
-    try {
-        $command = Get-CozyAgentsCommand $AgentsHome
-        # Metadata alone does not mean an interrupted installation is usable.
-        foreach ($path in @($command.Node, $command.Bundle)) {
-            if (-not [IO.Path]::IsPathRooted($path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
-            $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-            try {
-                if ($stream.Length -eq 0) { return $false }
-                if ($path -eq $command.Bundle) {
-                    # Legacy records may omit integrity fields. When recorded, they must
-                    # still match before an elevated update can skip verified setup.
-                    $size = $command.BundleRecord.PSObject.Properties['size']
-                    if ($size -and (($size.Value -isnot [int] -and $size.Value -isnot [long]) -or $size.Value -ne $stream.Length)) { return $false }
-                    $digest = $command.BundleRecord.PSObject.Properties['sha256']
-                    if ($digest) {
-                        if ($digest.Value -isnot [string] -or $digest.Value -notmatch '^[a-fA-F0-9]{64}$') { return $false }
-                        $sha = [Security.Cryptography.SHA256]::Create()
-                        try { $actual = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
-                        if ($actual -ne $digest.Value) { return $false }
-                    }
-                }
-            } finally { $stream.Dispose() }
-        }
-        return $true
-    } catch { return $false }
-}
-
-function Get-GatewayOrigin {
-    param([string] $ConfigPath)
-    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { Fail "CozyGateway did not write its configuration at $ConfigPath" }
-    $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
-    $names = @($config.PSObject.Properties.Name)
-    if ($names -contains 'publicUrl' -and -not [string]::IsNullOrWhiteSpace([string]$config.publicUrl)) { return ([string]$config.publicUrl) }
-    $listenHost = [string]$config.host
-    if ($listenHost -eq '0.0.0.0' -or $listenHost -eq '::') { $listenHost = '127.0.0.1' }
-    elseif ($listenHost.Contains(':')) { $listenHost = "[$listenHost]" }
-    return "http://$listenHost`:$([string]$config.port)"
-}
-
-# One runner pairing code, minted here through the gateway's own CLI and handed straight to the
-# CozyAgents runner, so nobody types a code to pair the machine they are standing at. It is never
-# printed, never logged, and never reaches an argument.
-function New-RunnerPairCode {
-    param([string] $Cli)
-    $output = (& $Cli pair --kind runner --ttl 10 2>&1 | Out-String)
-    if ($LASTEXITCODE -ne 0) { Fail "could not mint a runner pairing code; the gateway is installed, so retry with: $Cli pair --kind runner" }
-    $match = [regex]::Match($output, '(?m)^Setup code:\s*(?<code>\S+)\s*$')
-    if (-not $match.Success) { Fail 'the gateway did not return a usable runner pairing code' }
-    $code = $match.Groups['code'].Value
-    if ($code -cnotmatch '^[A-Za-z0-9-]{4,64}$') { Fail 'the gateway did not return a usable runner pairing code' }
-    return $code
-}
-
-function Join-RunnerToGateway {
-    param([string] $AgentsHome, [string] $Cli, [string] $ConfigPath)
-    $runnerEnv = Join-Path $AgentsHome 'runner.env'
-    # A computer that is already paired keeps the runner credential it has,
-    # exactly as a second run leaves device trust alone.
-    if (Get-RunnerEnvValue $runnerEnv 'COZYRUNNER_TOKEN') {
-        Write-Ok 'this computer is already paired to CozyGateway as a runner; keeping that pairing'
-        return
-    }
-    $origin = Get-GatewayOrigin $ConfigPath
-    $name = $env:COMPUTERNAME
-    if ([string]::IsNullOrWhiteSpace($name)) { $name = [Environment]::MachineName }
-    $command = Get-CozyAgentsCommand $AgentsHome
-    $code = New-RunnerPairCode $Cli
-    # The code travels in the environment, never in an argument: it is a credential in waiting, and
-    # an argument is readable by every other process on this machine while the command runs.
-    $previous = [Environment]::GetEnvironmentVariable('COZYAGENTS_PAIR_CODE', 'Process')
-    try {
-        $env:COZYAGENTS_PAIR_CODE = $code
-        & $command.Node $command.Bundle runner pair --gateway $origin --name $name --home $AgentsHome
-        if ($LASTEXITCODE -ne 0) {
-            Fail "CozyAgents is installed but pairing did not complete; mint a code with `"$Cli pair --kind runner`" and run: cozyagents runner pair <code> --gateway $origin"
-        }
-    } finally {
-        [Environment]::SetEnvironmentVariable('COZYAGENTS_PAIR_CODE', $previous, 'Process')
-    }
-    Write-Ok "CozyAgents is paired to $origin as `"$name`"; bots you make in CozyChat run here"
-}
-
-# The network question, asked once on a fresh install and answered by the listener the shared
-# installer is then told to use. An install that already has a listener keeps it.
 function Select-Listener {
     param([bool] $AlreadyConfigured, [string[]] $ForwardedArguments)
     if ($AlreadyConfigured) { return @() }
@@ -3021,17 +2251,10 @@ function Complete-Pairing {
         if ($LASTEXITCODE -ne 0) { Fail "could not create a pairing code; the gateway is installed, so retry with: $Cli pair" }
     }
     Write-Info "codes expire after 10 minutes; mint a fresh QR and code with: $Cli pair"
-    Write-Info 'remove: cozygateway uninstall --purge (also deletes paired CozyAgents bots and files)'
+    Write-Info 'remove: cozygateway uninstall --purge'
     Write-Info 'for a tunnel, rerun the installer with: --public-url https://gateway.example.com'
 }
 
-# The CozyAgents branch: the same gateway with no Hermes discovery, no plugin and no Dashboard,
-# plus the harness, its runner pairing, and the model answers the runner reads.
-
-
-# A CozyAgents uninstall takes back exactly what this bootstrap put there: the gateway through the
-# shared installer, and the harness through the CozyAgents uninstaller, which owns its launcher,
-# its PATH line, its task and its runner state.
 function Get-WindowsSetupPlan {
     param([string] $InstallRoot)
     $path = Join-Path $InstallRoot 'local\windows-setup.json'
@@ -3041,36 +2264,32 @@ function Get-WindowsSetupPlan {
         $receipt = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
         if ($receipt.schemaVersion -ne 1) { throw 'unsupported schema' }
         if (-not $receipt.PSObject.Properties['harness']) { return $null }
-        if ($receipt.harness -notin @('hermes', 'cozyagents', 'both')) { throw 'invalid selection' }
+        if ($receipt.harness -ne 'hermes') { throw 'invalid selection' }
         $pairingPending = $receipt.PSObject.Properties['pairingPending'] -and $receipt.pairingPending -eq $true
         if (-not $pairingPending -and -not @($receipt.components.PSObject.Properties | Where-Object { $_.Value -ne 'succeeded' }).Count) { return $null }
-        $agentsHome = if ($receipt.PSObject.Properties['agentsHome']) { [string]$receipt.agentsHome } else { '' }
-        if ($agentsHome -and -not [IO.Path]::IsPathRooted($agentsHome)) { throw 'invalid home' }
-        return [pscustomobject]@{ Harness = [string]$receipt.harness; AgentsHome = $agentsHome; PairingPending = [bool]$pairingPending }
+        return [pscustomobject]@{ Harness = [string]$receipt.harness; PairingPending = [bool]$pairingPending }
     } catch { Fail 'Windows setup progress is unreadable; existing product files were not changed' }
 }
 
 function Set-WindowsSetupStage {
-    param([string] $InstallRoot, [string] $Component, [string] $Status, [string] $HarnessName = '', [string] $AgentsHome = '', [bool] $PairingPending = $false)
-    if ($Component -notin @('gateway', 'hermes', 'cozyagents') -or $Status -notin @('started', 'succeeded', 'failed')) { Fail 'invalid Windows setup stage' }
+    param([string] $InstallRoot, [string] $Component, [string] $Status, [string] $HarnessName = '', [bool] $PairingPending = $false)
+    if ($Component -notin @('gateway', 'hermes') -or $Status -notin @('started', 'succeeded', 'failed')) { Fail 'invalid Windows setup stage' }
     $path = Join-Path $InstallRoot 'local\windows-setup.json'
     $next = "$path.next"
     Assert-BootstrapRegularFile $path 'Windows setup receipt'
     Assert-BootstrapRegularFile $next 'Windows setup receipt staging'
     $components = @{}
     $savedHarness = $HarnessName
-    $savedHome = $AgentsHome
-    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
         try {
             $previous = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
             if ($previous.schemaVersion -ne 1) { throw 'unsupported schema' }
             if (-not $PSBoundParameters.ContainsKey('PairingPending') -and $previous.PSObject.Properties['pairingPending']) { $PairingPending = [bool]$previous.pairingPending }
             if (-not $savedHarness -and $previous.PSObject.Properties['harness']) {
                 $savedHarness = [string]$previous.harness
-                $savedHome = if ($previous.PSObject.Properties['agentsHome']) { [string]$previous.agentsHome } else { '' }
             }
             foreach ($property in $previous.components.PSObject.Properties) {
-                if ($property.Name -notin @('gateway', 'hermes', 'cozyagents') -or $property.Value -notin @('started', 'succeeded', 'failed')) { throw 'invalid component' }
+                if ($property.Name -notin @('gateway', 'hermes') -or $property.Value -notin @('started', 'succeeded', 'failed')) { throw 'invalid component' }
                 $components[$property.Name] = [string]$property.Value
             }
         } catch { Fail 'Windows setup progress is unreadable; existing product files were not changed' }
@@ -3079,9 +2298,8 @@ function Set-WindowsSetupStage {
     New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
     $receipt = [ordered]@{ schemaVersion = 1; updatedAt = [DateTime]::UtcNow.ToString('o'); components = $components; pairingPending = $PairingPending }
     if ($savedHarness) {
-        if ($savedHarness -notin @('hermes', 'cozyagents', 'both') -or ($savedHome -and -not [IO.Path]::IsPathRooted($savedHome))) { Fail 'invalid Windows setup plan' }
+        if ($savedHarness -ne 'hermes') { Fail 'invalid Windows setup plan' }
         $receipt.harness = $savedHarness
-        $receipt.agentsHome = $savedHome
     }
     [IO.File]::WriteAllText($next, ($receipt | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
     Move-Item -LiteralPath $next -Destination $path -Force
@@ -3099,53 +2317,6 @@ function Invoke-WindowsSetupStage {
         Write-Warning "$Component did not complete. Rerun the Windows one-liner to retry; completed components and existing pairing are preserved."
         throw $failure
     }
-}
-
-function Uninstall-WithCozyAgents {
-    param([string] $Bin, [string] $InstallerPath, [string[]] $ForwardedArguments, [bool] $IsDryRun)
-    $agentsHome = Resolve-CozyAgentsHome -RecordedOnly
-    $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH 'Install Git for Windows from https://git-scm.com/download/win, then paste this command again.'
-    if (-not (Test-Path -LiteralPath $InstallerPath)) { Fail "no CozyGateway installer was found at $InstallerPath" }
-    $arguments = @($InstallerPath, '--service-platform', 'Windows', '--gateway-dir', $script:InstallHome) + @($ForwardedArguments)
-    if ($IsDryRun -and -not ($arguments -contains '--dry-run')) { $arguments += '--dry-run' }
-    $previousOwner = [Environment]::GetEnvironmentVariable('COZYGATEWAY_WINDOWS_HARNESS_OWNER', 'Process')
-    try {
-        $env:COZYGATEWAY_WINDOWS_HARNESS_OWNER = '1'
-        & $bash @arguments
-        if ($LASTEXITCODE -ne 0) { Fail "CozyGateway installer exited $LASTEXITCODE" }
-    } finally {
-        [Environment]::SetEnvironmentVariable('COZYGATEWAY_WINDOWS_HARNESS_OWNER', $previousOwner, 'Process')
-    }
-    if ($IsDryRun) {
-        Write-Info "dry run: would remove the CozyAgents harness through its own uninstaller at $agentsHome (delete bot files: $($ForwardedArguments -contains '--purge'))"
-        return
-    }
-    if (Test-Path -LiteralPath (Join-Path $agentsHome 'install.json') -PathType Leaf) {
-        $command = Get-CozyAgentsCommand $agentsHome
-        $agentArguments = @('uninstall', '--home', $agentsHome, '--yes')
-        if ($ForwardedArguments -contains '--purge') { $agentArguments += '--purge' }
-        # Windows locks the running executable. Run a temporary copy so the
-        # harness can delete its own private Node along with the install.
-        $uninstallNode = $command.Node
-        $temporaryRuntime = $null
-        try {
-            if ([IO.Path]::GetFullPath($command.Node).StartsWith($agentsHome.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
-                $temporaryRuntime = Join-Path ([IO.Path]::GetTempPath()) ('cozyagents-uninstall-' + [guid]::NewGuid().ToString('N'))
-                New-Item -ItemType Directory -Path $temporaryRuntime | Out-Null
-                $uninstallNode = Join-Path $temporaryRuntime 'node.exe'
-                Copy-Item -LiteralPath $command.Node -Destination $uninstallNode
-            }
-            & $uninstallNode $command.Bundle @agentArguments
-            if ($LASTEXITCODE -ne 0) { Fail "the CozyAgents harness could not be removed; remaining Gateway files were retained. Retry: cozygateway uninstall$(if ($ForwardedArguments -contains '--purge') { ' --purge' })" }
-        } finally {
-            if ($temporaryRuntime) { Remove-Item -LiteralPath $temporaryRuntime -Recurse -Force }
-        }
-        Write-Ok 'removed the CozyAgents harness through its own uninstaller'
-    } else {
-        Fail "CozyAgents ownership metadata is missing at $agentsHome; remaining Gateway files were retained. Restore CozyAgents before retrying uninstall."
-    }
-    Set-CozyGatewayCommandPath $Bin $false
-    Complete-WindowsUninstall $script:InstallHome
 }
 
 # Git Bash can itself live below the Gateway home. Delete that private runtime
@@ -3183,8 +2354,13 @@ $isUninstall = $InstallerArguments -contains '--uninstall'
 $isDryRun = $env:COZYGATEWAY_INSTALL_DRYRUN -eq '1' -or $InstallerArguments -contains '--dry-run'
 $isNoQr = $InstallerArguments -contains '--no-qr'
 $alreadyConfigured = Test-Path -LiteralPath $configPath -PathType Leaf
-$cozyAgentsInstaller = Get-CozyAgentsInstallerSource $CozyAgentsInstaller
-$script:CozyAgentsInstallerSha256 = Get-CozyAgentsInstallerDigest $cozyAgentsInstaller $CozyAgentsInstallerSha256
+
+if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+    $legacyHarness = ((Get-Content -LiteralPath $statePath | Where-Object { $_ -like 'harness=*' } | Select-Object -Last 1) -replace '^harness=', '').Trim()
+    if ($legacyHarness -in @('cozyagents', 'both')) {
+        Fail 'this install state belongs to the retired CozyAgents gateway; it was left unchanged. Use https://github.com/shiftedx/cozyagents for its embedded gateway, or install Hermes CozyGateway in a new COZYGATEWAY_HOME.'
+    }
+}
 
 if ($Repair) {
     if (-not (Test-Path -LiteralPath $bootstrapPath -PathType Leaf) -or -not (Test-Path -LiteralPath "$bootstrapPath.sha256" -PathType Leaf)) {
@@ -3201,29 +2377,20 @@ if ($Repair) {
         $env:COZYGATEWAY_INSTALL_ASSET_BASE = $recordedSource
         $explicitAssetBase = $recordedSource
     }
-    $repairHarness = Get-RecordedHarness $statePath
     if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) { Fail 'repair metadata is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 | iex' }
-    $repairMode = if ($repairHarness -eq 'cozyagents' -and $Harness -in @('hermes', 'both')) { '' } else { Get-PersistedRepairMode $statePath }
+    $repairMode = Get-PersistedRepairMode $statePath
     if ($repairMode -eq 'runtime-only' -and $InstallerArguments -notcontains '--runtime-only') {
         $InstallerArguments = @('--runtime-only') + @($InstallerArguments)
     }
-    if ($repairHarness -and -not $Harness) { $Harness = $repairHarness }
-    if ($Harness -eq 'cozyagents') {
+    if ($repairMode -eq 'runtime-only') {
         Write-Info 'repair refreshes verified runtime assets, then restarts CozyGateway'
-    } elseif ($repairMode -eq 'runtime-only') {
-        Write-Info 'repair refreshes verified runtime assets, then restarts CozyGateway'
-    } elseif ($repairHarness -in @('hermes', 'both')) {
+    } else {
         $InstallerArguments = @('--profiles', (Get-PersistedRepairProfiles $statePath)) + @($InstallerArguments)
         Write-Info 'repair refreshes verified runtime and plugin assets, then restarts CozyGateway and Hermes attachment'
     }
 }
 
 if ($isUninstall) {
-    $recorded = Get-RecordedHarness $statePath
-    if ($recorded -in @('cozyagents', 'both') -or $Harness -in @('cozyagents', 'both')) {
-        Uninstall-WithCozyAgents $bin $installerPath $InstallerArguments ([bool]$isDryRun)
-        return
-    }
     $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH
     if (-not (Test-Path -LiteralPath $installerPath)) { Fail "no CozyGateway installer was found at $installerPath" }
     $uninstallArguments = @($installerPath, '--service-platform', 'Windows', '--gateway-dir', $script:InstallHome) + @($InstallerArguments)
@@ -3243,27 +2410,13 @@ if ($isUninstall) {
     return
 }
 
-# Step 1 of the approved order: the harness, before anything is installed.
-$script:PendingSetupPlan = Get-WindowsSetupPlan $script:InstallHome
-if ($script:PendingSetupPlan -and (-not $Harness -or ($Repair -and -not $script:InstallerBoundParameters.ContainsKey('Harness')))) {
-    $Harness = $script:PendingSetupPlan.Harness
-    Write-Info "Resuming the incomplete $Harness setup with the saved component homes."
-}
+# Step 1: Hermes Agent, before anything else is installed.
+$harness = 'hermes'
 Write-Host ''
 Write-Host 'CozyGateway setup for Windows'
-Write-Host 'We will check your settings, update the required apps, and connect your bots.'
+Write-Host 'We will check Hermes, update the required apps, and connect your bots.'
 Write-Host 'Existing settings and pairings will be kept. Follow any choices below.'
-$harness = Select-Harness $Harness $statePath $configPath
 if ($isDryRun) {
-    if ($harness -in @('cozyagents', 'both')) {
-        $agentsHome = Resolve-CozyAgentsHome
-        Write-Info "dry run: would ask for the model provider or a local endpoint, and the model id, then write COZYRUNNER_MODEL_* into $(Join-Path $agentsHome 'runner.env')"
-        Write-Info 'dry run: would ask whether CozyChat may reach this Gateway over your local network'
-        if ($harness -eq 'cozyagents') { Write-Info 'dry run: would resolve and checksum-verify the CozyGateway release assets, and no Hermes attach plugin' }
-        Write-Info "dry run: would install CozyGateway under $script:InstallHome without administrator rights"
-        Write-Info 'dry run: would install or update CozyAgents and verify its running version, preserving existing pairing'
-        if ($harness -eq 'cozyagents') { $global:LASTEXITCODE = 0; return }
-    }
     if (Find-Hermes) {
         Write-Info 'dry run: would update Hermes, inspect model status and open model selection only when setup is incomplete'
     } else {
@@ -3284,8 +2437,7 @@ $stage = $null
 try {
     Write-Host ''
     Write-Info 'Step 1 of 4 - Downloading and checking the update.'
-    $assets = @('cozygateway.mjs', 'agent-install.sh', 'gateway-supervisor.cjs', 'cozygateway-bootstrap.ps1')
-    if ($harness -ne 'cozyagents') { $assets += 'cozygateway-hermes-attach-plugin.tar.gz' }
+    $assets = @('cozygateway.mjs', 'agent-install.sh', 'gateway-supervisor.cjs', 'cozygateway-bootstrap.ps1', 'cozygateway-hermes-attach-plugin.tar.gz')
     $recovered = Recover-BootstrapTransaction $script:InstallHome $bin $assets
     if ($recovered) {
         Restart-OwnedGatewayService $script:InstallHome
@@ -3306,29 +2458,20 @@ try {
     $script:BundlePath = Join-Path $bin 'cozygateway.mjs'
     $script:PluginPath = Join-Path $bin 'cozygateway-hermes-attach-plugin.tar.gz'
     $script:ResolvedHermes = ''
-    $agentsHome = if ($harness -in @('cozyagents', 'both')) { Resolve-CozyAgentsHome } else { '' }
-    $pairingPending = -not $alreadyConfigured -or ($script:PendingSetupPlan -and $script:PendingSetupPlan.PairingPending)
-    Set-WindowsSetupStage $script:InstallHome 'gateway' 'started' $harness $agentsHome -PairingPending $pairingPending
-    if ($harness -ne 'cozyagents') { Set-WindowsSetupStage $script:InstallHome 'hermes' 'started' }
-    if ($harness -ne 'hermes') { Set-WindowsSetupStage $script:InstallHome 'cozyagents' 'started' }
+    $pairingPending = -not $alreadyConfigured
+    Set-WindowsSetupStage $script:InstallHome 'gateway' 'started' $harness -PairingPending $pairingPending
+    Set-WindowsSetupStage $script:InstallHome 'hermes' 'started'
     Write-Info 'Step 2 of 4 - Checking your agents and AI settings.'
-    if ($harness -ne 'cozyagents') {
-        Invoke-WindowsSetupStage $script:InstallHome 'hermes' {
-            $script:ResolvedHermes = Resolve-Hermes $env:COZYGATEWAY_HERMES_INSTALL_URL
-            Confirm-HermesModel $script:ResolvedHermes -FreshInstall $script:FreshHermesInstall
-            Ensure-HermesDashboardAssets $script:ResolvedHermes
-        }
+    Invoke-WindowsSetupStage $script:InstallHome 'hermes' {
+        $script:ResolvedHermes = Resolve-Hermes $env:COZYGATEWAY_HERMES_INSTALL_URL
+        Confirm-HermesModel $script:ResolvedHermes -FreshInstall $script:FreshHermesInstall
+        Ensure-HermesDashboardAssets $script:ResolvedHermes
     }
     $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH
-    $model = $null
-    if ($harness -in @('cozyagents', 'both')) {
-        $agentsHome = Resolve-CozyAgentsHome
-        $model = Confirm-CozyAgentsModel (Join-Path $agentsHome 'runner.env')
-    }
     $listener = @(Select-Listener $alreadyConfigured $InstallerArguments)
-    if ($harness -ne 'hermes' -or $alreadyConfigured) { $listener += '--no-qr' }
+    if ($alreadyConfigured) { $listener += '--no-qr' }
     # The same profile scope is preserved for regular reruns and repair.
-    if ($alreadyConfigured -and -not $Repair -and (Get-RecordedHarness $statePath) -in @('hermes', 'both') -and $InstallerArguments -notcontains '--profiles') {
+    if ($alreadyConfigured -and -not $Repair -and $InstallerArguments -notcontains '--profiles') {
         if ((Get-PersistedRepairMode $statePath) -eq 'runtime-only') {
             if ($InstallerArguments -notcontains '--runtime-only') { $InstallerArguments = @('--runtime-only') + @($InstallerArguments) }
         } elseif (Test-Path -LiteralPath $statePath -PathType Leaf) {
@@ -3339,36 +2482,17 @@ try {
     Write-Info 'Step 3 of 4 - Updating Gateway and connecting your agents. This may take a few minutes.'
     Invoke-WindowsSetupStage $script:InstallHome 'gateway' {
         Invoke-TransactionalRelease $script:InstallHome $bin $stage $assets {
-            $gatewayHarness = if ($harness -eq 'cozyagents') { 'cozyagents' } else { 'hermes' }
-            Invoke-CozyGatewayInstaller $bash $installerPath $script:ResolvedHermes $InstallerArguments $gatewayHarness $listener
+            Invoke-CozyGatewayInstaller $bash $installerPath $script:ResolvedHermes (@($InstallerArguments) + @($listener))
             Save-ExplicitBootstrapSource $script:InstallHome $explicitAssetBase
             Set-CozyGatewayCommandPath $bin $true
-            if ($harness -in @('cozyagents', 'both')) {
-                # Persist the selected home so interrupted harness setup can be resumed.
-                Save-CozyAgentsState $statePath $harness $agentsHome
-            }
         } {
             Restart-OwnedGatewayService $script:InstallHome
         }
     }
-    if ($harness -in @('cozyagents', 'both')) {
-        # Product-local recovery: a runner failure must not rewind a healthy gateway.
-        Invoke-WindowsSetupStage $script:InstallHome 'cozyagents' {
-            if (-not (Test-CozyAgentsRuntime $agentsHome)) {
-                Install-CozyAgentsHarness $agentsHome $cozyAgentsInstaller $script:CozyAgentsInstallerSha256
-            }
-            Write-RunnerModelEnv (Join-Path $agentsHome 'runner.env') $model
-            Join-RunnerToGateway $agentsHome $cliPath $configPath
-            $null = Update-CozyAgentsHarness $agentsHome
-        }
-    }
     Write-Info 'Step 4 of 4 - Finishing your connection to CozyChat.'
-    if ($harness -ne 'hermes' -or $alreadyConfigured) { Complete-Pairing $cliPath (-not $pairingPending) $isNoQr }
+    Complete-Pairing $cliPath (-not $pairingPending) $isNoQr
     Set-WindowsSetupStage $script:InstallHome 'gateway' 'succeeded' -PairingPending $false
-    Write-Ok "Windows setup complete: CozyGateway and $harness are running"
-    if ($model -and $model.ContainsKey('NeedsAccount') -and $model.NeedsAccount) {
-        Write-Info "Next: connect $($model.Provider) in your agent's model settings before starting a bot, or rerun setup to choose a detected local model."
-    }
+    Write-Ok 'Windows setup complete: CozyGateway and Hermes Agent are running'
     $global:LASTEXITCODE = 0
 } finally {
     # The lock goes first. Everything below it is cmdlets, and a cmdlet that throws while the

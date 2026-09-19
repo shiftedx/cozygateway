@@ -8,6 +8,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / 'scripts/agent-install.sh'
+WINDOWS_INSTALLER = ROOT / 'scripts/install.ps1'
 
 
 class UninstallTests(unittest.TestCase):
@@ -16,13 +17,11 @@ class UninstallTests(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
         self.home = self.root / 'user'
         self.gateway = self.home / '.cozygateway'
-        self.agents = self.home / '.cozyagents'
         self.bin = self.root / 'tools'
         for path in (self.gateway / 'bin', self.gateway / 'local', self.bin, self.home / '.local/bin'):
             path.mkdir(parents=True, exist_ok=True)
         self.env = dict(os.environ, HOME=str(self.home), PATH=f'{self.bin}:/usr/bin:/bin',
-                        COZYGATEWAY_HOME=str(self.gateway), COZYAGENTS_HOME=str(self.agents),
-                        CALL_LOG=str(self.root / 'calls'))
+                        COZYGATEWAY_HOME=str(self.gateway), CALL_LOG=str(self.root / 'calls'))
         # No real service manager or network is reached, even when running on Linux as root.
         self.script(self.bin / 'id', '#!/bin/bash\necho 501\n')
         self.script(self.bin / 'launchctl', '#!/bin/bash\necho "launchctl $*" >> "$CALL_LOG"\n'
@@ -87,6 +86,61 @@ write_cli_wrapper
         self.assertTrue((self.gateway / 'local/history.sqlite').exists())
         self.assertFalse((self.root / 'calls').exists())
 
+    def test_legacy_cozyagents_state_refuses_update_and_uninstall_without_mutation(self):
+        state = self.gateway / 'local/install-state'
+        config = self.gateway / 'local/cozygateway.config.json'
+        config.write_text('{"sentinel":"preserve"}\n')
+        for harness in ('cozyagents', 'both'):
+            state.write_text(f'harness={harness}\nrepair_mode=runtime-only\n')
+            before_state = state.read_bytes()
+            before_config = config.read_bytes()
+            for arguments in ((), ('--uninstall', '--purge')):
+                result = subprocess.run(
+                    ['bash', str(INSTALLER), '--gateway-dir', str(self.gateway),
+                     '--service-platform', 'Darwin', *arguments],
+                    env=self.env, text=True, capture_output=True,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('retired CozyAgents gateway', result.stdout + result.stderr)
+                self.assertEqual(state.read_bytes(), before_state)
+                self.assertEqual(config.read_bytes(), before_config)
+                self.assertFalse((self.root / 'calls').exists())
+
+    def test_powershell_legacy_cozyagents_state_refuses_before_uninstall_or_upgrade(self):
+        powershell = shutil.which('powershell.exe') or shutil.which('pwsh')
+        if powershell is None:
+            self.skipTest('PowerShell is unavailable')
+        state = self.gateway / 'local/install-state'
+        config = self.gateway / 'local/cozygateway.config.json'
+        config.write_text('{"sentinel":"preserve"}\n')
+        script = self.root / 'legacy-state-guard.ps1'
+        source = str(WINDOWS_INSTALLER).replace("'", "''")
+        state_path = str(state).replace("'", "''")
+        config_path = str(config).replace("'", "''")
+        script.write_text(f'''$ErrorActionPreference = 'Stop'
+$source = [IO.File]::ReadAllText('{source}')
+$tokens = $null; $errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+if ($errors.Count) {{ throw ($errors | Out-String) }}
+$guard = $ast.Find({{ param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Extent.Text -match '\\$legacyHarness -in @\\(''cozyagents'', ''both''\\)' }}, $true)
+$uninstall = $ast.Find({{ param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Extent.Text -match '^if \\(\\$isUninstall\\)' }}, $true)
+$transaction = $ast.Find({{ param($node) $node -is [Management.Automation.Language.CommandAst] -and $node.Extent.Text -match '^Protect-CozyGatewayHome ' }}, $true)
+if (-not $guard -or -not $uninstall -or -not $transaction -or $guard.Extent.StartOffset -ge $uninstall.Extent.StartOffset -or $guard.Extent.StartOffset -ge $transaction.Extent.StartOffset) {{ throw 'legacy state guard must precede uninstall and upgrade mutation' }}
+function Fail {{ param([string] $Message) throw $Message }}
+$statePath = '{state_path}'
+$configPath = '{config_path}'
+foreach ($harness in @('cozyagents', 'both')) {{
+    [IO.File]::WriteAllText($statePath, "harness=$harness`nrepair_mode=runtime-only`n")
+    $beforeState = (Get-FileHash -LiteralPath $statePath).Hash
+    $beforeConfig = (Get-FileHash -LiteralPath $configPath).Hash
+    $blocked = $false
+    try {{ . ([scriptblock]::Create($guard.Extent.Text)) }} catch {{ $blocked = $_.Exception.Message -match 'retired CozyAgents gateway' }}
+    if (-not $blocked -or (Get-FileHash -LiteralPath $statePath).Hash -ne $beforeState -or (Get-FileHash -LiteralPath $configPath).Hash -ne $beforeConfig) {{ throw "legacy $harness state was not refused without mutation" }}
+}}
+''')
+        result = subprocess.run([powershell, '-NoProfile', '-File', str(script)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_live_service_stop_failure_retains_retry_files(self):
         self.env['FAIL_STOP'] = '1'
         self.run_uninstall('--purge', success=False)
@@ -99,47 +153,6 @@ write_cli_wrapper
         plist.write_text('unrelated service')
         self.run_uninstall('--purge', success=False)
         self.assertEqual(plist.read_text(), 'unrelated service')
-        self.assertTrue(self.gateway.exists())
-
-    def setup_agents(self):
-        (self.gateway / 'local/install-state').write_text(f'harness=cozyagents\ncozyagents_home={self.agents}\n')
-        (self.agents / 'bin').mkdir(parents=True)
-        (self.agents / 'bots').mkdir()
-        (self.agents / 'bots/keep.txt').write_text('bot')
-        self.script(self.agents / 'bin/cozyagents', '''#!/bin/bash
-set -eu
-echo "agents $*" >> "$CALL_LOG"
-[ "${FAIL_AGENTS:-}" != 1 ] || exit 1
-for arg in "$@"; do
-  if [ "$arg" = --purge ]; then rm -rf "$COZYAGENTS_HOME"; exit 0; fi
-done
-rm -rf "$COZYAGENTS_HOME/bin"
-''')
-
-    def test_purge_delegates_and_removes_bot_files(self):
-        self.setup_agents()
-        self.run_uninstall('--purge')
-        self.assertFalse(self.agents.exists())
-        self.assertFalse(self.gateway.exists())
-        self.assertIn('--yes --purge', (self.root / 'calls').read_text())
-
-    def test_default_keeps_bots(self):
-        self.setup_agents()
-        self.run_uninstall()
-        self.assertTrue((self.agents / 'bots/keep.txt').exists())
-        self.assertNotIn('--purge', (self.root / 'calls').read_text())
-
-    def test_failed_harness_retains_gateway_receipt(self):
-        self.setup_agents()
-        self.env['FAIL_AGENTS'] = '1'
-        self.run_uninstall('--purge', success=False)
-        self.assertTrue((self.gateway / 'local/install-state').exists())
-        self.assertTrue((self.agents / 'bots/keep.txt').exists())
-
-    def test_missing_harness_is_a_failure(self):
-        self.setup_agents()
-        (self.agents / 'bin/cozyagents').unlink()
-        self.run_uninstall('--purge', success=False)
         self.assertTrue(self.gateway.exists())
 
     def test_windows_shell_wrapper_routes_to_native_uninstall(self):

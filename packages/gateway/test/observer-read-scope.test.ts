@@ -58,8 +58,6 @@ function makeApp(now = () => 1_000, wired = true) {
     ...(wired
       ? {
           bots: unreachable<NonNullable<AppDeps["bots"]>>("bots"),
-          runners: unreachable<NonNullable<AppDeps["runners"]>>("runners"),
-          runnerPresence: unreachable<NonNullable<AppDeps["runnerPresence"]>>("runnerPresence"),
           providerConnections:
             unreachable<NonNullable<AppDeps["providerConnections"]>>("providerConnections"),
           maintenance: unreachable<NonNullable<AppDeps["maintenance"]>>("maintenance"),
@@ -220,7 +218,7 @@ describe("the read scope is refused by every write route", () => {
     // If a whole route family stops being registered, because a dependency name drifted or the
     // stub above stopped satisfying an `if (deps.x !== undefined)` guard, this fails loudly
     // instead of quietly walking a fraction of the router and passing.
-    expect(paths.size).toBeGreaterThanOrEqual(99);
+    expect(paths.size).toBeGreaterThanOrEqual(95);
     const failures: string[] = [];
     for (const entry of paths) {
       const [method, path] = entry.split(" ", 2) as [string, string];
@@ -259,7 +257,7 @@ describe("the read scope is refused by every write route", () => {
         .filter((route) => writeMethods.has(route.method.toUpperCase()))
         .map((route) => `${route.method.toUpperCase()} ${route.path}`),
     );
-    expect(paths.size).toBeGreaterThanOrEqual(99);
+    expect(paths.size).toBeGreaterThanOrEqual(95);
     const failures: string[] = [];
     for (const entry of paths) {
       const [method, path] = entry.split(" ", 2) as [string, string];
@@ -367,8 +365,9 @@ describe("POST /observers/pair-code", () => {
       headers: { authorization: `Bearer ${paired.deviceToken}` },
     });
     expect(res.status).toBe(200);
-    const minted = (await res.json()) as { setupCode: string; expiresAt: number };
+    const minted = (await res.json()) as { setupCode: string; expiresAt: number; gatewayUrl: string };
     expect(minted.setupCode).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+    expect(minted.gatewayUrl).toMatch(/^http:\/\/.+:8787$/);
 
     const wrongKind = await app.request("/pair", {
       method: "POST",

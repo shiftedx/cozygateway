@@ -12,8 +12,7 @@ type WorkspaceResult = NonNullable<RunnerChatWorkspaceResult["result"]>;
 type ChatLane = Pick<RunnerLane, "onChatFrame" | "onChatConnection" | "chatCapableRunners" | "sendChatCommand">;
 type ChatConfigSurface = Pick<AttachConfigSurface, "botProfile" | "modelConfig" | "providerConnections" | "prepareChatConfiguration">;
 interface ExecutionOptions {
-  runtimeBot: (bot: string) => boolean;
-  harness?: (bot: string) => "cozyagents" | "hermes" | undefined;
+  harness: (bot: string) => "hermes" | undefined;
   name: (runnerId: string) => string | undefined;
   tokens: Map<string, string>;
   isAttached: (peer: string) => boolean;
@@ -150,7 +149,7 @@ export class RunnerChatExecutionDriver implements ChatConfigurationDriver {
         executionId: `chatx_${randomBytes(16).toString("hex")}`,
         bot: input.bot, sessionId: input.sessionId, runnerId: input.workspace.computerId,
         token: randomBytes(32).toString("hex"), operationId: `chat_create_${randomBytes(16).toString("hex")}`,
-        workspace: input.workspace, model, sourceProfile, harness: this.#harness(input.bot) ?? "cozyagents",
+        workspace: input.workspace, model, sourceProfile, harness: "hermes",
         launchModel: { id: model.modelId, ...(endpoint ? { endpoint } : { provider: model.providerId }) },
         stage: "starting", createdAt: this.#options.now?.() ?? Date.now(),
       };
@@ -187,8 +186,8 @@ export class RunnerChatExecutionDriver implements ChatConfigurationDriver {
       throw new ChatConfigurationUnavailable("This chat was deleted while its computer was preparing.");
   }
 
-  #harness(bot: string): "cozyagents" | "hermes" | undefined {
-    return this.#options.harness?.(bot) ?? (this.#options.runtimeBot(bot) ? "cozyagents" : undefined);
+  #harness(bot: string): "hermes" | undefined {
+    return this.#options.harness(bot);
   }
 
   #remote(bot: string, computerId: string): boolean {
@@ -232,7 +231,7 @@ export class RunnerChatExecutionDriver implements ChatConfigurationDriver {
   #launch(row: ChatExecutionRow): void {
     const payload: RunnerCreateChatExecutionPayload = {
       operationId: row.operationId, executionId: row.executionId, botId: row.bot, sessionId: row.sessionId,
-      attachToken: row.token, workspace: row.workspace, harness: row.harness ?? "cozyagents",
+      attachToken: row.token, workspace: row.workspace, harness: "hermes",
       ...(row.launchModel ? { model: row.launchModel } : {}),
       ...(row.model?.providerId.startsWith("custom-") ? { credentialMode: "transfer_required" as const } : {}),
       ...(row.sourceProfile ? { sourceProfile: row.sourceProfile } : {}),
@@ -251,9 +250,11 @@ export class RunnerChatExecutionDriver implements ChatConfigurationDriver {
 
   #reconcile(runnerId?: string): void {
     for (const row of this.#storage.chatExecutions()) {
+      // Public CozyGateway retains split-era records as inert data.
+      if (row.harness !== "hermes") continue;
       if (runnerId !== undefined && row.runnerId !== runnerId) continue;
       if (row.stage === "deleted" || !this.#storage.nativeBotHasSession(row.bot, row.sessionId)) this.#retire(row);
-      else if (!this.#options.isAttached(row.executionId)) this.#launch(row);
+      else if (this.#lane.chatCapableRunners("hermes").includes(row.runnerId) && !this.#options.isAttached(row.executionId)) this.#launch(row);
     }
   }
 

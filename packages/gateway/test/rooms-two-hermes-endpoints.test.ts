@@ -406,7 +406,7 @@ describe("rooms on a gateway with two Hermes endpoints", () => {
     servers.push(home, studio);
     Object.assign(process.env, {
       HOME_HERMES: "h", STUDIO_HERMES: "s", HOME_LUNA: "hl", HOME_SAGE: "hs",
-      STUDIO_NOVA: "sn", STUDIO_PIP: "sp", CREW_PIXEL: "px", CREW_BYTE: "bt",
+      STUDIO_NOVA: "sn", STUDIO_PIP: "sp",
     });
     const directory = mkdtempSync(join(tmpdir(), "cozygateway-f8-restart-"));
     const path = join(directory, "config.json");
@@ -420,10 +420,6 @@ describe("rooms on a gateway with two Hermes endpoints", () => {
           profiles: { luna: { tokenEnv: "HOME_LUNA" }, sage: { tokenEnv: "HOME_SAGE" } } },
         { id: "studio", url: studio.url, tokenEnv: "STUDIO_HERMES",
           profiles: { nova: { tokenEnv: "STUDIO_NOVA" }, pip: { tokenEnv: "STUDIO_PIP" } } },
-      ],
-      bots: [
-        { id: "pixel", name: "Pixel", tokenEnv: "CREW_PIXEL", runtime: "cozyagents" },
-        { id: "byte", name: "Byte", tokenEnv: "CREW_BYTE", runtime: "cozyagents" },
       ],
     }));
 
@@ -466,13 +462,12 @@ describe("rooms on a gateway with two Hermes endpoints", () => {
     };
 
     const before = await boot();
-    for (const secret of ["hl", "hs", "sn", "sp", "px", "bt"]) await echo(before.gateway, secret);
-    await until(async () => ((await (await before.authed("/bots")).json()) as { bots: unknown[] }).bots.length === 6);
+    for (const secret of ["hl", "hs", "sn", "sp"]) await echo(before.gateway, secret);
+    await until(async () => ((await (await before.authed("/bots")).json()) as { bots: unknown[] }).bots.length === 4);
     const create = (authed: (suffix: string, init?: RequestInit) => Promise<Response>, name: string, members: string[]): Promise<Response> =>
       authed("/bots/groups", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, members }) });
     expect((await create(before.authed, "Home", ["home:luna", "home:sage"])).status).toBe(201);
     expect((await create(before.authed, "Studio", ["studio:nova", "studio:pip"])).status).toBe(201);
-    expect((await create(before.authed, "Crew", ["pixel", "byte"])).status).toBe(201);
     expect((await create(before.authed, "Spanning", ["home:luna", "studio:nova"])).status).toBe(503);
 
     // A member deleted BEFORE the restart. The room keeps naming it, which is what keeps ownership
@@ -484,22 +479,20 @@ describe("rooms on a gateway with two Hermes endpoints", () => {
     await Promise.all(gateways.splice(0).map((gateway) => gateway.close()));
 
     const after = await boot();
-    for (const secret of ["hl", "sn", "sp", "px", "bt"]) await echo(after.gateway, secret);
+    for (const secret of ["hl", "sn", "sp"]) await echo(after.gateway, secret);
     expect(((await (await after.authed("/bots/groups")).json()) as { groups: Array<{ name: string }> }).groups.map((group) => group.name).sort())
-      .toEqual(["Crew", "Home", "Studio"]);
-    for (const room of ["home", "studio", "crew"]) {
+      .toEqual(["Home", "Studio"]);
+    for (const room of ["home", "studio"]) {
       const sent = await after.authed(`/bots/groups/${room}/messages`, {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "who is here" }),
       });
       expect(sent.status).toBe(202);
     }
     // Each room's turns went to the host that owned it before the restart: the `home` endpoint (now
-    // one member short), the `studio` endpoint, and the gateway's own Hermes-free host.
+    // one member short) and the `studio` endpoint.
     await until(async () => (await spoke(after.authed, "home")).length === 1);
     expect(await spoke(after.authed, "home")).toEqual(["home:luna"]);
     await until(async () => (await spoke(after.authed, "studio")).length === 2);
     expect(await spoke(after.authed, "studio")).toEqual(["studio:nova", "studio:pip"]);
-    await until(async () => (await spoke(after.authed, "crew")).length === 2);
-    expect(await spoke(after.authed, "crew")).toEqual(["byte", "pixel"]);
   }, 60_000);
 });

@@ -1002,10 +1002,6 @@ CREATE TABLE IF NOT EXISTS observe_events (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS observe_events_window ON observe_events (kind, at);
 CREATE INDEX IF NOT EXISTS observe_events_age ON observe_events (at);
--- Section 12. Lifetime token and cost counters, declared here beside the ring but deliberately
--- OUTSIDE it: these are summed since the bot was created and the seven day trim never touches
--- them. D5 owns the producer; the table lives here because it is one storage decision with the
--- ring it sits next to.
 -- This gateway's identity key. Every id in the ring is stored as a keyed hash rather than raw, so
 -- there is no string a caller can invent that lands in the bot or ref column, only a hash of one.
 -- Per gateway and durable: a bot hashes the same across restarts, so a chart survives one, and
@@ -1014,51 +1010,6 @@ CREATE TABLE IF NOT EXISTS observe_identity (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   key TEXT NOT NULL
 ) STRICT;
--- Which snapshots have already been folded into the lifetime counters below. Those counters are
--- additive and are never trimmed, so a snapshot folded twice would inflate a token and cost figure
--- permanently with nothing able to correct it. The claim and the addition share one transaction.
--- Bounded the same way the ring is: the nightly pass trims a claim once it is older than the
--- retention window, and the ring refuses to fold a snapshot that old in the first place, so the two
--- together hold the no-double-count property for all time without an ever-growing ledger.
-CREATE TABLE IF NOT EXISTS observe_lifetime_folds (
-  snapshot_id TEXT PRIMARY KEY,
-  at INTEGER NOT NULL
-) STRICT, WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS observe_lifetime_folds_age ON observe_lifetime_folds (at);
-CREATE TABLE IF NOT EXISTS observe_snapshot_records (
-  bot TEXT NOT NULL, kind TEXT NOT NULL, at INTEGER NOT NULL, record_json TEXT NOT NULL
-) STRICT;
-CREATE INDEX IF NOT EXISTS observe_snapshot_records_window ON observe_snapshot_records (bot, kind, at);
-CREATE TABLE IF NOT EXISTS observe_snapshots (
-  bot TEXT PRIMARY KEY,
-  snapshot_json TEXT NOT NULL,
-  received_at INTEGER NOT NULL
-) STRICT, WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS observe_tool_lifetime (
-  bot TEXT NOT NULL, tool TEXT NOT NULL,
-  calls INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0,
-  failures INTEGER NOT NULL DEFAULT 0, cost_micros INTEGER NOT NULL DEFAULT 0,
-  priced INTEGER NOT NULL DEFAULT 0, unpriced INTEGER NOT NULL DEFAULT 0,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY (bot, tool)
-) STRICT, WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS observe_tool_durations (
-  bot TEXT NOT NULL, tool TEXT NOT NULL, at INTEGER NOT NULL, value REAL NOT NULL
-) STRICT;
-CREATE INDEX IF NOT EXISTS observe_tool_durations_window ON observe_tool_durations (bot, tool, at);
-CREATE TABLE IF NOT EXISTS observe_lifetime (
-  bot TEXT NOT NULL,
-  model TEXT NOT NULL,
-  prompt INTEGER NOT NULL,
-  completion INTEGER NOT NULL,
-  cached INTEGER NOT NULL,
-  cost_micros INTEGER NOT NULL,
-  turns INTEGER NOT NULL,
-  priced INTEGER NOT NULL DEFAULT 0,
-  unpriced INTEGER NOT NULL DEFAULT 0,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY (bot, model)
-) STRICT, WITHOUT ROWID;
 `;
 
 /** Capability 52. Which credential a setup code may mint. A code written before 52 has no kind
@@ -6483,12 +6434,6 @@ export function openStorage(dbPath: string): Storage {
     WHERE received_at IS NULL`);
   db.exec(`CREATE INDEX IF NOT EXISTS attach_turn_terminals_received_at_desc
     ON attach_turn_terminals (received_at DESC)`);
-  const observeLifetimeColumns = new Set(
-    (db.prepare("PRAGMA table_info(observe_lifetime)").all() as unknown as Array<{ name: string }>).map(row => row.name),
-  );
-  for (const column of ["priced", "unpriced"]) {
-    if (!observeLifetimeColumns.has(column)) db.exec(`ALTER TABLE observe_lifetime ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`);
-  }
   // Setup codes are short-lived invitations, not durable sessions. Old builds retained expired
   // and consumed rows forever; prune that residue while keeping a live invitation across restart.
   db.prepare("DELETE FROM setup_codes WHERE used_at IS NOT NULL OR expires_at < ?").run(Date.now());

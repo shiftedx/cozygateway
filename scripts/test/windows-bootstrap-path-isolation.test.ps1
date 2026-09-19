@@ -13,7 +13,7 @@ $env:PATH = 'child-process-only'
 if ($env:COZYGATEWAY_TEST_PATH_FAILURE -eq '1') { exit 9 }
 exit 0
 '@)
-    foreach ($suite in @('windows-bootstrap.test.ps1', 'windows-agents-bootstrap.test.ps1')) {
+    foreach ($suite in @('windows-bootstrap.test.ps1')) {
         # Load only the invocation helper. The suites and production installer are never executed.
         $tokens = $null; $errors = $null
         $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $suite), [ref]$tokens, [ref]$errors)

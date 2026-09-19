@@ -44,22 +44,10 @@ export const OBSERVE_SERIES = [
   // Section 11, reported by the app on the delivery receipt it already sends.
   "felt_latency_ms",
   "edge_rtt_ms",
-  // Section 3 and 12, folded in from the CozyAgents snapshot lane by D5. The gateway never measures
-  // these itself and never infers them.
-  "model_step_ms",
-  "model_steps",
-  "tool_ms",
-  "prefill_tokens_per_second",
-  "decode_tokens_per_second",
-  "induced_tokens",
-  "prompt_tokens",
-  "completion_tokens",
-  "cached_tokens",
 ] as const;
 export type ObserveSeries = (typeof OBSERVE_SERIES)[number];
 
-/** Series the gateway measures itself. Anything outside this set arrives from a peer's own clock or
- *  from a snapshot, which is why the dashboard draws it differently. */
+/** Series the gateway measures itself. */
 export const GATEWAY_MEASURED_SERIES = new Set<string>([
   "device_rtt_ms", "tunnel_rtt_ms", "gateway_handle_ms", "peer_rtt_ms",
   "ttft_ms", "turn_ms", "delta_frames", "heartbeat_gap_ms",

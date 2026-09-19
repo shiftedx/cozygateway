@@ -5,6 +5,14 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## 0.8.6 (2026-09-19): Hermes gateway identity
+
+CozyGateway is again the Hermes-compatible gateway for CozyChat, including the
+matching attach plugin, installer, Dashboard bridge, and Hermes administration
+surfaces. The public install and documentation routes now point CozyAgents users
+to its embedded gateway. The generic attach-v1 contract remains available for
+compatible adapters; this release does not add an OpenClaw adapter.
+
 ## 0.8.5 (2026-09-14): durable attach batching and bounded gateway work
 
 Attach ingestion now batches durable writes and yields between incoming frames while preserving

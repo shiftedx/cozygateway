@@ -360,7 +360,7 @@ td small { display: block; color: var(--stone-ink); }
   .hop-row .n, .thr .m .n { white-space: normal; overflow-wrap: anywhere; }
   .two > *, .internals > *, .turn-bottom > *, .thr > * { min-width: 0; }
 }
-/* Shared panel rhythm and navigation across Gateway and CozyAgents. */
+/* Shared panel rhythm and navigation across Gateway and gateway. */
 .section-nav { display: flex; flex-wrap: wrap; gap: 4px 8px; margin-top: 20px; }
 .section-nav a { display: inline-flex; align-items: center; min-height: 44px; padding: 8px 12px; border-radius: 14px; color: var(--stone-ink); font-weight: 550; text-decoration: none; }
 .section-nav a:hover { background: var(--neutral); color: var(--primary); }
