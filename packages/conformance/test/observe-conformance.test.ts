@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
 import { startGateway, type RunningGateway } from "cozygateway";
 import { OBSERVE_EVENT_DETAIL, OBSERVE_SERIES } from "../../gateway/src/observe/privacy.ts";
+import { startFakeHermesServer, type FakeHermesServer } from "../../gateway/test/support/fake-hermes-server.ts";
 
 const DAY = 86_400_000;
 const TRIM_INTERVAL_MS = 3_600_000;
@@ -16,7 +17,15 @@ const WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 const TURN = `obs:${"a".repeat(64)}`;
 
 let gateway: RunningGateway | undefined;
+let hermes: FakeHermesServer | undefined;
 let now: number;
+
+function profileList(...names: string[]): unknown {
+  return {
+    profiles: names.map((name) => ({ name, description: name, has_avatar: false })),
+    bot_mode_protocol: true,
+  };
+}
 
 function concrete(path: string): string {
   return path
@@ -27,12 +36,19 @@ function concrete(path: string): string {
 
 async function start(options: { observability?: boolean; retentionDays?: number } = {}): Promise<RunningGateway> {
   process.env.D6_ATTACH_TOKEN = "d6-attach-token";
+  process.env.D6_CONTROL_TOKEN = "d6-control-token";
+  hermes = await startFakeHermesServer({ methods: { "profiles.list": () => profileList("d6-bot") } });
   gateway = await startGateway({
     name: "d6-observe-conformance",
     port: 0,
     dbPath: ":memory:",
     turnTimeoutSeconds: 0,
-    bots: [{ id: "d6-bot", name: "D6", tokenEnv: "D6_ATTACH_TOKEN", runtime: "cozyagents" }],
+    hermesEndpoints: [{
+      id: "default",
+      url: hermes.url,
+      tokenEnv: "D6_CONTROL_TOKEN",
+      profiles: { "d6-bot": { tokenEnv: "D6_ATTACH_TOKEN", name: "D6" } },
+    }],
     observability: { enabled: options.observability ?? true, retentionDays: options.retentionDays ?? 7 },
   });
   return gateway;
@@ -111,7 +127,10 @@ beforeEach(() => {
 afterEach(async () => {
   await gateway?.close();
   gateway = undefined;
+  await hermes?.close();
+  hermes = undefined;
   delete process.env.D6_ATTACH_TOKEN;
+  delete process.env.D6_CONTROL_TOKEN;
   vi.useRealTimers();
 });
 
