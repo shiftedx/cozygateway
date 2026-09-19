@@ -38,7 +38,6 @@ import {
 } from "cozygateway-contract";
 import { MEMORY_KINDS, MemoryConflict, MemoryInvalidRequest, MemoryNotFound, createMemoryRateLimiter, type MemoryRateLimiter, type MemorySurface } from "./memory.ts";
 import { HistoryConflict, HistoryInvalidRequest, type HistorySurface } from "./bot-history.ts";
-import type { RunRoutineSurface } from "./native-data-plane.ts";
 import {
   ChatConfigurationSessionNotFound,
   ChatConfigurationStaleSession,
@@ -50,12 +49,6 @@ import {
 import type { BotMemoryKind } from "cozygateway-contract";
 
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
-import {
-  NoRunnerPaired,
-  RunnerChoiceRequired,
-  RunnerUnknown,
-  RuntimeBotRecoveryUnavailable,
-} from "../runner/runtime-bots.ts";
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
 import { ModelConfigInvalid } from "./model-config.ts";
 import { ProviderSetupInvalid } from "./provider-setup.ts";
@@ -441,10 +434,6 @@ export function registerBotRoutes(
   /** Capability 50, runtime bots only. Absent leaves the five history routes unregistered, so a
    *  gateway that serves no history answers `404` rather than a refusal that implies one exists. */
   history?: HistorySurface,
-  /** Capability 53, runtime bots only. Absent leaves `POST /bots/:name/routines/:id/run`
-   *  unregistered, the same "404 rather than a refusal that implies one exists" rule `history`
-   *  follows above. */
-  runRoutine?: RunRoutineSurface,
   /** Capability com.cozylabs.chat-configuration v1. It is assembled only with an adapter that
    * can prepare a context; a connected but older peer remains unavailable per bot. */
   chatConfiguration?: GatewayChatConfiguration,
@@ -703,51 +692,6 @@ export function registerBotRoutes(
       if (error instanceof ContractViolation || error instanceof BotNameInvalid)
         return c.json(errorBody("invalid_request", error.message), 400);
       if (error instanceof BotNameTaken)
-        return c.json(extensionErrorBody("conflict", error.message), 409);
-      // Capability 54. Where the new bot would run, answered before anything durable was written.
-      if (error instanceof NoRunnerPaired)
-        return c.json(extensionErrorBody("no_runner_paired", error.message), 409);
-      if (error instanceof RunnerChoiceRequired)
-        return c.json(
-          { ...extensionErrorBody("runner_choice_required", error.message), runners: error.runners },
-          409,
-        );
-      // A named computer this gateway does not have is a client bug, not a missing machine.
-      if (error instanceof RunnerUnknown)
-        return c.json(errorBody("invalid_request", error.message), 400);
-      return failure(c, error);
-    }
-  });
-
-  // Capability 49, read-only. Registered unconditionally: a bot with no gateway-owned runtime row
-  // answers `409 unsupported_for_runtime` through the same failure mapping every other wrong-kind
-  // surface uses, and a gateway whose plane has no runtime lifecycle at all does not expose the
-  // method, so the route answers 404 rather than pretending.
-  app.get("/bots/:name/runtime", requireDevice, (c) => {
-    const resolved = canonicalName(c);
-    if ("response" in resolved) return resolved.response;
-    if (typeof chat.botRuntime !== "function")
-      return c.json(errorBody("not_found", "this gateway serves no runtime bots"), 404);
-    try {
-      return c.json(chat.botRuntime(resolved.name));
-    } catch (error) {
-      return failure(c, error);
-    }
-  });
-
-  // Capability 61. A retry is an operator action, not a best-effort resend: the runtime service
-  // accepts it only for the exact current terminal create operation, then sends the fresh durable
-  // operation through the ordinary runner lane. No body means an accidental client replay cannot
-  // redirect the bot, change its spec, or replace its credential.
-  app.post("/bots/:name/runtime/recover", requireDevice, (c) => {
-    const resolved = canonicalName(c);
-    if ("response" in resolved) return resolved.response;
-    if (typeof chat.recoverBotRuntime !== "function")
-      return c.json(errorBody("not_found", "this gateway serves no runtime recovery"), 404);
-    try {
-      return c.json(chat.recoverBotRuntime(resolved.name), 202);
-    } catch (error) {
-      if (error instanceof RuntimeBotRecoveryUnavailable)
         return c.json(extensionErrorBody("conflict", error.message), 409);
       return failure(c, error);
     }
@@ -1167,22 +1111,7 @@ export function registerBotRoutes(
   });
 
   if (integrations !== undefined) {
-    /** A native data plane can serve a real runtime bot through `botProfile`, so profile existence
-     * alone is insufficient for a Dashboard-only route. Its runtime projection is the authoritative
-     * discriminator; ordinary Hermes names then use the adapter's narrow membership probe. */
-    const dashboardBot = async (name: string): Promise<void> => {
-      if (chat.botRuntime !== undefined) {
-        try {
-          chat.botRuntime(name);
-          throw new UnsupportedForRuntime(name, "integrations", "cozyagents");
-        } catch (err) {
-          if (!(err instanceof UnsupportedForRuntime && err.feature === "botRuntime")) throw err;
-        }
-        // A regular Hermes bot has no runtime projection and falls through to the selected
-        // Dashboard's name-only probe.
-      }
-      await integrations.assertProfileExists(name);
-    };
+    const dashboardBot = (name: string): Promise<void> => integrations.assertProfileExists(name);
     const integrationName = (c: Context<Env>, parameter = "name"): string | Response => {
       const value = c.req.param(parameter) ?? "";
       if (value.length === 0 || value.length > 120 || /[\u0000-\u001f\u007f]/.test(value))
@@ -2311,23 +2240,6 @@ export function registerBotRoutes(
       return failure(c, err);
     }
   });
-
-  // Capability 53, RUNTIME BOTS ONLY. Registered only when a config lane exists at all, and it
-  // refuses a Hermes bot with `409 unsupported_for_runtime` through the surface's own guard,
-  // exactly the way the capability-50 history routes refuse one: this route sends `routines.run`
-  // over the existing attach-v1 `bot_config` lane, and a Hermes cron job has no on-demand trigger
-  // this gateway can reach at all.
-  if (runRoutine !== undefined) {
-    app.post("/bots/:name/routines/:id/run", requireDevice, async (c) => {
-      const resolved = routineBotName(c);
-      if ("response" in resolved) return resolved.response;
-      try {
-        return c.json(await runRoutine.run(resolved.name, c.req.param("id") ?? ""));
-      } catch (err) {
-        return failure(c, err);
-      }
-    });
-  }
 
   // The media proxy. `name` scopes the route to a bot for symmetry with everything else under
   // `/bots/:name`, and is validated the same way, but it is NOT resolved against Hermes: the answer

@@ -83,11 +83,6 @@ describe("the observation ring's row shape", () => {
     observe.pushResult("device-1", "ok");
     observe.feltLatency("luna", 900, "wifi", true);
     observe.edgeRtt("luna", 40, "wifi", true);
-    observe.foldSnapshotIntoSeries("luna", {
-      steps: [{ turnId: "turn-1", step: 0, modelStepMs: 120, promptTokens: 1_000, completionTokens: 200, cachedTokens: 800, prefillTokensPerSecond: 10, decodeTokensPerSecond: 2 }],
-      toolCalls: [{ turnId: "turn-1", step: 0, toolMs: 8, inducedTokens: 4 }],
-      turns: [{ turnId: "turn-1", modelSteps: 2 }],
-    });
 
     const written = allSeriesRows();
     const names = new Set(written.map((row) => row.series.split("|")[0]));
@@ -182,19 +177,6 @@ describe("observability disabled", () => {
     observe.deadLetter("luna", null, { sequence: 3, attempts: 2 });
     observe.pushResult("device-1", "http_error");
     observe.feltLatency("luna", 900, "wifi");
-    observe.foldSnapshotIntoSeries("luna", { turns: [{ turnId: "t", modelSteps: 3 }] });
-    observe.accumulateLifetime({ snapshotId: "s1", bot: "luna", model: "qwen", prompt: 1, completion: 1, cached: 0, costMicros: 0, turns: 1, at: clock });
-
-    expect(allSeriesRows()).toHaveLength(0);
-    expect(eventRows()).toHaveLength(0);
-    expect(storage.observe.lifetime()).toHaveLength(0);
-    expect(storage.observe.refused).toBe(0);
-  });
-
-  it("reads an omitted config section as disabled with a seven day ring", () => {
-    expect(observability({ name: "g", port: 1, dbPath: "x", turnTimeoutSeconds: 0 })).toEqual({
-      enabled: false, retentionDays: 7,
-    });
     expect(observability({
       name: "g", port: 1, dbPath: "x", turnTimeoutSeconds: 0,
       observability: { enabled: true, retentionDays: 3 },
@@ -241,55 +223,8 @@ describe("the ring's retention", () => {
     expect(ring(false, 7).trim(clock)).toEqual({ series: 1, events: 0, folds: 0, complete: true });
   });
 
-  it("never trims the lifetime table the ring sits beside", () => {
-    const observe = ring();
-    observe.accumulateLifetime({ snapshotId: "s1", bot: "luna", model: "qwen3", prompt: 10, completion: 5, cached: 2, costMicros: 7, turns: 1, at: clock - 6 * DAY });
-    observe.accumulateLifetime({ snapshotId: "s2", bot: "luna", model: "qwen3", prompt: 1, completion: 1, cached: 0, costMicros: 1, turns: 1, at: clock });
-    // Every series row those folds wrote ages out; the lifetime counters they fed do not.
-    observe.trim(clock);
-    expect(storage.observe.lifetime(id("luna"))).toEqual([
-      { bot: id("luna"), model: id("qwen3"), prompt: 11, completion: 6, cached: 2, costMicros: 8, turns: 2, priced: 0, unpriced: 0, updatedAt: clock },
-    ]);
-  });
 
-  it("ages the replay ledger out on the ring's own window, batched and counted with the rest", () => {
-    const observe = ring(true, 7);
-    // Inside the window.
-    expect(observe.accumulateLifetime({ snapshotId: "fresh", bot: "luna", model: "qwen3", prompt: 10, completion: 1, cached: 0, costMicros: 1, turns: 1, at: clock - 1 * DAY })).toBe(true);
-    // Written a fortnight ago, which the trim below is about to reach.
-    storage.observe.accumulateLifetime({ snapshotId: id("stale"), bot: id("luna"), model: id("qwen3"), prompt: 5, completion: 1, cached: 0, costMicros: 1, turns: 1, at: clock - 14 * DAY });
-    expect(storage.observe.lifetimeFoldCount()).toBe(2);
 
-    const pass = observe.trim(clock);
-    expect(pass.folds).toBe(1);
-    expect(pass.complete).toBe(true);
-    expect(storage.observe.lifetimeFoldCount()).toBe(1);
-
-    // The claim inside the window survives, so replaying that snapshot is still refused BY THE
-    // LEDGER: the claim is there and the addition is a no-op.
-    expect(observe.accumulateLifetime({ snapshotId: "fresh", bot: "luna", model: "qwen3", prompt: 10, completion: 1, cached: 0, costMicros: 1, turns: 1, at: clock - 1 * DAY })).toBe(false);
-    // The claim outside it is gone, and replaying THAT snapshot is refused BY ITS AGE instead: a
-    // snapshot older than the ring is refused before the ledger is ever consulted, which is what
-    // makes trimming the claim safe rather than a reopened replay.
-    expect(observe.accumulateLifetime({ snapshotId: "stale", bot: "luna", model: "qwen3", prompt: 5, completion: 1, cached: 0, costMicros: 1, turns: 1, at: clock - 14 * DAY })).toBe(false);
-    // Neither refusal touched the counters, and nothing was double counted.
-    expect(storage.observe.lifetime(id("luna"))[0]).toMatchObject({ prompt: 15, turns: 2 });
-    expect(storage.observe.lifetimeFoldCount()).toBe(1);
-  });
-
-  it("bounds the ledger trim the same way and reports an incomplete pass", () => {
-    const observe = ring(true, 7);
-    for (let index = 0; index < 5_050; index += 1) {
-      storage.observe.accumulateLifetime({
-        snapshotId: id(`old-${index}`), bot: id("luna"), model: id("qwen3"),
-        prompt: 1, completion: 0, cached: 0, costMicros: 0, turns: 0, at: clock - 30 * DAY,
-      });
-    }
-    const pass = observe.trim(clock);
-    expect(pass.folds).toBe(5_050);
-    expect(pass.complete).toBe(true);
-    expect(storage.observe.lifetimeFoldCount()).toBe(0);
-  });
 });
 
 describe("the privacy rule at the writer", () => {
@@ -485,7 +420,6 @@ describe("p50 and p95 helpers", () => {
   it("does not read a neighbouring series through the underscore LIKE wildcard", () => {
     // `turn_ms` as a LIKE pattern also matches `turnXms`, so the folded read escapes it.
     storage.observe.sample("turn_ms|ok", id("luna"), clock, 1);
-    storage.observe.sample("tool_ms", id("luna"), clock, 999);
     const folded = storage.observe.summarize({ series: "turn_ms", from: 0, to: clock + 1, includeTags: true });
     expect(folded.count).toBe(1);
     expect(folded.max).toBe(1);
@@ -625,75 +559,12 @@ describe("the request origin tag", () => {
   });
 });
 
-describe("the fold-in seam D5 calls", () => {
-  const snapshot = {
-    steps: [
-      { turnId: "turn-1", step: 0, modelStepMs: 100, promptTokens: 10 },
-      { turnId: "turn-1", step: 1, modelStepMs: 200, promptTokens: 20 },
-    ],
-    toolCalls: [{ turnId: "turn-1", step: 1, index: 0, toolMs: 8 }],
-    turns: [{ turnId: "turn-1", modelSteps: 2 }],
-  };
-
-  it("writes only the numeric fields of a snapshot and never infers a hop it did not receive", () => {
-    const observe = ring();
-    observe.foldSnapshotIntoSeries("luna", snapshot);
-    expect(storage.observe.summarize({ series: "model_step_ms", bot: id("luna"), from: 0, to: clock + 1 }).count).toBe(2);
-    // A Hermes bot sends no snapshot, so it has no model rows at all rather than a subtracted one.
-    expect(storage.observe.summarize({ series: "model_step_ms", bot: id("hermes-bot"), from: 0, to: clock + 1 }).count).toBe(0);
-  });
-
-  it("is idempotent per bot, turn and step: a replayed snapshot writes nothing twice", () => {
-    const observe = ring();
-    // D5's harness repeats a step index between an idle tick and a terminal, and a cumulative
-    // snapshot replays the whole turn on every tick.
-    expect(observe.foldSnapshotIntoSeries("luna", snapshot)).toMatchObject({ folded: 4, skipped: 0 });
-    expect(observe.foldSnapshotIntoSeries("luna", snapshot)).toMatchObject({ folded: 0, skipped: 4 });
-    expect(observe.foldSnapshotIntoSeries("luna", snapshot)).toMatchObject({ folded: 0, skipped: 4 });
-
-    expect(storage.observe.summarize({ series: "model_step_ms", from: 0, to: clock + 1 }).count).toBe(2);
-    expect(storage.observe.summarize({ series: "tool_ms", from: 0, to: clock + 1 }).count).toBe(1);
-    expect(storage.observe.summarize({ series: "model_steps", from: 0, to: clock + 1 })).toMatchObject({ count: 1, p50: 2 });
-    expect(storage.observe.summarize({ series: "prompt_tokens", from: 0, to: clock + 1 }).count).toBe(2);
-  });
-
-  it("folds a genuinely new step of the same turn, and the same step of another bot", () => {
-    const observe = ring();
-    observe.foldSnapshotIntoSeries("luna", snapshot);
-    expect(observe.foldSnapshotIntoSeries("luna", {
-      steps: [...snapshot.steps, { turnId: "turn-1", step: 2, modelStepMs: 300 }],
-    })).toMatchObject({ folded: 1, skipped: 2 });
-    // Two bots reporting the same step index are two different measurements.
-    expect(observe.foldSnapshotIntoSeries("pixel", snapshot)).toMatchObject({ folded: 4, skipped: 0 });
-    expect(storage.observe.summarize({ series: "model_step_ms", bot: id("luna"), from: 0, to: clock + 1 }).count).toBe(3);
-    expect(storage.observe.summarize({ series: "model_step_ms", bot: id("pixel"), from: 0, to: clock + 1 }).count).toBe(2);
-  });
-
-  it("refuses a snapshot older than the ring, so trimming its claim can never reopen a replay", () => {
-    const observe = ring(true, 7);
-    const fold = { snapshotId: "ancient", bot: "luna", model: "qwen3", prompt: 100, completion: 20, cached: 5, costMicros: 9, turns: 1, at: clock - 8 * DAY };
-    expect(observe.accumulateLifetime(fold)).toBe(false);
-    expect(storage.observe.lifetime()).toHaveLength(0);
-    expect(storage.observe.lifetimeFoldCount()).toBe(0);
-    // A snapshot that old describes a turn that ended a week ago; no producer still holds one.
-    expect(observe.accumulateLifetime({ ...fold, at: clock - 7 * DAY + 1 })).toBe(true);
-  });
-
-  it("never adds a replayed snapshot twice to the lifetime counters, which nothing can correct", () => {
-    const observe = ring();
-    const fold = { snapshotId: "snap-1", bot: "luna", model: "qwen3", prompt: 100, completion: 20, cached: 5, costMicros: 9, turns: 1, at: clock };
-    expect(observe.accumulateLifetime(fold)).toBe(true);
-    expect(observe.accumulateLifetime(fold)).toBe(false);
-    expect(observe.accumulateLifetime({ ...fold, snapshotId: "snap-2" })).toBe(true);
-    expect(storage.observe.lifetime(id("luna"))[0]).toMatchObject({ prompt: 200, completion: 40, turns: 2 });
-  });
-});
 
 describe("the declared vocabulary", () => {
   it("keeps every series and event kind the design names", () => {
     for (const series of [
       "device_rtt_ms", "tunnel_rtt_ms", "gateway_handle_ms", "peer_rtt_ms", "ttft_ms", "turn_ms",
-      "delta_frames", "model_step_ms", "model_steps", "tool_ms", "attach_online", "queue_depth",
+      "delta_frames", "attach_online", "queue_depth",
       "dead_letters", "outbox_depth", "heartbeat_gap_ms", "push_result", "felt_latency_ms",
     ]) expect(OBSERVE_SERIES as readonly string[]).toContain(series);
     for (const kind of [

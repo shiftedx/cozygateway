@@ -1,7 +1,8 @@
 # CozyGateway
 
-The gateway owns bot identity, conversation continuity, and routing between paired clients and
-the computers and harnesses that execute their work.
+The gateway owns Hermes profile identity, conversation continuity, and routing between paired
+CozyChat clients and Hermes Agent. Its attach-v1 boundary remains generic so compatible harness
+adapters can use the published contract; CozyAgents ships its own embedded gateway.
 
 ## Language
 

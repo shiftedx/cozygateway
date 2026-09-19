@@ -58,13 +58,7 @@ import { SETUP_CODE_TTL_MS, hashToken, mintDeviceToken, newSetupCode } from "./a
 import { listenerOrigin } from "./configure.ts";
 import { primaryLanAddress } from "./lan.ts";
 import { gatewayScheme } from "./tls.ts";
-import {
-  LEGACY_RUNNER_ID,
-  effectiveRunnerName,
-  legacyRunnerRow,
-  runnerToWire,
-  type RunnerRoster,
-} from "./runner/roster.ts";
+import { LEGACY_RUNNER_ID, effectiveRunnerName, legacyRunnerRow, runnerToWire, type RunnerRoster } from "./runner/roster.ts";
 import { BackendUnavailable } from "./errors.ts";
 import { HermesUnavailable } from "./hermes-bridge/client.ts";
 import { GatewayHarnessSettings, HarnessSettingsInvalid } from "./harness-settings.ts";
@@ -85,7 +79,6 @@ import type { GatewayChatConfiguration } from "./chat-configuration.ts";
 import type { HermesDashboardIntegrations } from "./hermes-bridge/integrations.ts";
 import type { GatewayProviderConnections } from "./provider-connections.ts";
 import { providerConnectionRoutes } from "./provider-connection-routes.ts";
-import type { RunRoutineSurface } from "./hermes-bridge/native-data-plane.ts";
 import { registerBotRoutes } from "./hermes-bridge/routes.ts";
 import { resolveByteRange } from "./hermes-bridge/routes.ts";
 import type {
@@ -137,7 +130,6 @@ import { resolveAttachBearer } from "./adapters/attach/token-auth.ts";
 import type { MobileNodeMediaDescriptor } from "./mobile-node.ts";
 import { PAIR_REQUEST_MAX_BYTES, PairingAdmission, readPairBody, type PairingAttemptLimiter } from "./pairing-admission.ts";
 import type { ObservationRing } from "./observe/ring.ts";
-import type { ObserveSnapshotReader } from "./observe/routes.ts";
 
 const LIVE_ACTIVITY_DELETION_DRAIN_LIMIT = 50;
 // The relay is private-network adjacent and its ordinary request deadline is ten seconds. A
@@ -181,17 +173,12 @@ const LiveActivityRegisterRequestSchema = Type.Object(
   { additionalProperties: false },
 );
 
-/** Where a phone or an installer should dial this gateway, from configuration alone. A public
- *  origin wins; otherwise a wildcard listener advertises the LAN address rather than loopback,
- *  because the machine that will use a runner code is usually not this one. Mirrors the rule
- *  `cozygateway pair` prints, so one code means one URL wherever it was minted. */
 function configuredOrigin(config: GatewayConfig): string {
   if (config.publicUrl !== undefined) return config.publicUrl;
   const host = config.host;
-  const advertised =
-    host !== undefined && host !== "0.0.0.0" && host !== "::"
-      ? host
-      : primaryLanAddress() ?? "127.0.0.1";
+  const advertised = host !== undefined && host !== "0.0.0.0" && host !== "::"
+    ? host
+    : primaryLanAddress() ?? "127.0.0.1";
   return listenerOrigin(advertised, config.port, gatewayScheme(config));
 }
 
@@ -210,9 +197,6 @@ export interface AppDeps {
   /** Capability 50. A runtime bot's own checkpointed workspace history, over the attached peer's
    * bounded `bot_history` lane. Absent leaves the five history routes unregistered. */
   history?: HistorySurface;
-  /** Capability 53. Forces a runtime bot's routine to run now, over the existing capability-48
-   * `bot_config` lane. Absent leaves `POST /bots/:name/routines/:id/run` unregistered. */
-  runRoutine?: RunRoutineSurface;
   /** Session-scoped execution context. Omitted until an attached adapter can prepare it. */
   chatConfiguration?: GatewayChatConfiguration;
   providerConnections?: GatewayProviderConnections;
@@ -250,6 +234,8 @@ export interface AppDeps {
   pushRelayDeleteTimeoutMs?: number;
   config: GatewayConfig;
   gatewayInfo: GatewayInfo;
+  /** The live listener origin used in pairing material; direct app hosts fall back to config. */
+  pairingUrl?: () => string;
   gatewaySettings?: {
     read(): unknown;
     update(input: unknown): unknown;
@@ -312,28 +298,11 @@ export interface AppDeps {
     | "unsupported"
   >;
   onDeviceRevoked: (deviceId: string) => void;
-  /** Capability 52. The paired runners. Absent leaves `POST /pair {kind: "runner"}` refusing and
-   *  the three `/runners` routes unregistered, which is the honest answer for a host that assembled
-   *  no roster rather than a route that answers about nothing. */
+  /** Paired remote Hermes computers. */
   runners?: RunnerRoster;
-  /** Live socket state for the roster projection, from the runner lane. */
-  runnerPresence?: {
-    online: (runnerId: string) => boolean;
-    lastContactAt: (runnerId: string) => number | null;
-    /** Version from this runner's current authenticated hello only; a stored last-reported value
-     *  cannot prove that an offline runner is running an installed update. */
-    agentVersion: (runnerId: string) => string | undefined;
-  };
-  /** Whether the legacy shared `COZYGATEWAY_RUNNER_TOKEN` is configured, which the roster shows as
-   *  one row so the list and the lane never disagree about who exists. */
+  runnerPresence?: { online: (runnerId: string) => boolean; lastContactAt: (runnerId: string) => number | null; agentVersion: (runnerId: string) => string | undefined };
   legacyRunnerConfigured?: boolean;
-  /** Closes a revoked runner's socket. The row is gone, so the socket it authenticated must not
-   *  outlive it. */
   onRunnerRevoked?: (runnerId: string) => void;
-  /** The origin a freshly minted pairing code should be dialed at, which is the LISTENING port
-   *  rather than the configured one when the host bound port 0. Absent falls back to the config,
-   *  which is what a host that assembled its own app without a listener can honestly say. */
-  pairingUrl?: () => string;
   /** Capability 52. True when this gateway has no Hermes endpoint at all, which makes the bridge
    *  `absent` on `/health` and `/ready` rather than an offline bridge to alarm on. */
   hermesBridgeAbsent?: boolean;
@@ -341,10 +310,6 @@ export interface AppDeps {
    *  answer from. Absent leaves the whole group unregistered, which is the honest answer for a
    *  gateway with observability off. */
   observe?: ObservationRing;
-  /** Dashboard packet D3, THE D5 SEAM. Absent makes the CozyAgents panels answer
-   *  `{ available: false, reason: "no_snapshot_lane" }` rather than 404. */
-  observeSnapshots?: ObserveSnapshotReader;
-  observePeerAttached?: (bot: string) => boolean;
   now: () => number;
 }
 
@@ -352,19 +317,8 @@ export function errorBody(code: ErrorCode, message: string): ErrorBody {
   return { error: { code, message } };
 }
 
-/** Capability 55. Matches the C0 and C1 control character ranges (built from character codes
- *  rather than a literal escape, so no NUL or other control byte ever sits in this source file),
- *  plus every Unicode "Format" (Cf) code point: zero-width space and joiners, the bidi override
- *  and isolate controls, and the byte-order mark among them. A name built entirely from these is
- *  invisible or reorders the text around it, which is worse than the box a lone control character
- *  renders as, so both families are refused the same way. */
 const RUNNER_NAME_CONTROL_CHARS = new RegExp(
-  "["
-    + String.fromCharCode(0) + "-" + String.fromCharCode(31)
-    + String.fromCharCode(127) + "-" + String.fromCharCode(159)
-    + "\\p{Cf}"
-    + "]",
-  "u",
+  "[" + String.fromCharCode(0) + "-" + String.fromCharCode(31) + String.fromCharCode(127) + "-" + String.fromCharCode(159) + "\\p{Cf}]", "u",
 );
 
 /** A 415 that does not say what arrived is a 415 the producer has to guess about, so the received
@@ -1020,9 +974,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
   // network call to answer is itself a new way to go dark.
   app.get("/ready", (c) => {
     if (deps.bots === undefined) return c.json({ ready: true, ...(deps.attachHealth === undefined ? {} : { attach: deps.attachHealth() }) });
-    // No Hermes endpoint configured at all: ready, with the bridge named absent. A CozyAgents-only
-    // gateway serves its roster from runtime bots, and alarming on a bridge nobody configured would
-    // de-route a gateway that is answering perfectly well.
+    // No Hermes endpoint configured at all: ready, with the bridge named absent. A deployment
+    // that does not yet have a Hermes endpoint can still serve pairing and attach ingress.
     if (deps.hermesBridgeAbsent === true)
       return c.json({
         ready: true,
@@ -1058,9 +1011,6 @@ export function createApp(deps: AppDeps): Hono<Env> {
         err instanceof ContractViolation ? err.message : "malformed body";
       return c.json(errorBody("invalid_request", detail), 400);
     }
-    // Capability 52. `deviceName` is required for a device pair and optional for a runner pair,
-    // enforced here rather than in the schema so no existing device client's request, response or
-    // error message changes shape.
     // Capability 72 adds `observer`, which mints a device and therefore carries the same
     // `deviceName` requirement a plain device pair carries.
     const kind = pairRequest.kind ?? "device";
@@ -1068,7 +1018,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
       return c.json(errorBody("invalid_request", "deviceName is required"), 400);
     }
     if (kind === "runner" && deps.runners === undefined) {
-      return c.json(errorBody("invalid_request", "this gateway does not pair runners"), 400);
+      return c.json(errorBody("invalid_request", "this gateway does not pair remote Hermes computers"), 400);
     }
     // The kind is checked as part of consuming the code, so a code minted for a runner and
     // presented as a device (or the reverse) answers exactly the 401 an expired code answers, with
@@ -1085,14 +1035,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
       );
     }
     if (kind === "runner") {
-      const paired = deps.runners!.pair(
-        pairRequest.deviceName === undefined ? {} : { name: pairRequest.deviceName },
-      );
-      return c.json({
-        runnerToken: paired.token,
-        runner: runnerToWire(paired.runner, false),
-        gateway: deps.gatewayInfo,
-      });
+      const paired = deps.runners!.pair(pairRequest.deviceName === undefined ? {} : { name: pairRequest.deviceName });
+      return c.json({ runnerToken: paired.token, runner: runnerToWire(paired.runner, false), gateway: deps.gatewayInfo });
     }
     const { token, tokenHash } = mintDeviceToken();
     // Capability 72. The scope is a property of the token, decided here by the kind of code that
@@ -1123,9 +1067,8 @@ export function createApp(deps: AppDeps): Hono<Env> {
 
   app.get("/devices", requireDevice, (c) => c.json(deps.storage.listDevices()));
 
-  // Capability 72. Minting an observer code from CozyChat's device list, shaped exactly like the
-  // runner mint above and spending the same 10 minute TTL and the same gateway-wide bucket the
-  // unauthenticated pairing route spends: a code is a credential in waiting wherever it is minted.
+  // Minting an observer code from CozyChat's device list spends the same 10 minute TTL and
+  // gateway-wide bucket as unauthenticated pairing.
   // It is guarded by `requireDevice` like every authenticated route, and the one scope middleware
   // above already refuses a read-scoped token here, so an observer can never mint another
   // observer.
@@ -1148,173 +1091,51 @@ export function createApp(deps: AppDeps): Hono<Env> {
     });
   });
 
-  // Capability 52. The paired computers that run bots, beside the paired phones and shaped like
-  // them, including the 404 an unknown id gets.
   if (deps.runners !== undefined) {
     const roster = deps.runners;
     const online = (id: string) => deps.runnerPresence?.online(id) ?? false;
-    const seenAt = (id: string, stored: number | null) =>
-      deps.runnerPresence?.lastContactAt(id) ?? stored;
-    // Capability 54. The bots this gateway placed on that computer, counted off the durable rows
-    // rather than tracked, so it is the same answer before and after a restart.
-    const botCount = (id: string) => deps.storage.countRuntimeBotsForRunner(id);
-    app.get("/runners", requireDevice, (c) =>
-      c.json({
-        runners: [
-          ...roster.list().map((row) =>
-            runnerToWire(
-              { ...row, lastSeenAt: seenAt(row.id, row.lastSeenAt) },
-              online(row.id),
-              botCount(row.id),
-            ),
-          ),
-          // The legacy shared credential is one row too, so a gateway carrying both kinds answers
-          // one list rather than hiding the runner an operator placed by hand.
-          ...(deps.legacyRunnerConfigured === true
-            ? [
-                runnerToWire(
-                  legacyRunnerRow({ lastSeenAt: seenAt(LEGACY_RUNNER_ID, null) }),
-                  online(LEGACY_RUNNER_ID),
-                  botCount(LEGACY_RUNNER_ID),
-                ),
-              ]
-            : []),
-        ],
-      }),
-    );
-    // Authenticated by the runner's OWN token and nothing else. It is the only route a runner
-    // credential opens: no chat, no device list, no bot creation, and no other runner's row.
+    const seenAt = (id: string, stored: number | null) => deps.runnerPresence?.lastContactAt(id) ?? stored;
+    app.get("/runners", requireDevice, (c) => c.json({ runners: [
+      ...roster.list().map((row) => runnerToWire({ ...row, lastSeenAt: seenAt(row.id, row.lastSeenAt) }, online(row.id))),
+      ...(deps.legacyRunnerConfigured ? [runnerToWire(legacyRunnerRow({ lastSeenAt: seenAt(LEGACY_RUNNER_ID, null) }), online(LEGACY_RUNNER_ID))] : []),
+    ] }));
     app.get("/runners/self", (c) => {
       const row = roster.resolve(c.req.header("authorization"));
-      if (row === undefined)
-        return c.json(errorBody("unauthorized", "missing or unknown runner token"), 401);
+      if (row === undefined) return c.json(errorBody("unauthorized", "missing or unknown runner token"), 401);
       const attached = online(row.id);
-      return c.json({
-        id: row.id,
-        // Capability 55: the display name once a person has set one, exactly as GET /runners
-        // renders it, with `renamed` below saying which is which.
-        name: effectiveRunnerName(row),
-        platform: row.platform,
-        default: row.isDefault,
-        lastSeenAt: seenAt(row.id, row.lastSeenAt),
-        // What the INSTALLER polls: the row exists (it just paired) long before the service it
-        // registered has dialed in, so "am I attached" is a different question from "do I exist".
-        attached,
-        // Released Agents updaters read `online`; keep it equal to live attachment so they can
-        // verify the first upgrade to an Agents release that reads `attached` instead.
-        online: attached,
-        // An update verifier may accept this only alongside `attached`: it is read from the live
-        // authenticated hello, never the durable roster observation left by an old connection.
-        ...(deps.runnerPresence?.agentVersion(row.id) === undefined
-          ? {}
-          : { agentVersion: deps.runnerPresence.agentVersion(row.id) }),
-        renamed: row.displayName !== null,
-      });
+      return c.json({ id: row.id, name: effectiveRunnerName(row), platform: row.platform, default: row.isDefault,
+        lastSeenAt: seenAt(row.id, row.lastSeenAt), attached, online: attached,
+        ...(deps.runnerPresence?.agentVersion(row.id) === undefined ? {} : { agentVersion: deps.runnerPresence.agentVersion(row.id) }),
+        renamed: row.displayName !== null });
     });
-    // Minting a runner code from the app, with the same 10 minute TTL and the same gateway-wide
-    // bucket the unauthenticated pairing route spends: a code is a credential in waiting, and it is
-    // bounded here for the same reason it is bounded there.
     app.post("/runners/pair-code", requireDevice, (c) => {
       const retryAfter = pairingAdmission.attempt();
-      if (retryAfter !== undefined) {
-        return c.json(
-          errorBody("invalid_request", "too many pairing attempts; try again later"),
-          429,
-          { "retry-after": String(retryAfter) },
-        );
-      }
-      const setupCode = newSetupCode();
-      const expiresAt = deps.now() + SETUP_CODE_TTL_MS;
+      if (retryAfter !== undefined) return c.json(errorBody("invalid_request", "too many pairing attempts; try again later"), 429, { "retry-after": String(retryAfter) });
+      const setupCode = newSetupCode(); const expiresAt = deps.now() + SETUP_CODE_TTL_MS;
       deps.storage.createSetupCode(setupCode, expiresAt, "runner");
       return c.json({ setupCode, expiresAt, gatewayUrl: deps.pairingUrl?.() ?? configuredOrigin(deps.config) });
     });
     app.patch("/runners/:id", requireDevice, async (c) => {
       const id = c.req.param("id");
-      if (id === LEGACY_RUNNER_ID)
-        return c.json(
-          errorBody("invalid_request", "the legacy shared runner is placed by the operator and cannot be changed here"),
-          400,
-        );
-      const parsed = parseOr400(c, RunnerPatchRequestSchema, await readBody(c));
-      if (!parsed.ok) return parsed.response;
+      if (id === LEGACY_RUNNER_ID) return c.json(errorBody("invalid_request", "the legacy shared runner is placed by the operator and cannot be changed here"), 400);
+      const parsed = parseOr400(c, RunnerPatchRequestSchema, await readBody(c)); if (!parsed.ok) return parsed.response;
       const { default: moveDefault, name } = parsed.value;
-      if (moveDefault === undefined && name === undefined) {
-        return c.json(
-          errorBody("invalid_request", "name a field to change: default or name"),
-          400,
-        );
-      }
-      if (moveDefault !== undefined && !moveDefault) {
-        return c.json(
-          errorBody("invalid_request", "default is moved by naming the runner that should hold it"),
-          400,
-        );
-      }
-      // Capability 55. `name` clears the display name ONLY on the literal "" or null; a
-      // whitespace-only string is a client mistake, not a clear, and is refused rather than
-      // silently treated as one. Otherwise it must be 1 to 64 CODE POINTS after trimming -- counted
-      // with a spread, not `.length`, so a name built of astral characters (most emoji) is not
-      // clipped at half a code point -- with no control or Unicode format character, the same shape
-      // a display name is rendered in everywhere else, so a bad value is refused rather than stored
-      // and shown ugly, invisible, or reordered.
+      if (moveDefault === undefined && name === undefined) return c.json(errorBody("invalid_request", "name a field to change: default or name"), 400);
+      if (moveDefault === false) return c.json(errorBody("invalid_request", "default is moved by naming the runner that should hold it"), 400);
       let displayName: string | null | undefined;
-      if (name !== undefined) {
-        if (name === null || name === "") {
-          displayName = null;
-        } else {
-          const trimmed = name.trim();
-          const codePoints = [...trimmed].length;
-          if (
-            codePoints === 0 || codePoints > 64 || RUNNER_NAME_CONTROL_CHARS.test(trimmed)
-          ) {
-            return c.json(
-              errorBody(
-                "invalid_request",
-                "name must be 1 to 64 characters (code points) after trimming, with no control or format characters",
-              ),
-              400,
-            );
-          }
-          displayName = trimmed;
-        }
-      }
-      if (roster.get(id) === undefined)
-        return c.json(errorBody("not_found", "no such runner"), 404);
-      if (moveDefault === true && roster.setDefault(id) === undefined)
-        return c.json(errorBody("not_found", "no such runner"), 404);
-      if (displayName !== undefined && roster.setDisplayName(id, displayName) === undefined)
-        return c.json(errorBody("not_found", "no such runner"), 404);
+      if (name !== undefined) { if (name === null || name === "") displayName = null; else { const trimmed = name.trim(); if ([...trimmed].length === 0 || [...trimmed].length > 64 || RUNNER_NAME_CONTROL_CHARS.test(trimmed)) return c.json(errorBody("invalid_request", "name must be 1 to 64 characters after trimming, with no control or format characters"), 400); displayName = trimmed; } }
+      if (roster.get(id) === undefined) return c.json(errorBody("not_found", "no such runner"), 404);
+      if (moveDefault === true) roster.setDefault(id);
+      if (displayName !== undefined) roster.setDisplayName(id, displayName);
       const updated = roster.get(id)!;
       return c.json({ runner: runnerToWire({ ...updated, lastSeenAt: seenAt(updated.id, updated.lastSeenAt) }, online(updated.id)) });
     });
     app.delete("/runners/:id", requireDevice, (c) => {
       const id = c.req.param("id");
-      if (id === LEGACY_RUNNER_ID)
-        return c.json(
-          errorBody("invalid_request", "the legacy shared runner is revoked by unsetting COZYGATEWAY_RUNNER_TOKEN"),
-          400,
-        );
-      // Counted BEFORE the row goes, and the bots themselves are left exactly as they are:
-      // revoking a computer strands its bots, it does not delete them, and the number is what the
-      // app warns with.
-      const stranded = botCount(id);
+      if (id === LEGACY_RUNNER_ID) return c.json(errorBody("invalid_request", "the legacy shared runner is revoked by unsetting COZYGATEWAY_RUNNER_TOKEN"), 400);
       if (!roster.remove(id)) return c.json(errorBody("not_found", "no such runner"), 404);
-      // Capability 54. The work that machine had not been handed yet would otherwise be addressed
-      // to a runner that can no longer authenticate, so it is re-addressed here: to the account
-      // default when there is one, and to nobody when there is not, which is the unaddressed state
-      // the default picks up as soon as one is set. Read AFTER the removal, so the revoked runner
-      // is never its own successor.
-      const successor = roster.defaultRunner()?.id ?? null;
-      const reassignedOperations = deps.storage.readdressUnsentRunnerOperations(id, successor);
       deps.onRunnerRevoked?.(id);
-      const body: RunnerDeleteResponse = {
-        ok: true,
-        botCount: stranded,
-        reassignedOperations,
-        ...(successor === null || reassignedOperations === 0 ? {} : { reassignedTo: successor }),
-      };
-      // The published schema against the real bytes, so a route that drifts from the contract fails
-      // here rather than on a phone.
+      const body: RunnerDeleteResponse = { ok: true, botCount: 0, reassignedOperations: 0 };
       return c.json(assertValid(RunnerDeleteResponseSchema, body));
     });
   }
@@ -1858,7 +1679,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
   registerArtifactRoutes(app, requireDevice, deps.storage, deps.now, {
     auth: requireAttach,
     agentOf: attachAgent,
-    botOf: (agentId) => deps.storage.chatExecutionById(agentId)?.bot ?? agentId,
+    botOf: (agentId) => agentId,
   });
 
   // Vendor extension, registered last so it cannot shadow a core route (contract/ext-bots-v1.md).
@@ -1894,7 +1715,6 @@ export function createApp(deps: AppDeps): Hono<Env> {
       deps.memory,
       {},
       deps.history,
-      deps.runRoutine,
       deps.chatConfiguration,
       deps.integrations,
     );

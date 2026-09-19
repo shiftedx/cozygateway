@@ -171,6 +171,9 @@ export const GatewayInfoSchema = Type.Object({
   version: Type.String(),
   contract: Type.Literal("v1"),
   capabilities: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 1 }))),
+  /** The agent runtimes this gateway intentionally exposes for bot creation. Optional so clients
+   * can retain their capability-version fallback for gateways released before this field. */
+  botRuntimes: Type.Optional(Type.Array(Type.Union([Type.Literal("hermes"), Type.Literal("cozyagents")]))),
   bridges: Type.Optional(Type.Record(Type.String(), Type.Union([BridgeLivenessSchema, Type.Literal("absent")]))),
   attach: Type.Optional(AttachHealthSummarySchema),
 });

@@ -2,7 +2,8 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { BotProfile } from "cozygateway-contract";
 import { RunnerChatExecutionDriver } from "../src/runner/chat-executions.ts";
 import { openStorage } from "../src/storage.ts";
-import type { RunnerChatCommandFrame, RunnerChatFrame, RunnerHello } from "../src/runner/protocol.ts";
+import { RunnerHelloSchema, type RunnerChatCommandFrame, type RunnerChatFrame, type RunnerHello } from "../src/runner/protocol.ts";
+import { check } from "cozygateway-contract";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
@@ -12,7 +13,7 @@ const profile: BotProfile = {
   mcpServers: [], model: { provider: "openai", default: "example" }, runtimeInert: [],
 };
 
-function setup(custom = false) {
+function setup(custom = false, availableRunners: readonly string[] = ["remote"]) {
   const storage = openStorage(":memory:");
   cleanups.push(() => storage.close());
   const commands: RunnerChatCommandFrame[] = [];
@@ -24,9 +25,9 @@ function setup(custom = false) {
   const prepareChatConfiguration = vi.fn(async (_peer, configuration) => ({ configuration }));
   const modelConfig = vi.fn(async () => ({ model: `${provider}:example`, effort: "medium", efforts: [], catalog: [], ...(custom ? { providers: [{ slug: provider, name: "Studio", baseUrl: "http://localhost:1234/v1", authenticated: true, modelCount: 1 }] } : {}) }));
   const driver = new RunnerChatExecutionDriver({
-    storage, tokens, prepareProvider, runtimeBot: () => true, name: () => "Work Mac", isAttached: () => true, disconnect: vi.fn(),
+    storage, tokens, prepareProvider, harness: () => "hermes", name: () => "Work Mac", isAttached: () => true, disconnect: vi.fn(),
     lane: {
-      chatCapableRunners: () => ["remote"],
+      chatCapableRunners: () => availableRunners,
       onChatFrame: (listener) => { onFrame = listener; return () => undefined; },
       onChatConnection: (listener) => { onConnection = listener; return () => undefined; },
       sendChatCommand: (_id, frame) => { commands.push(frame); return true; },
@@ -167,4 +168,25 @@ it("does not restore a retired execution when an awaited configuration write fin
   await expect(preparing).rejects.toThrow("chat was deleted");
   expect(test.storage.chatExecutions().map((row) => row.stage)).toEqual(["deleted"]);
   expect(test.storage.purgeBot("delete-fixture")).toEqual({});
+});
+
+it("accepts a mixed-harness computer hello while the driver dispatches Hermes only", () => {
+  expect(check(RunnerHelloSchema, { kind: "hello", version: 1, runnerId: "remote", backends: ["process"], capabilities: { chat_execution: 1 }, chatExecutionHarnesses: ["cozyagents", "hermes"] })).toBe(true);
+});
+
+it("does not relaunch a legacy CozyAgents execution after a computer reconnects", () => {
+  const test = setup();
+  const sessionId = test.storage.nativeBotChat("sage", 1).sessionId;
+  test.storage.saveChatExecution({ executionId: "chatx_00000000000000000000000000000000", bot: "sage", sessionId, runnerId: "remote", token: "legacy-token", operationId: "legacy", workspace, harness: "cozyagents", stage: "ready", createdAt: 1 });
+  test.connection("remote", { kind: "hello", version: 1, runnerId: "remote", backends: ["process"] });
+  expect(test.commands).toEqual([]);
+  expect(test.tokens.has("legacy-token")).toBe(false);
+});
+
+it("does not relaunch a Hermes execution through a computer without Hermes capability", () => {
+  const test = setup(false, []);
+  const sessionId = test.storage.nativeBotChat("sage", 1).sessionId;
+  test.storage.saveChatExecution({ executionId: "chatx_11111111111111111111111111111111", bot: "sage", sessionId, runnerId: "remote", token: "hermes-token", operationId: "hermes", workspace, harness: "hermes", stage: "ready", createdAt: 1 });
+  test.connection("remote", { kind: "hello", version: 1, runnerId: "remote", backends: ["process"] });
+  expect(test.commands).toEqual([]);
 });

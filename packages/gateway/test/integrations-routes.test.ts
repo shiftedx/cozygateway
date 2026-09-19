@@ -38,7 +38,7 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-async function setup(opts: { runtimeBot?: boolean } = {}) {
+async function setup() {
   const configs: Record<string, Config> = {
     source: {
       mcp_servers: {
@@ -188,9 +188,7 @@ async function setup(opts: { runtimeBot?: boolean } = {}) {
   const app = createApp({
     storage,
     config: { name: "g", port: 8787, dbPath: ":memory:", turnTimeoutSeconds: 0 },
-    bots: opts.runtimeBot
-      ? Object.assign(Object.create(bridge) as HermesBridge, { botRuntime: () => ({}) })
-      : bridge,
+    bots: bridge,
     integrations,
     gatewayInfo: { name: "g", version: "0.1.0", contract: "v1", capabilities: { "com.cozylabs.integrations": 1 } },
     presenceOf: () => "online",
@@ -265,7 +263,7 @@ describe("Dashboard-backed integration routes", () => {
       .toMatchObject({ installed: false });
   });
 
-  it("keeps a manually configured source integration disabled and rejects a runtime bot", async () => {
+  it("keeps a manually configured source integration disabled", async () => {
     const h = await setup();
     const created = await h.authed(h.first, "/integrations", {
       method: "POST",
@@ -276,10 +274,6 @@ describe("Dashboard-backed integration routes", () => {
     expect(await created.json()).toMatchObject({ name: "manual", enabled: false });
     expect(record(record(h.configs.source!["mcp_servers"])["manual"])["enabled"]).toBe(false);
 
-    const runtime = await setup({ runtimeBot: true });
-    const denied = await runtime.authed(runtime.first, "/bots/scout/integrations");
-    expect(denied.status).toBe(409);
-    expect(await denied.json()).toMatchObject({ error: { code: "unsupported_for_runtime" } });
   });
 
   it("requires pairing, copies only missing credential references, and keeps test errors private", async () => {

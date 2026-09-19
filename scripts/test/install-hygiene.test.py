@@ -29,11 +29,15 @@ class NativeHygieneTest(unittest.TestCase):
         self.assertEqual(version.split(".")[0], "24", "run this fixture with Node.js 24 on PATH")
         for path in (self.home, self.bin, self.assets, self.hermes):
             path.mkdir(parents=True)
+        prompt_input = self.base / "negative-prompts"
+        prompt_input.write_text("n\n" * 32)
         self.env = dict(os.environ, HOME=str(self.home), PATH=f"{self.bin}:" + os.environ["PATH"],
                         COZYGATEWAY_HOME=str(self.gateway), COZYGATEWAY_NODE=self.node,
                         COZYGATEWAY_HERMES_BIN=str(self.bin / "hermes"),
                         COZYGATEWAY_SERVICE_PLATFORM="Darwin", FIXTURE_HERMES=str(self.hermes),
-                        FIXTURE_GATEWAY=str(self.gateway), COZYGATEWAY_INSTALL_ASSET_BASE=self.assets.as_uri())
+                        FIXTURE_GATEWAY=str(self.gateway), COZYGATEWAY_INSTALL_ASSET_BASE=self.assets.as_uri(),
+                        COZYGATEWAY_TEST_LAN_PROMPT_INPUT=str(prompt_input),
+                        COZYGATEWAY_TEST_PAIR_PROMPT_INPUT=str(prompt_input))
         self.executable("hermes", '''#!/bin/bash
 if [ "$1" = status ]; then printf 'Current model: fixture/model\nActive provider: fixture\n'; exit 0; fi
 if [ "$1" = -p ] && [ "$3" = config ] && [ "$4" = path ]; then

@@ -44,10 +44,6 @@ function receiptTag(networkPath: ReceiptNetworkPath | undefined, vpn: boolean | 
  *  one. Oldest entries are dropped first, and dropping one loses a metric and nothing else. */
 const MAX_TRACKED = 4_096;
 
-/** How many folded snapshot steps the ring remembers for the replay guard. A turn is a few dozen
- *  steps, so this covers hundreds of concurrent turns; forgetting the oldest entry can only ever
- *  re-admit a very old duplicate, which is a far smaller error than admitting every duplicate. */
-const MAX_FOLDED = 16_384;
 
 function remember<K, V>(map: Map<K, V>, key: K, value: V): void {
   if (map.size >= MAX_TRACKED && !map.has(key)) {
@@ -57,16 +53,6 @@ function remember<K, V>(map: Map<K, V>, key: K, value: V): void {
   map.set(key, value);
 }
 
-/** Claims a key in a bounded seen-set. False means it was already there. */
-function claim(seen: Set<string>, key: string): boolean {
-  if (seen.has(key)) return false;
-  if (seen.size >= MAX_FOLDED) {
-    const oldest = seen.values().next();
-    if (oldest.done !== true) seen.delete(oldest.value);
-  }
-  seen.add(key);
-  return true;
-}
 
 interface TurnTiming {
   /** Monotonic reading at admission: the durable turn row exists. */
@@ -78,35 +64,6 @@ interface TurnTiming {
   deltaFrames: number;
 }
 
-/** One step of a CozyAgents snapshot, as D5's harness reports it. Every record carries the turn it
- *  belongs to and its index within that turn, which is what makes a repeated fold detectable. */
-export interface ObserveSnapshotStep {
-  turnId: string;
-  step: number;
-  modelStepMs?: number;
-  promptTokens?: number;
-  completionTokens?: number;
-  cachedTokens?: number;
-  prefillTokensPerSecond?: number;
-  decodeTokensPerSecond?: number;
-}
-
-export interface ObserveSnapshotToolCall {
-  turnId: string;
-  step: number;
-  /** Distinguishes two tool calls made in the same step. */
-  index?: number;
-  toolMs?: number;
-  tool?: string;
-  inducedTokens?: number;
-}
-
-export interface ObserveSnapshot {
-  steps?: readonly ObserveSnapshotStep[];
-  toolCalls?: readonly ObserveSnapshotToolCall[];
-  /** How many model steps a FINISHED turn took. Folded once per turn. */
-  turns?: readonly { turnId: string; modelSteps: number }[];
-}
 
 /** The observation ring: everything the gateway measures once and would otherwise throw away.
  *
@@ -128,7 +85,6 @@ export class ObservationRing {
   readonly #retentionDays: number;
   readonly #turns = new Map<string, TurnTiming>();
   readonly #peerHeartbeats = new Map<string, number>();
-  readonly #folded = new Set<string>();
   #emitter: ((frame: ObserveSampleFrame | ObserveEventFrame) => void) | undefined;
 
   bindEmitter(sink: ((frame: ObserveSampleFrame | ObserveEventFrame) => void) | undefined): void {
@@ -262,7 +218,7 @@ export class ObservationRing {
   // turn timing
 
   #turnKey(bot: string, turnId: string): string {
-    return `${bot} ${turnId}`;
+    return `${bot}\0${turnId}`;
   }
 
   /** The turn was admitted: a durable turn row exists and the gateway now owes the peer a command. */
@@ -401,98 +357,6 @@ export class ObservationRing {
     };
     if (Object.keys(detail).length === 0) return;
     this.event("receipt_measurement", input.bot, input.deviceId, detail);
-  }
-
-  /** Section 12's lifetime counters, outside the ring and never trimmed.
-   *
-   *  Two guards, because these counters are additive and nothing downstream can correct an inflated
-   *  one, and because neither guard alone holds for all time:
-   *
-   *  1. `snapshotId` is claimed durably in the store's ledger, so a snapshot folded twice, including
-   *     across a restart, adds once.
-   *  2. A snapshot whose own timestamp is older than the retention window is REFUSED OUTRIGHT. The
-   *     ledger is trimmed on the ring's window (it is the one table here that would otherwise grow
-   *     forever, one row per snapshot), and trimming a claim would reopen the replay it was
-   *     preventing. This closes that: past the window there is no claim to check and nothing to
-   *     check it for, because the snapshot is refused on its age instead. A snapshot that old
-   *     describes a turn that ended a week ago and is not something any producer still holds.
-   *
-   *  Returns false for a refusal of either kind, so a caller can tell a replay from an addition. */
-  accumulateLifetime(input: {
-    snapshotId: string;
-    bot: string;
-    model: string;
-    prompt: number;
-    completion: number;
-    cached: number;
-    costMicros: number;
-    turns: number;
-    priced?: number;
-    unpriced?: number;
-    at: number;
-  }): boolean {
-    if (!this.#enabled) return false;
-    if (this.#now() - input.at > this.#retentionDays * 86_400_000) return false;
-    return this.#store.accumulateLifetime({
-      ...input,
-      snapshotId: this.#store.identify(input.snapshotId),
-      bot: this.#store.identify(input.bot),
-      model: this.#store.identify(input.model),
-    });
-  }
-
-  /** THE SEAM D5 CALLS. D5's gateway-side store-latest-snapshot code invokes this once per
-   *  `observation_snapshot` it accepts; D2 owns the series-write side and nothing else.
-   *
-   *  IDEMPOTENT PER BOT, TURN AND STEP. D5's harness repeats a step index between an idle tick and a
-   *  terminal, and a cumulative snapshot replays the whole turn on every tick, so folding blind would
-   *  double count by a factor that grows with the number of ticks. Every record carries the turn it
-   *  belongs to and its index within that turn, and a record already folded is skipped. The return
-   *  says how many of each it did, so a caller can see a replay rather than guess at one.
-   *
-   *  Only numeric fields cross, each under a CozyAgents-measured series name, so a Hermes bot that
-   *  never sends a snapshot simply has no rows here rather than an inferred one. */
-  foldSnapshotIntoSeries(bot: string, snapshot: ObserveSnapshot, durablyClaimed = false): {
-    folded: number; skipped: number; acceptedSteps: ObserveSnapshotStep[]; acceptedToolCalls: ObserveSnapshotToolCall[];
-  } {
-    const acceptedSteps: ObserveSnapshotStep[] = [];
-    const acceptedToolCalls: ObserveSnapshotToolCall[] = [];
-    if (!this.#enabled) return { folded: 0, skipped: 0, acceptedSteps, acceptedToolCalls };
-    let folded = 0;
-    let skipped = 0;
-    for (const step of snapshot.steps ?? []) {
-      if (!durablyClaimed && !claim(this.#folded, `${bot} ${step.turnId} s${step.step}`)) {
-        skipped += 1;
-        continue;
-      }
-      folded += 1;
-      acceptedSteps.push(step);
-      if (step.prefillTokensPerSecond !== undefined) this.sample("prefill_tokens_per_second", bot, step.prefillTokensPerSecond);
-      if (step.decodeTokensPerSecond !== undefined) this.sample("decode_tokens_per_second", bot, step.decodeTokensPerSecond);
-      if (step.modelStepMs !== undefined) this.sample("model_step_ms", bot, step.modelStepMs);
-      if (step.promptTokens !== undefined) this.sample("prompt_tokens", bot, step.promptTokens);
-      if (step.completionTokens !== undefined) this.sample("completion_tokens", bot, step.completionTokens);
-      if (step.cachedTokens !== undefined) this.sample("cached_tokens", bot, step.cachedTokens);
-    }
-    for (const call of snapshot.toolCalls ?? []) {
-      if (!durablyClaimed && !claim(this.#folded, `${bot} ${call.turnId} t${call.step}.${call.tool ?? call.index ?? 0}`)) {
-        skipped += 1;
-        continue;
-      }
-      folded += 1;
-      acceptedToolCalls.push(call);
-      if (call.toolMs !== undefined) this.sample("tool_ms", bot, call.toolMs);
-      if (call.inducedTokens !== undefined) this.sample("induced_tokens", bot, call.inducedTokens);
-    }
-    for (const turn of snapshot.turns ?? []) {
-      if (!durablyClaimed && !claim(this.#folded, `${bot} ${turn.turnId} n`)) {
-        skipped += 1;
-        continue;
-      }
-      folded += 1;
-      this.sample("model_steps", bot, turn.modelSteps);
-    }
-    return { folded, skipped, acceptedSteps, acceptedToolCalls };
   }
 
   // retention

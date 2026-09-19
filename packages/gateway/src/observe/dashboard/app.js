@@ -8,8 +8,6 @@
   const duration = value => typeof value !== 'number' || !Number.isFinite(value) ? 'Not reported' : value < 1000 ? `${Math.round(value)} ms` : value < 60000 ? `${(value / 1000).toFixed(1)} s` : value < 3600000 ? `${Math.round(value / 60000)} min` : `${(value / 3600000).toFixed(1)} h`;
   const age = at => typeof at === 'number' ? `${duration(Math.max(0, Date.now() - at))} ago` : 'Not reported';
   const clock = at => typeof at === 'number' ? new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'Not reported';
-  const money = value => typeof value === 'number' ? new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: value < 10000 && value > 0 ? 4 : 2 }).format(value / 1000000) : 'tokens only';
-  const sum = values => values.reduce((a, b) => a + (typeof b === 'number' ? b : 0), 0);
   const empty = text => `<p class="empty">${esc(text)}</p>`;
   const chip = (text, state = '') => `<span class="chip ${esc(state)}">${esc(text)}</span>`;
   const metric = (value, unit = duration) => !value || value.samples === 0 ? 'No samples' : value.belowSampleFloor ? `${number(value.samples)} samples · need 20` : `${unit(value.p50)} · p95 ${unit(value.p95)} · n ${number(value.samples)}`;
@@ -79,7 +77,7 @@
       if (generation === state.generation) state.errors.add(path);
     } finally { clearTimeout(timeout); }
   }
-  const endpoints = ['overview','bots','turns','roundtrip','attach','approvals','deliveries','devices','events','cozyagents','cozyagents/spend','cozyagents/tools','series?series=tunnel_rtt_ms','series?series=ttft_ms'];
+  const endpoints = ['overview','bots','turns','roundtrip','attach','approvals','deliveries','devices','events','series?series=tunnel_rtt_ms','series?series=ttft_ms'];
   async function refresh() {
     if (state.authExpired) return;
     if (state.pending) { state.again = true; return; }
@@ -94,9 +92,9 @@
     }
     if (state.again) { state.again = false; refresh(); }
   }
-  const panelPaths = { overview:['glance','header-strip'], bots:['bots'], turns:['turns'], roundtrip:['roundtrip','felt','network-path'], attach:['attach'], approvals:['approvals'], deliveries:['deliveries'], devices:['devices'], events:['events'], cozyagents:['internals','model','agent-glance'], 'cozyagents/spend':['spend'], 'cozyagents/tools':['tool-costs'], 'series?series=tunnel_rtt_ms':['tunnel-chart'], 'series?series=ttft_ms':['first-token-chart'] };
+  const panelPaths = { overview:['glance','header-strip'], bots:['bots'], turns:['turns'], roundtrip:['roundtrip','felt','network-path'], attach:['attach'], approvals:['approvals'], deliveries:['deliveries'], devices:['devices'], events:['events'], 'series?series=tunnel_rtt_ms':['tunnel-chart'], 'series?series=ttft_ms':['first-token-chart'] };
   function render() {
-    renderOverview(); renderBots(); renderLatency(); renderTurns(); renderAttach(); renderApprovals(); renderDeliveries(); renderDevices(); renderEvents(); renderAgents(); renderFlow();
+    renderOverview(); renderBots(); renderLatency(); renderTurns(); renderAttach(); renderApprovals(); renderDeliveries(); renderDevices(); renderEvents(); renderFlow();
     chart('tunnel-chart', state.data['series?series=tunnel_rtt_ms']?.points, 'Derived tunnel round trip', state.data['series?series=tunnel_rtt_ms']);
     chart('first-token-chart', state.data['series?series=ttft_ms']?.points, 'First token', state.data['series?series=ttft_ms']);
     for (const [path, ids] of Object.entries(panelPaths)) for (const id of ids) {
@@ -116,12 +114,10 @@
     $('gateway-name').textContent = data.gateway.name;
     const a = data.attach;
     $('header-strip').innerHTML = [chip(`v${data.gateway.version}`), chip(`up ${duration(data.gateway.uptimeMs)}`), chip(`bridge ${data.gateway.bridge}`, data.gateway.bridge === 'online' ? 'ok' : 'stale'), chip(`attach ${a?.online ?? 'unknown'} online`, a?.online ? 'ok' : ''), chip(`queue ${a?.queueDepth ?? 'not reported'}`), chip(`dead letters ${a?.deadLetters ?? 'not reported'}`, a?.deadLetters ? 'bad' : ''), chip(`tunnel ${data.tunnel.state}`, data.tunnel.state === 'offline' ? 'bad' : data.tunnel.state === 'online' ? 'ok' : 'stale')].join('');
-    const spend = data.tiles.spend?.rows;
-    const priced = spend?.length && spend.every(row => row.costMicros !== null);
-    const tiles = [ ['Needs a person',number(data.needsAPerson.total),`${number(data.needsAPerson.approvals)} approvals · ${number(data.needsAPerson.repairs)} repairs`,'wait'], ['Round trip',data.tiles.roundTrip?.samples ? duration(data.tiles.roundTrip.p50) : 'No samples',`socket round trip · n ${number(data.tiles.roundTrip?.samples)}`,''], ['First token',data.tiles.firstToken?.samples ? duration(data.tiles.firstToken.p50) : 'No samples',`p50 · n ${number(data.tiles.firstToken?.samples)}`,''], ['Turns',number(data.tiles.turns),`terminal records · ${state.window}`,''], ['Spend',priced ? money(sum(spend.map(x=>x.costMicros))) : 'tokens only',`reported token categories · ${state.window}`,''] ];
+    const tiles = [ ['Needs a person',number(data.needsAPerson.total),`${number(data.needsAPerson.approvals)} approvals · ${number(data.needsAPerson.repairs)} repairs`,'wait'], ['Round trip',data.tiles.roundTrip?.samples ? duration(data.tiles.roundTrip.p50) : 'No samples',`socket round trip · n ${number(data.tiles.roundTrip?.samples)}`,''], ['First token',data.tiles.firstToken?.samples ? duration(data.tiles.firstToken.p50) : 'No samples',`p50 · n ${number(data.tiles.firstToken?.samples)}`,''], ['Turns',number(data.tiles.turns),`terminal records · ${state.window}`,''] ];
     $('glance').innerHTML = tiles.map(([label,value,description,status]) => `<div class="tile ${status}" role="listitem"><div class="k">${esc(label)}</div><div class="v">${esc(value)}</div><div class="d">${esc(description)}</div></div>`).join('');
     const approvals = state.data.approvals?.pending ?? [];
-    const repairs = (state.data.cozyagents?.internals ?? []).flatMap(bot => (bot.toolServers ?? []).filter(server => server.state === 'repair_pending').map(server => ({ bot: bot.bot, server: server.server })));
+    const repairs = [];
     $('attention').classList.toggle('calm', !approvals.length && !repairs.length);
     $('attention-items').innerHTML = [...approvals.map(row=>`<li>${chip('Approval','wait')}<span>${esc(row.bot)} has a pending approval. Answer in CozyChat.</span><span class="since">${esc(age(row.createdAt))}</span></li>`), ...repairs.map(row=>`<li>${chip('Repair','wait')}<span>${esc(row.bot)} · ${esc(row.server)} needs a decision in CozyChat.</span></li>`)].join('') || '<li class="empty">No pending decisions reported.</li>';
   }
@@ -169,38 +165,13 @@
   }
   function renderDevices() {
     const data=state.data.devices;if(!data)return;
-    $('devices').innerHTML=`<div><h3>Devices</h3>${table(['Name','Kind','Scope','Last seen'],(data.devices??[]).map(row=>[esc(row.name),esc(row.kind),chip(row.scope),esc(age(row.lastSeenAt))]))}</div><div><h3>Runners</h3>${table(['Name','State','Last contact'],(data.runners??[]).map(row=>[esc(row.name),chip(row.online?'online':'offline',row.online?'ok':'stale'),esc(age(row.lastContactAt))]))}</div>`;
+    $('devices').innerHTML=`<div><h3>Devices</h3>${table(['Name','Kind','Scope','Last seen'],(data.devices??[]).map(row=>[esc(row.name),esc(row.kind),chip(row.scope),esc(age(row.lastSeenAt))]))}</div>`;
   }
   function renderEvents() {
     const all=state.data.events?.events;if(!all)return;
     const select=$('event-kind'); const kinds=[...new Set(all.map(row=>row.kind))].sort();
     select.innerHTML='<option value="">All kinds</option>'+kinds.map(kind=>`<option value="${esc(kind)}">${esc(kind)}</option>`).join(''); select.value=state.kind;
     $('events').innerHTML=table(['Time','Kind','Bot','Details'],all.filter(row=>!state.kind||row.kind===state.kind).map(row=>[esc(clock(row.at)),chip(row.kind),esc(row.botName??'gateway'),esc(Object.entries(row.detail??{}).map(([k,v])=>`${k}: ${v}`).join(' · ')||'No detail')]))+historyNote(state.data.events,all.length,state.data.events.totalEvents,'events')+(state.kind?empty('Kind filter applies to the received event feed.'): '');
-  }
-  function renderAgents() {
-    const data=state.data.cozyagents;if(!data)return;
-    $('tab-ca').hidden=!data.available;
-    if(!data.available){if($('tab-ca').getAttribute('aria-selected')==='true')select($('tab-gw'));return;}
-    const bots=data.internals??[];
-    if((location.hash==='#view-ca' || document.getElementById(location.hash.slice(1))?.closest('#view-ca')) && $('tab-gw').getAttribute('aria-selected')==='true')select($('tab-ca'));
-    const ages=bots.map(row=>row.snapshotAgeMs).filter(value=>typeof value==='number');
-    $('agent-glance').innerHTML=[['Peers',number(bots.length),'stored snapshot subjects'],['Snapshot',ages.length?duration(Math.max(...ages)):'Not reported','oldest snapshot age'],['Steps',number(data.model?.stepLatency?.samples),'latency samples in window'],['Checkpoints',bots.some(row=>Number.isFinite(row.checkpoints?.count))?number(sum(bots.map(row=>row.checkpoints?.count))):'Not reported','reported counters'],['Repairs',number(sum(bots.map(row=>(row.toolServers??[]).filter(s=>s.state==='repair_pending').length))),'waiting on a person']].map(([label,value,detail])=>`<div class="tile" role="listitem"><div class="k">${esc(label)}</div><div class="v">${esc(value)}</div><div class="d">${esc(detail)}</div></div>`).join('');
-    $('model').innerHTML=kv([['Model step latency',metric(data.model?.stepLatency)],['HTTP status distribution','Not reported'],['Provider usage','See throughput per model below']]);
-    $('internals').innerHTML=bots.map(bot=>`<article class="agent-block"><h3>${esc(bot.bot)} ${chip(bot.runtimeStage,bot.runtimeStage==='ready'?'ok':'wait')} ${chip(`snapshot ${duration(bot.snapshotAgeMs)}`,bot.snapshotAgeMs>90000?'stale':'')}</h3><div class="internals"><section><h3>Runtime</h3>${kv([['Generation wanted',number(bot.generationsWanted)],['Generation observed',number(bot.generationsObserved)],['Bundle',bot.bundleVersion??'Not reported'],['Runner',bot.runnerName??'Not reported'],['Runner contact',age(bot.runnerLastContactAt)]])}</section><section><h3>Tools by family</h3>${table(['Family','Calls'],(bot.toolFamilies??[]).map(row=>[esc(row.family),number(row.calls)]))}${kv([['Cache telemetry',bot.cache?.availability==='reported'?`${number(bot.cache.hits)} hits · ${number(bot.cache.misses)} misses · process lifetime`:'Not reported']])}</section><section><h3>Tool servers</h3>${table(['Server','Health layers','State'],(bot.toolServers??[]).map(server=>[`${esc(server.server)}<small class="mono">${esc(server.fingerprint??'Fingerprint not reported')}</small>`,`<span class="segbar" aria-label="${number(server.healthy)} of ${number(server.layers)} layers healthy">${Array.from({length:Math.min(32,server.layers??0)},(_,i)=>`<i class="${i<(server.healthy??0)?'':'off'}"></i>`).join('')}</span>`,chip(server.state,server.state==='healthy'?'ok':server.state==='repair_pending'?'wait':'stale')]))}</section><section><h3>Policy</h3>${kv([['Permitted',number(bot.policy?.permitted)],['Asked',number(bot.policy?.asked)],['Denied',number(bot.policy?.denied)],['Expired',number(bot.policy?.expired)],['Egress refused',number(bot.policy?.egressRefused)],['Level',bot.policy?.level??'Not reported']])}</section><section><h3>Context</h3>${kv([['In use tokens',number(bot.context?.inUseTokens)],['Window tokens',number(bot.context?.windowTokens)],['Rollovers',number(bot.context?.rollovers)],['Last rollover',age(bot.context?.lastRolloverAt)],['Cards attached',number(bot.context?.cardsAttached)],['Cards total',number(bot.context?.cardsTotal)],['Lease headroom','Not reported']])}</section><section><h3>Memory and checkpoints</h3>${kv([['Recall documents',number(bot.memory?.recallDocs)],['Recall bytes',number(bot.memory?.recallBytes)],['Last consolidation',age(bot.memory?.lastConsolidationAt)],['Evicted',number(bot.memory?.evicted)],['Tombstoned',number(bot.memory?.tombstoned)],['Checkpoints',number(bot.checkpoints?.count)],['Restores',number(bot.checkpoints?.restores)],['Last restore',bot.checkpoints?.lastRestoreResult??'Not reported']])}</section></div></article>`).join('')||empty('No snapshots match this bot.');
-    const spend=state.data['cozyagents/spend'];
-    if(spend?.available)$('spend').innerHTML=(spend.rows??[]).map(row=>`<div class="r" role="listitem"><div class="bname name">${esc(row.bot)}<small>${esc(row.model)}</small></div><div class="m"><span class="n">${(row.speedsByPrefix??[{prefix:'reported',prefill:row.prefill}]).map(speed=>`${esc(metric(speed.prefill,number))}<small>${esc(speed.prefix)} prefill tok/s</small>`).join('')}</span></div><div class="m"><span class="n">${(row.speedsByPrefix??[{prefix:'reported',decode:row.decode}]).map(speed=>`${esc(metric(speed.decode,number))}<small>${esc(speed.prefix)} decode tok/s</small>`).join('')}</span></div><div class="bn">${number(sum(Object.values(row.tokens??{})))} tok<small>lifetime ${number(sum([row.lifetime?.prompt,row.lifetime?.completion,row.lifetime?.cached]))}</small></div><div class="bn">${esc(money(row.costMicros))}<small>lifetime ${esc(money(row.lifetime?.costMicros))}</small><small>per turn ${esc(metric(row.costPerTurn,money))}</small></div></div>`).join('')||empty('No reported model usage in this window.');
-    const tools=state.data['cozyagents/tools'];
-    if(tools?.available)$('tool-costs').innerHTML=table(['Tool · family','Calls','Errors','Median result tokens','Induced tokens','Cost','Duration','Flags'],(tools.rows??[]).map(row=>[`${esc(row.tool)}<small class="mono">${esc(row.family)}</small>`,number(row.calls),number(row.errors),row.resultSize?esc(metric(row.resultSize,number)):number(row.medianResultTokens),number(row.inducedTokens),esc(money(row.costMicros)),esc(metric(row.duration)),[...(row.flags??[]),...(row.attributed?['attributed']:[])].map(flag=>chip(flag,flag==='errors'?'bad':'wait')).join(' ')||'none']))+(tools.rows??[]).filter(row=>row.drivingTurns?.length).map(row=>`<details class="numbers"><summary>${esc(row.tool)} · driving turns</summary>${table(['Bot','Turn reference','Calls','Induced tokens'],row.drivingTurns.map(turn=>[esc(turn.bot),esc(turn.turn),number(turn.calls),number(turn.inducedTokens)]))}</details>`).join('')+(tools.heavyDetectionAvailable===false?empty('Heavy-call detection is unavailable for grouped calls without an individual-call distribution.'):'')+empty('Retry detection by matching arguments is unavailable because this lane does not carry arguments hashes.');
-    const steps=data.steps??bots.flatMap(bot=>(bot.steps??[]).map(record=>({bot:bot.bot,record}))), calls=data.toolCalls??bots.flatMap(bot=>(bot.toolCalls??[]).map(record=>({bot:bot.bot,record})));
-    if(data.turn?.spans?.length && data.turn.spans.every(span=>Number.isFinite(span.start)&&Number.isFinite(span.end)&&span.end>=span.start)){
-      $('turnsvg').hidden=false;renderAnatomy(data.turn);$('turn-steps').innerHTML='';
-    }else{
-      $('turnsvg').hidden=true;
-      $('turn-narrow').textContent='Timing positions are not reported. Durations are shown without inventing a timeline.';
-      $('turn-steps').innerHTML=table(['Bot','Turn reference','Step','Model','Prompt','Completion','Cached','First token','Generation'],steps.map(value=>{const row=value.record??value;return[esc(value.bot??''),esc(row.turn??'Not reported'),number(row.step),esc(row.model??'Not reported'),number(row.promptTokens),number(row.completionTokens),number(row.cachedTokens),esc(duration(row.timeToFirstTokenMs)),esc(duration(row.generationMs))];}));
-      $('turn-inspect').innerHTML=table(['Tool','Step','Calls','Induced tokens','Duration'],calls.map(value=>{const row=value.record??value;return[esc(row.tool),number(row.step),number(row.calls),number(row.inducedTokens),esc(duration(row.durationMs))];}));
-      $('turn-summary').textContent=steps.length?`${number(steps.length)} step records and ${number(calls.length)} grouped tool records in the latest snapshots. Wait chronology, context limits and output-frame timing are not reported.`:'No step records reported in the latest snapshots. Snapshot presence alone does not imply measured turn timing.';
-    }
   }
   const svgNS='http://www.w3.org/2000/svg';
   function svgElement(tag,attrs,parent,text){const el=document.createElementNS(svgNS,tag);for(const [key,value]of Object.entries(attrs))el.setAttribute(key,String(value));if(text!==undefined)el.textContent=text;parent.appendChild(el);return el;}
@@ -257,113 +228,4 @@
   addEventListener('pagehide',()=>{clearTimeout(reconnectTimer);socket?.close();});
   refresh();connect();
 
-  function renderAnatomy(turn) {
-    function ms(v) { return v < 1000 ? Math.round(v) + ' ms' : v < 60000 ? (v / 1000).toFixed(1) + ' s' : Math.floor(v / 60000) + ' m ' + Math.round((v % 60000) / 1000) + ' s'; }
-    function tok(v) { return v < 1000 ? String(v) : v < 100000 ? (v / 1000).toFixed(1) + 'k' : Math.round(v / 1000) + 'k'; }
-    function num(v) { return number(v); }
-    function spanName(sp) { return sp.kind === 'model_step' ? 'model step ' + sp.n : sp.kind === 'tool_call' ? sp.name + (sp.calls > 1 ? ' ×' + sp.calls : '') : sp.kind === 'approval_wait' ? 'approval wait' : sp.kind === 'checkpoint' ? 'checkpoint ' + sp.id : sp.kind; }
-    function facts(sp) {
-      var d = sp.end - sp.start, f = [];
-      if (sp.kind === 'prompt') f = [['Tokens', num(sp.tokens) + ' tok'], ['Assembled at', ms(sp.start)]];
-      else if (sp.kind === 'model_step') f = [['Duration', ms(d)], ['First token at', ms(sp.firstTokenAt)], ['Prompt tokens', num(sp.promptTokens) + (sp.cachedTokens ? ' · ' + num(sp.cachedTokens) + ' cached' : ' · none cached')], ['Completion tokens', num(sp.completionTokens)], ['HTTP', String(sp.status)]];
-      else if (sp.kind === 'tool_call') f = [['Duration', ms(d) + (sp.calls > 1 ? ' for ' + sp.calls + ' calls' : '')], ['Family · role', sp.family + ' · ' + sp.role], ['Result tokens', num(sp.resultTokens) + (sp.resultTokens > 10000 ? ' · heavy' : '')], ['Cache hits', sp.cacheHits + ' of ' + sp.calls], ['Outcome', sp.outcome]];
-      else if (sp.kind === 'approval_wait') f = [['Waited', ms(d) + ', not counted as work'], ['Category', sp.category], ['Answered by', sp.answeredBy + ' · ' + sp.outcome]];
-      else if (sp.kind === 'stream') f = [['Duration', ms(d)], ['Delta frames', String(sp.frames)], ['Frame gap, mean', ms(d / sp.frames)]];
-      else if (sp.kind === 'checkpoint') f = [['Sealed at', ms(sp.start - waitDur) + ' of work'], ['Id', sp.id]];
-      return f;
-    }
-    var waitSpan = turn.spans.filter(function (x) { return x.kind === 'approval_wait'; })[0];
-    var waitDur = waitSpan ? waitSpan.end - waitSpan.start : 0;
-    var tsvg = document.getElementById('turnsvg'), inspect = document.getElementById('turn-inspect');
-    var selected = turn.spans.indexOf(turn.spans.filter(function (x) { return x.kind === 'tool_call'; }).sort(function (a, b) { return b.resultTokens - a.resultTokens; })[0]);
-    if (selected < 0) selected = 0;
-    function showSpan(i) {
-      var sp = turn.spans[i], kindClass = { prompt: 'live', model_step: '', tool_call: sp.role === 'Mutation' ? 'wait' : 'live', approval_wait: 'wait', stream: 'live', checkpoint: 'ok' }[sp.kind];
-      inspect.innerHTML = '<div class="ih"><span class="chip ' + kindClass + '">' + esc(sp.kind.replace('_',' ')) + '</span><b>' + esc(spanName(sp)) + '</b></div>' + kv(facts(sp));
-      tsvg.querySelectorAll('.span').forEach(function (g) { g.classList.toggle('sel', +g.dataset.i === selected); });
-    }
-    function renderTurn() {
-      var NS = svgNS, L = 84, R = 784, G = 56, total = turn.spans[turn.spans.length - 1].end, work = total - waitDur, k = (R - L - G) / work;
-      function X(t) { return waitSpan && t >= waitSpan.end ? L + G + (t - waitDur) * k : waitSpan && t > waitSpan.start ? L + (waitSpan.start * k) : L + t * k; }
-      function el(tag, attrs, parent) { var e = document.createElementNS(NS, tag); for (var a in attrs) e.setAttribute(a, attrs[a]); (parent || tsvg).appendChild(e); return e; }
-      function txt(x, y, str, attrs, parent) { var t = el('text', Object.assign({ x: x, y: y }, attrs || {}), parent); t.textContent = str; return t; }
-      Array.prototype.slice.call(tsvg.childNodes).forEach(function (n) { if (n.nodeName !== 'defs') tsvg.removeChild(n); });
-      // context growth: prompt tokens the model reads, rising as tool results are appended
-      var cy0 = 18, cy1 = 78, cmax = Math.max(1, ...turn.spans.map(s => (s.promptTokens || s.tokens || 0) + (s.completionTokens || 0))), cyOf = function (v) { return cy1 - (v / cmax) * (cy1 - cy0); };
-      var ctxPts = [[0, turn.spans[0].tokens]], running = turn.spans[0].tokens;
-      turn.spans.forEach(function (sp) { if (sp.kind === 'model_step') { running = sp.promptTokens; ctxPts.push([sp.start, running]); running += sp.completionTokens; ctxPts.push([sp.end, running]); } });
-      var pts = ctxPts.map(function (p) { return X(p[0]).toFixed(1) + ',' + cyOf(p[1]).toFixed(1); }).join(' ');
-      el('line', { x1: L, y1: cy1, x2: R, y2: cy1, 'class': 'grid' });
-      el('polygon', { points: pts + ' ' + X(total).toFixed(1) + ',' + cy1 + ' ' + L + ',' + cy1, 'class': 'ctxarea late' });
-      if (Number.isFinite(turn.rollover)) el('line', { x1: L, y1: cyOf(turn.rollover), x2: R, y2: cyOf(turn.rollover), 'class': 'threshold' });
-      if (Number.isFinite(turn.rollover)) txt(R, cyOf(turn.rollover) - 4, 'rollover ' + tok(turn.rollover), { 'text-anchor': 'end', 'class': 'mono' });
-      el('polyline', { points: pts, 'class': 'ctx draw', pathLength: 1 });
-      txt(L - 6, cyOf(ctxPts[0][1]) + 4, tok(ctxPts[0][1]), { 'text-anchor': 'end', 'class': 'mono' });
-      txt(X(total) + 6, cyOf(running) + 4, tok(running) + ' read', { 'class': 'mono' });
-      txt(4, cy0 + 8, 'context', { 'class': 'lbl' });
-      // lanes
-      var lanes = { model: [96, 118], tools: [126, 156], person: [166, 182], output: [192, 214] };
-      Object.keys(lanes).forEach(function (n) { txt(4, lanes[n][1] - 4, n, { 'class': 'lbl' }); el('line', { x1: L, y1: lanes[n][1] + 4, x2: R, y2: lanes[n][1] + 4, 'class': 'grid' }); });
-      var hOf = function (t) { return 6 + 24 * Math.log10(Math.max(t, 10)) / Math.log10(50000); };
-      turn.spans.forEach(function (sp, i) {
-        var g = el('g', { 'class': 'span', tabindex: 0, role: 'button', 'data-i': i, 'aria-label': spanName(sp) + ', ' + facts(sp).map(function (f) { return f[0] + ' ' + f[1]; }).join(', ') });
-        var x0 = X(sp.start), x1 = sp.kind === 'approval_wait' ? x0 + G : Math.max(X(sp.end), x0 + 3), t = document.createElementNS(NS, 'title'); t.textContent = spanName(sp) + ' · ' + facts(sp).map(function (f) { return f[1]; }).join(' · '); g.appendChild(t);
-        if (sp.kind === 'prompt') { el('path', { d: 'M' + (x0 - 5) + ',' + lanes.model[0] + ' l5,-6 5,6z', 'class': 'prompt' }, g); txt(x0 + 8, lanes.model[0] - 6, 'prompt ' + tok(sp.tokens) + ' tok', { 'class': 'mono' }, g); }
-        else if (sp.kind === 'model_step') {
-          var y = lanes.model[0], h = lanes.model[1] - y;
-          el('rect', { x: x0, y: y, width: x1 - x0, height: h, rx: 4, 'class': 'bar model' }, g);
-          if (sp.cachedTokens) el('rect', { x: x0, y: y, width: (x1 - x0) * sp.cachedTokens / sp.promptTokens, height: h, rx: 4, 'class': 'cached' }, g);
-          el('line', { x1: X(sp.start + sp.firstTokenAt), y1: y - 3, x2: X(sp.start + sp.firstTokenAt), y2: y + h + 3, 'class': 'tick' }, g);
-          txt(x0, y - 5, 'in ' + tok(sp.promptTokens) + ' · out ' + tok(sp.completionTokens), { 'class': 'mono' }, g);
-          if (sp.n === 1) txt(X(sp.start + sp.firstTokenAt) + 3, y + h + 14, 'first token ' + ms(sp.firstTokenAt), { 'class': 'mono sub' }, g);
-        } else if (sp.kind === 'tool_call') {
-          var h2 = hOf(sp.resultTokens), y2 = lanes.tools[1] - h2, heavy = sp.resultTokens > 10000;
-          el('rect', { x: x0, y: y2, width: x1 - x0, height: h2, rx: 3, 'class': 'bar ' + (sp.role === 'Mutation' ? 'mut' : 'inv') + (heavy ? ' heavy' : '') }, g);
-          if (x1 - x0 >= 30 || sp.calls > 1) {
-            var lx = x1 + 5, ly = y2 + 12;
-            var u = el('use', { href: sp.role === 'Mutation' ? '#g-mut' : '#g-inv', x: lx, y: ly - 10, width: 12, height: 12, 'class': 'role' }, g); u.setAttribute('color', sp.role === 'Mutation' ? 'var(--cork-ink)' : 'var(--sky-ink)');
-            txt(lx + 15, ly, sp.name + (sp.calls > 1 ? ' ×' + sp.calls : ''), {}, g);
-            txt(lx + 15, ly + 14, tok(sp.resultTokens) + ' tok · ' + ms(sp.end - sp.start), { 'class': 'mono sub' }, g);
-          }
-        } else if (sp.kind === 'approval_wait') {
-          var y3 = lanes.person[0], h3 = lanes.person[1] - y3;
-          el('rect', { x: x0, y: y3, width: G, height: h3, rx: 3, 'class': 'bar wait' }, g);
-          el('path', { d: 'M' + (x0 + G / 2 - 5) + ',' + (y3 - 2) + ' l4,' + (h3 + 4) + ' m4,-' + (h3 + 4) + ' l4,' + (h3 + 4), 'class': 'break' }, g);
-          txt(x0 + G + 6, y3 + 12, ms(sp.end - sp.start) + ' waiting · ' + sp.category + ' · answered by ' + sp.answeredBy, {}, g);
-          txt(x0 + G / 2, 236, 'compressed', { 'text-anchor': 'middle', 'class': 'mono sub' }, g);
-        } else if (sp.kind === 'stream') {
-          var y4 = lanes.output[0], h4 = lanes.output[1] - y4;
-          el('rect', { x: x0, y: y4, width: x1 - x0, height: h4, rx: 3, fill: 'transparent', 'class': 'bar' }, g);
-          for (var f = 0; f < sp.frames; f++) { var fx = x0 + (x1 - x0) * (f + 0.5) / sp.frames; el('line', { x1: fx, y1: y4 + 3, x2: fx, y2: y4 + h4 - 3, 'class': 'frame' }, g); }
-          txt(x0, y4 - 5, sp.frames + ' frames · ' + ms(sp.end - sp.start), { 'class': 'mono sub' }, g);
-        } else if (sp.kind === 'checkpoint') {
-          el('use', { href: '#g-ok', x: x0 - 7, y: lanes.output[0] + 4, width: 14, height: 14 }, g);
-          txt(x0 + 10, lanes.output[0] + 15, sp.id + ' sealed', { 'class': 'mono' }, g);
-        }
-        g.addEventListener('mouseenter', function () { showSpan(i); });
-        g.addEventListener('mouseleave', function () { showSpan(selected); });
-        g.addEventListener('focus', function () { showSpan(i); });
-        g.addEventListener('blur', function () { showSpan(selected); });
-        g.addEventListener('click', function () { selected = i; showSpan(i); });
-        g.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selected = i; showSpan(i); } });
-      });
-      // axis in work time, every second
-      for (var tt = 0; tt <= work; tt += Math.max(1000, Math.ceil(work / 10000) * 1000)) { var ax = X(tt < (waitSpan ? waitSpan.start : Infinity) ? tt : tt + waitDur); el('line', { x1: ax, y1: 218, x2: ax, y2: 223, 'class': 'grid' }); txt(ax, 236, tt === 0 ? '0' : (tt / 1000) + ' s', { 'text-anchor': 'middle', 'class': 'mono sub' }); }
-      txt(R, 236, 'work time', { 'text-anchor': 'end', 'class': 'mono sub' });
-      // playhead: one sweep on load, then rests at the end; reduced motion places it at the end
-      var ph = el('line', { x1: reduce.matches ? R : L, y1: 12, x2: reduce.matches ? R : L, y2: 218, 'class': 'playhead' });
-      if (!reduce.matches) ['x1', 'x2'].forEach(function (a) { el('animate', { attributeName: a, from: L, to: R, dur: '6s', begin: '0.5s', fill: 'freeze', calcMode: 'spline', keyTimes: '0;1', keySplines: '0.2 0 0.8 1' }, ph); });
-      // words
-      var model = 0, tools = 0, read = 0, heavyTok = 0, frames = 0, calls = 0;
-      turn.spans.forEach(function (sp) { if (sp.kind === 'model_step') { model += sp.end - sp.start; read += sp.promptTokens; } if (sp.kind === 'tool_call') { tools += sp.end - sp.start; calls += sp.calls; heavyTok = Math.max(heavyTok, sp.resultTokens); } if (sp.kind === 'stream') frames += sp.frames; });
-      var sentence = turn.bot + ' turn ' + turn.id + ' on ' + turn.model + ', started ' + turn.startedAt + ': ' + ms(model + tools) + ' of work, of which model ' + ms(model) + ' and tools ' + ms(tools) + ' across ' + calls + ' calls; ' + ms(waitDur) + ' waiting on a person, not counted; ' + tok(read) + ' tokens read by the model, ' + tok(heavyTok) + ' of them from one tool batch; ' + frames + ' frames streamed; ' + ms(work) + ' wall without the wait.';
-      document.getElementById('turn-summary').innerHTML = '<b>' + ms(model + tools) + '</b> of work, of which model <b>' + ms(model) + '</b> and tools <b>' + ms(tools) + '</b> across <b>' + calls + '</b> calls. <b>' + ms(waitDur) + '</b> waiting on a person, not counted. <b>' + tok(read) + '</b> tokens read by the model, <b>' + tok(heavyTok) + '</b> of them from one tool batch. <b>' + frames + '</b> frames streamed. Wall without the wait <b>' + ms(work) + '</b>.';
-      tsvg.setAttribute('aria-label', 'Anatomy of the last turn. ' + sentence + ' Each span is focusable and reads its own facts.');
-      document.getElementById('turn-narrow').textContent = 'Turn anatomy needs a wider screen. ' + sentence;
-      document.getElementById('turn-sub').textContent = turn.bot + ' · ' + turn.id + ' · started ' + turn.startedAt + ' · replays once on load · hover, focus or click a span';
-      showSpan(selected);
-    }
-
-    renderTurn();
-  }
 })();

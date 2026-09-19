@@ -53,25 +53,12 @@ ENV_RESTART_PROFILES=()
 PURGE=0
 STATUS=0
 RUNTIME_ONLY=0
-# Which harness runs the bots. Empty until choose_harness scans the machine or --harness answers
-# for it. COZYAGENTS_CHOSEN stays 0 unless a person or a recorded install actually said CozyAgents,
-# because that is the only answer allowed to take a Hermes bridge out of an existing config.
-HARNESS=""
-HARNESS_EXPLICIT=0
-COZYAGENTS_CHOSEN=0
-KEPT_HERMES_BRIDGE=0
+# The public installer owns Hermes. Generic attach/runtime internals retain their
+# vocabulary for compatible adapters, but this installer never selects or
+# bootstraps another product.
+HARNESS="hermes"
 HERMES_FOUND=""
 NO_QR=0
-COZYAGENTS_HOME_DIR="${COZYAGENTS_HOME:-$HOME/.cozyagents}"
-COZYAGENTS_INSTALL_URL_DEFAULT="https://cozylabs.ai/agents.sh"
-# Published alongside the reviewed CozyAgents v0.2.17 release. This pins the secondary installer
-# before it is executed; its own bundle verification starts only after that boundary.
-COZYAGENTS_INSTALL_SHA256_DEFAULT="d8794a0387b7a5acd265539584301ea5782d8b0ffc7bda2b34f76e45f7fd9dbd"
-RUNNER_MODEL_PROVIDER="${COZYGATEWAY_RUNNER_MODEL_PROVIDER:-}"
-RUNNER_MODEL_ENDPOINT="${COZYGATEWAY_RUNNER_MODEL_ENDPOINT:-}"
-RUNNER_MODEL_ID="${COZYGATEWAY_RUNNER_MODEL_ID:-}"
-RUNNER_SHARE_HOST_MODEL_AUTH=0
-RUNNER_PAIR_CODE=""
 SERVICE_PLATFORM="${COZYGATEWAY_SERVICE_PLATFORM:-}"
 TOKENS=()
 TOKEN_ENVS=()
@@ -101,11 +88,7 @@ usage() {
 usage: agent-install.sh --bundle PATH --plugin-archive PATH [options]
 
   --bundle PATH           verified cozygateway.mjs release asset
-  --plugin-archive PATH   verified CozyGateway Hermes plugin archive (Hermes harness only)
-  --harness NAME          cozyagents or hermes; skips the harness question
-  --runner-model-provider NAME  default model provider for CozyAgents bots
-  --runner-model-endpoint URL   default local model endpoint for CozyAgents bots
-  --runner-model-id ID          default model id for CozyAgents bots
+  --plugin-archive PATH   verified CozyGateway Hermes plugin archive
   --no-qr                 never print a pairing QR, whatever the run is
   --gateway-dir DIR       CozyGateway-owned state directory (default ~/.cozygateway)
   --profiles all|A,B      Hermes profiles to connect (default all discovered profiles)
@@ -121,7 +104,7 @@ usage: agent-install.sh --bundle PATH --plugin-archive PATH [options]
   --replace-gateway       re-home profiles attached to another Gateway: back up and remove
                           their CozyGateway env keys and attach plugin, then attach here
   --uninstall             remove only CozyGateway-owned service, plugins, env keys and state
-  --purge                 with --uninstall, also delete the paired CozyAgents bots and files
+  --purge                 with --uninstall, delete Gateway-owned local data
 
 The gateway and attach plugin both stay on this machine. This installer never
 configures remote networking, DNS, routers, or firewalls.
@@ -132,10 +115,9 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --bundle) need_value "$@"; BUNDLE_PATH="$2"; shift ;;
     --plugin-archive) need_value "$@"; PLUGIN_ARCHIVE="$2"; shift ;;
-    --harness) need_value "$@"; HARNESS="$2"; HARNESS_EXPLICIT=1; shift ;;
-    --runner-model-provider) need_value "$@"; RUNNER_MODEL_PROVIDER="$2"; shift ;;
-    --runner-model-endpoint) need_value "$@"; RUNNER_MODEL_ENDPOINT="$2"; shift ;;
-    --runner-model-id) need_value "$@"; RUNNER_MODEL_ID="$2"; shift ;;
+    # Old repair automation may still pass the only supported harness. Keep it as a no-op;
+    # this public installer has no alternative runtime selection.
+    --harness) need_value "$@"; [ "$2" = "hermes" ] || die "only the Hermes harness is supported"; shift ;;
     --no-qr) NO_QR=1 ;;
     --gateway-dir) need_value "$@"; GATEWAY_DIR="$2"; shift ;;
     --profiles) need_value "$@"; PROFILE_SPEC="$2"; PROFILE_SPEC_EXPLICIT=1; shift ;;
@@ -163,12 +145,8 @@ done
 
 [ "$PUBLIC_URL_EXPLICIT" = 0 ] || [ "$CLEAR_PUBLIC_URL" = 0 ] || \
   die "--public-url and --clear-public-url are mutually exclusive"
-case "$HARNESS" in ''|cozyagents|hermes) ;; *) die "--harness must be cozyagents or hermes" ;; esac
-[ -z "$RUNNER_MODEL_PROVIDER" ] || [ -z "$RUNNER_MODEL_ENDPOINT" ] || \
-  die "--runner-model-provider and --runner-model-endpoint are mutually exclusive; a bot has one model source"
-
-# CozyAgents installs per user under $HOME and registers a user service. Root would leave
-# root-owned state in a person's home and a service nobody's login can start.
+# CozyGateway installs per user under $HOME. Root would leave root-owned state in a person's home
+# and a service nobody's login can start.
 [ "$(id -u)" != 0 ] || die "CozyGateway installs per user under \$HOME and never needs sudo; rerun as yourself."
 
 normalize_service_platform() {
@@ -516,56 +494,14 @@ confirm_hermes_model() {
   say "OK    Hermes provider and model are configured"
 }
 
-# The harness is the thing that actually runs a bot. A machine that already has
-# Hermes keeps it, with no question asked; a machine with none is offered CozyAgents first and
-# takes it on Enter, on `--harness`, and whenever there is no terminal to ask on.
 choose_harness() {
-  local input answer recorded=""
   HERMES_FOUND="$(find_hermes || true)"
-  if [ "$HARNESS_EXPLICIT" = 1 ]; then
-    [ "$HARNESS" != cozyagents ] || COZYAGENTS_CHOSEN=1
-    say "OK    harness: $HARNESS (from --harness)"
-    return 0
-  fi
-  # A machine that answered this question once is never asked again: the recorded harness is the
-  # one this install owns, and changing it is an uninstall away. An install written before the
-  # harness line existed records a Hermes root instead, and that is just as binding: a Hermes
-  # install whose binary has since moved must never be re-read as a CozyAgents one.
-  if [ -f "$STATE_FILE" ]; then
-    recorded="$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)"
-    if [ -z "$recorded" ] && grep -q '^hermes_root=' "$STATE_FILE"; then recorded=hermes; fi
-  fi
-  case "$recorded" in
-    both) HARNESS=hermes; say "OK    harnesses: Hermes and CozyAgents (already installed here)"; return 0 ;;
-    cozyagents) HARNESS=cozyagents; COZYAGENTS_CHOSEN=1; say "OK    harness: cozyagents (already installed here)"; return 0 ;;
-    hermes) HARNESS=hermes; say "OK    harness: hermes (already installed here)"; return 0 ;;
-  esac
+  HARNESS=hermes
   if [ -n "$HERMES_FOUND" ]; then
-    HARNESS=hermes
     say "OK    Hermes Agent is already installed; keeping it as the harness that runs your bots"
-    return 0
+  else
+    say "INFO  CozyGateway installs Hermes Agent when it is not already available"
   fi
-  # Windows keeps the harness it has always had here. The native CozyAgents installer for Windows
-  # is its own one-liner, and this script has never installed a harness on Windows.
-  if is_windows; then HARNESS=hermes; return 0; fi
-  HARNESS=cozyagents
-  # The supported one-paste command pipes this script through stdin, so the question uses the
-  # controlling terminal rather than fd 0. With no terminal the recommended answer stands.
-  input="${COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT:-/dev/tty}"
-  if [ -z "${COZYGATEWAY_TEST_HARNESS_PROMPT_INPUT:-}" ] && { [ ! -t 2 ] || [ ! -r /dev/tty ]; }; then return 0; fi
-  [ -r "$input" ] || return 0
-  exec 7<"$input" || return 0
-  while true; do
-    printf 'Which harness runs your bots? [1] CozyAgents (recommended) [2] Hermes Agent [1] ' >&2
-    if ! IFS= read -r answer <&7; then answer=""; fi
-    case "$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')" in
-      ''|1|c|cozyagents) HARNESS=cozyagents; COZYAGENTS_CHOSEN=1; break ;;
-      2|h|hermes) HARNESS=hermes; break ;;
-      *) say 'Please answer 1 or 2.' >&2 ;;
-    esac
-  done
-  exec 7<&-
-  say "OK    harness: $HARNESS"
 }
 
 # A Codex login already on this machine is the one credential a person can share with their bots
@@ -578,153 +514,6 @@ detect_codex_login() {
     printf '%s' "$hermes_env"; return 0
   fi
   return 1
-}
-
-safe_model_word() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$ ]]; }
-safe_model_endpoint() { [[ "$1" =~ ^https?://[A-Za-z0-9._~:/?#@%+=-]{1,255}$ ]]; }
-
-# The CozyAgents half of provider-and-model onboarding: the same pair of questions the Hermes path
-# asks, answered once, and written to the runner env later by write_runner_model_env.
-confirm_cozyagents_model() {
-  local input answer codex_auth
-  if [ -n "$RUNNER_MODEL_PROVIDER" ] || [ -n "$RUNNER_MODEL_ENDPOINT" ]; then
-    [ -n "$RUNNER_MODEL_ID" ] || die "a model provider or endpoint needs --runner-model-id as well"
-  fi
-  if [ -n "$RUNNER_MODEL_ID" ] && [ -z "$RUNNER_MODEL_PROVIDER" ] && [ -z "$RUNNER_MODEL_ENDPOINT" ]; then
-    die "--runner-model-id needs --runner-model-provider or --runner-model-endpoint"
-  fi
-  if [ "$DRY_RUN" = 1 ]; then
-    say "DRY   ask for the model provider or a local endpoint, and the model id, then write COZYRUNNER_MODEL_* into $COZYAGENTS_HOME_DIR/runner.env"
-    return 0
-  fi
-  if [ -n "$RUNNER_MODEL_PROVIDER" ] || [ -n "$RUNNER_MODEL_ENDPOINT" ]; then
-    say "OK    default model for new bots: ${RUNNER_MODEL_ID} on ${RUNNER_MODEL_PROVIDER:-$RUNNER_MODEL_ENDPOINT}"
-    return 0
-  fi
-  input="${COZYGATEWAY_TEST_MODEL_PROMPT_INPUT:-/dev/tty}"
-  if [ -z "${COZYGATEWAY_TEST_MODEL_PROMPT_INPUT:-}" ] && { [ ! -t 2 ] || [ ! -r /dev/tty ]; }; then
-    say "INFO  no terminal to ask about a model on; set COZYRUNNER_MODEL_PROVIDER (or COZYRUNNER_MODEL_ENDPOINT) and COZYRUNNER_MODEL_ID in $COZYAGENTS_HOME_DIR/runner.env"
-    return 0
-  fi
-  [ -r "$input" ] || return 0
-  exec 6<"$input" || return 0
-  while true; do
-    printf 'Which provider should new bots use? A provider name (openai-codex) or a local endpoint URL (http://127.0.0.1:1234/v1) [openai-codex] ' >&2
-    if ! IFS= read -r answer <&6; then answer=""; fi
-    [ -n "$answer" ] || answer=openai-codex
-    case "$answer" in
-      http://*|https://*)
-        if safe_model_endpoint "$answer"; then RUNNER_MODEL_ENDPOINT="$answer"; break; fi
-        say 'That is not a usable endpoint URL.' >&2 ;;
-      *)
-        if safe_model_word "$answer"; then RUNNER_MODEL_PROVIDER="$answer"; break; fi
-        say 'Provider names are letters, digits, and . _ : / -' >&2 ;;
-    esac
-  done
-  while true; do
-    printf 'Which model id should new bots use? ' >&2
-    if ! IFS= read -r answer <&6; then answer=""; fi
-    if safe_model_word "$answer"; then RUNNER_MODEL_ID="$answer"; break; fi
-    say 'Model ids are letters, digits, and . _ : / -' >&2
-  done
-  if [ -n "$RUNNER_MODEL_PROVIDER" ] && codex_auth="$(detect_codex_login)"; then
-    while true; do
-      printf 'Share the Codex login on this computer (%s) with the bots that run here, so you never paste an API key? [y/N] ' "$codex_auth" >&2
-      if ! IFS= read -r answer <&6; then answer=""; fi
-      case "$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')" in
-        y|yes) RUNNER_SHARE_HOST_MODEL_AUTH=1; break ;;
-        ''|n|no) break ;;
-        *) say 'Please answer y or n.' >&2 ;;
-      esac
-    done
-  fi
-  exec 6<&-
-  say "OK    default model for new bots: ${RUNNER_MODEL_ID} on ${RUNNER_MODEL_PROVIDER:-$RUNNER_MODEL_ENDPOINT}"
-}
-
-# The answers land in the runner env CozyAgents already reads, next to the pairing token and
-# never in this installer's own state. No key is ever written here.
-write_runner_model_env() {
-  local file="$COZYAGENTS_HOME_DIR/runner.env"
-  [ -n "$RUNNER_MODEL_PROVIDER" ] || [ -n "$RUNNER_MODEL_ENDPOINT" ] || return 0
-  [ -n "$RUNNER_MODEL_ID" ] || return 0
-  if [ "$DRY_RUN" = 1 ]; then say "DRY   write COZYRUNNER_MODEL_* into $file at 0600"; return 0; fi
-  env_put "$file" COZYRUNNER_MODEL_ID "$RUNNER_MODEL_ID"
-  if [ -n "$RUNNER_MODEL_PROVIDER" ]; then
-    env_put "$file" COZYRUNNER_MODEL_PROVIDER "$RUNNER_MODEL_PROVIDER"
-  else
-    env_put "$file" COZYRUNNER_MODEL_ENDPOINT "$RUNNER_MODEL_ENDPOINT"
-  fi
-  [ "$RUNNER_SHARE_HOST_MODEL_AUTH" = 1 ] && env_put "$file" COZYRUNNER_SHARE_HOST_MODEL_AUTH 1
-  say "OK    wrote the default model for new bots to $file"
-  return 0
-}
-
-# One runner pairing code, minted here through the gateway's own storage and handed straight to
-# the CozyAgents installer, so nobody types a code to pair the machine they are standing at.
-mint_runner_pair_code() {
-  local output
-  output="$("$CLI_WRAPPER" pair --config "$CONFIG_JSON" --kind runner --ttl 10)" ||
-    die "could not mint a runner pairing code; the gateway is installed, so retry with: $CLI_WRAPPER pair --kind runner"
-  RUNNER_PAIR_CODE="$(printf '%s\n' "$output" | sed -n 's/^Setup code:[[:space:]]*//p' | head -1)"
-  [[ "$RUNNER_PAIR_CODE" =~ ^[A-Za-z0-9-]{4,64}$ ]] ||
-    die "the gateway did not return a usable runner pairing code"
-}
-
-cozyagents_launcher() { printf '%s/bin/cozyagents' "$COZYAGENTS_HOME_DIR"; }
-
-# True only when the native Windows bootstrap is driving this run and owns the harness half.
-windows_harness_owner() { is_windows && [ "${COZYGATEWAY_WINDOWS_HARNESS_OWNER:-}" = 1 ]; }
-
-# The CozyAgents half of the install: its own verified one-liner does the bundle, the private
-# Node, the launcher and the user service, and this installer pairs it, because it is the one
-# side that can mint a runner code without asking anybody to read one off a screen.
-install_cozyagents_harness() {
-  local url expected stage installer launcher origin name actual
-  url="${COZYAGENTS_INSTALL_URL:-$COZYAGENTS_INSTALL_URL_DEFAULT}"
-  expected="${COZYAGENTS_INSTALL_SHA256:-}"
-  if [ "$url" = "$COZYAGENTS_INSTALL_URL_DEFAULT" ]; then
-    [ -n "$expected" ] || expected="$COZYAGENTS_INSTALL_SHA256_DEFAULT"
-  elif [ -z "$expected" ]; then
-    die "COZYAGENTS_INSTALL_SHA256 is required for a custom CozyAgents installer source"
-  fi
-  [[ "$expected" =~ ^[a-fA-F0-9]{64}$ ]] || die "COZYAGENTS_INSTALL_SHA256 must be a SHA-256 digest"
-  origin="${PUBLIC_URL:-$(gateway_origin)}"
-  name="$(hostname 2>/dev/null || uname -n)"; name="${name%.local}"
-  if [ "$DRY_RUN" = 1 ]; then
-    say "DRY   install CozyAgents from $url with --no-pair, then pair it to $origin with a runner code minted here"
-    return 0
-  fi
-  have curl || die "curl is required to install CozyAgents"
-  stage="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-agents.XXXXXX")"; trap 'rm -rf "$stage"' RETURN
-  installer="$stage/agents.sh"
-  copy_or_download "$url" "$installer" || die "could not fetch the CozyAgents installer from $url"
-  actual="$(sha256_of "$installer" | tr '[:upper:]' '[:lower:]')"
-  expected="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
-  [ "$actual" = "$expected" ] || die "CozyAgents installer checksum mismatch"
-  chmod 700 "$installer"
-  say "OK    verified CozyAgents installer SHA-256"
-  say "INFO  installing CozyAgents, the harness that runs your bots on this machine."
-  COZYAGENTS_HOME="$COZYAGENTS_HOME_DIR" bash "$installer" --no-pair --home "$COZYAGENTS_HOME_DIR" ||
-    die "the CozyAgents install did not complete successfully"
-  launcher="$(cozyagents_launcher)"
-  [ -x "$launcher" ] || die "CozyAgents finished but $launcher is missing"
-  # The code travels in the environment, never in argv: it is a credential in waiting, and argv is
-  # readable by every process on this machine. `cozyagents runner pair` reads COZYAGENTS_PAIR_CODE
-  # when no code is given on the command line.
-  write_runner_model_env
-  # A computer that is already paired keeps the runner credential it has: a second run upgrades
-  # the harness and leaves the pairing, exactly as a second run leaves device trust alone.
-  if [ -n "$(env_get "$COZYAGENTS_HOME_DIR/runner.env" COZYRUNNER_TOKEN)" ]; then
-    say "OK    this computer is already paired to CozyGateway as a runner; keeping that pairing"
-    rm -rf "$stage"; trap - RETURN
-    return 0
-  fi
-  mint_runner_pair_code
-  COZYAGENTS_PAIR_CODE="$RUNNER_PAIR_CODE" "$launcher" runner pair --gateway "$origin" --name "$name" --home "$COZYAGENTS_HOME_DIR" ||
-    die "CozyAgents is installed but pairing did not complete; mint a code with \"$CLI_WRAPPER pair --kind runner\" and run: cozyagents runner pair <code> --gateway $origin"
-  say "OK    CozyAgents is paired to $origin as \"$name\"; bots you make in CozyChat run here"
-  rm -rf "$stage"; trap - RETURN
 }
 
 # profile names are shell/file-safe Hermes identifiers. Reject anything that
@@ -1531,72 +1320,6 @@ ensure_streaming_config() {
   record_profile_change "$profile"
 }
 
-# A CozyAgents-only gateway has no Hermes bridge at all: `hermesEndpoints` is absent rather than
-# empty, and the roster comes from the runtime bots the runner reports.
-write_cozyagents_gateway_config() {
-  [ "$DRY_RUN" = 1 ] && { say "DRY   write CozyAgents-only gateway config at $CONFIG_JSON with no Hermes endpoint"; return; }
-  # Taking a Hermes bridge out of a config is destructive and irreversible from here. main hands a
-  # kept bridge to the Hermes path before this runs, so reaching it with one still in the file is a
-  # bug rather than a default; the check below fails closed either way.
-  umask 077
-  "$NODE_RESOLVED" - "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$PUBLIC_URL" "$COZYAGENTS_CHOSEN" "$PUSH_RELAY_URL_DEFAULT" <<'NODE'
-const fs = require('node:fs');
-const [output, host, port, dbPath, publicUrl, chosen, pushRelayUrl] = process.argv.slice(2);
-let existing = {};
-try {
-  existing = JSON.parse(fs.readFileSync(output, 'utf8'));
-  if (existing === null || Array.isArray(existing) || typeof existing !== 'object') existing = {};
-} catch (error) {
-  if (error.code !== 'ENOENT') throw error;
-}
-const managed = { name: 'cozygateway', host, port: Number(port), dbPath, ...(publicUrl === '' ? {} : { publicUrl }) };
-delete existing.publicUrl;
-if (existing.pushRelayUrl === undefined) managed.pushRelayUrl = pushRelayUrl;
-if (chosen === '1') {
-  delete existing.hermesEndpoints;
-  delete existing.hermes;
-}
-const temporary = `${output}.new`;
-fs.writeFileSync(temporary, JSON.stringify({ ...existing, ...managed }, null, 2) + '\n', { mode: 0o600 });
-fs.renameSync(temporary, output);
-NODE
-  chmod 600 "$CONFIG_JSON"
-}
-write_cozyagents_gateway_env() {
-  [ "$DRY_RUN" = 1 ] && { say "DRY   write gateway environment at $GATEWAY_ENV (no Hermes token, no secret values)"; return; }
-  umask 077; : > "$GATEWAY_ENV"
-  printf '%s=%s\n' "$ENV_OWNER_KEY" "$ENV_OWNER_VALUE" >> "$GATEWAY_ENV"
-  chmod 600 "$GATEWAY_ENV"
-}
-# A Hermes bridge in a config that no one chose to replace freezes the run: main turns it into a
-# Hermes install, which records harness=hermes through write_state, so the next run cannot read
-# that kept bridge back as the explicit choice nobody made.
-detect_kept_hermes_bridge() {
-  KEPT_HERMES_BRIDGE=0
-  [ "$COZYAGENTS_CHOSEN" = 0 ] || return 0
-  [ -f "$CONFIG_JSON" ] || return 0
-  grep -q '"hermesEndpoints"' "$CONFIG_JSON" && KEPT_HERMES_BRIDGE=1
-  return 0
-}
-# cozyagents_home is recorded as this shell sees it, which on Windows is the Git Bash POSIX form
-# of the default %USERPROFILE%\.cozyagents. Only the POSIX uninstall reads it, and only to run the
-# launcher it names; the Windows bootstrap owns the harness there and never consults this line.
-write_cozyagents_state() {
-  local staged="$STATE_FILE.tmp.$$"
-  [ "$DRY_RUN" = 1 ] && return
-  umask 077
-  {
-    printf 'harness=cozyagents\n'
-    printf 'cozyagents_home=%s\n' "$COZYAGENTS_HOME_DIR"
-    printf 'node_resolved=%s\n' "$NODE_RESOLVED"
-    printf 'bundle_path=%s\n' "$BUNDLE_PATH"
-    printf 'supervisor=%s\n' "$SUPERVISOR"
-    if is_windows; then printf 'task_xml=%s\n' "$WINDOWS_TASK_XML"; fi
-  } > "$staged" || { rm -f "$staged"; return 1; }
-  chmod 600 "$staged" || { rm -f "$staged"; return 1; }
-  command -v sync >/dev/null 2>&1 && sync -f "$staged" 2>/dev/null || true
-  mv -f "$staged" "$STATE_FILE" || { rm -f "$staged"; return 1; }
-}
 write_gateway_config() {
   local map="$LOCAL_DIR/profiles.json" p env_name comma=""
   [ "$DRY_RUN" = 1 ] && { say "DRY   write Hermes-only gateway config at $CONFIG_JSON (no secret values)"; return; }
@@ -1871,20 +1594,11 @@ ensure_hermes_gateways() {
   done
 }
 write_state() {
-  local profile staged="$STATE_FILE.tmp.$$" recorded="" agents_home=""
+  local profile staged="$STATE_FILE.tmp.$$"
   [ "$DRY_RUN" = 1 ] && return
-  if [ -f "$STATE_FILE" ]; then
-    recorded="$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)"
-    agents_home="$(sed -n 's/^cozyagents_home=//p' "$STATE_FILE" | tail -1)"
-  fi
   umask 077
   {
-    if [ "$recorded" = cozyagents ] || [ "$recorded" = both ]; then
-      printf 'harness=both\n'
-      [ -z "$agents_home" ] || printf 'cozyagents_home=%s\n' "$agents_home"
-    else
-      printf 'harness=hermes\n'
-    fi
+    printf 'harness=hermes\n'
     printf 'install_hygiene_version=1\n'
     printf 'profiles='; (IFS=,; printf '%s' "${SELECTED[*]}")
     printf '\nprofile_scope=%s' "$PROFILE_SPEC"
@@ -1968,11 +1682,6 @@ if [ "\${1:-}" = repair ] || [ "\${1:-}" = update ]; then
   if [ "\$repair_mode" = runtime-only ]; then
     printf 'INFO  repair refreshes only the recorded CozyGateway runtime\n'
     exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") COZYGATEWAY_INSTALL_ASSET_BASE="\$asset_base" bash "\$bootstrap" --runtime-only
-  fi
-  harness="\$(sed -n 's/^harness=//p' "\$state" | tail -1)"
-  if [ "\$harness" = cozyagents ]; then
-    printf 'INFO  repair refreshes verified runtime assets, then restarts CozyGateway\n'
-    exec env COZYGATEWAY_HOME=$(printf %q "$GATEWAY_DIR") COZYGATEWAY_INSTALL_ASSET_BASE="\$asset_base" bash "\$bootstrap" --harness cozyagents
   fi
   profiles="\$(sed -n 's/^profiles=//p' "\$state" | tail -1)"
   profile_scope="\$(sed -n 's/^profile_scope=//p' "\$state" | tail -1)"
@@ -3201,8 +2910,7 @@ gateway_ready() {
 }
 wait_gateway_ready() {
   if [ "$DRY_RUN" = 1 ]; then
-    if [ "$HARNESS" = cozyagents ]; then say "DRY   wait for CozyGateway health before installing the harness"
-    else say "DRY   wait for CozyGateway health before starting Hermes attach"; fi
+    say "DRY   wait for CozyGateway health before starting Hermes attach"
     return
   fi
   local attempt
@@ -3290,11 +2998,7 @@ install_service() {
   resolve_platform
   if [ "$DRY_RUN" = 1 ]; then
     write_wrapper
-    if [ "$HARNESS" = cozyagents ]; then
-      say "DRY   install one CozyGateway $SERVICE_PLATFORM service; it supervises the gateway alone, with no Hermes control plane"
-    else
-      say "DRY   install one CozyGateway $SERVICE_PLATFORM service; it reuses/starts Hermes Dashboard as local control plane"
-    fi
+    say "DRY   install one CozyGateway $SERVICE_PLATFORM service; it reuses/starts Hermes Dashboard as local control plane"
     return
   fi
   if [ "$SERVICE_PLATFORM" = Windows ]; then
@@ -3506,65 +3210,8 @@ start_dashboard() {
     *) dashboard_owner_report "$DASHBOARD_PORT"; die "Hermes Dashboard session-token verification failed with HTTP ${code:-000} on 127.0.0.1:$DASHBOARD_PORT" ;;
   esac
 }
-# A CozyAgents uninstall takes back exactly what this installer put there: the gateway service and
-# its state here, and the harness through CozyAgents' own uninstaller, which owns its launcher, its
-# PATH line, its service and its runner state.
 remove_gateway_home() {
-  if windows_harness_owner && [ "$DRY_RUN" = 0 ]; then
-    say "INFO  the Windows bootstrap will remove Gateway files after its private tools exit"
-  else
-    run rm -rf "$GATEWAY_DIR"
-  fi
-}
-uninstall_cozyagents() {
-  local home launcher
-  local agent_options=(--yes)
-  [ "$PURGE" = 0 ] || agent_options+=(--purge)
-  home="$(sed -n 's/^cozyagents_home=//p' "$STATE_FILE" | tail -1)"
-  [ -n "$home" ] || home="$COZYAGENTS_HOME_DIR"
-  load_windows_state_identity || die "installer state has conflicting Windows supervisor identity"
-  case "$home" in /*) ;; *) die "installer state has an unsafe CozyAgents home" ;; esac
-  resolve_platform
-  HARNESS=cozyagents
-  if [ "$SERVICE_PLATFORM" = Darwin ]; then
-    if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
-    else remove_owned_posix_service "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist" || die "could not remove CozyGateway service or command; remaining files were retained"; fi
-  elif [ "$SERVICE_PLATFORM" = Linux ]; then
-    if [ "$DRY_RUN" = 1 ]; then run systemctl --user disable --now "$SERVICE_UNIT"; run rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"; run systemctl --user daemon-reload
-    else remove_owned_posix_service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT" || die "could not remove CozyGateway service or command; remaining files were retained"; fi
-  elif windows_harness_owner; then
-    # The native bootstrap installed the harness and removes it through the CozyAgents Windows
-    # uninstaller; what is left here is the gateway task, its Startup fallback and its PATH entry.
-    local startup_entry task_xml
-    startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
-    if [ "$DRY_RUN" = 1 ]; then
-      say "DRY   delete Scheduled Task $WINDOWS_TASK and Startup entry $startup_entry"
-    else
-      task_xml="$(MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" /XML 2>/dev/null || true)"
-      if [ -n "$task_xml" ] || [ -f "$startup_entry" ]; then
-        load_windows_wrapper_identity || die "CozyGateway supervisor ownership could not be verified; preserving installed Gateway state"
-      fi
-      [ -z "$task_xml" ] || windows_recorded_task_is_owned || die "CozyGateway Scheduled Task ownership could not be verified; preserving installed Gateway state"
-      [ ! -f "$startup_entry" ] || windows_startup_entry_is_owned "$startup_entry" || die "CozyGateway Startup entry ownership could not be verified; preserving installed Gateway state"
-      [ -z "$task_xml" ] || MSYS_NO_PATHCONV=1 schtasks.exe /Delete /F /TN "$WINDOWS_TASK" >/dev/null 2>&1 || die "could not remove owned CozyGateway Scheduled Task"
-      [ ! -f "$startup_entry" ] || rm -f "$startup_entry"
-      stop_owned_windows_gateway 0 || true
-    fi
-  else
-    die "the CozyAgents harness is not installed by this script on Windows"
-  fi
-  launcher="$home/bin/cozyagents"
-  if windows_harness_owner; then
-    say "INFO  the Windows bootstrap removes the CozyAgents harness through its own uninstaller"
-  elif [ -x "$launcher" ]; then
-    run "$launcher" uninstall --home "$home" "${agent_options[@]}"
-    say "OK    removed the CozyAgents harness through its own uninstaller"
-  else
-    die "the cozyagents command is gone; remaining files were retained. Restore CozyAgents at $home before retrying uninstall"
-  fi
-  is_windows || remove_posix_cli
-  remove_gateway_home
-  say "OK    removed only CozyGateway-owned state; nothing else on this machine was changed"
+  run rm -rf "$GATEWAY_DIR"
 }
 uninstall() {
   local profiles root hermes_bin dashboard_port p home plugin spool action hermes_available=1
@@ -3636,7 +3283,6 @@ uninstall() {
     say "OK    removed CozyGateway runtime-only state; Hermes profiles, plugins, services, and environment were preserved"
     return
   fi
-  if [ "$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)" = cozyagents ]; then uninstall_cozyagents; return; fi
   root="$(sed -n 's/^hermes_root=//p' "$STATE_FILE" | tail -1)"
   hermes_bin="$(sed -n 's/^hermes_bin=//p' "$STATE_FILE" | tail -1)"
   load_windows_state_identity || die "installer state has conflicting Windows supervisor identity"
@@ -3724,42 +3370,10 @@ uninstall() {
   done
   remove_gateway_home; say "OK    removed only CozyGateway-owned state; Hermes profiles and Hermes services remain"
 }
-# What a CozyAgents harness has instead of attach health: the runner's own row, asked for with the
-# runner's own token, which is the only thing that token opens. The token goes in through stdin, not
-# argv, so it never appears in this machine's process list.
-status_runner() {
-  local home token origin answer name
-  home="$(sed -n 's/^cozyagents_home=//p' "$STATE_FILE" | tail -1)"
-  [ -n "$home" ] || home="$COZYAGENTS_HOME_DIR"
-  token="$(env_get "$home/runner.env" COZYRUNNER_TOKEN)"
-  name="$(env_get "$home/runner.env" COZYRUNNER_NAME)"
-  origin="$(env_get "$home/runner.env" COZYRUNNER_GATEWAY_URL)"
-  [ -n "$origin" ] || origin="${PUBLIC_URL:-$(gateway_origin)}"
-  if [ -z "$token" ]; then
-    say "FAIL  no runner is paired on this computer; run: cozyagents runner pair <code>"
-    return 1
-  fi
-  answer="$(printf 'Authorization: Bearer %s\n' "$token" |
-    curl -s --max-time 5 "$origin/runners/self" -H @- 2>/dev/null |
-    "$NODE_RESOLVED" -e 'let b="";process.stdin.on("data",c=>b+=c).on("end",()=>{try{const r=JSON.parse(b);if(typeof r?.name!=="string")return process.exit(1);const seen=typeof r.lastSeenAt==="number"?new Date(r.lastSeenAt).toISOString():"never";process.stdout.write(`runner "${r.name}", last seen ${seen}, ${r.attached===true?"attached":"not attached"}`)}catch{process.exit(1)}})' 2>/dev/null || true)"
-  if [ -n "$answer" ]; then
-    say "OK    $answer"
-    return 0
-  fi
-  say "WARN  the gateway did not answer /runners/self; reporting the local runner state instead"
-  say "INFO  runner \"${name:-unnamed}\" is paired to $origin on this computer"
-  return 0
-}
 status_install() {
-  local persisted=0 live=0 startup_entry code harness=""
+  local persisted=0 live=0 startup_entry code
   resolve_platform
-  [ ! -f "$STATE_FILE" ] || harness="$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)"
-  if [ -z "$harness" ] && [ -f "$STATE_FILE" ] && grep -q '^hermes_root=' "$STATE_FILE"; then harness=hermes; fi
-  case "$harness" in
-    both) say "OK    harnesses: Hermes Agent and CozyAgents"; status_runner || true ;;
-    cozyagents) say "OK    harness: CozyAgents (bots run here under the CozyAgents runner)"; status_runner || true ;;
-    hermes) say "OK    harness: Hermes Agent" ;;
-  esac
+  say "OK    harness: Hermes Agent"
   if [ "$SERVICE_PLATFORM" = Windows ]; then
     startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
     MSYS_NO_PATHCONV=1 schtasks.exe /Query /TN "$WINDOWS_TASK" >/dev/null 2>&1 && { say "OK    Scheduled Task registered: $WINDOWS_TASK"; persisted=1; }
@@ -3789,7 +3403,7 @@ announce_listener() {
 # First setup ends ready to scan. Updates preserve existing device trust and ask before creating
 # any new credential; unattended updates take the default No, and --no-qr never prints one at all.
 pairing_and_finish() {
-  say "INFO  remove: cozygateway uninstall --purge (also deletes paired CozyAgents bots and files)"
+  say "INFO  remove: cozygateway uninstall --purge"
   if [ "$NO_QR" = 1 ]; then
     say "INFO  no pairing QR was printed (--no-qr); run $CLI_WRAPPER pair when you want to add a device"
   elif [ "$DRY_RUN" = 1 ]; then
@@ -3804,67 +3418,29 @@ pairing_and_finish() {
   say "INFO  codes expire after 10 minutes; mint a fresh QR and code with: $CLI_WRAPPER pair"
   say "INFO  for a tunnel, rerun the installer with: --public-url https://gateway.example.com"
 }
-# The CozyAgents branch: the same gateway, with no Hermes discovery, no plugin, no profiles, no
-# Hermes Dashboard and no attach-health wait, plus the harness and its pairing.
-#
-# On Windows the harness half belongs to the native bootstrap: scripts/install.ps1 asks the model
-# and network questions, runs the CozyAgents PowerShell installer, writes the runner model keys,
-# mints the runner code and prints the QR. It says so with COZYGATEWAY_WINDOWS_HARNESS_OWNER=1,
-# and this script then owns the gateway alone. Without that, Windows still has no CozyAgents
-# harness to install from here.
-install_with_cozyagents() {
-  local prerequisite_missing="$1"
-  if ! windows_harness_owner; then
-    is_windows && die "on Windows the CozyAgents harness has its own one-liner: irm https://cozylabs.ai/agents.ps1 | iex"
-  fi
-  say "OK    harness: CozyAgents; your bots run on this computer under the CozyAgents runner"
-  windows_harness_owner || confirm_cozyagents_model
-  if [ "$prerequisite_missing" = 1 ]; then
-    say "DRY   after prerequisites, write a CozyAgents-only gateway config with no Hermes endpoint, install CozyAgents from ${COZYAGENTS_INSTALL_URL:-$COZYAGENTS_INSTALL_URL_DEFAULT} with SHA-256 verification, and pair it"
-    return
-  fi
-  choose_fresh_listener
-  validate_listener_settings
-  is_windows && preflight_windows_service_ownership
-  [ "$DRY_RUN" = 1 ] || mkdir -p "$LOCAL_DIR"
-  write_cozyagents_state
-  write_cozyagents_gateway_env
-  write_cozyagents_gateway_config
-  write_cli_wrapper
-  install_service
-  wait_gateway_ready
-  is_windows || install_posix_cli
-  if windows_harness_owner; then
-    announce_listener
-    say "INFO  the Windows bootstrap installs and pairs the CozyAgents harness from here"
-    return
-  fi
-  install_cozyagents_harness
-  clear_run_pids
-  announce_listener
-  pairing_and_finish
+refuse_legacy_cozyagents_state() {
+  [ -f "$STATE_FILE" ] || return 0
+  local harness
+  harness="$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)"
+  case "$harness" in
+    cozyagents|both)
+      die "this install state belongs to the retired CozyAgents gateway; it was left unchanged. Use https://github.com/shiftedx/cozyagents for its embedded gateway, or install Hermes CozyGateway in a new --gateway-dir"
+      ;;
+  esac
 }
 runtime_state_value() {
   sed -n "s/^$1=//p" "$STATE_FILE" | tail -1
 }
 hydrate_runtime_only_harness() {
-  HARNESS="$(runtime_state_value harness)"
-  if [ -z "$HARNESS" ] && [ -n "$(runtime_state_value hermes_root)$(runtime_state_value hermes_bin)" ]; then HARNESS=hermes; fi
-  case "$HARNESS" in
-    hermes)
-      HERMES_ROOT="$(runtime_state_value hermes_root)"
-      HERMES_RESOLVED="$(runtime_state_value hermes_bin)"
-      [ -d "$HERMES_ROOT" ] && [ -x "$HERMES_RESOLVED" ] || die "--runtime-only needs the recorded Hermes runtime; reinstall normally to repair Hermes integration"
-      HERMES_BIN="$HERMES_RESOLVED"
-      DASHBOARD_SESSION_TOKEN="$(env_get "$DASHBOARD_ENV" DASHBOARD_SESSION_TOKEN)"
-      safe_secret "$DASHBOARD_SESSION_TOKEN" || die "--runtime-only needs the existing Dashboard credential"
-      write_dashboard_port_state
-      write_dashboard_owner_helper
-      if is_windows; then write_dashboard_elevation_helper; fi
-      ;;
-    cozyagents) ;;
-    *) die "--runtime-only cannot classify the existing harness; reinstall normally" ;;
-  esac
+  HERMES_ROOT="$(runtime_state_value hermes_root)"
+  HERMES_RESOLVED="$(runtime_state_value hermes_bin)"
+  [ -d "$HERMES_ROOT" ] && [ -x "$HERMES_RESOLVED" ] || die "--runtime-only needs the recorded Hermes runtime; reinstall normally to repair Hermes integration"
+  HERMES_BIN="$HERMES_RESOLVED"
+  DASHBOARD_SESSION_TOKEN="$(env_get "$DASHBOARD_ENV" DASHBOARD_SESSION_TOKEN)"
+  safe_secret "$DASHBOARD_SESSION_TOKEN" || die "--runtime-only needs the existing Dashboard credential"
+  write_dashboard_port_state
+  write_dashboard_owner_helper
+  if is_windows; then write_dashboard_elevation_helper; fi
 }
 write_runtime_only_state() {
   local staged="$STATE_FILE.runtime.$$"
@@ -3895,6 +3471,7 @@ runtime_only_repair() {
 }
 main() {
   local prerequisite_missing=0 profile action
+  refuse_legacy_cozyagents_state
   if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
   preflight_service_manager
   if [ "$RUNTIME_ONLY" = 1 ]; then
@@ -3913,21 +3490,8 @@ main() {
   [ "$prerequisite_missing" = 1 ] || { hydrate_listener_settings; hydrate_dashboard_port; }
   if [ "$STATUS" = 1 ]; then validate_listener_settings; status_install; return; fi
   [ -n "$BUNDLE_PATH" ] && [ -f "$BUNDLE_PATH" ] || die "--bundle must name the verified release bundle"
-  # Step 1 of the approved order: the harness, before anything is installed.
+  # Step 1: Hermes Agent, before anything else is installed.
   choose_harness
-  if [ "$HARNESS" = cozyagents ]; then
-    # A bridge nobody asked to remove decides the whole run, not just the config write: this stays
-    # a Hermes install end to end, with no CozyAgents harness, no runner pairing and no runner
-    # model keys, until someone passes --harness cozyagents or answers the question.
-    detect_kept_hermes_bridge
-    if [ "$KEPT_HERMES_BRIDGE" = 1 ]; then
-      say "WARN  this config already has a Hermes endpoint and no one chose CozyAgents here; keeping it. Rerun with --harness cozyagents to replace it."
-      say "INFO  continuing as a Hermes install; nothing CozyAgents-owned is installed, paired, or configured here."
-      HARNESS=hermes
-    else
-      install_with_cozyagents "$prerequisite_missing"; return
-    fi
-  fi
   [ -n "$PLUGIN_ARCHIVE" ] && [ -f "$PLUGIN_ARCHIVE" ] || die "--plugin-archive must name the verified release archive"
   if [ -n "$HERMES_FOUND" ]; then HERMES_RESOLVED="$HERMES_FOUND"; say "OK    using Hermes at $HERMES_RESOLVED"
   elif [ "$DRY_RUN" = 1 ]; then say "DRY   install Hermes Agent with the verified official tagged NousResearch installer, then resume CozyGateway setup"; prerequisite_missing=1

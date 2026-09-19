@@ -17,13 +17,11 @@ class UninstallTests(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
         self.home = self.root / 'user'
         self.gateway = self.home / '.cozygateway'
-        self.agents = self.home / '.cozyagents'
         self.bin = self.root / 'tools'
         for path in (self.gateway / 'bin', self.gateway / 'local', self.bin, self.home / '.local/bin'):
             path.mkdir(parents=True, exist_ok=True)
         self.env = dict(os.environ, HOME=str(self.home), PATH=f'{self.bin}:/usr/bin:/bin',
-                        COZYGATEWAY_HOME=str(self.gateway), COZYAGENTS_HOME=str(self.agents),
-                        CALL_LOG=str(self.root / 'calls'))
+                        COZYGATEWAY_HOME=str(self.gateway), CALL_LOG=str(self.root / 'calls'))
         # No real service manager or network is reached, even when running on Linux as root.
         self.script(self.bin / 'id', '#!/bin/bash\necho 501\n')
         self.script(self.bin / 'launchctl', '#!/bin/bash\necho "launchctl $*" >> "$CALL_LOG"\n'
@@ -155,47 +153,6 @@ foreach ($harness in @('cozyagents', 'both')) {{
         plist.write_text('unrelated service')
         self.run_uninstall('--purge', success=False)
         self.assertEqual(plist.read_text(), 'unrelated service')
-        self.assertTrue(self.gateway.exists())
-
-    def setup_agents(self):
-        (self.gateway / 'local/install-state').write_text(f'harness=cozyagents\ncozyagents_home={self.agents}\n')
-        (self.agents / 'bin').mkdir(parents=True)
-        (self.agents / 'bots').mkdir()
-        (self.agents / 'bots/keep.txt').write_text('bot')
-        self.script(self.agents / 'bin/cozyagents', '''#!/bin/bash
-set -eu
-echo "agents $*" >> "$CALL_LOG"
-[ "${FAIL_AGENTS:-}" != 1 ] || exit 1
-for arg in "$@"; do
-  if [ "$arg" = --purge ]; then rm -rf "$COZYAGENTS_HOME"; exit 0; fi
-done
-rm -rf "$COZYAGENTS_HOME/bin"
-''')
-
-    def test_purge_delegates_and_removes_bot_files(self):
-        self.setup_agents()
-        self.run_uninstall('--purge')
-        self.assertFalse(self.agents.exists())
-        self.assertFalse(self.gateway.exists())
-        self.assertIn('--yes --purge', (self.root / 'calls').read_text())
-
-    def test_default_keeps_bots(self):
-        self.setup_agents()
-        self.run_uninstall()
-        self.assertTrue((self.agents / 'bots/keep.txt').exists())
-        self.assertNotIn('--purge', (self.root / 'calls').read_text())
-
-    def test_failed_harness_retains_gateway_receipt(self):
-        self.setup_agents()
-        self.env['FAIL_AGENTS'] = '1'
-        self.run_uninstall('--purge', success=False)
-        self.assertTrue((self.gateway / 'local/install-state').exists())
-        self.assertTrue((self.agents / 'bots/keep.txt').exists())
-
-    def test_missing_harness_is_a_failure(self):
-        self.setup_agents()
-        (self.agents / 'bin/cozyagents').unlink()
-        self.run_uninstall('--purge', success=False)
         self.assertTrue(self.gateway.exists())
 
     def test_windows_shell_wrapper_routes_to_native_uninstall(self):

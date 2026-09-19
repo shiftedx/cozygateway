@@ -1,12 +1,12 @@
 # CozyGateway
 
-**Chat with a self-hosted AI agent from your phone while keeping the conversation on your own machine.**
+**Connect CozyChat to Hermes Agent from your phone while keeping the conversation on your own machine.**
 
-CozyGateway is a Node.js gateway that runs beside your agent. It implements the published [wire contract](contract/v1.md) for chat clients and connects agent harnesses through the [attach-v1](contract/attach-v1.md) WebSocket data plane. Pair a device with a short-lived code, then talk directly to your gateway—without creating an account for the gateway itself.
+CozyGateway is the Hermes-compatible Node.js gateway for CozyChat. It implements the published [wire contract](contract/v1.md), connects Hermes profiles through the [attach-v1](contract/attach-v1.md) WebSocket data plane, and preserves the generic attach contract for compatible harness adapters. Pair a device with a short-lived code, then talk directly to your gateway—without creating an account for the gateway itself.
 
 [Quick start](#quickstart) · [Documentation](#documentation) · [Releases](https://github.com/shiftedx/cozygateway/releases) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 
-[CozyChat](https://github.com/shiftedx/cozychat) is the Apple client. [CozyAgents](https://github.com/shiftedx/cozyagents) runs agents on your computers. CozyGateway owns pairing, conversation state, and routing between them.
+[CozyChat](https://github.com/shiftedx/cozychat) is the Apple client. For CozyAgents, use its [embedded gateway](https://github.com/shiftedx/cozyagents); it is a separate product and install path.
 
 ## What it provides
 
@@ -18,7 +18,7 @@ CozyGateway is a Node.js gateway that runs beside your agent. It implements the 
 
 ## Quickstart
 
-The release bootstrap downloads one matched, checksum-verified release and installs a per-user service. It provisions a private Node.js 24 runtime when needed and can set up the Hermes integration used by the standard install path.
+The release bootstrap downloads one matched, checksum-verified release and installs a per-user service. It provisions a private Node.js 24 runtime when needed and sets up the matching Hermes attach plugin.
 
 ### macOS and Linux
 
@@ -36,7 +36,7 @@ The command shows gateway status and lets you create a fresh pairing code. Scan 
 
 ### Windows PowerShell
 
-Choose Hermes, CozyAgents, or both, then configure the selected agents.
+The installer configures Hermes Agent and its selected profiles.
 
 ```powershell
 irm https://cozylabs.ai/install.ps1 | iex
@@ -46,26 +46,16 @@ Use this PowerShell command on Windows; the `curl ... | bash` command above is f
 macOS/Linux. Windows PowerShell aliases `curl` to `Invoke-WebRequest`, which does
 not accept curl's flags.
 
-Repeat the PowerShell command to update the gateway and its installed harnesses.
-Routine updates retain your harness choices, profiles, pairing, and model settings;
-setup asks for input only when configuration is missing. An administrator shell
+Repeat the PowerShell command to update the gateway and Hermes attachment.
+Routine updates retain your profiles, pairing, and model settings; setup asks for input only when configuration is missing. An administrator shell
 hands setup to a normal PowerShell window for the same Windows account and waits
 for its result. Setup verifies the normal desktop belongs to the same account
 and Windows session before using it to launch the installer.
 
-Setup installs a verified private Git Bash if needed, checks the running gateway
-version and configured Hermes attachments, and checks CozyAgents' updater readiness
-result before reporting completion. If a component fails, rerun the same command;
-the progress record retains incomplete choices and custom homes. `cozygateway update`
-remains available for updating the gateway itself.
-
-Both agents use the same gateway. Repeat the command to add either agent later;
-existing profiles, runner pairing, and gateway settings are preserved. For an
-unattended selection, use `-Harness hermes`, `-Harness cozyagents`, or `-Harness both`:
-
-```powershell
-& ([scriptblock]::Create((irm https://cozylabs.ai/install.ps1))) -Harness both
-```
+Setup installs a verified private Git Bash if needed and checks the running
+gateway version and configured Hermes attachments before reporting completion.
+If a component fails, rerun the same command; `cozygateway update` remains
+available for updating the gateway itself.
 
 Open a new PowerShell or Terminal window, then run `cozygateway` to check the installation or make a pairing code.
 
@@ -101,10 +91,8 @@ cozygateway uninstall --purge
 ```
 
 This deletes the installed Gateway, its local data (including conversations and pairing),
-background service, command, and managed Hermes connections. It also removes the
-CozyAgents runner installed with this Gateway, including its bots and their files.
-Deletion is permanent. Preview with `cozygateway uninstall --purge --dry-run`.
-Omit `--purge` to keep CozyAgents bot files.
+background service, command, and managed Hermes connections. Deletion is
+permanent. Preview with `cozygateway uninstall --purge --dry-run`.
 
 Hermes itself, its profiles and history, independently installed apps such as
 CozyChat, shared model credentials, and your projects remain. See
@@ -117,7 +105,7 @@ CozyChat, shared model credentials, and your projects remain. See
 | Install, update, remove, or inspect the service | [Service installation](docs/install-service.md) |
 | LAN, Tailscale, Cloudflare Tunnel, or public HTTPS | [Connectivity](docs/connectivity.md) and [TLS](docs/tls.md) |
 | Docker deployment | [Self-host with Docker](docs/self-host-docker.md) |
-| Hermes/attach operations | [Attach-v1 operations](docs/attach-v1-operations.md) |
+| Hermes installation and attach operations | [Hermes installation](docs/agent-install.md) and [attach-v1 operations](docs/attach-v1-operations.md) |
 | Gateway runtime configuration and commands | [Gateway package README](packages/gateway/README.md) |
 | Client and gateway protocol | [Contract v1](contract/v1.md) and [conformance suite](packages/conformance/README.md) |
 | Support | [Support guide](SUPPORT.md) · [GitHub Issues](https://github.com/shiftedx/cozygateway/issues) |
