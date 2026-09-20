@@ -49,9 +49,11 @@ for (const source of supervisors) {
   test(`${standaloneDashboard ? 'Dashboard' : withHermes ? 'Hermes' : 'CozyAgents'} launcher hides Windows children`, async () => {
     const launches = [];
     const proc = new EventEmitter();
+    const pidLedger = [];
     Object.assign(proc, {
       platform: 'win32', execPath: 'node.exe', env: {},
       argv: ['node', '-', 'env', 'dashboard-env', 'root', 'hermes.exe', 'launcher', 'owner', '9119', 'bundle', 'config'],
+      stdout: { write(value) { pidLedger.push(String(value)); } },
       exit: () => {},
     });
     const spawn = (command, args, options) => {
@@ -72,6 +74,7 @@ for (const source of supervisors) {
       fetch: async (url) => ({ status: url.endsWith('/api/health') ? 503 : 200 }),
     };
     await vm.runInNewContext(source.replaceAll('$windows_dashboard_profile', '1'), context);
+    if (standaloneDashboard) assert.deepEqual(pidLedger, ['123'], 'Dashboard launcher must report its child PID for the installer ledger');
     if (!standaloneDashboard) assert.ok(launches.some((launch) => launch.args.includes('serve')));
     if (withHermes || standaloneDashboard) assert.ok(launches.some((launch) => launch.args.includes('dashboard')));
     for (const launch of launches) {
