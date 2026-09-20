@@ -1523,6 +1523,29 @@ function Get-PersistedRepairProfiles {
     return $profiles
 }
 
+# Windows ignores POSIX modes. Restrict this generated configuration to the
+# invoking user and SYSTEM instead of leaving inherited readable ACLs behind.
+function Protect-FileToOwner {
+    param([string] $Path)
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $system = New-Object Security.Principal.SecurityIdentifier([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+    $acl = New-Object Security.AccessControl.FileSecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($identity in @($currentUser, $system)) {
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+            $identity,
+            [Security.AccessControl.FileSystemRights]::FullControl,
+            [Security.AccessControl.AccessControlType]::Allow
+        )
+        [void]$acl.AddAccessRule($rule)
+    }
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        [IO.FileSystemAclExtensions]::SetAccessControl((Get-Item -LiteralPath $Path), $acl)
+    } else {
+        (Get-Item -LiteralPath $Path).SetAccessControl($acl)
+    }
+}
+
 function Refresh-HermesEnvironment {
     param([string] $HermesHome)
     $env:HERMES_HOME = $HermesHome
@@ -1598,6 +1621,16 @@ function Get-HermesVersion {
 function Test-CompatibleHermesVersion {
     param($Version)
     return (-not $Version.IsPrerelease -and $Version.Core -ge [Version]'0.21.0')
+}
+
+function Test-SafeModelWord {
+    param([string] $Value)
+    return ($Value -cmatch '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$')
+}
+
+function Test-SafeModelEndpoint {
+    param([string] $Value)
+    return ($Value -cmatch '^https?://[A-Za-z0-9._~:/?#@%+=-]{1,255}$')
 }
 
 function Update-HermesHarness {

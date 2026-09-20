@@ -597,6 +597,13 @@ $fakeUserNetTCPIP = $null
 
 try {
     Assert-True (Test-Path -LiteralPath $installer) 'scripts/install.ps1 must exist'
+    $tokens = $null; $errors = $null
+    $installerAst = [Management.Automation.Language.Parser]::ParseFile($installer, [ref]$tokens, [ref]$errors)
+    Assert-True ($errors.Count -eq 0) 'scripts/install.ps1 must parse'
+    $installerFunctions = @($installerAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object Name)
+    foreach ($name in @('Protect-FileToOwner', 'Test-SafeModelWord', 'Test-SafeModelEndpoint', 'Update-HermesHarness')) {
+        Assert-True ($installerFunctions -contains $name) "scripts/install.ps1 must define its called $name helper"
+    }
     $fixtures = Join-Path $temp 'release assets'
     $eventLog = Join-Path $temp 'events.log'
     $fakeBin = Join-Path $temp 'fake bin'
