@@ -434,7 +434,12 @@ bootstrap_killed_status=$?
 trap "$err_trap" ERR
 set -e
 test "$bootstrap_killed_status" -ne 0
-test -f "$tmp/bootstrap-live-home/.bootstrap-transaction"
+if ! test -f "$tmp/bootstrap-live-home/.bootstrap-transaction"; then
+  printf 'FAIL  killed bootstrap did not preserve its transaction marker\n--- killed bootstrap transcript ---\n' >&2
+  cat "$tmp/bootstrap-killed.log" >&2 || true
+  printf '%s\n' '--- end killed bootstrap transcript ---' >&2
+  exit 1
+fi
 cmp -s "$tmp/bootstrap-before-kill.mjs" "$tmp/bootstrap-live-home/.bootstrap-previous/cozygateway.mjs"
 set +e
 bootstrap_recovered_output="$(HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-recovered" bash "$repo_root/scripts/install.sh" 2>&1)"
