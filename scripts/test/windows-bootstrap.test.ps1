@@ -165,7 +165,37 @@ public static class $className {
 function New-FakeBash {
     param([string] $Path, [string] $EventLog)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
-    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho bash-hermes:%COZYGATEWAY_HERMES_BIN%>>`"$EventLog`"`necho bash-powershell:%COZYGATEWAY_POWERSHELL%>>`"$EventLog`"`nif not `"%COZYGATEWAY_TEST_SECRET_PATH%`"==`"`" (`n  for %%I in (`"%COZYGATEWAY_TEST_SECRET_PATH%`") do if not exist `"%%~dpI`" mkdir `"%%~dpI`"`n  >`"%COZYGATEWAY_TEST_SECRET_PATH%`" echo DASHBOARD_SESSION_TOKEN=test-token`n)`nif not `"%COZYGATEWAY_TEST_BASH_FAIL_ONCE%`"==`"`" if not exist `"%COZYGATEWAY_TEST_BASH_FAIL_ONCE%`" (`n  type nul >`"%COZYGATEWAY_TEST_BASH_FAIL_ONCE%`"`n  exit /b 23`n)`nif `"%COZYGATEWAY_TEST_BASH_FAIL%`"==`"1`" exit /b 23`nexit /b 0`n"
+    $body = @"
+@echo off
+echo bash:%*>>"$EventLog"
+echo bash-hermes:%COZYGATEWAY_HERMES_BIN%>>"$EventLog"
+echo bash-powershell:%COZYGATEWAY_POWERSHELL%>>"$EventLog"
+set "gateway_dir="
+:find_gateway_dir
+if "%~1"=="" goto fake_bash_ready
+if "%~1"=="--gateway-dir" (
+  set "gateway_dir=%~2"
+  shift
+)
+shift
+goto find_gateway_dir
+:fake_bash_ready
+if not "%gateway_dir%"=="" (
+  if not exist "%gateway_dir%\bin" mkdir "%gateway_dir%\bin"
+  >"%gateway_dir%\bin\cozygateway.cmd" echo @echo off
+)
+if not "%COZYGATEWAY_TEST_SECRET_PATH%"=="" (
+  for %%I in ("%COZYGATEWAY_TEST_SECRET_PATH%") do if not exist "%%~dpI" mkdir "%%~dpI"
+  >"%COZYGATEWAY_TEST_SECRET_PATH%" echo DASHBOARD_SESSION_TOKEN=test-token
+)
+if not "%COZYGATEWAY_TEST_BASH_FAIL_ONCE%"=="" if not exist "%COZYGATEWAY_TEST_BASH_FAIL_ONCE%" (
+  type nul >"%COZYGATEWAY_TEST_BASH_FAIL_ONCE%"
+  exit /b 23
+)
+if "%COZYGATEWAY_TEST_BASH_FAIL%"=="1" exit /b 23
+exit /b 0
+"@
+    Write-Utf8NoBom $Path $body
 }
 
 function Invoke-Bootstrap {
