@@ -430,6 +430,9 @@ case "$(uname -s)" in
 esac
 set +e
 trap - ERR  # this run is killed on purpose, mid-promotion
+# Native Python only relays these values back to Git Bash. Preserve their POSIX
+# spelling instead of MSYS converting the fixture home to a drive-letter path.
+MSYS2_ENV_CONV_EXCL="${MSYS2_ENV_CONV_EXCL:+$MSYS2_ENV_CONV_EXCL;}HOME;COZYGATEWAY_" \
 HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-killed" COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION=cozygateway.mjs \
   python3 - "$bootstrap_bash" "$bootstrap_script" "$tmp/bootstrap-killed.log" <<'PY'
 import os
