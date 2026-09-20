@@ -165,7 +165,37 @@ public static class $className {
 function New-FakeBash {
     param([string] $Path, [string] $EventLog)
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
-    Write-Utf8NoBom $Path "@echo off`necho bash:%*>>`"$EventLog`"`necho bash-hermes:%COZYGATEWAY_HERMES_BIN%>>`"$EventLog`"`necho bash-powershell:%COZYGATEWAY_POWERSHELL%>>`"$EventLog`"`nif not `"%COZYGATEWAY_TEST_SECRET_PATH%`"==`"`" (`n  for %%I in (`"%COZYGATEWAY_TEST_SECRET_PATH%`") do if not exist `"%%~dpI`" mkdir `"%%~dpI`"`n  >`"%COZYGATEWAY_TEST_SECRET_PATH%`" echo DASHBOARD_SESSION_TOKEN=test-token`n)`nif not `"%COZYGATEWAY_TEST_BASH_FAIL_ONCE%`"==`"`" if not exist `"%COZYGATEWAY_TEST_BASH_FAIL_ONCE%`" (`n  type nul >`"%COZYGATEWAY_TEST_BASH_FAIL_ONCE%`"`n  exit /b 23`n)`nif `"%COZYGATEWAY_TEST_BASH_FAIL%`"==`"1`" exit /b 23`nexit /b 0`n"
+    $body = @"
+@echo off
+echo bash:%*>>"$EventLog"
+echo bash-hermes:%COZYGATEWAY_HERMES_BIN%>>"$EventLog"
+echo bash-powershell:%COZYGATEWAY_POWERSHELL%>>"$EventLog"
+set "gateway_dir="
+:find_gateway_dir
+if "%~1"=="" goto fake_bash_ready
+if "%~1"=="--gateway-dir" (
+  set "gateway_dir=%~2"
+  shift
+)
+shift
+goto find_gateway_dir
+:fake_bash_ready
+if not "%gateway_dir%"=="" (
+  if not exist "%gateway_dir%\bin" mkdir "%gateway_dir%\bin"
+  >"%gateway_dir%\bin\cozygateway.cmd" echo @echo off
+)
+if not "%COZYGATEWAY_TEST_SECRET_PATH%"=="" (
+  for %%I in ("%COZYGATEWAY_TEST_SECRET_PATH%") do if not exist "%%~dpI" mkdir "%%~dpI"
+  >"%COZYGATEWAY_TEST_SECRET_PATH%" echo DASHBOARD_SESSION_TOKEN=test-token
+)
+if not "%COZYGATEWAY_TEST_BASH_FAIL_ONCE%"=="" if not exist "%COZYGATEWAY_TEST_BASH_FAIL_ONCE%" (
+  type nul >"%COZYGATEWAY_TEST_BASH_FAIL_ONCE%"
+  exit /b 23
+)
+if "%COZYGATEWAY_TEST_BASH_FAIL%"=="1" exit /b 23
+exit /b 0
+"@
+    Write-Utf8NoBom $Path $body
 }
 
 function Invoke-Bootstrap {
@@ -567,6 +597,13 @@ $fakeUserNetTCPIP = $null
 
 try {
     Assert-True (Test-Path -LiteralPath $installer) 'scripts/install.ps1 must exist'
+    $tokens = $null; $errors = $null
+    $installerAst = [Management.Automation.Language.Parser]::ParseFile($installer, [ref]$tokens, [ref]$errors)
+    Assert-True ($errors.Count -eq 0) 'scripts/install.ps1 must parse'
+    $installerFunctions = @($installerAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object Name)
+    foreach ($name in @('Protect-FileToOwner', 'Test-SafeModelWord', 'Test-SafeModelEndpoint', 'Update-HermesHarness')) {
+        Assert-True ($installerFunctions -contains $name) "scripts/install.ps1 must define its called $name helper"
+    }
     $fixtures = Join-Path $temp 'release assets'
     $eventLog = Join-Path $temp 'events.log'
     $fakeBin = Join-Path $temp 'fake bin'
@@ -896,8 +933,7 @@ New-Item -ItemType Directory -Force -Path '$(Split-Path -Parent $missingHermes)'
 Copy-Item -LiteralPath '$preparedHermes' -Destination '$missingHermes' -Force
 Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHermes' -Force
 "@
-    # A machine with no Hermes at all is offered CozyAgents first, so -Harness hermes is what asks
-    # for the Hermes bootstrap this case is about.
+    # Hermes is the only supported setup path, so an empty invocation must bootstrap it.
     $missing = Invoke-Bootstrap $installer @{
         'PATH' = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
         'HERMES_HOME' = (Join-Path $missingRoot 'hermes')
@@ -906,7 +942,7 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
         'COZYGATEWAY_GIT_BASH' = $fakeBash
         'COZYGATEWAY_TEST_HERMES' = $missingHermes
         'COZYGATEWAY_HERMES_INSTALL_URL' = $officialInstaller
-    } @('-Harness', 'hermes')
+    }
     Assert-True ($missing.ExitCode -eq 0) "missing-Hermes bootstrap failed: $($missing.Output)"
     Assert-True ($missing.Output -match 'Hermes Agent is not installed') 'missing Hermes must invoke the official installer path'
     Assert-True ((Get-Content -LiteralPath $eventLog -Raw) -match [regex]::Escape("bash-hermes:$missingNativeHermes")) 'fresh-install handoff must expose native Hermes in the requested home'
@@ -937,12 +973,8 @@ Copy-Item -LiteralPath '$preparedNativeHermes' -Destination '$missingNativeHerme
     Assert-True $supervisorArgumentsMatch.Success 'shared installer must define the supervisor arguments'
     $wrapperIdentityMatch = [regex]::Match($agentInstaller, '(?ms)^load_windows_wrapper_identity\(\) \{.*?^\}\r?\n(?=stop_owned_windows_gateway\(\))')
     Assert-True $wrapperIdentityMatch.Success 'shared installer must define the persisted gateway wrapper identity loader'
-    $cozyStateWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_cozyagents_state\(\) \{.*?^\}')
-    Assert-True $cozyStateWriterMatch.Success 'shared installer must define the CozyAgents state writer'
     $hermesStateWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_state\(\) \{.*?^\}')
     Assert-True $hermesStateWriterMatch.Success 'shared installer must define the Hermes state writer'
-    $cozyInstallMatch = [regex]::Match($agentInstaller, '(?ms)^install_with_cozyagents\(\) \{.*?^\}')
-    Assert-True $cozyInstallMatch.Success 'shared installer must define the CozyAgents install branch'
     $windowsTaskWriterMatch = [regex]::Match($agentInstaller, '(?ms)^write_windows_task_xml\(\) \{.*?^\}\r?\n(?=install_windows_service\(\))')
     Assert-True $windowsTaskWriterMatch.Success 'shared installer must define the Windows task XML writer'
     $gatewayStopFunctionMatch = [regex]::Match($agentInstaller, '(?ms)^stop_owned_windows_gateway\(\) \{.*?^\}')
@@ -1032,68 +1064,11 @@ if (-not `$DryRun) { Remove-Item -LiteralPath `$env:COZYGATEWAY_HOME -Recurse -F
     Assert-True ($LASTEXITCODE -eq 0 -and -not (Test-Path -LiteralPath $repairHome)) "uninstall must exit successfully after deleting its own command: $actualUninstall"
     Assert-True (@(Get-Content -LiteralPath $uninstallMarker).Count -eq 2 -and (Get-Content -LiteralPath $uninstallMarker)[0] -eq $repairHome) 'uninstall must pass the installed custom home'
 
-    # A foreign Windows registration must stop the CozyAgents branch before it
-    # can replace any live state or configuration.
-    $cozyPreflightHarness = Join-Path $temp 'cozyagents-preflight-order.sh'
-    $cozyMutationMarker = Join-Path $temp 'cozyagents-preflight-mutation.txt'
-    $cozyPreflightScript = @"
-#!/usr/bin/env bash
-set -euo pipefail
-marker="`$1"
-windows_harness_owner() { return 0; }
-is_windows() { return 0; }
-say() { :; }
-confirm_cozyagents_model() { :; }
-choose_fresh_listener() { :; }
-validate_listener_settings() { :; }
-preflight_windows_service_ownership() { exit 71; }
-write_cozyagents_state() { printf 'state\n' >> "`$marker"; }
-write_cozyagents_gateway_env() { printf 'env\n' >> "`$marker"; }
-write_cozyagents_gateway_config() { printf 'config\n' >> "`$marker"; }
-write_cli_wrapper() { printf 'cli\n' >> "`$marker"; }
-install_service() { printf 'service\n' >> "`$marker"; }
-wait_gateway_ready() { :; }
-install_posix_cli() { :; }
-announce_listener() { :; }
-install_cozyagents_harness() { :; }
-pairing_and_finish() { :; }
-DRY_RUN=1
-LOCAL_DIR=/unused
-$($cozyInstallMatch.Value)
-install_with_cozyagents 0
-"@
-    Write-Utf8NoBom $cozyPreflightHarness $cozyPreflightScript
-    $cozyPreflightOutput = (& $bashPath $cozyPreflightHarness $cozyMutationMarker 2>&1 | Out-String)
-    Assert-True ($LASTEXITCODE -eq 71) "foreign CozyAgents registration preflight must abort the branch: $cozyPreflightOutput"
-    Assert-True (-not (Test-Path -LiteralPath $cozyMutationMarker)) 'foreign CozyAgents registration preflight must preserve state, environment, config, CLI, and service files'
-
     # A failed final rename simulates interruption at the state commit boundary.
     # The authoritative old identity must remain intact and no stage may survive.
-    $atomicStateHarness = Join-Path $temp 'cozyagents-atomic-state.sh'
+    $atomicStateHarness = Join-Path $temp 'gateway-atomic-state.sh'
     $atomicStatePath = Join-Path $temp 'atomic-state\install-state'
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $atomicStatePath) | Out-Null
-    Write-Utf8NoBom $atomicStatePath "old-authoritative-state`n"
-    $atomicStateScript = @"
-#!/usr/bin/env bash
-set -euo pipefail
-STATE_FILE="`$1"
-DRY_RUN=0
-COZYAGENTS_HOME_DIR=/fixture/cozyagents
-NODE_RESOLVED=/fixture/node
-BUNDLE_PATH=/fixture/bundle
-SUPERVISOR=/fixture/supervisor
-WINDOWS_TASK_XML=/fixture/task.xml
-is_windows() { return 0; }
-mv() { return 73; }
-$($cozyStateWriterMatch.Value)
-write_cozyagents_state
-"@
-    Write-Utf8NoBom $atomicStateHarness $atomicStateScript
-    $atomicStateOutput = (& $bashPath $atomicStateHarness $atomicStatePath 2>&1 | Out-String)
-    Assert-True ($LASTEXITCODE -ne 0) "state commit failure must propagate: $atomicStateOutput"
-    Assert-True ((Get-Content -LiteralPath $atomicStatePath -Raw) -eq "old-authoritative-state`n") 'failed state commit must preserve the complete old identity'
-    Assert-True (@(Get-ChildItem -LiteralPath (Split-Path -Parent $atomicStatePath) -Filter 'install-state.tmp.*').Count -eq 0) 'failed state commit must remove its staged state file'
-
     Write-Utf8NoBom $atomicStatePath "old-hermes-authoritative-state`n"
     $atomicHermesStateScript = @"
 #!/usr/bin/env bash
@@ -1141,7 +1116,7 @@ DASHBOARD_ENV=/unused
 DASHBOARD_OWNER_PS1=/unused
 DASHBOARD_PORT=9119
 SERVICE_PLATFORM=Windows
-HARNESS=cozyagents
+HARNESS=runtime-only
 is_windows() { return 0; }
 to_windows_path() { cygpath -w "`$1"; }
 die() { printf 'FAIL  %s\n' "`$*" >&2; exit 1; }
@@ -1321,7 +1296,7 @@ printf '%s\n' "`${SUPERVISOR_ARGS[@]}"
     $foreignArguments = '"{0}" serve --config "{1}" --foreign' -f $supervisorBundle, $supervisorConfig
     $foreignChild = Start-Process -WindowStyle Hidden -FilePath $nodeExecutable -ArgumentList $foreignArguments -PassThru
     $uninstallSupervisor = $null
-    $cozySupervisor = $null
+    $runtimeSupervisor = $null
     $foreignOldPortListener = $null
     try {
         $listening = $false
@@ -1398,17 +1373,17 @@ stop_owned_windows_gateway
         }
         Assert-True $reacquired 'a dashboard-port and gateway-port update must stop the persisted owned supervisor so it cannot reclaim the old gateway port'
 
-        $cozyWrapper = Join-Path $supervisorLocal 'run-gateway-cozyagents.sh'
-        $cozyWrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $cozyWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix cozyagents $dashboardPortStatePosix 2>&1 | Out-String)
-        Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $cozyWrapper)) "production writer must generate the CozyAgents supervisor wrapper: $cozyWrapperOutput"
-        Assert-True (-not ((Get-Content -LiteralPath $cozyWrapper -Raw) -match '--dashboard-env')) 'CozyAgents supervisor wrapper must omit the complete Hermes argument group'
-        $cozySupervisor = Start-Process -WindowStyle Hidden -FilePath $bashPath -ArgumentList ('"' + $cozyWrapper + '"') -PassThru
-        $cozyListening = $false
+        $runtimeWrapper = Join-Path $supervisorLocal 'run-gateway-runtime-only.sh'
+        $runtimeWrapperOutput = (& $bashPath $wrapperGenerator $supervisorRoot $supervisorLocal $runtimeWrapper $gatewayEnvPosix $dashboardEnvPosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $nodePosix $bundlePosix $configPosix runtime-only $dashboardPortStatePosix 2>&1 | Out-String)
+        Assert-True ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $runtimeWrapper)) "production writer must generate the runtime-only supervisor wrapper: $runtimeWrapperOutput"
+        Assert-True (-not ((Get-Content -LiteralPath $runtimeWrapper -Raw) -match '--dashboard-env')) 'runtime-only supervisor wrapper must omit the complete Hermes argument group'
+        $runtimeSupervisor = Start-Process -WindowStyle Hidden -FilePath $bashPath -ArgumentList ('"' + $runtimeWrapper + '"') -PassThru
+        $runtimeListening = $false
         for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
             $probe = [Net.Sockets.TcpClient]::new()
             try {
                 $probe.Connect('127.0.0.1', $supervisorPort)
-                $cozyListening = $true
+                $runtimeListening = $true
                 break
             } catch {
                 Start-Sleep -Milliseconds 100
@@ -1416,23 +1391,23 @@ stop_owned_windows_gateway
                 $probe.Dispose()
             }
         }
-        Assert-True $cozyListening 'CozyAgents supervisor fixture must start its managed gateway child'
-        $cozyStopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $cozyWrapper $supervisorPort cozyagents $dashboardPortStatePosix 2>&1 | Out-String)
-        Assert-True ($LASTEXITCODE -eq 0) "owned CozyAgents gateway stop helper failed: $cozyStopOutput"
+        Assert-True $runtimeListening 'runtime-only supervisor fixture must start its managed gateway child'
+        $runtimeStopOutput = (& $bashPath $gatewayStopHarness $nextSupervisorPort $configPosix $gatewayEnvPosix $dashboardEnvPosix $nodePosix $bundlePosix $hermesRootPosix $hermesPosix $ownerHelperPosix $supervisorDashboardPort $runtimeWrapper $supervisorPort runtime-only $dashboardPortStatePosix 2>&1 | Out-String)
+        Assert-True ($LASTEXITCODE -eq 0) "owned runtime-only gateway stop helper failed: $runtimeStopOutput"
         Start-Sleep -Milliseconds 1500
-        $cozyReacquired = $false
-        $cozyReplacement = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $supervisorPort)
+        $runtimeReacquired = $false
+        $runtimeReplacement = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $supervisorPort)
         try {
-            $cozyReplacement.Start()
-            $cozyReacquired = $true
+            $runtimeReplacement.Start()
+            $runtimeReacquired = $true
         } catch {
-            $cozyReacquired = $false
+            $runtimeReacquired = $false
         } finally {
-            if ($cozyReacquired) { $cozyReplacement.Stop() }
+            if ($runtimeReacquired) { $runtimeReplacement.Stop() }
         }
-        Assert-True $cozyReacquired 'CozyAgents cleanup must match and stop its supervisor without a Hermes argument group'
-        Stop-FixtureProcessTree $cozySupervisor
-        $cozySupervisor = $null
+        Assert-True $runtimeReacquired 'runtime-only cleanup must match and stop its supervisor without a Hermes argument group'
+        Stop-FixtureProcessTree $runtimeSupervisor
+        $runtimeSupervisor = $null
         $foreignListenerSource = Join-Path $supervisorRoot 'foreign-old-port-listener.mjs'
         Write-Utf8NoBom $foreignListenerSource @'
 import net from 'node:net';
@@ -1573,7 +1548,7 @@ stop_owned_windows_gateway 0
         Stop-FixtureProcessTree $supervisor
         Stop-FixtureProcessTree $staleSupervisor
         Stop-FixtureProcessTree $uninstallSupervisor
-        Stop-FixtureProcessTree $cozySupervisor
+        Stop-FixtureProcessTree $runtimeSupervisor
         Stop-FixtureProcessTree $foreignChild
         Stop-FixtureProcessTree $foreignOldPortListener
         Stop-FixtureProcessTree $dashboard

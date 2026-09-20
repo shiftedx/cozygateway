@@ -130,20 +130,32 @@ prepare_owned_dir() {
   fi
   chmod 700 "$path" || die "could not secure installer directory: $path"
 }
-# The installer records every process it starts detached under
-# local/run-pids. A failed run leaves its Dashboard and its profile gateways
-# holding the ports, and each retry then fails at the same step; restoring the
-# previous release does not stop them. Only pids this installation recorded are
-# ever signalled, and only while they are still alive.
+# The installer records detached Dashboard processes under local/run-pids. A
+# failed run can otherwise leave one holding the control port, and restoring the
+# release bytes alone does not release it. A PID is not ownership: before
+# signalling it, recovery requires the recorded process-group and start time to
+# still match. Older, PID-only ledger rows are intentionally ignored.
 stop_recorded_run_processes() {
-  local file="$HOME_DIR/local/run-pids" kind pid
+  local file="$HOME_DIR/local/run-pids" kind pid pgid started current_pgid current_started
   [ -f "$file" ] && [ ! -L "$file" ] || return 0
-  while IFS='=' read -r kind pid || [ -n "$kind" ]; do
+  while IFS=$'\t' read -r kind pid pgid started || [ -n "$kind" ]; do
     case "$pid" in ''|*[!0-9]*) continue ;; esac
     [ "$pid" -gt 1 ] || continue
     [ "$pid" != "$$" ] || continue
+    case "$pgid" in ''|*[!0-9]*) continue ;; esac
+    [ -n "$started" ] || continue
     kill -0 "$pid" 2>/dev/null || continue
-    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    current_pgid="$(ps -o pgid= -p "$pid" 2>/dev/null)" || continue
+    current_started="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)" || continue
+    current_pgid="$(tr -d '[:space:]' <<<"$current_pgid")"
+    current_started="$(awk '{$1=$1; print}' <<<"$current_started")"
+    if [ "$current_pgid" != "$pgid" ] || [ "$current_started" != "$started" ]; then
+      printf 'INFO  skipped stale %s process record for pid %s\n' "${kind:-unknown}" "$pid" >&2
+      continue
+    fi
+    if [ "$pgid" = "$pid" ]; then kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    else kill -TERM "$pid" 2>/dev/null || true
+    fi
     printf 'OK    stopped the %s process (pid %s) the failed run started\n' "${kind:-unknown}" "$pid" >&2
   done < "$file"
   rm -f "$file"

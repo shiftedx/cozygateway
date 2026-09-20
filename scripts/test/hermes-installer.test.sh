@@ -420,21 +420,18 @@ if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/rele
 printf '%s  cozygateway.mjs\n' "$asset_sha" > "$tmp/release-assets/cozygateway.mjs.sha256"
 set +e
 trap - ERR  # this run is killed on purpose, mid-promotion
+# Keep the child under Bash: native Windows Python loses MSYS signal status.
 HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-killed" COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION=cozygateway.mjs \
-  python3 - "$repo_root/scripts/install.sh" "$tmp/bootstrap-killed.log" <<'PY'
-import os
-import subprocess
-import sys
-
-with open(sys.argv[2], "wb") as output:
-    result = subprocess.run(["bash", sys.argv[1]], env=os.environ.copy(), stdout=output, stderr=subprocess.STDOUT)
-sys.exit(result.returncode)
-PY
+  "$BASH" "$repo_root/scripts/install.sh" >"$tmp/bootstrap-killed.log" 2>&1
 bootstrap_killed_status=$?
 trap "$err_trap" ERR
 set -e
-test "$bootstrap_killed_status" -ne 0
-test -f "$tmp/bootstrap-live-home/.bootstrap-transaction"
+if [ "$bootstrap_killed_status" -eq 0 ] || ! test -f "$tmp/bootstrap-live-home/.bootstrap-transaction"; then
+  printf 'FAIL  bootstrap did not stop with its interrupted transaction marker\n--- killed bootstrap transcript ---\n' >&2
+  cat "$tmp/bootstrap-killed.log" >&2 || true
+  printf '%s\n' '--- end killed bootstrap transcript ---' >&2
+  exit 1
+fi
 cmp -s "$tmp/bootstrap-before-kill.mjs" "$tmp/bootstrap-live-home/.bootstrap-previous/cozygateway.mjs"
 set +e
 bootstrap_recovered_output="$(HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-recovered" bash "$repo_root/scripts/install.sh" 2>&1)"
@@ -1060,7 +1057,7 @@ if script --version 2>&1 | grep -qi util-linux; then
     sed 's|^COZYGATEWAY_URL=.*|COZYGATEWAY_URL=http://127.0.0.1:9000|' "$pty_profile_env" > "$pty_profile_env.next"
     mv "$pty_profile_env.next" "$pty_profile_env"
   done < <(find "$pty_explicit_hermes" -name .env -type f)
-  pty_output="$({ sleep 1; printf 'yes\n'; } | script -qec "printf 'bootstrap-stdin\\n' | env HOME='$tmp/pty-home' PATH='$tmp/service-bin:$tmp/bin:$PATH' COZYGATEWAY_TEST_PAIRING_LAN_ADDRESS=192.0.2.11 COZYGATEWAY_TEST_HERMES_ROOT='$tmp/hermes' COZYGATEWAY_TEST_COMMAND_LOG='$tmp/pty-hermes-commands' COZYGATEWAY_TEST_REAL_NODE='$real_node' COZYGATEWAY_HERMES_BIN='$tmp/bin/hermes' COZYGATEWAY_NODE='$fake_node' COZYGATEWAY_SERVICE_PLATFORM=Darwin bash '$repo_root/scripts/agent-install.sh' --bundle '$tmp/gateway.mjs' --plugin-archive '$tmp/plugin.tar.gz' --gateway-dir '$tmp/gateway-pty'" /dev/null)"
+  pty_output="$({ sleep 1; printf 'yes\nyes\n'; } | script -qec "printf 'bootstrap-stdin\\n' | env -u COZYGATEWAY_TEST_LAN_PROMPT_INPUT -u COZYGATEWAY_TEST_PAIR_PROMPT_INPUT HOME='$tmp/pty-home' PATH='$tmp/service-bin:$tmp/bin:$PATH' COZYGATEWAY_TEST_PAIRING_LAN_ADDRESS=192.0.2.11 COZYGATEWAY_TEST_HERMES_ROOT='$tmp/hermes' COZYGATEWAY_TEST_COMMAND_LOG='$tmp/pty-hermes-commands' COZYGATEWAY_TEST_REAL_NODE='$real_node' COZYGATEWAY_HERMES_BIN='$tmp/bin/hermes' COZYGATEWAY_NODE='$fake_node' COZYGATEWAY_SERVICE_PLATFORM=Darwin bash '$repo_root/scripts/agent-install.sh' --bundle '$tmp/gateway.mjs' --plugin-archive '$tmp/plugin.tar.gz' --gateway-dir '$tmp/gateway-pty'" /dev/null)"
   grep -Fq 'Allow CozyChat to access this Gateway over your local network? [y/N]' <<<"$pty_output"
   grep -Fq '"gatewayUrl":"http://192.0.2.11:8787"' <<<"$pty_output"
   grep -Fq '"host": "0.0.0.0"' "$tmp/gateway-pty/local/cozygateway.config.json"
@@ -1211,7 +1208,10 @@ fi
 cp "$tmp/gateway-live/local/gateway-supervisor.cjs" "$tmp/supervisor.cjs"
 cat > "$tmp/reload-gateway.mjs" <<'RELOAD_GATEWAY'
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
-if (!existsSync(process.env.COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER)) process.exit(2);
+if (!existsSync(process.env.COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER)) {
+  console.error(`fixture Gateway cannot find authenticated Dashboard marker: ${process.env.COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER}`);
+  process.exit(2);
+}
 const configAt = process.argv.indexOf('--config');
 const config = JSON.parse(readFileSync(process.argv[configAt + 1], 'utf8'));
 appendFileSync(process.env.COZYGATEWAY_TEST_RELOAD_LOG, `${process.pid}:${config.port}\n`);
@@ -1394,10 +1394,21 @@ NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_RELOAD_LOG="$rel
   --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$mock_dashboard_port" --windows-dashboard-profile \
   >"$tmp/supervisor.log" 2>&1 &
 supervisor_pid=$!
-for _ in $(seq 1 50); do [ -s "$tmp/reload.log" ] && break; sleep 0.1; done
+# Authenticated cold start permits 30 probes (up to 2 seconds each) plus
+# 1-second retry delays. Observe that bounded contract, not a 5-second host-speed
+# assumption; fail early if the supervisor exits before launching Gateway.
+for _ in $(seq 1 1000); do
+  [ -s "$tmp/reload.log" ] && break
+  kill -0 "$supervisor_pid" 2>/dev/null || break
+  sleep 0.1
+done
 if [ ! -s "$tmp/reload.log" ]; then
   printf '%s\n' 'generated supervisor did not launch its gateway child' >&2
   cat "$tmp/supervisor.log" >&2
+  for marker in "$tmp/mock-dashboard.pid" "$dashboard_auth_marker" "$tmp/reload.log"; do
+    if [ -s "$marker" ]; then printf 'fixture marker present: %s\n' "$marker" >&2
+    else printf 'fixture marker absent: %s\n' "$marker" >&2; fi
+  done
   [ ! -f "$tmp/hermes-stub-trace" ] || cat "$tmp/hermes-stub-trace" >&2
   exit 1
 fi

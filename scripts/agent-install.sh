@@ -875,24 +875,24 @@ EOF
 }
 
 record_run_pid() {
-  local kind="$1" pid="$2"
+  local kind="$1" pid="$2" pgid started
   [ "$DRY_RUN" = 1 ] && return 0
   case "$pid" in ''|*[!0-9]*) return 0 ;; esac
   [ "$pid" -gt 1 ] || return 0
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null)" || return 0
+  started="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)" || return 0
+  pgid="$(tr -d '[:space:]' <<<"$pgid")"
+  started="$(awk '{$1=$1; print}' <<<"$started")"
+  case "$pgid" in ''|*[!0-9]*) return 0 ;; esac
+  [ -n "$started" ] || return 0
   (umask 077; mkdir -p "$LOCAL_DIR")
-  umask 077; printf '%s=%s\n' "$kind" "$pid" >> "$RUN_PIDS_FILE"
+  umask 077; printf '%s\t%s\t%s\t%s\n' "$kind" "$pid" "$pgid" "$started" >> "$RUN_PIDS_FILE"
   return 0
 }
 # A finished run owns everything it started; only an unfinished one leaves work
 # for a rollback. Clearing the ledger at both ends keeps a later failure from
 # stopping a healthy Dashboard.
 clear_run_pids() { [ "$DRY_RUN" = 1 ] || rm -f "$RUN_PIDS_FILE"; return 0; }
-record_profile_gateway_pid() {
-  local profile="$1" pid
-  [ "$DRY_RUN" = 1 ] && return 0
-  pid="$("$HERMES_BIN" -p "$profile" gateway status 2>/dev/null | sed -n 's/.*PID: \([0-9][0-9]*\).*/\1/p' | tail -1)"
-  record_run_pid "gateway-$profile" "$pid"
-}
 install_plugin() {
   local profile="$1" home="$2" target stage source
   target="$home/plugins/cozygateway"
@@ -1589,7 +1589,6 @@ ensure_hermes_gateways() {
         say "OK    installed and started Hermes gateway service for profile $profile"
         ;;
     esac
-    record_profile_gateway_pid "$profile"
     record_service_action "$profile" "$action"
   done
 }

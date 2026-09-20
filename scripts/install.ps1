@@ -1523,6 +1523,29 @@ function Get-PersistedRepairProfiles {
     return $profiles
 }
 
+# Windows ignores POSIX modes. Restrict this generated configuration to the
+# invoking user and SYSTEM instead of leaving inherited readable ACLs behind.
+function Protect-FileToOwner {
+    param([string] $Path)
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $system = New-Object Security.Principal.SecurityIdentifier([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+    $acl = New-Object Security.AccessControl.FileSecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($identity in @($currentUser, $system)) {
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+            $identity,
+            [Security.AccessControl.FileSystemRights]::FullControl,
+            [Security.AccessControl.AccessControlType]::Allow
+        )
+        [void]$acl.AddAccessRule($rule)
+    }
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        [IO.FileSystemAclExtensions]::SetAccessControl((Get-Item -LiteralPath $Path), $acl)
+    } else {
+        (Get-Item -LiteralPath $Path).SetAccessControl($acl)
+    }
+}
+
 function Refresh-HermesEnvironment {
     param([string] $HermesHome)
     $env:HERMES_HOME = $HermesHome
@@ -1598,6 +1621,36 @@ function Get-HermesVersion {
 function Test-CompatibleHermesVersion {
     param($Version)
     return (-not $Version.IsPrerelease -and $Version.Core -ge [Version]'0.21.0')
+}
+
+function Test-SafeModelWord {
+    param([string] $Value)
+    return ($Value -cmatch '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$')
+}
+
+function Test-SafeModelEndpoint {
+    param([string] $Value)
+    return ($Value -cmatch '^https?://[A-Za-z0-9._~:/?#@%+=-]{1,255}$')
+}
+
+function Update-HermesHarness {
+    param([string] $HermesPath, [bool] $DryRun = $false)
+    if ($DryRun) { Write-Info 'dry run: would run the Hermes updater and verify its version and launcher'; return }
+    $before = Get-HermesVersion $HermesPath
+    Write-Info 'Updating Hermes Agent with its supported Windows updater.'
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $HermesPath update --yes 2>&1 | ForEach-Object { Write-Host ([string]$_) }
+        $exitCode = $LASTEXITCODE
+    } catch { Fail 'Hermes update could not complete; resolve the Hermes updater error and retry. The overall update was not verified.' }
+    finally { $ErrorActionPreference = $previousErrorActionPreference }
+    if ($exitCode -ne 0) { Fail 'Hermes update failed or was refused; close other Hermes sessions, resolve the updater error, and retry. The overall update did not complete.' }
+    Ensure-HermesLauncherInterpreter $HermesPath
+    $after = Get-HermesVersion $HermesPath
+    if (-not (Test-CompatibleHermesVersion $after)) { Fail "Hermes update did not install a compatible stable version (found v$($after.Text); v0.21.0 or newer is required)" }
+    Write-Ok "updated Hermes from v$($before.Text) to v$($after.Text); gateway attachment will be checked after restart"
+    return [pscustomobject]@{ Status = 'succeeded'; Version = $after.Text }
 }
 
 function Ensure-CompatibleHermes {

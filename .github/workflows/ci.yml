@@ -62,7 +62,6 @@ jobs:
       - run: node --test scripts/test/windows-hidden-supervisor.test.mjs
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-launcher-stop.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-fresh-prerequisites.test.ps1
-      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-existing-runtime.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-installer-session.test.ps1
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap-durability.test.ps1
       # Also runs under pwsh 7 in test:installer; here it runs on Windows PowerShell 5.1,

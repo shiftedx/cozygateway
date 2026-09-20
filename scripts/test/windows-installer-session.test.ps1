@@ -12,20 +12,20 @@ foreach ($helperName in $helperNames) {
     . ([scriptblock]::Create($definition.Extent.Text))
 }
 function Assert-Session { param($Condition, [string] $Message) if (-not $Condition) { throw $Message } }
-$parameters = @{ Repair = [switch]$true; Harness = 'both'; CozyAgentsInstaller = 'C:\a b\quo''te.ps1' }
-$arguments = @('--value', '', 'quote"value', ('line' + "`n" + 'two'), ('snowman ' + [char]0x2603))
+$parameters = @{ Uninstall = [switch]$true; Purge = [switch]$true }
+$arguments = @('C:\a b\quo''te.ps1', '--value', '', 'quote"value', ('line' + "`n" + 'two'), ('snowman ' + [char]0x2603))
 $payload = New-CozySessionPayload $parameters $arguments
 $roundtrip = [Management.Automation.PSSerializer]::Deserialize([Management.Automation.PSSerializer]::Serialize($payload))
-Assert-Session ($roundtrip.Parameters.Repair -eq $true) 'Switch must survive as a Boolean'
-Assert-Session ($roundtrip.Parameters.CozyAgentsInstaller -ceq $parameters.CozyAgentsInstaller) 'Literal path changed'
+Assert-Session ($roundtrip.Parameters.Uninstall -eq $true) 'Switch must survive as a Boolean'
+Assert-Session ($roundtrip.Parameters.Purge -eq $true) 'Second switch changed'
 Assert-Session ($roundtrip.Arguments.Count -eq $arguments.Count) 'Argument count changed'
 for ($i = 0; $i -lt $arguments.Count; $i++) { Assert-Session ($roundtrip.Arguments[$i] -ceq $arguments[$i]) "Argument $i changed" }
 Initialize-CozySessionNative
 $elevated = [CozyGateway.DesktopInstallerSession]::IsElevated()
 $scriptText = @'
-param([switch] $Repair, [string] $Harness, [string] $CozyAgentsInstaller, [string[]] $InstallerArguments)
-if (-not $Repair -or $Harness -ne 'both' -or $CozyAgentsInstaller -ne "C:\a b\quo'te.ps1") { throw 'Bound arguments changed' }
-if ($InstallerArguments.Count -ne 5 -or $InstallerArguments[1] -cne '' -or $InstallerArguments[2] -cne 'quote"value') { throw 'Remaining arguments changed' }
+param([switch] $Uninstall, [switch] $Purge, [string[]] $InstallerArguments)
+if (-not $Uninstall -or -not $Purge) { throw 'Bound arguments changed' }
+if ($InstallerArguments.Count -ne 6 -or $InstallerArguments[0] -cne "C:\a b\quo'te.ps1" -or $InstallerArguments[2] -cne '' -or $InstallerArguments[3] -cne 'quote"value') { throw 'Remaining arguments changed' }
 if ($env:COZY_SESSION_TEST_VALUE -cne 'preserved value') { throw 'Environment changed' }
 if ($env:COZY_SESSION_TEST_CWD -and ((Get-Location).ProviderPath -ine $env:COZY_SESSION_TEST_CWD -or -not (Test-Path -LiteralPath './relative-input.txt'))) { throw 'Original working directory was not restored' }
 if ($env:COZY_SESSION_TEST_CWD -and [IO.File]::ReadAllText('relative-input.txt').Trim() -cne 'relative source') { throw 'Native relative paths were not restored' }
@@ -59,11 +59,11 @@ if (-not $elevated) {
         & $application -NoProfile -ExecutionPolicy Bypass -File $wrapper
         Assert-Session ($LASTEXITCODE -eq 37) 'Continuation must preserve parameters and exit status'
         Assert-Session ((Get-CozySessionError $folder) -ceq '') 'An explicit exit code must not invent failure details'
-        Set-Content -LiteralPath (Join-Path $folder 'installer.ps1') -Encoding UTF8 -Value 'param([switch]$Repair,[string]$Harness,[string]$CozyAgentsInstaller,[string[]]$InstallerArguments) throw "CozyAgents update failed readiness; retry the Windows one-liner."'
+        Set-Content -LiteralPath (Join-Path $folder 'installer.ps1') -Encoding UTF8 -Value 'param([switch]$Uninstall,[switch]$Purge,[string[]]$InstallerArguments) throw "Gateway update failed readiness; retry the Windows one-liner."'
         $nativeFailure = [CozyGateway.DesktopInstallerSession]::Launch($application, $wrapper, [Environment]::SystemDirectory)
         Assert-Session ($nativeFailure -eq 1) 'Native child exception must return failure'
         $failureMessage = Get-CozySessionError $folder
-        Assert-Session ($failureMessage -ceq 'CozyAgents update failed readiness; retry the Windows one-liner.') 'Original terminal must receive the child exception after its console closes'
+        Assert-Session ($failureMessage -ceq 'Gateway update failed readiness; retry the Windows one-liner.') 'Original terminal must receive the child exception after its console closes'
         $handoffBranch = $installerAst.Find({ param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Extent.Text -match '^if\s*\(\$session\.HandedOff\)' }, $true)
         function Fail { param([string]$Message) throw $Message }
         $session = [pscustomobject]@{ HandedOff = $true; ExitCode = $nativeFailure; ErrorMessage = $failureMessage }
@@ -86,7 +86,7 @@ if (-not $elevated) {
         # Exercise both PowerShell entrypoints without running any install operations.
         $fixtureHead = @'
 [CmdletBinding(PositionalBinding = $false)]
-param([switch] $Repair, [string] $Harness, [Parameter(ValueFromRemainingArguments = $true)][string[]] $InstallerArguments)
+param([switch] $Uninstall, [switch] $Purge, [Parameter(ValueFromRemainingArguments = $true)][string[]] $InstallerArguments)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 $capturedParameters = @{} + $PSBoundParameters
@@ -105,11 +105,11 @@ if ($session.HandedOff -or $session.ExitCode -ne 0) { throw 'Read-only limited-u
         [IO.File]::WriteAllText($fixturePath, $fixtureText, (New-Object Text.UTF8Encoding($true)))
         $env:COZY_SESSION_RESULT = (Split-Path $folder -Leaf) + '/entry-result.xml'
         $longArgument = 'argument-' + ('x' * 4096)
-        & $application -NoProfile -ExecutionPolicy Bypass -File $fixturePath -Repair -Harness both --entry $longArgument
+        & $application -NoProfile -ExecutionPolicy Bypass -File $fixturePath -Uninstall -Purge --entry $longArgument
         Assert-Session ($LASTEXITCODE -eq 0) '-File source capture failed'
         $entry = Import-Clixml -LiteralPath (Join-Path $folder 'entry-result.xml')
         Assert-Session ($entry.Source -ceq $fixtureText) '-File must capture complete original source'
-        Assert-Session ($entry.Payload.Parameters.Repair -and $entry.Payload.Parameters.Harness -ceq 'both') '-File bound parameters changed'
+        Assert-Session ($entry.Payload.Parameters.Uninstall -and $entry.Payload.Parameters.Purge) '-File bound parameters changed'
         Assert-Session ($entry.Payload.Arguments.Count -eq 2 -and $entry.Payload.Arguments[1] -ceq $longArgument) '-File long remaining argument changed'
         # Raw irm|iex has no invocation arguments; defaults must bind and source must survive.
         $iexDriver = Join-Path $folder 'iex-entry.ps1'
