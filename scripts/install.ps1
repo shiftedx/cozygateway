@@ -1600,6 +1600,26 @@ function Test-CompatibleHermesVersion {
     return (-not $Version.IsPrerelease -and $Version.Core -ge [Version]'0.21.0')
 }
 
+function Update-HermesHarness {
+    param([string] $HermesPath, [bool] $DryRun = $false)
+    if ($DryRun) { Write-Info 'dry run: would run the Hermes updater and verify its version and launcher'; return }
+    $before = Get-HermesVersion $HermesPath
+    Write-Info 'Updating Hermes Agent with its supported Windows updater.'
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $HermesPath update --yes 2>&1 | ForEach-Object { Write-Host ([string]$_) }
+        $exitCode = $LASTEXITCODE
+    } catch { Fail 'Hermes update could not complete; resolve the Hermes updater error and retry. The overall update was not verified.' }
+    finally { $ErrorActionPreference = $previousErrorActionPreference }
+    if ($exitCode -ne 0) { Fail 'Hermes update failed or was refused; close other Hermes sessions, resolve the updater error, and retry. The overall update did not complete.' }
+    Ensure-HermesLauncherInterpreter $HermesPath
+    $after = Get-HermesVersion $HermesPath
+    if (-not (Test-CompatibleHermesVersion $after)) { Fail "Hermes update did not install a compatible stable version (found v$($after.Text); v0.21.0 or newer is required)" }
+    Write-Ok "updated Hermes from v$($before.Text) to v$($after.Text); gateway attachment will be checked after restart"
+    return [pscustomobject]@{ Status = 'succeeded'; Version = $after.Text }
+}
+
 function Ensure-CompatibleHermes {
     param([string] $HermesPath)
     $before = Get-HermesVersion $HermesPath
