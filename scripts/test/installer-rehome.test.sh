@@ -502,20 +502,30 @@ grep -Fq 'for attempt in $(seq 1 45); do attach_ready && return; sleep 1; done' 
 # Gap 7: a rollback that leaves the failed run's processes holding the ports.
 ##############################################################################
 
-# The installer records what it starts; the bootstrap rollback stops exactly
-# that. Exercised against this test's own harmless background process.
+# The installer records an identity-bound Dashboard child. Bootstrap recovery
+# must stop that child without signalling its shell's process group.
 (
   set +e
+  eval "$(awk '
+    $0 == "record_run_pid() {" { capture = 1 }
+    capture { print }
+    capture && $0 == "}" { exit }
+  ' "$installer")"
   eval "$(awk '
     $0 == "stop_recorded_run_processes() {" { capture = 1 }
     capture { print }
     capture && $0 == "}" { exit }
   ' "$repo_root/scripts/install.sh")"
   HOME_DIR="$tmp/rollback-home"
-  mkdir -p "$HOME_DIR/local"
+  LOCAL_DIR="$HOME_DIR/local"
+  RUN_PIDS_FILE="$LOCAL_DIR/run-pids"
+  DRY_RUN=0
+  mkdir -p "$LOCAL_DIR"
   sleep 300 &
   victim=$!
-  printf 'dashboard=%s\ngateway-cleo=not-a-pid\n' "$victim" > "$HOME_DIR/local/run-pids"
+  record_run_pid dashboard "$victim"
+  awk -F '\t' -v pid="$victim" '$1 == "dashboard" && $2 == pid && $3 ~ /^[0-9]+$/ && length($4) > 0 { found = 1 } END { exit found ? 0 : 1 }' "$RUN_PIDS_FILE" || exit 1
+  printf 'legacy=not-a-pid\n' >> "$RUN_PIDS_FILE"
   report="$(stop_recorded_run_processes 2>&1)"
   case "$report" in *"stopped the dashboard process (pid $victim)"*) ;; *) printf '%s\n' "$report" >&2; exit 2 ;; esac
   [ -e "$HOME_DIR/local/run-pids" ] && exit 3
@@ -526,19 +536,47 @@ grep -Fq 'for attempt in $(seq 1 45); do attach_ready && return; sleep 1; done' 
 grep -Fq 'stop_recorded_run_processes; recover_bootstrap_transaction' "$repo_root/scripts/install.sh" \
   || fail 'the bootstrap rollback does not stop the failed run processes'
 
-# A run that starts a Dashboard writes its pid down, and a run that finishes
-# clears the ledger so a later failure cannot stop a healthy Dashboard.
+# A PID from a crashed run can be reused. Its stale identity must not signal the
+# live foreign process that inherited the number.
+(
+  set +e
+  eval "$(awk '
+    $0 == "stop_recorded_run_processes() {" { capture = 1 }
+    capture { print }
+    capture && $0 == "}" { exit }
+  ' "$repo_root/scripts/install.sh")"
+  HOME_DIR="$tmp/stale-pid-home"
+  mkdir -p "$HOME_DIR/local"
+  sleep 300 &
+  survivor=$!
+  survivor_pgid="$(ps -o pgid= -p "$survivor" | tr -d '[:space:]')"
+  # A v0.8.6-pre-fix ledger had only a PID. Its row is no authority to stop a
+  # currently live process, even if the number happens to match.
+  printf 'dashboard=%s\n' "$survivor" > "$HOME_DIR/local/run-pids"
+  stop_recorded_run_processes >/dev/null 2>&1
+  kill -0 "$survivor" 2>/dev/null || exit 2
+  printf 'dashboard\t%s\t%s\tstale-start-time\n' "$survivor" "$survivor_pgid" > "$HOME_DIR/local/run-pids"
+  report="$(stop_recorded_run_processes 2>&1)"
+  case "$report" in *"skipped stale dashboard process record for pid $survivor"*) ;; *) printf '%s\n' "$report" >&2; exit 3 ;; esac
+  kill -0 "$survivor" 2>/dev/null || exit 4
+  kill -TERM "$survivor" 2>/dev/null || exit 5
+  exit 0
+) || fail 'a stale PID record was allowed to signal a foreign process'
+
+# A run records a detached Dashboard identity but never claims Hermes' own
+# profile services. A finished run clears the ledger before a later rollback.
 make_rehome_root "$tmp/pids-hermes"
 rm -f "$tmp/pids-hermes/profiles/cleo/.env"
 COMMAND_LOG="$tmp/pids-commands"
 if ! pids_output="$(COZYGATEWAY_TEST_DASHBOARD_LAUNCH_MARKER="$tmp/dashboard-launched" \
-    COZYGATEWAY_TEST_PID_SOURCE="$tmp/pids-gateway/local/run-pids" \
-    COZYGATEWAY_TEST_PID_SNAPSHOT="$tmp/dashboard-launched.pids" \
     run_installer "$tmp/pids-hermes" "$tmp/pids-gateway" "$tmp/pids-home" --profiles cleo)"; then
   fail "the Dashboard-launching run failed:\n$pids_output"
 fi
 test -f "$tmp/dashboard-launched" || fail 'the run did not launch a Dashboard'
-grep -Eq '^dashboard=[0-9]+$' "$tmp/dashboard-launched.pids" || fail 'the launched Dashboard pid was not recorded'
+grep -Fq 'record_run_pid dashboard "$dashboard_pid"' "$installer" || fail 'the launched Dashboard identity was not recorded'
+if grep -Fq 'record_profile_gateway_pid' "$installer" || grep -Fq 'record_run_pid "gateway-' "$installer"; then
+  fail 'the rollback ledger must not claim Hermes-owned profile gateways'
+fi
 test ! -e "$tmp/pids-gateway/local/run-pids" || fail 'a finished run left its process ledger behind'
 
 ##############################################################################
