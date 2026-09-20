@@ -198,9 +198,9 @@ try {
     $database = Join-Path $root 'local\cozygateway.sqlite'
     $log = Join-Path $root 'local\cozygateway.log'
     $hermes = Join-Path $root 'external-hermes\profile.env'
-    $agents = Join-Path $root 'external-agents\install.json'
+    $externalState = Join-Path $root 'external-state\state.json'
     Write-TestFile $database 'sqlite-before'; Write-TestFile $log 'log-before'
-    Write-TestFile $hermes 'hermes-before'; Write-TestFile $agents 'agents-before'
+    Write-TestFile $hermes 'hermes-before'; Write-TestFile $externalState 'state-before'
     Start-BootstrapTransaction $root (Join-Path $root 'bin') $assets
     $inventory = Get-Content -LiteralPath (Join-Path $backup 'inventory')
     Assert-True ($inventory[0] -eq 'version=2') 'new transaction must use the versioned inventory'
@@ -215,7 +215,7 @@ try {
     $script:FakeTaskXml = New-OwnedTaskXml $root (Join-Path $root 'bin\gateway-maintenance-worker.cjs')
     Write-TestFile $script:StartupPath (New-OwnedStartupEntry $root 'C:\New\bash.exe')
     Write-TestFile $database 'sqlite-after'; Write-TestFile $log 'log-after'
-    Write-TestFile $hermes 'hermes-after'; Write-TestFile $agents 'agents-after'
+    Write-TestFile $hermes 'hermes-after'; Write-TestFile $externalState 'state-after'
     Assert-True (Recover-BootstrapTransaction $root (Join-Path $root 'bin') $assets) 'v2 recovery must report restored bytes'
     Assert-True ([Array]::IndexOf($script:TaskOperations, 'stop-owned') -ge 0 -and [Array]::IndexOf($script:TaskOperations, 'stop-owned') -lt [Array]::IndexOf($script:TaskOperations, 'delete')) 'recovery must stop owned processes before unregistering the current task'
     Assert-True ((Read-TestFile (Join-Path (Join-Path $root 'bin') 'cozygateway.mjs')) -eq 'old:cozygateway.mjs') 'v2 recovery must restore old asset bytes'
@@ -233,7 +233,7 @@ try {
     Assert-True ((Read-TestFile $database) -eq 'sqlite-after') 'SQLite state must remain outside rollback'
     Assert-True ((Read-TestFile $log) -eq 'log-after') 'logs must remain outside rollback'
     Assert-True ((Read-TestFile $hermes) -eq 'hermes-after') 'external Hermes state must remain outside rollback'
-    Assert-True ((Read-TestFile $agents) -eq 'agents-after') 'external CozyAgents state must remain outside rollback'
+    Assert-True ((Read-TestFile $externalState) -eq 'state-after') 'external unrelated state must remain outside rollback'
     Restart-OwnedGatewayService $root
     Assert-True ($script:TaskOperations -contains 'start-task') 'only the restored owned Task must be reactivated'
     Assert-True ([Array]::IndexOf($script:TaskOperations, 'ready') -gt [Array]::IndexOf($script:TaskOperations, 'start-task')) 'restored task must become ready before recovery finishes'
