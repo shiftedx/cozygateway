@@ -1208,7 +1208,10 @@ fi
 cp "$tmp/gateway-live/local/gateway-supervisor.cjs" "$tmp/supervisor.cjs"
 cat > "$tmp/reload-gateway.mjs" <<'RELOAD_GATEWAY'
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
-if (!existsSync(process.env.COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER)) process.exit(2);
+if (!existsSync(process.env.COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER)) {
+  console.error(`fixture Gateway cannot find authenticated Dashboard marker: ${process.env.COZYGATEWAY_TEST_DASHBOARD_AUTH_MARKER}`);
+  process.exit(2);
+}
 const configAt = process.argv.indexOf('--config');
 const config = JSON.parse(readFileSync(process.argv[configAt + 1], 'utf8'));
 appendFileSync(process.env.COZYGATEWAY_TEST_RELOAD_LOG, `${process.pid}:${config.port}\n`);
@@ -1391,10 +1394,21 @@ NODE_OPTIONS="--require=$node_options_preload" COZYGATEWAY_TEST_RELOAD_LOG="$rel
   --hermes "$hermes_stub_arg" --hermes-launcher "$expected_launcher" --owner-helper "$owner_helper" --dashboard-port "$mock_dashboard_port" --windows-dashboard-profile \
   >"$tmp/supervisor.log" 2>&1 &
 supervisor_pid=$!
-for _ in $(seq 1 50); do [ -s "$tmp/reload.log" ] && break; sleep 0.1; done
+# Authenticated cold start permits 30 probes (up to 2 seconds each) plus
+# 1-second retry delays. Observe that bounded contract, not a 5-second host-speed
+# assumption; fail early if the supervisor exits before launching Gateway.
+for _ in $(seq 1 1000); do
+  [ -s "$tmp/reload.log" ] && break
+  kill -0 "$supervisor_pid" 2>/dev/null || break
+  sleep 0.1
+done
 if [ ! -s "$tmp/reload.log" ]; then
   printf '%s\n' 'generated supervisor did not launch its gateway child' >&2
   cat "$tmp/supervisor.log" >&2
+  for marker in "$tmp/mock-dashboard.pid" "$dashboard_auth_marker" "$tmp/reload.log"; do
+    if [ -s "$marker" ]; then printf 'fixture marker present: %s\n' "$marker" >&2
+    else printf 'fixture marker absent: %s\n' "$marker" >&2; fi
+  done
   [ ! -f "$tmp/hermes-stub-trace" ] || cat "$tmp/hermes-stub-trace" >&2
   exit 1
 fi
