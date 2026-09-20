@@ -418,16 +418,26 @@ cp "$tmp/bootstrap-live-home/bin/cozygateway.mjs" "$tmp/bootstrap-before-kill.mj
 printf 'new verified bundle after interrupted bootstrap\n' > "$tmp/release-assets/cozygateway.mjs"
 if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/cozygateway.mjs" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/cozygateway.mjs" | awk '{print $1}')"; fi
 printf '%s  cozygateway.mjs\n' "$asset_sha" > "$tmp/release-assets/cozygateway.mjs.sha256"
+bootstrap_bash="$BASH"
+bootstrap_script="$repo_root/scripts/install.sh"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    # Python is native on GitHub's Windows runner. Its PATH can resolve `bash`
+    # to WSL, so give it this Git Bash executable and native script path.
+    bootstrap_bash="$(cygpath -m "$bootstrap_bash")"
+    bootstrap_script="$(cygpath -m "$bootstrap_script")"
+    ;;
+esac
 set +e
 trap - ERR  # this run is killed on purpose, mid-promotion
 HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-killed" COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION=cozygateway.mjs \
-  python3 - "$repo_root/scripts/install.sh" "$tmp/bootstrap-killed.log" <<'PY'
+  python3 - "$bootstrap_bash" "$bootstrap_script" "$tmp/bootstrap-killed.log" <<'PY'
 import os
 import subprocess
 import sys
 
-with open(sys.argv[2], "wb") as output:
-    result = subprocess.run(["bash", sys.argv[1]], env=os.environ.copy(), stdout=output, stderr=subprocess.STDOUT)
+with open(sys.argv[3], "wb") as output:
+    result = subprocess.run([sys.argv[1], sys.argv[2]], env=os.environ.copy(), stdout=output, stderr=subprocess.STDOUT)
 sys.exit(result.returncode)
 PY
 bootstrap_killed_status=$?
