@@ -418,37 +418,16 @@ cp "$tmp/bootstrap-live-home/bin/cozygateway.mjs" "$tmp/bootstrap-before-kill.mj
 printf 'new verified bundle after interrupted bootstrap\n' > "$tmp/release-assets/cozygateway.mjs"
 if command -v shasum >/dev/null 2>&1; then asset_sha="$(shasum -a 256 "$tmp/release-assets/cozygateway.mjs" | awk '{print $1}')"; else asset_sha="$(sha256sum "$tmp/release-assets/cozygateway.mjs" | awk '{print $1}')"; fi
 printf '%s  cozygateway.mjs\n' "$asset_sha" > "$tmp/release-assets/cozygateway.mjs.sha256"
-bootstrap_bash="$BASH"
-bootstrap_script="$repo_root/scripts/install.sh"
-case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*)
-    # Python is native on GitHub's Windows runner. Its PATH can resolve `bash`
-    # to WSL, so give it this Git Bash executable and native script path.
-    bootstrap_bash="$(cygpath -m "$bootstrap_bash")"
-    bootstrap_script="$(cygpath -m "$bootstrap_script")"
-    ;;
-esac
 set +e
 trap - ERR  # this run is killed on purpose, mid-promotion
-# Native Python only relays these values back to Git Bash. Preserve their POSIX
-# spelling instead of MSYS converting the fixture home to a drive-letter path.
-MSYS2_ENV_CONV_EXCL="${MSYS2_ENV_CONV_EXCL:+$MSYS2_ENV_CONV_EXCL;}HOME;COZYGATEWAY_" \
+# Keep the child under Bash: native Windows Python loses MSYS signal status.
 HOME="$bootstrap_user_home" COZYGATEWAY_HOME="$tmp/bootstrap-live-home" COZYGATEWAY_INSTALL_ASSET_BASE="$release_asset_base" COZYGATEWAY_TEST_BOOTSTRAP_HANDOFF="$tmp/bootstrap-handoff-killed" COZYGATEWAY_TEST_BOOTSTRAP_KILL_AFTER_PROMOTION=cozygateway.mjs \
-  python3 - "$bootstrap_bash" "$bootstrap_script" "$tmp/bootstrap-killed.log" <<'PY'
-import os
-import subprocess
-import sys
-
-with open(sys.argv[3], "wb") as output:
-    result = subprocess.run([sys.argv[1], sys.argv[2]], env=os.environ.copy(), stdout=output, stderr=subprocess.STDOUT)
-sys.exit(result.returncode)
-PY
+  "$BASH" "$repo_root/scripts/install.sh" >"$tmp/bootstrap-killed.log" 2>&1
 bootstrap_killed_status=$?
 trap "$err_trap" ERR
 set -e
-test "$bootstrap_killed_status" -ne 0
-if ! test -f "$tmp/bootstrap-live-home/.bootstrap-transaction"; then
-  printf 'FAIL  killed bootstrap did not preserve its transaction marker\n--- killed bootstrap transcript ---\n' >&2
+if [ "$bootstrap_killed_status" -eq 0 ] || ! test -f "$tmp/bootstrap-live-home/.bootstrap-transaction"; then
+  printf 'FAIL  bootstrap did not stop with its interrupted transaction marker\n--- killed bootstrap transcript ---\n' >&2
   cat "$tmp/bootstrap-killed.log" >&2 || true
   printf '%s\n' '--- end killed bootstrap transcript ---' >&2
   exit 1
