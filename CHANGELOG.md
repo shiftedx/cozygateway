@@ -18,7 +18,7 @@ Gateway and attach plugin. Installation reuses a pinned Dashboard credential, av
 starting a second gateway for the active profile, and supports explicit re-homing
 with backups. Failed-install cleanup verifies process identity before stopping a
 Dashboard it started and leaves Hermes-owned profile services alone. The Windows
-bootstrap also restores its existing-Hermes update helper.
+bootstrap also restores the required helpers for existing and fresh Hermes installs.
 
 ## 0.8.5 (2026-09-14): durable attach batching and bounded gateway work
 
