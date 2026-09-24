@@ -629,12 +629,16 @@ CREATE TABLE IF NOT EXISTS attach_scheduled_deliveries (
 CREATE TABLE IF NOT EXISTS bot_native_chats (
   bot TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,
+  -- Deprecated by issue #191: never read or written, and cleared to NULL at open. It stays only so
+  -- a rolled-back gateway (whose SQL still names it) can boot on this database; drop it in a later
+  -- release once no supported rollback target reads it.
   active_turn_id TEXT,
   updated_at INTEGER NOT NULL
 ) STRICT;
 -- bot_native_chats is deliberately only the active-session pointer. A bot can have more than
 -- one local attach conversation, so the durable session rows live separately rather than being
--- overwritten by reset/new-session actions.
+-- overwritten by reset/new-session actions. The session row's active_turn_id is the only copy of
+-- a native turn; the selected chat's turn is derived by joining this pointer to it.
 CREATE TABLE IF NOT EXISTS bot_native_sessions (
   bot TEXT NOT NULL,
   session_id TEXT NOT NULL,
@@ -3863,11 +3867,6 @@ export class Storage {
                      AND terminal.turn_id = json_extract(attach_event_inbox.frame_json, '$.event.turnId')
                 )
                 AND NOT EXISTS (
-                  SELECT 1 FROM bot_native_chats AS active
-                   WHERE active.bot = attach_event_inbox.agent_id
-                     AND active.active_turn_id = json_extract(attach_event_inbox.frame_json, '$.event.turnId')
-                )
-                AND NOT EXISTS (
                   SELECT 1 FROM bot_native_sessions AS active
                    WHERE active.bot = attach_event_inbox.agent_id
                      AND active.active_turn_id = json_extract(attach_event_inbox.frame_json, '$.event.turnId')
@@ -4451,25 +4450,27 @@ export class Storage {
   /** Return the selected local conversation, creating the first empty conversation on demand. */
   nativeBotChat(bot: string, now: number): { sessionId: string; created: boolean; activeTurnId?: string } {
     const selected = this.#db
-      .prepare("SELECT session_id AS sessionId, active_turn_id AS activeTurnId, updated_at AS updatedAt FROM bot_native_chats WHERE bot = ?")
-      .get(bot) as { sessionId: string; activeTurnId: string | null; updatedAt: number } | undefined;
+      .prepare(
+        `SELECT chat.session_id AS sessionId, chat.updated_at AS updatedAt,
+                session.session_id IS NOT NULL AS hasSession, session.active_turn_id AS activeTurnId
+         FROM bot_native_chats AS chat
+         LEFT JOIN bot_native_sessions AS session ON session.bot = chat.bot AND session.session_id = chat.session_id
+         WHERE chat.bot = ?`,
+      )
+      .get(bot) as { sessionId: string; updatedAt: number; hasSession: number; activeTurnId: string | null } | undefined;
     if (selected === undefined) {
       const sessionId = this.#insertNativeBotSession(bot, now);
-      this.#db.prepare("INSERT INTO bot_native_chats (bot, session_id, active_turn_id, updated_at) VALUES (?, ?, NULL, ?)").run(bot, sessionId, now);
+      this.#db.prepare("INSERT INTO bot_native_chats (bot, session_id, updated_at) VALUES (?, ?, ?)").run(bot, sessionId, now);
       return { sessionId, created: true };
     }
-    const session = this.#db
-      .prepare("SELECT active_turn_id AS activeTurnId FROM bot_native_sessions WHERE bot = ? AND session_id = ?")
-      .get(bot, selected.sessionId) as { activeTurnId: string | null } | undefined;
-    if (session === undefined) {
-      // A pre-session-table database (or a manually damaged pointer) still has authoritative
-      // selection and turn state in bot_native_chats. Restore that missing companion row.
+    if (selected.hasSession === 0) {
+      // A manually damaged pointer names no session row. The open-time migration already restored
+      // every legacy companion row with its turn, so the only honest repair left is an idle row.
       this.#db
-        .prepare("INSERT OR IGNORE INTO bot_native_sessions (bot, session_id, created_at, updated_at, active_turn_id) VALUES (?, ?, ?, ?, ?)")
-        .run(bot, selected.sessionId, selected.updatedAt, selected.updatedAt, selected.activeTurnId);
-      return { sessionId: selected.sessionId, created: false, ...(selected.activeTurnId === null ? {} : { activeTurnId: selected.activeTurnId }) };
+        .prepare("INSERT OR IGNORE INTO bot_native_sessions (bot, session_id, created_at, updated_at, active_turn_id) VALUES (?, ?, ?, ?, NULL)")
+        .run(bot, selected.sessionId, selected.updatedAt, selected.updatedAt);
     }
-    return { sessionId: selected.sessionId, created: false, ...(session.activeTurnId === null ? {} : { activeTurnId: session.activeTurnId }) };
+    return { sessionId: selected.sessionId, created: false, ...(selected.activeTurnId === null ? {} : { activeTurnId: selected.activeTurnId }) };
   }
 
   /** Mint and select a fresh empty local conversation. `reset` and `new session` intentionally
@@ -4478,8 +4479,8 @@ export class Storage {
     const sessionId = this.#insertNativeBotSession(bot, now);
     this.#db
       .prepare(
-        `INSERT INTO bot_native_chats (bot, session_id, active_turn_id, updated_at) VALUES (?, ?, NULL, ?)
-         ON CONFLICT(bot) DO UPDATE SET session_id = excluded.session_id, active_turn_id = NULL, updated_at = excluded.updated_at`,
+        `INSERT INTO bot_native_chats (bot, session_id, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(bot) DO UPDATE SET session_id = excluded.session_id, updated_at = excluded.updated_at`,
       )
       .run(bot, sessionId, now);
     return sessionId;
@@ -4707,8 +4708,8 @@ export class Storage {
        WHERE bot = ? AND hermes_session_id = ? AND session_id = ? AND resume_id = ? AND status = 'pending'`,
     ).run(input.now, input.bot, input.hermesSessionId, input.sessionId, input.resumeId);
     this.#db.prepare(
-      `INSERT INTO bot_native_chats (bot, session_id, active_turn_id, updated_at) VALUES (?, ?, NULL, ?)
-       ON CONFLICT(bot) DO UPDATE SET session_id = excluded.session_id, active_turn_id = NULL, updated_at = excluded.updated_at`,
+      `INSERT INTO bot_native_chats (bot, session_id, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(bot) DO UPDATE SET session_id = excluded.session_id, updated_at = excluded.updated_at`,
     ).run(input.bot, input.sessionId, input.now);
     return {
       previousSessionId: current.sessionId,
@@ -4792,7 +4793,7 @@ export class Storage {
 
   selectNativeBotSession(bot: string, sessionId: string, now: number): boolean {
     if (!this.nativeBotHasSession(bot, sessionId)) return false;
-    this.#db.prepare("UPDATE bot_native_chats SET session_id = ?, active_turn_id = NULL, updated_at = ? WHERE bot = ?").run(sessionId, now, bot);
+    this.#db.prepare("UPDATE bot_native_chats SET session_id = ?, updated_at = ? WHERE bot = ?").run(sessionId, now, bot);
     return true;
   }
 
@@ -4933,9 +4934,6 @@ export class Storage {
     this.#db
       .prepare("UPDATE bot_native_sessions SET active_turn_id = ?, updated_at = ? WHERE bot = ? AND session_id = ?")
       .run(turnId ?? null, now, bot, sessionId);
-    this.#db
-      .prepare("UPDATE bot_native_chats SET active_turn_id = ?, updated_at = ? WHERE bot = ? AND session_id = ?")
-      .run(turnId ?? null, now, bot, sessionId);
   }
 
   /** Capability 69. Every nonterminal native turn this profile is still carrying, across all of
@@ -5060,13 +5058,7 @@ export class Storage {
         "UPDATE bot_native_sessions SET active_turn_id = NULL, updated_at = ? WHERE bot = ? AND session_id = ? AND active_turn_id = ?",
       )
       .run(now, bot, sessionId, turnId);
-    if (cleared.changes === 0) return false;
-    this.#db
-      .prepare(
-        "UPDATE bot_native_chats SET active_turn_id = NULL, updated_at = ? WHERE bot = ? AND session_id = ? AND active_turn_id = ?",
-      )
-      .run(now, bot, sessionId, turnId);
-    return true;
+    return cleared.changes > 0;
   }
 
   appendNativeBotMessage(input: {
@@ -6150,7 +6142,12 @@ export class Storage {
    *  fresh chat row for it here would be self-defeating. */
   nativeBotActiveTurn(bot: string): { sessionId: string; turnId: string } | undefined {
     const row = this.#db
-      .prepare("SELECT session_id AS sessionId, active_turn_id AS turnId FROM bot_native_chats WHERE bot = ?")
+      .prepare(
+        `SELECT chat.session_id AS sessionId, session.active_turn_id AS turnId
+         FROM bot_native_chats AS chat
+         JOIN bot_native_sessions AS session ON session.bot = chat.bot AND session.session_id = chat.session_id
+         WHERE chat.bot = ?`,
+      )
       .get(bot) as unknown as { sessionId: string; turnId: string | null } | undefined;
     if (row === undefined || row.turnId === null) return undefined;
     return { sessionId: row.sessionId, turnId: row.turnId };
@@ -6690,6 +6687,34 @@ export function openStorage(dbPath: string): Storage {
   db.exec("PRAGMA synchronous = FULL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
+  // Issue #191. bot_native_chats once carried its own copy of the selected session's turn beside
+  // the per-session truth in bot_native_sessions. Before retiring that copy, restore any missing
+  // companion session row from the pointer (a pre-session-table database or a damaged pointer), so
+  // its in-flight turn survives; where both rows exist the session value already won every read
+  // and is kept. The column is cleared, not dropped: every earlier migration is additive so that a
+  // rolled-back release still boots here. Nothing writes the copy any more, so once cleared this
+  // is one cheap probe of a one-row-per-bot table. A second process that reaches this point while
+  // another holds the migration lock waits briefly for it, then re-probes and finds the work done.
+  const legacyChatTurn = db.prepare("SELECT 1 FROM bot_native_chats WHERE active_turn_id IS NOT NULL LIMIT 1");
+  if (legacyChatTurn.get() !== undefined) {
+    db.exec("PRAGMA busy_timeout = 5000");
+    try {
+      db.exec("BEGIN IMMEDIATE");
+    } finally {
+      db.exec("PRAGMA busy_timeout = 0");
+    }
+    try {
+      if (legacyChatTurn.get() !== undefined) {
+        db.exec(`INSERT OR IGNORE INTO bot_native_sessions (bot, session_id, created_at, updated_at, active_turn_id)
+          SELECT bot, session_id, updated_at, updated_at, active_turn_id FROM bot_native_chats`);
+        db.exec("UPDATE bot_native_chats SET active_turn_id = NULL WHERE active_turn_id IS NOT NULL");
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
   // The original tool table predates detail/error_text. Migrate before creating their index.
   const toolColumns = new Set(
     (db.prepare("PRAGMA table_info(bot_chat_tool_steps)").all() as Array<{ name: string }>).map(row => row.name),
@@ -6902,9 +6927,10 @@ export function openStorage(dbPath: string): Storage {
     SET status = 'interrupted', ended_at = ?
     WHERE ended_at IS NULL AND NOT EXISTS (
       SELECT 1 FROM bot_native_chats AS chat
+      JOIN bot_native_sessions AS session ON session.bot = chat.bot AND session.session_id = chat.session_id
       WHERE chat.bot = bot_chat_tool_steps.bot
         AND chat.session_id = bot_chat_tool_steps.session_id
-        AND chat.active_turn_id = bot_chat_tool_steps.turn_id
+        AND session.active_turn_id = bot_chat_tool_steps.turn_id
     )
   `).run(Date.now());
   // Restart truth for delegation children: only the selected active turn can still receive a
@@ -6917,9 +6943,10 @@ export function openStorage(dbPath: string): Storage {
     SET status = 'unknown', ended_at = ?
     WHERE status IN ('queued', 'starting', 'running', 'stalling') AND NOT EXISTS (
       SELECT 1 FROM bot_native_chats AS chat
+      JOIN bot_native_sessions AS session ON session.bot = chat.bot AND session.session_id = chat.session_id
       WHERE chat.bot = bot_chat_delegations.bot
         AND chat.session_id = bot_chat_delegations.session_id
-        AND chat.active_turn_id = bot_chat_delegations.turn_id
+        AND session.active_turn_id = bot_chat_delegations.turn_id
     )
   `).run(Date.now());
   return new Storage(db);

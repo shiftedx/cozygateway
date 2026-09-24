@@ -13,7 +13,7 @@
 #
 # QUIESCE HEURISTIC AND ITS LIMITS
 #   There is no local signal for "a turn is active" -- that state lives on
-#   the gateway side (bot_native_chats active_turn), not in anything this
+#   the gateway side (bot_native_sessions active_turn_id), not in anything this
 #   machine can read. The attach-v1 spool
 #   (~/.hermes/profiles/<p>/plugin-data/cozygateway/attach-v1.sqlite -- the
 #   LIVE spool the resident writes; the profile also carries a stale, no
