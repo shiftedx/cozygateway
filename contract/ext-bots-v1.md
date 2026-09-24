@@ -119,6 +119,12 @@ and does not register `/bots` routes.
 
 | 76 | A settled reply push may carry the Task id for the same turn. The gateway resolves it from the newest `task_runs.session_id` row before its fire-and-forget relay send is deferred, records that reply-push fact durably, and suppresses the queued `task_completed` push only for that Task during the following ten seconds. This collapses one fast reply and completion into one actionable banner without delaying either path or depending on delivery acknowledgement. A missing Task id remains a normal message push for old clients. The marker is written only when at least one background device is targeted, survives a gateway restart, and never applies to another Task. |
 | 77 | Room pending approval frames and room pending-interaction pointers may carry `cause: {kind: "user" or "member", seq: integer}`, copied from the durable writing turn before its reply exists. The existing capability-47 room message `turnId` and `cause` remain unchanged. Clients may resolve proven member cause chains to a user request, and must not substitute adjacency when a supplied cause is missing from retained history. Legacy rows without provenance retain their existing fallback. Delivery approval pushes alone may request the time-sensitive APNs interruption level; this does not guarantee presentation under Focus or change any approval timeout. |
+| 79 | Reserved: runtime-bot settings. |
+| 80 | Reserved: bot presentation. |
+| 81 | Reserved: avatars. |
+| 82 | Reserved: profile operations. |
+| 83 | Reserved: routines. |
+| 84 | Rooms reach Desktop parity. Threads: `BotGroupSendRequest.threadId` replies in a thread, absent starts one, and every entry from 84 carries `threadId` (a root send's thread is its own `messageId`). Sends while a drive is live queue behind it instead of superseding it. Stop directives: a user `stop`/`halt`/`pause` within two words of an `@mention` holds that member (`@all stop` holds everyone), a non-stop mention releases it, `@all` releases everyone, and code, quotes and blockquotes are ignored; a held member is skipped and the entries it missed replay in its next turn. `BotGroup` gains `holds`, `holdDetection` and `picture`. `PATCH /bots/groups/:group` renames (the room keeps its identity), edits members (2 to 6), sets or clears the picture and toggles stop-directive detection. `POST /bots/groups/:group/stop` stops the drive, interrupts the member on turn and holds every member when detection is on. `POST /bots/groups/:group/compress` runs `/compress` in one member's room thread. `POST /bots/groups/picture` generates a picture through Hermes `image.generate`. A member's commit on its room thread outside a room turn is mirrored in once with `external: true`. `bot_group_state` gains `activity` (`working`, `replied`, `passed`, `held`, `stopped`) and `room`/`renamedFrom` whenever settings or holds change. A send starting with a slash command is refused with 400. |
 
 ### Capability 69 F2b amendment
 
@@ -986,6 +992,10 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `GET /bots/groups/:group` | — | `BotGroupDetail` | Reads a gateway-owned room. |
 | `DELETE /bots/groups/:group` | — | `204 No Content` | Deletes a gateway-owned room. |
 | `POST /bots/groups/:group/messages` | `BotGroupSendRequest` | `202 { group, message: BotGroupMessage }` | Queues member turns through attach-v1. |
+| `PATCH /bots/groups/:group` | `BotGroupPatchRequest` | `{ group: BotGroup }` | Capability 84. Rename, members, picture, `holdDetection`. `409 conflict` for a taken name. |
+| `POST /bots/groups/:group/stop` | `{}` | `{ group: BotGroup }` | Capability 84. Stops the drive and interrupts the member on turn. |
+| `POST /bots/groups/:group/compress` | `BotGroupCompressRequest` | `{ member, text }` | Capability 84. `/compress` in one member's room thread. `409 conflict` while the room is running. |
+| `POST /bots/groups/picture` | `BotGroupPictureRequest` | `{ image }` | Capability 84. A data URL from Hermes `image.generate`; `503 backend_unavailable` without one. |
 | `POST /bots/:name/approvals/:toolCallId/approve` | optional `BotApprovalDecisionRequest` (capability 66) | `202 { status: "requested" }` | Durably requests a native approval; the terminal event confirms it. A body may ask for a standing grant. |
 | `POST /bots/:name/approvals/:toolCallId/deny` | — | `202 { status: "requested" }` | Durably requests a native denial; the terminal event confirms it. |
 | `GET /bots/approvals` | optional `state=pending` | `BotInteractionRecovery` | Bounded pending approvals/clarifications plus confirmed terminal receipts. |

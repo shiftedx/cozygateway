@@ -1213,6 +1213,17 @@ export interface BotGroupRow {
   epoch: number;
   needsYou: boolean;
   nextSeq: number;
+  /** Row 84 room state: per-thread marks, holds, held replay, picture, holdDetection. */
+  meta: BotGroupMeta;
+}
+
+/** Row 84. `marks` is thread -> member -> seq; `held` is member -> remembered seqs to replay. */
+export interface BotGroupMeta {
+  marks?: Record<string, Record<string, number>>;
+  holds?: Record<string, { at: number; seq?: number; thread?: string; noted?: boolean }>;
+  held?: Record<string, number[]>;
+  holdDetection?: boolean;
+  picture?: string;
 }
 
 /** One transcript entry. `kind` is `user` for the human and `member` for a bot; `name` is the bot's
@@ -1232,6 +1243,10 @@ export interface BotGroupLogRow {
   epoch?: number;
   cause?: BotGroupCause;
   attachTurn?: { threadId: string; turnId: string };
+  /** Row 84. The thread this entry belongs to; absent on legacy rows. */
+  threadId?: string;
+  /** Row 84. Mirrored from the member's own thread outside a room turn. */
+  external?: boolean;
 }
 
 /** The highest room seq a member had been shown when its turn started, and whose message that was.
@@ -1303,6 +1318,7 @@ interface BotGroupDbRow {
   epoch: number;
   needsYou: number;
   nextSeq: number;
+  metaJson: string | null;
 }
 
 function toBotGroupRow(row: BotGroupDbRow): BotGroupRow {
@@ -1316,7 +1332,18 @@ function toBotGroupRow(row: BotGroupDbRow): BotGroupRow {
     epoch: row.epoch,
     needsYou: row.needsYou === 1,
     nextSeq: row.nextSeq,
+    meta: parseGroupMeta(row.metaJson),
   };
+}
+
+function parseGroupMeta(raw: string | null): BotGroupMeta {
+  if (raw === null) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as BotGroupMeta : {};
+  } catch {
+    return {};
+  }
 }
 
 function toBotGroupTurnRow(row: Record<string, unknown>): BotGroupTurnRow {
@@ -2793,7 +2820,7 @@ export class Storage {
     const rows = this.#db
       .prepare(
         `SELECT key, name, members_json AS membersJson, owning_host AS owningHost, created_at AS createdAt, epoch,
-                needs_you AS needsYou, next_seq AS nextSeq
+                needs_you AS needsYou, next_seq AS nextSeq, meta_json AS metaJson
          FROM bot_groups ORDER BY created_at, key`,
       )
       .all() as unknown as BotGroupDbRow[];
@@ -2804,7 +2831,7 @@ export class Storage {
     const row = this.#db
       .prepare(
         `SELECT key, name, members_json AS membersJson, owning_host AS owningHost, created_at AS createdAt, epoch,
-                needs_you AS needsYou, next_seq AS nextSeq
+                needs_you AS needsYou, next_seq AS nextSeq, meta_json AS metaJson
          FROM bot_groups WHERE key = ?`,
       )
       .get(key) as BotGroupDbRow | undefined;
@@ -2863,13 +2890,14 @@ export class Storage {
       this.#db
         .prepare(
           `INSERT INTO bot_group_log (group_key, seq, from_kind, from_name, display_name, text, at, client_id,
-             message_id, turn_id, epoch, cause_kind, cause_seq, attach_thread_id, attach_turn_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             message_id, turn_id, epoch, cause_kind, cause_seq, attach_thread_id, attach_turn_id, thread_id, external)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(key, seq, entry.kind, entry.name, entry.displayName, entry.text, entry.at, entry.clientId ?? null,
           entry.messageId ?? null, entry.turnId ?? null, entry.epoch ?? null,
           entry.cause?.kind ?? null, entry.cause?.seq ?? null,
-          entry.attachTurn?.threadId ?? null, entry.attachTurn?.turnId ?? null);
+          entry.attachTurn?.threadId ?? null, entry.attachTurn?.turnId ?? null,
+          entry.threadId ?? null, entry.external === true ? 1 : null);
       this.#db.prepare("UPDATE bot_groups SET next_seq = ? WHERE key = ?").run(seq + 1, key);
       this.#db.exec("COMMIT");
       return { ...entry, seq };
@@ -2885,13 +2913,15 @@ export class Storage {
         `SELECT seq, from_kind AS kind, from_name AS name, display_name AS displayName, text, at,
                 client_id AS clientId, message_id AS messageId, turn_id AS turnId, epoch,
                 cause_kind AS causeKind, cause_seq AS causeSeq,
-                attach_thread_id AS attachThreadId, attach_turn_id AS attachTurnId
+                attach_thread_id AS attachThreadId, attach_turn_id AS attachTurnId,
+                thread_id AS threadId, external
          FROM bot_group_log WHERE group_key = ? ORDER BY seq`,
       )
-      .all(key) as unknown as Array<BotGroupLogRow & {
+      .all(key) as unknown as Array<Omit<BotGroupLogRow, "external" | "threadId"> & {
         clientId: string | null; messageId: string | null; turnId: string | null; epoch: number | null;
         causeKind: string | null; causeSeq: number | null;
         attachThreadId: string | null; attachTurnId: string | null;
+        threadId: string | null; external: number | null;
       }>;
     return rows.map((row) => {
       const entry: BotGroupLogRow = {
@@ -2910,6 +2940,8 @@ export class Storage {
         entry.cause = { kind: row.causeKind, seq: row.causeSeq };
       if (row.attachThreadId !== null && row.attachTurnId !== null)
         entry.attachTurn = { threadId: row.attachThreadId, turnId: row.attachTurnId };
+      if (row.threadId !== null) entry.threadId = row.threadId;
+      if (row.external === 1) entry.external = true;
       return entry;
     });
   }
@@ -2974,6 +3006,45 @@ export class Storage {
 
   setBotGroupNeedsYou(key: string, needsYou: boolean): void {
     this.#db.prepare("UPDATE bot_groups SET needs_you = ? WHERE key = ?").run(needsYou ? 1 : 0, key);
+  }
+
+  // --- Row 84: room settings. The key is the room's stable identity; the name is only its label. ---
+
+  /** The key of the live room DISPLAYED under this case-insensitive name, if any. */
+  botGroupKeyByName(name: string): string | undefined {
+    const row = this.#db.prepare("SELECT key FROM bot_groups WHERE lower(name) = lower(?) LIMIT 1").get(name.trim()) as
+      | { key: string } | undefined;
+    return row?.key;
+  }
+
+  setBotGroupMeta(key: string, meta: BotGroupMeta): void {
+    this.#db.prepare("UPDATE bot_groups SET meta_json = ? WHERE key = ?").run(JSON.stringify(meta), key);
+  }
+
+  renameBotGroup(key: string, name: string): void {
+    this.#db.prepare("UPDATE bot_groups SET name = ? WHERE key = ?").run(name, key);
+  }
+
+  /** New members get their deterministic thread; a removed member's row stays (harmless). */
+  setBotGroupMembers(key: string, members: string[]): void {
+    this.#db.prepare("UPDATE bot_groups SET members_json = ? WHERE key = ?").run(JSON.stringify(members), key);
+    for (const member of members) this.ensureBotGroupThread(key, member);
+  }
+
+  /** The room and member whose gateway-owned attach thread this is. */
+  botGroupMemberBySession(sessionId: string): { key: string; member: string } | undefined {
+    return this.#db.prepare(
+      "SELECT group_key AS key, member FROM bot_group_members WHERE session_id = ? LIMIT 1",
+    ).get(sessionId) as { key: string; member: string } | undefined;
+  }
+
+  /** Stop: every pending turn of the room is cancelled, the same shape `deleteBotGroup` uses. */
+  cancelPendingBotGroupTurns(key: string, detail: string, completedAt: number): BotGroupTurnRow[] {
+    const pending = this.pendingBotGroupTurns().filter((turn) => turn.key === key);
+    this.#db.prepare(
+      "UPDATE bot_group_turns SET state = 'cancelled', detail = ?, completed_at = ? WHERE group_key = ? AND state = 'pending'",
+    ).run(detail, completedAt, key);
+    return pending;
   }
 
   /** Returns the gateway-owned attach thread for this member.  Older rooms gain the deterministic
@@ -6549,6 +6620,8 @@ export function openStorage(dbPath: string): Storage {
       ["cause_seq", "ALTER TABLE bot_group_log ADD COLUMN cause_seq INTEGER"],
       ["attach_thread_id", "ALTER TABLE bot_group_log ADD COLUMN attach_thread_id TEXT"],
       ["attach_turn_id", "ALTER TABLE bot_group_log ADD COLUMN attach_turn_id TEXT"],
+      ["thread_id", "ALTER TABLE bot_group_log ADD COLUMN thread_id TEXT"],
+      ["external", "ALTER TABLE bot_group_log ADD COLUMN external INTEGER"],
     ]],
     ["bot_group_turns", [
       ["cause_kind", "ALTER TABLE bot_group_turns ADD COLUMN cause_kind TEXT"],
@@ -6558,6 +6631,8 @@ export function openStorage(dbPath: string): Storage {
     // before this column and persist it. A NULL must remain NULL until that reader has evidence.
     ["bot_groups", [
       ["owning_host", "ALTER TABLE bot_groups ADD COLUMN owning_host TEXT"],
+      // Row 84 room state (marks, holds, picture). NULL reads as an empty object.
+      ["meta_json", "ALTER TABLE bot_groups ADD COLUMN meta_json TEXT"],
     ]],
     ["bot_native_messages", [
       ["turn_id", "ALTER TABLE bot_native_messages ADD COLUMN turn_id TEXT"],

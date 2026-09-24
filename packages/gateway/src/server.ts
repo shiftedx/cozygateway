@@ -625,6 +625,7 @@ export async function startGateway(
         (key) => storage.botGroup(key)?.members,
         (key) => storage.botGroupOwner(key),
         (key, owner) => storage.backfillBotGroupOwner(key, owner),
+        (name) => storage.botGroupKeyByName(name),
       ));
   // Every host that can drive a room on this gateway: each endpoint's bridge, plus the gateway's
   // own host. On a single un-namespaced endpoint that is just the bridge, exactly as before.
@@ -643,7 +644,9 @@ export async function startGateway(
     const event = frame.event;
     if (!("threadId" in event) || !("turnId" in event)) return undefined;
     const owned = storage.botGroupTurnForAttach(agentId, event.threadId, event.turnId);
-    return owned === undefined ? undefined : roomHostFor(owned.key);
+    // Capability 84: a commit on a member's room thread that no room turn owns is an external write.
+    const key = owned?.key ?? storage.botGroupMemberBySession(event.threadId)?.key;
+    return key === undefined ? undefined : roomHostFor(key);
   };
   // Every configured Hermes profile has one attach identity shared by the core thread surface and
   // Bot Mode. Token resolution fails closed before the listener opens.
@@ -863,6 +866,7 @@ export async function startGateway(
     canQueue: (agentId) => attachV1Ingress.canQueue(agentId),
     sendNativeTurn: (agentId, input) =>
       attachV1Ingress.sendNativeTurn(agentId, input),
+    sendInterrupt: (agentId, input) => attachV1Ingress.sendNativeInterrupt(agentId, input),
   });
   const adapters = new Map<string, ReturnType<typeof createAttachAdapter>>();
   /** Each configured Hermes profile has one attach-v1 turn adapter. */
