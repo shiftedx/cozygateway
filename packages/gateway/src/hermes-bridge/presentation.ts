@@ -45,20 +45,44 @@ function text(value: unknown): string | undefined {
   return s === undefined || s.length === 0 ? undefined : s;
 }
 
-/** The five presentation keys out of a stored blob. An absent key stays absent: `pinned` missing is
- *  "never synced", which a client treats differently from `pinned: false`. */
+/** The presentation keys out of a stored blob. An absent key stays absent: `pinned` missing is
+ *  "never synced", which a client treats differently from `pinned: false`.
+ *
+ *  Capability 81 adds the LOOK the desktop writes beside them: `shape` (a free-form face string,
+ *  `blobatar[:seed[:kind]]` or one of the geometric shapes), `color`, `custom` and `imageKind`, plus
+ *  `cozychat`, CozyChat's own namespaced record of the exact jelly a phone chose. */
 export function presentationFromMeta(meta: Record<string, unknown> | null | undefined): BotPresentation {
   const out: BotPresentation = {};
   if (typeof meta?.["pinned"] === "boolean") out.pinned = meta["pinned"];
   if (typeof meta?.["hidden"] === "boolean") out.hidden = meta["hidden"];
-  const sectionId = text(meta?.["sectionId"]);
-  if (sectionId !== undefined) out.sectionId = sectionId;
-  const sectionName = text(meta?.["sectionName"]);
-  if (sectionName !== undefined) out.sectionName = sectionName;
-  const title = text(meta?.["title"]);
-  if (title !== undefined) out.title = title;
+  for (const key of ["sectionId", "sectionName", "title", "shape", "color"] as const) {
+    const value = text(meta?.[key]);
+    if (value !== undefined && value.length <= (key === "shape" ? 256 : 128)) out[key] = value;
+  }
+  if (typeof meta?.["custom"] === "boolean") out.custom = meta["custom"];
+  if (meta?.["imageKind"] === "photo" || meta?.["imageKind"] === "shape") out.imageKind = meta["imageKind"];
+  const cozy = cozyLook(meta?.["cozychat"]);
+  if (cozy !== undefined) out.cozychat = cozy;
   return out;
 }
+
+/** CozyChat's namespaced look record, tolerantly: only its four string keys, each only when sane. */
+function cozyLook(value: unknown): BotPresentation["cozychat"] | undefined {
+  const record = asRecord(value);
+  if (record === undefined) return undefined;
+  const out: NonNullable<BotPresentation["cozychat"]> = {};
+  for (const key of ["jelly", "seed", "prism", "shape"] as const) {
+    const s = text(record[key]);
+    if (s !== undefined && s.length <= (key === "shape" ? 256 : 128)) out[key] = s;
+  }
+  return Object.keys(out).length === 0 ? undefined : out;
+}
+
+/** Every key a presentation patch may name, in the one order the merge applies them. */
+const PATCH_KEYS = [
+  "pinned", "hidden", "sectionId", "sectionName", "title",
+  "shape", "color", "custom", "imageKind", "cozychat",
+] as const;
 
 /** The blob to write: the stored one, verbatim, with only the patched keys set. `null` clears, and
  *  is written as `null` exactly as the desktop's `moveBotsToSection(bots, null)` does. */
@@ -67,7 +91,7 @@ export function mergePresentation(
   patch: BotPresentationPatch,
 ): Record<string, unknown> {
   const next: Record<string, unknown> = { ...blob };
-  for (const key of ["pinned", "hidden", "sectionId", "sectionName", "title"] as const) {
+  for (const key of PATCH_KEYS) {
     if (patch[key] !== undefined) next[key] = patch[key];
   }
   return next;

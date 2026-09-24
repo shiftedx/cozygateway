@@ -29,6 +29,11 @@ import type {
   BotProfilePatch,
   BotPresentationPatch,
   BotPresentationResponse,
+  BotAvatarGenerateRequest,
+  BotAvatarGenerateResponse,
+  BotAvatarPetGallery,
+  BotAvatarPetThumbResponse,
+  BotAvatarSetResponse,
   BotReadiness,
   BotRuntimeProjection,
   BotRuntimeRecoveryResponse,
@@ -74,6 +79,7 @@ import type {
 } from "./approvals.ts";
 import { GroupRooms, type RoomInteractionExpiry } from "./group-rooms.ts";
 import { readPresentation, writePresentation } from "./presentation.ts";
+import { clearAvatar, generatePortrait, petGallery, petThumb, readAvatar, writeAvatar } from "./avatar.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
 import type { ProfileChangeEvent } from "./profile-provisioner.ts";
 import type { ObservationRing } from "../observe/ring.ts";
@@ -246,6 +252,12 @@ export interface BotControlSurface {
   /** Capability 80. Optional so a surface with no Hermes profile behind it simply lacks the route. */
   botPresentation?(name: string): Promise<BotPresentationResponse>;
   configurePresentation?(name: string, patch: BotPresentationPatch): Promise<BotPresentationResponse>;
+  /** Capability 81. Optional for the same reason: only a Hermes profile has an avatar asset. */
+  botAvatar?(name: string): Promise<{ mime: string; bytes: Buffer } | undefined>;
+  setBotAvatar?(name: string, data: string | null): Promise<BotAvatarSetResponse>;
+  generateBotAvatar?(name: string, request: BotAvatarGenerateRequest): Promise<BotAvatarGenerateResponse>;
+  botAvatarPets?(name: string, localOnly: boolean): Promise<BotAvatarPetGallery>;
+  botAvatarPetThumb?(name: string, slug: string, url: string): Promise<BotAvatarPetThumbResponse>;
   modelConfig(name: string): Promise<BotModelConfig>;
   configureModel(
     name: string,
@@ -1086,6 +1098,35 @@ export class HermesBridge implements BotControlSurface {
     // `bot_roster` carries the blob as `meta`, so every paired phone sees the write on this refresh.
     this.refreshSoon(`bot ${name} presentation`);
     return { name, presentation: written.presentation, revision: written.revision ?? 0 };
+  }
+  async botAvatar(name: string): Promise<{ mime: string; bytes: Buffer } | undefined> {
+    await this.#assertBotKnown(name);
+    return readAvatar(this.#client, name);
+  }
+  async setBotAvatar(name: string, data: string | null): Promise<BotAvatarSetResponse> {
+    await this.#assertBotKnown(name);
+    const size = await this.#chain(name, async () => {
+      if (data === null) {
+        await clearAvatar(this.#client, name);
+        return 0;
+      }
+      return writeAvatar(this.#client, name, data);
+    });
+    // `has_avatar` rides `profiles.list`, so the roster learns of it on this refresh.
+    this.refreshSoon(`bot ${name} avatar`);
+    return { name, hasAvatar: data !== null, size };
+  }
+  // Image generation and the pet gallery are host-wide in Hermes; the bot name only routes the call
+  // (federation) and scopes the device's permission. No per-call `profiles.list` for them.
+  async generateBotAvatar(_name: string, request: BotAvatarGenerateRequest): Promise<BotAvatarGenerateResponse> {
+    return generatePortrait(this.#client, request);
+  }
+  async botAvatarPets(_name: string, localOnly: boolean): Promise<BotAvatarPetGallery> {
+    return { pets: await petGallery(this.#client, localOnly) };
+  }
+  async botAvatarPetThumb(_name: string, slug: string, url: string): Promise<BotAvatarPetThumbResponse> {
+    const image = await petThumb(this.#client, slug, url);
+    return image === undefined ? { ok: false } : { ok: true, image };
   }
   async modelConfig(name: string): Promise<BotModelConfig> {
     await this.#assertBotKnown(name);

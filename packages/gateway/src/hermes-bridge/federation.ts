@@ -4,6 +4,8 @@ import type {
   BotModelProviderOAuthSession, BotModelProviderSetupCatalog, BotProfilePatch,
   BotRoutineCreateRequest, BotRoutinePatch, BotSummary, BridgeLiveness,
   BotDesktopHermesSession, BotPresentationPatch, BotPresentationResponse,
+  BotAvatarGenerateRequest, BotAvatarGenerateResponse, BotAvatarPetGallery, BotAvatarPetThumbResponse,
+  BotAvatarSetResponse,
 } from "cozygateway-contract";
 import { BackendUnavailable } from "../errors.ts";
 import { BotNotFound } from "./crud.ts";
@@ -188,6 +190,11 @@ export class FederatedBotControlSurface implements BotControlSurface {
   async configureProfile(name: string, patch: BotProfilePatch): Promise<ProfileConfigureResult> { const r = this.#route(name); return r.member.bridge.configureProfile(r.profile, patch); }
   async botPresentation(name: string): Promise<BotPresentationResponse> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.botPresentation === undefined) throw new BotNotFound(name); return { ...(await bridge.botPresentation(r.profile)), name }; }
   async configurePresentation(name: string, patch: BotPresentationPatch): Promise<BotPresentationResponse> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.configurePresentation === undefined) throw new BotNotFound(name); return { ...(await bridge.configurePresentation(r.profile, patch)), name }; }
+  async botAvatar(name: string): Promise<{ mime: string; bytes: Buffer } | undefined> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.botAvatar === undefined) throw new BotNotFound(name); return bridge.botAvatar(r.profile); }
+  async setBotAvatar(name: string, data: string | null): Promise<BotAvatarSetResponse> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.setBotAvatar === undefined) throw new BotNotFound(name); return { ...(await bridge.setBotAvatar(r.profile, data)), name }; }
+  async generateBotAvatar(name: string, request: BotAvatarGenerateRequest): Promise<BotAvatarGenerateResponse> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.generateBotAvatar === undefined) throw new BotNotFound(name); return bridge.generateBotAvatar(r.profile, request); }
+  async botAvatarPets(name: string, localOnly: boolean): Promise<BotAvatarPetGallery> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.botAvatarPets === undefined) throw new BotNotFound(name); return bridge.botAvatarPets(r.profile, localOnly); }
+  async botAvatarPetThumb(name: string, slug: string, url: string): Promise<BotAvatarPetThumbResponse> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.botAvatarPetThumb === undefined) throw new BotNotFound(name); return bridge.botAvatarPetThumb(r.profile, slug, url); }
   async modelConfig(name: string): Promise<BotModelConfig> { const r = this.#route(name); return r.member.bridge.modelConfig(r.profile); }
   async configureModel(name: string, patch: BotModelConfigPatch): Promise<BotModelConfig> { const r = this.#route(name); return r.member.bridge.configureModel(r.profile, patch); }
   async modelProviders(name: string): Promise<BotModelProviderSetupCatalog> { const r = this.#route(name); return r.member.bridge.modelProviders(r.profile); }
