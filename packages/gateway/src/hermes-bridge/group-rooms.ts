@@ -700,6 +700,7 @@ export class GroupRooms {
     const log = this.#storage.botGroupLog(room.key);
     const state = this.#driving(room.key) ? "running" : room.needsYou ? "needs_you" : "settled";
     return {
+      id: room.key,
       name: room.name,
       members: room.members,
       createdAt: room.createdAt,

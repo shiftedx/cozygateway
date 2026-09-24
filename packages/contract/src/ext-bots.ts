@@ -1878,6 +1878,9 @@ export const BotGroupPendingInteractionSchema = Type.Object({
 export type BotGroupPendingInteraction = Static<typeof BotGroupPendingInteractionSchema>;
 
 export const BotGroupSchema = Type.Object({
+  /** Capability 84. The room's stable identity: it survives a rename, so a client keys
+   *  device-local order and sections on it rather than on the name. */
+  id: Type.Optional(Type.String({ maxLength: 256 })),
   name: Type.String(),
   members: Type.Array(Type.String()),
   createdAt: Type.Integer(),

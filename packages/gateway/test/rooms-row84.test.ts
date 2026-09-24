@@ -174,6 +174,8 @@ describe("row 84 rooms engine", () => {
     await expect(h.rooms.update("Launch", { name: "other" })).rejects.toBeInstanceOf(GroupExists);
     const renamed = await h.rooms.update("Launch", { name: "Release" });
     expect(renamed.name).toBe("Release");
+    // The identity a client keys order and sections on survives the rename.
+    expect(renamed.id).toBe("launch");
     expect(h.states().at(-1)).toMatchObject({ group: "Release", renamedFrom: "Launch", room: { name: "Release" } });
     expect(h.rooms.detail("release").name).toBe("Release");
     const again = await h.rooms.create("Launch", ["scout", "luna"]);
