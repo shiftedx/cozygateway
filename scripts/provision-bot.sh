@@ -620,7 +620,7 @@ ensure_streaming_config() {
   fi
   keys="$(streaming_writes "$answer")"
   for key in $wrote; do
-    if printf '%s\n' "$keys" | grep -Fq "$key="; then missing="$missing $key"
+    if printf '%s\n' "$keys" | grep -q "^${key//./\\.}="; then missing="$missing $key"
     elif needs_restart "$key"; then restart=1
     fi
   done
@@ -902,10 +902,14 @@ recreate_box_gateway() {
 #   Observed live: install reported success, launchctl print reported nothing,
 #   and the attach never came up. So the load is asserted here rather than
 #   assumed from the installer's exit code.
+# Set by ensure_service when it had to bring a service up that was not loaded:
+# a fresh process, so a fresh attach hello to verify.
+SERVICE_STARTED=0
 ensure_service() {
   local profile="$1" restart_for_change="${2:-0}"
   local label="ai.hermes.gateway-$profile"
   local plist="$HOME/Library/LaunchAgents/$label.plist"
+  SERVICE_STARTED=0
 
   if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
     if [ "$restart_for_change" = 1 ]; then
@@ -923,6 +927,7 @@ ensure_service() {
     fi
     return 0
   fi
+  SERVICE_STARTED=1
   if [ "$DRY_RUN" = 1 ]; then
     say "  DRY  install and bootstrap $label"
     return 0
@@ -1091,6 +1096,7 @@ for profile in "${PROFILES[@]}"; do
   ensure_box_env_line "$env_name" "$token" "$profile"
   ensure_box_config_entry "$profile" "$env_name"
   [ "$pending_before" = 0 ] || BOX_CHANGED=1
+  box_recreated="$BOX_CHANGED"
   recreate_box_gateway
   restart_needed=0
   { [ "$PLUGIN_SYNC_CHANGED" = 1 ] || [ "$STREAMING_CONFIG_CHANGED" = 1 ] || [ "$token_changed" = 1 ] || [ "$pending_before" = 1 ]; } && restart_needed=1
@@ -1102,6 +1108,18 @@ for profile in "${PROFILES[@]}"; do
     host_pickup "$profile" "$hot_add" "$reloaded" "$restart_needed" || continue
   else
     ensure_service "$profile" "$restart_needed"
+  fi
+  # Nothing the attach connection depends on changed: same token, same plugin
+  # code, no restart-requiring config, no hot-add, box untouched, service already
+  # up. The connection that was live stays live and will never log a fresh
+  # hello, so waiting for one would only time out, fail the sweep and leave the
+  # pending marker, whose presence makes the next sweep restart the bot. A key
+  # Hermes reads per reply (the thinking preview) lands exactly this way.
+  if [ "$restart_needed" = 0 ] && [ "$hot_add" = 0 ] && [ "$box_recreated" = 0 ] \
+    && { [ "$served" = 1 ] || [ "$SERVICE_STARTED" = 0 ]; }; then
+    say "  nothing the attach connection depends on changed; its live connection stands"
+    [ "$DRY_RUN" = 1 ] || rm -f "$provisioning_pending"
+    continue
   fi
   if verify_attached "$profile"; then
     [ "$DRY_RUN" = 1 ] || rm -f "$provisioning_pending"

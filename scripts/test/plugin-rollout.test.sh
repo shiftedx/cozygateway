@@ -1029,6 +1029,79 @@ YAML
   fi
 }
 
+# The watcher's real call has no --no-verify. A sweep that wrote only the
+# thinking key restarted nothing, so the attach connection is the long-lived one
+# and no fresh "negotiated hello" will ever appear in the box log. Waiting for
+# one used to burn the whole verify timeout, fail the sweep, and leave the
+# pending marker, whose presence made the NEXT sweep restart the bot anyway.
+# Nothing the connection depends on changed, so there is nothing to verify.
+make_no_hello_ssh() {
+  cat > "$1/ssh" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "$COZY_TEST_SSH_LOG"
+case "$*" in
+  *"negotiated hello"*) exit 1 ;;
+  *"python3 -c "*) printf 'unchanged\n' ;;
+  *"python3 - "*) printf 'already present\n' ;;
+esac
+exit 0
+SH
+  chmod +x "$1/ssh"
+}
+check_thinking_repair_verifies_nothing() {
+  local mode="$1" tag="verify-$1" p=alpha run rc loaded
+  local hermes="$TMP/$tag-hermes" bin="$TMP/$tag-bin" hermes_log="$TMP/$tag-calls"
+  local launch_log="$TMP/$tag-launchctl" control_log="$TMP/$tag-control" out="$TMP/$tag.out"
+  make_fake_bin "$bin"
+  make_no_hello_ssh "$bin"
+  [ "$mode" = mux ] && make_multiplexed_root "$hermes"
+  make_profile "$hermes" "$p"
+  mkdir -p "$hermes/profiles/$p/plugins"
+  cp -R "$ROOT/integrations/attach-plugin" "$hermes/profiles/$p/plugins/cozygateway"
+  printf 'plugins:\n  enabled:\n  - cozygateway\ndisplay:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  edit_interval: 0.05\n  buffer_threshold: 1\n' \
+    > "$hermes/profiles/$p/config.yaml"
+  make_fake_python "$hermes" ''
+  loaded="ai.hermes.gateway-$p"; [ "$mode" = mux ] && loaded=''
+  for run in 1 2; do
+    rc=0
+    HOME="$TMP/$tag-home" PATH="$bin:/usr/bin:/bin" COZY_TEST_HERMES_HOME="$hermes" \
+      COZY_TEST_LAUNCHCTL_LOADED="$loaded" COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/$tag-ssh" \
+      COZY_TEST_HERMES_LOG="$hermes_log" COZY_TEST_CONTROL_LOG="$control_log" \
+      "$ROOT/scripts/provision-bot.sh" --verify-timeout 0 --hermes-home "$hermes" --box fake "$p" > "$out.$run" 2>&1 || rc=$?
+    [ "$rc" = 0 ] || { cat "$out.$run" >&2; fail "$mode sweep $run failed (rc=$rc)"; }
+    [ ! -e "$hermes/profiles/$p/.cozygateway-provision-pending" ] || fail "$mode sweep $run left the pending marker"
+  done
+  [ "$(grep -c "config set plugins.stream_reasoning_deltas true" "$hermes_log")" = 1 ] \
+    || fail "$mode: expected the key written once across two sweeps: $(cat "$hermes_log")"
+  if grep -q 'gateway restart' "$hermes_log"; then fail "$mode: a sweep restarted the host: $(cat "$hermes_log")"; fi
+  if grep -q 'kickstart' "$launch_log" 2>/dev/null; then fail "$mode: a sweep kickstarted: $(cat "$launch_log")"; fi
+  [ ! -s "$control_log" ] || fail "$mode: a sweep drove the host: $(cat "$control_log")"
+}
+test_a_thinking_only_sweep_does_not_wait_for_a_hello() {
+  check_thinking_repair_verifies_nothing plain
+  check_thinking_repair_verifies_nothing mux
+}
+
+# And a change the connection DOES depend on is still verified: the display
+# keys restart the bot, so its new hello is the proof, and without one the
+# sweep fails and keeps the marker for the next attempt.
+test_a_restarting_sweep_still_waits_for_the_hello() {
+  local hermes="$TMP/verify-mute-hermes" bin="$TMP/verify-mute-bin" out="$TMP/verify-mute.out" rc=0
+  make_fake_bin "$bin"
+  make_no_hello_ssh "$bin"
+  make_profile "$hermes" mute
+  make_mute_config "$hermes/profiles/mute"
+  mkdir -p "$hermes/profiles/mute/plugins"
+  cp -R "$ROOT/integrations/attach-plugin" "$hermes/profiles/mute/plugins/cozygateway"
+  make_fake_python "$hermes" ''
+  HOME="$TMP/verify-mute-home" PATH="$bin:/usr/bin:/bin" COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOG="$TMP/verify-mute-launchctl" COZY_TEST_SSH_LOG="$TMP/verify-mute-ssh" \
+    "$ROOT/scripts/provision-bot.sh" --verify-timeout 0 --hermes-home "$hermes" --box fake mute > "$out" 2>&1 || rc=$?
+  [ "$rc" != 0 ] || fail 'a restarting sweep with no hello passed without verifying'
+  assert_contains "$out" 'no attach hello in the box log'
+  [ -e "$hermes/profiles/mute/.cozygateway-provision-pending" ] || fail 'an unverified restart dropped the pending marker'
+}
+
 # ── Multiplexed Hermes host ─────────────────────────────────────────────────
 # ONE host gateway (the default profile's, `gateway.multiplex_profiles: true`) serves every
 # profile. A served profile never gets an `ai.hermes.gateway-<p>` job; Hermes refuses its
@@ -1260,6 +1333,8 @@ test_provisioner_turns_streaming_on_and_restarts_once
 test_provisioner_repairs_cadence_on_an_already_streaming_profile_once
 test_provisioner_turns_the_thinking_preview_on_once
 test_provisioner_restarts_for_the_keys_that_landed_when_one_fails
+test_a_thinking_only_sweep_does_not_wait_for_a_hello
+test_a_restarting_sweep_still_waits_for_the_hello
 test_provisioner_leaves_cadence_alone_beside_another_platform
 test_provisioner_leaves_streaming_turned_off_on_purpose
 test_provisioner_does_not_restart_when_the_write_did_not_land

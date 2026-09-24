@@ -1568,7 +1568,7 @@ ensure_streaming_config() {
   fi
   keys="$(streaming_writes "$answer")"
   for key in $wrote; do
-    if printf '%s\n' "$keys" | grep -Fq "$key="; then missing="$missing $key"
+    if printf '%s\n' "$keys" | grep -q "^${key//./\\.}="; then missing="$missing $key"
     elif needs_restart "$key"; then restart=1
     fi
   done
