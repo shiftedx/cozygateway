@@ -6,6 +6,7 @@ import type {
   BotDesktopHermesSession,
 } from "cozygateway-contract";
 import { BackendUnavailable } from "../errors.ts";
+import { ProfileOpInvalid } from "./profile-ops.ts";
 import type { Storage } from "../storage.ts";
 import type { BotControlSurface, BotFocusScreen, BotProfileOp, BotRoutineList, BotRosterView } from "./bridge.ts";
 import type { GatewayRoomHost, RoomHost } from "./group-rooms.ts";
@@ -150,6 +151,13 @@ export class FederatedBotControlSurface implements BotControlSurface {
     if (oldestKey !== undefined) this.#roomHosts.delete(oldestKey);
   }
   roomHostCacheSizeForTesting(): number { return this.#roomHosts.size; }
+  /** A roster name as the profile id on `endpointId`; a name on another computer is refused. */
+  #localName(qualified: string, endpointId: string, relativeTo: string): string {
+    const parsed = splitFederatedBotName(qualified.trim().toLowerCase());
+    if (parsed === undefined) return qualified;
+    if (parsed.endpointId !== endpointId) throw new ProfileOpInvalid(`"${qualified}" is not on the same computer as "${relativeTo}"`);
+    return parsed.profileId;
+  }
   #route(name: string): { member: FederationMember; profile: string } {
     const parsed = splitFederatedBotName(name);
     const member = parsed === undefined ? undefined : this.#members.get(parsed.endpointId);
@@ -179,19 +187,19 @@ export class FederatedBotControlSurface implements BotControlSurface {
   publish(): void { this.#broadcast?.(this.roster()); }
   async createBot(input: BotCreateRequest): Promise<BotCreateResponse> {
     const route = this.#route(input.name);
-    const result = await route.member.bridge.createBot({ ...input, name: route.profile });
+    const result = await route.member.bridge.createBot({
+      ...input,
+      name: route.profile,
+      // A clone source is a bot on the SAME computer, named the way the roster names it.
+      ...(input.cloneFrom === undefined ? {} : { cloneFrom: this.#localName(input.cloneFrom, route.member.id, input.name) }),
+    });
     return { ...result, bot: summary(route.member.id, result.bot) };
   }
   /** Capability 82. A new name (rename, duplicate) must sit on the same endpoint as the bot, and a
    *  roster row coming back is qualified exactly as the roster's own rows are. */
   async profileOp(name: string, op: BotProfileOp): Promise<unknown> {
     const r = this.#route(name);
-    const local = (qualified: string): string => {
-      const parsed = splitFederatedBotName(qualified.trim().toLowerCase());
-      if (parsed === undefined) return qualified;
-      if (parsed.endpointId !== r.member.id) throw new BackendUnavailable(`"${qualified}" is not on the same computer as "${name}"`);
-      return parsed.profileId;
-    };
+    const local = (qualified: string): string => this.#localName(qualified, r.member.id, name);
     const routed: BotProfileOp = op.kind === "rename" ? { ...op, newName: local(op.newName) }
       : op.kind === "duplicate" && op.newName !== undefined ? { ...op, newName: local(op.newName) }
       : op;

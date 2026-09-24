@@ -132,10 +132,14 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
   let ticketMintCount = 0;
 
   function readBody(req: import("node:http").IncomingMessage): Promise<string> {
+    return readBytes(req).then((bytes) => bytes.toString("utf8"));
+  }
+
+  function readBytes(req: import("node:http").IncomingMessage): Promise<Buffer> {
     return new Promise((resolve) => {
-      let raw = "";
-      req.on("data", (chunk) => (raw += String(chunk)));
-      req.on("end", () => resolve(raw));
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => resolve(Buffer.concat(chunks)));
     });
   }
 
@@ -152,14 +156,20 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
       res.end(JSON.stringify(body));
     };
     if (cfg.dashboard !== undefined && (path.startsWith("/api/") || path === "/openapi.json")) {
-      void readBody(req)
-        .then(async (raw) => {
+      void readBytes(req)
+        .then(async (bytes) => {
           let body: unknown;
-          try {
-            body = raw ? JSON.parse(raw) : undefined;
-          } catch {
-            send(400, { detail: "bad body" });
-            return;
+          // A multipart upload (the streamed files route) reaches the handler as its raw bytes.
+          if ((req.headers["content-type"] ?? "").startsWith("multipart/")) {
+            body = bytes;
+          } else {
+            const raw = bytes.toString("utf8");
+            try {
+              body = raw ? JSON.parse(raw) : undefined;
+            } catch {
+              send(400, { detail: "bad body" });
+              return;
+            }
           }
           const result = await cfg.dashboard!({
             method: req.method ?? "GET",

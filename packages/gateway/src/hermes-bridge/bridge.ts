@@ -254,9 +254,9 @@ export type BotProfileOp =
   | { kind: "identity"; patch: BotIdentityPatch }
   | { kind: "rename"; newName: string }
   | { kind: "describeAuto"; overwrite: boolean }
-  | { kind: "duplicate"; newName?: string }
+  | { kind: "duplicate"; newName?: string; avoid?: readonly string[] }
   | { kind: "export" }
-  | { kind: "import"; archive: Uint8Array }
+  | { kind: "import"; archive: ReadableStream<Uint8Array> | null }
   | { kind: "modelPin" }
   | { kind: "pinModel"; request: BotModelPinRequest }
   | { kind: "unpinModel" }
@@ -770,6 +770,7 @@ export class HermesBridge implements BotControlSurface {
     this.#storage.savePendingHermesProfileSeed({
       profile: name,
       selection,
+      ...(blankSlate ? {} : { blankSlate: false }),
       attempts: 1,
       nextAttemptAt: this.#now() + this.#seedRetryDelay(1),
     });
@@ -813,6 +814,7 @@ export class HermesBridge implements BotControlSurface {
       this.#storage.savePendingHermesProfileSeed({
         profile: name,
         selection,
+        ...(blankSlate ? {} : { blankSlate: false }),
         attempts: 1,
         nextAttemptAt: this.#now() + this.#seedRetryDelay(1),
       });
@@ -908,7 +910,7 @@ export class HermesBridge implements BotControlSurface {
       if (row === undefined || this.#closed) return;
       try {
         const seed = await seedBlankSlateProfile(this.#client, profile, {
-          blankSlate: this.#seedBlankSlateBots,
+          blankSlate: this.#seedBlankSlateBots && row.blankSlate !== false,
           selection: row.selection,
           skillsOn: this.#blankSlateSkillsOn,
         });
@@ -935,6 +937,7 @@ export class HermesBridge implements BotControlSurface {
         this.#storage.savePendingHermesProfileSeed({
           profile,
           selection: row.selection,
+          ...(row.blankSlate === false ? { blankSlate: false } : {}),
           attempts,
           nextAttemptAt: this.#now() + this.#seedRetryDelay(attempts),
         });
@@ -1118,6 +1121,10 @@ export class HermesBridge implements BotControlSurface {
    *  plane each route them with one line rather than twelve. */
   async profileOp(name: string, op: BotProfileOp): Promise<unknown> {
     const client = this.#client;
+    // Hermes resolves the profile name `current` to the launch profile, so an env or hub call
+    // addressed to it would change a different bot. It is reserved for new names too (crud.ts).
+    if (normalizeProfileName(name) === "current")
+      throw new BotNameInvalid(`"current" names the launch profile in Hermes and cannot be operated on here`);
     switch (op.kind) {
       case "import": {
         const target = validateNewBotName(name);
@@ -1147,7 +1154,7 @@ export class HermesBridge implements BotControlSurface {
       case "duplicate": {
         await this.#assertBotKnown(name);
         const target = op.newName === undefined
-          ? await freeDuplicateName(client, name)
+          ? await freeDuplicateName(client, name, op.avoid)
           : validateNewBotName(op.newName);
         const source = this.#storage.botRoster().bots.find((row) => row.name === name);
         const created = await this.createBot({

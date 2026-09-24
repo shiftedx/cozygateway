@@ -7,8 +7,8 @@
 //   rename              PATCH /api/profiles/{name} {new_name}                        (HTTP)
 //   describe-auto       POST  /api/profiles/{name}/describe-auto {overwrite}         (HTTP)
 //   duplicate           profiles.create {clone_from, clone_all} + ui_meta + get/set_asset (WS)
-//   export              POST  /api/profiles/{name}/export -> GET /api/files/download (HTTP)
-//   import              POST  /api/files/upload -> POST /api/profiles/import         (HTTP)
+//   export              POST  /api/profiles/{name}/export -> GET /api/files/download, streamed (HTTP)
+//   import              POST  /api/files/upload-stream (streamed) -> /api/profiles/import (HTTP)
 //   model pin           profiles.configure {model, provider, confirm_expensive_model} (WS)
 //   model unpin         cli.exec ['--profile', name, 'config', 'unset', 'model']     (WS)
 //   provider keys       GET/PUT/DELETE /api/env?profile=  (see Provider keys below) (HTTP)
@@ -39,8 +39,17 @@ export class ProfileOpInvalid extends Error {
   }
 }
 
-/** Hermes' import archives are bounded here, before any byte is staged on the host. */
-export const PROFILE_IMPORT_MAX_BYTES = 256 * 1024 * 1024;
+/** Hermes' managed files route refuses more than this (`_MANAGED_FILE_MAX_BYTES`), so the gateway
+ *  refuses it first, counting bytes as they stream rather than trusting a declared length. */
+export const PROFILE_IMPORT_MAX_BYTES = 100 * 1024 * 1024;
+
+/** An archive past `PROFILE_IMPORT_MAX_BYTES`, counted by the gateway or refused by Hermes. */
+export class ProfileArchiveTooLarge extends Error {
+  constructor() {
+    super("the archive is larger than 100 MiB");
+    this.name = "ProfileArchiveTooLarge";
+  }
+}
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -194,10 +203,10 @@ export async function describeProfileAuto(
 // MARK: Duplicate
 
 /** `<base>-2`, `-3`, ... the first name the host does not already have (upstream `duplicateBot`). */
-export async function freeDuplicateName(client: HermesClient, base: string): Promise<string> {
+export async function freeDuplicateName(client: HermesClient, base: string, avoid: readonly string[] = []): Promise<string> {
   const listed = record(await client.request("profiles.list", { include_sessions: false }));
-  const taken = new Set((Array.isArray(listed?.["profiles"]) ? (listed["profiles"] as unknown[]) : [])
-    .map((row) => text(record(row)?.["name"])));
+  const taken = new Set([...(Array.isArray(listed?.["profiles"]) ? (listed["profiles"] as unknown[]) : [])
+    .map((row) => text(record(row)?.["name"])), ...avoid]);
   for (let n = 2; n < 100; n += 1) {
     const suffix = `-${n}`;
     const candidate = base.slice(0, 64 - suffix.length) + suffix;
@@ -233,9 +242,12 @@ export async function copyBotLook(client: HermesClient, source: string, target: 
 
 // MARK: Export / import
 
-/** The export as a response whose body is the archive. The staged file is removed from the Hermes
- *  host once the bytes are read, because it is a copy of a whole bot sitting in a shared folder. */
-export async function exportProfileArchive(client: HermesClient, name: string): Promise<{ filename: string; bytes: Uint8Array<ArrayBuffer> }> {
+/** The export as a stream, never buffered: the body is Hermes' own download, and the staged file
+ *  is removed from the Hermes host once the stream ends or is abandoned, because it is a copy of a
+ *  whole bot sitting in a shared folder. */
+export async function exportProfileArchive(
+  client: HermesClient, name: string,
+): Promise<{ filename: string; body: ReadableStream<Uint8Array>; length?: number }> {
   let archive: string;
   try {
     const result = record(await dashboardCall(client, `/api/profiles/${segment(name)}/export`, {
@@ -247,18 +259,49 @@ export async function exportProfileArchive(client: HermesClient, name: string): 
     mapProfileError(error, name);
   }
   if (archive.length === 0) throw new BackendUnavailable(`hermes did not say where it wrote "${name}"'s export`);
+  let response: Response;
   try {
-    const response = await client.dashboardResponse(
+    response = await client.dashboardResponse(
       `/api/files/download?path=${encodeURIComponent(archive)}`,
-      { timeoutMs: 120_000, headers: { accept: "application/gzip, application/octet-stream" } },
+      { timeoutMs: 600_000, headers: { accept: "application/gzip, application/octet-stream" } },
     );
-    if (!response.ok) throw new BackendUnavailable(`hermes could not hand back the export (HTTP ${response.status})`);
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    const filename = archive.split(/[\\/]/).pop() || `${name}.tar.gz`;
-    return { filename, bytes };
-  } finally {
+  } catch (error) {
     await removeStagedFile(client, archive);
+    throw error;
   }
+  if (!response.ok || response.body === null) {
+    await response.body?.cancel().catch(() => undefined);
+    await removeStagedFile(client, archive);
+    throw new BackendUnavailable(`hermes could not hand back the export (HTTP ${response.status})`);
+  }
+  let removed = false;
+  const cleanup = (): void => {
+    if (removed) return;
+    removed = true;
+    void removeStagedFile(client, archive);
+  };
+  const reader = response.body.getReader();
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          cleanup();
+        } else controller.enqueue(value);
+      } catch (error) {
+        controller.error(error);
+        cleanup();
+      }
+    },
+    async cancel(reason) {
+      await reader.cancel(reason).catch(() => undefined);
+      cleanup();
+    },
+  });
+  const declared = Number(response.headers.get("content-length") ?? "");
+  const filename = archive.split(/[\\/]/).pop() || `${name}.tar.gz`;
+  return { filename, body, ...(Number.isSafeInteger(declared) && declared >= 0 ? { length: declared } : {}) };
 }
 
 async function removeStagedFile(client: HermesClient, path: string): Promise<void> {
@@ -282,22 +325,93 @@ async function importStagingPath(client: HermesClient): Promise<string> {
   return `${base}${separator}profile-exports${separator}cozy-import-${stamp}.tar.gz`;
 }
 
-export async function importProfileArchive(client: HermesClient, name: string, bytes: Uint8Array): Promise<string> {
-  if (bytes.byteLength === 0) throw new ProfileOpInvalid("the archive is empty");
-  if (bytes.byteLength > PROFILE_IMPORT_MAX_BYTES) throw new ProfileOpInvalid("the archive is larger than 256 MiB");
+/** `source` as `multipart/form-data` for Hermes' `/api/files/upload-stream`, streamed, with the
+ *  archive's bytes counted as they pass: past `maxBytes` the stream errors with
+ *  `ProfileArchiveTooLarge`, whatever length the phone declared (or did not). */
+export function multipartArchiveStream(
+  source: ReadableStream<Uint8Array>, path: string, boundary: string, maxBytes = PROFILE_IMPORT_MAX_BYTES,
+): { body: ReadableStream<Uint8Array>; counted: () => number } {
+  const encoder = new TextEncoder();
+  const field = (name: string, value: string): string =>
+    `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`;
+  const head = encoder.encode(
+    field("path", path) + field("overwrite", "true")
+    + `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="archive.tar.gz"\r\n`
+    + "Content-Type: application/gzip\r\n\r\n");
+  const tail = encoder.encode(`\r\n--${boundary}--\r\n`);
+  const reader = source.getReader();
+  let total = 0;
+  let stage: "head" | "body" | "done" = "head";
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (stage === "head") {
+        stage = "body";
+        controller.enqueue(head);
+        return;
+      }
+      if (stage === "done") return;
+      const { done, value } = await reader.read();
+      if (done) {
+        if (total === 0) {
+          controller.error(new ProfileOpInvalid("the archive is empty"));
+          return;
+        }
+        stage = "done";
+        controller.enqueue(tail);
+        controller.close();
+        return;
+      }
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        controller.error(new ProfileArchiveTooLarge());
+        return;
+      }
+      controller.enqueue(value);
+    },
+    async cancel(reason) {
+      await reader.cancel(reason).catch(() => undefined);
+    },
+  });
+  return { body, counted: () => total };
+}
+
+export async function importProfileArchive(
+  client: HermesClient, name: string, source: ReadableStream<Uint8Array> | null,
+): Promise<string> {
+  if (source === null) throw new ProfileOpInvalid("the archive is empty");
   const staged = await importStagingPath(client);
-  const dataUrl = `data:application/gzip;base64,${Buffer.from(bytes).toString("base64")}`;
+  const boundary = `cozy-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  const { body } = multipartArchiveStream(source, staged, boundary);
   try {
-    await dashboardCall(client, "/api/files/upload", {
-      method: "POST",
-      body: { path: staged, data_url: dataUrl, overwrite: true },
-    }, 120_000);
+    let response: Response;
+    try {
+      response = await client.dashboardResponse("/api/files/upload-stream", {
+        method: "POST",
+        rawBody: body,
+        headers: { "content-type": `multipart/form-data; boundary=${boundary}` },
+        timeoutMs: 600_000,
+      });
+    } catch (error) {
+      // The counting stream's own refusal surfaces as the fetch's cause.
+      const cause = error instanceof Error ? (error as Error & { cause?: unknown }).cause : undefined;
+      if (error instanceof ProfileArchiveTooLarge || cause instanceof ProfileArchiveTooLarge) throw new ProfileArchiveTooLarge();
+      if (error instanceof ProfileOpInvalid || cause instanceof ProfileOpInvalid) throw new ProfileOpInvalid("the archive is empty");
+      throw error;
+    }
+    if (response.status === 413) throw new ProfileArchiveTooLarge();
+    if (!response.ok) {
+      const detail = text(record(await response.json().catch(() => undefined))?.["detail"]);
+      throw new HermesRpcError(detail || `hermes could not stage the archive (HTTP ${response.status})`, response.status);
+    }
+    await response.body?.cancel().catch(() => undefined);
     const result = record(await dashboardCall(client, "/api/profiles/import", {
       method: "POST",
       body: { archive: staged, name },
     }, 120_000));
     return text(result?.["name"]) || name;
   } catch (error) {
+    if (error instanceof ProfileArchiveTooLarge || error instanceof ProfileOpInvalid) throw error;
     mapProfileError(error, name);
   } finally {
     await removeStagedFile(client, staged);

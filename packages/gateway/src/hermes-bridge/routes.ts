@@ -59,7 +59,7 @@ import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
 import { ModelConfigInvalid } from "./model-config.ts";
 import { ProviderSetupInvalid } from "./provider-setup.ts";
-import { PROFILE_IMPORT_MAX_BYTES, ProfileOpInvalid } from "./profile-ops.ts";
+import { PROFILE_IMPORT_MAX_BYTES, ProfileArchiveTooLarge, ProfileOpInvalid } from "./profile-ops.ts";
 import type { BotProfileOp } from "./bridge.ts";
 import {
   HermesDashboardIntegrations,
@@ -698,7 +698,7 @@ export function registerBotRoutes(
       input = assertValid(BotCreateRequestSchema, await c.req.json());
       return c.json(await bots.createBot(input), 201);
     } catch (error) {
-      if (error instanceof ContractViolation || error instanceof BotNameInvalid)
+      if (error instanceof ContractViolation || error instanceof BotNameInvalid || error instanceof ProfileOpInvalid)
         return c.json(errorBody("invalid_request", error.message), 400);
       if (error instanceof BotNameTaken)
         return c.json(extensionErrorBody("conflict", error.message), 409);
@@ -1547,6 +1547,8 @@ export function registerBotRoutes(
     } catch (error) {
       if (error instanceof BotNameInvalid || error instanceof ProfileOpInvalid)
         return c.json(errorBody("invalid_request", error.message), 400);
+      if (error instanceof ProfileArchiveTooLarge)
+        return c.json(errorBody("invalid_request", error.message), 413);
       if (error instanceof BotNameTaken)
         return c.json(extensionErrorBody("conflict", error.message), 409);
       if (error instanceof BotTurnActive)
@@ -1605,29 +1607,35 @@ export function registerBotRoutes(
     if ("response" in resolved) return resolved.response;
     try {
       if (bots.profileOp === undefined) throw new BackendUnavailable("this gateway has no Hermes profile operations");
-      const exported = (await bots.profileOp(resolved.name, { kind: "export" })) as { filename: string; bytes: Uint8Array<ArrayBuffer> };
+      // Streamed from Hermes straight to the phone, never held here whole.
+      const exported = (await bots.profileOp(resolved.name, { kind: "export" })) as {
+        filename: string; body: ReadableStream<Uint8Array>; length?: number;
+      };
       const filename = exported.filename.replace(/[^A-Za-z0-9._-]/g, "_");
-      return new Response(exported.bytes, {
+      return new Response(exported.body, {
         headers: {
           "content-type": "application/gzip",
-          "content-length": String(exported.bytes.byteLength),
+          ...(exported.length === undefined ? {} : { "content-length": String(exported.length) }),
           "content-disposition": `attachment; filename="${filename}"`,
           "cache-control": "no-store",
         },
       });
     } catch (error) {
+      if (error instanceof BotNameInvalid) return c.json(errorBody("invalid_request", error.message), 400);
       return failure(c, error);
     }
   });
 
+  // The archive is streamed into Hermes as it arrives and counted on the way: a declared length
+  // over the bound is refused before any byte moves, and a body with no length (chunked) is cut
+  // off at the bound, so the gateway never holds an archive in memory.
   app.post("/bots/import", requireDevice, async (c) => {
     const name = (c.req.query("name") ?? "").trim();
     if (name.length === 0) return c.json(errorBody("invalid_request", "name is required"), 400);
     const declared = Number(c.req.header("content-length") ?? "");
     if (Number.isFinite(declared) && declared > PROFILE_IMPORT_MAX_BYTES)
-      return c.json(errorBody("invalid_request", "the archive is larger than 256 MiB"), 413);
-    const archive = new Uint8Array(await c.req.arrayBuffer());
-    return profileOp(c, name, { kind: "import", archive }, 201);
+      return c.json(errorBody("invalid_request", "the archive is larger than 100 MiB"), 413);
+    return profileOp(c, name, { kind: "import", archive: c.req.raw.body }, 201);
   });
 
   app.get("/bots/:name/model-pin", requireDevice, async (c) => {

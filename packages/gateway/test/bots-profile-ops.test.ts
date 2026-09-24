@@ -7,6 +7,7 @@ import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
 import { createHermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
+import { ProfileArchiveTooLarge, multipartArchiveStream } from "../src/hermes-bridge/profile-ops.ts";
 import {
   startFakeHermesServer,
   type FakeHermesBehavior,
@@ -110,6 +111,7 @@ async function setup(opts: {
     now: () => 1_800_000_000_000,
     logSink: () => {},
     hiddenProfiles: [],
+    seedRetryBaseMs: 20,
   });
   bridges.push(bridge);
   const app = createApp({
@@ -138,7 +140,7 @@ async function setup(opts: {
     app.request(path, { ...init, headers: { ...(init?.headers ?? {}), authorization: `Bearer ${deviceToken}` } });
   bridge.start();
   await until(() => client.state() === "online");
-  return { server, rows, dashboardCalls, authed };
+  return { server, rows, dashboardCalls, authed, storage };
 }
 
 const json = (method: string, body?: unknown): RequestInit => ({
@@ -267,6 +269,52 @@ describe("capability 82: duplicate and create options", () => {
     });
   });
 
+  it("answers 400, not 500, when Hermes refuses the clone source", async () => {
+    const h = await setup({
+      methods: {
+        "profiles.create": () => {
+          throw { code: 4062, message: "Source profile 'ghost' does not exist." };
+        },
+      },
+    });
+    const res = await h.authed("/bots", json("POST", { name: "twin", cloneFrom: "ghost" }));
+    expect(res.status).toBe(400);
+  });
+
+  it("reserves `current`, which Hermes resolves to the launch profile", async () => {
+    const h = await setup();
+    expect((await h.authed("/bots", json("POST", { name: "Current" }))).status).toBe(400);
+    expect((await h.authed("/bots/scout/rename", json("POST", { newName: "current" }))).status).toBe(400);
+    expect((await h.authed("/bots/scout/duplicate", json("POST", { newName: "CURRENT" }))).status).toBe(400);
+    expect((await h.authed("/bots/import?name=current", { method: "POST", body: new Uint8Array([1]) })).status).toBe(400);
+    expect((await h.authed("/bots/current/provider-keys")).status).toBe(400);
+    expect((await h.authed("/bots/current/skills-hub?q=pdf")).status).toBe(400);
+    expect(h.server.callsOf("profiles.create")).toHaveLength(0);
+    expect(h.dashboardCalls.some((call) => call.path === "/api/env" || call.path.startsWith("/api/skills"))).toBe(false);
+  });
+
+  it("a deferred seed for a clone keeps its skills when it is retried", async () => {
+    let failSeed = true;
+    const h = await setup({
+      dashboard: (request) => {
+        if (request.path !== "/api/config") return undefined;
+        if (failSeed) return { status: 503, body: { detail: "busy" } };
+        return { body: { config: {} } };
+      },
+    });
+    expect((await h.authed("/bots", json("POST", { name: "twin", cloneFrom: "scout" }))).status).toBe(201);
+    expect(h.storage.pendingHermesProfileSeeds().find((row) => row.profile === "twin")?.blankSlate).toBe(false);
+    expect((await h.authed("/bots", json("POST", { name: "fresh" }))).status).toBe(201);
+    expect(h.storage.pendingHermesProfileSeeds().find((row) => row.profile === "fresh")?.blankSlate).toBeUndefined();
+    failSeed = false;
+    const described = h.server.callsOf("profiles.describe").length;
+    await until(() => h.storage.pendingHermesProfileSeeds().length === 0, 20_000);
+    // The blank slate reads the skill catalog to switch skills off; the clone's retry must not.
+    const describes = h.server.callsOf("profiles.describe").slice(described).map((call) => call.params["name"]);
+    expect(describes).not.toContain("twin");
+    expect(describes).toContain("fresh");
+  }, 30_000);
+
   it("a create with none of the new fields is byte identical to a pre-82 create", async () => {
     const h = await setup();
     expect((await h.authed("/bots", json("POST", { name: "plain" }))).status).toBe(201);
@@ -275,7 +323,7 @@ describe("capability 82: duplicate and create options", () => {
 });
 
 describe("capability 82: export and import", () => {
-  it("answers the archive's bytes and removes the staged copy from the host", async () => {
+  it("streams the archive's bytes and removes the staged copy from the host", async () => {
     const archive = new Uint8Array([0x1f, 0x8b, 8, 0, 1, 2, 3]);
     const h = await setup({
       dashboard: (request) => {
@@ -292,28 +340,37 @@ describe("capability 82: export and import", () => {
     expect(new Uint8Array(await res.arrayBuffer())).toEqual(archive);
     expect(h.dashboardCalls.find((call) => call.path === "/api/files/download")?.query.get("path"))
       .toBe("/home/h/.hermes/profile-exports/scout-1.tar.gz");
+    await until(() => h.dashboardCalls.some((call) => call.method === "DELETE"));
     expect(h.dashboardCalls.find((call) => call.method === "DELETE")?.body)
       .toEqual({ path: "/home/h/.hermes/profile-exports/scout-1.tar.gz" });
   });
 
-  it("stages the upload beside Hermes' own exports, imports it, and cleans up", async () => {
-    const archive = new Uint8Array([0x1f, 0x8b, 8, 0, 9, 9]);
-    let staged = "";
-    const h = await setup({
-      dashboard: (request) => {
+  /** A fake Hermes that stages an upload-stream and imports it, recording what arrived. */
+  function importingHermes(state: { staged: string; bytes: Buffer }, rows: () => Row[]) {
+    return (request: DashboardRequest): { status?: number; body: unknown } | undefined => {
+      if (request.path === "/api/files/upload-stream") {
+        const raw = request.body as Buffer;
+        const text = raw.toString("latin1");
+        state.staged = /name="path"\r\n\r\n([^\r]+)\r\n/.exec(text)?.[1] ?? "";
+        const start = text.indexOf("\r\n\r\n", text.indexOf('name="file"')) + 4;
+        const end = text.lastIndexOf("\r\n--");
+        state.bytes = raw.subarray(start, end);
+        return { body: { ok: true } };
+      }
+      if (request.path === "/api/profiles/import") {
         const body = request.body as Record<string, unknown>;
-        if (request.path === "/api/files/upload") {
-          staged = String(body["path"]);
-          return { body: { ok: true } };
-        }
-        if (request.path === "/api/profiles/import") {
-          h.rows.push({ name: String(body["name"]), path: "/p/imported" });
-          return { body: { ok: true, name: body["name"], path: "/p/imported", desktop: null } };
-        }
-        if (request.method === "DELETE" && request.path === "/api/files") return { body: { ok: true } };
-        return undefined;
-      },
-    });
+        rows().push({ name: String(body["name"]), path: "/p/imported" });
+        return { body: { ok: true, name: body["name"], path: "/p/imported", desktop: null } };
+      }
+      if (request.method === "DELETE" && request.path === "/api/files") return { body: { ok: true } };
+      return undefined;
+    };
+  }
+
+  it("streams the upload beside Hermes' own exports, imports it, and cleans up", async () => {
+    const archive = new Uint8Array([0x1f, 0x8b, 8, 0, 9, 9]);
+    const state = { staged: "", bytes: Buffer.alloc(0) };
+    const h = await setup({ dashboard: (request) => importingHermes(state, () => h.rows)(request) });
     const res = await h.authed("/bots/import?name=imported", {
       method: "POST",
       headers: { "content-type": "application/gzip" },
@@ -321,11 +378,60 @@ describe("capability 82: export and import", () => {
     });
     expect(res.status).toBe(201);
     expect(((await res.json()) as { bot: { name: string } }).bot.name).toBe("imported");
-    expect(staged).toMatch(/^\/home\/h\/\.hermes\/profile-exports\/cozy-import-[a-z0-9]+\.tar\.gz$/);
-    const upload = h.dashboardCalls.find((call) => call.path === "/api/files/upload")?.body as Record<string, unknown>;
-    expect(upload["data_url"]).toBe(`data:application/gzip;base64,${Buffer.from(archive).toString("base64")}`);
-    expect(h.dashboardCalls.find((call) => call.path === "/api/profiles/import")?.body).toEqual({ archive: staged, name: "imported" });
-    expect(h.dashboardCalls.find((call) => call.method === "DELETE")?.body).toEqual({ path: staged });
+    expect(state.staged).toMatch(/^\/home\/h\/\.hermes\/profile-exports\/cozy-import-[a-z0-9]+\.tar\.gz$/);
+    expect(new Uint8Array(state.bytes)).toEqual(archive);
+    expect(h.dashboardCalls.find((call) => call.path === "/api/profiles/import")?.body).toEqual({ archive: state.staged, name: "imported" });
+    expect(h.dashboardCalls.find((call) => call.method === "DELETE")?.body).toEqual({ path: state.staged });
+  });
+
+  it("takes a chunked body with no declared length, streamed through", async () => {
+    const chunks = [new Uint8Array([0x1f, 0x8b]), new Uint8Array([8, 0]), new Uint8Array([7, 7, 7])];
+    const state = { staged: "", bytes: Buffer.alloc(0) };
+    const h = await setup({ dashboard: (request) => importingHermes(state, () => h.rows)(request) });
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+    const res = await h.authed("/bots/import?name=chunked", {
+      method: "POST",
+      headers: { "content-type": "application/gzip" },
+      body,
+      duplex: "half",
+    } as RequestInit);
+    expect(res.status).toBe(201);
+    expect(new Uint8Array(state.bytes)).toEqual(new Uint8Array([0x1f, 0x8b, 8, 0, 7, 7, 7]));
+  });
+
+  it("refuses a declared length over 100 MiB before any byte moves, and maps Hermes' own 413", async () => {
+    const h = await setup({
+      dashboard: (request) => request.path === "/api/files/upload-stream"
+        ? { status: 413, body: { detail: "File is too large" } }
+        : request.method === "DELETE" ? { body: { ok: true } } : undefined,
+    });
+    const declared = await h.authed("/bots/import?name=huge", {
+      method: "POST",
+      headers: { "content-type": "application/gzip", "content-length": String(101 * 1024 * 1024) },
+      body: new Uint8Array([1]),
+    });
+    expect(declared.status).toBe(413);
+    expect(h.dashboardCalls.some((call) => call.path === "/api/files/upload-stream")).toBe(false);
+    const upstream = await h.authed("/bots/import?name=huge", { method: "POST", body: new Uint8Array([1, 2]) });
+    expect(upstream.status).toBe(413);
+  });
+
+  it("counts streamed bytes and cuts a body off at the bound, whatever it declared", async () => {
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let i = 0; i < 4; i += 1) controller.enqueue(new Uint8Array(10));
+        controller.close();
+      },
+    });
+    const { body } = multipartArchiveStream(source, "/x.tar.gz", "b", 25);
+    const reader = body.getReader();
+    await expect((async () => { for (;;) { if ((await reader.read()).done) return; } })())
+      .rejects.toBeInstanceOf(ProfileArchiveTooLarge);
   });
 
   it("requires a name for an import", async () => {
