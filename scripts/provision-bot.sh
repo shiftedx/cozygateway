@@ -562,6 +562,8 @@ STREAMING_CONFIG_CHANGED=0
 # through a config cache keyed on the file's stat signature.
 READ_PER_REPLY_KEYS=" plugins.stream_reasoning_deltas "
 needs_restart() { case "$READ_PER_REPLY_KEYS" in *" $1 "*) return 1 ;; *) return 0 ;; esac; }
+# Set when one of those keys was written AND the read-back found it on disk.
+READ_PER_REPLY_WROTE=0
 # A "!" line from the reader is a note to say, not a key to write. Both reads
 # below drop them, so a profile that keeps its own cadence is not mistaken for a
 # write that failed to land.
@@ -570,6 +572,7 @@ streaming_writes() { printf '%s\n' "$1" | grep -v '^!' || true; }
 ensure_streaming_config() {
   local profile="$1" dir="$2" answer keys note entry key value rc=0 wrote="" missing="" restart=0
   STREAMING_CONFIG_CHANGED=0
+  READ_PER_REPLY_WROTE=0
   answer="$(streaming_keys_absent "$dir")" || rc=$?
   if [ "$rc" != 0 ]; then
     warn "[$profile] could not read config.yaml, leaving streaming settings alone"
@@ -622,6 +625,7 @@ ensure_streaming_config() {
   for key in $wrote; do
     if printf '%s\n' "$keys" | grep -q "^${key//./\\.}="; then missing="$missing $key"
     elif needs_restart "$key"; then restart=1
+    else READ_PER_REPLY_WROTE=1
     fi
   done
   if [ -n "$missing" ] && [ "$restart" = 1 ]; then
@@ -698,12 +702,18 @@ ensure_env_line() {
 # Upsert. For the handful of values that must be EXACTLY right rather than
 # merely present, because a fresh profile arrives holding a copy of the launch
 # profile's .env and an inherited value there is wrong, not pre-existing.
+#
+# SET_ENV_CHANGED goes to 1 whenever a value really changes, so the caller can
+# tell a rewritten COZYGATEWAY_URL (an adapter still dialing the old gateway
+# until its process restarts) from a line that was already right.
+SET_ENV_CHANGED=0
 set_env_line() {
   local file="$1" key="$2" value="$3"
   if [ -f "$file" ] && [ "$(env_value "$file" "$key" || true)" = "$value" ]; then
     say "  env $key already correct"
     return 0
   fi
+  SET_ENV_CHANGED=1
   if [ "$DRY_RUN" = 1 ]; then say "  DRY  set $key in $file"; return 0; fi
   mkdir -p "$(dirname "$file")"
   [ -f "$file" ] || : > "$file"
@@ -1082,6 +1092,7 @@ for profile in "${PROFILES[@]}"; do
   # native install on this Mac, say) the copied COZYGATEWAY_URL points there. A plugin that
   # dials the wrong gateway with this gateway's token is refused forever, and the row on the box
   # never leaves setup_required (observed 2026-09-05: snug-nimbus and dewy-bayberry).
+  SET_ENV_CHANGED=0
   set_env_line "$env_file" COZYGATEWAY_URL "$GATEWAY_URL"
   ensure_env_line "$env_file" COZYGATEWAY_HOME_CHANNEL "$HOME_CHANNEL"
   ensure_env_line "$env_file" COZYGATEWAY_INSTALLER_OWNER "$INSTALLER_OWNER"
@@ -1091,6 +1102,10 @@ for profile in "${PROFILES[@]}"; do
   # and ack each other's events out of one file.
   set_env_line "$env_file" COZYGATEWAY_SPOOL_PATH \
     "$profile_dir/plugin-data/cozygateway/attach-v1.sqlite"
+  # The URL, token and spool the adapter dials with are read at process start,
+  # and a multiplexed rescan skips a live adapter, so a changed one is a restart
+  # (and a hello to verify) exactly like a new token.
+  attach_env_changed="$SET_ENV_CHANGED"
   inherit_chat_registry "$env_file"
   ensure_streaming_config "$profile" "$profile_dir"
   ensure_box_env_line "$env_name" "$token" "$profile"
@@ -1099,7 +1114,7 @@ for profile in "${PROFILES[@]}"; do
   box_recreated="$BOX_CHANGED"
   recreate_box_gateway
   restart_needed=0
-  { [ "$PLUGIN_SYNC_CHANGED" = 1 ] || [ "$STREAMING_CONFIG_CHANGED" = 1 ] || [ "$token_changed" = 1 ] || [ "$pending_before" = 1 ]; } && restart_needed=1
+  { [ "$PLUGIN_SYNC_CHANGED" = 1 ] || [ "$STREAMING_CONFIG_CHANGED" = 1 ] || [ "$token_changed" = 1 ] || [ "$attach_env_changed" = 1 ] || [ "$pending_before" = 1 ]; } && restart_needed=1
   if [ "$served" = 1 ]; then
     # The host rebuilds a profile only after its .env or config.yaml changed since its last look,
     # so mark one change after the reload even when every value above was already right.
@@ -1109,15 +1124,16 @@ for profile in "${PROFILES[@]}"; do
   else
     ensure_service "$profile" "$restart_needed"
   fi
-  # Nothing the attach connection depends on changed: same token, same plugin
-  # code, no restart-requiring config, no hot-add, box untouched, service already
-  # up. The connection that was live stays live and will never log a fresh
-  # hello, so waiting for one would only time out, fail the sweep and leave the
-  # pending marker, whose presence makes the next sweep restart the bot. A key
-  # Hermes reads per reply (the thinking preview) lands exactly this way.
-  if [ "$restart_needed" = 0 ] && [ "$hot_add" = 0 ] && [ "$box_recreated" = 0 ] \
-    && { [ "$served" = 1 ] || [ "$SERVICE_STARTED" = 0 ]; }; then
-    say "  nothing the attach connection depends on changed; its live connection stands"
+  # This run's only change was a key Hermes reads per reply (the thinking
+  # preview), confirmed on disk: same token, URL, spool and plugin code, no
+  # restart-requiring config, no hot-add, box untouched, service already up.
+  # The live connection stays live and will never log a fresh hello, so waiting
+  # for one would only time out, fail the sweep and leave the pending marker,
+  # whose presence makes the next sweep restart the bot. A run that changed
+  # NOTHING still verifies: that is how a manual run finds a broken attach.
+  if [ "$READ_PER_REPLY_WROTE" = 1 ] && [ "$restart_needed" = 0 ] && [ "$hot_add" = 0 ] \
+    && [ "$box_recreated" = 0 ] && { [ "$served" = 1 ] || [ "$SERVICE_STARTED" = 0 ]; }; then
+    say "  no attach change; not waiting for a new hello"
     [ "$DRY_RUN" = 1 ] || rm -f "$provisioning_pending"
     continue
   fi

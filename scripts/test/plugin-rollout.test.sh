@@ -159,6 +159,7 @@ streaming:
   buffer_threshold: 1
 YAML
   cat > "$hermes/profiles/$name/.env" <<EOF
+COZYGATEWAY_URL=https://warm.cozylabs.ai
 COZYGATEWAY_TOKEN=test-token
 COZYGATEWAY_SPOOL_PATH=$hermes/profiles/$name/plugin-data/cozygateway/attach-v1.sqlite
 EOF
@@ -1062,17 +1063,36 @@ check_thinking_repair_verifies_nothing() {
     > "$hermes/profiles/$p/config.yaml"
   make_fake_python "$hermes" ''
   loaded="ai.hermes.gateway-$p"; [ "$mode" = mux ] && loaded=''
-  for run in 1 2; do
-    rc=0
-    HOME="$TMP/$tag-home" PATH="$bin:/usr/bin:/bin" COZY_TEST_HERMES_HOME="$hermes" \
-      COZY_TEST_LAUNCHCTL_LOADED="$loaded" COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/$tag-ssh" \
-      COZY_TEST_HERMES_LOG="$hermes_log" COZY_TEST_CONTROL_LOG="$control_log" \
-      "$ROOT/scripts/provision-bot.sh" --verify-timeout 0 --hermes-home "$hermes" --box fake "$p" > "$out.$run" 2>&1 || rc=$?
-    [ "$rc" = 0 ] || { cat "$out.$run" >&2; fail "$mode sweep $run failed (rc=$rc)"; }
-    [ ! -e "$hermes/profiles/$p/.cozygateway-provision-pending" ] || fail "$mode sweep $run left the pending marker"
-  done
-  [ "$(grep -c "config set plugins.stream_reasoning_deltas true" "$hermes_log")" = 1 ] \
-    || fail "$mode: expected the key written once across two sweeps: $(cat "$hermes_log")"
+  rc=0
+  HOME="$TMP/$tag-home" PATH="$bin:/usr/bin:/bin" COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOADED="$loaded" COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/$tag-ssh" \
+    COZY_TEST_HERMES_LOG="$hermes_log" COZY_TEST_CONTROL_LOG="$control_log" \
+    "$ROOT/scripts/provision-bot.sh" --verify-timeout 0 --hermes-home "$hermes" --box fake "$p" > "$out" 2>&1 || rc=$?
+  [ "$rc" = 0 ] || { cat "$out" >&2; fail "$mode sweep failed (rc=$rc)"; }
+  assert_contains "$out" 'no attach change; not waiting for a new hello'
+  [ ! -e "$hermes/profiles/$p/.cozygateway-provision-pending" ] || fail "$mode sweep left the pending marker"
+  assert_contains "$hermes_log" 'config set plugins.stream_reasoning_deltas true'
+
+  # The next watcher tick finds nothing pending, so it never calls the
+  # provisioner (and so never re-verifies or restarts) for this profile again.
+  local repo="$TMP/$tag-repo" calls="$TMP/$tag-provision-calls" log="$TMP/$tag-watch.log"
+  mkdir -p "$repo/scripts" "$repo/integrations"
+  cp "$ROOT/scripts/bot-provisioner-watch.sh" "$ROOT/scripts/deprovision-bot.sh" "$ROOT/scripts/hermes-host.sh" "$repo/scripts/"
+  cp -R "$ROOT/integrations/attach-plugin" "$repo/integrations/attach-plugin"
+  cat > "$bin/provision" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" > "$COZY_TEST_PROVISION_CALLS"
+SH
+  chmod +x "$bin/provision"
+  mkdir -p "$TMP/$tag-runtime"
+  date +%s > "$TMP/$tag.lock.reconcile"
+  HOME="$TMP/$tag-home" TMPDIR="$TMP/$tag-runtime" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" COZY_TEST_LAUNCHCTL_LOADED="$loaded" \
+    COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/$tag-ssh" \
+    COZY_TEST_PROVISION_CALLS="$calls" COZY_PROVISION_COMMAND="$bin/provision" \
+    COZY_PROVISIONER_LOCK="$TMP/$tag.lock" COZY_PROVISIONER_RECONCILE_SECONDS=999999 \
+    "$repo/scripts/bot-provisioner-watch.sh" --dry-run --hermes-home "$hermes" --log "$log"
+  [ ! -e "$calls" ] || fail "$mode: the next watcher tick re-provisioned the profile: $(cat "$log")"
   if grep -q 'gateway restart' "$hermes_log"; then fail "$mode: a sweep restarted the host: $(cat "$hermes_log")"; fi
   if grep -q 'kickstart' "$launch_log" 2>/dev/null; then fail "$mode: a sweep kickstarted: $(cat "$launch_log")"; fi
   [ ! -s "$control_log" ] || fail "$mode: a sweep drove the host: $(cat "$control_log")"
@@ -1080,6 +1100,68 @@ check_thinking_repair_verifies_nothing() {
 test_a_thinking_only_sweep_does_not_wait_for_a_hello() {
   check_thinking_repair_verifies_nothing plain
   check_thinking_repair_verifies_nothing mux
+}
+
+# The skip is only for a run whose one change was a per-reply key. A rewritten
+# COZYGATEWAY_URL leaves the adapter dialing the old gateway until its process
+# restarts (a multiplexed rescan skips a live adapter), so it restarts and then
+# verifies; with no hello the sweep fails.
+check_url_change_restarts_and_verifies() {
+  local mode="$1" tag="url-$1" p=alpha rc=0 loaded
+  local hermes="$TMP/$tag-hermes" bin="$TMP/$tag-bin" hermes_log="$TMP/$tag-calls"
+  local launch_log="$TMP/$tag-launchctl" control_log="$TMP/$tag-control" out="$TMP/$tag.out"
+  make_fake_bin "$bin"
+  make_no_hello_ssh "$bin"
+  [ "$mode" = mux ] && make_multiplexed_root "$hermes"
+  make_profile "$hermes" "$p"
+  mkdir -p "$hermes/profiles/$p/plugins"
+  cp -R "$ROOT/integrations/attach-plugin" "$hermes/profiles/$p/plugins/cozygateway"
+  sed -i.bak 's#^COZYGATEWAY_URL=.*#COZYGATEWAY_URL=https://old-gateway.example.test#' "$hermes/profiles/$p/.env"
+  make_fake_python "$hermes" ''
+  loaded="ai.hermes.gateway-$p"; [ "$mode" = mux ] && loaded=''
+  HOME="$TMP/$tag-home" PATH="$bin:/usr/bin:/bin" COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOADED="$loaded" COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/$tag-ssh" \
+    COZY_TEST_HERMES_LOG="$hermes_log" COZY_TEST_CONTROL_LOG="$control_log" \
+    "$ROOT/scripts/provision-bot.sh" --verify-timeout 0 --hermes-home "$hermes" --box fake "$p" > "$out" 2>&1 || rc=$?
+  assert_contains "$hermes/profiles/$p/.env" 'COZYGATEWAY_URL=https://warm.cozylabs.ai'
+  [ "$rc" != 0 ] || fail "$mode: a URL change with no hello passed"
+  assert_contains "$out" 'no attach hello in the box log'
+  if [ "$mode" = mux ]; then
+    assert_contains "$hermes_log" '-p default gateway restart'
+  else
+    assert_contains "$launch_log" "kickstart -k gui/"
+  fi
+}
+test_a_url_change_restarts_and_verifies() {
+  check_url_change_restarts_and_verifies plain
+  check_url_change_restarts_and_verifies mux
+}
+
+# A run that changed nothing at all still verifies: a manual provision-bot.sh
+# on a fully configured profile is how an operator finds an attach that is
+# genuinely broken, so it must fail and keep the marker, not report success.
+check_noop_run_still_verifies() {
+  local mode="$1" tag="noop-verify-$1" p=alpha rc=0 loaded
+  local hermes="$TMP/$tag-hermes" bin="$TMP/$tag-bin" out="$TMP/$tag.out"
+  make_fake_bin "$bin"
+  make_no_hello_ssh "$bin"
+  [ "$mode" = mux ] && make_multiplexed_root "$hermes"
+  make_profile "$hermes" "$p"
+  mkdir -p "$hermes/profiles/$p/plugins"
+  cp -R "$ROOT/integrations/attach-plugin" "$hermes/profiles/$p/plugins/cozygateway"
+  make_fake_python "$hermes" ''
+  loaded="ai.hermes.gateway-$p"; [ "$mode" = mux ] && loaded=''
+  HOME="$TMP/$tag-home" PATH="$bin:/usr/bin:/bin" COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOADED="$loaded" COZY_TEST_LAUNCHCTL_LOG="$TMP/$tag-launchctl" COZY_TEST_SSH_LOG="$TMP/$tag-ssh" \
+    COZY_TEST_HERMES_LOG="$TMP/$tag-calls" COZY_TEST_CONTROL_LOG="$TMP/$tag-control" \
+    "$ROOT/scripts/provision-bot.sh" --verify-timeout 0 --hermes-home "$hermes" --box fake "$p" > "$out" 2>&1 || rc=$?
+  [ "$rc" != 0 ] || { cat "$out" >&2; fail "$mode: a no-op run on a broken attach reported success"; }
+  assert_contains "$out" 'no attach hello in the box log'
+  [ -e "$hermes/profiles/$p/.cozygateway-provision-pending" ] || fail "$mode: a failed verify dropped the pending marker"
+}
+test_a_noop_run_still_verifies() {
+  check_noop_run_still_verifies plain
+  check_noop_run_still_verifies mux
 }
 
 # And a change the connection DOES depend on is still verified: the display
@@ -1335,6 +1417,8 @@ test_provisioner_turns_the_thinking_preview_on_once
 test_provisioner_restarts_for_the_keys_that_landed_when_one_fails
 test_a_thinking_only_sweep_does_not_wait_for_a_hello
 test_a_restarting_sweep_still_waits_for_the_hello
+test_a_url_change_restarts_and_verifies
+test_a_noop_run_still_verifies
 test_provisioner_leaves_cadence_alone_beside_another_platform
 test_provisioner_leaves_streaming_turned_off_on_purpose
 test_provisioner_does_not_restart_when_the_write_did_not_land
