@@ -21,6 +21,9 @@ import {
   BotModelProviderOAuthCodeSchema,
   BotProfilePatchSchema,
   BotPresentationPatchSchema,
+  BotAvatarSetRequestSchema,
+  BotAvatarGenerateRequestSchema,
+  BotAvatarPetThumbRequestSchema,
   IntegrationCreateRequestSchema,
   IntegrationCatalogInstallRequestSchema,
   IntegrationEnabledRequestSchema,
@@ -75,6 +78,10 @@ import {
 } from "./crud.ts";
 import { GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
 import { PresentationConflict, PresentationNotApplied } from "./presentation.ts";
+import { AvatarInvalid, decodeAvatar } from "./avatar.ts";
+
+/** A 2 MB image as base64 in a JSON envelope, with headroom. */
+const AVATAR_PUT_MAX_BYTES = 3_000_000;
 import {
   MEDIA_CACHE_CONTROL,
   MEDIA_MAX_CONCURRENT,
@@ -297,6 +304,8 @@ function failure(c: Context<Env>, err: unknown) {
     return c.json(extensionErrorBody("conflict", err.message), 409);
   if (err instanceof PresentationNotApplied)
     return c.json(errorBody("backend_unavailable", err.message), 503);
+  if (err instanceof AvatarInvalid)
+    return c.json(errorBody("invalid_request", err.message), 400);
   if (err instanceof BotSessionConflict) {
     return c.json(extensionErrorBody("conflict", err.message), 409);
   }
@@ -1127,6 +1136,12 @@ export function registerBotRoutes(
     const jsonBody = async (c: Context<Env>): Promise<unknown> => {
       try { return await c.req.json(); } catch { return undefined; }
     };
+    // The PUT body is read against a hard cap whether or not the sender declared a length: a
+    // chunked upload declares nothing, and `c.req.json()` would buffer whatever arrived.
+    const cappedJson = async (c: Context<Env>): Promise<unknown> => {
+      const bytes = await readCappedBody(c.req.raw.body, AVATAR_PUT_MAX_BYTES);
+      try { return JSON.parse(new TextDecoder().decode(bytes)); } catch { return undefined; }
+    };
     const invalidBody = (c: Context<Env>, err: unknown): Response =>
       c.json(errorBody("invalid_request", err instanceof Error ? err.message : "malformed body"), 400);
 
@@ -1405,7 +1420,7 @@ export function registerBotRoutes(
       }
       // An empty patch is a client bug; an empty success would hide it.
       if (Object.keys(parsed).length === 0) {
-        return c.json(errorBody("invalid_request", "at least one of pinned, hidden, sectionId, sectionName, title is required"), 400);
+        return c.json(errorBody("invalid_request", "at least one presentation key is required"), 400);
       }
       try {
         return c.json(await writePresentation(resolved.name, parsed));
@@ -1413,6 +1428,156 @@ export function registerBotRoutes(
         return failure(c, err);
       }
     });
+  }
+
+  // Capability 81: avatars. The picture is the profile's avatar asset (`profiles.get_asset` /
+  // `set_asset`); a generated portrait and a chosen pet are returned for the phone to preview and
+  // then saved with PUT, as the desktop's picker does. Registered only on a surface that can answer.
+  if (bots.botAvatar !== undefined && bots.setBotAvatar !== undefined) {
+    const readAvatar = bots.botAvatar.bind(bots);
+    const writeAvatar = bots.setBotAvatar.bind(bots);
+    const jsonBody = async (c: Context<Env>): Promise<unknown> => {
+      try { return await c.req.json(); } catch { return undefined; }
+    };
+    // The PUT body is read against a hard cap whether or not the sender declared a length: a
+    // chunked upload declares nothing, and `c.req.json()` would buffer whatever arrived.
+    const cappedJson = async (c: Context<Env>): Promise<unknown> => {
+      const bytes = await readCappedBody(c.req.raw.body, AVATAR_PUT_MAX_BYTES);
+      try { return JSON.parse(new TextDecoder().decode(bytes)); } catch { return undefined; }
+    };
+    const invalid = (c: Context<Env>, err: unknown) =>
+      c.json(errorBody("invalid_request", err instanceof ContractViolation ? err.message : "malformed body"), 400);
+    const imageResponse = (image: { mime: string; bytes: Uint8Array }) =>
+      // Copied: a Node Buffer is a view into a shared pool, so `.buffer` would send the whole pool.
+      new Response(new Uint8Array(image.bytes), {
+        status: 200,
+        headers: {
+          "content-type": image.mime,
+          "content-length": String(image.bytes.byteLength),
+          // The URL is versioned by the look's revision, so a private cache may keep it a while.
+          "cache-control": "private, max-age=3600",
+          "x-content-type-options": "nosniff",
+        },
+      });
+
+    app.get("/bots/:name/avatar", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        const image = await readAvatar(resolved.name);
+        if (image === undefined) return c.json(errorBody("not_found", `bot "${resolved.name}" has no avatar`), 404);
+        return imageResponse(image);
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+
+    app.put("/bots/:name/avatar", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      const declared = Number(c.req.header("content-length") ?? "0");
+      if (Number.isFinite(declared) && declared > AVATAR_PUT_MAX_BYTES) {
+        return c.json(errorBody("invalid_request", "avatar is larger than 2 MB"), 413);
+      }
+      let body: unknown;
+      try {
+        body = await cappedJson(c);
+      } catch {
+        return c.json(errorBody("invalid_request", "avatar is larger than 2 MB"), 413);
+      }
+      let parsed;
+      try {
+        parsed = assertValid(BotAvatarSetRequestSchema, body);
+        decodeAvatar(parsed.data);
+      } catch (err) {
+        if (err instanceof AvatarInvalid) return failure(c, err);
+        return invalid(c, err);
+      }
+      try {
+        return c.json(await writeAvatar(resolved.name, parsed.data));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+
+    app.delete("/bots/:name/avatar", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        return c.json(await writeAvatar(resolved.name, null));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+
+    if (bots.generateBotAvatar !== undefined) {
+      const generate = bots.generateBotAvatar.bind(bots);
+      app.post("/bots/:name/avatar/generate", requireDevice, async (c) => {
+        const resolved = canonicalName(c);
+        if ("response" in resolved) return resolved.response;
+        let parsed;
+        try {
+          parsed = assertValid(BotAvatarGenerateRequestSchema, await jsonBody(c));
+        } catch (err) {
+          return invalid(c, err);
+        }
+        if (parsed.probe !== true && parsed.prompt === undefined) {
+          return c.json(errorBody("invalid_request", "prompt is required unless probe is true"), 400);
+        }
+        try {
+          return c.json(await generate(resolved.name, parsed));
+        } catch (err) {
+          return failure(c, err);
+        }
+      });
+    }
+
+    if (bots.botAvatarPets !== undefined && bots.botAvatarPetThumb !== undefined) {
+      const pets = bots.botAvatarPets.bind(bots);
+      const thumb = bots.botAvatarPetThumb.bind(bots);
+      app.get("/bots/:name/avatar/pets", requireDevice, async (c) => {
+        const resolved = canonicalName(c);
+        if ("response" in resolved) return resolved.response;
+        try {
+          return c.json(await pets(resolved.name, c.req.query("localOnly") === "1" || c.req.query("localOnly") === "true"));
+        } catch (err) {
+          return failure(c, err);
+        }
+      });
+
+      app.post("/bots/:name/avatar/pets/thumb", requireDevice, async (c) => {
+        const resolved = canonicalName(c);
+        if ("response" in resolved) return resolved.response;
+        let parsed;
+        try {
+          parsed = assertValid(BotAvatarPetThumbRequestSchema, await jsonBody(c));
+        } catch (err) {
+          return invalid(c, err);
+        }
+        try {
+          return c.json(await thumb(resolved.name, parsed.slug, parsed.url ?? ""));
+        } catch (err) {
+          return failure(c, err);
+        }
+      });
+
+      // A legacy `ui_meta.pet` slug drawn as bytes (the roster's `avatar.kind: "pet"` URL), so a
+      // pet the desktop once picked renders as the pet rather than as a jelly.
+      app.get("/bots/:name/avatar/pets/:slug", requireDevice, async (c) => {
+        const resolved = canonicalName(c);
+        if ("response" in resolved) return resolved.response;
+        const slug = c.req.param("slug");
+        if (!/^[A-Za-z0-9._-]{1,128}$/.test(slug)) return c.json(errorBody("invalid_request", "bad pet slug"), 400);
+        try {
+          const answer = await thumb(resolved.name, slug, "");
+          if (!answer.ok || answer.image === undefined) return c.json(errorBody("not_found", `no thumbnail for pet "${slug}"`), 404);
+          return imageResponse(decodeAvatar(answer.image));
+        } catch (err) {
+          if (err instanceof AvatarInvalid) return c.json(errorBody("not_found", `no thumbnail for pet "${slug}"`), 404);
+          return failure(c, err);
+        }
+      });
+    }
   }
 
   app.get("/bots/:name/model-config", requireDevice, async (c) => {

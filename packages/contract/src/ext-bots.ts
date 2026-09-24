@@ -90,6 +90,16 @@ export const BotSummarySchema = Type.Object({
   runnerId: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
   runnerName: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
   meta: Type.Union([Type.Record(Type.String(), Type.Unknown()), Type.Null()]),
+  /** Capability 81. How to draw the bot when it is not a drawn face: an `image` served by
+   *  `GET /bots/:name/avatar` (an upload, a generated portrait or a chosen pet, all stored as the
+   *  profile's avatar asset), or a legacy `pet` slug whose thumbnail `imageUrl` serves. `imageUrl`
+   *  is gateway-relative and carries a `v` that changes when the look is rewritten, so a client
+   *  cache keyed on it refetches. Absent: draw the face `meta` describes. */
+  avatar: Type.Optional(Type.Object({
+    kind: Type.Union([Type.Literal("image"), Type.Literal("pet")]),
+    imageUrl: Type.Optional(Type.String({ minLength: 1, maxLength: 512, pattern: "^/" })),
+    petSlug: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+  }, { additionalProperties: false })),
 });
 export type BotSummary = Static<typeof BotSummarySchema>;
 
@@ -1473,12 +1483,36 @@ export type BotProfile = Static<typeof BotProfileSchema>;
  *  optional because the blob simply lacks a key nobody wrote; an absent key is NOT `false`, which is
  *  what lets a client push a device-local pin the first time it syncs. */
 const PresentationText = Type.String({ minLength: 1, maxLength: 128, pattern: "\\S" });
+/** Capability 81. The desktop's face string: `blobatar[:seed[:kind]]`, a geometric shape, or a
+ *  legacy `sigil-<n>`. Free-form on purpose; the client parses it. */
+const LookShape = Type.String({ minLength: 1, maxLength: 256, pattern: "\\S" });
+/** Capability 81. CozyChat's own namespaced look record inside the same blob: the exact Living Jelly
+ *  a phone chose (`jelly`), the seed it locked (`seed`), a Prism tint (`prism`, `#rrggbb`) and the
+ *  desktop `shape` it wrote beside them (`shape`), which is how a phone tells whether a desktop has
+ *  changed the look since. */
+export const BotCozyLookSchema = Type.Object({
+  jelly: Type.Optional(PresentationText),
+  seed: Type.Optional(PresentationText),
+  prism: Type.Optional(Type.String({ pattern: "^#[0-9a-fA-F]{6}$" })),
+  shape: Type.Optional(LookShape),
+  /** The desktop `color` written beside it: a colour-only desktop change also retires the record. */
+  color: Type.Optional(PresentationText),
+}, { additionalProperties: false });
+export type BotCozyLook = Static<typeof BotCozyLookSchema>;
+const ImageKind = Type.Union([Type.Literal("photo"), Type.Literal("shape")]);
+
 export const BotPresentationSchema = Type.Object({
   pinned: Type.Optional(Type.Boolean()),
   hidden: Type.Optional(Type.Boolean()),
   sectionId: Type.Optional(PresentationText),
   sectionName: Type.Optional(PresentationText),
   title: Type.Optional(PresentationText),
+  /** Capability 81: the look. */
+  shape: Type.Optional(LookShape),
+  color: Type.Optional(PresentationText),
+  custom: Type.Optional(Type.Boolean()),
+  imageKind: Type.Optional(ImageKind),
+  cozychat: Type.Optional(BotCozyLookSchema),
 }, { additionalProperties: false });
 export type BotPresentation = Static<typeof BotPresentationSchema>;
 
@@ -1491,6 +1525,16 @@ export const BotPresentationPatchSchema = Type.Object({
   sectionId: Type.Optional(Type.Union([PresentationText, Type.Null()])),
   sectionName: Type.Optional(Type.Union([PresentationText, Type.Null()])),
   title: Type.Optional(Type.Union([PresentationText, Type.Null()])),
+  /** Capability 81: the look, set or (`null`) cleared key by key like the rest. */
+  shape: Type.Optional(Type.Union([LookShape, Type.Null()])),
+  color: Type.Optional(Type.Union([PresentationText, Type.Null()])),
+  custom: Type.Optional(Type.Union([Type.Boolean(), Type.Null()])),
+  imageKind: Type.Optional(Type.Union([ImageKind, Type.Null()])),
+  cozychat: Type.Optional(Type.Union([BotCozyLookSchema, Type.Null()])),
+  /** Capability 81: a backfill. Written only if the blob, re-read inside the compare-and-swap loop,
+   *  still has NO look key; otherwise the write is skipped and the current presentation answered.
+   *  This is how a phone's first sync can never overwrite a look another client wrote meanwhile. */
+  lookIfAbsent: Type.Optional(Type.Boolean()),
 }, { additionalProperties: false });
 export type BotPresentationPatch = Static<typeof BotPresentationPatchSchema>;
 
@@ -1502,6 +1546,69 @@ export const BotPresentationResponseSchema = Type.Object({
   revision: Type.Integer({ minimum: 0 }),
 }, { additionalProperties: false });
 export type BotPresentationResponse = Static<typeof BotPresentationResponseSchema>;
+
+/** Capability 81. `PUT /bots/:name/avatar`: a PNG, JPEG or WebP as a data URL (or bare base64),
+ *  at most 2 MB decoded. The format is sniffed from the bytes, never taken from the declared type. */
+export const BotAvatarSetRequestSchema = Type.Object({
+  data: Type.String({ minLength: 8, maxLength: 2_800_000 }),
+}, { additionalProperties: false });
+export type BotAvatarSetRequest = Static<typeof BotAvatarSetRequestSchema>;
+
+/** Capability 81. `PUT`/`DELETE /bots/:name/avatar` answer. */
+export const BotAvatarSetResponseSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 128 }),
+  hasAvatar: Type.Boolean(),
+  size: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotAvatarSetResponse = Static<typeof BotAvatarSetResponseSchema>;
+
+/** Capability 81. `POST /bots/:name/avatar/generate`: `probe: true` only asks whether Hermes has an
+ *  image backend; otherwise `prompt` is required. */
+export const BotAvatarGenerateRequestSchema = Type.Object({
+  prompt: Type.Optional(Type.String({ minLength: 1, maxLength: 2000, pattern: "\\S" })),
+  probe: Type.Optional(Type.Boolean()),
+}, { additionalProperties: false });
+export type BotAvatarGenerateRequest = Static<typeof BotAvatarGenerateRequestSchema>;
+
+/** Capability 81. `image` is a data URL, present only on success. The portrait is NOT saved: the
+ *  client previews it and saves it with `PUT /bots/:name/avatar`, as the desktop does. */
+export const BotAvatarGenerateResponseSchema = Type.Object({
+  available: Type.Boolean(),
+  success: Type.Optional(Type.Boolean()),
+  image: Type.Optional(Type.String()),
+  error: Type.Optional(Type.String()),
+}, { additionalProperties: false });
+export type BotAvatarGenerateResponse = Static<typeof BotAvatarGenerateResponseSchema>;
+
+/** Capability 81. One petdex companion from `GET /bots/:name/avatar/pets`. */
+export const BotAvatarPetSchema = Type.Object({
+  slug: Type.String({ minLength: 1, maxLength: 128 }),
+  displayName: Type.String(),
+  installed: Type.Boolean(),
+  curated: Type.Boolean(),
+  /** Empty for a pet hatched locally, which the thumb route still serves from disk. */
+  spritesheetUrl: Type.String(),
+}, { additionalProperties: false });
+export type BotAvatarPet = Static<typeof BotAvatarPetSchema>;
+
+export const BotAvatarPetGallerySchema = Type.Object({
+  pets: Type.Array(BotAvatarPetSchema),
+}, { additionalProperties: false });
+export type BotAvatarPetGallery = Static<typeof BotAvatarPetGallerySchema>;
+
+/** Capability 81. `POST /bots/:name/avatar/pets/thumb`: a pet's first idle frame as a PNG data URI,
+ *  cropped by Hermes (`pet.thumb`). The client sets it as the avatar with `PUT`. */
+export const BotAvatarPetThumbRequestSchema = Type.Object({
+  slug: Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._-]+$" }),
+  url: Type.Optional(Type.String({ maxLength: 1024 })),
+}, { additionalProperties: false });
+export type BotAvatarPetThumbRequest = Static<typeof BotAvatarPetThumbRequestSchema>;
+
+export const BotAvatarPetThumbResponseSchema = Type.Object({
+  ok: Type.Boolean(),
+  image: Type.Optional(Type.String()),
+}, { additionalProperties: false });
+export type BotAvatarPetThumbResponse = Static<typeof BotAvatarPetThumbResponseSchema>;
 
 const NameItem = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
 
@@ -3103,5 +3210,11 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * Capability 79: reserved, runtime-bot settings (CozyAgents gateway). Not advertised meaning here.
  * Capability 80: `GET`/`PATCH /bots/:name/presentation` reads and writes the synced roster
  * presentation (pin, hide, user section, title) in `ui_meta["hermes-bots"]` with Hermes's own
- * per-key compare-and-swap; a revision conflict re-reads and re-applies only the patched keys. */
-export const BOTS_CAPABILITY_VERSION = 80;
+ * per-key compare-and-swap; a revision conflict re-reads and re-applies only the patched keys.
+ * Capability 81: avatars. The presentation carries the look (`shape`, `color`, `custom`,
+ * `imageKind`, and CozyChat's namespaced `cozychat` record); `GET`/`PUT`/`DELETE /bots/:name/avatar`
+ * read and write the profile's avatar asset (`profiles.get_asset`/`set_asset`),
+ * `POST /bots/:name/avatar/generate` probes and runs `image.generate`, and
+ * `GET /bots/:name/avatar/pets` + `POST /bots/:name/avatar/pets/thumb` browse the petdex gallery.
+ * `BotSummary.avatar` names the image to draw. */
+export const BOTS_CAPABILITY_VERSION = 81;
