@@ -763,17 +763,28 @@ describe("client-declared MCP servers (capability 89)", () => {
       "http://[febf::1]/mcp", "http://[::ffff:127.0.0.1]/mcp", "http://[::ffff:7f00:1]/mcp",
       "http://[::ffff:169.254.169.254]/mcp", "http://[fd00:ec2::254]/mcp",
       "https://ha.example.com\\@127.0.0.1/mcp", "https:\\\\ha.example.com/mcp",
+      // Other clouds' metadata services, and the loopback and metadata NAMES.
+      "http://100.100.100.200/latest/meta-data", "http://192.0.0.192/opc/v1", "http://metadata.google.internal/computeMetadata/v1",
+      "http://localhost.localdomain/mcp", "http://ip6-localhost/mcp", "http://ip6-loopback/mcp",
+      // IPv6 forms that carry an IPv4 address are that address: IPv4-compatible `::/96` in both
+      // spellings, NAT64 `64:ff9b::/96`, and 6to4 `2002::/16`.
+      "http://[::127.0.0.1]/mcp", "http://[::7f00:1]/mcp", "http://[::a9fe:a9fe]/mcp",
+      "http://[64:ff9b::127.0.0.1]/mcp", "http://[64:ff9b::a9fe:a9fe]/mcp",
+      "http://[2002:7f00:1::]/mcp", "http://[2002:a9fe:a9fe::1]/mcp",
+      // Deprecated site-local `fec0::/10`, across the whole prefix.
+      "http://[fec0::1]/mcp", "http://[feff::1]/mcp",
     ];
     for (const url of refused) {
       expect(mcpServerDeclarationProblem({ declareMcpServers: [{ ...home, url }] }), url).toBeDefined();
     }
-    for (const url of ["https://ha.example.com/api/mcp", "http://192.168.1.20:8123/api/mcp", "http://10.0.0.5/mcp", "http://ha.local/mcp", "http://[fec0::1]/mcp", "http://127.example.com/mcp"]) {
+    for (const url of ["https://ha.example.com/api/mcp", "http://192.168.1.20:8123/api/mcp", "http://10.0.0.5/mcp", "http://ha.local/mcp", "http://127.example.com/mcp",
+      "http://[2001:db8::1]/mcp", "http://[64:ff9b::808:808]/mcp", "http://[2002:808:808::]/mcp", "http://[::808:808]/mcp", "http://[fd00::1]/mcp"]) {
       expect(mcpServerDeclarationProblem({ declareMcpServers: [{ ...home, url }] }), url).toBeUndefined();
     }
   });
 
   it("refuses the framing, routing and cookie headers, in any case", () => {
-    for (const header of ["Host", "content-length", "Transfer-Encoding", "CONNECTION", "Keep-Alive", "Upgrade", "TE", "Trailer", "Cookie", "Proxy-Authorization", "proxy-connection"]) {
+    for (const header of ["Host", "content-length", "Transfer-Encoding", "CONNECTION", "Keep-Alive", "Upgrade", "TE", "Trailer", "Cookie", "Proxy-Authorization", "proxy-connection", "Mcp-Session-Id", "mcp-session-id", "Expect"]) {
       const declaration = { ...home, headers: { [header]: "${COZY_MCP_A}" } };
       expect(check(BotMcpServerDeclarationSchema, declaration), header).toBe(true);
       expect(mcpServerDeclarationProblem({ declareMcpServers: [declaration] }), header).toContain("may not set header");

@@ -1453,7 +1453,9 @@ const McpToolNameSchema = Type.String({ pattern: "^[A-Za-z0-9_./:-]{1,128}$" });
  *  named. Naming is not sending: the peer expands `${COZY_MCP_<NAME>}` ONLY when the declaration's
  *  URL origin (scheme, host, port) is listed in the operator-set `COZY_MCP_<NAME>_ORIGINS` (a comma
  *  list of origins), and otherwise refuses the whole declaration by name in `ignored`, before
- *  anything is dialled. So a device that can write this patch still cannot aim an operator secret
+ *  anything is dialled. An entry is compared exactly against the WHATWG `URL.origin`
+ *  serialization: no wildcards, and `null` never matches. The binding is per origin, not per path,
+ *  so an operator lists only origins whose whole surface they trust with that token. So a device that can write this patch still cannot aim an operator secret
  *  at a URL of its choosing: the origin allowlist is set on the harness, never through this lane,
  *  and a header may not name an `_ORIGINS` variable itself.
  *
@@ -1463,8 +1465,10 @@ const McpToolNameSchema = Type.String({ pattern: "^[A-Za-z0-9_./:-]{1,128}$" });
  *  metadata host and `localhost`. The peer is the real SSRF boundary: it puts every client-declared
  *  URL through its URL policy with private, loopback and link-local addresses blocked, refuses
  *  `.local` hosts, and allows private hosts only under an operator setting for CLIENT declarations
- *  that is separate from the one its own servers use; it checks the RESOLVED address and either
- *  pins it for the connection or re-checks every redirect hop (or refuses redirects).
+ *  that is separate from the one its own servers use; it checks the RESOLVED address, pins it for
+ *  the connection AND re-checks every redirect hop (or refuses redirects). Once any header has been
+ *  expanded it never follows a redirect off the allowlisted origin: `fetch` carries a custom header
+ *  such as `X-Api-Key` across a cross-origin redirect.
  *
  *  Harness-owned settings are absent for the same reason: `mutating`, capability 63's `repair`,
  *  `groups` and the budgets are the operator's. The harness MUST treat EVERY tool of a
@@ -1892,47 +1896,71 @@ export type BotProfilePatch = Static<typeof BotProfilePatchSchema>;
  *  prototype rather than an own entry. Refused as server, tool, action and header names. */
 const PROTOTYPE_KEYS: ReadonlySet<string> = new Set(["__proto__", "constructor", "prototype"]);
 
-/** Capability 89. Headers a declaration may not set: the transport's own framing and routing
- *  (a smuggled `Host` or `Transfer-Encoding` re-aims or re-frames the request), and ambient
- *  credentials (`Cookie`). Compared case-insensitively; every `Proxy-*` header is included. */
+/** Capability 89. Headers a declaration may not set: the transport's own framing, routing and
+ *  session (a smuggled `Host` or `Transfer-Encoding` re-aims or re-frames the request, and
+ *  `Mcp-Session-Id` would hijack or pin a session the harness owns), and ambient credentials
+ *  (`Cookie`). Compared case-insensitively; every `Proxy-*` header is included. */
 const DENIED_HEADERS: ReadonlySet<string> = new Set([
   "host", "content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer", "cookie",
+  // The MCP transport's own session header, and the interim-response handshake.
+  "mcp-session-id", "expect",
 ]);
+
+/** Capability 89. Host NAMES that mean this machine or a cloud metadata service. */
+const REFUSED_HOST_NAMES: ReadonlySet<string> = new Set([
+  "localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback", "metadata.google.internal",
+]);
+
+/** Capability 89. Why an IPv4 address (as four octets) is refused, or `undefined`. */
+function refusedIpv4(a: number, b: number, c: number, d: number): string | undefined {
+  if (a === 127) return "a loopback address";
+  if (a === 0) return "an unspecified address";
+  if (a === 169 && b === 254) return "a link-local or cloud metadata address";
+  if (a === 100 && b === 100 && c === 100 && d === 200) return "a cloud metadata address";
+  if (a === 192 && b === 0 && c === 0 && d === 192) return "a cloud metadata address";
+  return undefined;
+}
+
+/** Capability 89. A WHATWG-serialized IPv6 host (hex groups, `::` compressed, never dotted) as
+ *  its eight 16-bit groups, or `undefined` when it is not one. */
+function ipv6Groups(host: string): number[] | undefined {
+  const halves = host.split("::");
+  if (halves.length > 2) return undefined;
+  const parse = (part: string) => (part === "" ? [] : part.split(":").map((group) => /^[0-9a-f]{1,4}$/.test(group) ? parseInt(group, 16) : NaN));
+  const head = parse(halves[0]!);
+  const tail = halves.length === 2 ? parse(halves[1]!) : [];
+  const fill = 8 - head.length - tail.length;
+  if (halves.length === 1 ? head.length !== 8 : fill < 1) return undefined;
+  const groups = [...head, ...Array<number>(halves.length === 2 ? fill : 0).fill(0), ...tail];
+  return groups.some(Number.isNaN) ? undefined : groups;
+}
 
 /** Capability 89. Why a URL's host is one the gateway refuses outright, or `undefined`. Defence in
  *  depth only: the literal forms are refusable here without a DNS lookup, and everything a name
  *  resolves to (a private address, a `.local` host, a redirect) is the peer's URL policy to check
  *  at connect time, as row 89 requires. `hostname` is the WHATWG-normalized one, so an IPv4 in
- *  decimal, hex or shorthand has already been rewritten to dotted quads, and IPv6 is compressed. */
+ *  decimal, hex or shorthand has already been rewritten to dotted quads, and IPv6 is compressed
+ *  hex. An IPv6 form that CARRIES an IPv4 address (mapped `::ffff:0:0/96`, the deprecated
+ *  IPv4-compatible `::/96`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`) is judged as that address. */
 function refusedHost(hostname: string): string | undefined {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (host === "localhost" || host.endsWith(".localhost")) return "a loopback host";
-  const v4 = (text: string): string | undefined => {
-    const match = /^(\d+)\.(\d+)\.\d+\.\d+$/.exec(text);
-    if (match === null) return undefined;
-    const [a, b] = [Number(match[1]), Number(match[2])];
-    if (a === 127) return "a loopback address";
-    if (a === 0) return "an unspecified address";
-    if (a === 169 && b === 254) return "a link-local or cloud metadata address";
-    return undefined;
-  };
-  const ipv4 = v4(host);
-  if (ipv4 !== undefined) return ipv4;
+  if (REFUSED_HOST_NAMES.has(host) || host.endsWith(".localhost")) return "a loopback or metadata host";
+  const quad = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(host);
+  if (quad !== null) return refusedIpv4(Number(quad[1]), Number(quad[2]), Number(quad[3]), Number(quad[4]));
   if (!host.includes(":")) return undefined;
-  if (host === "::1") return "a loopback address";
-  if (host === "::") return "an unspecified address";
-  if (/^fe[89ab][0-9a-f]:/.test(host)) return "a link-local address";
-  if (host === "fd00:ec2::254") return "a cloud metadata address";
-  // IPv4-mapped (`::ffff:127.0.0.1`, which WHATWG prints as `::ffff:7f00:1`) is the IPv4 address.
-  const mapped = /^::ffff:(?:([0-9a-f]{1,4}):([0-9a-f]{1,4})|(\d+\.\d+\.\d+\.\d+))$/.exec(host);
-  if (mapped !== null) {
-    const dotted = mapped[3] ?? (() => {
-      const high = parseInt(mapped[1]!, 16);
-      const low = parseInt(mapped[2]!, 16);
-      return `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
-    })();
-    return v4(dotted);
-  }
+  const g = ipv6Groups(host);
+  if (g === undefined) return undefined;
+  const zero = (from: number, to: number) => g.slice(from, to).every((group) => group === 0);
+  const embedded = (high: number, low: number) => refusedIpv4(high >> 8, high & 255, low >> 8, low & 255);
+  if (zero(0, 8)) return "an unspecified address";
+  if (zero(0, 7) && g[7] === 1) return "a loopback address";
+  if ((g[0]! & 0xffc0) === 0xfe80) return "a link-local address";
+  if ((g[0]! & 0xffc0) === 0xfec0) return "a site-local address";
+  if (g[0] === 0xfd00 && g[1] === 0x0ec2 && zero(2, 7) && g[7] === 0x0254) return "a cloud metadata address";
+  if (zero(0, 5) && g[5] === 0xffff) return embedded(g[6]!, g[7]!);
+  if (zero(0, 6)) return embedded(g[6]!, g[7]!);
+  if (g[0] === 0x64 && g[1] === 0xff9b && zero(2, 6)) return embedded(g[6]!, g[7]!);
+  if (g[0] === 0x2002) return embedded(g[1]!, g[2]!);
   return undefined;
 }
 
@@ -1949,8 +1977,9 @@ function refusedHost(hostname: string): string | undefined {
  *  The URL must parse as http or https and carry no userinfo, query, fragment, backslash or `${...}`
  *  placeholder, which keeps the obvious credential slots out of an address every projection shows
  *  (a path segment can still hold anything, so a client must not put a secret there). Its host may
- *  not be a literal loopback, unspecified, link-local or cloud metadata address, nor `localhost`:
- *  defence in depth only, since the peer's URL policy is what checks a NAME's resolved address. */
+ *  not be a literal loopback, unspecified, link-local, site-local or cloud metadata address (an
+ *  IPv6 form carrying one included), nor a loopback or metadata host name (`refusedHost`): defence
+ *  in depth only, since the peer's URL policy is what checks a NAME's resolved address. */
 export function mcpServerDeclarationProblem(patch: BotProfilePatch): string | undefined {
   for (const name of patch.removeMcpServers ?? []) {
     if (PROTOTYPE_KEYS.has(name)) return `removeMcpServers may not name ${name}`;
@@ -3854,7 +3883,8 @@ export type BotScreenRequestCancelFrame = Static<typeof BotScreenRequestCancelFr
  * by name otherwise. The gateway refuses userinfo, query, fragment, backslash, placeholders and a
  * literal loopback, link-local or metadata host (`mcpServerDeclarationProblem`, `400`); the peer's
  * URL policy owns the resolved address, `.local`, private hosts (a separate operator opt-in for
- * client declarations) and redirects. Every tool of a client-declared server asks.
+ * client declarations) and redirects (pinned, every hop re-checked, never off the allowlisted
+ * origin once a header is expanded). Every tool of a client-declared server asks.
  *
  * GATED THREE WAYS. The route is the write-scoped paired device's (capability 72 refuses a
  * read-scoped one `403`). The gateway forwards either field only to a peer that offered the

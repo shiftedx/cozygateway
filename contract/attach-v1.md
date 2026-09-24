@@ -316,10 +316,13 @@ beside `memory_management`; the gateway refuses such a write to any other peer b
 built, and builds every `profile.write` input from the published patch keys only. A harness offers
 the capability only when its operator turned client declarations on. The peer MUST: expand a header's
 `${COZY_MCP_<NAME>}` only when the declaration's URL origin is listed in the operator-set
-`COZY_MCP_<NAME>_ORIGINS`, refusing the declaration by name in `ignored` otherwise; put every
+`COZY_MCP_<NAME>_ORIGINS` (each entry compared exactly against the URL's WHATWG `URL.origin`; no
+wildcards, `null` never matches; the binding is per origin, not per path), refusing the declaration
+by name in `ignored` otherwise; put every
 client-declared URL through its URL policy on the resolved address (private, loopback, link-local
 and `.local` blocked unless the operator allowed private hosts for client declarations
-specifically), pinning that address or re-checking every redirect hop; treat every tool of a
+specifically), pinning that address AND re-checking every redirect hop, and never following a
+redirect off the allowlisted origin once any header has been expanded; treat every tool of a
 client-declared server as mutating regardless of an absent `mutating`; apply removals, then
 declarations, then `enabledMcpServers`; never change enablement from a declaration; and refuse by
 name in `ignored` any name the client did not declare. A `profile.read` row MAY carry

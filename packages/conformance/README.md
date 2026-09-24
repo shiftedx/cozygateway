@@ -52,8 +52,10 @@ variables the schema refuses, and the bodies `mcpServerDeclarationProblem` refus
 headers, `_ORIGINS` variables, prototype keys). What the fixture cannot pin is the peer's half of
 the row: expanding a `COZY_MCP_<NAME>` header only for an origin listed in the operator's
 `COZY_MCP_<NAME>_ORIGINS`, its URL policy on the resolved address (private, loopback, link-local and
-`.local` blocked unless the operator allowed private hosts for client declarations; redirects pinned
-or re-checked), and treating every tool of a client-declared server as mutating.
+`.local` blocked unless the operator allowed private hosts for client declarations; the address
+pinned AND every redirect hop re-checked, never off the allowlisted origin once a header is
+expanded; `_ORIGINS` entries matched exactly against `URL.origin`), and treating every tool of a
+client-declared server as mutating.
 
 ## The reference Hermes/attach echo peer
 

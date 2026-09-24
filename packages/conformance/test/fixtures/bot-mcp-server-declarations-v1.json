@@ -262,6 +262,45 @@
       "removeMcpServers": [
         "constructor"
       ]
+    },
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "http://[64:ff9b::a9fe:a9fe]/mcp"
+        }
+      ]
+    },
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "http://100.100.100.200/latest/meta-data"
+        }
+      ]
+    },
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "http://metadata.google.internal/computeMetadata/v1"
+        }
+      ]
+    },
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "https://ha.example.com/api/mcp",
+          "headers": {
+            "Mcp-Session-Id": "${COZY_MCP_A}"
+          }
+        }
+      ]
     }
   ]
 }
