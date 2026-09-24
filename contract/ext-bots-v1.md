@@ -1803,6 +1803,10 @@ that does not exist.
 `GET /bots/:name/team` is the one read a runtime peer needs to know whether it leads: the config
 lane never carries `role` or `reports`, so a peer asks here with its own attach bearer.
 
+A leader's roster row (`BotSummary`, both a Hermes profile's and a runtime bot's) carries
+`role: "leader"`; a member's carries no `role` key at all, the same absent-means-member rule
+`BotProfile.role` already follows.
+
 **Frame.** `bot_inbox_activity` `{bot, threadId, updatedAt, taskId, state}` is sent once per live
 participant whenever an assignment may have moved: on assign, cancel, acknowledgement, the
 assignee's reply or failure, every update of the wrapped Task, the deadline, a deletion, and the

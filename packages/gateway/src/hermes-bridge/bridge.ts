@@ -1170,6 +1170,7 @@ export class HermesBridge implements BotControlSurface {
             routedProfile: null,
             gatewayState: "idle",
             now: at,
+            teamRole: (name) => this.#storage.botTeam(name)?.role,
           });
           this.#storage.replaceBotRoster(
             bots.map((summary) => ({ name: summary.name, summary })),

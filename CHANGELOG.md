@@ -30,8 +30,9 @@ report's parsed `Result:` block, and the leader's acknowledgement. Caps are 8 op
 leader, 1 per report, and 16 reports. The Agent Inbox returns as `com.cozylabs.agent-inbox` 1,
 backed by these assignment rows (ADR 0082 is superseded), so the phone can read every assignment
 thread. A runtime peer learns whether it leads with its own attach bearer over the new
-`GET /bots/:name/team`, since the config lane never carries `role` or `reports`. Nothing changes
-for an install until a bot is made a leader.
+`GET /bots/:name/team`, since the config lane never carries `role` or `reports`. A leader's roster
+row carries `role: "leader"` for both a Hermes profile and a runtime bot; a member's carries none.
+Nothing changes for an install until a bot is made a leader.
 
 ## 0.8.6 (2026-09-19): Hermes gateway identity
 
