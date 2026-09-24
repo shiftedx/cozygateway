@@ -160,6 +160,11 @@ served_by_host() {
 # One Hermes control verb on the host's socket: `reload-plugins <profile>` or
 # `rescan-profiles`. Succeeds only when the running host answered it; a caller
 # falls back to host_restart otherwise (no host running, or one predating the verb).
+#   * A rescan that outlasts Hermes' 5-second bound answers `pending` while the new
+#     adapter still connects (gateway/run.py: "not an error"); that is an answer,
+#     and the caller's own attach verification proves the rest.
+#   * reload-plugins refuses a home the host does not serve yet
+#     (gateway/run_plugin_rewire.py): rescan once so it does, and retry once.
 host_control() {
   HERMES_HOME="$HERMES_HOME_ROOT" "$PYTHON" - --hermes-control "$HERMES_HOME_ROOT" "$@" <<'PY' >/dev/null 2>&1
 import sys
@@ -170,17 +175,65 @@ try:
     from gateway import control_socket
 except Exception:
     sys.exit(3)
-if verb == "reload-plugins":
-    answer = control_socket.reload_gateway_plugins(root, profile_home=root / "profiles" / sys.argv[4])
-    sys.exit(0 if isinstance(answer, dict) and answer.get("reloaded") else 1)
-if verb == "rescan-profiles":
+
+
+def rescanned():
     answer = control_socket.rescan_gateway_profiles(root)
-    sys.exit(0 if isinstance(answer, dict) and answer.get("multiplex") is not False
-             and "served_profiles" in answer and not answer.get("pending") else 1)
-if verb == "unserve-profile":
-    answer = control_socket.request_unserve_profile(root, sys.argv[4])
-    sys.exit(0 if isinstance(answer, dict) and "error" not in answer else 1)
+    return isinstance(answer, dict) and answer.get("multiplex") is not False and "served_profiles" in answer
+
+
+def reloaded(home):
+    answer = control_socket.reload_gateway_plugins(root, profile_home=home)
+    return isinstance(answer, dict) and answer.get("reloaded") is True
+
+
+if verb == "reload-plugins":
+    home = root / "profiles" / sys.argv[4]
+    sys.exit(0 if reloaded(home) or (rescanned() and reloaded(home)) else 1)
+if verb == "rescan-profiles":
+    sys.exit(0 if rescanned() else 1)
 sys.exit(2)
+PY
+}
+
+# Ask the host to stop serving a profile before its directory is removed, as Hermes'
+# own profile delete does. 0: the host confirmed `unserved: <profile>` (Hermes' own
+# CLI accepts nothing less), or does not serve it; a `pending` teardown is followed
+# until the host's served set drops the profile (HOST_UNSERVE_WAIT_SECONDS, 20 s).
+# 1: still served, or refused; never delete then. 4: no host answered.
+host_unserve() {
+  HERMES_HOME="$HERMES_HOME_ROOT" HOST_UNSERVE_WAIT_SECONDS="${HOST_UNSERVE_WAIT_SECONDS:-20}" \
+    HOST_UNSERVE_POLL_SECONDS="${HOST_UNSERVE_POLL_SECONDS:-1}" \
+    "$PYTHON" - --hermes-control "$HERMES_HOME_ROOT" unserve-profile "$1" <<'PY' >/dev/null 2>&1
+import os
+import sys
+import time
+from pathlib import Path
+
+root, name = Path(sys.argv[2]), sys.argv[4]
+try:
+    from gateway import control_socket
+except Exception:
+    sys.exit(4)
+answer = control_socket.request_unserve_profile(root, name)
+if answer is None:
+    sys.exit(4)
+if not isinstance(answer, dict):
+    sys.exit(1)
+if answer.get("unserved") == name and not answer.get("error"):
+    sys.exit(0)
+if answer.get("error") == f"profile '{name}' is not served":
+    sys.exit(0)
+if not answer.get("pending"):
+    sys.exit(1)
+deadline = time.monotonic() + float(os.environ["HOST_UNSERVE_WAIT_SECONDS"])
+while time.monotonic() < deadline:
+    served = control_socket.rescan_gateway_profiles(root)
+    if isinstance(served, dict) and isinstance(served.get("served_profiles"), list) \
+            and name not in served["served_profiles"]:
+        sys.exit(0)
+    time.sleep(float(os.environ["HOST_UNSERVE_POLL_SECONDS"]))
+sys.exit(1)
 PY
 }
 
