@@ -210,6 +210,13 @@ WANTED = (
     (("display", "platforms", "cozygateway", "streaming"), "true"),
     (("streaming", "edit_interval"), "0.05"),
     (("streaming", "buffer_threshold"), "1"),
+    # The live thinking preview. Hermes hands the attach plugin's `on_stream_delta`
+    # hook reasoning deltas only when this reads true
+    # (agent/plugin_stream_hooks.py::stream_reasoning_deltas_enabled, default
+    # false), and it reads it from the CURRENT profile's config.yaml, per stream,
+    # even under a multiplexed host. Not a cadence key, so the platform guard
+    # below leaves it alone; an explicit false is kept like every other key here.
+    (("plugins", "stream_reasoning_deltas"), "true"),
 )
 WANTED_PATHS = tuple(path for path, _ in WANTED)
 KEY = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z0-9_][A-Za-z0-9_.\-]*):(?P<rest>[ \t].*|)$")
@@ -278,10 +285,18 @@ def absent_without_yaml(text):
             return None
         if stripped.startswith("---") or stripped.startswith("..."):
             return None
-        while stack and indent <= stack[-1][0]:
+        # A sequence item may sit at the SAME indent as the key that owns it
+        # (`enabled:` then `- cozygateway`). Hermes itself saves through its
+        # indenting dumper (utils.py `IndentDumper`), so this is the shape of a
+        # hand-edited file or one dumped with PyYAML's defaults. A dash line
+        # therefore closes only the keys indented deeper than itself; otherwise
+        # such a `plugins.enabled` would read as a sequence directly under
+        # `plugins`, where a wanted key lives, and the probe would give up.
+        dash = stripped.startswith("-")
+        while stack and (indent < stack[-1][0] if dash else indent <= stack[-1][0]):
             stack.pop()
         path = tuple(key for _, key in stack)
-        if stripped.startswith("-"):
+        if dash:
             # A sequence where one of the wanted keys would be a mapping.
             if on_the_way(path):
                 return None
@@ -537,16 +552,23 @@ EOF
 # YAML rewrite here, so the file keeps whatever shape Hermes gives it and this
 # script never has to own a config writer.
 #
-# Set for the immediately following ensure_service call: Hermes reads config.yaml
-# at gateway start, so a repaired profile streams only after one restart.
+# Set for the immediately following ensure_service call: Hermes reads the display
+# and cadence keys at gateway start, so a repaired profile streams only after one
+# restart.
 STREAMING_CONFIG_CHANGED=0
+# Keys Hermes re-reads on every reply, so writing one is the whole repair and a
+# restart would only drop in-flight turns. `plugins.stream_reasoning_deltas` is
+# looked up per stream (agent/stream_delivery.py resets its cache per stream)
+# through a config cache keyed on the file's stat signature.
+READ_PER_REPLY_KEYS=" plugins.stream_reasoning_deltas "
+needs_restart() { case "$READ_PER_REPLY_KEYS" in *" $1 "*) return 1 ;; *) return 0 ;; esac; }
 # A "!" line from the reader is a note to say, not a key to write. Both reads
 # below drop them, so a profile that keeps its own cadence is not mistaken for a
 # write that failed to land.
 streaming_notes() { printf '%s\n' "$1" | grep '^!' || true; }
 streaming_writes() { printf '%s\n' "$1" | grep -v '^!' || true; }
 ensure_streaming_config() {
-  local profile="$1" dir="$2" answer keys note entry key value rc=0
+  local profile="$1" dir="$2" answer keys note entry key value rc=0 wrote="" missing="" restart=0
   STREAMING_CONFIG_CHANGED=0
   answer="$(streaming_keys_absent "$dir")" || rc=$?
   if [ "$rc" != 0 ]; then
@@ -569,27 +591,45 @@ ensure_streaming_config() {
   for entry in $keys; do
     key="${entry%%=*}"; value="${entry#*=}"
     if [ "$DRY_RUN" = 1 ]; then say "  DRY  set $key=$value"; continue; fi
-    # A profile whose config cannot be written is one profile with no draft
-    # frames, not a reason to abandon the rest of the sweep.
+    # A key whose config cannot be written is one missing setting, not a reason
+    # to abandon the rest of the sweep, nor the other keys: a managed layer
+    # pinning `plugins.*` must not cost the display keys their restart.
     if ! "$HERMES_BIN" -p "$profile" config set "$key" "$value" >/dev/null; then
-      warn "[$profile] hermes could not set $key, leaving streaming off for this profile"
-      return 0
+      if needs_restart "$key"; then
+        warn "[$profile] hermes could not set $key, leaving streaming off for this profile"
+      else
+        warn "[$profile] hermes could not set $key, leaving the thinking preview off for this profile"
+      fi
+      continue
     fi
     say "  $key set to $value"
+    wrote="$wrote $key"
   done
   [ "$DRY_RUN" = 1 ] && return 0
+  [ -n "$wrote" ] || return 0
   # Read the file back before claiming anything changed. `config set` is not
   # proof of a write: Hermes' own `set_config_value` returns 0 WITHOUT writing on
   # a package-managed install (`is_managed()`), and trusting the exit code there
-  # would kickstart this profile on every 30 second tick forever.
+  # would kickstart this profile on every 30 second tick forever. Only a key that
+  # is now really there, and that Hermes reads at start, earns the restart.
   rc=0
   answer="$(streaming_keys_absent "$dir")" || rc=$?
-  keys="$(streaming_writes "$answer")"
-  if [ "$rc" != 0 ] || [ -n "$keys" ]; then
-    warn "[$profile] hermes reported success but ${keys//$'\n'/ } is still absent; leaving streaming off and not restarting"
+  if [ "$rc" != 0 ]; then
+    warn "[$profile] could not read config.yaml back after writing it; not restarting"
     return 0
   fi
-  STREAMING_CONFIG_CHANGED=1
+  keys="$(streaming_writes "$answer")"
+  for key in $wrote; do
+    if printf '%s\n' "$keys" | grep -Fq "$key="; then missing="$missing $key"
+    elif needs_restart "$key"; then restart=1
+    fi
+  done
+  if [ -n "$missing" ] && [ "$restart" = 1 ]; then
+    warn "[$profile] hermes reported success but${missing} is still absent; restarting only for the keys that landed"
+  elif [ -n "$missing" ]; then
+    warn "[$profile] hermes reported success but${missing} is still absent; leaving streaming off and not restarting"
+  fi
+  STREAMING_CONFIG_CHANGED=$restart
 }
 
 # Set by sync_plugin for the immediately following ensure_service call. A

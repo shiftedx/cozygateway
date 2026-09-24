@@ -196,7 +196,7 @@ REMOTE_ORIGIN='https://warm.example.test'
 make_rehome_root() {
   local root="$1" profile home
   mkdir -p "$root"
-  printf 'model: test/model\ndisplay:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  edit_interval: 0.05\n  buffer_threshold: 1\n' > "$root/config.yaml"
+  printf 'model: test/model\nplugins:\n  stream_reasoning_deltas: true\ndisplay:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  edit_interval: 0.05\n  buffer_threshold: 1\n' > "$root/config.yaml"
   printf 'absent\n' > "$root/gateway-default.state"
   for profile in cleo drowsy-lark night-owl polished-satellite; do
     home="$root/profiles/$profile"

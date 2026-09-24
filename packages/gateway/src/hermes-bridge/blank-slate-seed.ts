@@ -60,11 +60,20 @@ export const BLANK_SLATE_SKILLS_ON: readonly string[] = [];
  *  does not get to widen the toolset floor the seed just wrote. */
 export const ATTACH_PLUGIN_NAME = "cozygateway";
 
-/** The plugin stanza a fresh profile needs, in the shape the working profiles carry it. */
+/** The plugin stanza a fresh profile needs, in the shape the working profiles carry it.
+ *
+ *  `stream_reasoning_deltas` is what feeds the attach plugin's live thinking preview (capability
+ *  `thinking`). Hermes hands a plugin's `on_stream_delta` hook `kind="reasoning"` deltas only when
+ *  `agent/plugin_stream_hooks.py::stream_reasoning_deltas_enabled` reads this key true, and its
+ *  default is false, so a profile that names nothing shows a generic thinking state for the whole
+ *  turn (issue #200). The read resolves through `load_config`, which is keyed on the CURRENT
+ *  Hermes home, so under a multiplexed host it is this profile's config.yaml that decides, not the
+ *  host's. The plugin sanitizes and truncates before a character reaches the wire. */
 export const ATTACH_PLUGIN_SEED = {
   enabled: [ATTACH_PLUGIN_NAME],
   disabled: [] as string[],
   entries: { [ATTACH_PLUGIN_NAME]: { allow_tool_override: false } },
+  stream_reasoning_deltas: true,
 } as const;
 
 /** The display keys that make a seeded bot stream its reply as it writes it.
@@ -226,7 +235,11 @@ function planDisabledSkills(
  *
  *  A name sitting in `disabled` is dropped from it in the same write: Hermes reads both lists and
  *  leaving `cozygateway` in each would be an instruction that contradicts itself. That is the one
- *  place this seed overrules an existing decision, and it does so only for its own plugin. */
+ *  place this seed overrules an existing decision, and it does so only for its own plugin.
+ *
+ *  `stream_reasoning_deltas` follows the display rule instead: only an ABSENT (or null) key is
+ *  written. An explicit `false` is an operator turning the thinking preview off for this bot, and
+ *  it stays. */
 function planAttachPlugin(plugins: Record<string, unknown>): Record<string, unknown> | undefined {
   const enabled = Array.isArray(plugins["enabled"]) ? (plugins["enabled"] as unknown[]) : [];
   const disabled = Array.isArray(plugins["disabled"]) ? (plugins["disabled"] as unknown[]) : [];
@@ -235,13 +248,20 @@ function planAttachPlugin(plugins: Record<string, unknown>): Record<string, unkn
   const isEnabled = enabled.includes(ATTACH_PLUGIN_NAME);
   const isDisabled = disabled.includes(ATTACH_PLUGIN_NAME);
   const hasEntry = entries[ATTACH_PLUGIN_NAME] !== undefined;
-  if (isEnabled && !isDisabled && hasEntry) return undefined;
+  // `== null`, not `!== undefined`: a bare `stream_reasoning_deltas:` loads as null, which Hermes
+  // reads as false and the installer sweep reads as absent. Absent it is, here too.
+  const hasReasoning = plugins["stream_reasoning_deltas"] != null;
+  // Already bound: the only thing left to say is the thinking flag, and only if nobody has.
+  if (isEnabled && !isDisabled && hasEntry) {
+    return hasReasoning ? undefined : { stream_reasoning_deltas: true };
+  }
 
   const patch: Record<string, unknown> = {};
   if (!isEnabled) patch["enabled"] = [...enabled, ATTACH_PLUGIN_NAME];
   if (isDisabled) patch["disabled"] = disabled.filter((name) => name !== ATTACH_PLUGIN_NAME);
   else if (plugins["disabled"] === undefined) patch["disabled"] = [];
   if (!hasEntry) patch["entries"] = { [ATTACH_PLUGIN_NAME]: { allow_tool_override: false } };
+  if (!hasReasoning) patch["stream_reasoning_deltas"] = true;
   return patch;
 }
 

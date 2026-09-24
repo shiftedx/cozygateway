@@ -215,6 +215,7 @@ describe("POST /bots seeds a blank slate", () => {
           enabled: ["cozygateway"],
           disabled: [],
           entries: { cozygateway: { allow_tool_override: false } },
+          stream_reasoning_deltas: true,
         },
         // Hermes streams only when the profile says so: `StreamingConfig.enabled` is false and
         // this is the per-platform key the phone turn resolves.
@@ -319,6 +320,7 @@ describe("POST /bots seeds the skills OFF-list", () => {
           enabled: ["cozygateway"],
           disabled: [],
           entries: { cozygateway: { allow_tool_override: false } },
+          stream_reasoning_deltas: true,
         },
         // Already streaming, so this profile carries the whole seed.
         display: { streaming: true, platforms: { cozygateway: { streaming: true } } },
@@ -423,6 +425,7 @@ describe("idempotency", () => {
           enabled: ["cozygateway"],
           disabled: [],
           entries: { cozygateway: { allow_tool_override: false } },
+          stream_reasoning_deltas: true,
         },
         // Already streaming, so this profile carries the whole seed.
         display: { streaming: true, platforms: { cozygateway: { streaming: true } } },
@@ -442,6 +445,7 @@ describe("idempotency", () => {
           enabled: ["cozygateway"],
           disabled: [],
           entries: { cozygateway: { allow_tool_override: false } },
+          stream_reasoning_deltas: true,
         },
       },
       blankSlate: true,
@@ -465,6 +469,7 @@ describe("the attach-plugin binding", () => {
       enabled: ["house-lights", "cozygateway"],
       disabled: [],
       entries: { cozygateway: { allow_tool_override: false } },
+      stream_reasoning_deltas: true,
     });
   });
 
@@ -478,6 +483,7 @@ describe("the attach-plugin binding", () => {
       // house-lights stays disabled: this seed only ever overrules the decision about itself.
       disabled: ["house-lights"],
       entries: { cozygateway: { allow_tool_override: false } },
+      stream_reasoning_deltas: true,
     });
   });
 
@@ -490,6 +496,8 @@ describe("the attach-plugin binding", () => {
           enabled: ["cozygateway"],
           disabled: [],
           entries: { cozygateway: { allow_tool_override: true } },
+          // Thinking preview turned OFF on purpose, the same kind of decision as the entry.
+          stream_reasoning_deltas: false,
         },
         // Streaming turned OFF on purpose: an explicit false is a decision, not an absence.
         display: { streaming: false, platforms: { cozygateway: { streaming: false } } },
@@ -534,6 +542,7 @@ describe("seedBlankSlateBots: false", () => {
       enabled: ["cozygateway"],
       disabled: [],
       entries: { cozygateway: { allow_tool_override: false } },
+      stream_reasoning_deltas: true,
     });
   });
 
@@ -556,6 +565,7 @@ describe("seedBlankSlateBots: false", () => {
       enabled: ["cozygateway"],
       disabled: [],
       entries: { cozygateway: { allow_tool_override: false } },
+      stream_reasoning_deltas: true,
     });
   });
 });
@@ -612,5 +622,76 @@ describe("streaming drafts are on for a phone-created bot", () => {
       streaming: true,
       platforms: { cozygateway: { streaming: true } },
     });
+  });
+});
+
+/** The live thinking preview (capability `thinking`) is the attach plugin's `on_stream_delta` tap
+ *  reading `kind == "reasoning"` deltas. Hermes only hands a plugin those deltas when the profile
+ *  says `plugins.stream_reasoning_deltas: true` (`agent/plugin_stream_hooks.py`, default false),
+ *  so a phone-created bot that names nothing shows a generic thinking state for the whole turn
+ *  while a hand-configured one shows the preview (issue #200). */
+describe("the thinking preview is on for a phone-created bot", () => {
+  it("writes plugins.stream_reasoning_deltas beside the binding", async () => {
+    const { authed, dashboard } = await setup();
+
+    expect((await authed("/bots", post({ name: "night-owl" }))).status).toBe(201);
+
+    const body = writes(dashboard)[0]?.body as { config: Record<string, unknown> };
+    expect(body.config["plugins"]).toMatchObject({ stream_reasoning_deltas: true });
+  });
+
+  it("seeds only the flag onto a profile that is already bound", () => {
+    const plan = planBlankSlateSeed({
+      current: {
+        plugins: {
+          enabled: ["cozygateway"],
+          disabled: [],
+          entries: { cozygateway: { allow_tool_override: false } },
+        },
+      },
+      blankSlate: true,
+    });
+    // enabled, disabled and entries are not restated: they are already right, and the deep merge
+    // on the other side keeps every key this patch does not name.
+    expect(plan.config?.["plugins"]).toEqual({ stream_reasoning_deltas: true });
+  });
+
+  it("reads an explicit null as absent, the way Hermes and the installer sweep do", () => {
+    const plan = planBlankSlateSeed({
+      current: {
+        plugins: {
+          enabled: ["cozygateway"],
+          disabled: [],
+          entries: { cozygateway: { allow_tool_override: false } },
+          // `stream_reasoning_deltas:` with nothing after it loads as null.
+          stream_reasoning_deltas: null,
+        },
+      },
+      blankSlate: true,
+    });
+    expect(plan.config?.["plugins"]).toEqual({ stream_reasoning_deltas: true });
+  });
+
+  it("leaves an explicit false exactly as the operator set it", () => {
+    const plan = planBlankSlateSeed({
+      current: {
+        plugins: {
+          enabled: ["cozygateway"],
+          disabled: [],
+          entries: { cozygateway: { allow_tool_override: false } },
+          stream_reasoning_deltas: false,
+        },
+      },
+      blankSlate: true,
+    });
+    expect(plan.config?.["plugins"]).toBeUndefined();
+  });
+
+  it("is written whatever seedBlankSlateBots says, like the plugin binding", async () => {
+    const { authed, dashboard } = await setup({ seedBlankSlateBots: false });
+    expect((await authed("/bots", post({ name: "night-owl" }))).status).toBe(201);
+    const body = writes(dashboard)[0]?.body as { config: Record<string, unknown> };
+    // The flag is toolset policy. What the phone shows while a bot thinks is not a toolset.
+    expect(body.config["plugins"]).toMatchObject({ stream_reasoning_deltas: true });
   });
 });

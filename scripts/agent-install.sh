@@ -1236,6 +1236,13 @@ WANTED = (
     (("display", "platforms", "cozygateway", "streaming"), "true"),
     (("streaming", "edit_interval"), "0.05"),
     (("streaming", "buffer_threshold"), "1"),
+    # The live thinking preview. Hermes hands the attach plugin's `on_stream_delta`
+    # hook reasoning deltas only when this reads true
+    # (agent/plugin_stream_hooks.py::stream_reasoning_deltas_enabled, default
+    # false), and it reads it from the CURRENT profile's config.yaml, per stream,
+    # even under a multiplexed host. Not a cadence key, so the platform guard
+    # below leaves it alone; an explicit false is kept like every other key here.
+    (("plugins", "stream_reasoning_deltas"), "true"),
 )
 WANTED_PATHS = tuple(path for path, _ in WANTED)
 KEY = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z0-9_][A-Za-z0-9_.\-]*):(?P<rest>[ \t].*|)$")
@@ -1304,10 +1311,18 @@ def absent_without_yaml(text):
             return None
         if stripped.startswith("---") or stripped.startswith("..."):
             return None
-        while stack and indent <= stack[-1][0]:
+        # A sequence item may sit at the SAME indent as the key that owns it
+        # (`enabled:` then `- cozygateway`). Hermes itself saves through its
+        # indenting dumper (utils.py `IndentDumper`), so this is the shape of a
+        # hand-edited file or one dumped with PyYAML's defaults. A dash line
+        # therefore closes only the keys indented deeper than itself; otherwise
+        # such a `plugins.enabled` would read as a sequence directly under
+        # `plugins`, where a wanted key lives, and the probe would give up.
+        dash = stripped.startswith("-")
+        while stack and (indent < stack[-1][0] if dash else indent <= stack[-1][0]):
             stack.pop()
         path = tuple(key for _, key in stack)
-        if stripped.startswith("-"):
+        if dash:
             # A sequence where one of the wanted keys would be a mapping.
             if on_the_way(path):
                 return None
@@ -1494,8 +1509,14 @@ PY
 # write that failed to land.
 streaming_notes() { printf '%s\n' "$1" | grep '^!' || true; }
 streaming_writes() { printf '%s\n' "$1" | grep -v '^!' || true; }
+# Keys Hermes re-reads on every reply, so writing one is the whole repair and a
+# restart would only drop in-flight turns. `plugins.stream_reasoning_deltas` is
+# looked up per stream (agent/stream_delivery.py resets its cache per stream)
+# through a config cache keyed on the file's stat signature.
+READ_PER_REPLY_KEYS=" plugins.stream_reasoning_deltas "
+needs_restart() { case "$READ_PER_REPLY_KEYS" in *" $1 "*) return 1 ;; *) return 0 ;; esac; }
 ensure_streaming_config() {
-  local profile="$1" home="$2" python answer keys note entry key value rc=0
+  local profile="$1" home="$2" python answer keys note entry key value rc=0 wrote="" missing="" restart=0
   python="$(streaming_python)" || {
     say "NOTE  no usable python found, so streaming settings for profile $profile were left alone"
     return 0
@@ -1522,27 +1543,43 @@ ensure_streaming_config() {
     key="${entry%%=*}"; value="${entry#*=}"
     if [ "$DRY_RUN" = 1 ]; then say "DRY   set $key to $value for Hermes profile $profile"; continue; fi
     # A display default never fails an install: this profile keeps Hermes'
-    # behaviour and every other part of the install carries on.
+    # behaviour and every other part of the install carries on. Nor does it cost
+    # the other keys: a managed layer pinning `plugins.*` must not keep the
+    # display keys from landing, or from their restart.
     if ! "$HERMES_BIN" -p "$profile" config set "$key" "$value" >/dev/null; then
       say "NOTE  hermes could not set $key, so streaming settings for profile $profile were left alone"
-      return 0
+      continue
     fi
     say "OK    set $key to $value for Hermes profile $profile"
+    wrote="$wrote $key"
   done
   [ "$DRY_RUN" = 1 ] && return 0
+  [ -n "$wrote" ] || return 0
   # Read the file back before restarting anything. `config set` is not proof of a
   # write: Hermes' `set_config_value` returns 0 WITHOUT writing on a
   # package-managed install (`is_managed()`), and a restart on that evidence
-  # would be a restart that changes nothing, every rerun.
+  # would be a restart that changes nothing, every rerun. Only a key that is now
+  # really there, and that Hermes reads at start, earns the restart.
   rc=0
   answer="$(streaming_keys_absent "$python" "$home")" || rc=$?
-  keys="$(streaming_writes "$answer")"
-  if [ "$rc" != 0 ] || [ -n "$keys" ]; then
-    say "NOTE  hermes reported success but streaming settings for profile $profile are still absent, so it was not restarted"
+  if [ "$rc" != 0 ]; then
+    say "NOTE  could not read $home/config.yaml back, so profile $profile was not restarted"
     return 0
   fi
+  keys="$(streaming_writes "$answer")"
+  for key in $wrote; do
+    if printf '%s\n' "$keys" | grep -Fq "$key="; then missing="$missing $key"
+    elif needs_restart "$key"; then restart=1
+    fi
+  done
+  if [ -n "$missing" ] && [ "$restart" = 0 ]; then
+    say "NOTE  hermes reported success but streaming settings for profile $profile are still absent, so it was not restarted"
+  elif [ -n "$missing" ]; then
+    say "NOTE  hermes reported success but${missing} is still absent for profile $profile; restarting only for the keys that landed"
+  fi
   # One restart, through the same lifecycle pass a changed plugin uses.
-  record_profile_change "$profile"
+  [ "$restart" = 1 ] && record_profile_change "$profile"
+  return 0
 }
 
 write_gateway_config() {

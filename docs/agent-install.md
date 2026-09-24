@@ -222,7 +222,9 @@ display:
 
 Profiles created before this default existed are repaired in place: an installer
 rerun writes whichever of the two keys is absent, through Hermes' own
-`config set`, and restarts that profile's Hermes gateway once so it takes.
+`config set`, and restarts that profile's Hermes gateway once so it takes. On a
+multiplexed host (`gateway.multiplex_profiles: true`) a served profile has no
+gateway of its own, so it is the host that restarts, once for the whole run.
 Nothing else about the profile is touched.
 
 To turn streaming off for one bot, say so explicitly and neither the seed nor a
@@ -234,7 +236,33 @@ hermes -p <profile> config set display.streaming false
 hermes -p <profile> gateway restart
 ```
 
+On a multiplexed host, restart the host instead: `hermes -p default gateway restart`.
+
 An explicit `false` is a decision. Only an ABSENT key is ever written.
+
+The live thinking preview follows the same rule. Hermes hands the attach
+plugin a reasoning model's thinking only when the profile opts in, so the seed
+and the installer repair also write:
+
+```yaml
+plugins:
+  stream_reasoning_deltas: true
+```
+
+The plugin shows a short, redacted preview of it while the bot thinks. Hermes
+reads the key from each profile's own `config.yaml` on every reply, including
+under a multiplexed host gateway, so the host's config does not decide it for
+the profiles it serves. Because it is read on every reply, writing it takes
+effect without a restart, and the repair does not restart anything for it.
+
+The key is profile-wide, not specific to this plugin: any other plugin in that
+profile that registers `on_stream_delta` receives the reasoning deltas too.
+
+To turn the preview off for one bot:
+
+```sh
+hermes -p <profile> config set plugins.stream_reasoning_deltas false
+```
 
 On Windows, state is under `%LOCALAPPDATA%\cozygateway`. Persistence uses the
 current-user `CozyGateway` Scheduled Task with a hidden Startup-folder fallback
