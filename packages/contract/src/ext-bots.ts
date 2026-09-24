@@ -107,6 +107,11 @@ export const BotSummarySchema = Type.Object({
     imageUrl: Type.Optional(Type.String({ minLength: 1, maxLength: 512, pattern: "^/" })),
     petSlug: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
   }, { additionalProperties: false })),
+  /** The names this Hermes profile was renamed from (Hermes's `previous_names`, oldest first,
+   *  lowercased), so a client resolves an `@old-handle` and re-seats stored room members and
+   *  per-bot state the way upstream Desktop does. Additive under capability 82: absent when the
+   *  profile has none, on a runtime bot, and on an older gateway. */
+  previousNames: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }))),
 });
 export type BotSummary = Static<typeof BotSummarySchema>;
 

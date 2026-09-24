@@ -723,6 +723,9 @@ export class HermesBridge implements BotControlSurface {
       // public name, not the profile id the roster cache stores its row under.
       handle: this.#roomNamespace === undefined ? row?.handle ?? botHandle(name) : name,
       displayName: row?.displayName ?? botDisplayName(local, null),
+      // Old handles are un-namespaced profile ids, so they only mean something un-namespaced.
+      ...(this.#roomNamespace === undefined && row?.previousNames !== undefined
+        ? { previousNames: row.previousNames } : {}),
     };
   }
   /** The roster row a room member is named after. The cached Hermes rows answer for every

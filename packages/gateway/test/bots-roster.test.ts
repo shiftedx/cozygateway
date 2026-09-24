@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { BotSummarySchema, check } from "cozygateway-contract";
 import {
   ACTIVE_WINDOW_S, botActivityAt, botDisplayName, botHandle, botMetaForWriteback,
   buildRoster, classifyPreview, extractBotMeta, isBotActive, parseProfilesList,
@@ -54,6 +55,17 @@ describe("Hermes roster", () => {
     ] }).profiles, idle);
     expect(roster.map((bot) => bot.name)).toEqual(["pinned-old", "fresh", "stale"]);
     expect(botActivityAt(parseProfilesList({ profiles: [profileRow({ ui_meta: { "hermes-bots": { created: NOW - 1_000 } } })] }).profiles[0]!)).toBe(NOW - 1_000);
+  });
+
+  it("carries previous_names on the summary so an old handle resolves", () => {
+    const [renamed, plain] = buildRoster(parseProfilesList({ profiles: [
+      profileRow({ name: "lookout", previous_names: [" Scout ", "", 7, "ranger"], last_session: lastSession(2) }),
+      profileRow({ name: "plain", previous_names: [] }),
+    ] }).profiles, idle);
+    expect(renamed?.previousNames).toEqual(["scout", "ranger"]);
+    expect(plain).not.toHaveProperty("previousNames");
+    expect(check(BotSummarySchema, renamed)).toBe(true);
+    expect(check(BotSummarySchema, plain)).toBe(true);
   });
 
   it("preserves compact UI metadata writes", () => {

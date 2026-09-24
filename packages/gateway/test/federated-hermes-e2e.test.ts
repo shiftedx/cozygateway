@@ -28,7 +28,7 @@ describe("federated Hermes endpoints", () => {
   });
 
   it("consolidates duplicate profile ids, routes them by stable namespace, and retains roster on partial failure", async () => {
-    const profile = (title: string) => ({ profiles: [{ name: "sage", description: title, has_avatar: false }], bot_mode_protocol: true });
+    const profile = (title: string) => ({ profiles: [{ name: "sage", description: title, has_avatar: false, ...(title === "home" ? { previous_names: ["owl"] } : {}) }], bot_mode_protocol: true });
     const home = await startFakeHermesServer({ methods: { "profiles.list": () => profile("home") } });
     const studio = await startFakeHermesServer({ methods: { "profiles.list": () => profile("studio") } });
     servers.push(home, studio);
@@ -94,6 +94,10 @@ describe("federated Hermes endpoints", () => {
     };
     await until(async () => (await roster()).length === 2);
     expect(await roster()).toEqual(["home:sage", "studio:sage"]);
+    // A renamed profile's old names are qualified like its live one, so `@home:owl` finds home:sage.
+    const rows = ((await (await fetch(`${gateway.url}/bots`, { headers: { authorization: `Bearer ${token}` } })).json()) as { bots: Array<{ name: string; previousNames?: string[] }> }).bots;
+    expect(rows.find((bot) => bot.name === "home:sage")?.previousNames).toEqual(["home:owl"]);
+    expect(rows.find((bot) => bot.name === "studio:sage")?.previousNames).toBeUndefined();
 
     const attach = async (secret: string): Promise<{ ws: WebSocket; frames: any[] }> => {
       const frames: any[] = [];

@@ -28,6 +28,8 @@ export interface GroupMember {
   name: string;
   handle: string;
   displayName: string;
+  /** Hermes `previous_names`: a renamed member still answers to its old handles, gap-fill only. */
+  previousNames?: string[];
 }
 
 /** One entry in the room log. `kind: "user"` is the human. */
@@ -92,12 +94,15 @@ export function parseMentions(text: string, members: GroupMember[]): { everyone:
     // Exact form first, then the form with separators stripped, which is what lets `@ops-runner`,
     // `@ops_runner` and `@opsrunner` all reach the same bot.
     const bare = token.replace(/[._-]+/g, "");
-    for (const entry of forms) {
-      if (entry.forms.includes(token) || entry.forms.some((form) => form.replace(/[._-]+/g, "") === bare)) {
-        named.add(entry.member.name);
-        break;
-      }
-    }
+    const live = forms.find((entry) =>
+      entry.forms.includes(token) || entry.forms.some((form) => form.replace(/[._-]+/g, "") === bare));
+    // A pre-rename handle fills a gap only: every live form is tried first, so an old name never
+    // takes a live member's mention (upstream group-rounds.ts, #110200).
+    const renamed = live ?? forms.find((entry) => (entry.member.previousNames ?? []).some((previous) => {
+      const old = previous.trim().toLowerCase();
+      return old === token || old.replace(/[\s._-]+/g, "") === bare;
+    }));
+    if (renamed !== undefined) named.add(renamed.member.name);
   }
   return { everyone, members: named };
 }

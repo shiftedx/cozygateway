@@ -344,6 +344,10 @@ describe("rename carries rooms, the Bot Chat binding and routines", () => {
     expect(h.storage.botGroup("haunt")?.members).toEqual(["ghost", "default"]);
     expect(h.frames.some((frame) => frame["type"] === "bot_group_state"
       && (frame["room"] as { members: string[] } | undefined)?.members.includes("lookout") === true)).toBe(true);
+     // The roster row carries the history so a client resolves `@scout` to lookout.
+    const bots = await (await h.authed("/bots")).json() as { bots: Array<{ name: string; previousNames?: string[] }> };
+    expect(bots.bots.find((bot) => bot.name === "lookout")?.previousNames).toEqual(["scout"]);
+    expect(bots.bots.find((bot) => bot.name === "default")?.previousNames).toBeUndefined();
   });
 
   it("the live bot's state wins over a deleted bot of the new name still listed in the room", async () => {
