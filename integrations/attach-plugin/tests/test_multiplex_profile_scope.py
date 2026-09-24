@@ -178,6 +178,37 @@ class MultiplexedProfileScopeTests(unittest.IsolatedAsyncioTestCase):
         (self.alpha / ".env").write_text("")
         self.assertEqual(provider(), "alpha-token")
 
+    def test_an_unscoped_read_on_a_multiplexed_host_never_sees_the_host_env(self):
+        # Hermes fails closed here (agent/secret_scope.py get_secret raises UnscopedSecretError): an
+        # unscoped read on a multiplexer has no owning profile, and os.environ is another's.
+        hermes_secret_scope.set_multiplex_active(True)
+        from cozygateway.profile_env import profile_env
+        self.assertIsNone(profile_env("COZYGATEWAY_TOKEN"))
+        self.assertEqual(profile_env("COZYGATEWAY_TOKEN", "unset"), "unset")
+        self.assertFalse(adapter_module.is_connected())
+
+    def test_the_launch_profile_adapter_gets_its_settings_from_its_own_config(self):
+        # Hermes builds the launch (default) profile's adapter unscoped on a multiplexer, from the
+        # PlatformConfig it loaded under that profile's scope (gateway/run.py
+        # load_gateway_config_for_runner). env_enablement_fn is how a plugin seeds that config.
+        (self.root / ".env").parent.mkdir(parents=True, exist_ok=True)
+        (self.root / ".env").write_text(
+            "COZYGATEWAY_URL=http://launch-gateway.invalid:4\nCOZYGATEWAY_TOKEN=launch-token\n"
+            f"COZYGATEWAY_SPOOL_PATH={self.root}/launch-spool.sqlite\n")
+        with self._served(self.root):
+            seed = adapter_module._env_enablement()
+        self.assertEqual(seed["gateway_url"], "http://launch-gateway.invalid:4")
+        self.assertEqual(seed["spool_path"], f"{self.root}/launch-spool.sqlite")
+        hermes_secret_scope.set_multiplex_active(True)
+        launch = self._adapter(seed)
+        self.assertEqual((launch.gateway_url, launch.token), ("http://launch-gateway.invalid:4", "launch-token"))
+        self.assertEqual(launch._spool_path, f"{self.root}/launch-spool.sqlite")
+
+    def test_the_seed_is_absent_for_a_profile_without_its_own_attach_settings(self):
+        (self.beta / ".env").write_text("")
+        with self._served(self.beta):
+            self.assertIsNone(adapter_module._env_enablement())
+
 
 class StandaloneProfileEnvTests(unittest.TestCase):
     """No profile scope bound: a standalone gateway IS its profile, so os.environ is the contract."""

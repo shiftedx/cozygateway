@@ -5739,6 +5739,24 @@ def check_requirements() -> bool:
         return False
 
 
+def _env_enablement() -> Optional[Dict[str, Any]]:
+    """``env_enablement_fn``: seed ``PlatformConfig.extra`` from the profile's own attach env.
+
+    Hermes calls this while it loads a profile's config under that profile's scope
+    (gateway/config_env.py ``_enable_plugin_platform``). On a multiplexer it builds the launch
+    profile's adapter unscoped, so this seed is where that adapter's settings come from.
+    """
+    url, token = profile_env("COZYGATEWAY_URL"), profile_env("COZYGATEWAY_TOKEN")
+    if not (url and token):
+        return None
+    seed: Dict[str, Any] = {"gateway_url": url, "token": token}
+    for key, name in (("spool_path", "COZYGATEWAY_SPOOL_PATH"), ("ca_file", "COZYGATEWAY_CA_FILE")):
+        value = profile_env(name)
+        if value:
+            seed[key] = value
+    return seed
+
+
 def is_connected(*_args: Any) -> bool:
     """Configured iff both the gateway URL and the token are present for the owning profile.
 
@@ -6477,6 +6495,7 @@ def register(ctx: Any) -> None:
         adapter_factory=lambda cfg: _make_adapter_class()(cfg),
         check_fn=check_requirements,
         is_connected=is_connected,
+        env_enablement_fn=_env_enablement,
         required_env=["COZYGATEWAY_URL", "COZYGATEWAY_TOKEN"],
         install_hint="Needs the 'websockets' package (pip install websockets)",
         emoji="🧵",

@@ -18,8 +18,11 @@ The Hermes imports are lazy and optional so the package stays importable with no
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 def scope_bound() -> bool:
@@ -31,13 +34,31 @@ def scope_bound() -> bool:
     return current_secret_scope() is not None
 
 
-def profile_env(name: str, default: Optional[str] = None) -> Optional[str]:
-    """``name`` for the owning profile: the bound scope when there is one, else ``os.getenv``."""
-    if not scope_bound():
-        return os.getenv(name, default)
-    from agent.secret_scope import get_secret  # harness-defined identifier
+def multiplex_active() -> bool:
+    """True inside a multiplexing Hermes gateway process."""
+    try:
+        from agent.secret_scope import is_multiplex_active  # harness-defined identifier
+    except Exception:  # noqa: BLE001 - no harness: a standalone process
+        return False
+    return is_multiplex_active()
 
-    return get_secret(name, default)
+
+def profile_env(name: str, default: Optional[str] = None) -> Optional[str]:
+    """``name`` for the owning profile: the bound scope when there is one, else ``os.getenv``.
+
+    A multiplexer with no scope bound has no owning profile to read for, and its ``os.environ`` is
+    the launch profile's: that read fails closed (Hermes' own ``get_secret`` raises there). The
+    launch profile's adapter, which Hermes builds unscoped, gets its settings from the
+    PlatformConfig seeded under its own scope instead (``adapter._env_enablement``).
+    """
+    if scope_bound():
+        from agent.secret_scope import get_secret  # harness-defined identifier
+
+        return get_secret(name, default)
+    if multiplex_active():
+        logger.debug("attach: %s read with no profile scope on a multiplexed gateway; treated as unset", name)
+        return default
+    return os.getenv(name, default)
 
 
 def scoped_home() -> Optional[str]:
