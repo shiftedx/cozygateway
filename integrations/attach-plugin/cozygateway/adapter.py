@@ -81,6 +81,7 @@ from .text_blocks import (
 )
 from .tool_chips import ToolChipTracker
 from .memory import MemoryConflict, MemoryError, MemoryManager
+from .profile_env import profile_env, profile_name_for_home, scope_bound, scoped_home
 
 logger = logging.getLogger(__name__)
 
@@ -123,8 +124,8 @@ def _truthy(value: Any) -> bool:
 
 
 def _env_float(name: str, default: float) -> float:
-    """Read a positive float from the environment, falling back on unset/garbage."""
-    raw = os.getenv(name)
+    """Read a positive float from the owning profile's env, falling back on unset/garbage."""
+    raw = profile_env(name)
     if not raw:
         return default
     try:
@@ -141,8 +142,8 @@ _NATIVE_STREAM_PLACEHOLDERS = ("", "✅")
 
 
 def _env_flag(name: str, default: bool) -> bool:
-    """Read an on/off switch from the environment; anything unrecognised is the default."""
-    raw = (os.getenv(name) or "").strip().lower()
+    """Read an on/off switch from the owning profile's env; anything unrecognised is the default."""
+    raw = (profile_env(name) or "").strip().lower()
     if raw in ("1", "true", "yes", "on"):
         return True
     if raw in ("0", "false", "no", "off"):
@@ -151,8 +152,8 @@ def _env_flag(name: str, default: bool) -> bool:
 
 
 def _env_int(name: str, default: int) -> int:
-    """Read a positive int from the environment, falling back on unset/garbage."""
-    raw = os.getenv(name)
+    """Read a positive int from the owning profile's env, falling back on unset/garbage."""
+    raw = profile_env(name)
     if not raw:
         return default
     try:
@@ -162,9 +163,64 @@ def _env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
-def _fresh_attach_token(fallback: str) -> str:
-    """Reload the profile secret so a rotated token can heal without a process restart."""
-    hermes_home = os.getenv("HERMES_HOME", "").strip()
+@dataclass(frozen=True)
+class _Owner:
+    """The Hermes profile an attach belongs to, captured while Hermes had it bound.
+
+    ``scoped`` is True on a multiplexed gateway serving a secondary profile: Hermes bound that
+    profile's secret scope (and ``home``) around this adapter's creation, connect or a cron send.
+    False is a standalone gateway, or a multiplexer's launch profile, whose process env IS its own.
+    """
+
+    scoped: bool = False
+    home: Optional[str] = None
+
+
+def _current_owner() -> _Owner:
+    return _Owner(scope_bound(), scoped_home())
+
+
+@dataclass(frozen=True)
+class _AttachSettings:
+    gateway_url: str
+    token: str
+    ca_file: Optional[str]
+
+
+def _attach_settings(pconfig: Any) -> _AttachSettings:
+    """Dial settings for the profile bound now: its env first, then ``PlatformConfig.extra``.
+
+    Standalone that env is ``os.environ``; served by a multiplexed gateway it is the profile's own
+    ``.env`` through Hermes' secret scope, and a missing value stays missing (never the host's).
+    """
+    extra = getattr(pconfig, "extra", {}) or {}
+    return _AttachSettings(
+        gateway_url=(profile_env("COZYGATEWAY_URL") or extra.get("gateway_url") or "").rstrip("/"),
+        token=profile_env("COZYGATEWAY_TOKEN") or extra.get("token", ""),
+        ca_file=profile_env("COZYGATEWAY_CA_FILE") or extra.get("ca_file") or None,
+    )
+
+
+def _default_spool_path(owner: _Owner) -> str:
+    """The spool for a profile with no ``COZYGATEWAY_SPOOL_PATH``.
+
+    Standalone keeps the historical ``~/.hermes`` path. A profile served by a multiplexed gateway
+    keeps it under its own home instead, so two profiles never contend for one spool (its transport
+    lease would park the second).
+    """
+    if owner.scoped and owner.home:
+        return os.path.join(owner.home, "cozygateway-attach-v1.sqlite")
+    return os.path.join(os.path.expanduser("~"), ".hermes", "cozygateway-attach-v1.sqlite")
+
+
+def _fresh_attach_token(fallback: str, owner: _Owner = _Owner()) -> str:
+    """Reload the profile secret so a rotated token can heal without a process restart.
+
+    A profile served by a multiplexed gateway rereads ITS home's ``.env`` (even when the dial runs
+    outside its scope) and otherwise keeps the token it had; it never reads the process env, which
+    belongs to the launch profile.
+    """
+    hermes_home = (owner.home or "") if owner.scoped else os.getenv("HERMES_HOME", "").strip()
     if hermes_home:
         try:
             from agent.secret_scope import load_env_file  # harness-defined identifier
@@ -175,6 +231,8 @@ def _fresh_attach_token(fallback: str) -> str:
                 return token.strip()
         except Exception:
             logger.debug("attach: could not refresh token from the profile env", exc_info=True)
+    if owner.scoped:
+        return fallback.strip()
     return (os.getenv("COZYGATEWAY_TOKEN") or fallback).strip()
 
 
@@ -838,12 +896,7 @@ def _profile_from_hermes_home() -> str:
     Returns "" when the home is absent or is not a profile directory (the default profile, a test
     harness), which leaves the gate exactly as fail-closed as it was.
     """
-    home = (os.getenv("HERMES_HOME") or "").strip()
-    if not home:
-        return ""
-    path = os.path.normpath(home)
-    parent, name = os.path.split(path)
-    return name if os.path.basename(parent) == "profiles" and name else ""
+    return profile_name_for_home((os.getenv("HERMES_HOME") or "").strip())
 
 
 @dataclass
@@ -894,24 +947,31 @@ class AttachAdapter:
         # Retained so a proactive media send can fall back to the durable one-shot
         # journal when this adapter's own socket is not writable.
         self._pconfig: Any = config
-        self.gateway_url: str = (
-            os.getenv("COZYGATEWAY_URL") or extra.get("gateway_url", "")
-        ).rstrip("/")
+        # A multiplexed Hermes gateway builds a served profile's adapter inside that profile's
+        # scope (gateway/run.py `_start_one_profile_adapters`), so every setting below is that
+        # profile's own. Remember which profile it was for the reads that happen later.
+        self._owner: _Owner = _current_owner()
+        settings = _attach_settings(config)
+        self.gateway_url: str = settings.gateway_url
         # The attach bearer token. Header-only; never logged, never in a URL.
-        self.token: str = os.getenv("COZYGATEWAY_TOKEN") or extra.get("token", "")
-        self._profile: str = (
-            str(extra.get("profile") or os.getenv("HERMES_PROFILE") or "").strip()
-            or _profile_from_hermes_home()
-        )
+        self.token: str = settings.token
+        if self._owner.scoped:
+            # HERMES_PROFILE and HERMES_HOME in the process env name the launch profile.
+            self._profile: str = (
+                str(extra.get("profile") or "").strip() or profile_name_for_home(self._owner.home)
+            )
+        else:
+            self._profile = (
+                str(extra.get("profile") or os.getenv("HERMES_PROFILE") or "").strip()
+                or _profile_from_hermes_home()
+            )
         # Present only on a remote execution adapter. Its provider-import operation is refused on
         # the ordinary source profile, so a handoff id cannot be consumed into arbitrary state.
-        self._execution_id: Optional[str] = str(extra.get("execution_id") or os.getenv("COZYGATEWAY_EXECUTION_ID") or "").strip() or None
+        self._execution_id: Optional[str] = str(extra.get("execution_id") or profile_env("COZYGATEWAY_EXECUTION_ID") or "").strip() or None
         # A remote execution process owns exactly one gateway conversation.
-        self._execution_session_id: Optional[str] = str(os.getenv("COZYGATEWAY_EXECUTION_SESSION_ID") or "").strip() or None
-        self.ca_file: Optional[str] = (
-            os.getenv("COZYGATEWAY_CA_FILE") or extra.get("ca_file") or None
-        )
-        self._spool_path: Optional[str] = extra.get("spool_path") or os.getenv("COZYGATEWAY_SPOOL_PATH") or None
+        self._execution_session_id: Optional[str] = str(profile_env("COZYGATEWAY_EXECUTION_SESSION_ID") or "").strip() or None
+        self.ca_file: Optional[str] = settings.ca_file
+        self._spool_path: Optional[str] = extra.get("spool_path") or profile_env("COZYGATEWAY_SPOOL_PATH") or None
         self._spool: Optional[AttachSpool] = None
         self._client: Optional[Any] = None
         self._watcher: Optional[asyncio.Task] = None
@@ -1021,7 +1081,7 @@ class AttachAdapter:
         # Strong refs to fire-and-forget tasks; the loop keeps only a weak ref to a
         # bare create_task result, so hold each here until it finishes.
         self._background_tasks: Set[asyncio.Task] = set()
-        self._memory_manager = MemoryManager(extra, os.getenv("HERMES_HOME"))
+        self._memory_manager = MemoryManager(extra, self._owner.home if self._owner.scoped else os.getenv("HERMES_HOME"))
         # A memory request reads real files and provider SQL, so it runs on a worker
         # thread and exactly one runs at a time. A second request arriving while one
         # is in flight is refused immediately: queueing them would let a search
@@ -1032,6 +1092,11 @@ class AttachAdapter:
         # the write a second time. Bounded oldest-first.
         self._memory_results: OrderedDict[str, Tuple[str, Optional[Dict[str, Any]], Optional[str], Optional[Dict[str, Any]]]] = OrderedDict()
         self._memory_results_max = 64
+
+    def _attach_token_provider(self) -> Any:
+        """The dial-time token source: this adapter's profile, rotated tokens included."""
+        owner = getattr(self, "_owner", _Owner())
+        return lambda: _fresh_attach_token(self.token, owner)
 
     def _spawn_background(self, loop: asyncio.AbstractEventLoop, coro: Any) -> None:
         task = loop.create_task(coro)
@@ -1254,9 +1319,7 @@ class AttachAdapter:
             return False
         self._closing = False
         if self._spool is None:
-            spool_path = self._spool_path or os.path.join(
-                os.path.expanduser("~"), ".hermes", "cozygateway-attach-v1.sqlite"
-            )
+            spool_path = self._spool_path or _default_spool_path(getattr(self, "_owner", _Owner()))
             self._spool = AttachSpool(str(spool_path))
         if not self._spool.acquire_transport_lease():
             self._set_fatal_error(  # type: ignore[attr-defined]
@@ -1269,7 +1332,7 @@ class AttachAdapter:
             AttachV1ClientConfig(
                 gateway_url=self.gateway_url,
                 token=self.token,
-                token_provider=lambda: _fresh_attach_token(self.token),
+                token_provider=self._attach_token_provider(),
                 spool=self._spool,
                 ca_file=self.ca_file,
                 on_turn=self._on_turn,
@@ -1814,7 +1877,7 @@ class AttachAdapter:
         """The dedicated child process carries its resolved workspace without re-making a worktree."""
         if not self._execution_session_id or session_id != self._execution_session_id:
             return None
-        raw = os.getenv("COZYGATEWAY_EXECUTION_WORKSPACE_ROOT", "")
+        raw = profile_env("COZYGATEWAY_EXECUTION_WORKSPACE_ROOT", "")
         try:
             root = Path(raw).resolve(strict=True)
             return root if root.is_dir() and Path.cwd().resolve() == root else None
@@ -1826,7 +1889,7 @@ class AttachAdapter:
         if self._execution_session_id is None or getattr(source, "chat_id", None) != self._execution_session_id:
             return None
         try:
-            profile = json.loads(os.getenv("COZYGATEWAY_SOURCE_PROFILE_JSON", "{}"))
+            profile = json.loads(profile_env("COZYGATEWAY_SOURCE_PROFILE_JSON", "{}"))
         except json.JSONDecodeError:
             return []
         selected = profile.get("enabledToolsets", [])
@@ -1839,7 +1902,7 @@ class AttachAdapter:
         if self._execution_session_id is None:
             return True
         try:
-            selected = json.loads(os.getenv("COZYGATEWAY_EXECUTION_MODEL_JSON", "{}"))
+            selected = json.loads(profile_env("COZYGATEWAY_EXECUTION_MODEL_JSON", "{}"))
         except json.JSONDecodeError:
             return False
 
@@ -5677,8 +5740,13 @@ def check_requirements() -> bool:
 
 
 def is_connected(*_args: Any) -> bool:
-    """Configured iff both the gateway URL and the token are present."""
-    return bool(os.getenv("COZYGATEWAY_URL") and os.getenv("COZYGATEWAY_TOKEN"))
+    """Configured iff both the gateway URL and the token are present for the owning profile.
+
+    Hermes asks this while loading each profile's config under that profile's scope
+    (gateway/config_env.py `_enable_plugin_platform`), so on a multiplexed gateway it answers for
+    the profile being loaded, not the launch profile whose env the process carries.
+    """
+    return bool(profile_env("COZYGATEWAY_URL") and profile_env("COZYGATEWAY_TOKEN"))
 
 
 async def _standalone_send(
@@ -5981,8 +6049,8 @@ def _proactive_spool_path(pconfig: Any, spool_path: Optional[str]) -> str:
     extra = getattr(pconfig, "extra", {}) or {}
     return str(
         extra.get("spool_path")
-        or os.getenv("COZYGATEWAY_SPOOL_PATH")
-        or os.path.join(os.path.expanduser("~"), ".hermes", "cozygateway-attach-v1.sqlite")
+        or profile_env("COZYGATEWAY_SPOOL_PATH")
+        or _default_spool_path(_current_owner())
     )
 
 
@@ -6306,13 +6374,15 @@ async def enqueue_proactive_delivery(
     try:
         media_ids: List[str] = []
         media_errors: List[str] = []
-        configured_token = os.getenv("COZYGATEWAY_TOKEN") or extra.get("token", "")
+        # Cron and tools call this under the owning profile's scope; resolve it once, here.
+        settings, owner = _attach_settings(pconfig), _current_owner()
+        configured_token = settings.token
         client = AttachV1Client(AttachV1ClientConfig(
-            gateway_url=(os.getenv("COZYGATEWAY_URL") or extra.get("gateway_url") or "").rstrip("/"),
+            gateway_url=settings.gateway_url,
             token=configured_token,
-            token_provider=lambda: _fresh_attach_token(configured_token),
+            token_provider=lambda: _fresh_attach_token(configured_token, owner),
             spool=spool,
-            ca_file=os.getenv("COZYGATEWAY_CA_FILE") or extra.get("ca_file") or None,
+            ca_file=settings.ca_file,
         ))
         service = MediaUploadService(
             client,
