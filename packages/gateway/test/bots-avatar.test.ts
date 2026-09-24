@@ -15,7 +15,7 @@ import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
 import { createHermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
-import { decodeAvatar, rosterAvatar, sniffAvatar } from "../src/hermes-bridge/avatar.ts";
+import { AvatarFingerprints, decodeAvatar, rosterAvatar, sniffAvatar } from "../src/hermes-bridge/avatar.ts";
 import { buildRoster, parseProfilesList } from "../src/hermes-bridge/roster.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
 
@@ -290,6 +290,55 @@ describe("POST /bots/:name/avatar/generate", () => {
   });
 });
 
+describe("roster image version", () => {
+  it("follows the asset's bytes, so a picture replaced without a look write still moves the URL", async () => {
+    const h = await setup();
+    h.asset.current = { mime: "image/png", bytes: PNG };
+    h.blob.current = { imageKind: "photo" };
+    const url = async () => {
+      const res = await h.authed("/bots");
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const body = (await (await h.authed("/bots")).json()) as { bots: Array<{ name: string; avatar?: { imageUrl?: string } }> };
+      void res;
+      return body.bots.find((b) => b.name === "pixel")?.avatar?.imageUrl;
+    };
+    const first = await url();
+    expect(first).toMatch(/^\/bots\/pixel\/avatar\?v=[0-9a-f]{12}$/);
+    // A desktop replaces the picture through set_asset only: no ui_meta write, same revision.
+    await h.authed("/bots/pixel/avatar", json("PUT", { data: `data:image/jpeg;base64,${JPEG.toString("base64")}` }));
+    await until(() => h.asset.current?.mime === "image/jpeg");
+    const second = await url();
+    expect(second).not.toBe(first);
+    expect(h.blob.revision).toBe(2);
+  });
+});
+
+describe("avatar fingerprints", () => {
+  it("re-reads a desktop's silent replace after the TTL, and at once when has_avatar or the revision moves", async () => {
+    let bytes = PNG;
+    let reads = 0;
+    const rpc = {
+      request: async () => {
+        reads += 1;
+        return { found: true, mime: "image/png", data: `data:image/png;base64,${bytes.toString("base64")}` };
+      },
+    };
+    const prints = new AvatarFingerprints();
+    const row = (revision = 2) => ({ name: "pixel", hasAvatar: true, metaRevision: revision } as { name: string; hasAvatar: boolean; metaRevision: number; avatarFingerprint?: string });
+    const a = row(); await prints.stamp(rpc, [a], 0);
+    bytes = Buffer.concat([PNG, Buffer.from([0])]);   // a desktop replaces the file, no ui_meta write
+    const b = row(); await prints.stamp(rpc, [b], 30_000);
+    expect(b.avatarFingerprint).toBe(a.avatarFingerprint);   // inside the TTL: no read
+    expect(reads).toBe(1);
+    const c = row(); await prints.stamp(rpc, [c], 61_000);
+    expect(c.avatarFingerprint).not.toBe(a.avatarFingerprint);
+    const d = row(3); await prints.stamp(rpc, [d], 61_001);   // a look write: read again at once
+    expect(reads).toBe(3);
+    await prints.stamp(rpc, [{ name: "pixel", hasAvatar: false }], 61_002);
+    expect(reads).toBe(3);
+  });
+});
+
 describe("pets", () => {
   it("lists the gallery installed and curated first, dropping rows without a slug", async () => {
     const h = await setup();
@@ -338,6 +387,16 @@ describe("the look on the presentation route", () => {
     await h.authed("/bots/pixel/presentation", json("PATCH", { shape: "circle", cozychat: null }));
     expect(h.blob.current?.["cozychat"]).toBeNull();
     expect(h.blob.current?.["color"]).toBe("#5fb8b0");
+  });
+
+  it("clears custom with null, as a restore to the name-derived look needs", async () => {
+    const h = await setup();
+    await h.authed("/bots/pixel/presentation", json("PATCH", { custom: true, shape: "blobatar" }));
+    expect(h.blob.current?.["custom"]).toBe(true);
+    const res = await h.authed("/bots/pixel/presentation", json("PATCH", { custom: null, shape: null }));
+    expect(res.status).toBe(200);
+    expect(h.blob.current?.["custom"]).toBeNull();
+    expect((await res.json()).presentation).toEqual({});
   });
 
   it("refuses a malformed look", async () => {

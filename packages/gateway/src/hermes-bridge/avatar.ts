@@ -3,6 +3,7 @@ import type {
   BotAvatarPet,
   BotSummary,
 } from "cozygateway-contract";
+import { createHash } from "node:crypto";
 import { asRecord, asString, type HermesRpc } from "./rpc.ts";
 
 /** Capability 81: bot avatars, over the same Hermes RPCs the desktop Bot Mode plugin uses.
@@ -160,14 +161,60 @@ export function rosterAvatar(
   hasAvatar: boolean,
   meta: Record<string, unknown> | null,
   revision: number,
+  fingerprint?: string,
 ): BotSummary["avatar"] | undefined {
   const base = `/bots/${encodeURIComponent(name)}/avatar`;
   if (hasAvatar && meta?.["imageKind"] !== "shape") {
-    return { kind: "image", imageUrl: `${base}?v=${revision}` };
+    return { kind: "image", imageUrl: `${base}?v=${fingerprint ?? revision}` };
   }
   const pet = asString(meta?.["pet"])?.trim();
   if (!hasAvatar && pet !== undefined && /^[A-Za-z0-9._-]{1,128}$/.test(pet)) {
     return { kind: "pet", petSlug: pet, imageUrl: `${base}/pets/${encodeURIComponent(pet)}` };
   }
   return undefined;
+}
+
+/** How long a fingerprint is trusted before the asset is read again, when nothing else moved. */
+export const AVATAR_FINGERPRINT_TTL_MS = 60_000;
+
+/** A short content hash of each profile's avatar asset, so the roster's `imageUrl` changes when the
+ *  PICTURE changes, not only when the look is rewritten. Hermes exposes no asset mtime or hash
+ *  (`profiles.list` has only `has_avatar`), and a desktop or CLI can replace the asset without a
+ *  `ui_meta` write, or between its `ui_meta` write and its `set_asset`. So the gateway reads the
+ *  asset, at most once a minute per profile unless `has_avatar` or the blob revision moved. */
+export class AvatarFingerprints {
+  readonly #cache = new Map<string, { revision: number; hash: string | undefined; at: number }>();
+
+  /** This gateway just wrote the asset: read it again on the next refresh. */
+  forget(name: string): void {
+    this.#cache.delete(name);
+  }
+
+  async stamp(
+    rpc: HermesRpc,
+    profiles: Array<{ name: string; hasAvatar: boolean; metaRevision?: number; avatarFingerprint?: string }>,
+    now: number,
+  ): Promise<void> {
+    for (const profile of profiles) {
+      if (!profile.hasAvatar) {
+        this.#cache.delete(profile.name);
+        continue;
+      }
+      const revision = profile.metaRevision ?? 0;
+      const cached = this.#cache.get(profile.name);
+      if (cached !== undefined && cached.revision === revision && now - cached.at < AVATAR_FINGERPRINT_TTL_MS) {
+        profile.avatarFingerprint = cached.hash;
+        continue;
+      }
+      let hash: string | undefined;
+      try {
+        const image = await readAvatar(rpc, profile.name);
+        hash = image === undefined ? undefined : createHash("sha256").update(image.bytes).digest("hex").slice(0, 12);
+      } catch {
+        hash = cached?.hash;
+      }
+      this.#cache.set(profile.name, { revision, hash, at: now });
+      profile.avatarFingerprint = hash;
+    }
+  }
 }

@@ -79,7 +79,7 @@ import type {
 } from "./approvals.ts";
 import { GroupRooms, type RoomInteractionExpiry } from "./group-rooms.ts";
 import { readPresentation, writePresentation } from "./presentation.ts";
-import { clearAvatar, generatePortrait, petGallery, petThumb, readAvatar, writeAvatar } from "./avatar.ts";
+import { AvatarFingerprints, clearAvatar, generatePortrait, petGallery, petThumb, readAvatar, writeAvatar } from "./avatar.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
 import type { ProfileChangeEvent } from "./profile-provisioner.ts";
 import type { ObservationRing } from "../observe/ring.ts";
@@ -490,6 +490,7 @@ export interface HermesBridgeOptions {
 /** Dashboard control/read plane. All Bot Mode conversation traffic is attach-v1. */
 export class HermesBridge implements BotControlSurface {
   readonly #client: HermesClient;
+  readonly #avatarFingerprints = new AvatarFingerprints();
   readonly #storage: Storage;
   readonly #broadcast: (frame: ServerFrame) => void;
   readonly #now: () => number;
@@ -1008,6 +1009,7 @@ export class HermesBridge implements BotControlSurface {
         const { profiles } = parseProfilesList(
           await this.#client.request("profiles.list", {}),
         );
+        await this.#avatarFingerprints.stamp(this.#client, profiles, at);
         const bots = buildRoster(profiles.filter((profile) => !this.#storage.isBotDeleted(profile.name)), {
           hidden: this.#hidden,
           routedProfile: null,
@@ -1112,7 +1114,9 @@ export class HermesBridge implements BotControlSurface {
       }
       return writeAvatar(this.#client, name, data);
     });
-    // `has_avatar` rides `profiles.list`, so the roster learns of it on this refresh.
+    // `has_avatar` rides `profiles.list`, so the roster learns of it on this refresh, and the
+    // fingerprint is re-read so the image URL moves with the picture.
+    this.#avatarFingerprints.forget(name);
     this.refreshSoon(`bot ${name} avatar`);
     return { name, hasAvatar: data !== null, size };
   }

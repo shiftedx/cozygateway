@@ -30,6 +30,8 @@ export interface ParsedProfile {
   /** Capability 81: Hermes's CAS revision for `ui_meta["hermes-bots"]` (0 when never written). Every
    *  look write bumps it, so it versions the roster's avatar URL. */
   metaRevision?: number;
+  /** Capability 81: a short hash of the avatar asset's bytes, when the bridge has read it. */
+  avatarFingerprint?: string;
 }
 
 /** Pulls the bot blob out of the current `ui_meta["hermes-bots"]` namespace. */
@@ -220,7 +222,7 @@ export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions)
       syncState: "setup_required",
       meta,
     };
-    const avatar = rosterAvatar(profile.name, profile.hasAvatar, meta, profile.metaRevision ?? 0);
+    const avatar = rosterAvatar(profile.name, profile.hasAvatar, meta, profile.metaRevision ?? 0, profile.avatarFingerprint);
     if (avatar !== undefined) summary.avatar = avatar;
     return { summary, activityAt: botActivityAt(profile) };
   });

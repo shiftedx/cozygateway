@@ -1526,7 +1526,7 @@ export const BotPresentationPatchSchema = Type.Object({
   /** Capability 81: the look, set or (`null`) cleared key by key like the rest. */
   shape: Type.Optional(Type.Union([LookShape, Type.Null()])),
   color: Type.Optional(Type.Union([PresentationText, Type.Null()])),
-  custom: Type.Optional(Type.Boolean()),
+  custom: Type.Optional(Type.Union([Type.Boolean(), Type.Null()])),
   imageKind: Type.Optional(Type.Union([ImageKind, Type.Null()])),
   cozychat: Type.Optional(Type.Union([BotCozyLookSchema, Type.Null()])),
 }, { additionalProperties: false });
