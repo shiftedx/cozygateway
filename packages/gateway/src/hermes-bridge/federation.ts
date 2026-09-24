@@ -2,15 +2,19 @@ import type {
   BotCatalog, BotCreateRequest, BotCreateResponse, BotDeleteResponse, BotGroup,
   BotGroupDetail, BotGroupMessage, BotGroupPatchRequest, BotModelConfig, BotModelConfigPatch, BotProfile,
   BotModelProviderOAuthSession, BotModelProviderSetupCatalog, BotProfilePatch,
-  BotRoutineCreateRequest, BotRoutinePatch, BotSummary, BridgeLiveness,
-  BotDesktopHermesSession,
+  BotRoutine, BotRoutineBlueprint, BotRoutineCreateRequest, BotRoutinePatch, BotRoutineRunRecord, BotSummary, BridgeLiveness,
+  BotDesktopHermesSession, BotPresentationPatch, BotPresentationResponse,
+  BotAvatarGenerateRequest, BotAvatarGenerateResponse, BotAvatarPetGallery, BotAvatarPetThumbResponse,
+  BotAvatarSetResponse,
 } from "cozygateway-contract";
 import { BackendUnavailable } from "../errors.ts";
+import { ProfileOpInvalid } from "./profile-ops.ts";
+import { BotNotFound } from "./crud.ts";
 import type { Storage } from "../storage.ts";
-import type { BotControlSurface, BotFocusScreen, BotRoutineList, BotRosterView } from "./bridge.ts";
+import type { BotControlSurface, BotFocusScreen, BotProfileOp, BotRoutineList, BotRoutineRunStarted, BotRosterView } from "./bridge.ts";
 import type { GatewayRoomHost, RoomHost } from "./group-rooms.ts";
 import type { ProfileConfigureResult } from "./profile.ts";
-import type { RoutineWriteResult } from "./routines.ts";
+import { RoutineNotFound, type RoutineWriteResult } from "./routines.ts";
 
 export interface FederationMember {
   id: string;
@@ -154,6 +158,13 @@ export class FederatedBotControlSurface implements BotControlSurface {
     if (oldestKey !== undefined) this.#roomHosts.delete(oldestKey);
   }
   roomHostCacheSizeForTesting(): number { return this.#roomHosts.size; }
+  /** A roster name as the profile id on `endpointId`; a name on another computer is refused. */
+  #localName(qualified: string, endpointId: string, relativeTo: string): string {
+    const parsed = splitFederatedBotName(qualified.trim().toLowerCase());
+    if (parsed === undefined) return qualified;
+    if (parsed.endpointId !== endpointId) throw new ProfileOpInvalid(`"${qualified}" is not on the same computer as "${relativeTo}"`);
+    return parsed.profileId;
+  }
   #route(name: string): { member: FederationMember; profile: string } {
     const parsed = splitFederatedBotName(name);
     const member = parsed === undefined ? undefined : this.#members.get(parsed.endpointId);
@@ -183,12 +194,37 @@ export class FederatedBotControlSurface implements BotControlSurface {
   publish(): void { this.#broadcast?.(this.roster()); }
   async createBot(input: BotCreateRequest): Promise<BotCreateResponse> {
     const route = this.#route(input.name);
-    const result = await route.member.bridge.createBot({ ...input, name: route.profile });
+    const result = await route.member.bridge.createBot({
+      ...input,
+      name: route.profile,
+      // A clone source is a bot on the SAME computer, named the way the roster names it.
+      ...(input.cloneFrom === undefined ? {} : { cloneFrom: this.#localName(input.cloneFrom, route.member.id, input.name) }),
+    });
     return { ...result, bot: summary(route.member.id, result.bot) };
+  }
+  /** Capability 82. A new name (rename, duplicate) must sit on the same endpoint as the bot, and a
+   *  roster row coming back is qualified exactly as the roster's own rows are. */
+  async profileOp(name: string, op: BotProfileOp): Promise<unknown> {
+    const r = this.#route(name);
+    const local = (qualified: string): string => this.#localName(qualified, r.member.id, name);
+    const routed: BotProfileOp = op.kind === "rename" ? { ...op, newName: local(op.newName) }
+      : op.kind === "duplicate" && op.newName !== undefined ? { ...op, newName: local(op.newName) }
+      : op;
+    if (r.member.bridge.profileOp === undefined) throw new BackendUnavailable("this endpoint has no profile operations");
+    const result = await r.member.bridge.profileOp(r.profile, routed);
+    const bot = (result as { bot?: BotSummary } | undefined)?.bot;
+    return bot === undefined ? result : { ...(result as object), bot: summary(r.member.id, bot) };
   }
   async deleteBot(name: string, opts?: { force?: boolean }): Promise<BotDeleteResponse> { const r = this.#route(name); const result = await r.member.bridge.deleteBot(r.profile, opts); return { ...result, name }; }
   async botProfile(name: string): Promise<BotProfile> { const r = this.#route(name); return r.member.bridge.botProfile(r.profile); }
   async configureProfile(name: string, patch: BotProfilePatch): Promise<ProfileConfigureResult> { const r = this.#route(name); return r.member.bridge.configureProfile(r.profile, patch); }
+  async botPresentation(name: string): Promise<BotPresentationResponse> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.botPresentation === undefined) throw new BotNotFound(name); return { ...(await bridge.botPresentation(r.profile)), name }; }
+  async configurePresentation(name: string, patch: BotPresentationPatch): Promise<BotPresentationResponse> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.configurePresentation === undefined) throw new BotNotFound(name); return { ...(await bridge.configurePresentation(r.profile, patch)), name }; }
+  async botAvatar(name: string): Promise<{ mime: string; bytes: Buffer } | undefined> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.botAvatar === undefined) throw new BotNotFound(name); return bridge.botAvatar(r.profile); }
+  async setBotAvatar(name: string, data: string | null): Promise<BotAvatarSetResponse> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.setBotAvatar === undefined) throw new BotNotFound(name); return { ...(await bridge.setBotAvatar(r.profile, data)), name }; }
+  async generateBotAvatar(name: string, request: BotAvatarGenerateRequest): Promise<BotAvatarGenerateResponse> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.generateBotAvatar === undefined) throw new BotNotFound(name); return bridge.generateBotAvatar(r.profile, request); }
+  async botAvatarPets(name: string, localOnly: boolean): Promise<BotAvatarPetGallery> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.botAvatarPets === undefined) throw new BotNotFound(name); return bridge.botAvatarPets(r.profile, localOnly); }
+  async botAvatarPetThumb(name: string, slug: string, url: string): Promise<BotAvatarPetThumbResponse> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.botAvatarPetThumb === undefined) throw new BotNotFound(name); return bridge.botAvatarPetThumb(r.profile, slug, url); }
   async modelConfig(name: string): Promise<BotModelConfig> { const r = this.#route(name); return r.member.bridge.modelConfig(r.profile); }
   async configureModel(name: string, patch: BotModelConfigPatch): Promise<BotModelConfig> { const r = this.#route(name); return r.member.bridge.configureModel(r.profile, patch); }
   async modelProviders(name: string): Promise<BotModelProviderSetupCatalog> { const r = this.#route(name); return r.member.bridge.modelProviders(r.profile); }
@@ -215,6 +251,11 @@ export class FederatedBotControlSurface implements BotControlSurface {
   async createRoutine(name: string, input: BotRoutineCreateRequest): Promise<RoutineWriteResult> { const r = this.#route(name); return r.member.bridge.createRoutine(r.profile, input); }
   async patchRoutine(name: string, id: string, patch: BotRoutinePatch): Promise<RoutineWriteResult> { const r = this.#route(name); return r.member.bridge.patchRoutine(r.profile, id, patch); }
   async deleteRoutine(name: string, id: string): Promise<void> { const r = this.#route(name); return r.member.bridge.deleteRoutine(r.profile, id); }
+  async runRoutine(name: string, id: string): Promise<BotRoutineRunStarted> { const r = this.#route(name); if (r.member.bridge.runRoutine === undefined) throw new RoutineNotFound(id); return r.member.bridge.runRoutine(r.profile, id); }
+  async routineRuns(name: string, id: string, limit?: number): Promise<BotRoutineRunRecord[]> { const r = this.#route(name); if (r.member.bridge.routineRuns === undefined) throw new RoutineNotFound(id); return r.member.bridge.routineRuns(r.profile, id, limit); }
+  async routineRunOutput(name: string, id: string, runId: string): Promise<string | null> { const r = this.#route(name); if (r.member.bridge.routineRunOutput === undefined) throw new RoutineNotFound(runId); return r.member.bridge.routineRunOutput(r.profile, id, runId); }
+  async routineBlueprints(name: string): Promise<BotRoutineBlueprint[]> { const r = this.#route(name); return r.member.bridge.routineBlueprints?.(r.profile) ?? []; }
+  async instantiateRoutineBlueprint(name: string, key: string, values: Record<string, string>): Promise<BotRoutine> { const r = this.#route(name); if (r.member.bridge.instantiateRoutineBlueprint === undefined) throw new RoutineNotFound(key); return r.member.bridge.instantiateRoutineBlueprint(r.profile, key, values); }
   setFocus(deviceId: string, screen: BotFocusScreen | null): void { for (const member of this.#members.values()) member.bridge.setFocus(deviceId, screen); }
   /** The endpoint that owns a public bot name, or `GATEWAY_HOST` when no endpoint does. A gateway
    *  runtime bot is named bare on every gateway shape and belongs to no endpoint; so does a name
