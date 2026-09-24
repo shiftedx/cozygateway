@@ -20,6 +20,7 @@ import type {
   BotGroupMessage,
   BotModelConfig,
   BotModelConfigPatch,
+  BotVoice,
   BotModelProviderOAuthSession,
   BotModelProviderSetupCatalog,
   BotInteractionSettlement,
@@ -112,6 +113,7 @@ import {
   type RoutineWriteResult,
 } from "./routines.ts";
 import { readBotModelConfig, writeBotModelConfig } from "./model-config.ts";
+import { readBotVoice, speakThroughHermes, type BotSpeech } from "./voice.ts";
 import {
   ProfileOpInvalid,
   copyBotLook,
@@ -297,6 +299,9 @@ export interface BotControlSurface {
   generateBotAvatar?(name: string, request: BotAvatarGenerateRequest): Promise<BotAvatarGenerateResponse>;
   botAvatarPets?(name: string, localOnly: boolean): Promise<BotAvatarPetGallery>;
   botAvatarPetThumb?(name: string, slug: string, url: string): Promise<BotAvatarPetThumbResponse>;
+  /** Capability 86 (voice). Optional so a surface with no Hermes profile behind it lacks the routes. */
+  botVoice?(name: string): Promise<BotVoice>;
+  speakBot?(name: string, text: string): Promise<BotSpeech>;
   modelConfig(name: string): Promise<BotModelConfig>;
   configureModel(
     name: string,
@@ -1301,6 +1306,14 @@ export class HermesBridge implements BotControlSurface {
     }
     const image = await petThumb(this.#client, slug, this.#petGallery.pets.get(slug) ?? "");
     return image === undefined ? { ok: false } : { ok: true, image };
+  }
+  async botVoice(name: string): Promise<BotVoice> {
+    await this.#assertBotKnown(name);
+    return readBotVoice(this.#client, name);
+  }
+  async speakBot(name: string, text: string): Promise<BotSpeech> {
+    await this.#assertBotKnown(name);
+    return speakThroughHermes(this.#client, name, text);
   }
   async modelConfig(name: string): Promise<BotModelConfig> {
     await this.#assertBotKnown(name);

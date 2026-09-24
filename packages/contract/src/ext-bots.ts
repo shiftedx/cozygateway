@@ -1620,6 +1620,26 @@ export const BotAvatarPetThumbResponseSchema = Type.Object({
 }, { additionalProperties: false });
 export type BotAvatarPetThumbResponse = Static<typeof BotAvatarPetThumbResponseSchema>;
 
+/** Capability 86 (voice). The voice a bot speaks with: its OWN profile's `tts.*` on its own Hermes,
+ *  as upstream Bot Mode does (Read Aloud and auto-speak never borrow the active profile's voice).
+ *  `configured: false` means the profile has no usable `tts` block, and a client hides its speech
+ *  controls. `provider` is Hermes's provider id (`edge` when the block names none, Hermes's own
+ *  default); `voice` is that provider's configured voice when it names one. */
+export const BotVoiceSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 128 }),
+  configured: Type.Boolean(),
+  provider: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+  voice: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+}, { additionalProperties: false });
+export type BotVoice = Static<typeof BotVoiceSchema>;
+
+/** Capability 86 (voice). `POST /bots/:name/speak` body. The text is spoken as given; Hermes strips
+ *  markdown itself. The cap matches one long reply, not a document. */
+export const BotSpeakRequestSchema = Type.Object({
+  text: Type.String({ minLength: 1, maxLength: 20_000, pattern: "\\S" }),
+}, { additionalProperties: false });
+export type BotSpeakRequest = Static<typeof BotSpeakRequestSchema>;
+
 const NameItem = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
 
 export const BotProfilePatchSchema = Type.Object({
@@ -3238,8 +3258,12 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * `PUT`/`DELETE /bots/:name/provider-keys/:provider` save or disconnect one, on the bot's own profile.
  * `GET /bots/:name/skills-hub?q=` and `POST /bots/:name/skills-hub/install` search the Skills Hub
  * and install into this bot. `POST /bots` gains `cloneFrom`, `cloneAll`, `noSkills` and
- * `shareKeys`. Additive: every route is new and a client below 82 sends none of the fields. */
-export const BOTS_CAPABILITY_VERSION = 82;
+ * `shareKeys`. Additive: every route is new and a client below 82 sends none of the fields.
+ * Capability 86 (voice): `GET /bots/:name/voice` reports the bot's own profile `tts.*` voice, and
+ * `POST /bots/:name/speak {text}` synthesizes through it, streaming raw PCM from Hermes
+ * `/api/audio/speak-stream` or answering the whole file from `/api/audio/speak` when that voice
+ * has no chunked API. Row 86 also carries S2's chat semantics and reactions. */
+export const BOTS_CAPABILITY_VERSION = 86;
 
 /** Capability 82. At least one field. `title` is the friendly name; the empty string clears it. */
 export const BotIdentityPatchSchema = Type.Object({

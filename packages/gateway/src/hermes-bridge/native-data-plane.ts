@@ -388,6 +388,8 @@ const DASHBOARD_ONLY: ReadonlySet<string> = new Set([
   "profileOp",
   "botProfile",
   "configureProfile",
+  "botVoice",
+  "speakBot",
   "botPresentation",
   "configurePresentation",
   "botAvatar",
