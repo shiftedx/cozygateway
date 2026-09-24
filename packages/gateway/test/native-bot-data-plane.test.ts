@@ -2334,8 +2334,10 @@ describe("native runtime bots", () => {
     const storage = openStorage(":memory:");
     const botProfile = vi.fn();
     const routines = vi.fn();
+    const botVoice = vi.fn();
+    const speakBot = vi.fn();
     const plane = new NativeBotDataPlane({
-      control: { botProfile, routines } as unknown as BotsSurface,
+      control: { botProfile, routines, botVoice, speakBot } as unknown as BotsSurface,
       storage,
       ingress: {} as AttachV1Ingress,
       nativeBots: ["sage"],
@@ -2345,6 +2347,11 @@ describe("native runtime bots", () => {
     });
 
     await expect(plane.surface().botProfile("SAGE")).rejects.toBeInstanceOf(UnsupportedForRuntime);
+    // Row 86 (voice): a runtime bot has no Hermes profile voice, so both routes answer 409.
+    await expect(plane.surface().botVoice!("sage")).rejects.toBeInstanceOf(UnsupportedForRuntime);
+    await expect(plane.surface().speakBot!("sage", "hello")).rejects.toBeInstanceOf(UnsupportedForRuntime);
+    expect(botVoice).not.toHaveBeenCalled();
+    expect(speakBot).not.toHaveBeenCalled();
     await expect(plane.surface().routines("sage")).rejects.toMatchObject({
       feature: "routines",
       runtime: "cozyagents",
@@ -2610,6 +2617,43 @@ describe("native runtime bots", () => {
     });
     expect(configureProfile).toHaveBeenCalledWith("sage", { enabledSkills: ["missing-skill"] });
 
+    plane.close();
+    storage.close();
+  });
+});
+
+describe("capability 82 profile operations beside runtime bots", () => {
+  const sage = { id: "sage", name: "Sage", avatar: null, runtime: "cozyagents" } as const;
+
+  it("never lets a rename, a duplicate or an import take a runtime bot's name", async () => {
+    const storage = openStorage(":memory:");
+    const calls: unknown[] = [];
+    const control = {
+      roster: () => ({ bots: [], updatedAt: 1, stale: false, hermesState: "online" }),
+      profileOp: vi.fn(async (name: string, op: unknown) => {
+        calls.push({ name, op });
+        return { ok: true };
+      }),
+    } as unknown as BotsSurface;
+    const plane = new NativeBotDataPlane({
+      control,
+      storage,
+      ingress: { isAttached: () => false } as unknown as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+    });
+    const surface = plane.surface();
+    await expect(surface.profileOp!("scout", { kind: "rename", newName: "Sage" })).rejects.toBeInstanceOf(BotNameTaken);
+    await expect(surface.profileOp!("scout", { kind: "duplicate", newName: "sage" })).rejects.toBeInstanceOf(BotNameTaken);
+    await expect(surface.profileOp!("sage", { kind: "import", archive: null })).rejects.toBeInstanceOf(BotNameTaken);
+    expect(calls).toEqual([]);
+    // A duplicate with no name asks Hermes' free-name search to step over every runtime bot.
+    await surface.profileOp!("scout", { kind: "duplicate" });
+    expect(calls).toEqual([{ name: "scout", op: { kind: "duplicate", avoid: ["sage"] } }]);
+    // And an operation ON a runtime bot is still the runtime refusal.
+    await expect(surface.profileOp!("sage", { kind: "export" })).rejects.toBeInstanceOf(UnsupportedForRuntime);
     plane.close();
     storage.close();
   });

@@ -1,5 +1,6 @@
 import type { BotPreview, BotSummary } from "cozygateway-contract";
 import { asRecord, asString } from "./rpc.ts";
+import { rosterAvatar } from "./avatar.ts";
 
 /** Pure roster construction: everything the bridge derives from a `profiles.list` response, with
  *  no sockets, no clock of its own, and no storage. Kept pure so the desktop conventions it
@@ -29,6 +30,11 @@ export interface ParsedProfile {
    *  null when the row has none (capability 87). */
   workerActiveAt: number | null;
   preview: string | null;
+  /** Capability 81: Hermes's CAS revision for `ui_meta["hermes-bots"]` (0 when never written). Every
+   *  look write bumps it, so it versions the roster's avatar URL. */
+  metaRevision?: number;
+  /** Capability 81: a short hash of the avatar asset's bytes, when the bridge has read it. */
+  avatarFingerprint?: string;
 }
 
 /** Pulls the bot blob out of the current `ui_meta["hermes-bots"]` namespace. */
@@ -107,7 +113,13 @@ export function parseProfileRow(row: unknown): ParsedProfile | undefined {
         ? Math.round(workerSeconds * 1000)
         : null,
     preview: asString(lastSession?.["preview"]) ?? null,
+    metaRevision: metaRevision(record["ui_meta_revisions"]),
   };
+}
+
+function metaRevision(revisions: unknown): number {
+  const raw = asRecord(revisions)?.[UI_META_KEY];
+  return typeof raw === "number" && Number.isInteger(raw) && raw >= 0 ? raw : 0;
 }
 
 /** `profiles.list` returns `{ profiles: [...], bot_mode_protocol: true }`. Both fields are read
@@ -228,6 +240,8 @@ export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions)
       syncState: "setup_required",
       meta,
     };
+    const avatar = rosterAvatar(profile.name, profile.hasAvatar, meta, profile.metaRevision ?? 0, profile.avatarFingerprint);
+    if (avatar !== undefined) summary.avatar = avatar;
     return { summary, activityAt: botActivityAt(profile) };
   });
 

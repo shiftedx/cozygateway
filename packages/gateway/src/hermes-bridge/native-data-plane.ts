@@ -15,6 +15,8 @@ import type {
   BotChatDeltaFrame,
   BotChatContextReading,
   BotChatMessage,
+  BotCanonicalChatResponse,
+  BotChatReactionResponse,
   BotChatStateCause,
   BotChatStateFrame,
   BotMobileReceipt,
@@ -385,10 +387,18 @@ type NativeRowOverlay = Pick<
  * about a profile that does not exist and answer 404. Chat, readiness and desktop-session methods
  * are absent on purpose: the native plane owns those for every bot it handles. */
 const DASHBOARD_ONLY: ReadonlySet<string> = new Set([
+  "profileOp",
   "botProfile",
   "configureProfile",
+  "botVoice",
+  "speakBot",
   "botPresentation",
   "configurePresentation",
+  "botAvatar",
+  "setBotAvatar",
+  "generateBotAvatar",
+  "botAvatarPets",
+  "botAvatarPetThumb",
   "modelConfig",
   "configureModel",
   "modelProviders",
@@ -588,6 +598,30 @@ export class NativeBotDataPlane {
         }
         return this.#control.createBot(input);
       },
+      // Capability 82. A rename, a duplicate or an import names a NEW Hermes profile, and the
+      // proxy guard only looks at the bot being operated on. Unguarded, a Hermes profile could take
+      // a runtime bot's name and then be hidden by the roster filter, the orphan `createBot` guards
+      // against above.
+      profileOp: async (name, op) => {
+        if (this.#control.profileOp === undefined) throw new BackendUnavailable("this gateway has no Hermes profile operations");
+        const taken = (candidate: string | undefined): void => {
+          if (candidate !== undefined && this.#runtimeBots.has(normalize(candidate))) throw new BotNameTaken(normalize(candidate));
+        };
+        if (op.kind === "import") taken(name);
+        if (op.kind === "rename") taken(op.newName);
+        if (op.kind === "duplicate") {
+          taken(op.newName);
+          return this.#control.profileOp(name, { ...op, avoid: [...this.#runtimeBots.keys()] });
+        }
+        const result = await this.#control.profileOp(name, op);
+        // Capability 86: a pin or unpin writes the PROFILE model, which takes over from every
+        // per-chat override again, exactly as a `configureModel` model write does. A pin that only
+        // asks for the expensive-model confirmation wrote nothing.
+        if ((op.kind === "pinModel" && (result as { pinned?: unknown } | undefined)?.pinned === true)
+            || op.kind === "unpinModel")
+          this.#storage.clearNativeChatModels(normalize(name), this.#now());
+        return result;
+      },
       // Capability 49. A gateway-owned runtime bot is deletable here rather than 409: its identity
       // is revoked, its rows are purged, and the runner is handed a `delete_runtime`. A runtime bot
       // this gateway does NOT own (a config-declared capability-45 one) keeps the refusal, because
@@ -612,6 +646,14 @@ export class NativeBotDataPlane {
       resumeDesktopSession: (name, hermesSessionId) =>
         this.#resumeDesktopSession(name, hermesSessionId),
       canonicalChat: (name) => this.#canonical(name),
+      openBotChat: (name) => this.#openBotChat(name),
+      reactToChatMessage: (name, messageId, emoji) => this.#react(name, messageId, emoji),
+      // Capability 86: a new PROFILE model takes over from every per-chat override again.
+      configureModel: async (name, patch) => {
+        const result = await this.#control.configureModel(name, patch);
+        if (patch.model !== undefined) this.#storage.clearNativeChatModels(normalize(name), this.#now());
+        return result;
+      },
       newSession: (name) => this.#newSession(name),
       sessions: (name, limit) => this.#sessions(name, limit),
       adoptSession: (name, sessionId, limit) =>
@@ -655,6 +697,9 @@ export class NativeBotDataPlane {
         // not own. Rejected rather than thrown: every guarded method returns a promise.
         return (...args: unknown[]) => {
           const name = typeof args[0] === "string" ? normalize(args[0]) : undefined;
+          // An import's name is the NEW bot's, not one being operated on: the override answers it.
+          if (property === "profileOp" && (args[1] as { kind?: string } | undefined)?.kind === "import")
+            return bound(...args);
           const runtimeBot = name === undefined ? undefined : this.#runtimeBots.get(name);
           if ((property === "modelConfig" || property === "configureModel") && name !== undefined && runtimeBot === undefined && this.#botConfig !== undefined
               && this.#ingress.negotiatedCapabilities?.(name)?.has("provider_connections")) {
@@ -1853,6 +1898,68 @@ export class NativeBotDataPlane {
     };
   }
 
+  /** Capability 86: resolve (or mint) the profile's `Bot Chat` and bind the current chat to it
+   * through the capability-4 exact resume proof. A durable binding that already names the Bot Chat
+   * is NOT re-staged: the plugin keeps that lane in its durable spool across restarts, and once a
+   * gateway turn has run Hermes re-stamps the row's source `cozygateway`, which the plugin's
+   * interactive-only resume proof refuses, so a re-stage would only flip a working binding to
+   * `pending` (observed live on 0.21.4). */
+  async #openBotChat(name: string): Promise<BotCanonicalChatResponse> {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    this.#assertRuntimeSupports(bot, "openBotChat");
+    if (this.#control.canonicalBotChat === undefined)
+      throw new BackendUnavailable("this gateway cannot reach a Hermes profile for a Bot Chat");
+    const canonical = await this.#control.canonicalBotChat(bot, true);
+    if (canonical === null) throw new BackendUnavailable(`hermes did not create ${bot}'s Bot Chat`);
+    // Durable (bot_canonical_chats): a restart keeps retire-on-clear and the no-displace rule.
+    this.#storage.setCanonicalBotChat(bot, canonical.hermesSessionId, this.#now());
+    const current = this.#storage.nativeBotChat(bot, this.#now());
+    const binding = this.#storage.nativeDesktopResumeBinding(bot, current.sessionId);
+    if (binding?.hermesSessionId === canonical.hermesSessionId && binding.status === "resumed")
+      return { name: bot, created: canonical.created, status: "resumed", sessionId: current.sessionId };
+    const resumed = await this.#resumeEligibleDesktopSession(bot, canonical.hermesSessionId);
+    return {
+      name: bot,
+      created: canonical.created,
+      status: resumed.status,
+      ...(resumed.sessionId === undefined ? {} : { sessionId: resumed.sessionId }),
+    };
+  }
+
+  /** Capability 86: Tapback one message of this bot, and tell every paired device. */
+  async #react(name: string, messageId: string, emoji: string | null): Promise<BotChatReactionResponse> {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    const now = this.#now();
+    const set = this.#storage.setBotMessageReaction({ bot, messageId, author: "user", emoji, now });
+    if (set === undefined) throw new BotSessionNotFound(messageId);
+    this.#broadcast({
+      type: "bot_chat_reaction",
+      bot,
+      sessionId: set.sessionId,
+      messageId,
+      reactions: set.reactions,
+      updatedAt: now,
+    });
+    return { messageId, reactions: set.reactions };
+  }
+
+  /** `session.reclaimed` names a stored id: a bound Bot Chat re-proves its binding now rather than
+   * on the next send (upstream plugin.tsx). */
+  sessionReclaimed(hermesSessionId: string): void {
+    for (const { bot, hermesSessionId: canonical } of this.#storage.canonicalBotChats()) {
+      if (canonical !== hermesSessionId || !this.#native.has(bot)) continue;
+      // Only when the CURRENT chat is bound to the Bot Chat, and only a re-proof of that same
+      // binding: the staged resume reuses the bound gateway session, so this event can never
+      // move the selection off a chat the user chose.
+      const current = this.#storage.nativeBotChat(bot, this.#now());
+      const binding = this.#storage.nativeDesktopResumeBinding(bot, current.sessionId);
+      if (binding?.hermesSessionId !== canonical || current.activeTurnId !== undefined) continue;
+      void this.#resumeEligibleDesktopSession(bot, canonical).catch(() => undefined);
+    }
+  }
+
   #commands(name: string) {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
@@ -1926,6 +2033,9 @@ export class NativeBotDataPlane {
       if (!this.#native.has(bot) || !this.#storage.nativeBotHasSession(bot, current.sessionId)) return;
       if (latest === undefined) return;
       const binding = this.#storage.nativeDesktopResumeBinding(bot, current.sessionId);
+      // Capability 86: the bot's Bot Chat is its forever chat. A newer scratch session elsewhere
+      // is still one tap away in Sessions, but it never takes over the chat the roster opens.
+      if (binding !== undefined && binding.hermesSessionId === this.#storage.canonicalBotChat(bot)) return;
       if (binding?.hermesSessionId === latest.hermesSessionId) {
         const proof = this.#liveDesktopResumeProofs.get(bot);
         if (proof?.hermesSessionId === latest.hermesSessionId
@@ -2453,6 +2563,18 @@ export class NativeBotDataPlane {
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
     const now = this.#now();
     const previous = this.#storage.nativeBotChat(bot, now);
+    // Capability 86: clearing a chat bound to the Bot Chat RETIRES it (archived + hidden), so the
+    // next open mints a fresh canonical one instead of re-binding the conversation just cleared.
+    // The archive comes FIRST and a failure fails the whole reset: the binding row and the
+    // selection are untouched, so the clear can be retried rather than silently undone later.
+    const bound = this.#storage.nativeDesktopResumeBinding(bot, previous.sessionId);
+    const canonical = this.#storage.canonicalBotChat(bot);
+    if (bound !== undefined && canonical !== undefined && bound.hermesSessionId === canonical) {
+      if (this.#control.archiveHermesSession === undefined)
+        throw new BackendUnavailable("this gateway cannot retire a Hermes Bot Chat");
+      await this.#control.archiveHermesSession(bot, canonical);
+      this.#storage.setCanonicalBotChat(bot, null, now);
+    }
     if (previous.activeTurnId !== undefined) {
       this.#discardLiveTurn(this.#nativeTurnKey(bot, previous.sessionId, previous.activeTurnId));
       this.#cancelMobileTurn(bot, previous.sessionId, previous.activeTurnId);

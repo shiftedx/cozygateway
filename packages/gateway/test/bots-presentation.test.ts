@@ -139,8 +139,12 @@ const patch = (body: unknown): RequestInit => ({
 });
 
 describe("presentation: pure rules", () => {
-  it("reads only the five keys and keeps absence distinct from false", () => {
-    expect(presentationFromMeta({ chat: "x", shape: "blob" })).toEqual({});
+  it("reads only the presentation and look keys and keeps absence distinct from false", () => {
+    expect(presentationFromMeta({ chat: "x", group: "g" })).toEqual({});
+    expect(presentationFromMeta({ chat: "x", shape: "blobatar::cloud", color: "#8b5cf6", custom: true, imageKind: "shape", image: "data:x" }))
+      .toEqual({ shape: "blobatar::cloud", color: "#8b5cf6", custom: true, imageKind: "shape" });
+    expect(presentationFromMeta({ imageKind: "gif", custom: "yes", cozychat: { jelly: "ink-quill", seed: "", other: 1 } }))
+      .toEqual({ cozychat: { jelly: "ink-quill" } });
     expect(presentationFromMeta({ pinned: false, hidden: true, sectionId: "sec-1", sectionName: "Clients", title: " Cleo " }))
       .toEqual({ pinned: false, hidden: true, sectionId: "sec-1", sectionName: "Clients", title: "Cleo" });
     expect(presentationFromMeta({ sectionId: null, sectionName: "" })).toEqual({});

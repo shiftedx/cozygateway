@@ -113,6 +113,34 @@ function surface(rooms: Map<string, string[]>): {
 }
 
 describe("room ownership on a federated control surface", () => {
+  it("remembers a new room under its own key when a renamed room still holds its name's key", async () => {
+    const storage = openStorage(":memory:");
+    try {
+      // "Release" was renamed from "Launch" and keeps the key `launch`, on home.
+      storage.createBotGroup({ key: "launch", name: "Release", members: ["home:luna", "home:sage"], owningHost: "home", createdAt: 1 });
+      const hosts = { home: new RecordingHost("home"), studio: new RecordingHost("studio"), gateway: new RecordingHost("gateway") };
+      Object.assign(hosts.studio, {
+        createGroup: (name: string, members: string[], owningHost?: string) => {
+          hosts.studio.calls.push(`create:${name}`);
+          storage.createBotGroup({ key: "launch~2", name, members, ...(owningHost === undefined ? {} : { owningHost }), createdAt: 2 });
+          return Promise.resolve({ id: "launch~2", name, members });
+        },
+      });
+      const federation = new FederatedBotControlSurface(
+        [{ id: "home", bridge: hosts.home as unknown as FederationMember["bridge"] },
+          { id: "studio", bridge: hosts.studio as unknown as FederationMember["bridge"] }],
+        undefined, hosts.gateway as unknown as GatewayRoomHost,
+        (key) => storage.botGroup(key)?.members, (key) => storage.botGroupOwner(key),
+        (key, owner) => storage.backfillBotGroupOwner(key, owner), (name) => storage.botGroupKeyByName(name),
+      );
+      await federation.createGroup("Launch", ["studio:luna", "studio:sage"]);
+      federation.groupDetail("Release");
+      federation.groupDetail("Launch");
+      expect(hosts.home.calls).toEqual(["detail:Release"]);
+      expect(hosts.studio.calls).toEqual(["create:Launch", "detail:Launch"]);
+    } finally { storage.close(); }
+  });
+
   it("persists a newly created room owner in the create transaction", async () => {
     const storage = openStorage(":memory:");
     try {

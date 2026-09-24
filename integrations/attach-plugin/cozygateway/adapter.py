@@ -87,6 +87,8 @@ logger = logging.getLogger(__name__)
 # The registered platform name. It is also the value the harness stamps into the
 # per-turn session context, so the tool hooks can filter to this platform's turns.
 PLATFORM_NAME = "cozygateway"
+# Upstream Bot Mode's canonical chat title (hermes_state CANONICAL_BOT_CHAT_TITLE).
+CANONICAL_BOT_CHAT_TITLE = "Bot Chat"
 
 # The harness binds these task-local session identifiers per turn and propagates
 # them into the tool worker thread. They are harness-defined identifiers, used only
@@ -944,6 +946,13 @@ class AttachAdapter:
         # The only window in which this adapter itself is writing a mobile-originated row. The
         # separate mirror worker skips it, then advances its durable cursor once the inject ends.
         self._desktop_mirror_injections: Set[str] = set()
+        # thread -> (turn id, inbound source) for an injected turn whose mirror baseline is owed at
+        # SETTLE time. Upstream ``handle_message`` only spawns the run, so baselining right after
+        # it returned saw none of the turn's rows and the mirror echoed them back.
+        self._mirror_settles: Dict[str, Tuple[str, Any]] = {}
+        # thread -> the running settle baseline, which the NEXT turn awaits before its own flush:
+        # otherwise that flush mirrors the previous turn's rows before they are baselined.
+        self._settle_tasks: Dict[str, "asyncio.Task[Any]"] = {}
         self._desktop_mirror_interval = _env_float(
             "COZYGATEWAY_DESKTOP_SESSION_SYNC_INTERVAL_SECONDS", 1.0,
         )
@@ -1623,9 +1632,15 @@ class AttachAdapter:
             binding = self._desktop_session_bindings.get(thread_id)
             link = next((item for item in spool.desktop_session_links() if item["threadId"] == thread_id), None)
             link_source = str(link.get("source") or "") if link is not None else ""
-            if (binding is not None and binding[0] == session_key and link is not None
-                    and link_source in INTERACTIVE_SESSION_SOURCES
-                    and str(row.get("source") or "").strip().lower() == link_source):
+            # The bound Bot Chat needs no in-process binding: after a plugin restart the lane still
+            # runs in it (durable switch), and skipping this baseline would echo the gateway's own
+            # turn rows back through the mirror.
+            bound_bot_chat = (link is not None and link_source in INTERACTIVE_SESSION_SOURCES
+                              and await asyncio.to_thread(self._is_bound_bot_chat, db, link))
+            if (link is not None and link_source in INTERACTIVE_SESSION_SOURCES
+                    and (bound_bot_chat or (
+                        binding is not None and binding[0] == session_key
+                        and str(row.get("source") or "").strip().lower() == link_source))):
                 # Compression can rotate the active SessionEntry after adoption.  The durable
                 # link's root remains the proof; resolve it before accepting the new active tip.
                 linked_tip = await asyncio.to_thread(
@@ -1642,6 +1657,15 @@ class AttachAdapter:
                 )
         except Exception:  # noqa: BLE001 - mirroring may never affect a phone turn
             logger.debug("attach: could not baseline desktop session mirror", exc_info=True)
+
+    @staticmethod
+    def _is_bound_bot_chat(db: Any, link: Dict[str, Any]) -> bool:
+        """Whether a mirror link's adopted registry row is the profile's canonical Bot Chat."""
+        desktop_session_id = link.get("desktopSessionId")
+        if not desktop_session_id:
+            return False
+        row = db.get_session(str(desktop_session_id))
+        return isinstance(row, dict) and str(row.get("title") or "") == CANONICAL_BOT_CHAT_TITLE
 
     async def _mirror_desktop_session_link(
         self, client: Any, spool: Any, db: Any, link: Dict[str, Any], *, allow_active: bool = False,
@@ -1675,7 +1699,13 @@ class AttachAdapter:
                 if (session_source != PLATFORM_NAME or bool(session.get("hidden"))
                         or str(session.get("chat_id") or "") != thread_id):
                     return
-            elif session_source != source or not link.get("desktopSessionId"):
+            elif not link.get("desktopSessionId") or (
+                    session_source != source
+                    # Bot parity S2: the bound Bot Chat is followed WHATEVER its source. Hermes
+                    # re-stamps it ``cozygateway`` after a gateway turn, yet teammates'
+                    # ``message_agent`` DMs keep landing in it. The turn baseline already moved the
+                    # cursor past the gateway's own rows, so only external rows are mirrored.
+                    and not await asyncio.to_thread(self._is_bound_bot_chat, db, link)):
                 return
 
             after = int(link["lastMessageRowId"])
@@ -2163,6 +2193,10 @@ class AttachAdapter:
         # any mobile write starts; text/time dedupe would lose legitimate repeated turns. Hermes
         # 0.20.5's cross-process ``session_turn_leases`` serializes this session lineage, so this
         # high-water baseline is safe for handoff (but is intentionally not a concurrent merge).
+        settling = self._settle_tasks.get(turn.thread_id)
+        if settling is not None:
+            # The previous phone turn's baseline must land first (it is bounded by its idle wait).
+            await asyncio.shield(settling)
         await self._flush_desktop_session_before_injection(turn.thread_id)
         media_urls: List[str] = []
         media_types: List[str] = []
@@ -2205,16 +2239,57 @@ class AttachAdapter:
         # Session sync supports serialized handoff, not concurrent two-writer merges.  Keep this
         # guard across the entire injected turn and baseline before releasing it, so a poller can
         # never reflect the phone's own rows back while this lane is being written.
+        #
+        # The guard is released, and the baseline taken, when the turn SETTLES (``_cleanup_turn``
+        # on its final commit or failure, then the runner going idle), not when ``handle_message``
+        # returns: upstream only spawns the run there. Trade-off: a row an external writer (a
+        # teammate's ``message_agent`` DM) adds to this lane's session DURING the phone's turn is
+        # covered by that baseline and is not mirrored; it is still in Hermes's transcript.
         self._desktop_mirror_injections.add(turn.thread_id)
+        self._mirror_settles[turn.thread_id] = (turn.turn_id, source)
         try:
             await self.handle_message(event)  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 - best-effort failed, then clean up
             logger.debug("attach: handle_message raised", exc_info=True)
             await self._safe_failed(turn.thread_id, turn.turn_id, "turn error")
             self._cleanup_turn(turn.thread_id, turn.turn_id)
+
+    def _settle_mirror(self, chat_id: str, turn_id: str) -> None:
+        """Schedule the owed baseline for an injected turn that just settled (see ``_handle_turn``)."""
+        pending = self._mirror_settles.get(chat_id)
+        if pending is None or pending[0] != turn_id:
+            return
+        del self._mirror_settles[chat_id]
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._desktop_mirror_injections.discard(chat_id)
+            return
+        task = loop.create_task(self._settle_mirror_after_idle(chat_id, pending[1]))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        self._settle_tasks[chat_id] = task
+        task.add_done_callback(
+            lambda done, chat=chat_id: self._settle_tasks.pop(chat, None)
+            if self._settle_tasks.get(chat) is done else None)
+
+    async def _settle_mirror_after_idle(self, chat_id: str, source: Any) -> None:
+        """Baseline once the runner has finished writing the turn's rows, then release the guard."""
+        try:
+            runner = getattr(self, "gateway_runner", None)
+            session_key = self._dispatch_session_key(source)
+            is_running = getattr(runner, "_is_session_running", None)
+            # Bounded: a runner that never reports idle still releases the guard.
+            for _ in range(240):
+                if not session_key or not callable(is_running) or not is_running(session_key):
+                    break
+                await asyncio.sleep(0.25)
+            await self._baseline_mobile_mirror_link(chat_id, source)
+        except Exception:  # noqa: BLE001 - mirroring may never affect a phone turn
+            logger.debug("attach: settle baseline failed", exc_info=True)
         finally:
-            await self._baseline_mobile_mirror_link(turn.thread_id, source)
-            self._desktop_mirror_injections.discard(turn.thread_id)
+            if chat_id not in self._mirror_settles:
+                self._desktop_mirror_injections.discard(chat_id)
 
     async def _report_turn_context(self, chat_id: str, turn_id: str, session_key: str) -> None:
         """Report the runtime's current prompt occupancy after a completed injected turn.
@@ -2375,7 +2450,12 @@ class AttachAdapter:
             session_db = self._sync_session_db(runner, store)
             raw = session_db.get_session(raw_id) if session_db is not None else None
             raw_source = str(raw.get("source") or "").strip().lower() if isinstance(raw, dict) else ""
-            if not isinstance(raw, dict) or raw_source not in INTERACTIVE_SESSION_SOURCES:
+            # Bot parity S2: the profile's canonical "Bot Chat" stays adoptable after a gateway turn
+            # re-stamped its source ``cozygateway``; the exact title is Hermes's own UNIQUE identity.
+            canonical_bot_chat = (raw_source == PLATFORM_NAME and isinstance(raw, dict)
+                                  and str(raw.get("title") or "") == CANONICAL_BOT_CHAT_TITLE)
+            if not isinstance(raw, dict) or (raw_source not in INTERACTIVE_SESSION_SOURCES
+                                             and not canonical_bot_chat):
                 return
             target = session_db.resolve_resume_session_id(raw_id)
             target_row = session_db.get_session(target) if isinstance(target, str) and target else None
@@ -2399,7 +2479,9 @@ class AttachAdapter:
                 # This is the only intentional retarget: an explicit, idle, serialized desktop
                 # adoption. Ordinary retries use insert-only links and cannot discard an outbox tail.
                 spool.reset_desktop_session_link(
-                    thread_id=thread_id, current_hermes_session_id=target, source=raw_source,
+                    thread_id=thread_id, current_hermes_session_id=target,
+                    # A re-adopted Bot Chat keeps the interactive link shape the mirror speaks.
+                    source="desktop" if canonical_bot_chat else raw_source,
                     desktop_session_id=raw_id, last_message_row_id=baseline,
                 )
             client = self._client
@@ -3635,6 +3717,8 @@ class AttachAdapter:
             self._thinking.pop(turn_id, None)
         if not keep_active and self._active_turn.get(chat_id) == turn_id:
             self._active_turn.pop(chat_id, None)
+        if not keep_active:
+            self._settle_mirror(chat_id, turn_id)
 
     async def _proactive_media_send(
         self,

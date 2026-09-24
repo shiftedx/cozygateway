@@ -160,6 +160,14 @@ export interface HermesEvent {
 
 export type HermesState = "absent" | "connecting" | "online";
 
+/** One server->client request off the Hermes stream (capability 85). `id` is Hermes's own string
+ *  id (`srq-...`), answered verbatim through `respond`. */
+export interface HermesServerRequest {
+  id: string;
+  method: string;
+  params: Record<string, unknown>;
+}
+
 /** A snapshot of the client's own connection state, for a health surface to report (issue #63: a
  *  monitor watching only the advertised capability cannot tell "online" from "stuck reconnecting
  *  for six hours", because the capability itself never goes away). `since` is when `state` last
@@ -223,14 +231,28 @@ export interface HermesClient {
   dashboardResponse(path: string, init?: {
     method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
     body?: unknown;
+    /** A body sent as it is (a streamed multipart upload): no JSON encoding, the caller's own
+     *  `content-type`. Not replayed on the password-mode re-login retry. */
+    rawBody?: ReadableStream<Uint8Array>;
     headers?: Readonly<Record<string, string>>;
     signal?: AbortSignal;
     timeoutMs?: number;
   }): Promise<Response>;
+  /** Capability 86 (voice). The authenticated address of a SIBLING dashboard WebSocket on this same
+   *  Hermes (for example `/api/audio/speak-stream`), with the credential of the moment on it: the
+   *  loopback token, or a freshly minted single-use ticket. Optional so hand-rolled test clients
+   *  keep compiling; the real client always implements it. The URL carries a secret: never log it. */
+  sidecarSocketUrl?(path: string, query?: Readonly<Record<string, string>>): Promise<string>;
   /** Subscribes to every event frame, including the optional `sessions.changed` /
    *  `cron.changed` broadcasts. Handlers cannot be removed. */
   onEvent(handler: (event: HermesEvent) => void): void;
   onStateChange(handler: (state: HermesState) => void): void;
+  /** Capability 85. Server->client JSON-RPC requests (`{ id, method, params }` with no `result` or
+   *  `error`), such as `display.install.sudo`. Optional so hand-rolled test clients keep compiling;
+   *  the real client always implements both. Unanswered requests simply time out Hermes-side. */
+  onServerRequest?(handler: (request: HermesServerRequest) => void): void;
+  /** Answers one server request on the CURRENT socket. False when the link is not open. */
+  respond?(id: string, result: unknown): boolean;
   /** Idempotent. Begins the connect and reconnect loop. */
   start(): void;
   /** Idempotent. Cancels reconnects, fails every in-flight request, closes the socket. */
@@ -260,6 +282,21 @@ function replyOf(
   }
   if ("result" in frame) return { id, ok: true, result: frame["result"] };
   return undefined;
+}
+
+/** Reads a server->client request: an id, a string method other than `event`, and no result or
+ *  error (which `replyOf` already claimed). */
+function serverRequestOf(frame: Record<string, unknown>): HermesServerRequest | undefined {
+  const rawId = frame["id"];
+  const method = frame["method"];
+  if (rawId === undefined || rawId === null || typeof method !== "string" || method === "event") return undefined;
+  if ("result" in frame || "error" in frame) return undefined;
+  const params = frame["params"];
+  return {
+    id: String(rawId),
+    method,
+    params: typeof params === "object" && params !== null ? (params as Record<string, unknown>) : {},
+  };
 }
 
 /** Reads an event frame. Hermes sends `{ method: "event", params: { type, session_id, payload } }`;
@@ -333,6 +370,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   const pending = new Map<string, Pending>();
   const eventHandlers: Array<(event: HermesEvent) => void> = [];
   const stateHandlers: Array<(state: HermesState) => void> = [];
+  const serverRequestHandlers: Array<(request: HermesServerRequest) => void> = [];
 
   function setState(next: HermesState): void {
     if (state === next) return;
@@ -462,6 +500,18 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
       if (entry === undefined) return;
       if (reply.ok) entry.resolve(reply.result);
       else entry.reject(reply.error);
+      return;
+    }
+
+    const serverRequest = serverRequestOf(frame);
+    if (serverRequest !== undefined) {
+      for (const handler of serverRequestHandlers) {
+        try {
+          handler(serverRequest);
+        } catch (err) {
+          log(`server request handler threw on "${serverRequest.method}"; continuing (${(err as Error).message})`);
+        }
+      }
       return;
     }
 
@@ -647,6 +697,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     init: {
       method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
       body?: unknown;
+      rawBody?: ReadableStream<Uint8Array>;
       headers?: Readonly<Record<string, string>>;
       signal?: AbortSignal;
       timeoutMs?: number;
@@ -673,7 +724,9 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
       const response = await doFetch(new URL(path, `${dashboardBaseUrl}/`), {
         method: init.method ?? "GET",
         headers,
-        ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+        ...(init.rawBody !== undefined
+          ? { body: init.rawBody, duplex: "half" } as RequestInit
+          : init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
         signal: init.signal === undefined
           ? timeoutSignal
           : AbortSignal.any([init.signal, timeoutSignal]),
@@ -683,7 +736,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
 
     let attempt = await send();
     let response = attempt.response;
-    if (auth.mode === "password" && response.status === 401 && !relogged) {
+    if (auth.mode === "password" && response.status === 401 && !relogged && init.rawBody === undefined) {
       await response.text().catch(() => "");
       if (sessionCookie === attempt.cookie) sessionCookie = undefined;
       relogged = true;
@@ -709,11 +762,23 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     return body as T;
   }
 
+  async function sidecarSocketUrl(path: string, query: Readonly<Record<string, string>> = {}): Promise<string> {
+    const credential = await resolveCredential();
+    const url = new URL(opts.url);
+    url.pathname = path;
+    url.search = "";
+    url.hash = "";
+    for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
+    url.searchParams.set(credential.param, credential.value);
+    return url.toString();
+  }
+
   function dashboardResponse(
     path: string,
     init: {
       method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
       body?: unknown;
+      rawBody?: ReadableStream<Uint8Array>;
       headers?: Readonly<Record<string, string>>;
       signal?: AbortSignal;
       timeoutMs?: number;
@@ -804,6 +869,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
 
     dashboardJson,
     dashboardResponse,
+    sidecarSocketUrl,
 
     onEvent(handler: (event: HermesEvent) => void): void {
       eventHandlers.push(handler);
@@ -811,6 +877,17 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
 
     onStateChange(handler: (state: HermesState) => void): void {
       stateHandlers.push(handler);
+    },
+
+    onServerRequest(handler: (request: HermesServerRequest) => void): void {
+      serverRequestHandlers.push(handler);
+    },
+
+    respond(id: string, result: unknown): boolean {
+      const socket = ws;
+      if (socket === undefined || socket.readyState !== WebSocket.OPEN) return false;
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id, result }));
+      return true;
     },
 
     start(): void {

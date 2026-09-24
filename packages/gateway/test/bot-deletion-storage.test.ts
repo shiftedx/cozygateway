@@ -57,13 +57,19 @@ describe("bot deletion owns its complete SQLite graph", () => {
     for (const bot of [BOT, KEEP]) {
       storage.nativeBotChat(bot, 1);
       storage.stageNativeDesktopResume(bot, `desktop-${bot}`, 2);
+      // Capability 86: the Bot Chat binding and a Tapback.
+      storage.setCanonicalBotChat(bot, `bot-chat-${bot}`, 2);
+      const chat = storage.nativeBotChat(bot, 3);
+      storage.appendNativeBotMessage({ bot, sessionId: chat.sessionId, messageId: `${bot}#0`, role: "assistant", text: "hi", at: 3 });
+      storage.setBotMessageReaction({ bot, messageId: `${bot}#0`, author: "user", emoji: "❤️", now: 4 });
       db.prepare("INSERT INTO bot_native_history_migrations VALUES (?, 1)").run(bot);
       db.prepare("INSERT INTO task_slash_catalogs VALUES (?, '[]')").run(bot);
       seedTask(db, bot, bot, null);
     }
     seedTask(db, "shared-task", BOT, "shared-room");
     const purged = storage.purgeBot(BOT);
-    expect(purged).toMatchObject({ desktopResumeBindings: 1, nativeHistoryMigrations: 1, slashCatalogs: 1, tasks: 1 });
+    expect(purged).toMatchObject({ desktopResumeBindings: 1, nativeHistoryMigrations: 1, slashCatalogs: 1, tasks: 1,
+      reactions: 1, canonicalBotChat: 1 });
     for (const table of ["tasks", ...taskChildren]) {
       expect(count(db, table, "task_id", BOT), table).toBe(0);
       expect(count(db, table, "task_id", KEEP), table).toBe(1);
@@ -71,7 +77,8 @@ describe("bot deletion owns its complete SQLite graph", () => {
     }
     expect(count(db, "task_tool_facts", "run_id", BOT)).toBe(0);
     expect(count(db, "task_tool_facts", "run_id", "shared-task")).toBe(1);
-    for (const table of ["bot_desktop_resume_bindings", "bot_native_history_migrations", "bot_native_sessions"]) {
+    for (const table of ["bot_desktop_resume_bindings", "bot_native_history_migrations", "bot_native_sessions",
+      "bot_canonical_chats", "bot_message_reactions"]) {
       expect(count(db, table, "bot", BOT), table).toBe(0);
       expect(count(db, table, "bot", KEEP), table).toBeGreaterThan(0);
     }

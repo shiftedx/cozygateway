@@ -8,10 +8,15 @@ export type UpgradeHandler = (req: IncomingMessage, socket: Duplex, head: Buffer
  *  routing by pathname here is the only dispatch that runs. A path matching no route would
  *  otherwise never be answered (the client hangs until its own timeout); this writes a plain
  *  HTTP error response and destroys the socket instead. */
-export function createUpgradeDispatcher(routes: ReadonlyMap<string, UpgradeHandler>): UpgradeHandler {
+export function createUpgradeDispatcher(
+  routes: ReadonlyMap<string, UpgradeHandler>,
+  /** Capability 85. A parameterized path (`/bots/:name/screen/ws`) cannot be a map key; the
+   *  fallback is asked only when no exact route matched, so the fixed paths keep their dispatch. */
+  fallback?: (pathname: string) => UpgradeHandler | undefined,
+): UpgradeHandler {
   return (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     const pathname = (req.url ?? "").split("?")[0] ?? "";
-    const handler = routes.get(pathname);
+    const handler = routes.get(pathname) ?? fallback?.(pathname);
     if (handler === undefined) {
       socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
       socket.destroy();

@@ -47,6 +47,9 @@ export interface FakeHermesBehavior {
   /** Gated mode: ticket lifetime in ms. 0 means every minted ticket is already expired, which is
    *  how the expiry path is exercised. Default 30000, matching upstream TTL_SECONDS. */
   ticketTtlMs?: number;
+  /** Sibling dashboard WebSockets (for example `/api/audio/speak-stream`), keyed by path. The
+   *  socket is handed over as accepted; it is not counted as a gateway connection. */
+  sidecars?: Record<string, (ws: WebSocket, query: URLSearchParams) => void>;
   /** Optional authenticated dashboard REST handler for bridge features that use the same
    *  connection's HTTP surface. */
   dashboard?: (request: {
@@ -92,6 +95,10 @@ export interface FakeHermesServer {
   /** Every query string the server has seen on an upgrade, in connection order. */
   queries(): string[];
   sendEvent(type: string, payload?: unknown, sessionId?: string): void;
+  /** Capability 85: pushes any frame verbatim (a server->client request, say). */
+  sendRaw(frame: unknown): void;
+  /** Capability 85: every client frame that was NOT a request (responses to server requests). */
+  clientResponses(): Array<Record<string, unknown>>;
   /** The token-event sequence a real Hermes 0.20.3 emits for one assistant turn, modeled on the
    *  probe capture of 2026-08-18: `message.start`, one `message.delta` per token with the text in
    *  `payload.text`, and `message.complete` carrying the whole reply plus a usage block. Every frame
@@ -132,28 +139,44 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
   let ticketMintCount = 0;
 
   function readBody(req: import("node:http").IncomingMessage): Promise<string> {
+    return readBytes(req).then((bytes) => bytes.toString("utf8"));
+  }
+
+  function readBytes(req: import("node:http").IncomingMessage): Promise<Buffer> {
     return new Promise((resolve) => {
-      let raw = "";
-      req.on("data", (chunk) => (raw += String(chunk)));
-      req.on("end", () => resolve(raw));
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => resolve(Buffer.concat(chunks)));
     });
   }
 
   const http: Server = createServer((req, res) => {
     const path = (req.url ?? "").split("?")[0] ?? "/";
     const send = (status: number, body: unknown, headers: Record<string, string | string[]> = {}): void => {
+      // Raw bytes (a file download) go out as they are; everything else is a JSON body.
+      if (body instanceof Uint8Array) {
+        res.writeHead(status, { "content-type": "application/octet-stream", ...headers });
+        res.end(body);
+        return;
+      }
       res.writeHead(status, { "content-type": "application/json", ...headers });
       res.end(JSON.stringify(body));
     };
     if (cfg.dashboard !== undefined && (path.startsWith("/api/") || path === "/openapi.json")) {
-      void readBody(req)
-        .then(async (raw) => {
+      void readBytes(req)
+        .then(async (bytes) => {
           let body: unknown;
-          try {
-            body = raw ? JSON.parse(raw) : undefined;
-          } catch {
-            send(400, { detail: "bad body" });
-            return;
+          // A multipart upload (the streamed files route) reaches the handler as its raw bytes.
+          if ((req.headers["content-type"] ?? "").startsWith("multipart/")) {
+            body = bytes;
+          } else {
+            const raw = bytes.toString("utf8");
+            try {
+              body = raw ? JSON.parse(raw) : undefined;
+            } catch {
+              send(400, { detail: "bad body" });
+              return;
+            }
           }
           const result = await cfg.dashboard!({
             method: req.method ?? "GET",
@@ -221,10 +244,17 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
   const wss = new WebSocketServer({ server: http });
   const sockets = new Set<WebSocket>();
   const calls: HermesCall[] = [];
+  const clientResponses: Array<Record<string, unknown>> = [];
   const queries: string[] = [];
   let totalConnections = 0;
 
   wss.on("connection", (ws, req) => {
+    const [upgradePath = "/", upgradeQuery = ""] = (req.url ?? "").split("?");
+    const sidecar = cfg.sidecars?.[upgradePath];
+    if (sidecar !== undefined) {
+      sidecar(ws, new URLSearchParams(upgradeQuery));
+      return;
+    }
     totalConnections += 1;
     const query = (req.url ?? "").split("?")[1] ?? "";
     queries.push(query);
@@ -266,7 +296,10 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
         return;
       }
       const frame = parsed as { id?: unknown; method?: unknown; params?: unknown };
-      if (typeof frame.method !== "string") return;
+      if (typeof frame.method !== "string") {
+        if (typeof parsed === "object" && parsed !== null) clientResponses.push(parsed as Record<string, unknown>);
+        return;
+      }
       const params = (typeof frame.params === "object" && frame.params !== null ? frame.params : {}) as Record<
         string,
         unknown
@@ -342,6 +375,13 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
     totalConnections: () => totalConnections,
     connectionCount: () => sockets.size,
     queries: () => [...queries],
+    sendRaw(frame: unknown): void {
+      const raw = JSON.stringify(frame);
+      for (const ws of sockets) {
+        if (ws.readyState === WebSocket.OPEN) ws.send(raw);
+      }
+    },
+    clientResponses: () => [...clientResponses],
     sendEvent(type: string, payload?: unknown, sessionId?: string): void {
       const raw = JSON.stringify({
         method: "event",

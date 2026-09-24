@@ -81,6 +81,8 @@ import type { HermesDashboardIntegrations } from "./hermes-bridge/integrations.t
 import type { GatewayProviderConnections } from "./provider-connections.ts";
 import { providerConnectionRoutes } from "./provider-connection-routes.ts";
 import { registerBotRoutes } from "./hermes-bridge/routes.ts";
+import { registerBotScreenRoutes } from "./hermes-bridge/bot-screen-routes.ts";
+import type { BotScreenSurface } from "./hermes-bridge/bot-screen.ts";
 import { resolveByteRange } from "./hermes-bridge/routes.ts";
 import type {
   MediaFetch,
@@ -193,6 +195,8 @@ export interface AppDeps {
    *  routes are not registered at all and the capability is not advertised, so an app probing
    *  `GatewayInfo.capabilities` sees the truth. */
   bots?: BotControlSurface | BotsSurface;
+  /** Capability 85, bot screen. Present whenever a Hermes endpoint is configured. */
+  botScreen?: BotScreenSurface;
   /** Profile-local memory travels only over the attached plugin's bounded management lane. */
   memory?: MemorySurface;
   /** Capability 50. A runtime bot's own checkpointed workspace history, over the attached peer's
@@ -1699,6 +1703,7 @@ export function createApp(deps: AppDeps): Hono<Env> {
 
   // Vendor extension, registered last so it cannot shadow a core route (contract/ext-bots-v1.md).
   if (deps.bots !== undefined) {
+    if (deps.botScreen !== undefined) registerBotScreenRoutes(app, requireDevice, deps.botScreen);
     registerBotRoutes(
       app,
       requireDevice,
