@@ -238,8 +238,8 @@ async function setup(opts: {
 }
 
 describe("bot routines v2 (capability 83)", () => {
-  it("advertises capability 86 (which includes 83)", () => {
-    expect(BOTS_CAPABILITY_VERSION).toBe(86);
+  it("advertises capability 87 (which includes 83)", () => {
+    expect(BOTS_CAPABILITY_VERSION).toBe(87);
   });
 
   it("lists the full instruction, the delivery target and whether the scheduler runs", async () => {

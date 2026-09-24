@@ -31,6 +31,11 @@ import type {
   BotProfilePatch,
   BotPresentationPatch,
   BotPresentationResponse,
+  BotRelayAgent,
+  BotRelayDeliverRequest,
+  BotRelayDeliverResponse,
+  BotRelayDrainResponse,
+  BotRelayReplyRequest,
   BotCanonicalChatResponse,
   BotChatReactionResponse,
   BotAvatarGenerateRequest,
@@ -88,6 +93,7 @@ import type {
 } from "./approvals.ts";
 import { GroupRooms, type RoomInteractionExpiry } from "./group-rooms.ts";
 import { readPresentation, writePresentation } from "./presentation.ts";
+import { relayDeliver, relayDrain, relayInstallId, relayReply, relayRosterSync } from "./relay.ts";
 import { createCanonicalBotChat, ensureBotModeMarker, findCanonicalBotChat } from "./bot-chat.ts";
 import { AvatarFingerprints, clearAvatar, generatePortrait, petGallery, petThumb, readAvatar, writeAvatar } from "./avatar.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
@@ -313,6 +319,13 @@ export interface BotControlSurface {
   /** Capability 80. Optional so a surface with no Hermes profile behind it simply lacks the route. */
   botPresentation?(name: string): Promise<BotPresentationResponse>;
   configurePresentation?(name: string, patch: BotPresentationPatch): Promise<BotPresentationResponse>;
+  /** Capability 87, the relay doors. Optional so only a surface with a Hermes behind it relays. */
+  relayRosterSync?(agents: BotRelayAgent[]): Promise<{ count: number }>;
+  /** The Hermes install id behind this surface, for the relay identity. */
+  relayInstallId?(): Promise<string | undefined>;
+  relayDrain?(): Promise<BotRelayDrainResponse>;
+  relayDeliver?(req: BotRelayDeliverRequest): Promise<BotRelayDeliverResponse>;
+  relayReply?(req: BotRelayReplyRequest): Promise<{ ok: true }>;
   /** Capability 86, control-plane half. The profile's canonical `Bot Chat` registry row (fail
    *  closed), minted when `create` and absent, with the Bot-Mode marker ensured. Optional so a
    *  surface with no Hermes profile behind it simply lacks the route. */
@@ -788,6 +801,8 @@ export class HermesBridge implements BotControlSurface {
     this.#client.onEvent((event) => {
       if (event.type === "sessions.changed") this.refreshSoon(event.type);
       if (event.type === "cron.changed") this.#refreshRoutinesSoon();
+      // Capability 87: an envelope landed in this Hermes's relay outbox. The courier is the phone.
+      if (event.type === "bot_relay.outbox.pending") this.#broadcast({ type: "bot_relay_pending" });
     });
     this.#client.start();
     // Discovery can connect the shared client before this bridge subscribes.
@@ -948,7 +963,7 @@ export class HermesBridge implements BotControlSurface {
   #adoptCreatedRow(name: string, description: string, meta: Record<string, unknown>): BotSummary {
     const at = this.#now();
     const [row] = buildRoster(
-      [{ name, description: description.length === 0 ? null : description, hasAvatar: false, meta, lastActiveAt: null, preview: null }],
+      [{ name, description: description.length === 0 ? null : description, hasAvatar: false, meta, lastActiveAt: null, workerActiveAt: null, preview: null }],
       { hidden: this.#hidden, routedProfile: null, gatewayState: "idle", now: at },
     );
     if (row === undefined) throw new BotNotFound(name);
@@ -1452,6 +1467,28 @@ export class HermesBridge implements BotControlSurface {
     // `bot_roster` carries the blob as `meta`, so every paired phone sees the write on this refresh.
     this.refreshSoon(`bot ${name} presentation`);
     return { name, presentation: written.presentation, revision: written.revision ?? 0 };
+  }
+  relayRosterSync(agents: BotRelayAgent[]): Promise<{ count: number }> {
+    return relayRosterSync(this.#client, agents);
+  }
+  #installId: Promise<string | undefined> | undefined;
+  relayInstallId(): Promise<string | undefined> {
+    // Stable for the install's life; a failed read is retried on the next ask.
+    const read = this.#installId ?? relayInstallId(this.#client);
+    this.#installId = read.then((id) => {
+      if (id === undefined) this.#installId = undefined;
+      return id;
+    });
+    return this.#installId;
+  }
+  relayDrain(): Promise<BotRelayDrainResponse> {
+    return relayDrain(this.#client);
+  }
+  relayDeliver(req: BotRelayDeliverRequest): Promise<BotRelayDeliverResponse> {
+    return relayDeliver(this.#client, req);
+  }
+  relayReply(req: BotRelayReplyRequest): Promise<{ ok: true }> {
+    return relayReply(this.#client, req);
   }
   async botAvatar(name: string): Promise<{ mime: string; bytes: Buffer } | undefined> {
     // Every row image is a GET; the cached roster answers "is this a bot" without a profiles.list.
