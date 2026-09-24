@@ -1687,8 +1687,14 @@ export function createApp(deps: AppDeps): Hono<Env> {
   // install id), so every phone that holds this gateway calls it the same thing.
   if (deps.bots !== undefined && "relayInstallId" in deps.bots && deps.bots.relayInstallId !== undefined) {
     const installId = deps.bots.relayInstallId.bind(deps.bots);
-    app.get("/bot-relay/identity", requireDevice, async (c) =>
-      c.json({ connectionId: relayConnectionId(deps.gatewayInfo.name, await installId()), label: deps.gatewayInfo.name }));
+    app.get("/bot-relay/identity", requireDevice, async (c) => {
+      const id = await installId();
+      return c.json({
+        connectionId: relayConnectionId(deps.gatewayInfo.name, id),
+        label: deps.gatewayInfo.name,
+        ...(id === undefined ? {} : { installId: id }),
+      });
+    });
   }
 
   // Vendor extension, registered last so it cannot shadow a core route (contract/ext-bots-v1.md).

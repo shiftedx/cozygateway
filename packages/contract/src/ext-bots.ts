@@ -1576,6 +1576,9 @@ export type BotRelayReplyRequest = Static<typeof BotRelayReplyRequestSchema>;
 export const BotRelayIdentitySchema = Type.Object({
   connectionId: RelayHandle,
   label: Type.String(),
+  /** The Hermes install behind this gateway, so a phone that ALSO reaches that install directly
+   *  recognises the two as one relay connection. Absent on a Hermes that does not report one. */
+  installId: Type.Optional(Type.String()),
 }, { additionalProperties: false });
 export type BotRelayIdentity = Static<typeof BotRelayIdentitySchema>;
 

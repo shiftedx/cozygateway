@@ -8,7 +8,7 @@ import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
 import { createHermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
-import { RELAY_DELIVER_TIMEOUT_MS, relayConnectionId } from "../src/hermes-bridge/relay.ts";
+import { RELAY_DELIVER_TIMEOUT_MS, relayConnectionId, relayInstallId } from "../src/hermes-bridge/relay.ts";
 import { buildRoster, parseProfileRow } from "../src/hermes-bridge/roster.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
 
@@ -168,6 +168,12 @@ describe("relay routes (capability 87)", () => {
     expect(await res.json()).toEqual({ connectionId: "g", label: "g" });
     expect(relayConnectionId("Pixel Box!", "eda540fc24ac4a5f")).toBe("pixel-box-eda540");
     expect(relayConnectionId("", undefined)).toBe("gateway");
+  });
+
+  it("reads the Hermes install id off /api/status, and nothing on an older Hermes", async () => {
+    expect(await relayInstallId({ dashboardJson: async <T>() => ({ install_id: "eda540fc" }) as T })).toBe("eda540fc");
+    expect(await relayInstallId({ dashboardJson: async <T>() => ({}) as T })).toBeUndefined();
+    expect(await relayInstallId({ dashboardJson: async () => { throw new Error("down"); } })).toBeUndefined();
   });
 
   it("drains the outbox and hands the envelopes back unchanged", async () => {
