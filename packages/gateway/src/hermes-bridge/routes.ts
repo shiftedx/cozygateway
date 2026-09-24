@@ -25,6 +25,7 @@ import {
   IntegrationEnabledRequestSchema,
   IntegrationUpdateRequestSchema,
   BotRoutineCreateRequestSchema,
+  BotRoutineBlueprintInstantiateRequestSchema,
   BotRoutinePatchSchema,
   BotMemoryWriteRequestSchema,
   BotMemoryDeleteRequestSchema,
@@ -104,6 +105,7 @@ import {
 } from "./photos.ts";
 import { FILE_MAX_BYTES, acceptFileBytes, attachmentDisposition, safeFilename } from "./documents.ts";
 import {
+  RoutineDashboardUnavailable,
   RoutineNotFound,
   RoutineRefused,
   RoutineUnconfirmed,
@@ -403,6 +405,22 @@ function failure(c: Context<Env>, err: unknown) {
     );
   }
   throw err;
+}
+
+/** `failure`, plus the answers Hermes's dashboard cron routes give (capability 83). Their errors
+ *  carry the HTTP status as the code: a 400/422 is the client's schedule or slot value, a 404 is a
+ *  job that is gone, a 409 is a run already in flight. Everything else is `failure`'s. */
+function routineFailure(c: Context<Env>, err: unknown) {
+  if (err instanceof RoutineDashboardUnavailable)
+    return c.json(errorBody("backend_unavailable", err.message), 503);
+  if (err instanceof HermesRpcError && err.code !== undefined && err.code >= 400 && err.code < 500) {
+    if (err.code === 404)
+      return c.json({ ...errorBody("not_found", "hermes has no such routine"), hermesError: err.message }, 404);
+    if (err.code === 409)
+      return c.json({ ...extensionErrorBody("conflict", "hermes refused the routine request"), hermesError: err.message }, 409);
+    return c.json({ ...errorBody("invalid_request", "hermes refused the routine request"), hermesError: err.message }, 400);
+  }
+  return failure(c, err);
 }
 
 export function registerBotRoutes(
@@ -2188,25 +2206,7 @@ export function registerBotRoutes(
       return c.json(
         errorBody(
           "invalid_request",
-          "at least one of title, schedule, prompt, enabled, repeat, continuity, model or effort is required",
-        ),
-        400,
-      );
-    }
-    // The one rule a client cannot discover from the shape: an edit to anything but the on/off
-    // switch must carry the routine's instruction too. There is no update action on the backend, so
-    // such an edit is a recreate, and the backend only ever reports a 100-character PREVIEW of a
-    // stored prompt. Rebuilding a routine from that preview would silently truncate the user's own
-    // instruction, so the request is refused instead of quietly damaging the routine.
-    //
-    // `repeat` and `continuity` are on this side of the line for the same reason `title` is: they
-    // reach the backend only on an `add`, so a patch that named one without a rewrite used to answer
-    // 200 and throw it away.
-    if (patchNeedsRewrite(parsed) && parsed.prompt === undefined) {
-      return c.json(
-        errorBody(
-          "invalid_request",
-          "prompt is required when title, schedule, repeat or continuity changes: hermes has no cron update action and reports only a truncated prompt preview, so the routine is recreated",
+          "at least one of title, schedule, prompt, enabled, repeat, continuity, deliver, model or effort is required",
         ),
         400,
       );
@@ -2224,9 +2224,83 @@ export function registerBotRoutes(
           : { orphanedId: result.orphanedId }),
       });
     } catch (err) {
-      return failure(c, err);
+      return routineFailure(c, err);
     }
   });
+
+  // Capability 83. Each route is registered only where the surface implements it, so a surface
+  // without Hermes's dashboard answers 404 rather than a refusal that implies the route exists.
+  const surface = bots as Partial<BotControlSurface>;
+  if (surface.runRoutine !== undefined) {
+    const run = surface.runRoutine.bind(bots);
+    app.post("/bots/:name/routines/:id/run", requireDevice, async (c) => {
+      const resolved = routineBotName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        return c.json(await run(resolved.name, c.req.param("id") ?? ""));
+      } catch (err) {
+        return routineFailure(c, err);
+      }
+    });
+  }
+  if (surface.routineRuns !== undefined) {
+    const runs = surface.routineRuns.bind(bots);
+    app.get("/bots/:name/routines/:id/runs", requireDevice, async (c) => {
+      const resolved = routineBotName(c);
+      if ("response" in resolved) return resolved.response;
+      const id = c.req.param("id") ?? "";
+      const limit = Number(c.req.query("limit") ?? "20");
+      try {
+        return c.json({ name: resolved.name, id, runs: await runs(resolved.name, id, Number.isFinite(limit) ? limit : 20) });
+      } catch (err) {
+        return routineFailure(c, err);
+      }
+    });
+  }
+  if (surface.routineRunOutput !== undefined) {
+    const output = surface.routineRunOutput.bind(bots);
+    app.get("/bots/:name/routines/:id/runs/:runId/output", requireDevice, async (c) => {
+      const resolved = routineBotName(c);
+      if ("response" in resolved) return resolved.response;
+      const runId = c.req.param("runId") ?? "";
+      try {
+        return c.json({ runId, output: await output(resolved.name, c.req.param("id") ?? "", runId) });
+      } catch (err) {
+        return routineFailure(c, err);
+      }
+    });
+  }
+  if (surface.routineBlueprints !== undefined) {
+    const blueprints = surface.routineBlueprints.bind(bots);
+    app.get("/bots/:name/routine-blueprints", requireDevice, async (c) => {
+      const resolved = routineBotName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        return c.json({ name: resolved.name, blueprints: await blueprints(resolved.name) });
+      } catch (err) {
+        return routineFailure(c, err);
+      }
+    });
+  }
+  if (surface.instantiateRoutineBlueprint !== undefined) {
+    const instantiate = surface.instantiateRoutineBlueprint.bind(bots);
+    app.post("/bots/:name/routine-blueprints/:key/instantiate", requireDevice, async (c) => {
+      const resolved = routineBotName(c);
+      if ("response" in resolved) return resolved.response;
+      let parsed;
+      try {
+        parsed = assertValid(BotRoutineBlueprintInstantiateRequestSchema, await c.req.json().catch(() => undefined));
+      } catch (err) {
+        return c.json(errorBody("invalid_request", err instanceof ContractViolation ? err.message : "malformed body"), 400);
+      }
+      try {
+        const routine = await instantiate(resolved.name, c.req.param("key") ?? "", parsed.values);
+        return c.json({ name: resolved.name, routine }, 201);
+      } catch (err) {
+        return routineFailure(c, err);
+      }
+    });
+  }
 
   // 204, and NOT idempotent: a second delete of the same routine is a 404. A client that cannot
   // tell "already gone" from "the delete broke" cannot decide whether to retry.
