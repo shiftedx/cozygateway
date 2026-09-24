@@ -48,7 +48,9 @@ import {
   BotModelProviderFieldUpdateSchema,
   BotModelProviderOAuthSessionSchema,
   BotModelProviderSetupCatalogSchema,
+  BotMcpServerDeclarationSchema,
   BotMcpServerSchema,
+  mcpServerDeclarationProblem,
   BotNewSessionResponseSchema,
   BotProfileConfigureResponseSchema,
   BotProfilePatchSchema,
@@ -636,6 +638,199 @@ describe("profile", () => {
   });
 });
 
+describe("client-declared MCP servers (capability 89)", () => {
+  const home = {
+    name: "home",
+    transport: "http" as const,
+    url: "https://ha.example.com/api/mcp",
+    headers: { Authorization: "Bearer ${COZY_MCP_HOME_TOKEN}" },
+    description: "lights and climate",
+    tools: ["GetLiveContext", "HassTurnOn"],
+    actions: { HassTurnOn: ["light"] },
+  };
+
+  it("accepts a remote server declared by name, url, tool allowlist and env-named headers", () => {
+    expect(check(BotMcpServerDeclarationSchema, home)).toBe(true);
+    expect(check(BotMcpServerDeclarationSchema, { name: "docs", transport: "http", url: "https://mcp.example.com/mcp" })).toBe(true);
+    expect(check(BotProfilePatchSchema, { declareMcpServers: [home] })).toBe(true);
+    expect(check(BotProfilePatchSchema, { removeMcpServers: ["home"] })).toBe(true);
+    expect(mcpServerDeclarationProblem({ declareMcpServers: [home], removeMcpServers: ["old"] })).toBeUndefined();
+  });
+
+  // THE LINE THIS ROW DRAWS. A declaration a chat client sends is a URL the harness dials, never a
+  // program the host starts: the object is closed, `transport` is the one literal `http`, and every
+  // field a stdio server needs is simply not a field. No shape reaches host command execution.
+  it("refuses every stdio shape: no command, args, env, cwd, and no transport but http", () => {
+    for (const extra of [
+      { command: "npx" },
+      { args: ["-y", "comfyui-mcp"] },
+      { env: { COMFYUI_URL: "${COMFYUI_URL}" } },
+      { cwd: "/tmp" },
+    ]) {
+      expect(check(BotMcpServerDeclarationSchema, { ...home, ...extra }), JSON.stringify(extra)).toBe(false);
+    }
+    for (const transport of ["stdio", "sse", "HTTP", "", undefined]) {
+      expect(check(BotMcpServerDeclarationSchema, { ...home, transport }), String(transport)).toBe(false);
+    }
+    expect(check(BotMcpServerDeclarationSchema, { name: "x", transport: "stdio", command: "sh" })).toBe(false);
+  });
+
+  // Operator-only settings stay on the harness: a client cannot mark a tool read-only (which would
+  // lift its approval), set the repair policy capability 63 keeps read-only, or tune the budgets.
+  it("refuses the harness-owned fields: mutating, repair, groups, budgets", () => {
+    for (const extra of [
+      { mutating: [] },
+      { repair: "auto_refresh" },
+      { groups: { lights: ["HassTurnOn"] } },
+      { groupsRequired: true },
+      { budgetTokens: 1 },
+      { schemaTtlSeconds: 1 },
+    ]) {
+      expect(check(BotMcpServerDeclarationSchema, { ...home, ...extra }), JSON.stringify(extra)).toBe(false);
+    }
+  });
+
+  // No secret crosses the wire. A header value is one `${COZY_MCP_*}` variable name, optionally
+  // after an auth scheme word; the value lives in the operator's environment and nowhere else. The
+  // prefix is the operator's opt-in: a variable not exported under it (a model provider's key,
+  // say) is unreachable from a phone, so a declaration cannot point one at a URL it chose.
+  it("admits a header only as a COZY_MCP_ variable name, never a literal or another variable", () => {
+    for (const value of ["${COZY_MCP_HOME_TOKEN}", "Bearer ${COZY_MCP_A}", "Basic ${COZY_MCP_B_2}", "Token ${COZY_MCP_C}"]) {
+      expect(check(BotMcpServerDeclarationSchema, { ...home, headers: { Authorization: value } }), value).toBe(true);
+    }
+    for (const value of [
+      "Bearer sk-live-abc123",
+      "${ANTHROPIC_API_KEY}",
+      "Bearer ${HOME_ASSISTANT_TOKEN}",
+      "${COZY_MCP_A}${COZY_MCP_B}",
+      "x ${COZY_MCP_A}",
+      "Bearer  ${COZY_MCP_A}",
+      "${COZY_MCP_}",
+      "${cozy_mcp_a}",
+      "",
+    ]) {
+      expect(check(BotMcpServerDeclarationSchema, { ...home, headers: { Authorization: value } }), value).toBe(false);
+    }
+    expect(check(BotMcpServerDeclarationSchema, { ...home, headers: { "Bad Header": "${COZY_MCP_A}" } })).toBe(false);
+  });
+
+  it("bounds the name to a card name and the lists to a size a phone can mean", () => {
+    for (const name of ["Home", "home.lights", "-home", "", "a".repeat(65), " home"]) {
+      expect(check(BotMcpServerDeclarationSchema, { ...home, name }), name).toBe(false);
+    }
+    expect(check(BotMcpServerDeclarationSchema, { ...home, tools: [] })).toBe(false);
+    expect(check(BotMcpServerDeclarationSchema, { ...home, tools: ["a", "a"] })).toBe(false);
+    expect(check(BotMcpServerDeclarationSchema, { ...home, actions: { HassTurnOn: [] } })).toBe(false);
+    expect(check(BotProfilePatchSchema, { declareMcpServers: [] })).toBe(false);
+    expect(check(BotProfilePatchSchema, { declareMcpServers: Array.from({ length: 17 }, (_, i) => ({ ...home, name: `s${i}` })) })).toBe(false);
+    expect(check(BotProfilePatchSchema, { removeMcpServers: ["Home"] })).toBe(false);
+  });
+
+  // What a schema cannot say, the one exported check does, so the gateway route and any client
+  // refuse the same bodies for the same reasons.
+  it("names the cross-field problems the schema cannot express", () => {
+    const problem = (patch: Parameters<typeof mcpServerDeclarationProblem>[0]) => mcpServerDeclarationProblem(patch);
+    expect(problem({ declareMcpServers: [home, home] })).toContain("more than once");
+    expect(problem({ declareMcpServers: [home], removeMcpServers: ["home"] })).toContain("both");
+    expect(problem({ declareMcpServers: [{ ...home, actions: { Other: ["x"] } }] })).toContain("not in tools");
+    const { tools: _tools, ...untooled } = home;
+    expect(problem({ declareMcpServers: [untooled] })).toContain("tools");
+    expect(problem({ declareMcpServers: [{ ...home, headers: { authorization: "${COZY_MCP_A}", Authorization: "${COZY_MCP_B}" } }] })).toContain("more than once");
+    for (const url of [
+      "http://user:pw@example.com/mcp",
+      "https://example.com/mcp?token=abc",
+      "https://example.com/mcp#frag",
+      "https://${COZY_MCP_HOST}/mcp",
+      "ftp://example.com/mcp",
+      "http://",
+    ]) {
+      expect(problem({ declareMcpServers: [{ ...home, url }] }), url).toBeDefined();
+    }
+    expect(problem({ soul: "x" })).toBeUndefined();
+  });
+
+  // Defence in depth for SSRF. The literal forms are refusable without DNS; WHATWG normalization
+  // means decimal, hex and shorthand IPv4 and every IPv6 spelling arrive in one canonical form.
+  // A LAN name or private address is NOT refused here: whether a client declaration may reach one
+  // is the peer's URL policy behind a separate operator opt-in (row 89), checked on the resolved
+  // address, which a gateway without the peer's DNS view cannot decide.
+  it("refuses literal loopback, unspecified, link-local and metadata hosts, and a backslash", () => {
+    const refused = [
+      "http://127.0.0.1/mcp", "http://127.8.9.10:8080/mcp", "http://2130706433/mcp", "http://0x7f.1/mcp",
+      "http://localhost:3000/mcp", "http://LOCALHOST/mcp", "http://api.localhost/mcp", "http://localhost./mcp",
+      "http://0.0.0.0/mcp", "http://[::]/mcp", "http://[::1]/mcp", "http://[0:0:0:0:0:0:0:1]/mcp",
+      "http://169.254.169.254/latest/meta-data", "http://169.254.1.1/mcp", "http://[fe80::1]/mcp",
+      "http://[febf::1]/mcp", "http://[::ffff:127.0.0.1]/mcp", "http://[::ffff:7f00:1]/mcp",
+      "http://[::ffff:169.254.169.254]/mcp", "http://[fd00:ec2::254]/mcp",
+      "https://ha.example.com\\@127.0.0.1/mcp", "https:\\\\ha.example.com/mcp",
+      // Other clouds' metadata services, and the loopback and metadata NAMES.
+      "http://100.100.100.200/latest/meta-data", "http://192.0.0.192/opc/v1", "http://metadata.google.internal/computeMetadata/v1",
+      "http://localhost.localdomain/mcp", "http://ip6-localhost/mcp", "http://ip6-loopback/mcp",
+      // IPv6 forms that carry an IPv4 address are that address: IPv4-compatible `::/96` in both
+      // spellings, NAT64 `64:ff9b::/96`, and 6to4 `2002::/16`.
+      "http://[::127.0.0.1]/mcp", "http://[::7f00:1]/mcp", "http://[::a9fe:a9fe]/mcp",
+      "http://[64:ff9b::127.0.0.1]/mcp", "http://[64:ff9b::a9fe:a9fe]/mcp",
+      "http://[2002:7f00:1::]/mcp", "http://[2002:a9fe:a9fe::1]/mcp",
+      // Deprecated site-local `fec0::/10`, across the whole prefix.
+      "http://[fec0::1]/mcp", "http://[feff::1]/mcp",
+    ];
+    for (const url of refused) {
+      expect(mcpServerDeclarationProblem({ declareMcpServers: [{ ...home, url }] }), url).toBeDefined();
+    }
+    for (const url of ["https://ha.example.com/api/mcp", "http://192.168.1.20:8123/api/mcp", "http://10.0.0.5/mcp", "http://ha.local/mcp", "http://127.example.com/mcp",
+      "http://[2001:db8::1]/mcp", "http://[64:ff9b::808:808]/mcp", "http://[2002:808:808::]/mcp", "http://[::808:808]/mcp", "http://[fd00::1]/mcp"]) {
+      expect(mcpServerDeclarationProblem({ declareMcpServers: [{ ...home, url }] }), url).toBeUndefined();
+    }
+  });
+
+  it("refuses the framing, routing and cookie headers, in any case", () => {
+    for (const header of ["Host", "content-length", "Transfer-Encoding", "CONNECTION", "Keep-Alive", "Upgrade", "TE", "Trailer", "Cookie", "Proxy-Authorization", "proxy-connection", "Mcp-Session-Id", "mcp-session-id", "Expect"]) {
+      const declaration = { ...home, headers: { [header]: "${COZY_MCP_A}" } };
+      expect(check(BotMcpServerDeclarationSchema, declaration), header).toBe(true);
+      expect(mcpServerDeclarationProblem({ declareMcpServers: [declaration] }), header).toContain("may not set header");
+    }
+    expect(mcpServerDeclarationProblem({ declareMcpServers: [{ ...home, headers: { "X-Api-Key": "${COZY_MCP_A}" } }] })).toBeUndefined();
+  });
+
+  // The `_ORIGINS` variables are the operator's allowlists binding a secret to origins; a header
+  // that named one would be reading the policy rather than a credential.
+  it("refuses a header that names an _ORIGINS allowlist variable", () => {
+    const declaration = { ...home, headers: { Authorization: "Bearer ${COZY_MCP_HOME_TOKEN_ORIGINS}" } };
+    expect(mcpServerDeclarationProblem({ declareMcpServers: [declaration] })).toContain("_ORIGINS");
+  });
+
+  // Parsed from JSON, as the route parses them, so `__proto__` is a real own key and not a setter.
+  it("refuses prototype keys as server, tool, action and header names", () => {
+    const parse = (text: string) => JSON.parse(text) as Parameters<typeof mcpServerDeclarationProblem>[0];
+    const base = `"name":"home","transport":"http","url":"https://ha.example.com/api/mcp"`;
+    const bodies = [
+      `{"removeMcpServers":["constructor"]}`,
+      `{"removeMcpServers":["prototype"]}`,
+      `{"declareMcpServers":[{"name":"constructor","transport":"http","url":"https://ha.example.com/mcp"}]}`,
+      `{"declareMcpServers":[{${base},"tools":["__proto__"]}]}`,
+      `{"declareMcpServers":[{${base},"tools":["constructor"],"actions":{"constructor":["x"]}}]}`,
+      `{"declareMcpServers":[{${base},"tools":["a"],"actions":{"__proto__":["x"]}}]}`,
+      `{"declareMcpServers":[{${base},"tools":["a"],"actions":{"a":["prototype"]}}]}`,
+      `{"declareMcpServers":[{${base},"headers":{"constructor":"\${COZY_MCP_A}"}}]}`,
+    ];
+    for (const body of bodies) {
+      expect(mcpServerDeclarationProblem(parse(body)), body).toBeDefined();
+    }
+    // `__proto__` never even passes the server-name pattern, which starts with a letter or digit.
+    expect(check(BotProfilePatchSchema, parse(`{"removeMcpServers":["__proto__"]}`))).toBe(false);
+  });
+
+  // The read side marks the rows a client may edit: `declaration` is present exactly on a server a
+  // chat client declared, and it is the declaration back, which by construction carries no secret.
+  it("projects a client declaration read-only on its server row, and nothing on the others", () => {
+    const row = { name: "home", installed: true, enabled: false, declaration: home };
+    expect(check(BotMcpServerSchema, row)).toBe(true);
+    expect(check(BotMcpServerSchema, { name: "github", installed: true, enabled: true })).toBe(true);
+    expect(check(BotMcpServerSchema, { ...row, declaration: { ...home, command: "npx" } })).toBe(false);
+    expect(check(BotProfilePatchSchema, { enabledMcpServers: [row] })).toBe(false);
+  });
+});
+
 describe("routines", () => {
   const routine = {
     id: "job_7f2c19",
@@ -944,7 +1139,10 @@ describe("capability advertisement", () => {
     // Capability 66 adds the typed scoped-approval block, payload-hash binding, standing once and
     // category grants, the always-require list no grant may cover, and the revocation view.
     // Capability 88 adds gateway-owned team roles and the assignment turn context.
-    expect(BOTS_CAPABILITY_VERSION).toBe(88);
+    // Capability 89 lets a chat client declare remote (http) MCP servers per bot over the
+    // `bot_config` profile write, gated on the peer's `mcp_server_declarations` attach capability.
+    // No stdio shape exists, and a header names a `COZY_MCP_*` variable, never a value.
+    expect(BOTS_CAPABILITY_VERSION).toBe(89);
   });
 
   it("versions the agent inbox on its own id, never on the bots scalar", () => {

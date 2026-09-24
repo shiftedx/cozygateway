@@ -4,6 +4,7 @@ import { Value } from "@sinclair/typebox/value";
 import {
   BotModelConfigSchema,
   BotProfileConfigureResponseSchema,
+  BotProfilePatchSchema,
   BotProfileSchema,
   BotRoutineListResponseSchema,
   BotRoutineWriteResponseSchema,
@@ -250,7 +251,7 @@ export class AttachConfigSurface implements ConfigSurface {
   async configureProfile(name: string, patch: BotProfilePatch): Promise<ProfileConfigureResult> {
     // The wire body is the PUBLISHED configure response, which additionally echoes the bot name.
     // The internal result deliberately does not carry it twice: the caller already knows it.
-    const result = await this.#request(name, "profile.write", patch) as BotProfileConfigureResponse;
+    const result = await this.#request(name, "profile.write", publishedPatch(patch)) as BotProfileConfigureResponse;
     return {
       outcome: result.outcome,
       ok: result.ok,
@@ -404,6 +405,26 @@ export class AttachChatConfigurationDriver implements ChatConfigurationDriver {
       throw new BackendUnavailable("runtime prepared a different chat configuration");
     return { workspacePrepared: input.workspace !== null };
   }
+}
+
+/** The patch as the PUBLISHED schema names it, and nothing else. `BotProfilePatchSchema` is open,
+ *  as every object on this contract is, so a body key the schema does not model passes validation;
+ *  forwarding the parsed body whole would hand a peer an unvalidated `mcpServers` map or a
+ *  mis-cased `DeclareMcpServers` that no gate ever looked at, and would slip past the capability-89
+ *  `mcp_server_declarations` gate, which reads the published names. Rebuilt from the schema's own
+ *  keys rather than closed at the boundary, so an older client sending an extra key still saves. */
+/** Capability 88's `role` and `reports` are published but GATEWAY-OWNED: the route checks and
+ *  stores them itself and strips them before forwarding, so no peer ever receives them. Excluded
+ *  here too, so a caller that forgot to strip them still cannot hand a peer the team. */
+const GATEWAY_OWNED: ReadonlySet<string> = new Set(["role", "reports"]);
+const PATCH_KEYS = (Object.keys(BotProfilePatchSchema.properties) as (keyof BotProfilePatch)[])
+  .filter((key) => !GATEWAY_OWNED.has(key));
+function publishedPatch(patch: BotProfilePatch): BotProfilePatch {
+  const out: Record<string, unknown> = {};
+  for (const key of PATCH_KEYS) {
+    if (patch[key] !== undefined) out[key] = patch[key];
+  }
+  return out as BotProfilePatch;
 }
 
 /** A non-`ok` status, turned into the error the existing bot routes already answer correctly.

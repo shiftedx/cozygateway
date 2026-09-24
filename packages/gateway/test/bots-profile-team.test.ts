@@ -113,6 +113,23 @@ describe("team fields on the bot profile", () => {
     expect(h.storage.botTeam("scout")).toBeUndefined();
   });
 
+  // Capability 89 beside 88. A Hermes bot refuses a client MCP declaration whole with 409, and the
+  // refusal lands before the team half is stored: a refused patch writes nothing, team included.
+  it("refuses an MCP declaration on a Hermes bot before the team half is stored", async () => {
+    const h = await setup();
+    const home = { name: "home", transport: "http", url: "https://ha.example.com/api/mcp" };
+    for (const body of [
+      { role: "leader", reports: ["sage"], declareMcpServers: [home] },
+      { role: "leader", removeMcpServers: ["home"], soul: "# Scout" },
+    ]) {
+      const res = await h.authed("/bots/scout/profile", patch(body));
+      expect(res.status, JSON.stringify(body)).toBe(409);
+      expect(await res.json()).toMatchObject({ error: { code: "unsupported_for_runtime" }, feature: "declareMcpServers" });
+    }
+    expect(h.storage.botTeam("scout")).toBeUndefined();
+    expect(h.server.callsOf("profiles.configure")).toHaveLength(0);
+  });
+
   it("answers 400, not 500, when a report stops being a bot during the forward", async () => {
     let known: Set<string> | undefined;
     const h = await setup({ configure: () => { known?.delete("sage"); return { applied: { soul: true } }; } });
