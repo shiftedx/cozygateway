@@ -27,7 +27,8 @@ Phases, in order. Every phase after Setup takes the same -RunRoot:
                 With step 4, uninstall shows ONE scoped UAC prompt for the Dashboard cleanup
                 helper; approve it. Without step 4 it must not prompt at all: the foreign stale
                 Dashboard on the preferred port is never inspected, only the private port is.
-  6. Cleanup    ELEVATED window. Stops only the processes Setup started (PID + creation time).
+  6. Cleanup    ELEVATED window. Stops only the processes the harness started, including an
+                elevated Dashboard left running, each matched by PID + creation time.
 
   # elevated
   .\scripts\test\windows-elevated-acceptance.ps1 -Phase Setup -RunRoot C:\cga\run1 -AcknowledgeDisposableHost `
@@ -89,6 +90,7 @@ $script:Cases = [ordered]@{
     'K01' = @('SelfCheck', 'case table has unique IDs in known phases')
     'K02' = @('SelfCheck', 'stale Dashboard stand-in answers health 200, stale token 200, other token 401')
     'K03' = @('SelfCheck', 'poisoned PSModulePath shadows Get-NetTCPConnection and records the load')
+    'K04' = @('SelfCheck', 'Dashboard identity check refuses wrong port, foreign root, non-Dashboard and newer (reused-PID) parents')
     'S01' = @('Setup', 'Windows host, elevated harness, Windows PowerShell 5.1 present')
     'S02' = @('Setup', 'fresh host: no CozyGateway home and no Hermes home')
     'S03' = @('Setup', 'Dashboard, sentinel and Gateway ports are free')
@@ -112,7 +114,7 @@ $script:Cases = [ordered]@{
     'U04' = @('Uninstall', 'stale Dashboard and sentinel preserved through uninstall')
     'U05' = @('Uninstall', 'orphaned private Dashboard and Gateway ports released')
     'U06' = @('Uninstall', 'poisoned NetTCPIP module never loaded in an elevated process')
-    'C01' = @('Cleanup', 'harness-started processes stopped after identity check')
+    'C01' = @('Cleanup', 'harness-started processes (stale, sentinel, elevated Dashboard) stopped after identity check')
 }
 $script:Results = [ordered]@{}
 
@@ -411,6 +413,28 @@ function Get-SupervisorProcesses {
     })
 }
 
+# A process the harness may tree-kill as the Gateway's private Dashboard: its command line runs
+# `dashboard` on exactly this port, and its executable lives under the Hermes root.
+function Test-DashboardIdentity {
+    param($Process, [int] $Port, [string] $HermesRoot)
+    if ($null -eq $Process -or [string]::IsNullOrWhiteSpace([string]$Process.CommandLine) -or [string]::IsNullOrWhiteSpace([string]$Process.ExecutablePath)) { return $false }
+    $tokens = @([regex]::Matches([string]$Process.CommandLine, '[^\s"]+|"[^"]*"') | ForEach-Object { $_.Value.Trim([char]34) })
+    $portIndex = [Array]::IndexOf([string[]]$tokens, '--port')
+    $portMatches = ($portIndex -ge 0 -and $portIndex + 1 -lt $tokens.Count -and $tokens[$portIndex + 1] -ceq [string]$Port) -or ($tokens -ccontains "--port=$Port")
+    if (-not ($tokens -ccontains 'dashboard') -or -not $portMatches) { return $false }
+    try {
+        $root = [IO.Path]::GetFullPath($HermesRoot).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+        return [IO.Path]::GetFullPath([string]$Process.ExecutablePath).StartsWith($root, [StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
+# A parent whose PID was reused after the child was orphaned started after the child did.
+function Test-OlderParent {
+    param($Parent, $Child)
+    if ($null -eq $Parent -or $null -eq $Parent.CreationDate -or $null -eq $Child.CreationDate) { return $false }
+    return ([datetime]$Parent.CreationDate) -lt ([datetime]$Child.CreationDate)
+}
+
 function Assert-HostPhase {
     param([bool] $RequireElevated, [bool] $RequireNormal)
     if (-not (Test-IsWindowsHost)) { throw "-Phase $Phase needs a Windows host; use -Phase SelfCheck elsewhere" }
@@ -424,8 +448,8 @@ switch ($Phase) {
     'SelfCheck' {
         $ownsRunRoot = -not $RunRoot
         if ($ownsRunRoot) { $RunRoot = Join-Path ([IO.Path]::GetTempPath()) ('cozygateway-acceptance-selfcheck-' + [guid]::NewGuid().ToString('N')) }
-        New-Item -ItemType Directory -Force -Path $RunRoot | Out-Null
         if (Test-Path -LiteralPath (Join-Path $RunRoot 'state.json')) { throw "$RunRoot holds Setup state; run SelfCheck without -RunRoot or with a separate one" }
+        New-Item -ItemType Directory -Force -Path $RunRoot | Out-Null
         $phases = @('SelfCheck', 'Setup', 'Install', 'Verify', 'ElevateDashboard', 'Uninstall', 'Cleanup')
         $unknown = @($script:Cases.Keys | Where-Object { $phases -notcontains $script:Cases[$_][0] })
         $null = Assert-Case 'K01' ($unknown.Count -eq 0 -and @($script:Cases.Keys | Select-Object -Unique).Count -eq $script:Cases.Count) "$($script:Cases.Count) cases"
@@ -458,6 +482,20 @@ switch ($Phase) {
         }
         $loads = @(Get-PoisonLoads $marker)
         $null = Assert-Case 'K03' ($resolved.StartsWith($poisonRoot) -and $loads.Count -ge 1 -and $loads[0] -match '^elevated=False pid=\d+$') "resolved $resolved; loads: $($loads -join '; ')"
+        $fixtureRoot = Join-Path $RunRoot 'Hermes Root'
+        $launcher = [IO.Path]::Combine($fixtureRoot, 'bin', 'hermes.exe')
+        $elsewhere = [IO.Path]::Combine($RunRoot, 'Other', 'hermes.exe')
+        $older = (Get-Date).AddMinutes(-5); $newer = (Get-Date)
+        $dashboard = [pscustomobject]@{ ExecutablePath = $launcher; CommandLine = ('"{0}" dashboard -p default --host 127.0.0.1 --port 9121 --no-open --skip-build --isolated' -f $launcher); CreationDate = $older.AddMinutes(1) }
+        $identity = @(
+            (Test-DashboardIdentity $dashboard 9121 $fixtureRoot),
+            (-not (Test-DashboardIdentity $dashboard 9119 $fixtureRoot)),
+            (-not (Test-DashboardIdentity ([pscustomobject]@{ ExecutablePath = $elsewhere; CommandLine = ('"{0}" dashboard --port 9121' -f $elsewhere) }) 9121 $fixtureRoot)),
+            (-not (Test-DashboardIdentity ([pscustomobject]@{ ExecutablePath = $launcher; CommandLine = ('"{0}" gateway run --port 9121' -f $launcher) }) 9121 $fixtureRoot)),
+            (Test-OlderParent ([pscustomobject]@{ CreationDate = $older }) $dashboard),
+            (-not (Test-OlderParent ([pscustomobject]@{ CreationDate = $newer }) $dashboard))
+        )
+        $null = Assert-Case 'K04' (@($identity | Where-Object { -not $_ }).Count -eq 0) "results: $($identity -join ', ')"
         if ($ownsRunRoot) {
             Remove-Item -LiteralPath $RunRoot -Recurse -Force -ErrorAction SilentlyContinue
             $RunRoot = $null
@@ -565,24 +603,26 @@ switch ($Phase) {
         Assert-HostPhase -RequireElevated $true -RequireNormal $false
         $state = Read-State
         $installed = Read-InstalledEndpoint $state
-        # Walk from the listener up to the direct child of the supervisor: that is the Dashboard
-        # process tree the supervisor spawned (hermes.exe may front a python.exe listener).
+        $hermesRoot = [string](Get-Content -LiteralPath (Join-Path $state.GatewayHome 'local\install-state') | Where-Object { $_ -like 'hermes_root=*' } | Select-Object -Last 1)
+        $hermesRoot = $hermesRoot.Substring('hermes_root='.Length)
+        if ($hermesRoot -match '^/([A-Za-z])/(.*)$') { $hermesRoot = $Matches[1].ToUpperInvariant() + ':\' + $Matches[2].Replace('/', '\') }
+        # Walk from the listener up the Dashboard process tree the supervisor spawned (hermes.exe
+        # may front a python.exe listener). Climb only to an older parent that is itself this
+        # Dashboard, so a reused PID or the supervisor is never chosen for the elevated tree kill.
         $process = $(if ($null -ne $installed.Port) { Get-CimProcess ([int](Get-ListenerOwner ([int]$installed.Port))) } else { $null })
         for ($depth = 0; $depth -lt 4 -and $null -ne $process; $depth++) {
             $parent = Get-CimProcess ([int]$process.ParentProcessId)
-            if ($null -eq $parent -or ([string]$parent.CommandLine) -like '*gateway-supervisor.cjs*') { break }
+            if (-not (Test-OlderParent $parent $process) -or -not (Test-DashboardIdentity $parent ([int]$installed.Port) $hermesRoot)) { break }
             $process = $parent
         }
-        if ($null -eq $process -or [string]::IsNullOrWhiteSpace([string]$process.CommandLine)) {
-            Set-CaseResult 'E01' FAIL "no private Dashboard process found on port $($installed.Port)"
+        if (-not (Test-DashboardIdentity $process ([int]$installed.Port) $hermesRoot)) {
+            $seen = $(if ($null -ne $process) { "$($process.ExecutablePath) :: $($process.CommandLine)" } else { 'nothing' })
+            Set-CaseResult 'E01' FAIL "refusing to kill: the listener on port $($installed.Port) is not a Dashboard under $hermesRoot ($seen)"
             Complete-Phase
         }
         $executable = [string]$process.ExecutablePath
         $command = [string]$process.CommandLine
         $arguments = [regex]::Replace($command, '^\s*("[^"]*"|\S+)\s*', '')
-        $hermesRoot = [string](Get-Content -LiteralPath (Join-Path $state.GatewayHome 'local\install-state') | Where-Object { $_ -like 'hermes_root=*' } | Select-Object -Last 1)
-        $hermesRoot = $hermesRoot.Substring('hermes_root='.Length)
-        if ($hermesRoot -match '^/([A-Za-z])/(.*)$') { $hermesRoot = $Matches[1].ToUpperInvariant() + ':\' + $Matches[2].Replace('/', '\') }
         & (Join-Path ([Environment]::SystemDirectory) 'taskkill.exe') /PID ([string]$process.ProcessId) /T /F | Out-Null
         for ($attempt = 0; $attempt -lt 50 -and $null -ne (Get-ListenerOwner ([int]$installed.Port)); $attempt++) { Start-Sleep -Milliseconds 200 }
         # Same executable, arguments, HERMES_HOME and session token as the supervisor used, but
@@ -644,11 +684,13 @@ switch ($Phase) {
         Assert-HostPhase -RequireElevated $true -RequireNormal $false
         $state = Read-State
         $left = @()
-        foreach ($tracked in @($state.Stale, $state.Sentinel)) {
+        $elevatedDashboard = $(if ($null -ne $state.PSObject.Properties['ElevatedDashboard']) { $state.ElevatedDashboard } else { $null })
+        foreach ($tracked in @($state.Stale, $state.Sentinel, $elevatedDashboard)) {
             if ($null -eq $tracked) { continue }
-            # Only a process whose PID and creation time both match what Setup recorded is ours.
+            # Only a process whose PID and creation time both match what the harness recorded is
+            # ours; the elevated Dashboard's hermes.exe may front a python.exe, hence /T.
             if ((Get-ProcessCreation ([int]$tracked.Pid)) -eq [string]$tracked.Created) {
-                Stop-Process -Id ([int]$tracked.Pid) -Force -ErrorAction SilentlyContinue
+                & (Join-Path ([Environment]::SystemDirectory) 'taskkill.exe') /PID ([string]$tracked.Pid) /T /F | Out-Null
             }
             Start-Sleep -Milliseconds 300
             if ((Get-ProcessCreation ([int]$tracked.Pid)) -eq [string]$tracked.Created) { $left += $tracked.Pid }
