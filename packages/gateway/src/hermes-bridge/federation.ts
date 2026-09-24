@@ -75,7 +75,9 @@ function hostLabel(id: string): string {
 
 function summary(id: string, bot: BotSummary): BotSummary {
   const name = federatedBotName(id, bot.name);
-  return { ...bot, name, handle: name };
+  // Old names are qualified like the live one, so `@old-handle` names the same federated bot.
+  const previousNames = bot.previousNames?.map((previous) => federatedBotName(id, previous));
+  return { ...bot, name, handle: name, ...(previousNames === undefined ? {} : { previousNames }) };
 }
 
 /** Gives each HermesBridge an isolated roster cache while retaining the shared durable

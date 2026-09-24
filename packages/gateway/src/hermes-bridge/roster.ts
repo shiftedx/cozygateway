@@ -237,6 +237,7 @@ export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions)
     };
     const avatar = rosterAvatar(profile.name, profile.hasAvatar, meta, profile.metaRevision ?? 0, profile.avatarFingerprint);
     if (avatar !== undefined) summary.avatar = avatar;
+    if (profile.previousNames !== undefined) summary.previousNames = [...profile.previousNames];
     return { summary, activityAt: botActivityAt(profile) };
   });
 
