@@ -258,6 +258,12 @@ request id. It writes only the three credential-free Hermes memory settings thro
 native atomic config writer and replies with a fresh `BotMemoryOverviewResponse`. A disconnected
 or old plugin fails immediately; a timed-out request is not retained for reconnect.
 
+A peer that also negotiated `memory_setup_state` adds `setup`, the closed public
+`BotMemorySetupState`, to its `overview`, `setup` and `items` results: the three switches as its
+effective configuration reads them at reply time, never an echo of the request. Without that
+capability the results keep their exact earlier shape, because an older gateway validates them as
+closed objects; a peer that cannot read its configuration omits the field rather than guessing.
+
 ## Bot config lane
 
 `config_request` / `config_result` is the same bounded live request/reply shape as the memory lane
