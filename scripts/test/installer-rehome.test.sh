@@ -391,10 +391,10 @@ grep -Fq "'--isolated'" "$repo_root/scripts/gateway-supervisor.cjs" \
 "$real_node" - "$repo_root/scripts/gateway-supervisor.cjs" <<'NODE' || fail 'the supervisor fallback launch is not the isolated one'
 const { readFileSync } = require('node:fs');
 const source = readFileSync(process.argv[2], 'utf8');
-// The preferred port reuses the machine Dashboard on purpose; only the private
-// fallback in the port-scan loop is isolated.
+// The private fallback is always isolated; the preferred port is too, except under
+// the Windows ownership proof, which treats an isolated Dashboard as foreign.
 if (!/child = await start\(port, true\);/.test(source)) process.exit(1);
-if (!/child = await start\(preferred\);/.test(source)) process.exit(1);
+if (!/child = await start\(preferred, !options\.windowsDashboardProfile\);/.test(source)) process.exit(1);
 NODE
 # A supervisor that cannot start says why.
 grep -Fq 'CozyGateway supervisor could not start: ' "$repo_root/scripts/gateway-supervisor.cjs" \

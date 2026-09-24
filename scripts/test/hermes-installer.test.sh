@@ -1285,6 +1285,11 @@ childProcess.spawn = function (command, args, options) {
 };
 const { spawn } = childProcess;
 const hermesArgs = [basename(process.argv[1] || ''), ...process.argv.slice(2)];
+// The supervisor probes `dashboard --help` for --isolated before passing it.
+if (hermesArgs[0] === 'dashboard' && hermesArgs.includes('--help')) {
+  process.stdout.write('  --isolated    run a dedicated server\n');
+  process.exit(0);
+}
 if (hermesArgs[0] === 'dashboard') {
   const windowsLauncher = process.platform === 'win32';
   // gateway-live is intentionally generated with service platform Darwin,
@@ -1292,7 +1297,8 @@ if (hermesArgs[0] === 'dashboard') {
   const port = hermesArgs[hermesArgs.indexOf('--port') + 1];
   // Hermes' unified server routes a plain `dashboard --port N` to the existing
   // machine-level Dashboard, so the supervisor's PRIVATE fallback asks for a
-  // separate server with --isolated. The preferred port deliberately does not.
+  // separate server with --isolated. This fixture runs the Windows profile shape,
+  // whose preferred port stays plain for the Windows ownership proof.
   const isolated = hermesArgs[hermesArgs.length - 1] === '--isolated';
   const expectedLauncherArgs = ['dashboard', '-p', 'default', '--host', '127.0.0.1', '--port', port, '--no-open', '--skip-build', ...(isolated ? ['--isolated'] : [])];
   const descendantProfileArgs = ['-p', 'default'];
