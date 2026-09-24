@@ -1141,13 +1141,14 @@ export class GroupRooms {
         const detail = `no reply within ${Math.round(timeoutMs / 1000)}s`;
         this.#storage.timeoutBotGroupTurn(key, turnId, detail, this.#now());
         // #325: this loop owns the timeout, so it consumes the row now; a late terminal then finds it
-        // already claimed and cannot re-drive the sealed round. The peer is told to stop, as `stop()` does.
+        // already claimed and cannot re-drive the sealed round.
         const timedOut = this.#storage.consumeBotGroupTurn(key, turnId, this.#now());
-        if (timedOut !== undefined) this.#nativeTurns?.sendInterrupt?.(timedOut.agentId, { threadId: timedOut.threadId, turnId });
         // The member stopped mid-sentence. Nothing is coming to close its bubble, so the gateway
         // closes it: this is the settlement no attach event will ever announce.
         this.#endDraft(turnId);
         this.#endTurnActivity(turnId, "error");
+        // Last, so a throwing send cannot leave the bubble open. The peer is told to stop, as `stop()` does.
+        if (timedOut !== undefined) this.#nativeTurns?.sendInterrupt?.(timedOut.agentId, { threadId: timedOut.threadId, turnId });
         return { outcome: "timeout", detail };
       }
       await new Promise<void>((resolve) => {
@@ -1164,6 +1165,9 @@ export class GroupRooms {
   }
 
   #recoverSettledTurn(turn: BotGroupTurnRow): void {
+    // #325: a timed-out turn's round has already sealed. Rows timed out before the fix were never
+    // consumed, so the state itself is what keeps a late terminal from re-driving it.
+    if (turn.state === "timeout") return;
     const claimed = this.#storage.consumeBotGroupTurn(turn.key, turn.turnId, this.#now());
     if (claimed === undefined || this.#closed) return;
     // A compress turn (capability 84) is maintenance, never a room message.
