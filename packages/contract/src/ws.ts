@@ -5,6 +5,7 @@
 import { type Static, Type } from "@sinclair/typebox";
 
 import { TaskUpdatedFrameSchema } from "./tasks.ts";
+import { BotInboxActivityFrameSchema } from "./assignments.ts";
 import { RichBlockSchema } from "./rich-blocks.ts";
 import {
   BotApprovalPendingFrameSchema,
@@ -326,6 +327,8 @@ export const ServerFrameSchema = Type.Union([
   BotRelayPendingFrameSchema,
   BotGroupFrameSchema,
   BotGroupStateFrameSchema,
+  // agent-inbox 1. Leader assignments.
+  BotInboxActivityFrameSchema,
   BotApprovalPendingFrameSchema,
   BotApprovalResolutionRequestedFrameSchema,
   BotApprovalResolvedFrameSchema,

@@ -1490,6 +1490,13 @@ export const GuardrailLevelSchema = Type.Union([
 ]);
 export type GuardrailLevel = Static<typeof GuardrailLevelSchema>;
 
+const NameItem = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
+
+/** Capability 88. A bot's place on a team. Absent means `member`: only a `leader` may assign work,
+ *  and only to a bot in its `reports`. */
+export const BotTeamRoleSchema = Type.Union([Type.Literal("leader"), Type.Literal("member")]);
+export type BotTeamRole = Static<typeof BotTeamRoleSchema>;
+
 /** `GET /bots/:name/profile`: one bot's full edit-screen state. `model.default` is the model id and
  *  keeps the gateway's own field name; both model fields are empty strings when the profile
  *  inherits the launch profile's model rather than pinning one.
@@ -1517,6 +1524,11 @@ export const BotProfileSchema = Type.Object({
   runtimeInert: BotProfileRuntimeInertSchema,
   guardrailLevel: Type.Optional(GuardrailLevelSchema),
   guardrailCeiling: Type.Optional(GuardrailLevelSchema),
+  /** Capability 88. Stored by the gateway, never by the peer, because the gateway is what enforces
+   *  it. Absent means member. */
+  role: Type.Optional(BotTeamRoleSchema),
+  /** Capability 88. The bots this leader may assign work to, at most 16. Absent on a member. */
+  reports: Type.Optional(Type.Array(NameItem, { maxItems: 16 })),
 });
 export type BotProfile = Static<typeof BotProfileSchema>;
 
@@ -1780,8 +1792,6 @@ export const BotRelayPendingFrameSchema = Type.Object({
 });
 export type BotRelayPendingFrame = Static<typeof BotRelayPendingFrameSchema>;
 
-const NameItem = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
-
 export const BotProfilePatchSchema = Type.Object({
   soul: Type.Optional(Type.String({ maxLength: 200_000 })),
   disabledSkills: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
@@ -1790,6 +1800,12 @@ export const BotProfilePatchSchema = Type.Object({
   enabledMcpServers: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
   guardrailLevel: Type.Optional(GuardrailLevelSchema),
   guardrailCeiling: Type.Optional(Type.Never()),
+  /** Capability 88. Stored by the gateway and stripped before the rest of the patch is forwarded;
+   *  a patch carrying only `role` and `reports` touches no peer. `member` clears `reports`. */
+  role: Type.Optional(BotTeamRoleSchema),
+  /** Capability 88. Replace semantics. Refused with `invalid_request` on a member, for the bot
+   *  itself, and for a name that is not a bot on this gateway. */
+  reports: Type.Optional(Type.Array(NameItem, { maxItems: 16 })),
 });
 export type BotProfilePatch = Static<typeof BotProfilePatchSchema>;
 
@@ -2808,11 +2824,13 @@ export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
  * never on a later scalar value of `com.cozylabs.bots`. */
 export const HERMES_DESKTOP_SESSIONS_CAPABILITY_ID = "com.cozylabs.hermes-desktop-sessions";
 export const HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION = 4;
-/** Reserved future A2A inbox seam. This is the sole future advertisement for the withdrawn
- * surface and has no version until Hermes exposes durable structured A2A identity, delivery/reply
- * metadata, and bounded replay. It is separate from `com.cozylabs.bots` because no later value
- * of that scalar may be read as support for withdrawn capability 17. */
+/** The A2A inbox seam. Version 1 is leader assignments: `/bots/:name/assignments`,
+ * `/assignments/:taskId`, and the reinstated `GET /bots/:name/inbox` routes, all backed by
+ * gateway-owned rows rather than the withdrawn Hermes heuristic (ADR 0082). It is separate from
+ * `com.cozylabs.bots` because no later value of that scalar may be read as support for withdrawn
+ * capability 17, and it is never inferred from that scalar. */
 export const AGENT_INBOX_CAPABILITY_ID = "com.cozylabs.agent-inbox";
+export const AGENT_INBOX_CAPABILITY_VERSION = 1;
 /** The phone-as-node capability, advertised beside the bots one.
  *  4: device status v2 answers over an authenticated origin, under a single-use lease.
  *  5: the phone can also capture a photo or a short video, hand over a file the person picked,
@@ -3620,7 +3638,14 @@ export type BotScreenRequestCancelFrame = Static<typeof BotScreenRequestCancelFr
  * `bot_relay_pending` frame forwards `bot_relay.outbox.pending`, so a phone holding this gateway and
  * another Hermes connection can carry `message_agent` DMs between them. `BotSummary.workerActiveAt`
  * carries the worker heartbeat for "Active now". Additive: no existing route or frame changes. */
-export const BOTS_CAPABILITY_VERSION = 87;
+/** Capability 88: team roles and the assignment turn context. `BotProfile` and `BotProfilePatch`
+ * gain optional `role` (`leader` | `member`) and `reports` (at most 16 bot names), stored by the
+ * gateway and merged into the read; a patch carrying only these two touches no peer. Attach-v1
+ * `TurnContext` gains an optional `task` beside `room` naming the Task, its leader, brief, done
+ * criteria and deadline, and `room` becomes optional because an assignment turn has none; `text`
+ * is byte-identical with and without `context`, exactly as 47 promised. The assignment surface
+ * itself is advertised on `com.cozylabs.agent-inbox` 1, never inferred from this scalar. Additive. */
+export const BOTS_CAPABILITY_VERSION = 88;
 
 /** Capability 82. At least one field. `title` is the friendly name; the empty string clears it. */
 export const BotIdentityPatchSchema = Type.Object({
