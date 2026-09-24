@@ -223,6 +223,9 @@ export interface HermesClient {
   dashboardResponse(path: string, init?: {
     method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
     body?: unknown;
+    /** A body sent as it is (a streamed multipart upload): no JSON encoding, the caller's own
+     *  `content-type`. Not replayed on the password-mode re-login retry. */
+    rawBody?: ReadableStream<Uint8Array>;
     headers?: Readonly<Record<string, string>>;
     signal?: AbortSignal;
     timeoutMs?: number;
@@ -647,6 +650,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     init: {
       method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
       body?: unknown;
+      rawBody?: ReadableStream<Uint8Array>;
       headers?: Readonly<Record<string, string>>;
       signal?: AbortSignal;
       timeoutMs?: number;
@@ -673,7 +677,9 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
       const response = await doFetch(new URL(path, `${dashboardBaseUrl}/`), {
         method: init.method ?? "GET",
         headers,
-        ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+        ...(init.rawBody !== undefined
+          ? { body: init.rawBody, duplex: "half" } as RequestInit
+          : init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
         signal: init.signal === undefined
           ? timeoutSignal
           : AbortSignal.any([init.signal, timeoutSignal]),
@@ -683,7 +689,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
 
     let attempt = await send();
     let response = attempt.response;
-    if (auth.mode === "password" && response.status === 401 && !relogged) {
+    if (auth.mode === "password" && response.status === 401 && !relogged && init.rawBody === undefined) {
       await response.text().catch(() => "");
       if (sessionCookie === attempt.cookie) sessionCookie = undefined;
       relogged = true;
@@ -714,6 +720,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     init: {
       method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
       body?: unknown;
+      rawBody?: ReadableStream<Uint8Array>;
       headers?: Readonly<Record<string, string>>;
       signal?: AbortSignal;
       timeoutMs?: number;

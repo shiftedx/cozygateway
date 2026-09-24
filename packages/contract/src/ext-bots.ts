@@ -90,6 +90,16 @@ export const BotSummarySchema = Type.Object({
   runnerId: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
   runnerName: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
   meta: Type.Union([Type.Record(Type.String(), Type.Unknown()), Type.Null()]),
+  /** Capability 81. How to draw the bot when it is not a drawn face: an `image` served by
+   *  `GET /bots/:name/avatar` (an upload, a generated portrait or a chosen pet, all stored as the
+   *  profile's avatar asset), or a legacy `pet` slug whose thumbnail `imageUrl` serves. `imageUrl`
+   *  is gateway-relative and carries a `v` that changes when the look is rewritten, so a client
+   *  cache keyed on it refetches. Absent: draw the face `meta` describes. */
+  avatar: Type.Optional(Type.Object({
+    kind: Type.Union([Type.Literal("image"), Type.Literal("pet")]),
+    imageUrl: Type.Optional(Type.String({ minLength: 1, maxLength: 512, pattern: "^/" })),
+    petSlug: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+  }, { additionalProperties: false })),
 });
 export type BotSummary = Static<typeof BotSummarySchema>;
 
@@ -128,6 +138,16 @@ export const BotCreateRequestSchema = Type.Object({
    * a client that names a machine that is not there is a client bug rather than a missing
    * machine. */
   runnerId: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+  /** Capability 82. Start from another bot on the same Hermes host: its config, skills and SOUL,
+   * or with `cloneAll` its whole state (memory and sessions too). Absent is a fresh bot with the
+   * bundled skills, which is every create written before 82. */
+  cloneFrom: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+  cloneAll: Type.Optional(Type.Boolean()),
+  /** Capability 82. Skip the bundled skills. Hermes refuses it beside `cloneFrom`. */
+  noSkills: Type.Optional(Type.Boolean()),
+  /** Capability 82. Default true: provider keys are copied and OAuth logins are shared from the
+   * launch profile (`mirror_credentials` + `share_auth`). False starts the bot with no keys. */
+  shareKeys: Type.Optional(Type.Boolean()),
 });
 export type BotCreateRequest = Static<typeof BotCreateRequestSchema>;
 
@@ -1467,6 +1487,139 @@ export type BotProfile = Static<typeof BotProfileSchema>;
  *  rather than through this gateway, so the field is `Type.Optional(Type.Never())` -- present at
  *  all, with any value, is `400 invalid_request` naming the field, the same shape every other
  *  boundary refusal on this route already answers. */
+/** Capability 80. The per-bot presentation the Hermes desktop plugin syncs through
+ *  `ui_meta["hermes-bots"]`: roster pin, roster hide, user-section membership (id plus the name that
+ *  lets another client rebuild a section it never made) and the friendly title. Every field is
+ *  optional because the blob simply lacks a key nobody wrote; an absent key is NOT `false`, which is
+ *  what lets a client push a device-local pin the first time it syncs. */
+const PresentationText = Type.String({ minLength: 1, maxLength: 128, pattern: "\\S" });
+/** Capability 81. The desktop's face string: `blobatar[:seed[:kind]]`, a geometric shape, or a
+ *  legacy `sigil-<n>`. Free-form on purpose; the client parses it. */
+const LookShape = Type.String({ minLength: 1, maxLength: 256, pattern: "\\S" });
+/** Capability 81. CozyChat's own namespaced look record inside the same blob: the exact Living Jelly
+ *  a phone chose (`jelly`), the seed it locked (`seed`), a Prism tint (`prism`, `#rrggbb`) and the
+ *  desktop `shape` it wrote beside them (`shape`), which is how a phone tells whether a desktop has
+ *  changed the look since. */
+export const BotCozyLookSchema = Type.Object({
+  jelly: Type.Optional(PresentationText),
+  seed: Type.Optional(PresentationText),
+  prism: Type.Optional(Type.String({ pattern: "^#[0-9a-fA-F]{6}$" })),
+  shape: Type.Optional(LookShape),
+  /** The desktop `color` written beside it: a colour-only desktop change also retires the record. */
+  color: Type.Optional(PresentationText),
+}, { additionalProperties: false });
+export type BotCozyLook = Static<typeof BotCozyLookSchema>;
+const ImageKind = Type.Union([Type.Literal("photo"), Type.Literal("shape")]);
+
+export const BotPresentationSchema = Type.Object({
+  pinned: Type.Optional(Type.Boolean()),
+  hidden: Type.Optional(Type.Boolean()),
+  sectionId: Type.Optional(PresentationText),
+  sectionName: Type.Optional(PresentationText),
+  title: Type.Optional(PresentationText),
+  /** Capability 81: the look. */
+  shape: Type.Optional(LookShape),
+  color: Type.Optional(PresentationText),
+  custom: Type.Optional(Type.Boolean()),
+  imageKind: Type.Optional(ImageKind),
+  cozychat: Type.Optional(BotCozyLookSchema),
+}, { additionalProperties: false });
+export type BotPresentation = Static<typeof BotPresentationSchema>;
+
+/** Capability 80. `PATCH /bots/:name/presentation` body. Only the keys present are written, `null`
+ *  clears a section or title, and every other key in the profile's `ui_meta["hermes-bots"]` blob is
+ *  kept verbatim (the gateway re-reads and re-applies on a revision conflict, never overwrites). */
+export const BotPresentationPatchSchema = Type.Object({
+  pinned: Type.Optional(Type.Boolean()),
+  hidden: Type.Optional(Type.Boolean()),
+  sectionId: Type.Optional(Type.Union([PresentationText, Type.Null()])),
+  sectionName: Type.Optional(Type.Union([PresentationText, Type.Null()])),
+  title: Type.Optional(Type.Union([PresentationText, Type.Null()])),
+  /** Capability 81: the look, set or (`null`) cleared key by key like the rest. */
+  shape: Type.Optional(Type.Union([LookShape, Type.Null()])),
+  color: Type.Optional(Type.Union([PresentationText, Type.Null()])),
+  custom: Type.Optional(Type.Union([Type.Boolean(), Type.Null()])),
+  imageKind: Type.Optional(Type.Union([ImageKind, Type.Null()])),
+  cozychat: Type.Optional(Type.Union([BotCozyLookSchema, Type.Null()])),
+  /** Capability 81: a backfill. Written only if the blob, re-read inside the compare-and-swap loop,
+   *  still has NO look key; otherwise the write is skipped and the current presentation answered.
+   *  This is how a phone's first sync can never overwrite a look another client wrote meanwhile. */
+  lookIfAbsent: Type.Optional(Type.Boolean()),
+}, { additionalProperties: false });
+export type BotPresentationPatch = Static<typeof BotPresentationPatchSchema>;
+
+/** Capability 80. `GET` and `PATCH /bots/:name/presentation` answer. `revision` is Hermes's own
+ *  per-key compare-and-swap counter for `ui_meta["hermes-bots"]` (0 when never written). */
+export const BotPresentationResponseSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 128 }),
+  presentation: BotPresentationSchema,
+  revision: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotPresentationResponse = Static<typeof BotPresentationResponseSchema>;
+
+/** Capability 81. `PUT /bots/:name/avatar`: a PNG, JPEG or WebP as a data URL (or bare base64),
+ *  at most 2 MB decoded. The format is sniffed from the bytes, never taken from the declared type. */
+export const BotAvatarSetRequestSchema = Type.Object({
+  data: Type.String({ minLength: 8, maxLength: 2_800_000 }),
+}, { additionalProperties: false });
+export type BotAvatarSetRequest = Static<typeof BotAvatarSetRequestSchema>;
+
+/** Capability 81. `PUT`/`DELETE /bots/:name/avatar` answer. */
+export const BotAvatarSetResponseSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 128 }),
+  hasAvatar: Type.Boolean(),
+  size: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotAvatarSetResponse = Static<typeof BotAvatarSetResponseSchema>;
+
+/** Capability 81. `POST /bots/:name/avatar/generate`: `probe: true` only asks whether Hermes has an
+ *  image backend; otherwise `prompt` is required. */
+export const BotAvatarGenerateRequestSchema = Type.Object({
+  prompt: Type.Optional(Type.String({ minLength: 1, maxLength: 2000, pattern: "\\S" })),
+  probe: Type.Optional(Type.Boolean()),
+}, { additionalProperties: false });
+export type BotAvatarGenerateRequest = Static<typeof BotAvatarGenerateRequestSchema>;
+
+/** Capability 81. `image` is a data URL, present only on success. The portrait is NOT saved: the
+ *  client previews it and saves it with `PUT /bots/:name/avatar`, as the desktop does. */
+export const BotAvatarGenerateResponseSchema = Type.Object({
+  available: Type.Boolean(),
+  success: Type.Optional(Type.Boolean()),
+  image: Type.Optional(Type.String()),
+  error: Type.Optional(Type.String()),
+}, { additionalProperties: false });
+export type BotAvatarGenerateResponse = Static<typeof BotAvatarGenerateResponseSchema>;
+
+/** Capability 81. One petdex companion from `GET /bots/:name/avatar/pets`. */
+export const BotAvatarPetSchema = Type.Object({
+  slug: Type.String({ minLength: 1, maxLength: 128 }),
+  displayName: Type.String(),
+  installed: Type.Boolean(),
+  curated: Type.Boolean(),
+  /** Empty for a pet hatched locally, which the thumb route still serves from disk. */
+  spritesheetUrl: Type.String(),
+}, { additionalProperties: false });
+export type BotAvatarPet = Static<typeof BotAvatarPetSchema>;
+
+export const BotAvatarPetGallerySchema = Type.Object({
+  pets: Type.Array(BotAvatarPetSchema),
+}, { additionalProperties: false });
+export type BotAvatarPetGallery = Static<typeof BotAvatarPetGallerySchema>;
+
+/** Capability 81. `POST /bots/:name/avatar/pets/thumb`: a pet's first idle frame as a PNG data URI,
+ *  cropped by Hermes (`pet.thumb`). The client sets it as the avatar with `PUT`. */
+export const BotAvatarPetThumbRequestSchema = Type.Object({
+  slug: Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._-]+$" }),
+  url: Type.Optional(Type.String({ maxLength: 1024 })),
+}, { additionalProperties: false });
+export type BotAvatarPetThumbRequest = Static<typeof BotAvatarPetThumbRequestSchema>;
+
+export const BotAvatarPetThumbResponseSchema = Type.Object({
+  ok: Type.Boolean(),
+  image: Type.Optional(Type.String()),
+}, { additionalProperties: false });
+export type BotAvatarPetThumbResponse = Static<typeof BotAvatarPetThumbResponseSchema>;
+
 const NameItem = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
 
 export const BotProfilePatchSchema = Type.Object({
@@ -3142,10 +3295,29 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * exists. Delivery approval pushes alone may request the time-sensitive APNs interruption level.
  * Capability 78: optional attach heartbeat turn-health reports let the gateway detect an interim
  * delivery seal while a turn remains active; native chat state may expose `deliveryStatus` as
- * `checking` without changing its execution lifecycle. */
-/** Capabilities 79-82 are reserved for sibling slices of the Hermes bot parity program (79:
- * runtime-bot settings, 80: presentation, 81: avatars, 82: profile ops); they are documented by
- * those slices.
+ * `checking` without changing its execution lifecycle.
+ * Capability 79: reserved, runtime-bot settings (CozyAgents gateway). Not advertised meaning here.
+ * Capability 80: `GET`/`PATCH /bots/:name/presentation` reads and writes the synced roster
+ * presentation (pin, hide, user section, title) in `ui_meta["hermes-bots"]` with Hermes's own
+ * per-key compare-and-swap; a revision conflict re-reads and re-applies only the patched keys.
+ * Capability 81: avatars. The presentation carries the look (`shape`, `color`, `custom`,
+ * `imageKind`, and CozyChat's namespaced `cozychat` record); `GET`/`PUT`/`DELETE /bots/:name/avatar`
+ * read and write the profile's avatar asset (`profiles.get_asset`/`set_asset`),
+ * `POST /bots/:name/avatar/generate` probes and runs `image.generate`, and
+ * `GET /bots/:name/avatar/pets` + `POST /bots/:name/avatar/pets/thumb` browse the petdex gallery.
+ * `BotSummary.avatar` names the image to draw.
+ * Capability 82: profile operations. `PATCH /bots/:name/identity` writes the friendly title into
+ * `ui_meta["hermes-bots"].title` through capability 80's presentation writer, and the description. `POST /bots/:name/rename` renames
+ * the Hermes profile itself. `POST /bots/:name/describe-auto` asks Hermes to write a description.
+ * `POST /bots/:name/duplicate` clones the whole profile plus its look and avatar. `POST
+ * /bots/:name/export` answers the profile's `.tar.gz` (credentials excluded by Hermes) and `POST
+ * /bots/import?name=` creates a bot from one. `GET`/`PUT`/`DELETE /bots/:name/model-pin` reads, the
+ * profile's model with the expensive-model handshake, or unpins it so the launch profile's model
+ * applies. `GET /bots/:name/provider-keys` lists the providers that take a key, and
+ * `PUT`/`DELETE /bots/:name/provider-keys/:provider` save or disconnect one, on the bot's own profile.
+ * `GET /bots/:name/skills-hub?q=` and `POST /bots/:name/skills-hub/install` search the Skills Hub
+ * and install into this bot. `POST /bots` gains `cloneFrom`, `cloneAll`, `noSkills` and
+ * `shareKeys`. Additive: every route is new and a client below 82 sends none of the fields.
  * Capability 83: Hermes routines v2. `BotRoutine.deliver`, `BotRoutineListResponse.schedulerRunning`,
  * create/patch `deliver`, in-place routine edits (prompt optional, id kept), `POST
  * /bots/:name/routines/:id/run` for Hermes bots (fires Hermes's own trigger), `GET
@@ -3153,3 +3325,81 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * blueprint catalog: `GET /bots/:name/routine-blueprints` and `POST
  * /bots/:name/routine-blueprints/:key/instantiate`. */
 export const BOTS_CAPABILITY_VERSION = 83;
+
+/** Capability 82. At least one field. `title` is the friendly name; the empty string clears it. */
+export const BotIdentityPatchSchema = Type.Object({
+  title: Type.Optional(Type.String({ maxLength: 120 })),
+  description: Type.Optional(Type.String({ maxLength: 2_000 })),
+});
+export type BotIdentityPatch = Static<typeof BotIdentityPatchSchema>;
+
+export const BotIdentitySchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  title: Type.String(),
+  description: Type.String(),
+});
+export type BotIdentity = Static<typeof BotIdentitySchema>;
+
+/** Capability 82. `newName` is the Hermes profile name (lowercase letters, digits, `-`, `_`). */
+export const BotRenameRequestSchema = Type.Object({
+  newName: Type.String({ minLength: 1, maxLength: 64 }),
+});
+export type BotRenameRequest = Static<typeof BotRenameRequestSchema>;
+
+/** Capability 82. `newName` absent picks `<name>-2`, `-3`, ... the first free one. */
+export const BotDuplicateRequestSchema = Type.Object({
+  newName: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+});
+export type BotDuplicateRequest = Static<typeof BotDuplicateRequestSchema>;
+
+export const BotDescribeAutoRequestSchema = Type.Object({
+  overwrite: Type.Optional(Type.Boolean()),
+});
+export type BotDescribeAutoRequest = Static<typeof BotDescribeAutoRequestSchema>;
+
+/** `ok: false` is Hermes' own inline refusal (no auxiliary model, say), not an HTTP error. */
+export const BotDescribeAutoResponseSchema = Type.Object({
+  ok: Type.Boolean(),
+  description: Type.Optional(Type.String()),
+  reason: Type.Optional(Type.String()),
+});
+export type BotDescribeAutoResponse = Static<typeof BotDescribeAutoResponseSchema>;
+
+export const BotModelPinRequestSchema = Type.Object({
+  model: Type.String({ minLength: 1, maxLength: 200 }),
+  provider: Type.String({ minLength: 1, maxLength: 120 }),
+  confirmExpensiveModel: Type.Optional(Type.Boolean()),
+});
+export type BotModelPinRequest = Static<typeof BotModelPinRequestSchema>;
+
+/** `confirmRequired` means NOTHING was written: resend with `confirmExpensiveModel: true` once the
+ * person agrees to `confirmMessage`. */
+export const BotModelPinResponseSchema = Type.Object({
+  pinned: Type.Boolean(),
+  confirmRequired: Type.Optional(Type.Boolean()),
+  confirmMessage: Type.Optional(Type.String()),
+  model: Type.Optional(Type.Object({ provider: Type.String(), model: Type.String() })),
+});
+export type BotModelPinResponse = Static<typeof BotModelPinResponseSchema>;
+
+export const BotProviderKeyRequestSchema = Type.Object({
+  apiKey: Type.String({ minLength: 1, maxLength: 4_096 }),
+});
+export type BotProviderKeyRequest = Static<typeof BotProviderKeyRequestSchema>;
+
+export const BotSkillsHubResultSchema = Type.Object({
+  name: Type.String(),
+  description: Type.String(),
+  /** What `install` takes; several hub sources can offer one `name`. */
+  identifier: Type.String(),
+  installed: Type.Optional(Type.Boolean()),
+});
+export const BotSkillsHubSearchSchema = Type.Object({
+  results: Type.Array(BotSkillsHubResultSchema),
+});
+export type BotSkillsHubSearch = Static<typeof BotSkillsHubSearchSchema>;
+
+export const BotSkillsHubInstallRequestSchema = Type.Object({
+  identifier: Type.String({ minLength: 1, maxLength: 300 }),
+});
+export type BotSkillsHubInstallRequest = Static<typeof BotSkillsHubInstallRequestSchema>;

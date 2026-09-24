@@ -117,6 +117,9 @@ export interface PendingHermesProfileSeedRow {
   selection: { toolsets?: readonly string[]; mcpServers?: readonly string[] };
   attempts: number;
   nextAttemptAt: number;
+  /** False for a clone, a duplicate or an import: the seed must not blank the skills it brought.
+   *  Absent reads as true, which is every row written before capability 82. */
+  blankSlate?: boolean;
 }
 
 /** Terminal receipts are reconnect aids, not permanent interaction history. Pending rows are
@@ -346,7 +349,8 @@ CREATE TABLE IF NOT EXISTS pending_hermes_profile_seeds (
   profile TEXT PRIMARY KEY,
   selection_json TEXT NOT NULL,
   attempts INTEGER NOT NULL CHECK (attempts >= 1),
-  next_attempt_at INTEGER NOT NULL
+  next_attempt_at INTEGER NOT NULL,
+  blank_slate INTEGER NOT NULL DEFAULT 1
 ) STRICT;
 -- Tool steps a bot's turn ran (contract/ext-bots-v1.md, capability 12). A CACHE of nothing: hermes
 -- keeps its tool lifecycle on a live event stream and replays none of it, so if these rows are not
@@ -2188,8 +2192,8 @@ export class Storage {
   savePendingHermesProfileSeed(row: PendingHermesProfileSeedRow): void {
     this.#db.prepare(
       `INSERT INTO pending_hermes_profile_seeds
-         (profile, selection_json, attempts, next_attempt_at)
-       VALUES (?, ?, ?, ?)
+         (profile, selection_json, attempts, next_attempt_at, blank_slate)
+       VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(profile) DO UPDATE SET
          attempts = excluded.attempts,
          next_attempt_at = excluded.next_attempt_at`,
@@ -2198,18 +2202,21 @@ export class Storage {
       JSON.stringify(row.selection),
       row.attempts,
       row.nextAttemptAt,
+      row.blankSlate === false ? 0 : 1,
     );
   }
 
   pendingHermesProfileSeeds(): PendingHermesProfileSeedRow[] {
     const rows = this.#db.prepare(
-      `SELECT profile, selection_json AS selectionJson, attempts, next_attempt_at AS nextAttemptAt
+      `SELECT profile, selection_json AS selectionJson, attempts, next_attempt_at AS nextAttemptAt,
+              blank_slate AS blankSlate
        FROM pending_hermes_profile_seeds ORDER BY next_attempt_at, profile`,
     ).all() as unknown as Array<{
       profile: string;
       selectionJson: string;
       attempts: number;
       nextAttemptAt: number;
+      blankSlate: number;
     }>;
     return rows.flatMap((row) => {
       try {
@@ -2235,6 +2242,7 @@ export class Storage {
           },
           attempts: row.attempts,
           nextAttemptAt: row.nextAttemptAt,
+          ...(row.blankSlate === 0 ? { blankSlate: false } : {}),
         }];
       } catch {
         // Corrupt durable intent must not turn into a seed with an invented selection.  Removing
@@ -6459,6 +6467,16 @@ export function openStorage(dbPath: string): Storage {
     if (!columns.has("vpn")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN vpn INTEGER");
     if (!columns.has("edge_rtt_ms")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN edge_rtt_ms INTEGER");
     if (!columns.has("edge_colo")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN edge_colo TEXT");
+  }
+  // Capability 82: a cloned, duplicated or imported profile's deferred seed must not blank the
+  // skills it brought. Rows written before it are fresh creates, so the default is 1.
+  {
+    const columns = new Set(
+      (db.prepare("PRAGMA table_info(pending_hermes_profile_seeds)").all() as unknown as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!columns.has("blank_slate"))
+      db.exec("ALTER TABLE pending_hermes_profile_seeds ADD COLUMN blank_slate INTEGER NOT NULL DEFAULT 1");
   }
   for (const table of ["runtime_bots", "runner_operations"]) {
     const columns = new Set(

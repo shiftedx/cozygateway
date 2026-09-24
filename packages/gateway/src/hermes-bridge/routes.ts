@@ -20,6 +20,17 @@ import {
   BotModelProviderFieldUpdateSchema,
   BotModelProviderOAuthCodeSchema,
   BotProfilePatchSchema,
+  BotDescribeAutoRequestSchema,
+  BotDuplicateRequestSchema,
+  BotIdentityPatchSchema,
+  BotModelPinRequestSchema,
+  BotProviderKeyRequestSchema,
+  BotRenameRequestSchema,
+  BotSkillsHubInstallRequestSchema,
+  BotPresentationPatchSchema,
+  BotAvatarSetRequestSchema,
+  BotAvatarGenerateRequestSchema,
+  BotAvatarPetThumbRequestSchema,
   IntegrationCreateRequestSchema,
   IntegrationCatalogInstallRequestSchema,
   IntegrationEnabledRequestSchema,
@@ -53,6 +64,8 @@ import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
 import { ModelConfigInvalid } from "./model-config.ts";
 import { ProviderSetupInvalid } from "./provider-setup.ts";
+import { PROFILE_IMPORT_MAX_BYTES, ProfileArchiveTooLarge, ProfileOpInvalid } from "./profile-ops.ts";
+import type { BotProfileOp } from "./bridge.ts";
 import {
   HermesDashboardIntegrations,
   IntegrationFlowNotFound,
@@ -74,6 +87,11 @@ import {
   normalizeProfileName,
 } from "./crud.ts";
 import { GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
+import { PresentationConflict, PresentationNotApplied } from "./presentation.ts";
+import { AvatarInvalid, decodeAvatar } from "./avatar.ts";
+
+/** A 2 MB image as base64 in a JSON envelope, with headroom. */
+const AVATAR_PUT_MAX_BYTES = 3_000_000;
 import {
   MEDIA_CACHE_CONTROL,
   MEDIA_MAX_CONCURRENT,
@@ -292,6 +310,12 @@ function failure(c: Context<Env>, err: unknown) {
       409,
     );
   if (err instanceof ProviderSetupInvalid)
+    return c.json(errorBody("invalid_request", err.message), 400);
+  if (err instanceof PresentationConflict)
+    return c.json(extensionErrorBody("conflict", err.message), 409);
+  if (err instanceof PresentationNotApplied)
+    return c.json(errorBody("backend_unavailable", err.message), 503);
+  if (err instanceof AvatarInvalid)
     return c.json(errorBody("invalid_request", err.message), 400);
   if (err instanceof BotSessionConflict) {
     return c.json(extensionErrorBody("conflict", err.message), 409);
@@ -707,7 +731,7 @@ export function registerBotRoutes(
       input = assertValid(BotCreateRequestSchema, await c.req.json());
       return c.json(await bots.createBot(input), 201);
     } catch (error) {
-      if (error instanceof ContractViolation || error instanceof BotNameInvalid)
+      if (error instanceof ContractViolation || error instanceof BotNameInvalid || error instanceof ProfileOpInvalid)
         return c.json(errorBody("invalid_request", error.message), 400);
       if (error instanceof BotNameTaken)
         return c.json(extensionErrorBody("conflict", error.message), 409);
@@ -1139,6 +1163,12 @@ export function registerBotRoutes(
     const jsonBody = async (c: Context<Env>): Promise<unknown> => {
       try { return await c.req.json(); } catch { return undefined; }
     };
+    // The PUT body is read against a hard cap whether or not the sender declared a length: a
+    // chunked upload declares nothing, and `c.req.json()` would buffer whatever arrived.
+    const cappedJson = async (c: Context<Env>): Promise<unknown> => {
+      const bytes = await readCappedBody(c.req.raw.body, AVATAR_PUT_MAX_BYTES);
+      try { return JSON.parse(new TextDecoder().decode(bytes)); } catch { return undefined; }
+    };
     const invalidBody = (c: Context<Env>, err: unknown): Response =>
       c.json(errorBody("invalid_request", err instanceof Error ? err.message : "malformed body"), 400);
 
@@ -1384,6 +1414,199 @@ export function registerBotRoutes(
     }
   });
 
+  // Capability 80: the synced roster presentation (pin, hide, user section, title). Registered only
+  // on a surface that can answer it, so a gateway without a Hermes profile behind it answers 404.
+  if (bots.botPresentation !== undefined && bots.configurePresentation !== undefined) {
+    const readPresentation = bots.botPresentation.bind(bots);
+    const writePresentation = bots.configurePresentation.bind(bots);
+    app.get("/bots/:name/presentation", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        return c.json(await readPresentation(resolved.name));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+
+    app.patch("/bots/:name/presentation", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      let body: unknown;
+      try {
+        body = await c.req.json();
+      } catch {
+        body = undefined;
+      }
+      let parsed;
+      try {
+        parsed = assertValid(BotPresentationPatchSchema, body);
+      } catch (err) {
+        const detail = err instanceof ContractViolation ? err.message : "malformed body";
+        return c.json(errorBody("invalid_request", detail), 400);
+      }
+      // An empty patch is a client bug; an empty success would hide it.
+      if (Object.keys(parsed).length === 0) {
+        return c.json(errorBody("invalid_request", "at least one presentation key is required"), 400);
+      }
+      try {
+        return c.json(await writePresentation(resolved.name, parsed));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+  }
+
+  // Capability 81: avatars. The picture is the profile's avatar asset (`profiles.get_asset` /
+  // `set_asset`); a generated portrait and a chosen pet are returned for the phone to preview and
+  // then saved with PUT, as the desktop's picker does. Registered only on a surface that can answer.
+  if (bots.botAvatar !== undefined && bots.setBotAvatar !== undefined) {
+    const readAvatar = bots.botAvatar.bind(bots);
+    const writeAvatar = bots.setBotAvatar.bind(bots);
+    const jsonBody = async (c: Context<Env>): Promise<unknown> => {
+      try { return await c.req.json(); } catch { return undefined; }
+    };
+    // The PUT body is read against a hard cap whether or not the sender declared a length: a
+    // chunked upload declares nothing, and `c.req.json()` would buffer whatever arrived.
+    const cappedJson = async (c: Context<Env>): Promise<unknown> => {
+      const bytes = await readCappedBody(c.req.raw.body, AVATAR_PUT_MAX_BYTES);
+      try { return JSON.parse(new TextDecoder().decode(bytes)); } catch { return undefined; }
+    };
+    const invalid = (c: Context<Env>, err: unknown) =>
+      c.json(errorBody("invalid_request", err instanceof ContractViolation ? err.message : "malformed body"), 400);
+    const imageResponse = (image: { mime: string; bytes: Uint8Array }) =>
+      // Copied: a Node Buffer is a view into a shared pool, so `.buffer` would send the whole pool.
+      new Response(new Uint8Array(image.bytes), {
+        status: 200,
+        headers: {
+          "content-type": image.mime,
+          "content-length": String(image.bytes.byteLength),
+          // The URL is versioned by the look's revision, so a private cache may keep it a while.
+          "cache-control": "private, max-age=3600",
+          "x-content-type-options": "nosniff",
+        },
+      });
+
+    app.get("/bots/:name/avatar", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        const image = await readAvatar(resolved.name);
+        if (image === undefined) return c.json(errorBody("not_found", `bot "${resolved.name}" has no avatar`), 404);
+        return imageResponse(image);
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+
+    app.put("/bots/:name/avatar", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      const declared = Number(c.req.header("content-length") ?? "0");
+      if (Number.isFinite(declared) && declared > AVATAR_PUT_MAX_BYTES) {
+        return c.json(errorBody("invalid_request", "avatar is larger than 2 MB"), 413);
+      }
+      let body: unknown;
+      try {
+        body = await cappedJson(c);
+      } catch {
+        return c.json(errorBody("invalid_request", "avatar is larger than 2 MB"), 413);
+      }
+      let parsed;
+      try {
+        parsed = assertValid(BotAvatarSetRequestSchema, body);
+        decodeAvatar(parsed.data);
+      } catch (err) {
+        if (err instanceof AvatarInvalid) return failure(c, err);
+        return invalid(c, err);
+      }
+      try {
+        return c.json(await writeAvatar(resolved.name, parsed.data));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+
+    app.delete("/bots/:name/avatar", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        return c.json(await writeAvatar(resolved.name, null));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+
+    if (bots.generateBotAvatar !== undefined) {
+      const generate = bots.generateBotAvatar.bind(bots);
+      app.post("/bots/:name/avatar/generate", requireDevice, async (c) => {
+        const resolved = canonicalName(c);
+        if ("response" in resolved) return resolved.response;
+        let parsed;
+        try {
+          parsed = assertValid(BotAvatarGenerateRequestSchema, await jsonBody(c));
+        } catch (err) {
+          return invalid(c, err);
+        }
+        if (parsed.probe !== true && parsed.prompt === undefined) {
+          return c.json(errorBody("invalid_request", "prompt is required unless probe is true"), 400);
+        }
+        try {
+          return c.json(await generate(resolved.name, parsed));
+        } catch (err) {
+          return failure(c, err);
+        }
+      });
+    }
+
+    if (bots.botAvatarPets !== undefined && bots.botAvatarPetThumb !== undefined) {
+      const pets = bots.botAvatarPets.bind(bots);
+      const thumb = bots.botAvatarPetThumb.bind(bots);
+      app.get("/bots/:name/avatar/pets", requireDevice, async (c) => {
+        const resolved = canonicalName(c);
+        if ("response" in resolved) return resolved.response;
+        try {
+          return c.json(await pets(resolved.name, c.req.query("localOnly") === "1" || c.req.query("localOnly") === "true"));
+        } catch (err) {
+          return failure(c, err);
+        }
+      });
+
+      app.post("/bots/:name/avatar/pets/thumb", requireDevice, async (c) => {
+        const resolved = canonicalName(c);
+        if ("response" in resolved) return resolved.response;
+        let parsed;
+        try {
+          parsed = assertValid(BotAvatarPetThumbRequestSchema, await jsonBody(c));
+        } catch (err) {
+          return invalid(c, err);
+        }
+        try {
+          return c.json(await thumb(resolved.name, parsed.slug, parsed.url ?? ""));
+        } catch (err) {
+          return failure(c, err);
+        }
+      });
+
+      // A legacy `ui_meta.pet` slug drawn as bytes (the roster's `avatar.kind: "pet"` URL), so a
+      // pet the desktop once picked renders as the pet rather than as a jelly.
+      app.get("/bots/:name/avatar/pets/:slug", requireDevice, async (c) => {
+        const resolved = canonicalName(c);
+        if ("response" in resolved) return resolved.response;
+        const slug = c.req.param("slug");
+        if (!/^[A-Za-z0-9._-]{1,128}$/.test(slug)) return c.json(errorBody("invalid_request", "bad pet slug"), 400);
+        try {
+          const answer = await thumb(resolved.name, slug, "");
+          if (!answer.ok || answer.image === undefined) return c.json(errorBody("not_found", `no thumbnail for pet "${slug}"`), 404);
+          return imageResponse(decodeAvatar(answer.image));
+        } catch (err) {
+          if (err instanceof AvatarInvalid) return c.json(errorBody("not_found", `no thumbnail for pet "${slug}"`), 404);
+          return failure(c, err);
+        }
+      });
+    }
+  }
+
   app.get("/bots/:name/model-config", requireDevice, async (c) => {
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;
@@ -1545,6 +1768,167 @@ export function registerBotRoutes(
     } catch (err) {
       return failure(c, err);
     }
+  });
+
+  // Capability 82: profile operations (contract/ext-bots-v1.md row 82). Every route is one call
+  // through `profileOp`, whose bridge half is `profile-ops.ts`.
+  const profileOp = async (c: Context<Env>, name: string, op: BotProfileOp, status: 200 | 201 = 200): Promise<Response> => {
+    try {
+      if (bots.profileOp === undefined) throw new BackendUnavailable("this gateway has no Hermes profile operations");
+      return c.json((await bots.profileOp(name, op)) as object, status);
+    } catch (error) {
+      if (error instanceof BotNameInvalid || error instanceof ProfileOpInvalid)
+        return c.json(errorBody("invalid_request", error.message), 400);
+      if (error instanceof ProfileArchiveTooLarge)
+        return c.json(errorBody("invalid_request", error.message), 413);
+      if (error instanceof BotNameTaken)
+        return c.json(extensionErrorBody("conflict", error.message), 409);
+      if (error instanceof BotTurnActive)
+        return c.json({ ...extensionErrorBody("conflict", error.message), turnId: error.turnId }, 409);
+      return failure(c, error);
+    }
+  };
+  const profileOpBody = async <T,>(c: Context<Env>, schema: Parameters<typeof assertValid>[0], optional = false): Promise<T | Response> => {
+    let body: unknown;
+    try { body = await c.req.json(); } catch { body = optional ? {} : undefined; }
+    try {
+      return assertValid(schema, body) as T;
+    } catch (err) {
+      return c.json(errorBody("invalid_request", err instanceof ContractViolation ? err.message : "malformed body"), 400);
+    }
+  };
+
+  app.patch("/bots/:name/identity", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const patch = await profileOpBody<{ title?: string; description?: string }>(c, BotIdentityPatchSchema);
+    if (patch instanceof Response) return patch;
+    if (patch.title === undefined && patch.description === undefined)
+      return c.json(errorBody("invalid_request", "at least one of title, description is required"), 400);
+    return profileOp(c, resolved.name, { kind: "identity", patch });
+  });
+
+  app.post("/bots/:name/rename", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ newName: string }>(c, BotRenameRequestSchema);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, { kind: "rename", newName: body.newName });
+  });
+
+  app.post("/bots/:name/describe-auto", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ overwrite?: boolean }>(c, BotDescribeAutoRequestSchema, true);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, { kind: "describeAuto", overwrite: body.overwrite === true });
+  });
+
+  app.post("/bots/:name/duplicate", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ newName?: string }>(c, BotDuplicateRequestSchema, true);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, {
+      kind: "duplicate", ...(body.newName === undefined ? {} : { newName: body.newName }),
+    }, 201);
+  });
+
+  app.post("/bots/:name/export", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      if (bots.profileOp === undefined) throw new BackendUnavailable("this gateway has no Hermes profile operations");
+      // Streamed from Hermes straight to the phone, never held here whole.
+      const exported = (await bots.profileOp(resolved.name, { kind: "export" })) as {
+        filename: string; body: ReadableStream<Uint8Array>; length?: number;
+      };
+      const filename = exported.filename.replace(/[^A-Za-z0-9._-]/g, "_");
+      return new Response(exported.body, {
+        headers: {
+          "content-type": "application/gzip",
+          ...(exported.length === undefined ? {} : { "content-length": String(exported.length) }),
+          "content-disposition": `attachment; filename="${filename}"`,
+          "cache-control": "no-store",
+        },
+      });
+    } catch (error) {
+      if (error instanceof BotNameInvalid) return c.json(errorBody("invalid_request", error.message), 400);
+      return failure(c, error);
+    }
+  });
+
+  // The archive is streamed into Hermes as it arrives and counted on the way: a declared length
+  // over the bound is refused before any byte moves, and a body with no length (chunked) is cut
+  // off at the bound, so the gateway never holds an archive in memory.
+  app.post("/bots/import", requireDevice, async (c) => {
+    const name = (c.req.query("name") ?? "").trim();
+    if (name.length === 0) return c.json(errorBody("invalid_request", "name is required"), 400);
+    const declared = Number(c.req.header("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > PROFILE_IMPORT_MAX_BYTES)
+      return c.json(errorBody("invalid_request", "the archive is larger than 100 MiB"), 413);
+    return profileOp(c, name, { kind: "import", archive: c.req.raw.body }, 201);
+  });
+
+  app.get("/bots/:name/model-pin", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    return profileOp(c, resolved.name, { kind: "modelPin" });
+  });
+
+  app.put("/bots/:name/model-pin", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ model: string; provider: string; confirmExpensiveModel?: boolean }>(c, BotModelPinRequestSchema);
+    if (body instanceof Response) return body;
+    const response = await profileOp(c, resolved.name, { kind: "pinModel", request: body });
+    if (response.ok) chat.contextConfigurationChanged?.(resolved.name);
+    return response;
+  });
+
+  app.delete("/bots/:name/model-pin", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const response = await profileOp(c, resolved.name, { kind: "unpinModel" });
+    if (response.ok) chat.contextConfigurationChanged?.(resolved.name);
+    return response;
+  });
+
+  app.get("/bots/:name/provider-keys", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    return profileOp(c, resolved.name, { kind: "providerKeys" });
+  });
+
+  app.put("/bots/:name/provider-keys/:provider", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ apiKey: string }>(c, BotProviderKeyRequestSchema);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, { kind: "saveProviderKey", provider: c.req.param("provider"), apiKey: body.apiKey });
+  });
+
+  app.delete("/bots/:name/provider-keys/:provider", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    return profileOp(c, resolved.name, { kind: "disconnectProvider", provider: c.req.param("provider") });
+  });
+
+  app.get("/bots/:name/skills-hub", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const query = (c.req.query("q") ?? "").trim();
+    if (query.length === 0 || query.length > CATALOG_QUERY_MAX)
+      return c.json(errorBody("invalid_request", `q must be 1 to ${CATALOG_QUERY_MAX} characters`), 400);
+    return profileOp(c, resolved.name, { kind: "skillsHubSearch", query });
+  });
+
+  app.post("/bots/:name/skills-hub/install", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ identifier: string }>(c, BotSkillsHubInstallRequestSchema);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, { kind: "skillsHubInstall", identifier: body.identifier });
   });
 
   app.get("/bots/:name/chat", requireDevice, async (c) => {
