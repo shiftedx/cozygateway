@@ -6693,8 +6693,8 @@ export function openStorage(dbPath: string): Storage {
   // its in-flight turn survives; where both rows exist the session value already won every read
   // and is kept. The column is cleared, not dropped: every earlier migration is additive so that a
   // rolled-back release still boots here. Nothing writes the copy any more, so once cleared this
-  // is one cheap probe of a one-row-per-bot table. A second process opening at the same moment
-  // waits briefly for the write lock instead of failing, then re-probes and finds the work done.
+  // is one cheap probe of a one-row-per-bot table. A second process that reaches this point while
+  // another holds the migration lock waits briefly for it, then re-probes and finds the work done.
   const legacyChatTurn = db.prepare("SELECT 1 FROM bot_native_chats WHERE active_turn_id IS NOT NULL LIMIT 1");
   if (legacyChatTurn.get() !== undefined) {
     db.exec("PRAGMA busy_timeout = 5000");
