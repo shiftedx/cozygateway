@@ -3391,9 +3391,10 @@ export class Storage {
   }
 
   /** Newest first. `participant` matches either side. */
-  botAssignments(filter: { leader?: string; assignee?: string; participant?: string } = {}): BotAssignmentRow[] {
+  botAssignments(filter: { leader?: string; assignee?: string; participant?: string; createdSince?: number } = {}): BotAssignmentRow[] {
     const where: string[] = [];
-    const params: string[] = [];
+    const params: Array<string | number> = [];
+    if (filter.createdSince !== undefined) { where.push("created_at >= ?"); params.push(filter.createdSince); }
     if (filter.leader !== undefined) { where.push("leader = ?"); params.push(filter.leader); }
     if (filter.assignee !== undefined) { where.push("assignee = ?"); params.push(filter.assignee); }
     if (filter.participant !== undefined) { where.push("(leader = ? OR assignee = ?)"); params.push(filter.participant, filter.participant); }
@@ -3472,7 +3473,8 @@ export class Storage {
           if (state?.activeTurnId !== undefined && state.activeTurnId !== command.turnId) return false;
           this.setNativeBotTurn(view.bot, command.threadId, command.turnId, at);
           this.appendNativeBotMessage({ bot: view.bot, sessionId: command.threadId, messageId: command.messageId, role: "user", text: command.text, turnId: command.turnId, at });
-        } else if (this.threadById(command.threadId)?.agentId !== peer) return false;
+        // Capability 88: an assignment thread is gateway-owned too, and only its assignee may run on it.
+        } else if (this.threadById(command.threadId)?.agentId !== peer && this.botAssignmentByThread(command.threadId)?.assignee !== peer) return false;
       }
       this.enqueueAttachCommand(peer, commandId, command, at);
       return true;
