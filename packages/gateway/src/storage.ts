@@ -4646,6 +4646,10 @@ export class Storage {
       this.#db.prepare(`DELETE FROM bot_message_receipts WHERE bot = ? AND message_id IN
         (SELECT message_id FROM bot_native_messages WHERE bot = ? AND session_id = ?)`)
         .run(input.bot, input.bot, input.sessionId);
+      // Capability 86: a deleted conversation's Tapbacks go with it.
+      this.#db.prepare(`DELETE FROM bot_message_reactions WHERE bot = ? AND message_id IN
+        (SELECT message_id FROM bot_native_messages WHERE bot = ? AND session_id = ?)`)
+        .run(input.bot, input.bot, input.sessionId);
       this.#db.prepare(`DELETE FROM bot_turn_media_deliveries WHERE bot = ? AND message_id IN
         (SELECT message_id FROM bot_native_messages WHERE bot = ? AND session_id = ?)`)
         .run(input.bot, input.bot, input.sessionId);
@@ -6017,6 +6021,9 @@ export class Storage {
       ["sessions", "bot_native_sessions", "bot"],
       ["messages", "bot_native_messages", "bot"],
       ["receipts", "bot_message_receipts", "bot"],
+      // Capability 86.
+      ["reactions", "bot_message_reactions", "bot"],
+      ["canonicalBotChat", "bot_canonical_chats", "bot"],
       ["mobileReceipts", "bot_mobile_receipts", "bot"],
       // Capability 68. A lifecycle record names a device, a turn and the purpose a person was
       // shown. Deleting the bot takes them with it rather than leaving them keyed to an identity

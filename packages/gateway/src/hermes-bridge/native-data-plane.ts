@@ -1915,7 +1915,13 @@ export class NativeBotDataPlane {
   sessionReclaimed(hermesSessionId: string): void {
     for (const { bot, hermesSessionId: canonical } of this.#storage.canonicalBotChats()) {
       if (canonical !== hermesSessionId || !this.#native.has(bot)) continue;
-      void this.#openBotChat(bot).catch(() => undefined);
+      // Only when the CURRENT chat is bound to the Bot Chat, and only a re-proof of that same
+      // binding: the staged resume reuses the bound gateway session, so this event can never
+      // move the selection off a chat the user chose.
+      const current = this.#storage.nativeBotChat(bot, this.#now());
+      const binding = this.#storage.nativeDesktopResumeBinding(bot, current.sessionId);
+      if (binding?.hermesSessionId !== canonical || current.activeTurnId !== undefined) continue;
+      void this.#resumeEligibleDesktopSession(bot, canonical).catch(() => undefined);
     }
   }
 
@@ -2522,6 +2528,18 @@ export class NativeBotDataPlane {
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
     const now = this.#now();
     const previous = this.#storage.nativeBotChat(bot, now);
+    // Capability 86: clearing a chat bound to the Bot Chat RETIRES it (archived + hidden), so the
+    // next open mints a fresh canonical one instead of re-binding the conversation just cleared.
+    // The archive comes FIRST and a failure fails the whole reset: the binding row and the
+    // selection are untouched, so the clear can be retried rather than silently undone later.
+    const bound = this.#storage.nativeDesktopResumeBinding(bot, previous.sessionId);
+    const canonical = this.#storage.canonicalBotChat(bot);
+    if (bound !== undefined && canonical !== undefined && bound.hermesSessionId === canonical) {
+      if (this.#control.archiveHermesSession === undefined)
+        throw new BackendUnavailable("this gateway cannot retire a Hermes Bot Chat");
+      await this.#control.archiveHermesSession(bot, canonical);
+      this.#storage.setCanonicalBotChat(bot, null, now);
+    }
     if (previous.activeTurnId !== undefined) {
       this.#discardLiveTurn(this.#nativeTurnKey(bot, previous.sessionId, previous.activeTurnId));
       this.#cancelMobileTurn(bot, previous.sessionId, previous.activeTurnId);
@@ -2530,14 +2548,6 @@ export class NativeBotDataPlane {
         threadId: previous.sessionId,
         turnId: previous.activeTurnId,
       });
-    }
-    // Capability 86: clearing a chat bound to the Bot Chat RETIRES it (archived + hidden), so the
-    // next open mints a fresh canonical one instead of re-binding the conversation just cleared.
-    const bound = this.#storage.nativeDesktopResumeBinding(bot, previous.sessionId);
-    const canonical = this.#storage.canonicalBotChat(bot);
-    if (bound !== undefined && bound.hermesSessionId === canonical && this.#control.archiveHermesSession) {
-      this.#storage.setCanonicalBotChat(bot, null, now);
-      await this.#control.archiveHermesSession(bot, canonical).catch(() => undefined);
     }
     const sessionId = this.#storage.resetNativeBotChat(bot, now);
     this.#broadcast({

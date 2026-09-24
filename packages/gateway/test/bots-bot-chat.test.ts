@@ -227,6 +227,57 @@ describe("capability 86 on the native data plane", () => {
     h.close();
   });
 
+  it("a failed archive fails Clear chat and keeps the binding (review #3)", async () => {
+    const h = plane();
+    const opening = h.surface.openBotChat!("sage");
+    await vi.waitFor(() => expect(h.resumes).toHaveLength(1));
+    h.confirm();
+    await opening;
+    const before = h.storage.nativeBotChat("sage", Date.now()).sessionId;
+    (h.control.archiveHermesSession as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("dashboard down"));
+    await expect(h.surface.resetChat("sage")).rejects.toThrow(/dashboard down/);
+    expect(h.storage.canonicalBotChat("sage")).toBe("bot-chat-1");
+    expect(h.storage.nativeBotChat("sage", Date.now()).sessionId).toBe(before);
+    expect(h.frames.filter((f) => f["type"] === "bot_chat_reset")).toEqual([]);
+    // The retry succeeds and retires it.
+    await h.surface.resetChat("sage");
+    expect(h.storage.canonicalBotChat("sage")).toBeUndefined();
+    h.close();
+  });
+
+  it("session.reclaimed re-proves only a chat bound to the Bot Chat, never switching selection (review #4)", async () => {
+    const h = plane();
+    const opening = h.surface.openBotChat!("sage");
+    await vi.waitFor(() => expect(h.resumes).toHaveLength(1));
+    h.confirm();
+    await opening;
+    const bound = h.storage.nativeBotChat("sage", Date.now()).sessionId;
+    h.plane.sessionReclaimed("bot-chat-1");
+    await vi.waitFor(() => expect(h.resumes).toHaveLength(2));
+    // The re-proof names the SAME gateway chat, so confirming it moves nothing.
+    expect(h.resumes[1]!.threadId).toBe(bound);
+    h.confirm();
+    expect(h.storage.nativeBotChat("sage", Date.now()).sessionId).toBe(bound);
+    // The user moves to another chat: a reclaim of the Bot Chat now does nothing at all.
+    await h.surface.newSession("sage");
+    h.plane.sessionReclaimed("bot-chat-1");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(h.resumes).toHaveLength(2);
+    expect(h.storage.nativeBotChat("sage", Date.now()).sessionId).not.toBe(bound);
+    h.close();
+  });
+
+  it("deleting a conversation deletes its Tapbacks (review #7)", async () => {
+    const h = plane();
+    const old = h.storage.nativeBotChat("sage", 1).sessionId;
+    h.storage.appendNativeBotMessage({ bot: "sage", sessionId: old, messageId: `${old}#0`, role: "assistant", text: "x", at: 1 });
+    h.storage.setBotMessageReaction({ bot: "sage", messageId: `${old}#0`, author: "user", emoji: "❤️", now: 2 });
+    await h.surface.newSession("sage");
+    expect(h.storage.deleteNativeBotSession({ bot: "sage", sessionId: old, deletedAt: 3, enqueue: false }).outcome).toBe("deleted");
+    expect(h.storage.botMessageReactions("sage", `${old}#0`)).toEqual([]);
+    h.close();
+  });
+
   it("a new profile model clears every per-chat override of that bot", async () => {
     const h = plane();
     const chat = h.storage.nativeBotChat("sage", Date.now());
