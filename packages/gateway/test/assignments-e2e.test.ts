@@ -36,7 +36,7 @@ it("a leader assigns to a Hermes profile over attach-v1 and acknowledges the res
     await until(() => gateway!.storage.botRoster().bots.some((bot) => bot.name === "lead"));
     const health = (await (await fetch(`${url}/health`)).json()) as GatewayInfo;
     expect(health.capabilities?.["com.cozylabs.agent-inbox"]).toBe(1);
-    expect(health.capabilities?.["com.cozylabs.bots"]).toBe(88);
+    expect(health.capabilities?.["com.cozylabs.bots"]).toBe(89);
 
     const pair = await fetch(`${url}/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ setupCode: gateway.issueSetupCode(), deviceName: "phone" }) });
     const deviceToken = ((await pair.json()) as { deviceToken: string }).deviceToken;

@@ -494,6 +494,17 @@ describe("attach-v1 config lane", () => {
       }
     });
 
+    // Capability 88's `role` and `reports` are published patch keys but GATEWAY-OWNED: the route
+    // strips them before forwarding, and the lane refuses to carry them even if a caller did not.
+    it("never forwards the gateway-owned team fields to a peer", async () => {
+      const peer = await dial({
+        "profile.write": { name: "sage", outcome: "applied", ok: true, applied: { soul: true }, requested: ["soul"] },
+      }, ["bot_config", "mcp_server_declarations"]);
+      await config.configureProfile("sage", { soul: "# new", role: "leader", reports: ["scout"] });
+      expect(peer.requests.map((request) => request.input)).toEqual([{ soul: "# new" }]);
+      peer.ws.close();
+    });
+
     // The whole HTTP route over a real attached runtime peer: the ordinary PATCH a phone sends.
     describe("through PATCH /bots/:name/profile", () => {
       async function appFor() {

@@ -413,7 +413,12 @@ export class AttachChatConfigurationDriver implements ChatConfigurationDriver {
  *  mis-cased `DeclareMcpServers` that no gate ever looked at, and would slip past the capability-89
  *  `mcp_server_declarations` gate, which reads the published names. Rebuilt from the schema's own
  *  keys rather than closed at the boundary, so an older client sending an extra key still saves. */
-const PATCH_KEYS = Object.keys(BotProfilePatchSchema.properties) as (keyof BotProfilePatch)[];
+/** Capability 88's `role` and `reports` are published but GATEWAY-OWNED: the route checks and
+ *  stores them itself and strips them before forwarding, so no peer ever receives them. Excluded
+ *  here too, so a caller that forgot to strip them still cannot hand a peer the team. */
+const GATEWAY_OWNED: ReadonlySet<string> = new Set(["role", "reports"]);
+const PATCH_KEYS = (Object.keys(BotProfilePatchSchema.properties) as (keyof BotProfilePatch)[])
+  .filter((key) => !GATEWAY_OWNED.has(key));
 function publishedPatch(patch: BotProfilePatch): BotProfilePatch {
   const out: Record<string, unknown> = {};
   for (const key of PATCH_KEYS) {
