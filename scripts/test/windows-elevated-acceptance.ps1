@@ -5,8 +5,9 @@ Automates the live scenario that was validated by hand on a Windows host: a fres
 install with a local model provider while a stale ELEVATED Dashboard holds the Dashboard port
 with a mismatched session token, an unrelated listener sits on the next port, and the installer
 inherits a poisoned PSModulePath. It then checks authenticated Dashboard access, a healthy
-Gateway attach, preservation of both unrelated listeners, and that the poisoned module never ran
-elevated. It is not the 29-case native qualification matrix in
+Gateway attach, preservation of both unrelated listeners, that uninstall stops the Gateway's
+private Dashboard even after it was orphaned from its supervisor, and that the poisoned module
+never ran elevated. It is not the 29-case native qualification matrix in
 docs/windows-qualification-2026-09-04.md; it covers this one scenario and records evidence.
 
 It changes the machine. Run it only on a disposable Windows VM or test account with no
@@ -19,8 +20,14 @@ Phases, in order. Every phase after Setup takes the same -RunRoot:
   2. Install    NORMAL window. Runs the installer with the poisoned PSModulePath and the
                 unattended local-model settings.
   3. Verify     NORMAL window. Checks the installed result against the preserved listeners.
-  4. Uninstall  NORMAL window. Runs the uninstaller and checks what it must leave behind.
-  5. Cleanup    ELEVATED window. Stops only the processes Setup started (PID + creation time).
+  4. ElevateDashboard  ELEVATED window, optional. Replaces the Gateway's private Dashboard with
+                an elevated process running its exact command line: the scoped UAC leg.
+  5. Uninstall  NORMAL window. Kills the Gateway supervisor without /T so the private Dashboard is
+                orphaned, runs the uninstaller, and checks what it must stop and leave behind.
+                With step 4, uninstall shows ONE scoped UAC prompt for the Dashboard cleanup
+                helper; approve it. Without step 4 it must not prompt at all: the foreign stale
+                Dashboard on the preferred port is never inspected, only the private port is.
+  6. Cleanup    ELEVATED window. Stops only the processes Setup started (PID + creation time).
 
   # elevated
   .\scripts\test\windows-elevated-acceptance.ps1 -Phase Setup -RunRoot C:\cga\run1 -AcknowledgeDisposableHost `
@@ -28,24 +35,37 @@ Phases, in order. Every phase after Setup takes the same -RunRoot:
   # normal
   .\scripts\test\windows-elevated-acceptance.ps1 -Phase Install -RunRoot C:\cga\run1 -AcknowledgeDisposableHost
   .\scripts\test\windows-elevated-acceptance.ps1 -Phase Verify -RunRoot C:\cga\run1
+  # elevated, optional
+  .\scripts\test\windows-elevated-acceptance.ps1 -Phase ElevateDashboard -RunRoot C:\cga\run1 -AcknowledgeDisposableHost
+  # normal; approve the single UAC prompt if ElevateDashboard ran
   .\scripts\test\windows-elevated-acceptance.ps1 -Phase Uninstall -RunRoot C:\cga\run1 -AcknowledgeDisposableHost
   # elevated
   .\scripts\test\windows-elevated-acceptance.ps1 -Phase Cleanup -RunRoot C:\cga\run1 -AcknowledgeDisposableHost
 
-Keep -RunRoot short (MAX_PATH bit earlier native runs). By default the installer is this
-checkout's scripts\install.ps1 and downloads the latest published assets; -AssetBase points it at
-a local asset directory, and -InstallerPath at a downloaded published install.ps1.
+Keep -RunRoot short (MAX_PATH bit earlier native runs).
+
+Which code is under test: by default the installer is this checkout's scripts\install.ps1, but it
+downloads the LATEST PUBLISHED release assets, so a branch's agent-install.sh and supervisor are
+not what runs. To test a branch or PR, build its assets and pass them as -AssetBase to Setup:
+
+  git checkout <branch>; pnpm install --frozen-lockfile; pnpm build; pnpm bundle
+  # dist-bundle\ now holds cozygateway.mjs, cozygateway-installer.sh, gateway-supervisor.cjs,
+  # install.ps1, the attach plugin archive and a .sha256 beside each.
+  ... -Phase Setup ... -AssetBase C:\path\to\checkout\dist-bundle
+
+Setup records the checkout commit and the SHA-256 of the installer and each local asset, and every
+results-<phase>.json carries that record. -InstallerPath instead runs a downloaded install.ps1.
 
 -Phase SelfCheck runs anywhere pwsh does (including macOS/Linux) and exercises only the
 harness's own fixtures: the case table, the stale Dashboard stand-in's HTTP contract, and the
-poisoned module's shadowing. It installs nothing.
+poisoned module's shadowing. It installs nothing and refuses a run root that holds Setup state.
 
 Each phase writes <RunRoot>\results-<phase>.json and exits 1 if any case failed.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('SelfCheck', 'Setup', 'Install', 'Verify', 'Uninstall', 'Cleanup')]
+    [ValidateSet('SelfCheck', 'Setup', 'Install', 'Verify', 'ElevateDashboard', 'Uninstall', 'Cleanup')]
     [string] $Phase,
     [string] $RunRoot,
     [switch] $AcknowledgeDisposableHost,
@@ -77,18 +97,21 @@ $script:Cases = [ordered]@{
     'S06' = @('Setup', 'unrelated sentinel listener holds the next Dashboard port')
     'I01' = @('Install', 'installer runs from a non-elevated session')
     'I02' = @('Install', 'installer exits 0')
-    'I03' = @('Install', 'fresh install with a foreign Dashboard does not take the scoped UAC path')
+    'I03' = @('Install', 'install log shows no scoped UAC step for the foreign Dashboard (log grep only)')
     'V01' = @('Verify', 'stale elevated Dashboard preserved (same PID and creation time, still listening)')
     'V02' = @('Verify', 'stale Dashboard still rejects the installed session token')
     'V03' = @('Verify', 'unrelated sentinel listener preserved')
     'V04' = @('Verify', 'Gateway Hermes endpoint moved to a private loopback Dashboard port')
     'V05' = @('Verify', 'private Dashboard accepts the installed token on /api/config')
     'V06' = @('Verify', 'Gateway /ready answers 200 (Hermes attach healthy)')
-    'V07' = @('Verify', 'poisoned NetTCPIP module never loaded in an elevated process')
-    'U01' = @('Uninstall', 'uninstaller exits 0')
-    'U02' = @('Uninstall', 'stale Dashboard and sentinel preserved through uninstall')
-    'U03' = @('Uninstall', 'private Dashboard and Gateway ports released')
-    'U04' = @('Uninstall', 'poisoned NetTCPIP module never loaded in an elevated process')
+    'V07' = @('Verify', 'poisoned NetTCPIP module never loaded in an elevated process (SKIP unless one did: nothing is elevated during install)')
+    'E01' = @('ElevateDashboard', 'private Dashboard relaunched elevated with its exact command line answers the installed token')
+    'U01' = @('Uninstall', 'supervisor killed without /T leaves the private Dashboard orphaned and listening')
+    'U02' = @('Uninstall', 'uninstaller exits 0')
+    'U03' = @('Uninstall', 'uninstall stopped the private Dashboard itself (scoped UAC helper only when ElevateDashboard ran)')
+    'U04' = @('Uninstall', 'stale Dashboard and sentinel preserved through uninstall')
+    'U05' = @('Uninstall', 'orphaned private Dashboard and Gateway ports released')
+    'U06' = @('Uninstall', 'poisoned NetTCPIP module never loaded in an elevated process')
     'C01' = @('Cleanup', 'harness-started processes stopped after identity check')
 }
 $script:Results = [ordered]@{}
@@ -114,7 +137,10 @@ function Complete-Phase {
     }
     $rows = @($rows)
     if ($RunRoot) {
-        $report = [pscustomobject]@{ Phase = $Phase; Finished = (Get-Date).ToString('o'); Cases = $rows }
+        $assets = $null
+        $statePath = Join-Path $RunRoot 'state.json'
+        if ($Phase -ne 'SelfCheck' -and (Test-Path -LiteralPath $statePath)) { $assets = ([IO.File]::ReadAllText($statePath) | ConvertFrom-Json).Assets }
+        $report = [pscustomobject]@{ Phase = $Phase; Finished = (Get-Date).ToString('o'); Assets = $assets; Cases = $rows }
         [IO.File]::WriteAllText((Join-Path $RunRoot "results-$($Phase.ToLowerInvariant()).json"), ($report | ConvertTo-Json -Depth 5))
     }
     $failed = @($rows | Where-Object { $_.Status -ne 'PASS' -and $_.Status -ne 'SKIP' })
@@ -344,6 +370,47 @@ function Read-InstalledEndpoint {
     return [pscustomobject]@{ Urls = $urls; Port = $port; Token = $token }
 }
 
+function Get-FileSha256 {
+    param([string] $Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+# What this run actually tested: the checkout commit, the installer, and each local asset. Without
+# -AssetBase the installer downloads the latest published release; install.log names it.
+function Get-AssetRecord {
+    param([string] $Installer, [string] $Base)
+    $commit = $null
+    try { $commit = [string](& git -C $PSScriptRoot rev-parse HEAD 2>$null) } catch { }
+    $local = [ordered]@{}
+    if ($Base -and (Test-Path -LiteralPath $Base -PathType Container)) {
+        foreach ($name in 'cozygateway.mjs', 'cozygateway-installer.sh', 'gateway-supervisor.cjs', 'install.ps1', 'cozygateway-hermes-attach-plugin.tar.gz') {
+            $local[$name] = Get-FileSha256 (Join-Path $Base $name)
+        }
+    }
+    return [ordered]@{
+        HarnessCommit = $commit
+        Installer = $Installer
+        InstallerSha256 = Get-FileSha256 $Installer
+        AssetSource = $(if ($Base) { $Base } else { 'latest published release (see install.log)' })
+        LocalAssetSha256 = $local
+    }
+}
+
+function Get-CimProcess {
+    param([int] $ProcessId)
+    return Get-CimInstance Win32_Process -Filter ("ProcessId=" + $ProcessId) -ErrorAction SilentlyContinue
+}
+
+# The Gateway supervisor for this install: node running gateway-supervisor.cjs from its home.
+function Get-SupervisorProcesses {
+    param($State)
+    return @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue | Where-Object {
+        $command = [string]$_.CommandLine
+        $command -like '*gateway-supervisor.cjs*' -and $command.IndexOf([string]$State.GatewayHome, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    })
+}
+
 function Assert-HostPhase {
     param([bool] $RequireElevated, [bool] $RequireNormal)
     if (-not (Test-IsWindowsHost)) { throw "-Phase $Phase needs a Windows host; use -Phase SelfCheck elsewhere" }
@@ -358,7 +425,8 @@ switch ($Phase) {
         $ownsRunRoot = -not $RunRoot
         if ($ownsRunRoot) { $RunRoot = Join-Path ([IO.Path]::GetTempPath()) ('cozygateway-acceptance-selfcheck-' + [guid]::NewGuid().ToString('N')) }
         New-Item -ItemType Directory -Force -Path $RunRoot | Out-Null
-        $phases = @('SelfCheck', 'Setup', 'Install', 'Verify', 'Uninstall', 'Cleanup')
+        if (Test-Path -LiteralPath (Join-Path $RunRoot 'state.json')) { throw "$RunRoot holds Setup state; run SelfCheck without -RunRoot or with a separate one" }
+        $phases = @('SelfCheck', 'Setup', 'Install', 'Verify', 'ElevateDashboard', 'Uninstall', 'Cleanup')
         $unknown = @($script:Cases.Keys | Where-Object { $phases -notcontains $script:Cases[$_][0] })
         $null = Assert-Case 'K01' ($unknown.Count -eq 0 -and @($script:Cases.Keys | Select-Object -Unique).Count -eq $script:Cases.Count) "$($script:Cases.Count) cases"
 
@@ -377,8 +445,8 @@ switch ($Phase) {
             if (-not $stale.HasExited) { $stale.Kill() }
         }
 
-        $marker = Join-Path $RunRoot 'poison-loads.txt'
-        $poisonRoot = Join-Path $RunRoot 'poison-modules'
+        $marker = Join-Path $RunRoot 'selfcheck-poison-loads.txt'
+        $poisonRoot = Join-Path $RunRoot 'selfcheck-poison-modules'
         New-PoisonModuleRoot $poisonRoot $marker
         $probe = 'try { $null = Get-NetTCPConnection -State Listen } catch { }; (Get-Command Get-NetTCPConnection).Module.Path'
         $savedModulePath = $env:PSModulePath
@@ -417,7 +485,9 @@ switch ($Phase) {
             PoisonMarker = Join-Path $RunRoot 'poison-loads.txt'
             Stale = $null
             Sentinel = $null
+            ElevatedDashboard = $null
         }
+        $state.Assets = Get-AssetRecord $state.InstallerPath $AssetBase
 
         $ps51 = Get-WindowsPowerShellPath
         if (-not (Assert-Case 'S01' (Test-Path -LiteralPath $ps51) "Windows PowerShell at $ps51")) { Complete-Phase }
@@ -482,8 +552,58 @@ switch ($Phase) {
         $health = Invoke-LoopbackGet ([int]$state.GatewayPort) '/health'
         [IO.File]::WriteAllText((Join-Path $RunRoot 'gateway-health.txt'), "ready $($ready.Status)`n$($ready.Body)`nhealth $($health.Status)`n$($health.Body)`n")
         $null = Assert-Case 'V06' ($ready.Status -eq 200) "ready $($ready.Status); bodies in gateway-health.txt"
+        # A fresh install elevates nothing, so a clean marker proves little here; U06 is the check
+        # that matters, after the scoped UAC helper has run with the poisoned environment.
         $loads = @(Get-PoisonLoads $state.PoisonMarker)
-        $null = Assert-Case 'V07' (@($loads | Where-Object { $_ -match '^elevated=True' }).Count -eq 0) "$($loads.Count) non-elevated load(s) recorded"
+        $elevatedLoads = @($loads | Where-Object { $_ -match '^elevated=True' })
+        if ($elevatedLoads.Count) { Set-CaseResult 'V07' FAIL ($elevatedLoads -join '; ') }
+        else { Set-CaseResult 'V07' SKIP "no elevated step runs during install; $($loads.Count) non-elevated load(s) recorded; see U06" }
+        Complete-Phase
+    }
+
+    'ElevateDashboard' {
+        Assert-HostPhase -RequireElevated $true -RequireNormal $false
+        $state = Read-State
+        $installed = Read-InstalledEndpoint $state
+        # Walk from the listener up to the direct child of the supervisor: that is the Dashboard
+        # process tree the supervisor spawned (hermes.exe may front a python.exe listener).
+        $process = $(if ($null -ne $installed.Port) { Get-CimProcess ([int](Get-ListenerOwner ([int]$installed.Port))) } else { $null })
+        for ($depth = 0; $depth -lt 4 -and $null -ne $process; $depth++) {
+            $parent = Get-CimProcess ([int]$process.ParentProcessId)
+            if ($null -eq $parent -or ([string]$parent.CommandLine) -like '*gateway-supervisor.cjs*') { break }
+            $process = $parent
+        }
+        if ($null -eq $process -or [string]::IsNullOrWhiteSpace([string]$process.CommandLine)) {
+            Set-CaseResult 'E01' FAIL "no private Dashboard process found on port $($installed.Port)"
+            Complete-Phase
+        }
+        $executable = [string]$process.ExecutablePath
+        $command = [string]$process.CommandLine
+        $arguments = [regex]::Replace($command, '^\s*("[^"]*"|\S+)\s*', '')
+        $hermesRoot = [string](Get-Content -LiteralPath (Join-Path $state.GatewayHome 'local\install-state') | Where-Object { $_ -like 'hermes_root=*' } | Select-Object -Last 1)
+        $hermesRoot = $hermesRoot.Substring('hermes_root='.Length)
+        if ($hermesRoot -match '^/([A-Za-z])/(.*)$') { $hermesRoot = $Matches[1].ToUpperInvariant() + ':\' + $Matches[2].Replace('/', '\') }
+        & (Join-Path ([Environment]::SystemDirectory) 'taskkill.exe') /PID ([string]$process.ProcessId) /T /F | Out-Null
+        for ($attempt = 0; $attempt -lt 50 -and $null -ne (Get-ListenerOwner ([int]$installed.Port)); $attempt++) { Start-Sleep -Milliseconds 200 }
+        # Same executable, arguments, HERMES_HOME and session token as the supervisor used, but
+        # started from this elevated window: the owner helper can no longer read its metadata.
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = $executable
+        $info.Arguments = $arguments
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.EnvironmentVariables['HERMES_HOME'] = $hermesRoot
+        $info.EnvironmentVariables['HERMES_DASHBOARD_SESSION_TOKEN'] = [string]$installed.Token
+        $elevated = [Diagnostics.Process]::Start($info)
+        $config = [pscustomobject]@{ Status = 0 }
+        for ($attempt = 0; $attempt -lt 90 -and $config.Status -ne 200; $attempt++) {
+            Start-Sleep -Seconds 1
+            $config = Invoke-LoopbackGet ([int]$installed.Port) '/api/config' @{ 'X-Hermes-Session-Token' = [string]$installed.Token }
+        }
+        $record = [pscustomobject]@{ Pid = $elevated.Id; Port = $installed.Port; Created = (Get-ProcessCreation $elevated.Id); CommandLine = $command }
+        $state | Add-Member -NotePropertyName ElevatedDashboard -NotePropertyValue $record -Force
+        Write-State $state
+        $null = Assert-Case 'E01' ($config.Status -eq 200) "pid $($elevated.Id) on $($installed.Port); /api/config $($config.Status)"
         Complete-Phase
     }
 
@@ -491,13 +611,32 @@ switch ($Phase) {
         Assert-HostPhase -RequireElevated $false -RequireNormal $true
         $state = Read-State
         $installed = Read-InstalledEndpoint $state
+        # Orphan the private Dashboard: kill only the supervisor node, no /T. The Gateway's own
+        # tree stop at uninstall then cannot reach the Dashboard, so only the Dashboard owner
+        # check on its private port can stop it.
+        $dashboardOwner = $(if ($null -ne $installed.Port) { Get-ListenerOwner ([int]$installed.Port) } else { $null })
+        $supervisors = @(Get-SupervisorProcesses $state)
+        foreach ($supervisor in $supervisors) {
+            & (Join-Path ([Environment]::SystemDirectory) 'taskkill.exe') /PID ([string]$supervisor.ProcessId) /F | Out-Null
+        }
+        Start-Sleep -Seconds 2
+        $stillOwner = $(if ($null -ne $installed.Port) { Get-ListenerOwner ([int]$installed.Port) } else { $null })
+        $null = Assert-Case 'U01' ($supervisors.Count -ge 1 -and $null -ne $dashboardOwner -and $stillOwner -eq $dashboardOwner) "killed supervisor(s) $(@($supervisors | ForEach-Object { $_.ProcessId }) -join ', '); Dashboard owner $dashboardOwner then $stillOwner on $($installed.Port)"
+
         $result = Invoke-Installer @('--uninstall') 'uninstall.log'
-        $null = Assert-Case 'U01' ($result.ExitCode -eq 0) "exit $($result.ExitCode); log uninstall.log"
-        $null = Assert-Case 'U02' ((Test-TrackedProcess $state.Stale) -and (Test-TrackedProcess $state.Sentinel)) "stale pid $($state.Stale.Pid), sentinel pid $($state.Sentinel.Pid)"
+        $null = Assert-Case 'U02' ($result.ExitCode -eq 0) "exit $($result.ExitCode); log uninstall.log"
+        if ($null -ne $state.PSObject.Properties['ElevatedDashboard'] -and $null -ne $state.ElevatedDashboard) {
+            $stopped = $result.Log -match 'scoped UAC cleanup helper' -and $result.Log -match 'stopped the verified elevated Hermes Dashboard'
+            $null = Assert-Case 'U03' $stopped 'expected one scoped UAC cleanup helper that stopped the elevated Dashboard'
+        } else {
+            $stopped = $result.Log -match 'stopped the verified Hermes Dashboard started for CozyGateway' -and -not ($result.Log -match 'scoped UAC')
+            $null = Assert-Case 'U03' $stopped 'expected the owner helper to stop the Dashboard with no UAC step'
+        }
+        $null = Assert-Case 'U04' ((Test-TrackedProcess $state.Stale) -and (Test-TrackedProcess $state.Sentinel)) "stale pid $($state.Stale.Pid), sentinel pid $($state.Sentinel.Pid)"
         $held = @(@($installed.Port, [int]$state.GatewayPort) | Where-Object { $null -ne $_ -and $null -ne (Get-ListenerOwner $_) })
-        $null = Assert-Case 'U03' ($held.Count -eq 0) "still listening: $($held -join ', ')"
+        $null = Assert-Case 'U05' ($held.Count -eq 0) "still listening: $($held -join ', ')"
         $loads = @(Get-PoisonLoads $state.PoisonMarker)
-        $null = Assert-Case 'U04' (@($loads | Where-Object { $_ -match '^elevated=True' }).Count -eq 0) "$($loads.Count) non-elevated load(s) recorded"
+        $null = Assert-Case 'U06' (@($loads | Where-Object { $_ -match '^elevated=True' }).Count -eq 0) "$($loads.Count) non-elevated load(s) recorded"
         Complete-Phase
     }
 
