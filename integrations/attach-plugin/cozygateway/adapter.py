@@ -950,6 +950,9 @@ class AttachAdapter:
         # SETTLE time. Upstream ``handle_message`` only spawns the run, so baselining right after
         # it returned saw none of the turn's rows and the mirror echoed them back.
         self._mirror_settles: Dict[str, Tuple[str, Any]] = {}
+        # thread -> the running settle baseline, which the NEXT turn awaits before its own flush:
+        # otherwise that flush mirrors the previous turn's rows before they are baselined.
+        self._settle_tasks: Dict[str, "asyncio.Task[Any]"] = {}
         self._desktop_mirror_interval = _env_float(
             "COZYGATEWAY_DESKTOP_SESSION_SYNC_INTERVAL_SECONDS", 1.0,
         )
@@ -2190,6 +2193,10 @@ class AttachAdapter:
         # any mobile write starts; text/time dedupe would lose legitimate repeated turns. Hermes
         # 0.20.5's cross-process ``session_turn_leases`` serializes this session lineage, so this
         # high-water baseline is safe for handoff (but is intentionally not a concurrent merge).
+        settling = self._settle_tasks.get(turn.thread_id)
+        if settling is not None:
+            # The previous phone turn's baseline must land first (it is bounded by its idle wait).
+            await asyncio.shield(settling)
         await self._flush_desktop_session_before_injection(turn.thread_id)
         media_urls: List[str] = []
         media_types: List[str] = []
@@ -2258,7 +2265,13 @@ class AttachAdapter:
         except RuntimeError:
             self._desktop_mirror_injections.discard(chat_id)
             return
-        self._spawn_background(loop, self._settle_mirror_after_idle(chat_id, pending[1]))
+        task = loop.create_task(self._settle_mirror_after_idle(chat_id, pending[1]))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        self._settle_tasks[chat_id] = task
+        task.add_done_callback(
+            lambda done, chat=chat_id: self._settle_tasks.pop(chat, None)
+            if self._settle_tasks.get(chat) is done else None)
 
     async def _settle_mirror_after_idle(self, chat_id: str, source: Any) -> None:
         """Baseline once the runner has finished writing the turn's rows, then release the guard."""

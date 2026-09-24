@@ -398,6 +398,45 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event["message_row_id"] for event in client.mirrored], [43, 44])
         self.assertEqual({event["source"] for event in client.mirrored}, {"desktop"})
 
+    async def test_a_quick_next_turn_waits_for_the_previous_turns_baseline(self):
+        # Live, the next phone turn arrived 0.2 s after the previous reply, while that turn's
+        # settle was still waiting for the runner to go idle: its pre-injection flush mirrored the
+        # previous turn's rows back as desktop rows.
+        adapter, runner, store, client = self._adapter(
+            rows=("bot-chat",), source="desktop", title="Bot Chat", messages=[],
+        )
+        client.desktop_session_sync_available = True
+        spool = self._spool()
+        self.addCleanup(spool.close)
+        adapter._spool = spool
+        client.spool = spool
+        await adapter._handle_desktop_resume_command({
+            "threadId": "native:sage:1", "hermesSessionId": "bot-chat", "resumeId": "r1",
+        })
+        idle = asyncio.Event()
+        running = {"flag": True}
+        runner._is_session_running = lambda _key: running["flag"]
+
+        async def handle_message(event):
+            adapter.injected.append(event)
+
+        adapter.handle_message = handle_message
+        await adapter._handle_turn(TurnFrame(thread_id="native:sage:1", turn_id="turn-1", text="hello"))
+        adapter._cleanup_turn("native:sage:1", "turn-1")  # final commit sent, rows still being written
+        store.session_db.messages.extend([
+            {"id": 1, "role": "user", "content": "hello", "timestamp": 1},
+            {"id": 2, "role": "assistant", "content": "hi there", "timestamp": 2},
+        ])
+
+        async def go_idle():
+            await asyncio.sleep(0.3)
+            running["flag"] = False
+        asyncio.ensure_future(go_idle())
+        await adapter._handle_turn(TurnFrame(thread_id="native:sage:1", turn_id="turn-2", text="again"))
+
+        self.assertEqual(client.mirrored, [])
+        self.assertEqual(spool.desktop_session_links()[0]["lastMessageRowId"], 2)
+
     async def test_a_restamped_session_that_is_not_the_bot_chat_stays_unmirrored(self):
         adapter, _runner, store, client = self._adapter(
             rows=("desktop-raw",), source="cozygateway", title="Scratch",
