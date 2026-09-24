@@ -30,6 +30,7 @@ import { BackendUnavailable } from "../errors.ts";
 import { HermesRpcError, type HermesClient } from "./client.ts";
 import { BotNameTaken, BotNotFound } from "./crud.ts";
 import { UI_META_KEY } from "./roster.ts";
+import { writePresentation } from "./presentation.ts";
 
 /** A request Hermes refused as malformed (HTTP 400 that is not a name collision). */
 export class ProfileOpInvalid extends Error {
@@ -117,11 +118,10 @@ async function readHermesBotsMeta(client: HermesClient, name: string): Promise<H
   };
 }
 
-/** Merges into this bot's `ui_meta["hermes-bots"]` and nothing else. Decision 1 of the bot parity
- *  spec: a revision conflict re-reads and re-applies ONCE, and never overwrites another key.
- *
- *  This is the minimal writer S3 needs for the title and a duplicate's look. Slice S1 builds the
- *  general presentation writer (row 80); on rebase this becomes a call into that one. */
+/** Merges into this bot's `ui_meta["hermes-bots"]` and nothing else; a revision conflict re-reads
+ *  and re-applies once. Used only to copy a duplicate's WHOLE look onto the new profile, which can
+ *  carry keys a newer desktop wrote that row 80's patch does not name (upstream `duplicateBot`
+ *  copies everything but `chat` and `created`). Every named key goes through `writePresentation`. */
 export async function mergeHermesBotsMeta(
   client: HermesClient,
   name: string,
@@ -147,13 +147,12 @@ export async function mergeHermesBotsMeta(
 
 export async function setBotIdentity(client: HermesClient, name: string, patch: BotIdentityPatch): Promise<BotIdentity> {
   if (patch.title !== undefined) {
+    // Row 80's presentation writer: the same per-key compare-and-swap the roster's pins use, so
+    // the title and a pin written at once from two devices never lose each other. An empty title
+    // is written as `null`, which is how the desktop clears it.
     const title = patch.title.trim();
-    await mergeHermesBotsMeta(client, name, (meta) => {
-      const next = { ...meta };
-      if (title.length === 0) delete next["title"];
-      else next["title"] = title;
-      return next;
-    });
+    const written = await writePresentation(client, name, { title: title.length === 0 ? null : title });
+    if (written === undefined) throw new BotNotFound(name);
   }
   if (patch.description !== undefined) {
     const result = record(await client.request("profiles.configure", {

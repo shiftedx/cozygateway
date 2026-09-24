@@ -27,6 +27,13 @@ import type {
   BotPendingApproval,
   BotProfile,
   BotProfilePatch,
+  BotPresentationPatch,
+  BotPresentationResponse,
+  BotAvatarGenerateRequest,
+  BotAvatarGenerateResponse,
+  BotAvatarPetGallery,
+  BotAvatarPetThumbResponse,
+  BotAvatarSetResponse,
   BotReadiness,
   BotRuntimeProjection,
   BotRuntimeRecoveryResponse,
@@ -73,6 +80,8 @@ import type {
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
 import { GroupRooms, type RoomInteractionExpiry } from "./group-rooms.ts";
+import { readPresentation, writePresentation } from "./presentation.ts";
+import { AvatarFingerprints, clearAvatar, generatePortrait, petGallery, petThumb, readAvatar, writeAvatar } from "./avatar.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
 import type { ProfileChangeEvent } from "./profile-provisioner.ts";
 import type { ObservationRing } from "../observe/ring.ts";
@@ -279,6 +288,15 @@ export interface BotControlSurface {
     name: string,
     patch: BotProfilePatch,
   ): Promise<ProfileConfigureResult>;
+  /** Capability 80. Optional so a surface with no Hermes profile behind it simply lacks the route. */
+  botPresentation?(name: string): Promise<BotPresentationResponse>;
+  configurePresentation?(name: string, patch: BotPresentationPatch): Promise<BotPresentationResponse>;
+  /** Capability 81. Optional for the same reason: only a Hermes profile has an avatar asset. */
+  botAvatar?(name: string): Promise<{ mime: string; bytes: Buffer } | undefined>;
+  setBotAvatar?(name: string, data: string | null): Promise<BotAvatarSetResponse>;
+  generateBotAvatar?(name: string, request: BotAvatarGenerateRequest): Promise<BotAvatarGenerateResponse>;
+  botAvatarPets?(name: string, localOnly: boolean): Promise<BotAvatarPetGallery>;
+  botAvatarPetThumb?(name: string, slug: string, url: string): Promise<BotAvatarPetThumbResponse>;
   modelConfig(name: string): Promise<BotModelConfig>;
   configureModel(
     name: string,
@@ -511,6 +529,9 @@ export interface HermesBridgeOptions {
 /** Dashboard control/read plane. All Bot Mode conversation traffic is attach-v1. */
 export class HermesBridge implements BotControlSurface {
   readonly #client: HermesClient;
+  readonly #avatarFingerprints = new AvatarFingerprints();
+  #rosterGeneration = 0;
+  #petGallery: { at: number; pets: Map<string, string> } | undefined;
   readonly #storage: Storage;
   readonly #broadcast: (frame: ServerFrame) => void;
   readonly #now: () => number;
@@ -1050,20 +1071,31 @@ export class HermesBridge implements BotControlSurface {
     const run = (async () => {
       try {
         const at = this.#now();
-        const { profiles } = parseProfilesList(
+        const { profiles: listed } = parseProfilesList(
           await this.#client.request("profiles.list", {}),
         );
-        const bots = buildRoster(profiles.filter((profile) => !this.#storage.isBotDeleted(profile.name)), {
-          hidden: this.#hidden,
-          routedProfile: null,
-          gatewayState: "idle",
-          now: at,
-        });
-        this.#storage.replaceBotRoster(
-          bots.map((summary) => ({ name: summary.name, summary })),
-          at,
-        );
-        this.#publish(bots, at);
+        const profiles = listed.filter((profile) => !this.#storage.isBotDeleted(profile.name));
+        const publish = () => {
+          const bots = buildRoster(profiles, {
+            hidden: this.#hidden,
+            routedProfile: null,
+            gatewayState: "idle",
+            now: at,
+          });
+          this.#storage.replaceBotRoster(
+            bots.map((summary) => ({ name: summary.name, summary })),
+            at,
+          );
+          this.#publish(bots, at);
+        };
+        // Publish with the fingerprints already known, then read what is due in the background
+        // and republish only if a picture changed, and only if no newer refresh has run since.
+        this.#avatarFingerprints.applyCached(profiles);
+        publish();
+        const generation = ++this.#rosterGeneration;
+        void this.#avatarFingerprints.refresh(this.#client, profiles, at).then((changed) => {
+          if (changed && generation === this.#rosterGeneration && !this.#closed) publish();
+        }, () => {});
       } catch (error) {
         this.#log(
           `roster refresh failed (${reason}): ${error instanceof Error ? error.message : "unknown failure"}`,
@@ -1215,6 +1247,60 @@ export class HermesBridge implements BotControlSurface {
     return this.#chain(name, () =>
       configureBotProfile(this.#client, name, patch),
     );
+  }
+  async botPresentation(name: string): Promise<BotPresentationResponse> {
+    const read = await readPresentation(this.#client, name);
+    if (read === undefined) throw new BotNotFound(name);
+    return { name, presentation: read.presentation, revision: read.revision ?? 0 };
+  }
+  async configurePresentation(name: string, patch: BotPresentationPatch): Promise<BotPresentationResponse> {
+    // Chained per profile with every other write to it, so this gateway never races itself; the
+    // CAS inside `writePresentation` is for the OTHER clients (a desktop, another gateway).
+    const written = await this.#chain(name, () => writePresentation(this.#client, name, patch));
+    if (written === undefined) throw new BotNotFound(name);
+    // `bot_roster` carries the blob as `meta`, so every paired phone sees the write on this refresh.
+    this.refreshSoon(`bot ${name} presentation`);
+    return { name, presentation: written.presentation, revision: written.revision ?? 0 };
+  }
+  async botAvatar(name: string): Promise<{ mime: string; bytes: Buffer } | undefined> {
+    // Every row image is a GET; the cached roster answers "is this a bot" without a profiles.list.
+    if (!this.#storage.botRoster().bots.some((bot) => bot.name === name)) await this.#assertBotKnown(name);
+    return readAvatar(this.#client, name);
+  }
+  async setBotAvatar(name: string, data: string | null): Promise<BotAvatarSetResponse> {
+    await this.#assertBotKnown(name);
+    const size = await this.#chain(name, async () => {
+      if (data === null) {
+        await clearAvatar(this.#client, name);
+        return 0;
+      }
+      return writeAvatar(this.#client, name, data);
+    });
+    // `has_avatar` rides `profiles.list`, so the roster learns of it on this refresh, and the
+    // fingerprint is re-read so the image URL moves with the picture.
+    this.#avatarFingerprints.forget(name);
+    this.refreshSoon(`bot ${name} avatar`);
+    return { name, hasAvatar: data !== null, size };
+  }
+  // Image generation and the pet gallery are host-wide in Hermes; the bot name only routes the call
+  // (federation) and scopes the device's permission. No per-call `profiles.list` for them.
+  async generateBotAvatar(_name: string, request: BotAvatarGenerateRequest): Promise<BotAvatarGenerateResponse> {
+    return generatePortrait(this.#client, request);
+  }
+  async botAvatarPets(_name: string, localOnly: boolean): Promise<BotAvatarPetGallery> {
+    return { pets: await petGallery(this.#client, localOnly) };
+  }
+  /** The spritesheet URL is resolved HERE, from Hermes's own gallery, never taken from the client:
+   *  Hermes caches a thumbnail by slug, so a client naming another sheet could poison that slug's
+   *  thumbnail for every desktop. The gallery is cached for five minutes. */
+  async botAvatarPetThumb(_name: string, slug: string, _clientUrl: string): Promise<BotAvatarPetThumbResponse> {
+    const now = this.#now();
+    if (this.#petGallery === undefined || now - this.#petGallery.at > 300_000) {
+      const pets = await petGallery(this.#client, false);
+      this.#petGallery = { at: now, pets: new Map(pets.map((pet) => [pet.slug, pet.spritesheetUrl])) };
+    }
+    const image = await petThumb(this.#client, slug, this.#petGallery.pets.get(slug) ?? "");
+    return image === undefined ? { ok: false } : { ok: true, image };
   }
   async modelConfig(name: string): Promise<BotModelConfig> {
     await this.#assertBotKnown(name);

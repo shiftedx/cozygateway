@@ -177,11 +177,12 @@ describe("capability 82: identity", () => {
     expect(description?.params).toEqual({ name: "scout", description: "watches deploys" });
   });
 
-  it("an empty title removes the field rather than storing a blank", async () => {
+  it("an empty title clears the field rather than storing a blank", async () => {
     const h = await setup();
     expect((await h.authed("/bots/scout/identity", json("PATCH", { title: "" }))).status).toBe(200);
     const write = h.server.callsOf("profiles.configure").find((call) => call.params["ui_meta"] !== undefined);
-    expect(write?.params["ui_meta"]).toEqual({ "hermes-bots": { color: "honey" } });
+    // Cleared the way the desktop clears it, through row 80's writer.
+    expect(write?.params["ui_meta"]).toEqual({ "hermes-bots": { title: null, color: "honey" } });
   });
 
   it("refuses an empty patch", async () => {
