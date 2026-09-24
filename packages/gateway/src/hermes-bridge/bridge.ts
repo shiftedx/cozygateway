@@ -30,6 +30,8 @@ import type {
   BotProfilePatch,
   BotPresentationPatch,
   BotPresentationResponse,
+  BotCanonicalChatResponse,
+  BotChatReactionResponse,
   BotAvatarGenerateRequest,
   BotAvatarGenerateResponse,
   BotAvatarPetGallery,
@@ -84,6 +86,7 @@ import type {
 } from "./approvals.ts";
 import { GroupRooms, type RoomInteractionExpiry } from "./group-rooms.ts";
 import { readPresentation, writePresentation } from "./presentation.ts";
+import { createCanonicalBotChat, ensureBotModeMarker, findCanonicalBotChat } from "./bot-chat.ts";
 import { AvatarFingerprints, clearAvatar, generatePortrait, petGallery, petThumb, readAvatar, writeAvatar } from "./avatar.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
 import type { ProfileChangeEvent } from "./profile-provisioner.ts";
@@ -306,6 +309,12 @@ export interface BotControlSurface {
   /** Capability 80. Optional so a surface with no Hermes profile behind it simply lacks the route. */
   botPresentation?(name: string): Promise<BotPresentationResponse>;
   configurePresentation?(name: string, patch: BotPresentationPatch): Promise<BotPresentationResponse>;
+  /** Capability 86, control-plane half. The profile's canonical `Bot Chat` registry row (fail
+   *  closed), minted when `create` and absent, with the Bot-Mode marker ensured. Optional so a
+   *  surface with no Hermes profile behind it simply lacks the route. */
+  canonicalBotChat?(name: string, create: boolean): Promise<{ hermesSessionId: string; created: boolean } | null>;
+  /** Capability 86. Archive (and hide) one Hermes session, which retires a Bot Chat. */
+  archiveHermesSession?(name: string, hermesSessionId: string): Promise<void>;
   /** Capability 81. Optional for the same reason: only a Hermes profile has an avatar asset. */
   botAvatar?(name: string): Promise<{ mime: string; bytes: Buffer } | undefined>;
   setBotAvatar?(name: string, data: string | null): Promise<BotAvatarSetResponse>;
@@ -398,6 +407,10 @@ export interface BotsSurface extends BotControlSurface {
     limit: number;
   }): { items: BotAttachmentHistoryItem[]; nextOffset: number | null };
   canonicalChat(name: string): Promise<CanonicalChatResult>;
+  /** Capability 86: resolve or mint the Hermes `Bot Chat` and bind the current chat to it. */
+  openBotChat?(name: string): Promise<BotCanonicalChatResponse>;
+  /** Capability 86: this user's Tapback on one message (null clears). */
+  reactToChatMessage?(name: string, messageId: string, emoji: string | null): Promise<BotChatReactionResponse>;
   newSession(name: string): Promise<BotNewSessionResult>;
   resetChat(name: string): Promise<ChatResetResult>;
   sessions(name: string, limit: number): Promise<BotSessionsView>;
@@ -1298,6 +1311,34 @@ export class HermesBridge implements BotControlSurface {
     const read = await readPresentation(this.#client, name);
     if (read === undefined) throw new BotNotFound(name);
     return { name, presentation: read.presentation, revision: read.revision ?? 0 };
+  }
+  async canonicalBotChat(name: string, create: boolean): Promise<{ hermesSessionId: string; created: boolean } | null> {
+    await this.#assertBotKnown(name);
+    const found = await findCanonicalBotChat(this.#client, name);
+    if (found === null && !create) return null;
+    // Serialized with every other write to this profile, so two taps cannot mint two chats here.
+    const result = found !== null
+      ? { hermesSessionId: found.hermesSessionId, created: false }
+      : await this.#chain(name, async () => {
+          const again = await findCanonicalBotChat(this.#client, name);
+          if (again !== null) return { hermesSessionId: again.hermesSessionId, created: false };
+          return { hermesSessionId: (await createCanonicalBotChat(this.#client, name)).hermesSessionId, created: true };
+        });
+    try {
+      if (await this.#chain(name, () => ensureBotModeMarker(this.#client, name)))
+        this.refreshSoon(`bot ${name} bot-mode marker`);
+    } catch {
+      // The marker switches on bot-to-bot messaging; its absence never blocks the chat itself.
+    }
+    return result;
+  }
+  async archiveHermesSession(name: string, hermesSessionId: string): Promise<void> {
+    await this.#assertBotKnown(name);
+    // Archived AND hidden: Hermes retires a Bot Chat (hands its title to the next one) only then.
+    await this.#client.dashboardJson(`/api/sessions/${encodeURIComponent(hermesSessionId)}`, {
+      method: "PATCH",
+      body: { archived: true, hidden: true, profile: name },
+    });
   }
   async configurePresentation(name: string, patch: BotPresentationPatch): Promise<BotPresentationResponse> {
     // Chained per profile with every other write to it, so this gateway never races itself; the
