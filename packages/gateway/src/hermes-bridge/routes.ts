@@ -21,6 +21,7 @@ import {
   BotModelProviderOAuthCodeSchema,
   BotProfilePatchSchema,
   BotPresentationPatchSchema,
+  BotChatReactionRequestSchema,
   IntegrationCreateRequestSchema,
   IntegrationCatalogInstallRequestSchema,
   IntegrationEnabledRequestSchema,
@@ -1837,6 +1838,52 @@ export function registerBotRoutes(
   // user writes in it (capability 11).
   //
   // No request body at all. There is nothing to parameterize: a reset is a reset.
+  // Capability 86 (bot parity S2): the canonical Hermes `Bot Chat`. Registered only on a surface
+  // that can bind one, so a gateway with no Hermes profile behind it answers 404.
+  if (chat.openBotChat !== undefined) {
+    const openBotChat = chat.openBotChat.bind(chat);
+    app.post("/bots/:name/bot-chat", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        return c.json(await openBotChat(resolved.name));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+  }
+
+  // Capability 86: this user's Tapback on one message. `{ emoji: null }` clears it; the same emoji
+  // again retracts it. Answers the full list and broadcasts `bot_chat_reaction`.
+  if (chat.reactToChatMessage !== undefined) {
+    const react = chat.reactToChatMessage.bind(chat);
+    app.put("/bots/:name/chat/messages/:messageId/reaction", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      const messageId = c.req.param("messageId") ?? "";
+      if (messageId.length === 0 || messageId.length > 256)
+        return c.json(errorBody("invalid_request", "message id is required"), 400);
+      let body: unknown;
+      try {
+        body = await c.req.json();
+      } catch {
+        body = undefined;
+      }
+      let parsed;
+      try {
+        parsed = assertValid(BotChatReactionRequestSchema, body);
+      } catch (err) {
+        const detail = err instanceof ContractViolation ? err.message : "malformed body";
+        return c.json(errorBody("invalid_request", detail), 400);
+      }
+      try {
+        return c.json(await react(resolved.name, messageId, parsed.emoji));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+  }
+
   app.post("/bots/:name/chat/reset", requireDevice, async (c) => {
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;

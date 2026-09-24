@@ -362,6 +362,16 @@ export const BotChatAttachmentSchema = Type.Composite([
 ]);
 export type BotChatAttachment = Static<typeof BotChatAttachmentSchema>;
 
+/** Capability 86. One persisted Tapback, the shape Hermes's `message.react` answers
+ *  (`tui_gateway/contracts/common.py` `MessageReaction`): at most one per author, the same emoji
+ *  again retracts it, and `null` clears. `at` is SECONDS, as Hermes stamps it. */
+export const BotMessageReactionSchema = Type.Object({
+  emoji: Type.String({ minLength: 1, maxLength: 32 }),
+  author: Type.Union([Type.Literal("user"), Type.Literal("agent")]),
+  at: Type.Optional(Type.Number()),
+});
+export type BotMessageReaction = Static<typeof BotMessageReactionSchema>;
+
 export const BotChatMessageSchema = Type.Object({
   id: Type.String(),
   role: Type.String(),
@@ -391,6 +401,8 @@ export const BotChatMessageSchema = Type.Object({
    *  A steer shares the running turn's `turnId` and does NOT become a new `inReplyToId` target:
    *  the question a turn answers is the one that opened it, not a mid-turn nudge. */
   inReplyToId: Type.Optional(Type.String({ maxLength: 256 })),
+  /** Capability 86. The row's Tapbacks, absent when nobody reacted. */
+  reactions: Type.Optional(Type.Array(BotMessageReactionSchema, { maxItems: 2 })),
 });
 export type BotChatMessage = Static<typeof BotChatMessageSchema>;
 
@@ -1187,6 +1199,44 @@ export const BotChatAdoptedFrameSchema = Type.Object({
   updatedAt: Type.Integer(),
 });
 export type BotChatAdoptedFrame = Static<typeof BotChatAdoptedFrameSchema>;
+
+/** Capability 86. `bot_chat_reaction`: the FULL reaction list of one message after a Tapback, so a
+ *  repeated or reordered frame costs nothing. Broadcast to every paired device. */
+export const BotChatReactionFrameSchema = Type.Object({
+  type: Type.Literal("bot_chat_reaction"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  messageId: Type.String(),
+  reactions: Type.Array(BotMessageReactionSchema, { maxItems: 2 }),
+  updatedAt: Type.Integer(),
+});
+export type BotChatReactionFrame = Static<typeof BotChatReactionFrameSchema>;
+
+/** Capability 86. `PUT /bots/:name/chat/messages/:id/reaction` body: this user's Tapback, or `null`
+ *  to clear it. The key is REQUIRED so an empty body is never read as a clear. */
+export const BotChatReactionRequestSchema = Type.Object(
+  { emoji: Type.Union([Type.String({ minLength: 1, maxLength: 32 }), Type.Null()]) },
+  { additionalProperties: false },
+);
+export type BotChatReactionRequest = Static<typeof BotChatReactionRequestSchema>;
+
+export const BotChatReactionResponseSchema = Type.Object({
+  messageId: Type.String(),
+  reactions: Type.Array(BotMessageReactionSchema, { maxItems: 2 }),
+});
+export type BotChatReactionResponse = Static<typeof BotChatReactionResponseSchema>;
+
+/** Capability 86. `POST /bots/:name/bot-chat`: the profile's canonical Hermes `Bot Chat` was
+ *  resolved (or minted, `created: true`) and the bot's current chat bound to it. `resumed` carries
+ *  the gateway chat now bound; `pending` means the attached plugin has not proved the binding yet
+ *  and the current chat is unchanged. */
+export const BotCanonicalChatResponseSchema = Type.Object({
+  name: Type.String(),
+  created: Type.Boolean(),
+  status: Type.Union([Type.Literal("resumed"), Type.Literal("pending")]),
+  sessionId: Type.Optional(Type.String()),
+});
+export type BotCanonicalChatResponse = Static<typeof BotCanonicalChatResponseSchema>;
 
 /** `POST /bots/:name/chat/reset` response. `sessionId` is the selected fresh native chat and
  *  `previousSessionId` is the prior selection. Reset changes selection; it does not erase the
@@ -3103,5 +3153,17 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * Capability 79: reserved, runtime-bot settings (CozyAgents gateway). Not advertised meaning here.
  * Capability 80: `GET`/`PATCH /bots/:name/presentation` reads and writes the synced roster
  * presentation (pin, hide, user section, title) in `ui_meta["hermes-bots"]` with Hermes's own
- * per-key compare-and-swap; a revision conflict re-reads and re-applies only the patched keys. */
-export const BOTS_CAPABILITY_VERSION = 80;
+ * per-key compare-and-swap; a revision conflict re-reads and re-applies only the patched keys.
+ * Capabilities 81-85: reserved for the bot parity program (avatars, profile ops, routines, rooms,
+ * screen), each defined by its own slice.
+ * Capability 86 (chat semantics + reactions; bot parity S2, voice appends here): `POST
+ * /bots/:name/bot-chat` resolves the profile's canonical Hermes session titled exactly `Bot Chat`
+ * (fail closed on a failed lookup), mints it hidden when absent (`created: true`, the client sends
+ * the kickoff line), marks the install Bot-Mode-managed (`ui_meta["hermes-bots"]`) when no profile
+ * is, and binds the bot's current chat to it through the capability-4 desktop resume proof. A bound
+ * Bot Chat is never displaced by a newer desktop session. `POST /bots/:name/chat/reset` on a bound
+ * Bot Chat also ARCHIVES it in Hermes, which retires it: the next open mints a fresh one. A write of
+ * the bot's profile model clears every per-chat model override. `PUT
+ * /bots/:name/chat/messages/:id/reaction` sets or clears the user's Tapback, answers the full list
+ * and broadcasts `bot_chat_reaction`; history rows carry `reactions`. */
+export const BOTS_CAPABILITY_VERSION = 86;

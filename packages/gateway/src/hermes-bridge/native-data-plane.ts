@@ -15,6 +15,8 @@ import type {
   BotChatDeltaFrame,
   BotChatContextReading,
   BotChatMessage,
+  BotCanonicalChatResponse,
+  BotChatReactionResponse,
   BotChatStateCause,
   BotChatStateFrame,
   BotMobileReceipt,
@@ -473,6 +475,10 @@ export class NativeBotDataPlane {
     string,
     { hermesSessionId: string; sessionId: string }
   >();
+  /** Capability 86: each bot's canonical Hermes `Bot Chat` registry id, as last resolved. A current
+   * chat bound to it is never displaced by a newer desktop session. Process-local: every roster
+   * open re-resolves it, so a restart costs at most one reconciliation. */
+  readonly #canonicalBotChats = new Map<string, string>();
   readonly #interactionTimers = new Map<
     string,
     ReturnType<typeof setTimeout>
@@ -612,6 +618,14 @@ export class NativeBotDataPlane {
       resumeDesktopSession: (name, hermesSessionId) =>
         this.#resumeDesktopSession(name, hermesSessionId),
       canonicalChat: (name) => this.#canonical(name),
+      openBotChat: (name) => this.#openBotChat(name),
+      reactToChatMessage: (name, messageId, emoji) => this.#react(name, messageId, emoji),
+      // Capability 86: a new PROFILE model takes over from every per-chat override again.
+      configureModel: async (name, patch) => {
+        const result = await this.#control.configureModel(name, patch);
+        if (patch.model !== undefined) this.#storage.clearNativeChatModels(normalize(name), this.#now());
+        return result;
+      },
       newSession: (name) => this.#newSession(name),
       sessions: (name, limit) => this.#sessions(name, limit),
       adoptSession: (name, sessionId, limit) =>
@@ -1853,6 +1867,61 @@ export class NativeBotDataPlane {
     };
   }
 
+  /** Capability 86: resolve (or mint) the profile's `Bot Chat` and bind the current chat to it
+   * through the capability-4 exact resume proof. A durable binding that already names the Bot Chat
+   * is NOT re-staged: the plugin keeps that lane in its durable spool across restarts, and once a
+   * gateway turn has run Hermes re-stamps the row's source `cozygateway`, which the plugin's
+   * interactive-only resume proof refuses, so a re-stage would only flip a working binding to
+   * `pending` (observed live on 0.21.4). */
+  async #openBotChat(name: string): Promise<BotCanonicalChatResponse> {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    this.#assertRuntimeSupports(bot, "openBotChat");
+    if (this.#control.canonicalBotChat === undefined)
+      throw new BackendUnavailable("this gateway cannot reach a Hermes profile for a Bot Chat");
+    const canonical = await this.#control.canonicalBotChat(bot, true);
+    if (canonical === null) throw new BackendUnavailable(`hermes did not create ${bot}'s Bot Chat`);
+    this.#canonicalBotChats.set(bot, canonical.hermesSessionId);
+    const current = this.#storage.nativeBotChat(bot, this.#now());
+    const binding = this.#storage.nativeDesktopResumeBinding(bot, current.sessionId);
+    if (binding?.hermesSessionId === canonical.hermesSessionId && binding.status === "resumed")
+      return { name: bot, created: canonical.created, status: "resumed", sessionId: current.sessionId };
+    const resumed = await this.#resumeEligibleDesktopSession(bot, canonical.hermesSessionId);
+    return {
+      name: bot,
+      created: canonical.created,
+      status: resumed.status,
+      ...(resumed.sessionId === undefined ? {} : { sessionId: resumed.sessionId }),
+    };
+  }
+
+  /** Capability 86: Tapback one message of this bot, and tell every paired device. */
+  async #react(name: string, messageId: string, emoji: string | null): Promise<BotChatReactionResponse> {
+    const bot = normalize(name);
+    if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
+    const now = this.#now();
+    const set = this.#storage.setBotMessageReaction({ bot, messageId, author: "user", emoji, now });
+    if (set === undefined) throw new BotSessionNotFound(messageId);
+    this.#broadcast({
+      type: "bot_chat_reaction",
+      bot,
+      sessionId: set.sessionId,
+      messageId,
+      reactions: set.reactions,
+      updatedAt: now,
+    });
+    return { messageId, reactions: set.reactions };
+  }
+
+  /** `session.reclaimed` names a stored id: a bound Bot Chat re-proves its binding now rather than
+   * on the next send (upstream plugin.tsx). */
+  sessionReclaimed(hermesSessionId: string): void {
+    for (const [bot, canonical] of this.#canonicalBotChats) {
+      if (canonical !== hermesSessionId) continue;
+      void this.#openBotChat(bot).catch(() => undefined);
+    }
+  }
+
   #commands(name: string) {
     const bot = normalize(name);
     if (!this.#native.has(bot)) throw new BotSessionNotFound(name);
@@ -1926,6 +1995,9 @@ export class NativeBotDataPlane {
       if (!this.#native.has(bot) || !this.#storage.nativeBotHasSession(bot, current.sessionId)) return;
       if (latest === undefined) return;
       const binding = this.#storage.nativeDesktopResumeBinding(bot, current.sessionId);
+      // Capability 86: the bot's Bot Chat is its forever chat. A newer scratch session elsewhere
+      // is still one tap away in Sessions, but it never takes over the chat the roster opens.
+      if (binding !== undefined && binding.hermesSessionId === this.#canonicalBotChats.get(bot)) return;
       if (binding?.hermesSessionId === latest.hermesSessionId) {
         const proof = this.#liveDesktopResumeProofs.get(bot);
         if (proof?.hermesSessionId === latest.hermesSessionId
@@ -2461,6 +2533,14 @@ export class NativeBotDataPlane {
         threadId: previous.sessionId,
         turnId: previous.activeTurnId,
       });
+    }
+    // Capability 86: clearing a chat bound to the Bot Chat RETIRES it (archived + hidden), so the
+    // next open mints a fresh canonical one instead of re-binding the conversation just cleared.
+    const bound = this.#storage.nativeDesktopResumeBinding(bot, previous.sessionId);
+    const canonical = this.#canonicalBotChats.get(bot);
+    if (bound !== undefined && bound.hermesSessionId === canonical && this.#control.archiveHermesSession) {
+      this.#canonicalBotChats.delete(bot);
+      await this.#control.archiveHermesSession(bot, canonical).catch(() => undefined);
     }
     const sessionId = this.#storage.resetNativeBotChat(bot, now);
     this.#broadcast({

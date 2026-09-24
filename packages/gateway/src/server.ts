@@ -986,6 +986,15 @@ export async function startGateway(
     mobileNode,
   });
   const nativePlane = nativeBotPlane;
+  // Capability 86: upstream plugin.tsx's `session.reclaimed` handling. A reclaimed Bot Chat
+  // re-proves its binding at once instead of on the next send.
+  for (const { client } of clientMembers) {
+    client.onEvent((event) => {
+      if (event.type !== "session.reclaimed") return;
+      const stored = (event.payload as { stored_session_id?: unknown } | null)?.stored_session_id;
+      if (typeof stored === "string" && stored.length > 0) nativePlane.sessionReclaimed(stored);
+    });
+  }
   // Capability 51. A room member turn records ordinary interaction rows, so it borrows the plane's
   // own deadline wheel and turn-settlement rule rather than growing a second copy. Wired here, like
   // the room turn transport above, because the plane is assembled after the bridge that owns rooms.

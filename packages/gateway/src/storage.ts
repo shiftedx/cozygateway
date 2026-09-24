@@ -15,6 +15,7 @@ import type {
   DeviceKind,
   DeviceScope,
   BotChatMessage,
+  BotMessageReaction,
   BotMobileReceipt,
   BotComposerDraft,
   BotMobilePreferredDevice,
@@ -710,6 +711,15 @@ CREATE TABLE IF NOT EXISTS bot_native_messages (
   in_reply_to_id TEXT,
   PRIMARY KEY (bot, session_id, seq),
   UNIQUE (bot, message_id)
+) STRICT, WITHOUT ROWID;
+-- Capability 86. Tapback reactions: at most one per author per message (Hermes's own rule).
+CREATE TABLE IF NOT EXISTS bot_message_reactions (
+  bot TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  author TEXT NOT NULL,
+  emoji TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  PRIMARY KEY (bot, message_id, author)
 ) STRICT, WITHOUT ROWID;
 -- Proof a HUMAN saw a row, which no other durable record in this gateway carries: a transcript row
 -- proves only that the gateway holds the message, and push is fire-and-forget. First write wins and
@@ -4962,7 +4972,64 @@ export class Storage {
          FROM bot_native_messages WHERE bot = ? AND session_id = ? ORDER BY seq`,
       )
       .all(bot, sessionId) as unknown as NativeBotMessageDbRow[];
-    return rows.map(nativeBotMessage);
+    const reactions = this.#reactionsBySession(bot, sessionId);
+    return rows.map((row) => withReactions(nativeBotMessage(row), reactions.get(row.id)));
+  }
+
+  /** Capability 86. Every reacted row of one session, by message id, in author order. */
+  #reactionsBySession(bot: string, sessionId: string): Map<string, BotMessageReaction[]> {
+    const rows = this.#db.prepare(
+      `SELECT r.message_id AS messageId, r.author, r.emoji, r.at FROM bot_message_reactions r
+       JOIN bot_native_messages m ON m.bot = r.bot AND m.message_id = r.message_id
+       WHERE r.bot = ? AND m.session_id = ? ORDER BY r.at`,
+    ).all(bot, sessionId) as Array<{ messageId: string; author: string; emoji: string; at: number }>;
+    const out = new Map<string, BotMessageReaction[]>();
+    for (const row of rows) {
+      const list = out.get(row.messageId) ?? [];
+      list.push(reactionRow(row));
+      out.set(row.messageId, list);
+    }
+    return out;
+  }
+
+  botMessageReactions(bot: string, messageId: string): BotMessageReaction[] {
+    return (this.#db.prepare(
+      `SELECT author, emoji, at FROM bot_message_reactions WHERE bot = ? AND message_id = ? ORDER BY at`,
+    ).all(bot, messageId) as Array<{ author: string; emoji: string; at: number }>).map(reactionRow);
+  }
+
+  /** Capability 86, Tapback semantics (`tui_gateway` `message.react`): one reaction per author, the
+   *  same emoji again retracts it, null clears. Undefined when the message is not this bot's. */
+  setBotMessageReaction(input: {
+    bot: string; messageId: string; author: "user" | "agent"; emoji: string | null; now: number;
+  }): { sessionId: string; reactions: BotMessageReaction[] } | undefined {
+    const owner = this.#db.prepare(
+      "SELECT session_id AS sessionId FROM bot_native_messages WHERE bot = ? AND message_id = ?",
+    ).get(input.bot, input.messageId) as { sessionId: string } | undefined;
+    if (owner === undefined) return undefined;
+    const mine = this.#db.prepare(
+      "SELECT emoji FROM bot_message_reactions WHERE bot = ? AND message_id = ? AND author = ?",
+    ).get(input.bot, input.messageId, input.author) as { emoji: string } | undefined;
+    if (input.emoji === null || mine?.emoji === input.emoji) {
+      this.#db.prepare("DELETE FROM bot_message_reactions WHERE bot = ? AND message_id = ? AND author = ?")
+        .run(input.bot, input.messageId, input.author);
+    } else {
+      this.#db.prepare(
+        `INSERT INTO bot_message_reactions (bot, message_id, author, emoji, at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(bot, message_id, author) DO UPDATE SET emoji = excluded.emoji, at = excluded.at`,
+      ).run(input.bot, input.messageId, input.author, input.emoji, input.now);
+    }
+    return { sessionId: owner.sessionId, reactions: this.botMessageReactions(input.bot, input.messageId) };
+  }
+
+  /** Capability 86: the bot's profile model changed, so every per-chat override of this bot yields
+   *  to it again (upstream: a chat's pick sticks "until you change the Bot's profile model"). The
+   *  row stays explicitly configured, so the next turn's preparation clears the harness override. */
+  clearNativeChatModels(bot: string, now: number): number {
+    return Number(this.#db.prepare(
+      `UPDATE bot_chat_configurations SET model_json = NULL, updated_at = ?
+       WHERE bot = ? AND model_json IS NOT NULL`,
+    ).run(now, bot).changes);
   }
 
   /** First write wins on requestId. Only metadata is accepted by this API. */
@@ -5256,7 +5323,8 @@ export class Storage {
          FROM bot_native_messages WHERE bot = ? AND message_id = ?`,
       )
       .get(bot, messageId) as NativeBotMessageDbRow | undefined;
-    return row === undefined ? undefined : nativeBotMessage(row);
+    return row === undefined ? undefined
+      : withReactions(nativeBotMessage(row), this.botMessageReactions(bot, messageId));
   }
 
   #insertNativeBotSession(bot: string, now: number): string {
@@ -6386,6 +6454,15 @@ function chatExecution(row: ChatExecutionDbRow): ChatExecutionRow {
     ...(row.launchModelJson === null ? {} : { launchModel: JSON.parse(row.launchModelJson) as { provider?: string; endpoint?: string; id: string } }),
     harness: row.harness, stage: row.stage, createdAt: row.createdAt,
   };
+}
+
+function reactionRow(row: { author: string; emoji: string; at: number }): BotMessageReaction {
+  // Hermes stamps reactions in SECONDS; this table stores the gateway's milliseconds.
+  return { emoji: row.emoji, author: row.author === "agent" ? "agent" : "user", at: row.at / 1000 };
+}
+
+function withReactions(message: BotChatMessage, reactions: BotMessageReaction[] | undefined): BotChatMessage {
+  return reactions === undefined || reactions.length === 0 ? message : { ...message, reactions };
 }
 
 function nativeBotMessage(row: NativeBotMessageDbRow): BotChatMessage {
