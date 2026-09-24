@@ -134,8 +134,14 @@ describe("assignment routes", () => {
     const h = await setup();
     expect(await (await h.peer("lead", "/bots/lead/team")).json()).toEqual({ role: "leader", reports: ["scout", "sage"] });
     expect(await (await h.peer("scout", "/bots/scout/team")).json()).toEqual({ role: "member", reports: [] });
-    expect((await h.peer("scout", "/bots/lead/team")).status).toBe(403);
+    const other = await h.peer("scout", "/bots/lead/team");
+    expect(other.status).toBe(403);
+    const body = await other.json() as { error: { message: string } };
+    expect(body.error.message).not.toMatch(/assignment/i);
+    expect(body.error.message).toMatch(/team/i);
     expect((await h.device("/bots/lead/team")).status).toBe(200);
     expect((await h.app.request("/bots/lead/team")).status).toBe(401);
+    // An unknown or revoked bearer is neither a live peer nor a paired device.
+    expect((await h.app.request("/bots/lead/team", { headers: { authorization: "Bearer tok-ghost" } })).status).toBe(401);
   });
 });
