@@ -379,5 +379,59 @@ os.replace = replace
         self.assertEqual(len(json.loads(self.config.read_text())["hermesEndpoints"][0]["profiles"]), 3)
 
 
+    def test_multiplexed_host_unserves_a_served_profile_before_its_directory_goes(self):
+        # One multiplexed Hermes host serves every profile, so a served bot has no launchd job of
+        # its own and Hermes refuses its per-profile gateway verbs. Hermes' own profile delete asks
+        # the host to unserve the profile before removing the tree (a host still serving it
+        # recreates files under it); a manual deprovision must do the same.
+        (self.hermes / "config.yaml").write_text("gateway:\n  multiplex_profiles: true\n")
+        served = self.profiles / "served-bot"
+        served.mkdir()
+        (served / "config.yaml").write_text("plugins:\n  enabled:\n    - cozygateway\n")
+        self.seed(["keeper", "served-bot"])
+        (self.loaded / "ai.hermes.gateway-served-bot").unlink()
+        (self.home / "Library/LaunchAgents/ai.hermes.gateway-served-bot.plist").unlink()
+        control = self.base / "control"
+        interpreter = self.hermes / "hermes-agent/venv/bin/python"
+        interpreter.write_text(f"""#!/bin/sh
+if [ "$2" = --hermes-config-bool ]; then exec python3 -S "$@"; fi
+if [ "$2" = --hermes-control ]; then
+  cat >/dev/null
+  present=0; [ ! -d "$3/profiles/$5" ] || present=1
+  printf '%s %s dir-present=%s\\n' "$4" "$5" "$present" >> {control}
+  exit 0
+fi
+cat >/dev/null
+exit 1
+""")
+        hermes_calls = self.base / "hermes-calls"
+        self.executable("hermes", f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {hermes_calls}\nexit 0\n")
+        self.run_script("deprovision-bot.sh", "served-bot")
+        self.assertEqual(control.read_text().splitlines(), ["unserve-profile served-bot dir-present=1"])
+        self.assertFalse(served.exists())
+        self.assertFalse(hermes_calls.exists() and " gateway " in hermes_calls.read_text())
+        self.assertEqual(list(json.loads(self.config.read_text())["hermesEndpoints"][0]["profiles"]), ["keeper"])
+        self.assertEqual((self.profiles / "keeper/sessions.db").read_bytes(), b"keeper history")
+
+    def test_standalone_profile_on_a_multiplexed_host_keeps_todays_teardown(self):
+        (self.hermes / "config.yaml").write_text("gateway:\n  multiplex_profiles: true\n")
+        solo = self.profiles / "deleted-a"
+        solo.mkdir()
+        (solo / "config.yaml").write_text("gateway:\n  standalone: true\n")
+        control = self.base / "control"
+        interpreter = self.hermes / "hermes-agent/venv/bin/python"
+        interpreter.write_text(f"""#!/bin/sh
+if [ "$2" = --hermes-config-bool ]; then exec python3 -S "$@"; fi
+if [ "$2" = --hermes-control ]; then cat >/dev/null; printf '%s\\n' "$4" >> {control}; exit 0; fi
+cat >/dev/null
+exit 1
+""")
+        self.run_script("deprovision-bot.sh", "deleted-a")
+        self.assertFalse((self.loaded / "ai.hermes.gateway-deleted-a").exists())
+        self.assertFalse((self.home / "Library/LaunchAgents/ai.hermes.gateway-deleted-a.plist").exists())
+        self.assertFalse(solo.exists())
+        self.assertFalse(control.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

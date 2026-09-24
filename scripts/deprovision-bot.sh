@@ -100,6 +100,12 @@ while [ "$#" -gt 0 ]; do
 done
 for arg in ${@+"$@"}; do PROFILES+=("$arg"); done
 
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="$HERMES_HOME_ROOT/hermes-agent/venv/bin/python"
+[ -x "$PYTHON" ] || PYTHON="$(command -v python3 || true)"
+# shellcheck source=hermes-host.sh
+. "$SCRIPT_DIR/hermes-host.sh"
+
 # Quote each remote argument for the SSH login shell (including custom paths).
 shell_quote() { local value="$1"; value=${value//\'/\'\\\'\'}; printf "'%s'" "$value"; }
 
@@ -359,6 +365,18 @@ remove_profile_dir() {
     "$HERMES_HOME_ROOT/profiles/$profile") ;;
     *) die "[$profile] refusing to remove an unexpected path: $dir" ;;
   esac
+  # A multiplexed host serving this profile would recreate files under it. Hermes' own profile
+  # delete asks the host to unserve it first; so does this. No answer means no host is serving it
+  # now, or its 30-second reconcile unroutes the vanished profile on its own.
+  if served_by_host "$profile"; then
+    if [ "$DRY_RUN" = 1 ]; then
+      say "  DRY  ask the host Hermes gateway to unserve $profile"
+    elif host_control unserve-profile "$profile"; then
+      say "  host Hermes gateway unserved $profile"
+    else
+      say "  host Hermes gateway did not answer unserve-profile; its reconcile unroutes $profile"
+    fi
+  fi
   if [ "$DRY_RUN" = 1 ]; then say "  DRY  rm -rf $dir"; return 0; fi
   rm -rf "$dir"
   say "  profile dir removed: $dir"
