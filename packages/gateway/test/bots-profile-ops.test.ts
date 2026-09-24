@@ -51,6 +51,7 @@ interface Row {
   ui_meta?: Record<string, unknown>;
   ui_meta_revisions?: Record<string, number>;
   has_avatar?: boolean;
+  previous_names?: string[];
 }
 
 interface DashboardRequest {
@@ -64,6 +65,8 @@ async function setup(opts: {
   rows?: Row[];
   methods?: FakeHermesBehavior["methods"];
   dashboard?: (request: DashboardRequest) => { status?: number; body: unknown } | undefined;
+  /** Seeds durable state before the bridge starts (its first roster refresh reads it). */
+  seed?: (storage: Storage) => void;
 } = {}) {
   const rows: Row[] = opts.rows ?? [
     { name: "default", is_default: true, path: "/home/h/.hermes" },
@@ -99,6 +102,8 @@ async function setup(opts: {
   servers.push(server);
   const storage = openStorage(":memory:");
   storages.push(storage);
+  opts.seed?.(storage);
+  const frames: Array<Record<string, unknown>> = [];
   const client = createHermesClient({
     url: server.url,
     auth: { mode: "token", token: "T" },
@@ -107,7 +112,7 @@ async function setup(opts: {
   const bridge = new HermesBridge({
     client,
     storage,
-    broadcast: () => {},
+    broadcast: (frame) => { frames.push(frame as unknown as Record<string, unknown>); },
     now: () => 1_800_000_000_000,
     logSink: () => {},
     hiddenProfiles: [],
@@ -140,7 +145,7 @@ async function setup(opts: {
     app.request(path, { ...init, headers: { ...(init?.headers ?? {}), authorization: `Bearer ${deviceToken}` } });
   bridge.start();
   await until(() => client.state() === "online");
-  return { server, rows, dashboardCalls, authed, storage };
+  return { server, rows, dashboardCalls, authed, storage, bridge, frames };
 }
 
 const json = (method: string, body?: unknown): RequestInit => ({
@@ -236,6 +241,125 @@ describe("capability 82: rename and describe-auto", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: false, reason: "no auxiliary model" });
     expect(h.dashboardCalls.find((call) => call.path.endsWith("describe-auto"))?.body).toEqual({ overwrite: true });
+  });
+});
+
+describe("rename carries rooms, the Bot Chat binding and routines", () => {
+  const seedRoom = (storage: Storage): void => {
+    storage.createBotGroup({ key: "crew", name: "Crew", members: ["scout", "default"], createdAt: 1 });
+    storage.setBotGroupWatermark("crew", "scout", 7);
+    storage.setBotGroupMeta("crew", {
+      holds: { scout: { at: 5 } },
+      held: { scout: [3] },
+      marks: { t1: { scout: 4, default: 2 } },
+    });
+    storage.setCanonicalBotChat("scout", "hermes-bot-chat-1", 10);
+    storage.setBotRoutineOverrides("scout", "job-1", { model: "m1" });
+  };
+
+  it("a bot renamed through the gateway stays in its rooms and keeps its Bot Chat", async () => {
+    const puts: DashboardRequest[] = [];
+    const h = await setup({
+      seed: seedRoom,
+      methods: {
+        "cron.manage": () => ({
+          success: true,
+          jobs: [
+            { job_id: "job-1", name: "[bot:scout] Morning", enabled: true },
+            { job_id: "job-2", name: "[bot:other] Theirs", enabled: true },
+          ],
+        }),
+      },
+      dashboard: (request) => {
+        if (request.method === "PATCH" && request.path === "/api/profiles/scout") {
+          const row = h.rows.find((r) => r.name === "scout");
+          // No previous_names here, so the re-link defense cannot be what moves the state.
+          if (row !== undefined) row.name = "lookout";
+          return { body: { ok: true, name: "lookout", path: "/p/lookout" } };
+        }
+        if (request.path === "/api/cron/jobs/job-1" && request.method === "GET") {
+          return { body: { id: "job-1", prompt: "[bot-mode:routine:v2] You are running the scheduled routine \"Morning\" for agent 'scout'. x -q '[Scheduled routine] Say hi'\n\nIf the command fails, report the error instead." } };
+        }
+        if (request.method === "PUT") {
+          puts.push(request);
+          return { body: { ok: true } };
+        }
+        return undefined;
+      },
+    });
+    h.frames.length = 0;
+    const res = await h.authed("/bots/scout/rename", json("POST", { newName: "lookout" }));
+    expect(res.status).toBe(200);
+
+    // The room still lists the bot, under its new name, with its per-member state.
+    expect(h.bridge.groups().find((room) => room.name === "Crew")?.members).toEqual(["lookout", "default"]);
+    const room = h.storage.botGroup("crew")!;
+    expect(room.meta.holds).toEqual({ lookout: { at: 5 } });
+    expect(room.meta.held).toEqual({ lookout: [3] });
+    expect(room.meta.marks).toEqual({ t1: { lookout: 4, default: 2 } });
+    const members = h.storage.botGroupMembers("crew");
+    expect(members.get("lookout")?.watermark).toBe(7);
+    expect(members.get("lookout")?.sessionId).toBe("group:crew:scout");
+    expect(members.has("scout")).toBe(false);
+
+    // The Bot Chat binding and routine overrides moved; nothing is left under the old name.
+    expect(h.storage.canonicalBotChat("lookout")).toBe("hermes-bot-chat-1");
+    expect(h.storage.canonicalBotChat("scout")).toBeUndefined();
+    expect(h.storage.botRoutineOverrides("lookout", "job-1")).toEqual({ model: "m1" });
+    expect(h.storage.botRoutineOverrides("scout", "job-1")).toBeUndefined();
+
+    // Only this bot's routine is retagged, and its delegation names the new profile.
+    expect(puts).toHaveLength(1);
+    expect(puts[0]?.path).toBe("/api/cron/jobs/job-1");
+    expect(puts[0]?.query.get("profile")).toBe("lookout");
+    const updates = (puts[0]?.body as { updates: Record<string, string> }).updates;
+    expect(updates["name"]).toBe("[bot:lookout] Morning");
+    expect(updates["prompt"]).toContain("hermes -p 'lookout'");
+    expect(updates["prompt"]).toContain("Say hi");
+
+    // Clients hear about the room and the roster.
+    const roomFrame = h.frames.find((frame) => frame["type"] === "bot_group_state");
+    expect((roomFrame?.["room"] as { members: string[] } | undefined)?.members).toEqual(["lookout", "default"]);
+    const roster = h.frames.filter((frame) => frame["type"] === "bot_roster").at(-1);
+    expect((roster?.["bots"] as Array<{ name: string }>).map((bot) => bot.name)).toContain("lookout");
+  });
+
+  it("re-links a member renamed outside the gateway through previous_names", async () => {
+    const h = await setup({
+      rows: [
+        { name: "default", is_default: true, path: "/home/h/.hermes" },
+        { name: "lookout", path: "/home/h/.hermes/profiles/lookout", previous_names: ["scout"] },
+      ],
+      seed: (storage) => {
+        seedRoom(storage);
+        // Nobody claims `ghost`, so it stays a missing member.
+        storage.createBotGroup({ key: "haunt", name: "Haunt", members: ["ghost", "default"], createdAt: 2 });
+      },
+    });
+    await until(() => h.storage.botGroup("crew")?.members.includes("lookout") === true);
+    expect(h.storage.botGroup("crew")?.members).toEqual(["lookout", "default"]);
+    expect(h.storage.botGroupMembers("crew").get("lookout")?.watermark).toBe(7);
+    expect(h.storage.canonicalBotChat("lookout")).toBe("hermes-bot-chat-1");
+    expect(h.storage.canonicalBotChat("scout")).toBeUndefined();
+    expect(h.storage.botGroup("haunt")?.members).toEqual(["ghost", "default"]);
+    expect(h.frames.some((frame) => frame["type"] === "bot_group_state"
+      && (frame["room"] as { members: string[] } | undefined)?.members.includes("lookout") === true)).toBe(true);
+  });
+
+  it("refuses to rename a bot whose room turn is still pending", async () => {
+    const h = await setup({
+      seed: (storage) => {
+        seedRoom(storage);
+        storage.beginBotGroupTurn({
+          key: "crew", turnId: "turn-1", member: "scout", agentId: "scout", threadId: "group:crew:scout",
+          messageId: "m-1", epoch: 1, watermark: 0, createdAt: 1,
+        });
+      },
+    });
+    const res = await h.authed("/bots/scout/rename", json("POST", { newName: "lookout" }));
+    expect(res.status).toBe(409);
+    expect(h.dashboardCalls.some((call) => call.method === "PATCH")).toBe(false);
+    expect(h.storage.botGroup("crew")?.members).toEqual(["scout", "default"]);
   });
 });
 

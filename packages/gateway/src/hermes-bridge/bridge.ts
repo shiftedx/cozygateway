@@ -77,6 +77,7 @@ import {
   buildRoster,
   parseProfilesList,
   UI_META_KEY,
+  type ParsedProfile,
 } from "./roster.ts";
 import type { GroupMember } from "./group-protocol.ts";
 import type {
@@ -120,6 +121,7 @@ import {
   listRoutineBlueprints,
   patchBotRoutine,
   readBotRoutineRunOutput,
+  retagBotRoutines,
   runBotRoutine,
   type RoutineWriteResult,
 } from "./routines.ts";
@@ -1139,6 +1141,7 @@ export class HermesBridge implements BotControlSurface {
           await this.#client.request("profiles.list", {}),
         );
         const profiles = listed.filter((profile) => !this.#storage.isBotDeleted(profile.name));
+        this.#relinkRenamed(profiles);
         const publish = () => {
           const bots = buildRoster(profiles, {
             hidden: this.#hidden,
@@ -1211,7 +1214,43 @@ export class HermesBridge implements BotControlSurface {
       // roster refresh remains the one reader that requests session previews and activity.
       await this.#client.request("profiles.list", { include_sessions: false }),
     );
+    // The fresh read is also where a room member renamed outside the gateway is noticed.
+    this.#relinkRenamed(profiles.filter((profile) => !this.#storage.isBotDeleted(profile.name)));
     return new Set(profiles.map((profile) => profile.name));
+  }
+  /** The name rooms, the Bot Chat binding and routine overrides key this endpoint's profile by:
+   *  the profile id, or `<endpoint>:<profile>` on a namespaced federation endpoint. */
+  #publicName(profile: string): string {
+    return this.#roomNamespace === undefined ? profile : `${this.#roomNamespace}:${profile}`;
+  }
+  /** Moves the state that follows a renamed bot (`Storage.renameBotState`) and re-announces the
+   *  rooms it sits in. Idempotent: a second call for the same rename finds nothing left to move. */
+  #moveBotState(from: string, to: string, why: string): void {
+    const rooms = this.#storage.renameBotState(this.#publicName(from), this.#publicName(to));
+    this.#groups.announceRooms(rooms);
+    if (rooms.length > 0) this.#log(`bot ${from} is now ${to} (${why}); re-linked ${rooms.length} room(s)`);
+  }
+  /** Defense for a rename done outside the gateway (Desktop, CLI): a room member or Bot Chat
+   *  binding naming a profile that no longer exists is re-linked to the ONE live profile whose
+   *  Hermes `previous_names` carries it, the way upstream Desktop re-seats a stored room member
+   *  (`group-membership.ts`, #110200). A name no profile claims, or more than one does, or one the
+   *  gateway deleted, is left alone: the room already renders a missing member honestly. */
+  #relinkRenamed(profiles: readonly ParsedProfile[]): void {
+    if (!profiles.some((profile) => profile.previousNames !== undefined)) return;
+    const live = new Set(profiles.map((profile) => profile.name));
+    const runtime = this.#runtimeBotNames();
+    const stranded = new Set<string>();
+    const consider = (name: string): void => {
+      if (runtime.has(name)) return;
+      const local = this.#localProfile(name);
+      if (local !== undefined && !live.has(local) && !this.#storage.isBotDeleted(local)) stranded.add(local);
+    };
+    for (const room of this.#storage.botGroups()) for (const member of room.members) consider(member);
+    for (const { bot } of this.#storage.canonicalBotChats()) consider(bot);
+    for (const old of stranded) {
+      const claims = profiles.filter((profile) => profile.previousNames?.includes(old) === true);
+      if (claims.length === 1) this.#moveBotState(old, claims[0]!.name, "previous_names");
+    }
   }
   /** Capability 82. One door for the profile operations, so a federation member and the native
    *  plane each route them with one line rather than twelve. */
@@ -1235,8 +1274,21 @@ export class HermesBridge implements BotControlSurface {
         await this.#assertBotKnown(canon);
         const active = this.#storage.nativeBotActiveTurn(canon);
         if (active !== undefined) throw new BotTurnActive(canon, active.turnId);
+        // A room turn in flight is addressed to the old attach identity, which the rename revokes.
+        const roomTurn = this.#storage.pendingBotGroupTurns().find((turn) => turn.member === this.#publicName(canon));
+        if (roomTurn !== undefined) throw new BotTurnActive(canon, roomTurn.turnId);
         return this.#chain(canon, async () => {
           const renamed = await renameProfile(client, canon, target);
+          // Rooms, the Bot Chat binding and routine overrides follow the bot; its 1:1 transcript
+          // does not (see `Storage.renameBotState`).
+          this.#moveBotState(canon, renamed, "renamed");
+          // The routines moved with the profile but are still tagged `[bot:<old>]`.
+          try {
+            const { failed } = await retagBotRoutines(client, canon, renamed);
+            if (failed.length > 0) this.#log(`bot ${renamed}: could not retag routine(s) ${failed.join(", ")}`);
+          } catch (error) {
+            this.#log(`bot ${renamed}: routine retag failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
           // The old attach identity names a profile that no longer exists; the provisioner enrols
           // the new name the same way it enrols a phone-created bot.
           this.#revokeAttachIdentity(canon);

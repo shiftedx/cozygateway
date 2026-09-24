@@ -604,6 +604,12 @@ export class GroupRooms {
     return this.#emitRoom(key, renamed ? room.name : undefined);
   }
 
+  /** A member's bot was renamed and storage has already moved its membership
+   *  (`Storage.renameBotState`): re-announce each changed room so clients re-seat the member. */
+  announceRooms(keys: readonly string[]): void {
+    for (const key of keys) if (this.#storage.botGroup(key) !== undefined) this.#emitRoom(key);
+  }
+
   /** Capability 84. Stop: supersede the drive, drop the queue, cancel and interrupt the member on
    *  turn, and hold everyone when stop directives are on. */
   stop(rawName: string): BotGroup {

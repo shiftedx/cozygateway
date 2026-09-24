@@ -591,6 +591,44 @@ export async function createBotRoutine(
   return { ...mapRoutine(stored), prompt: instruction };
 }
 
+/** A bot's profile was renamed. Its cron jobs moved with the profile directory, but their names
+ *  still carry `[bot:<from>]`, which `selectRoutineJobs` reads as another bot's claim, so every
+ *  routine would vanish from the new name. Hermes's own rename does not touch job names (the
+ *  namespace is Bot Mode's, and this gateway is the one place it is written, `routineJobName`), so
+ *  the gateway rewrites them: the tag and, for a job carrying the gateway's delegation wrapper, the
+ *  prompt, whose `hermes -p <bot>` would otherwise name a profile that no longer exists.
+ *
+ *  Best effort per job: a failure is returned by id rather than thrown, since the rename itself
+ *  has already happened and a job left behind is still visible in Hermes's Cron view. */
+export async function retagBotRoutines(
+  port: HermesRoutinesPort,
+  from: string,
+  to: string,
+): Promise<{ retagged: string[]; failed: string[] }> {
+  const retagged: string[] = [];
+  const failed: string[] = [];
+  const jobs = (await listCronStore(port, to)).filter((job) => routineBot(job) === from);
+  if (jobs.length === 0) return { retagged, failed };
+  const call = dashboard(port, "retag");
+  for (const job of jobs) {
+    const id = asString(job.job_id) ?? "";
+    if (id.length === 0) continue;
+    try {
+      const title = routineTitle(job);
+      const updates: Record<string, unknown> = { name: routineJobName(to, title) };
+      const stored = asString(asRecord(await call<unknown>(cronJobPath(id, to)))?.["prompt"]);
+      if (stored?.startsWith(SAFE_ROUTINE_MARKER) === true) {
+        updates["prompt"] = routinePrompt({ bot: to, title, instruction: routineInstruction(stored) });
+      }
+      await call(cronJobPath(id, to), { method: "PUT", body: { updates } });
+      retagged.push(id);
+    } catch {
+      failed.push(id);
+    }
+  }
+  return { retagged, failed };
+}
+
 /** Deletes a tagged routine. An id outside this bot's namespace is a 404, never a delete. */
 export async function deleteBotRoutine(rpc: HermesRpc, bot: string, jobId: string): Promise<void> {
   await findBotRoutineJob(rpc, bot, jobId);
