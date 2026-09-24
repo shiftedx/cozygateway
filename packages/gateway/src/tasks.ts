@@ -449,9 +449,13 @@ export class Tasks {
     const group = this.#db.prepare("SELECT member AS bot, group_key AS room FROM bot_group_turns WHERE agent_id = ? AND thread_id = ? AND turn_id = ?").get(peer, command.threadId, command.turnId) as { bot: string; room: string } | undefined;
     const session = this.#db.prepare("SELECT bot FROM bot_native_sessions WHERE session_id = ?").get(command.threadId) as { bot: string } | undefined;
     const core = this.#db.prepare("SELECT agent_id AS bot FROM threads WHERE id = ? AND agent_id = ?").get(command.threadId, peer) as { bot: string } | undefined;
-    const bot = group?.bot ?? session?.bot ?? core?.bot;
+    // Capability 88. An assignment names its Task before the turn exists, so the Task takes the id
+    // the leader already holds, and a later turn on the same thread is not a second Task.
+    const assignment = group ?? session ?? core ? undefined : this.#db.prepare("SELECT task_id AS taskId, assignee AS bot FROM bot_assignments WHERE thread_id = ? AND assignee = ?").get(command.threadId, peer) as { taskId: string; bot: string } | undefined;
+    const bot = group?.bot ?? session?.bot ?? core?.bot ?? assignment?.bot;
     if (bot === undefined) return;
-    const taskId = randomUUID();
+    const taskId = assignment?.taskId ?? randomUUID();
+    if (this.#db.prepare("SELECT 1 FROM tasks WHERE task_id = ?").get(taskId) !== undefined) return;
     this.#db.prepare("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?)").run(taskId, bot, command.threadId, group?.room ?? null, command.turnId, command.messageId, command.text || "Attached work");
     this.#db.prepare("INSERT INTO task_runs VALUES (?, ?, ?, ?, 1, NULL)").run(taskId, peer, command.turnId, command.threadId);
     this.#db.prepare("INSERT INTO task_intent_revisions VALUES (?, 1, ?, ?)").run(taskId, command.text || "Attached work", at);

@@ -518,6 +518,41 @@ CREATE TABLE IF NOT EXISTS bot_group_turns (
   PRIMARY KEY (group_key, turn_id)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS bot_group_turns_target ON bot_group_turns(agent_id, thread_id, turn_id);
+-- Capability 88. Gateway-owned team role. Hermes has no field for it and the gateway is what
+-- enforces it, so the gateway owns it.
+CREATE TABLE IF NOT EXISTS bot_team (
+  bot TEXT PRIMARY KEY,
+  role TEXT NOT NULL CHECK (role IN ('leader', 'member')),
+  reports_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
+-- agent-inbox 1. One assignment wraps one capability-64 Task and shares its id. The thread
+-- (assignment:<task_id>) is gateway-owned, which is what lets Tasks.admit find the assignee and
+-- the Task id when the turn is enqueued in the same transaction. The state is derived, never stored.
+CREATE TABLE IF NOT EXISTS bot_assignments (
+  task_id TEXT PRIMARY KEY,
+  leader TEXT NOT NULL,
+  assignee TEXT NOT NULL,
+  thread_id TEXT NOT NULL UNIQUE,
+  brief TEXT NOT NULL,
+  done_criteria TEXT NOT NULL,
+  output_format TEXT,
+  deadline_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  idempotency_key TEXT,
+  result_json TEXT,
+  final_text TEXT,
+  final_at INTEGER,
+  final_turn_id TEXT,
+  failure TEXT,
+  cancelled_by TEXT CHECK (cancelled_by IN ('leader', 'user')),
+  acknowledged_at INTEGER,
+  acknowledged_outcome TEXT CHECK (acknowledged_outcome IN ('completed', 'failed'))
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS bot_assignments_idempotency ON bot_assignments(leader, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS bot_assignments_leader ON bot_assignments(leader, created_at);
+CREATE INDEX IF NOT EXISTS bot_assignments_assignee ON bot_assignments(assignee, created_at);
 -- attach-v1 is an at-least-once transport. Both journals are gateway-owned durability boundaries:
 -- commands survive until the plugin ACKs them, and events are ACKed only after the inbox commit.
 CREATE TABLE IF NOT EXISTS attach_streams (
@@ -1302,6 +1337,55 @@ export interface BotGroupTurnRow {
   createdAt: number;
   completedAt?: number;
   consumedAt?: number;
+}
+
+/** Capability 88. A bot's team role; a bot with no row is a member with no reports. */
+export interface BotTeamRow {
+  bot: string;
+  role: "leader" | "member";
+  reports: string[];
+  updatedAt: number;
+}
+
+/** agent-inbox 1. The assignment's own facts beside the Task it wraps; `taskId` is that Task's id. */
+export interface BotAssignmentRow {
+  taskId: string;
+  leader: string;
+  assignee: string;
+  threadId: string;
+  brief: string;
+  doneCriteria: string;
+  outputFormat?: string;
+  deadlineAt: number;
+  createdAt: number;
+  updatedAt: number;
+  idempotencyKey?: string;
+  resultJson?: string;
+  finalText?: string;
+  finalAt?: number;
+  finalTurnId?: string;
+  failure?: string;
+  cancelledBy?: "leader" | "user";
+  acknowledgedAt?: number;
+  acknowledgedOutcome?: "completed" | "failed";
+}
+export type BotAssignmentPatch = Partial<Pick<BotAssignmentRow, "resultJson" | "finalText" | "finalAt" | "finalTurnId" | "failure" | "cancelledBy" | "acknowledgedAt" | "acknowledgedOutcome">> & { updatedAt: number };
+
+const BOT_ASSIGNMENT_SELECT = `SELECT task_id AS taskId, leader, assignee, thread_id AS threadId, brief,
+  done_criteria AS doneCriteria, output_format AS outputFormat, deadline_at AS deadlineAt,
+  created_at AS createdAt, updated_at AS updatedAt, idempotency_key AS idempotencyKey,
+  result_json AS resultJson, final_text AS finalText, final_at AS finalAt, final_turn_id AS finalTurnId,
+  failure, cancelled_by AS cancelledBy, acknowledged_at AS acknowledgedAt,
+  acknowledged_outcome AS acknowledgedOutcome FROM bot_assignments`;
+const BOT_ASSIGNMENT_COLUMNS: Record<keyof BotAssignmentPatch, string> = {
+  resultJson: "result_json", finalText: "final_text", finalAt: "final_at", finalTurnId: "final_turn_id",
+  failure: "failure", cancelledBy: "cancelled_by", acknowledgedAt: "acknowledged_at",
+  acknowledgedOutcome: "acknowledged_outcome", updatedAt: "updated_at",
+};
+
+/** Optional columns become absent keys, never `null`. */
+function toBotAssignmentRow(row: Record<string, unknown>): BotAssignmentRow {
+  return Object.fromEntries(Object.entries(row).filter(([, value]) => value !== null)) as unknown as BotAssignmentRow;
 }
 
 /** Gateway-owned truth for an admitted scheduled delivery. `journaled` remains plugin-local and
@@ -3270,6 +3354,58 @@ export class Storage {
        FROM bot_group_turns WHERE state = 'pending'`,
     ).all() as Record<string, unknown>[];
     return rows.map(toBotGroupTurnRow);
+  }
+
+  botTeam(bot: string): BotTeamRow | undefined {
+    const row = this.#db.prepare("SELECT bot, role, reports_json AS reports, updated_at AS updatedAt FROM bot_team WHERE bot = ?")
+      .get(bot) as { bot: string; role: BotTeamRow["role"]; reports: string; updatedAt: number } | undefined;
+    return row === undefined ? undefined : { ...row, reports: JSON.parse(row.reports) as string[] };
+  }
+
+  setBotTeam(row: BotTeamRow): void {
+    this.#db.prepare(`INSERT INTO bot_team (bot, role, reports_json, updated_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(bot) DO UPDATE SET role = excluded.role, reports_json = excluded.reports_json, updated_at = excluded.updated_at`)
+      .run(row.bot, row.role, JSON.stringify(row.reports), row.updatedAt);
+  }
+
+  createBotAssignment(row: Omit<BotAssignmentRow, "updatedAt" | "resultJson" | "finalText" | "finalAt" | "finalTurnId" | "failure" | "cancelledBy" | "acknowledgedAt" | "acknowledgedOutcome">): void {
+    this.#db.prepare(`INSERT INTO bot_assignments (task_id, leader, assignee, thread_id, brief, done_criteria,
+        output_format, deadline_at, created_at, updated_at, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(row.taskId, row.leader, row.assignee, row.threadId, row.brief, row.doneCriteria, row.outputFormat ?? null,
+        row.deadlineAt, row.createdAt, row.createdAt, row.idempotencyKey ?? null);
+  }
+
+  botAssignment(taskId: string): BotAssignmentRow | undefined {
+    const row = this.#db.prepare(`${BOT_ASSIGNMENT_SELECT} WHERE task_id = ?`).get(taskId) as Record<string, unknown> | undefined;
+    return row === undefined ? undefined : toBotAssignmentRow(row);
+  }
+
+  botAssignmentByThread(threadId: string): BotAssignmentRow | undefined {
+    const row = this.#db.prepare(`${BOT_ASSIGNMENT_SELECT} WHERE thread_id = ?`).get(threadId) as Record<string, unknown> | undefined;
+    return row === undefined ? undefined : toBotAssignmentRow(row);
+  }
+
+  botAssignmentByKey(leader: string, idempotencyKey: string): BotAssignmentRow | undefined {
+    const row = this.#db.prepare(`${BOT_ASSIGNMENT_SELECT} WHERE leader = ? AND idempotency_key = ?`).get(leader, idempotencyKey) as Record<string, unknown> | undefined;
+    return row === undefined ? undefined : toBotAssignmentRow(row);
+  }
+
+  /** Newest first. `participant` matches either side. */
+  botAssignments(filter: { leader?: string; assignee?: string; participant?: string } = {}): BotAssignmentRow[] {
+    const where: string[] = [];
+    const params: string[] = [];
+    if (filter.leader !== undefined) { where.push("leader = ?"); params.push(filter.leader); }
+    if (filter.assignee !== undefined) { where.push("assignee = ?"); params.push(filter.assignee); }
+    if (filter.participant !== undefined) { where.push("(leader = ? OR assignee = ?)"); params.push(filter.participant, filter.participant); }
+    const rows = this.#db.prepare(`${BOT_ASSIGNMENT_SELECT}${where.length === 0 ? "" : ` WHERE ${where.join(" AND ")}`}
+      ORDER BY created_at DESC, rowid DESC`).all(...params) as Record<string, unknown>[];
+    return rows.map(toBotAssignmentRow);
+  }
+
+  updateBotAssignment(taskId: string, patch: BotAssignmentPatch): void {
+    const entries = Object.entries(patch).filter(([, value]) => value !== undefined) as [keyof BotAssignmentPatch, string | number][];
+    this.#db.prepare(`UPDATE bot_assignments SET ${entries.map(([key]) => `${BOT_ASSIGNMENT_COLUMNS[key]} = ?`).join(", ")} WHERE task_id = ?`)
+      .run(...entries.map(([, value]) => value), taskId);
   }
 
   /** Durably queues one gateway→plugin command. Reusing commandId is idempotent and returns the
@@ -6222,6 +6358,10 @@ export class Storage {
       // operations are deliberately NOT purged, because the `delete_runtime` this delete enqueues
       // is the record of the cleanup a runner still owes.
       ["runtimeBot", "runtime_bots", "id"],
+      // Capability 88. The deleted bot's own team row, and the assignments it answered, whose Tasks
+      // go with its other non-room Tasks. Assignments it led stay as the assignee's history.
+      ["team", "bot_team", "bot"],
+      ["assignments", "bot_assignments", "assignee"],
     ];
     const purged: Record<string, number> = {};
     this.#db.exec("BEGIN IMMEDIATE");
