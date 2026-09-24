@@ -144,6 +144,7 @@ async function setup(opts: { gatewayRunning?: boolean | null; triggerDelayMs?: n
           if (typeof updates["prompt"] === "string") job.prompt = updates["prompt"];
           if (typeof updates["deliver"] === "string") job.deliver = updates["deliver"];
           if (typeof updates["repeat"] === "number") job.repeat = { ...job.repeat, times: updates["repeat"] };
+          if ("repeat" in updates && updates["repeat"] === null) job.repeat = { ...job.repeat, times: null };
           if (Array.isArray(updates["context_from"])) job.context_from = updates["context_from"] as string[];
           return { body: job };
         }
@@ -295,6 +296,14 @@ describe("bot routines v2 (capability 83)", () => {
     }]);
     // The instruction was not named, so it was not touched.
     expect(jobs.get("j1")?.prompt).toContain("Summarize");
+  });
+
+  it("clears a run cap back to forever with repeat: null", async () => {
+    const { call, puts } = await setup();
+    const { status, body } = await call(`/bots/${BOT}/routines/j1`, { method: "PATCH", body: { repeat: null } });
+    expect(status).toBe(200);
+    expect(puts).toEqual([{ repeat: null }]);
+    expect(body["routine"]).toMatchObject({ id: "j1", repeat: "forever" });
   });
 
   it("re-wraps a new instruction and composes enabled with an edit", async () => {

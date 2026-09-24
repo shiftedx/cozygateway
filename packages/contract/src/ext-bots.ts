@@ -1760,7 +1760,8 @@ export const BotRoutinePatchSchema = Type.Object({
   schedule: Type.Optional(RoutineText(200)),
   prompt: Type.Optional(RoutineText(32_000)),
   enabled: Type.Optional(Type.Boolean()),
-  repeat: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
+  /** Runs from now. Capability 83: `null` clears the cap, so the routine runs until stopped. */
+  repeat: Type.Optional(Type.Union([Type.Integer({ minimum: 1, maximum: 10_000 }), Type.Null()])),
   continuity: Type.Optional(Type.Boolean()),
   /** Capability 83. See `BotRoutineCreateRequest.deliver`. */
   deliver: Type.Optional(RoutineDeliver),

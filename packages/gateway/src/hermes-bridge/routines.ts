@@ -592,7 +592,9 @@ export async function patchBotRoutine(
     if (patch.prompt !== undefined) {
       updates["prompt"] = routinePrompt({ bot, title, instruction: patch.prompt.trim(), schedulerProfile });
     }
-    if (patch.repeat !== undefined) updates["repeat"] = patch.repeat + routineCompletedRuns(existing);
+    // `null` is "forever": Hermes's update_job stores `{times: None}` and keeps the completed count.
+    if (patch.repeat !== undefined)
+      updates["repeat"] = patch.repeat === null ? null : patch.repeat + routineCompletedRuns(existing);
     if (patch.deliver !== undefined) updates["deliver"] = patch.deliver;
     if (patch.continuity !== undefined) {
       const stored = asRecord(await call<unknown>(cronJobPath(jobId, bot)));
