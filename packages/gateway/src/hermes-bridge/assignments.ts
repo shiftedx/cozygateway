@@ -103,8 +103,21 @@ export class AssignmentRooms {
     return row === undefined ? undefined : { role: row.role, reports: row.reports };
   }
 
+  /** Throws `AssignmentInvalid` for a profile patch's `role` and `reports` the gateway will not store. */
+  checkTeam(bot: string, patch: { role?: BotTeamRow["role"]; reports?: string[] }): void {
+    this.#teamRow(bot, patch);
+  }
+
   /** Stores a profile patch's `role` and `reports`. Demoting a leader cancels the work it led. */
   setTeam(bot: string, patch: { role?: BotTeamRow["role"]; reports?: string[] }): void {
+    const stored = this.#storage.botTeam(bot);
+    const row = this.#teamRow(bot, patch);
+    this.#storage.setBotTeam(row);
+    if (stored?.role === "leader" && row.role === "member") this.#cancelLed(bot);
+  }
+
+  #teamRow(bot: string, patch: { role?: BotTeamRow["role"]; reports?: string[] }): BotTeamRow {
+    if (!this.#knownBot(bot)) throw new AssignmentInvalid(`${bot} is not a bot on this gateway`);
     const stored = this.#storage.botTeam(bot);
     const role = patch.role ?? stored?.role ?? "member";
     if (patch.reports !== undefined) {
@@ -114,8 +127,7 @@ export class AssignmentRooms {
       if (missing.length > 0) throw new AssignmentInvalid(`not a bot on this gateway: ${missing.join(", ")}`);
     }
     const reports = role === "member" ? [] : [...new Set(patch.reports ?? stored?.reports ?? [])];
-    this.#storage.setBotTeam({ bot, role, reports, updatedAt: this.#now() });
-    if (stored?.role === "leader" && role === "member") this.#cancelLed(bot);
+    return { bot, role, reports, updatedAt: this.#now() };
   }
 
   /** The bot's attach identity is gone. Work it led is cancelled; work it held is cancelled by the
