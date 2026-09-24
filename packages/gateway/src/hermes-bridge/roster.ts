@@ -26,6 +26,9 @@ export interface ParsedProfile {
   meta: Record<string, unknown> | null;
   /** Milliseconds, converted from the wire's seconds. Null when the profile has no session. */
   lastActiveAt: number | null;
+  /** Milliseconds of the freshest kanban/tool worker heartbeat (`worker_session.last_active`),
+   *  null when the row has none (capability 87). */
+  workerActiveAt: number | null;
   preview: string | null;
   /** Capability 81: Hermes's CAS revision for `ui_meta["hermes-bots"]` (0 when never written). Every
    *  look write bumps it, so it versions the roster's avatar URL. */
@@ -97,6 +100,7 @@ export function parseProfileRow(row: unknown): ParsedProfile | undefined {
 
   const lastSession = asRecord(record["last_session"]);
   const lastActiveSeconds = typeof lastSession?.["last_active"] === "number" ? lastSession["last_active"] : undefined;
+  const workerSeconds = asRecord(record["worker_session"])?.["last_active"];
 
   return {
     name,
@@ -107,6 +111,10 @@ export function parseProfileRow(row: unknown): ParsedProfile | undefined {
       lastActiveSeconds === undefined || !Number.isFinite(lastActiveSeconds)
         ? null
         : Math.round(lastActiveSeconds * 1000),
+    workerActiveAt:
+      typeof workerSeconds === "number" && Number.isFinite(workerSeconds) && workerSeconds > 0
+        ? Math.round(workerSeconds * 1000)
+        : null,
     preview: asString(lastSession?.["preview"]) ?? null,
     metaRevision: metaRevision(record["ui_meta_revisions"]),
     ...previousNames(record["previous_names"]),
@@ -196,6 +204,14 @@ export function isBotActive(
   return ctx.now / 1000 - bot.lastActiveAt / 1000 < ACTIVE_WINDOW_S;
 }
 
+/** Upstream `WORKER_ACTIVE_WINDOW_S`: workers heartbeat at least every 60 s while running. */
+export const WORKER_ACTIVE_WINDOW_S = 150;
+
+/** `row-helpers.ts workerActiveAt`, against THIS gateway's clock (both are milliseconds here). */
+export function isWorkerActive(workerActiveAt: number | null, now: number): boolean {
+  return workerActiveAt !== null && now / 1000 - workerActiveAt / 1000 < WORKER_ACTIVE_WINDOW_S;
+}
+
 /** Roster sort key (dissection 2.5): most recent of the bot's creation stamp and its last
  *  session activity. Both are milliseconds by the time they reach here. */
 export function botActivityAt(profile: ParsedProfile): number {
@@ -230,6 +246,8 @@ export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions)
       pinned: meta?.["pinned"] === true,
       active: isBotActive(profile, opts),
       lastActiveAt: profile.lastActiveAt,
+      workerActiveAt: profile.workerActiveAt,
+      workerActive: isWorkerActive(profile.workerActiveAt, opts.now),
       chatSessionId: null,
       preview: classifyPreview(profile.preview, profile.description),
       syncState: "setup_required",

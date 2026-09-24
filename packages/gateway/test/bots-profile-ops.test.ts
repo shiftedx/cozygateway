@@ -350,6 +350,94 @@ describe("rename carries rooms, the Bot Chat binding and routines", () => {
     expect(bots.bots.find((bot) => bot.name === "default")?.previousNames).toBeUndefined();
   });
 
+  it("the live bot's state wins over a deleted bot of the new name still listed in the room", async () => {
+    const h = await setup({
+      seed: (storage) => {
+        storage.createBotGroup({ key: "crew", name: "Crew", members: ["owl", "scout", "default"], createdAt: 1 });
+        storage.setBotGroupWatermark("crew", "owl", 99);
+        storage.setBotGroupWatermark("crew", "scout", 7);
+        storage.setBotGroupMeta("crew", { holds: { owl: { at: 1 }, scout: { at: 5 } }, marks: { t1: { owl: 90, scout: 4 } } });
+        storage.purgeBot("owl");
+      },
+      dashboard: (request) => {
+        if (request.method === "PATCH" && request.path === "/api/profiles/scout") {
+          const row = h.rows.find((r) => r.name === "scout");
+          if (row !== undefined) row.name = "owl";
+          return { body: { ok: true, name: "owl", path: "/p/owl" } };
+        }
+        return undefined;
+      },
+    });
+    const res = await h.authed("/bots/scout/rename", json("POST", { newName: "owl" }));
+    expect(res.status).toBe(200);
+    const room = h.storage.botGroup("crew")!;
+    expect(room.members).toEqual(["owl", "default"]);
+    expect(room.meta.holds).toEqual({ owl: { at: 5 } });
+    expect(room.meta.marks).toEqual({ t1: { owl: 4 } });
+    expect(h.storage.botGroupMembers("crew").get("owl")).toEqual({ watermark: 7, sessionId: "group:crew:scout" });
+    // The deletion fence is lifted for the name the live bot now holds, so the roster shows it.
+    expect(h.storage.isBotDeleted("owl")).toBe(false);
+    expect(h.storage.botRoster().bots.map((bot) => bot.name)).toContain("owl");
+  });
+
+  it("a previous_names re-link never overwrites a live bot's own state", async () => {
+    const h = await setup({
+      rows: [
+        { name: "default", is_default: true, path: "/home/h/.hermes" },
+        { name: "lookout", path: "/home/h/.hermes/profiles/lookout", previous_names: ["scout"] },
+      ],
+      seed: (storage) => {
+        storage.createBotGroup({ key: "both", name: "Both", members: ["lookout", "scout", "default"], createdAt: 1 });
+        storage.setBotGroupWatermark("both", "lookout", 3);
+        storage.setBotGroupWatermark("both", "scout", 7);
+        storage.setBotGroupMeta("both", { holds: { lookout: { at: 2 }, scout: { at: 5 } } });
+        storage.setCanonicalBotChat("lookout", "live-chat", 20);
+        storage.setCanonicalBotChat("scout", "stale-chat", 10);
+        storage.setBotRoutineOverrides("lookout", "job-1", { model: "live" });
+        storage.setBotRoutineOverrides("scout", "job-1", { model: "stale" });
+      },
+    });
+    await until(() => h.storage.botGroup("both")?.members.includes("scout") === false);
+    expect(h.storage.botGroup("both")?.members).toEqual(["lookout", "default"]);
+    expect(h.storage.botGroup("both")?.meta.holds).toEqual({ lookout: { at: 2 } });
+    expect(h.storage.botGroupMembers("both").get("lookout")?.watermark).toBe(3);
+    expect(h.storage.botGroupMembers("both").has("scout")).toBe(false);
+    expect(h.storage.canonicalBotChat("lookout")).toBe("live-chat");
+    expect(h.storage.canonicalBotChat("scout")).toBeUndefined();
+    expect(h.storage.botRoutineOverrides("lookout", "job-1")).toEqual({ model: "live" });
+    expect(h.storage.botRoutineOverrides("scout", "job-1")).toBeUndefined();
+  });
+
+  it("lists and retags a routine still tagged with a previous name", async () => {
+    const jobs = [{ job_id: "job-9", name: "[bot:scout] Nightly", enabled: true }];
+    const puts: DashboardRequest[] = [];
+    const h = await setup({
+      rows: [
+        { name: "default", is_default: true, path: "/home/h/.hermes" },
+        { name: "lookout", path: "/home/h/.hermes/profiles/lookout", previous_names: ["scout"] },
+      ],
+      methods: { "cron.manage": () => ({ success: true, jobs }) },
+      dashboard: (request) => {
+        if (request.method === "PUT" && request.path === "/api/cron/jobs/job-9") {
+          puts.push(request);
+          jobs[0]!.name = String((request.body as { updates: { name: string } }).updates.name);
+          return { body: { ok: true } };
+        }
+        if (request.method === "GET" && request.path === "/api/cron/jobs/job-9") return { body: { id: "job-9", prompt: "Say hi" } };
+        return undefined;
+      },
+    });
+    await until(() => h.storage.botRoster().bots.some((bot) => bot.name === "lookout"));
+    const res = await h.authed("/bots/lookout/routines");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { routines: Array<{ id: string; title: string }> };
+    expect(body.routines.map((routine) => routine.id)).toEqual(["job-9"]);
+    expect(body.routines[0]?.title).toBe("Nightly");
+    expect(puts).toHaveLength(1);
+    // A bare prompt stays bare; only the tag changes.
+    expect((puts[0]?.body as { updates: Record<string, unknown> }).updates).toEqual({ name: "[bot:lookout] Nightly" });
+  });
+
   it("refuses to rename a bot whose room turn is still pending", async () => {
     const h = await setup({
       seed: (storage) => {

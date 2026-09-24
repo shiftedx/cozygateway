@@ -33,6 +33,9 @@ import {
   BotRenameRequestSchema,
   BotSkillsHubInstallRequestSchema,
   BotPresentationPatchSchema,
+  BotRelayDeliverRequestSchema,
+  BotRelayReplyRequestSchema,
+  BotRelayRosterRequestSchema,
   BotChatReactionRequestSchema,
   BotAvatarSetRequestSchema,
   BotAvatarGenerateRequestSchema,
@@ -94,6 +97,7 @@ import {
 } from "./crud.ts";
 import { GroupBusy, GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
 import { PresentationConflict, PresentationNotApplied } from "./presentation.ts";
+import { normalizeRelayAgents } from "./relay.ts";
 import { AvatarInvalid, decodeAvatar } from "./avatar.ts";
 
 /** A 2 MB image as base64 in a JSON envelope, with headroom. */
@@ -1686,6 +1690,68 @@ export function registerBotRoutes(
           "cache-control": "no-store",
         },
       });
+    });
+  }
+
+  // Capability 87: the relay courier's four doors onto this gateway's Hermes. Registered only on a
+  // surface that relays, so any other gateway answers 404 and the phone leaves it out of the relay.
+  if (
+    bots.relayRosterSync !== undefined &&
+    bots.relayDrain !== undefined &&
+    bots.relayDeliver !== undefined &&
+    bots.relayReply !== undefined
+  ) {
+    const rosterSync = bots.relayRosterSync.bind(bots);
+    const drain = bots.relayDrain.bind(bots);
+    const deliver = bots.relayDeliver.bind(bots);
+    const reply = bots.relayReply.bind(bots);
+    const body = async <T>(c: Context<Env>, schema: Parameters<typeof assertValid>[0]): Promise<T | Response> => {
+      let raw: unknown;
+      try {
+        raw = await c.req.json();
+      } catch {
+        raw = undefined;
+      }
+      try {
+        return assertValid(schema, raw) as T;
+      } catch (err) {
+        const detail = err instanceof ContractViolation ? err.message : "malformed body";
+        return c.json(errorBody("invalid_request", detail), 400);
+      }
+    };
+    app.post("/bot-relay/roster", requireDevice, async (c) => {
+      const parsed = await body<{ agents: unknown[] }>(c, BotRelayRosterRequestSchema);
+      if (parsed instanceof Response) return parsed;
+      try {
+        return c.json(await rosterSync(normalizeRelayAgents(parsed.agents)));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+    app.post("/bot-relay/drain", requireDevice, async (c) => {
+      try {
+        return c.json(await drain());
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+    app.post("/bot-relay/deliver", requireDevice, async (c) => {
+      const parsed = await body<Parameters<typeof deliver>[0]>(c, BotRelayDeliverRequestSchema);
+      if (parsed instanceof Response) return parsed;
+      try {
+        return c.json(await deliver(parsed));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+    app.post("/bot-relay/reply", requireDevice, async (c) => {
+      const parsed = await body<Parameters<typeof reply>[0]>(c, BotRelayReplyRequestSchema);
+      if (parsed instanceof Response) return parsed;
+      try {
+        return c.json(await reply(parsed));
+      } catch (err) {
+        return failure(c, err);
+      }
     });
   }
 

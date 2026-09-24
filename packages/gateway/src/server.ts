@@ -661,7 +661,7 @@ export async function startGateway(
     if (!("threadId" in event) || !("turnId" in event)) return undefined;
     const owned = storage.botGroupTurnForAttach(agentId, event.threadId, event.turnId);
     // Capability 84: a commit on a member's room thread that no room turn owns is an external write.
-    const key = owned?.key ?? storage.botGroupMemberBySession(event.threadId)?.key;
+    const key = owned?.key ?? storage.botGroupMemberBySession(event.threadId, agentId)?.key;
     return key === undefined ? undefined : roomHostFor(key);
   };
   // Every configured Hermes profile has one attach identity shared by the core thread surface and

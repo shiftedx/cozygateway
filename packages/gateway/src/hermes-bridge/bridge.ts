@@ -31,6 +31,11 @@ import type {
   BotProfilePatch,
   BotPresentationPatch,
   BotPresentationResponse,
+  BotRelayAgent,
+  BotRelayDeliverRequest,
+  BotRelayDeliverResponse,
+  BotRelayDrainResponse,
+  BotRelayReplyRequest,
   BotCanonicalChatResponse,
   BotChatReactionResponse,
   BotAvatarGenerateRequest,
@@ -88,6 +93,7 @@ import type {
 } from "./approvals.ts";
 import { GroupRooms, type RoomInteractionExpiry } from "./group-rooms.ts";
 import { readPresentation, writePresentation } from "./presentation.ts";
+import { relayDeliver, relayDrain, relayInstallId, relayReply, relayRosterSync } from "./relay.ts";
 import { createCanonicalBotChat, ensureBotModeMarker, findCanonicalBotChat } from "./bot-chat.ts";
 import { AvatarFingerprints, clearAvatar, generatePortrait, petGallery, petThumb, readAvatar, writeAvatar } from "./avatar.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
@@ -313,6 +319,13 @@ export interface BotControlSurface {
   /** Capability 80. Optional so a surface with no Hermes profile behind it simply lacks the route. */
   botPresentation?(name: string): Promise<BotPresentationResponse>;
   configurePresentation?(name: string, patch: BotPresentationPatch): Promise<BotPresentationResponse>;
+  /** Capability 87, the relay doors. Optional so only a surface with a Hermes behind it relays. */
+  relayRosterSync?(agents: BotRelayAgent[]): Promise<{ count: number }>;
+  /** The Hermes install id behind this surface, for the relay identity. */
+  relayInstallId?(): Promise<string | undefined>;
+  relayDrain?(): Promise<BotRelayDrainResponse>;
+  relayDeliver?(req: BotRelayDeliverRequest): Promise<BotRelayDeliverResponse>;
+  relayReply?(req: BotRelayReplyRequest): Promise<{ ok: true }>;
   /** Capability 86, control-plane half. The profile's canonical `Bot Chat` registry row (fail
    *  closed), minted when `create` and absent, with the Bot-Mode marker ensured. Optional so a
    *  surface with no Hermes profile behind it simply lacks the route. */
@@ -600,6 +613,10 @@ export class HermesBridge implements BotControlSurface {
   readonly #chains = new Map<string, Promise<unknown>>();
   readonly #routineWatch = new Map<string, number>();
   readonly #lastRoutines = new Map<string, string>();
+  /** Per bot, the previous names no live bot holds now, from the last profile read. */
+  readonly #routineAliases = new Map<string, string[]>();
+  /** Bot and alias sets whose `[bot:<alias>]` jobs have all been retagged already. */
+  readonly #retagged = new Set<string>();
   readonly #focus = new Map<string, { screen: BotFocusScreen; at: number }>();
   #refreshTimer: ReturnType<typeof setTimeout> | undefined;
   #routineTimer: ReturnType<typeof setTimeout> | undefined;
@@ -787,6 +804,8 @@ export class HermesBridge implements BotControlSurface {
     this.#client.onEvent((event) => {
       if (event.type === "sessions.changed") this.refreshSoon(event.type);
       if (event.type === "cron.changed") this.#refreshRoutinesSoon();
+      // Capability 87: an envelope landed in this Hermes's relay outbox. The courier is the phone.
+      if (event.type === "bot_relay.outbox.pending") this.#broadcast({ type: "bot_relay_pending" });
     });
     this.#client.start();
     // Discovery can connect the shared client before this bridge subscribes.
@@ -947,7 +966,7 @@ export class HermesBridge implements BotControlSurface {
   #adoptCreatedRow(name: string, description: string, meta: Record<string, unknown>): BotSummary {
     const at = this.#now();
     const [row] = buildRoster(
-      [{ name, description: description.length === 0 ? null : description, hasAvatar: false, meta, lastActiveAt: null, preview: null }],
+      [{ name, description: description.length === 0 ? null : description, hasAvatar: false, meta, lastActiveAt: null, workerActiveAt: null, preview: null }],
       { hidden: this.#hidden, routedProfile: null, gatewayState: "idle", now: at },
     );
     if (row === undefined) throw new BotNotFound(name);
@@ -1144,7 +1163,7 @@ export class HermesBridge implements BotControlSurface {
           await this.#client.request("profiles.list", {}),
         );
         const profiles = listed.filter((profile) => !this.#storage.isBotDeleted(profile.name));
-        this.#relinkRenamed(profiles);
+        const relinked = this.#relinkRenamed(profiles);
         const publish = () => {
           const bots = buildRoster(profiles, {
             hidden: this.#hidden,
@@ -1162,6 +1181,8 @@ export class HermesBridge implements BotControlSurface {
         // and republish only if a picture changed, and only if no newer refresh has run since.
         this.#avatarFingerprints.applyCached(profiles);
         publish();
+        // After the roster frame, so a client re-seating a room member already knows its row.
+        this.#groups.announceRooms(relinked);
         const generation = ++this.#rosterGeneration;
         void this.#avatarFingerprints.refresh(this.#client, profiles, at).then((changed) => {
           if (changed && generation === this.#rosterGeneration && !this.#closed) publish();
@@ -1217,8 +1238,10 @@ export class HermesBridge implements BotControlSurface {
       // roster refresh remains the one reader that requests session previews and activity.
       await this.#client.request("profiles.list", { include_sessions: false }),
     );
-    // The fresh read is also where a room member renamed outside the gateway is noticed.
-    this.#relinkRenamed(profiles.filter((profile) => !this.#storage.isBotDeleted(profile.name)));
+    // The fresh read is also where a room member renamed outside the gateway is noticed. Its
+    // rooms are announced by the roster refresh this asks for, after the roster frame.
+    if (this.#relinkRenamed(profiles.filter((profile) => !this.#storage.isBotDeleted(profile.name))).length > 0)
+      this.refreshSoon("room member re-linked through previous_names");
     return new Set(profiles.map((profile) => profile.name));
   }
   /** The name rooms, the Bot Chat binding and routine overrides key this endpoint's profile by:
@@ -1226,21 +1249,37 @@ export class HermesBridge implements BotControlSurface {
   #publicName(profile: string): string {
     return this.#roomNamespace === undefined ? profile : `${this.#roomNamespace}:${profile}`;
   }
-  /** Moves the state that follows a renamed bot (`Storage.renameBotState`) and re-announces the
-   *  rooms it sits in. Idempotent: a second call for the same rename finds nothing left to move. */
-  #moveBotState(from: string, to: string, why: string): void {
-    const rooms = this.#storage.renameBotState(this.#publicName(from), this.#publicName(to));
-    this.#groups.announceRooms(rooms);
-    if (rooms.length > 0) this.#log(`bot ${from} is now ${to} (${why}); re-linked ${rooms.length} room(s)`);
+  /** Moves the state that follows a renamed bot (`Storage.renameBotState`) and answers the keys
+   *  of the rooms that changed, for the caller to announce once the roster knows the new name.
+   *  Idempotent: a second call for the same rename finds nothing left to move. Never throws: the
+   *  profile has already been renamed in Hermes by now, and a failed move is repaired by the
+   *  `previous_names` re-link on the next refresh. */
+  #moveBotState(from: string, to: string, why: "renamed" | "previous_names"): string[] {
+    try {
+      const rooms = this.#storage.renameBotState(
+        this.#publicName(from), this.#publicName(to), why === "renamed" ? "from" : "to",
+      );
+      if (rooms.length > 0) this.#log(`bot ${from} is now ${to} (${why}); re-linked ${rooms.length} room(s)`);
+      return rooms;
+    } catch (error) {
+      this.#log(`bot ${from} -> ${to}: moving its rooms and Bot Chat failed (${error instanceof Error ? error.message : String(error)}); the next refresh retries`);
+      return [];
+    }
   }
   /** Defense for a rename done outside the gateway (Desktop, CLI): a room member or Bot Chat
    *  binding naming a profile that no longer exists is re-linked to the ONE live profile whose
    *  Hermes `previous_names` carries it, the way upstream Desktop re-seats a stored room member
    *  (`group-membership.ts`, #110200). A name no profile claims, or more than one does, or one the
    *  gateway deleted, is left alone: the room already renders a missing member honestly. */
-  #relinkRenamed(profiles: readonly ParsedProfile[]): void {
-    if (!profiles.some((profile) => profile.previousNames !== undefined)) return;
+  #relinkRenamed(profiles: readonly ParsedProfile[]): string[] {
     const live = new Set(profiles.map((profile) => profile.name));
+    // Routine aliases: previous names no live bot holds now (`#readRoutines`).
+    this.#routineAliases.clear();
+    for (const profile of profiles) {
+      const aliases = (profile.previousNames ?? []).filter((name) => !live.has(name));
+      if (aliases.length > 0) this.#routineAliases.set(profile.name, aliases);
+    }
+    if (this.#routineAliases.size === 0) return [];
     const runtime = this.#runtimeBotNames();
     const stranded = new Set<string>();
     const consider = (name: string): void => {
@@ -1250,10 +1289,13 @@ export class HermesBridge implements BotControlSurface {
     };
     for (const room of this.#storage.botGroups()) for (const member of room.members) consider(member);
     for (const { bot } of this.#storage.canonicalBotChats()) consider(bot);
+    const rooms = new Set<string>();
     for (const old of stranded) {
       const claims = profiles.filter((profile) => profile.previousNames?.includes(old) === true);
-      if (claims.length === 1) this.#moveBotState(old, claims[0]!.name, "previous_names");
+      if (claims.length !== 1) continue;
+      for (const key of this.#moveBotState(old, claims[0]!.name, "previous_names")) rooms.add(key);
     }
+    return [...rooms];
   }
   /** Capability 82. One door for the profile operations, so a federation member and the native
    *  plane each route them with one line rather than twelve. */
@@ -1275,19 +1317,37 @@ export class HermesBridge implements BotControlSurface {
           throw new BotNameInvalid(`"${canon}" is reserved and cannot be renamed through this route`);
         const target = validateNewBotName(op.newName);
         await this.#assertBotKnown(canon);
-        const active = this.#storage.nativeBotActiveTurn(canon);
-        if (active !== undefined) throw new BotTurnActive(canon, active.turnId);
-        // A room turn in flight is addressed to the old attach identity, which the rename revokes.
-        const roomTurn = this.#storage.pendingBotGroupTurns().find((turn) => turn.member === this.#publicName(canon));
-        if (roomTurn !== undefined) throw new BotTurnActive(canon, roomTurn.turnId);
+        const assertIdle = (): void => {
+          const active = this.#storage.nativeBotActiveTurn(canon);
+          if (active !== undefined) throw new BotTurnActive(canon, active.turnId);
+          // A room turn in flight is addressed to the old attach identity, which the rename revokes.
+          const roomTurn = this.#storage.pendingBotGroupTurns().find((turn) => turn.member === this.#publicName(canon));
+          if (roomTurn !== undefined) throw new BotTurnActive(canon, roomTurn.turnId);
+        };
+        assertIdle();
         return this.#chain(canon, async () => {
-          const renamed = await renameProfile(client, canon, target);
-          // Rooms, the Bot Chat binding and routine overrides follow the bot; its 1:1 transcript
-          // does not (see `Storage.renameBotState`).
-          this.#moveBotState(canon, renamed, "renamed");
-          // The routines moved with the profile but are still tagged `[bot:<old>]`.
+          // Fence the member BEFORE the re-check, synchronously: a room drive that has not handed
+          // this bot its turn yet cannot start one now, and one already pending is refused.
+          const member = this.#publicName(canon);
+          this.#groups.beginMemberRename(member);
+          let rooms: string[];
+          let renamed: string;
           try {
-            const { failed } = await retagBotRoutines(client, canon, renamed);
+            assertIdle();
+            renamed = await renameProfile(client, canon, target);
+            // The new name may sit behind the deletion fence (a bot of that name was deleted);
+            // the rename is an explicit create of it, exactly as `#settleCreatedProfile` restores.
+            this.#storage.restoreBot(renamed);
+            // Rooms, the Bot Chat binding and routine overrides follow the bot; its 1:1 transcript
+            // does not (see `Storage.renameBotState`).
+            rooms = this.#moveBotState(canon, renamed, "renamed");
+          } finally {
+            this.#groups.endMemberRename(member);
+          }
+          // The routines moved with the profile but are still tagged `[bot:<old>]`. A failure here
+          // is retried lazily: `#readRoutines` accepts and retags a previous name's tag.
+          try {
+            const { failed } = await retagBotRoutines(client, [canon], renamed);
             if (failed.length > 0) this.#log(`bot ${renamed}: could not retag routine(s) ${failed.join(", ")}`);
           } catch (error) {
             this.#log(`bot ${renamed}: routine retag failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1296,6 +1356,8 @@ export class HermesBridge implements BotControlSurface {
           // the new name the same way it enrols a phone-created bot.
           this.#revokeAttachIdentity(canon);
           await this.refresh(`bot ${canon} renamed to ${renamed}`);
+          // After the roster frame, so a client re-seating the member already knows its row.
+          this.#groups.announceRooms(rooms);
           this.#profileChanged({ profile: renamed, change: "created" });
           const bot = this.#storage.botRoster().bots.find((row) => row.name === renamed)
             ?? this.#adoptCreatedRow(renamed, "", {});
@@ -1408,6 +1470,28 @@ export class HermesBridge implements BotControlSurface {
     // `bot_roster` carries the blob as `meta`, so every paired phone sees the write on this refresh.
     this.refreshSoon(`bot ${name} presentation`);
     return { name, presentation: written.presentation, revision: written.revision ?? 0 };
+  }
+  relayRosterSync(agents: BotRelayAgent[]): Promise<{ count: number }> {
+    return relayRosterSync(this.#client, agents);
+  }
+  #installId: Promise<string | undefined> | undefined;
+  relayInstallId(): Promise<string | undefined> {
+    // Stable for the install's life; a failed read is retried on the next ask.
+    const read = this.#installId ?? relayInstallId(this.#client);
+    this.#installId = read.then((id) => {
+      if (id === undefined) this.#installId = undefined;
+      return id;
+    });
+    return this.#installId;
+  }
+  relayDrain(): Promise<BotRelayDrainResponse> {
+    return relayDrain(this.#client);
+  }
+  relayDeliver(req: BotRelayDeliverRequest): Promise<BotRelayDeliverResponse> {
+    return relayDeliver(this.#client, req);
+  }
+  relayReply(req: BotRelayReplyRequest): Promise<{ ok: true }> {
+    return relayReply(this.#client, req);
   }
   async botAvatar(name: string): Promise<{ mime: string; bytes: Buffer } | undefined> {
     // Every row image is a GET; the cached roster answers "is this a bot" without a profiles.list.
@@ -1689,7 +1773,19 @@ export class HermesBridge implements BotControlSurface {
     }
   }
   async #readRoutines(name: string): Promise<BotRoutineList> {
-    const listed = await listBotRoutines(this.#client, name);
+    const aliases = this.#routineAliases.get(name) ?? [];
+    const aliasKey = `${name}\u0000${aliases.join(",")}`;
+    if (aliases.length > 0 && !this.#retagged.has(aliasKey)) {
+      // A rename whose retag failed, or one done outside the gateway, leaves `[bot:<old>]` jobs.
+      // Retag them now; until that succeeds the listing below still shows them.
+      try {
+        const { failed } = await retagBotRoutines(this.#client, aliases, name);
+        if (failed.length === 0) this.#retagged.add(aliasKey);
+      } catch {
+        /* the aliased listing stands; the next read retries */
+      }
+    }
+    const listed = await listBotRoutines(this.#client, name, aliases);
     const routines = listed.routines.map(
       (routine) => ({
         ...routine,

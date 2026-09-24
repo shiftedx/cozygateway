@@ -3068,15 +3068,20 @@ export class Storage {
    *  with the old name, per row 82's review: the provisioner enrols the new name afresh.
    *
    *  Settled group-turn rows keep the old agent id on purpose: they authorize late events from
-   *  the old attach identity. Returns the keys of the rooms that changed. */
-  renameBotState(from: string, to: string): string[] {
+   *  the old attach identity.
+   *
+   *  `prefer` settles a collision with state already under `to`. A gateway rename passes `from`:
+   *  `to` was free a moment ago, so anything under it is a stale leftover (a deleted bot of that
+   *  name a room still lists) and the live bot's state wins. The `previous_names` re-link passes
+   *  `to`: there `to` is a live bot, and a stale name it once had never overwrites its own state;
+   *  the stale rows are dropped instead. Returns the keys of the rooms that changed. */
+  renameBotState(from: string, to: string, prefer: "from" | "to" = "from"): string[] {
     if (from === to) return [];
     const renameKeys = <T>(record: Record<string, T> | undefined): Record<string, T> | undefined => {
       if (record === undefined || !(from in record)) return record;
       const next: Record<string, T> = {};
-      for (const [key, value] of Object.entries(record)) {
-        if (key === from) { if (!(to in record)) next[to] = value; } else next[key] = value;
-      }
+      for (const [key, value] of Object.entries(record)) if (key !== from) next[key] = value;
+      if (prefer === "from" || !(to in record)) next[to] = record[from]!;
       return next;
     };
     const changed: string[] = [];
@@ -3102,21 +3107,28 @@ export class Storage {
         }
         this.#db.prepare("UPDATE bot_groups SET members_json = ?, meta_json = ? WHERE key = ?")
           .run(JSON.stringify(members), JSON.stringify(meta), room.key);
-        // A stale row under the new name (a deleted bot of that name, or one removed earlier) yields
-        // to the live member's row, which carries its watermark and attach thread.
-        if (this.#db.prepare("SELECT 1 FROM bot_group_members WHERE group_key = ? AND member = ?").get(room.key, from) !== undefined) {
-          this.#db.prepare("DELETE FROM bot_group_members WHERE group_key = ? AND member = ?").run(room.key, to);
-          this.#db.prepare("UPDATE bot_group_members SET member = ? WHERE group_key = ? AND member = ?")
-            .run(to, room.key, from);
+        // The per-member row (watermark and attach thread) follows the same preference.
+        const rowOf = (member: string): boolean =>
+          this.#db.prepare("SELECT 1 FROM bot_group_members WHERE group_key = ? AND member = ?").get(room.key, member) !== undefined;
+        if (rowOf(from)) {
+          if (prefer === "to" && rowOf(to)) {
+            this.#db.prepare("DELETE FROM bot_group_members WHERE group_key = ? AND member = ?").run(room.key, from);
+          } else {
+            this.#db.prepare("DELETE FROM bot_group_members WHERE group_key = ? AND member = ?").run(room.key, to);
+            this.#db.prepare("UPDATE bot_group_members SET member = ? WHERE group_key = ? AND member = ?")
+              .run(to, room.key, from);
+          }
         }
         changed.push(room.key);
       }
+      const conflict = prefer === "from" ? "REPLACE" : "IGNORE";
       this.#db.prepare(
-        `INSERT OR REPLACE INTO bot_canonical_chats (bot, hermes_session_id, updated_at)
+        `INSERT OR ${conflict} INTO bot_canonical_chats (bot, hermes_session_id, updated_at)
          SELECT ?, hermes_session_id, updated_at FROM bot_canonical_chats WHERE bot = ?`,
       ).run(to, from);
       this.#db.prepare("DELETE FROM bot_canonical_chats WHERE bot = ?").run(from);
-      this.#db.prepare("UPDATE OR REPLACE bot_routine_overrides SET bot = ? WHERE bot = ?").run(to, from);
+      this.#db.prepare(`UPDATE OR ${conflict} bot_routine_overrides SET bot = ? WHERE bot = ?`).run(to, from);
+      this.#db.prepare("DELETE FROM bot_routine_overrides WHERE bot = ?").run(from);
       this.#db.exec("COMMIT");
     } catch (err) {
       this.#db.exec("ROLLBACK");
@@ -3132,10 +3144,12 @@ export class Storage {
   }
 
   /** The room and member whose gateway-owned attach thread this is. */
-  botGroupMemberBySession(sessionId: string): { key: string; member: string } | undefined {
+  botGroupMemberBySession(sessionId: string, member: string): { key: string; member: string } | undefined {
+    // By member too: a renamed member keeps its thread id (`group:<key>:<old name>`), so a new bot
+    // later given the old name in the same room derives the very same id.
     return this.#db.prepare(
-      "SELECT group_key AS key, member FROM bot_group_members WHERE session_id = ? LIMIT 1",
-    ).get(sessionId) as { key: string; member: string } | undefined;
+      "SELECT group_key AS key, member FROM bot_group_members WHERE session_id = ? AND member = ? LIMIT 1",
+    ).get(sessionId, member) as { key: string; member: string } | undefined;
   }
 
   /** Stop: every pending turn of the room is cancelled, the same shape `deleteBotGroup` uses. */
