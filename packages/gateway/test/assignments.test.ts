@@ -104,6 +104,14 @@ describe("assign", () => {
     expect(() => h.room.assign("lead", request)).toThrow(expect.objectContaining({ reason: "assignee_busy" }));
   });
 
+  it("leaves nothing behind when the attach transport refuses the turn", () => {
+    const h = harness({ silent: true });
+    h.room.setNativeTurns({ sendNativeTurn: () => false });
+    expect(() => h.room.assign("lead", request)).toThrow(expect.objectContaining({ reason: "assignee_unavailable" }));
+    expect(h.storage.botAssignments()).toHaveLength(0);
+    expect(h.storage.tasks.list()).toHaveLength(0);
+  });
+
   it("answers a repeated delivery with the same Task", () => {
     const h = harness({ silent: true });
     const first = h.room.assign("lead", { ...request, idempotencyKey: "k1" });

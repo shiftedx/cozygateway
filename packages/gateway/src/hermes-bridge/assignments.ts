@@ -183,7 +183,8 @@ export class AssignmentRooms {
           task: { id: taskId, assignedBy: leader, brief: request.brief, doneCriteria: request.doneCriteria, deadlineAt, ...(outputFormat === undefined ? {} : { outputFormat }) },
         },
       });
-      if (!sent || this.#storage.tasks.run(to, turnId)?.taskId !== taskId) refuse("assignee_unavailable");
+      // A refused enqueue wrote nothing, so the rollback is complete.
+      if (!sent) refuse("assignee_unavailable");
     });
     const row = this.#storage.botAssignment(taskId)!;
     this.#emit(row);
