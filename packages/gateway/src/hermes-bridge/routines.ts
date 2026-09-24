@@ -303,10 +303,11 @@ export function cronJobsOf(result: unknown): CronJob[] {
 /** Jobs owned by the bot profile requested from `cron.manage`: its tagged routines and its older,
  *  untagged cron jobs. A malformed or foreign tag is still somebody else's ownership claim and is
  *  therefore excluded rather than adopted as an existing cron. */
-export function selectRoutineJobs(jobs: readonly CronJob[], bot: string): CronJob[] {
+export function selectRoutineJobs(jobs: readonly CronJob[], bot: string, aliases: readonly string[] = []): CronJob[] {
   return jobs.filter((job) => {
     const owner = routineBot(job);
-    return owner === bot || (owner === null && !BOT_TAG_CLAIM_RE.test(asString(job.name) ?? ""));
+    return owner === bot || (owner !== null && aliases.includes(owner))
+      || (owner === null && !BOT_TAG_CLAIM_RE.test(asString(job.name) ?? ""));
   });
 }
 
@@ -345,10 +346,17 @@ export interface RoutineListResult {
  *  stored prompts from the dashboard (`GET /api/cron/jobs?profile=`) and unwraps the instruction
  *  the user wrote, so an editor can show and edit the whole thing. That read is best effort: when
  *  it fails the preview stays, exactly as before. */
-export async function listBotRoutines(port: HermesRoutinesPort, bot: string): Promise<RoutineListResult> {
+export async function listBotRoutines(
+  port: HermesRoutinesPort,
+  bot: string,
+  /** Names this bot was renamed from that no live bot holds now (Hermes's `previous_names`). A job
+   *  still tagged with one of them is this bot's, left behind by a rename whose retag failed or
+   *  that happened outside the gateway. */
+  aliases: readonly string[] = [],
+): Promise<RoutineListResult> {
   const result = await port.request("cron.manage", { action: "list", include_disabled: true, profile: bot });
   readCronReply("list", result);
-  const jobs = selectRoutineJobs(cronJobsOf(result), bot);
+  const jobs = selectRoutineJobs(cronJobsOf(result), bot, aliases);
   const full = await fullPrompts(port, bot, jobs.length);
   const running = asRecord(result)?.["gateway_running"];
   return {
@@ -589,6 +597,47 @@ export async function createBotRoutine(
     throw new RoutineUnconfirmed(createdId, err instanceof Error ? err.message : String(err));
   }
   return { ...mapRoutine(stored), prompt: instruction };
+}
+
+/** A bot's profile was renamed. Its cron jobs moved with the profile directory, but their names
+ *  still carry `[bot:<from>]`, which `selectRoutineJobs` reads as another bot's claim, so every
+ *  routine would vanish from the new name. Hermes's own rename does not touch job names (the
+ *  namespace is Bot Mode's, and this gateway is the one place it is written, `routineJobName`), so
+ *  the gateway rewrites them: the tag and, for a job carrying the gateway's delegation wrapper, the
+ *  prompt, whose `hermes -p <bot>` would otherwise name a profile that no longer exists.
+ *
+ *  Best effort per job: a failure is returned by id rather than thrown, since the rename itself
+ *  has already happened and a job left behind is still visible in Hermes's Cron view. */
+export async function retagBotRoutines(
+  port: HermesRoutinesPort,
+  from: readonly string[],
+  to: string,
+): Promise<{ retagged: string[]; failed: string[] }> {
+  const retagged: string[] = [];
+  const failed: string[] = [];
+  const jobs = (await listCronStore(port, to)).filter((job) => {
+    const owner = routineBot(job);
+    return owner !== null && owner !== to && from.includes(owner);
+  });
+  if (jobs.length === 0) return { retagged, failed };
+  const call = dashboard(port, "retag");
+  for (const job of jobs) {
+    const id = asString(job.job_id) ?? "";
+    if (id.length === 0) continue;
+    try {
+      const title = routineTitle(job);
+      const updates: Record<string, unknown> = { name: routineJobName(to, title) };
+      const stored = asString(asRecord(await call<unknown>(cronJobPath(id, to)))?.["prompt"]);
+      if (stored?.startsWith(SAFE_ROUTINE_MARKER) === true) {
+        updates["prompt"] = routinePrompt({ bot: to, title, instruction: routineInstruction(stored) });
+      }
+      await call(cronJobPath(id, to), { method: "PUT", body: { updates } });
+      retagged.push(id);
+    } catch {
+      failed.push(id);
+    }
+  }
+  return { retagged, failed };
 }
 
 /** Deletes a tagged routine. An id outside this bot's namespace is a 404, never a delete. */

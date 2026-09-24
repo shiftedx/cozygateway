@@ -3053,6 +3053,90 @@ export class Storage {
     this.#db.prepare("UPDATE bot_groups SET name = ? WHERE key = ?").run(name, key);
   }
 
+  /** A bot's profile was renamed (row 82, or outside the gateway and re-linked through Hermes's
+   *  `previous_names`). Moves, in ONE transaction, the bot-keyed state that belongs to the bot
+   *  rather than to one conversation:
+   *
+   *  - room membership: `members_json`, the per-member row (watermark and attach thread, whose
+   *    Hermes session lives in the profile directory and so moved with it), and the member-keyed
+   *    room meta (`marks`, `holds`, `held`). The transcript's author names stay as written;
+   *  - the canonical Bot Chat binding (`bot_canonical_chats`): the Hermes session moved with the
+   *    profile directory, so the binding still names it;
+   *  - routine overrides (`bot_routine_overrides`): keyed by cron job id, and the jobs moved too.
+   *
+   *  The 1:1 transcript and everything hanging off it (reactions, receipts, drafts, grants) stay
+   *  with the old name, per row 82's review: the provisioner enrols the new name afresh.
+   *
+   *  Settled group-turn rows keep the old agent id on purpose: they authorize late events from
+   *  the old attach identity.
+   *
+   *  `prefer` settles a collision with state already under `to`. A gateway rename passes `from`:
+   *  `to` was free a moment ago, so anything under it is a stale leftover (a deleted bot of that
+   *  name a room still lists) and the live bot's state wins. The `previous_names` re-link passes
+   *  `to`: there `to` is a live bot, and a stale name it once had never overwrites its own state;
+   *  the stale rows are dropped instead. Returns the keys of the rooms that changed. */
+  renameBotState(from: string, to: string, prefer: "from" | "to" = "from"): string[] {
+    if (from === to) return [];
+    const renameKeys = <T>(record: Record<string, T> | undefined): Record<string, T> | undefined => {
+      if (record === undefined || !(from in record)) return record;
+      const next: Record<string, T> = {};
+      for (const [key, value] of Object.entries(record)) if (key !== from) next[key] = value;
+      if (prefer === "from" || !(to in record)) next[to] = record[from]!;
+      return next;
+    };
+    const changed: string[] = [];
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const room of this.botGroups()) {
+        // A member removed earlier leaves its row behind (harmless), so the list is the test.
+        if (!room.members.includes(from)) continue;
+        const members: string[] = [];
+        for (const member of room.members) {
+          const next = member === from ? to : member;
+          if (!members.includes(next)) members.push(next);
+        }
+        const meta: BotGroupMeta = { ...room.meta };
+        const holds = renameKeys(meta.holds);
+        if (holds !== undefined) meta.holds = holds;
+        const held = renameKeys(meta.held);
+        if (held !== undefined) meta.held = held;
+        if (meta.marks !== undefined) {
+          meta.marks = Object.fromEntries(
+            Object.entries(meta.marks).map(([thread, byMember]) => [thread, renameKeys(byMember) ?? byMember]),
+          );
+        }
+        this.#db.prepare("UPDATE bot_groups SET members_json = ?, meta_json = ? WHERE key = ?")
+          .run(JSON.stringify(members), JSON.stringify(meta), room.key);
+        // The per-member row (watermark and attach thread) follows the same preference.
+        const rowOf = (member: string): boolean =>
+          this.#db.prepare("SELECT 1 FROM bot_group_members WHERE group_key = ? AND member = ?").get(room.key, member) !== undefined;
+        if (rowOf(from)) {
+          if (prefer === "to" && rowOf(to)) {
+            this.#db.prepare("DELETE FROM bot_group_members WHERE group_key = ? AND member = ?").run(room.key, from);
+          } else {
+            this.#db.prepare("DELETE FROM bot_group_members WHERE group_key = ? AND member = ?").run(room.key, to);
+            this.#db.prepare("UPDATE bot_group_members SET member = ? WHERE group_key = ? AND member = ?")
+              .run(to, room.key, from);
+          }
+        }
+        changed.push(room.key);
+      }
+      const conflict = prefer === "from" ? "REPLACE" : "IGNORE";
+      this.#db.prepare(
+        `INSERT OR ${conflict} INTO bot_canonical_chats (bot, hermes_session_id, updated_at)
+         SELECT ?, hermes_session_id, updated_at FROM bot_canonical_chats WHERE bot = ?`,
+      ).run(to, from);
+      this.#db.prepare("DELETE FROM bot_canonical_chats WHERE bot = ?").run(from);
+      this.#db.prepare(`UPDATE OR ${conflict} bot_routine_overrides SET bot = ? WHERE bot = ?`).run(to, from);
+      this.#db.prepare("DELETE FROM bot_routine_overrides WHERE bot = ?").run(from);
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+    return changed;
+  }
+
   /** New members get their deterministic thread; a removed member's row stays (harmless). */
   setBotGroupMembers(key: string, members: string[]): void {
     this.#db.prepare("UPDATE bot_groups SET members_json = ? WHERE key = ?").run(JSON.stringify(members), key);
@@ -3060,10 +3144,12 @@ export class Storage {
   }
 
   /** The room and member whose gateway-owned attach thread this is. */
-  botGroupMemberBySession(sessionId: string): { key: string; member: string } | undefined {
+  botGroupMemberBySession(sessionId: string, member: string): { key: string; member: string } | undefined {
+    // By member too: a renamed member keeps its thread id (`group:<key>:<old name>`), so a new bot
+    // later given the old name in the same room derives the very same id.
     return this.#db.prepare(
-      "SELECT group_key AS key, member FROM bot_group_members WHERE session_id = ? LIMIT 1",
-    ).get(sessionId) as { key: string; member: string } | undefined;
+      "SELECT group_key AS key, member FROM bot_group_members WHERE session_id = ? AND member = ? LIMIT 1",
+    ).get(sessionId, member) as { key: string; member: string } | undefined;
   }
 
   /** Stop: every pending turn of the room is cancelled, the same shape `deleteBotGroup` uses. */

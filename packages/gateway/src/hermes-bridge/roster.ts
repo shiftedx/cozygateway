@@ -35,6 +35,9 @@ export interface ParsedProfile {
   metaRevision?: number;
   /** Capability 81: a short hash of the avatar asset's bytes, when the bridge has read it. */
   avatarFingerprint?: string;
+  /** The names this profile was renamed from (Hermes's `previous_names`, oldest first), lowercased.
+   *  Absent when there are none. Room membership re-links through it. */
+  previousNames?: string[];
 }
 
 /** Pulls the bot blob out of the current `ui_meta["hermes-bots"]` namespace. */
@@ -114,7 +117,17 @@ export function parseProfileRow(row: unknown): ParsedProfile | undefined {
         : null,
     preview: asString(lastSession?.["preview"]) ?? null,
     metaRevision: metaRevision(record["ui_meta_revisions"]),
+    ...previousNames(record["previous_names"]),
   };
+}
+
+function previousNames(raw: unknown): { previousNames?: string[] } {
+  if (!Array.isArray(raw)) return {};
+  const names = raw.flatMap((entry) => {
+    const name = typeof entry === "string" ? entry.trim().toLowerCase() : "";
+    return name.length === 0 ? [] : [name];
+  });
+  return names.length === 0 ? {} : { previousNames: names };
 }
 
 function metaRevision(revisions: unknown): number {
