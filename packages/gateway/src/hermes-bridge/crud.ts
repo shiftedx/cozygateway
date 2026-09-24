@@ -8,6 +8,9 @@ export const RESERVED_PROFILE_NAMES = new Set([
   "tmp",
   "root",
   "sudo",
+  // Hermes resolves `current` to the launch profile (hermes_cli.profiles), so a bot of that name
+  // would be addressed as a different one by every profile-scoped route.
+  "current",
 ]);
 
 /** An unusable profile identity supplied in a route or group membership. */

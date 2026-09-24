@@ -45,6 +45,8 @@ import type {
   BotTurnToolSteps,
   BotTurnDelegations,
   BridgeLiveness,
+  BotIdentityPatch,
+  BotModelPinRequest,
   ServerFrame,
 } from "cozygateway-contract";
 import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
@@ -110,6 +112,24 @@ import {
   type RoutineWriteResult,
 } from "./routines.ts";
 import { readBotModelConfig, writeBotModelConfig } from "./model-config.ts";
+import {
+  ProfileOpInvalid,
+  copyBotLook,
+  describeProfileAuto,
+  disconnectProvider,
+  exportProfileArchive,
+  freeDuplicateName,
+  importProfileArchive,
+  installHubSkill,
+  listProviderKeys,
+  pinProfileModel,
+  readProfileModelPin,
+  renameProfile,
+  saveProviderKey,
+  searchSkillsHub,
+  setBotIdentity,
+  unpinProfileModel,
+} from "./profile-ops.ts";
 import {
   cancelProviderOAuth,
   deleteProviderSetupField,
@@ -238,8 +258,27 @@ export class BotSessionConflict extends Error {
   }
 }
 
+/** Capability 82: one profile operation on a Hermes-backed bot (`profile-ops.ts`). */
+export type BotProfileOp =
+  | { kind: "identity"; patch: BotIdentityPatch }
+  | { kind: "rename"; newName: string }
+  | { kind: "describeAuto"; overwrite: boolean }
+  | { kind: "duplicate"; newName?: string; avoid?: readonly string[] }
+  | { kind: "export" }
+  | { kind: "import"; archive: ReadableStream<Uint8Array> | null }
+  | { kind: "modelPin" }
+  | { kind: "pinModel"; request: BotModelPinRequest }
+  | { kind: "unpinModel" }
+  | { kind: "providerKeys" }
+  | { kind: "saveProviderKey"; provider: string; apiKey: string }
+  | { kind: "disconnectProvider"; provider: string }
+  | { kind: "skillsHubSearch"; query: string }
+  | { kind: "skillsHubInstall"; identifier: string };
+
 export interface BotControlSurface {
   roster(): BotRosterView;
+  /** Capability 82. The result's shape is the route's own; a `bot` member is a roster row. */
+  profileOp?(name: string, op: BotProfileOp): Promise<unknown>;
   createBot(input: BotCreateRequest): Promise<BotCreateResponse>;
   deleteBot(name: string, opts?: { force?: boolean }): Promise<BotDeleteResponse>;
   health(): BridgeLiveness;
@@ -699,22 +738,43 @@ export class HermesBridge implements BotControlSurface {
   }
   async createBot(input: BotCreateRequest): Promise<BotCreateResponse> {
     const name = validateNewBotName(input.name);
+    const cloneFrom = input.cloneFrom === undefined ? undefined : normalizeProfileName(input.cloneFrom);
+    // Capability 82: "Share keys & accounts" is on unless the person turned it off, which is the
+    // only create any client below 82 ever sent (`share_auth: true`, keys mirrored by default).
+    const shareKeys = input.shareKeys !== false;
     try {
       await this.#client.request("profiles.create", {
         name,
         description: input.description?.trim() ?? "",
-        share_auth: true,
+        share_auth: shareKeys,
+        ...(shareKeys ? {} : { mirror_credentials: false }),
+        ...(cloneFrom === undefined ? {} : { clone_from: cloneFrom }),
+        ...(input.cloneAll === true ? { clone_all: true } : {}),
+        ...(input.noSkills === true ? { no_skills: true } : {}),
       });
     } catch (error) {
       if (
         error instanceof HermesRpcError &&
-        (error.code === 4062 || /already exists|file exists/i.test(error.message))
+        (/already exists|file exists/i.test(error.message) ||
+          (error.code === 4062 && cloneFrom === undefined && input.noSkills !== true))
       ) {
         throw new BotNameTaken(name);
       }
+      // A missing clone source or `no_skills` beside a clone: Hermes' own sentence says which.
+      if (error instanceof HermesRpcError && error.code === 4062) throw new ProfileOpInvalid(error.message);
       throw error;
     }
-
+    // A clone brings the source's skills and toolsets, and that is the point of it: the blank
+    // slate is for a bot starting from nothing.
+    return this.#settleCreatedProfile(name, input, cloneFrom === undefined);
+  }
+  /** Everything after Hermes accepted a new profile, shared by a create, a duplicate and an
+   *  import: restore, the attach-enrolling seed, the title, the roster row and the provisioner. */
+  async #settleCreatedProfile(
+    name: string,
+    input: BotCreateRequest,
+    blankSlate: boolean,
+  ): Promise<BotCreateResponse> {
     this.#storage.restoreBot(name);
 
     // The profile exists from here on. Metadata is best-effort decoration, but the idempotent seed
@@ -731,6 +791,7 @@ export class HermesBridge implements BotControlSurface {
     this.#storage.savePendingHermesProfileSeed({
       profile: name,
       selection,
+      ...(blankSlate ? {} : { blankSlate: false }),
       attempts: 1,
       nextAttemptAt: this.#now() + this.#seedRetryDelay(1),
     });
@@ -739,7 +800,7 @@ export class HermesBridge implements BotControlSurface {
     // (issue #183), so there is no configuration under which skipping this pass is correct.
     try {
       const seed = await this.#chain(name, () => seedBlankSlateProfile(this.#client, name, {
-        blankSlate: this.#seedBlankSlateBots,
+        blankSlate: this.#seedBlankSlateBots && blankSlate,
         selection,
         skillsOn: this.#blankSlateSkillsOn,
       }));
@@ -774,6 +835,7 @@ export class HermesBridge implements BotControlSurface {
       this.#storage.savePendingHermesProfileSeed({
         profile: name,
         selection,
+        ...(blankSlate ? {} : { blankSlate: false }),
         attempts: 1,
         nextAttemptAt: this.#now() + this.#seedRetryDelay(1),
       });
@@ -869,7 +931,7 @@ export class HermesBridge implements BotControlSurface {
       if (row === undefined || this.#closed) return;
       try {
         const seed = await seedBlankSlateProfile(this.#client, profile, {
-          blankSlate: this.#seedBlankSlateBots,
+          blankSlate: this.#seedBlankSlateBots && row.blankSlate !== false,
           selection: row.selection,
           skillsOn: this.#blankSlateSkillsOn,
         });
@@ -896,6 +958,7 @@ export class HermesBridge implements BotControlSurface {
         this.#storage.savePendingHermesProfileSeed({
           profile,
           selection: row.selection,
+          ...(row.blankSlate === false ? { blankSlate: false } : {}),
           attempts,
           nextAttemptAt: this.#now() + this.#seedRetryDelay(attempts),
         });
@@ -1085,6 +1148,92 @@ export class HermesBridge implements BotControlSurface {
       await this.#client.request("profiles.list", { include_sessions: false }),
     );
     return new Set(profiles.map((profile) => profile.name));
+  }
+  /** Capability 82. One door for the profile operations, so a federation member and the native
+   *  plane each route them with one line rather than twelve. */
+  async profileOp(name: string, op: BotProfileOp): Promise<unknown> {
+    const client = this.#client;
+    // Hermes resolves the profile name `current` to the launch profile, so an env or hub call
+    // addressed to it would change a different bot. It is reserved for new names too (crud.ts).
+    if (normalizeProfileName(name) === "current")
+      throw new BotNameInvalid(`"current" names the launch profile in Hermes and cannot be operated on here`);
+    switch (op.kind) {
+      case "import": {
+        const target = validateNewBotName(name);
+        const imported = await importProfileArchive(client, target, op.archive);
+        return this.#settleCreatedProfile(imported, { name: imported }, false);
+      }
+      case "rename": {
+        const canon = normalizeProfileName(name);
+        if (RESERVED_PROFILE_NAMES.has(canon))
+          throw new BotNameInvalid(`"${canon}" is reserved and cannot be renamed through this route`);
+        const target = validateNewBotName(op.newName);
+        await this.#assertBotKnown(canon);
+        const active = this.#storage.nativeBotActiveTurn(canon);
+        if (active !== undefined) throw new BotTurnActive(canon, active.turnId);
+        return this.#chain(canon, async () => {
+          const renamed = await renameProfile(client, canon, target);
+          // The old attach identity names a profile that no longer exists; the provisioner enrols
+          // the new name the same way it enrols a phone-created bot.
+          this.#revokeAttachIdentity(canon);
+          await this.refresh(`bot ${canon} renamed to ${renamed}`);
+          this.#profileChanged({ profile: renamed, change: "created" });
+          const bot = this.#storage.botRoster().bots.find((row) => row.name === renamed)
+            ?? this.#adoptCreatedRow(renamed, "", {});
+          return { bot };
+        });
+      }
+      case "duplicate": {
+        await this.#assertBotKnown(name);
+        const target = op.newName === undefined
+          ? await freeDuplicateName(client, name, op.avoid)
+          : validateNewBotName(op.newName);
+        const source = this.#storage.botRoster().bots.find((row) => row.name === name);
+        const created = await this.createBot({
+          name: target,
+          cloneFrom: name,
+          cloneAll: true,
+          ...(source?.description ? { description: source.description } : {}),
+        });
+        await copyBotLook(client, name, target);
+        await this.refresh(`bot ${target} duplicated from ${name}`);
+        const bot = this.#storage.botRoster().bots.find((row) => row.name === target) ?? created.bot;
+        return { ...created, bot };
+      }
+      default:
+        break;
+    }
+    await this.#assertBotKnown(name);
+    switch (op.kind) {
+      case "identity": {
+        const identity = await this.#chain(name, () => setBotIdentity(client, name, op.patch));
+        this.refreshSoon(`bot ${name} identity`);
+        return identity;
+      }
+      case "describeAuto": {
+        const described = await describeProfileAuto(client, name, op.overwrite);
+        this.refreshSoon(`bot ${name} described`);
+        return described;
+      }
+      case "export":
+        return exportProfileArchive(client, name);
+      case "modelPin":
+        return readProfileModelPin(client, name);
+      case "pinModel":
+        return this.#chain(name, () => pinProfileModel(client, name, op.request));
+      case "unpinModel":
+        return this.#chain(name, () => unpinProfileModel(client, name));
+      case "providerKeys":
+        return listProviderKeys(client, name);
+      case "saveProviderKey":
+        return this.#chain(name, () => saveProviderKey(client, name, op.provider, op.apiKey));
+      case "disconnectProvider":
+        return this.#chain(name, () => disconnectProvider(client, name, op.provider));
+      case "skillsHubSearch":
+        return searchSkillsHub(client, name, op.query);
+      case "skillsHubInstall":
+        return this.#chain(name, () => installHubSkill(client, name, op.identifier));
+    }
   }
   async botProfile(name: string): Promise<BotProfile> {
     await this.#assertBotKnown(name);

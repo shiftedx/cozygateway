@@ -385,6 +385,7 @@ type NativeRowOverlay = Pick<
  * about a profile that does not exist and answer 404. Chat, readiness and desktop-session methods
  * are absent on purpose: the native plane owns those for every bot it handles. */
 const DASHBOARD_ONLY: ReadonlySet<string> = new Set([
+  "profileOp",
   "botProfile",
   "configureProfile",
   "botPresentation",
@@ -593,6 +594,23 @@ export class NativeBotDataPlane {
         }
         return this.#control.createBot(input);
       },
+      // Capability 82. A rename, a duplicate or an import names a NEW Hermes profile, and the
+      // proxy guard only looks at the bot being operated on. Unguarded, a Hermes profile could take
+      // a runtime bot's name and then be hidden by the roster filter, the orphan `createBot` guards
+      // against above.
+      profileOp: async (name, op) => {
+        if (this.#control.profileOp === undefined) throw new BackendUnavailable("this gateway has no Hermes profile operations");
+        const taken = (candidate: string | undefined): void => {
+          if (candidate !== undefined && this.#runtimeBots.has(normalize(candidate))) throw new BotNameTaken(normalize(candidate));
+        };
+        if (op.kind === "import") taken(name);
+        if (op.kind === "rename") taken(op.newName);
+        if (op.kind === "duplicate") {
+          taken(op.newName);
+          return this.#control.profileOp(name, { ...op, avoid: [...this.#runtimeBots.keys()] });
+        }
+        return this.#control.profileOp(name, op);
+      },
       // Capability 49. A gateway-owned runtime bot is deletable here rather than 409: its identity
       // is revoked, its rows are purged, and the runner is handed a `delete_runtime`. A runtime bot
       // this gateway does NOT own (a config-declared capability-45 one) keeps the refusal, because
@@ -660,6 +678,9 @@ export class NativeBotDataPlane {
         // not own. Rejected rather than thrown: every guarded method returns a promise.
         return (...args: unknown[]) => {
           const name = typeof args[0] === "string" ? normalize(args[0]) : undefined;
+          // An import's name is the NEW bot's, not one being operated on: the override answers it.
+          if (property === "profileOp" && (args[1] as { kind?: string } | undefined)?.kind === "import")
+            return bound(...args);
           const runtimeBot = name === undefined ? undefined : this.#runtimeBots.get(name);
           if ((property === "modelConfig" || property === "configureModel") && name !== undefined && runtimeBot === undefined && this.#botConfig !== undefined
               && this.#ingress.negotiatedCapabilities?.(name)?.has("provider_connections")) {
