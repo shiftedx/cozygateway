@@ -1026,6 +1026,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `POST /assignments/:taskId/acknowledge` | `AssignmentAcknowledgeRequest` | `AssignmentView` | agent-inbox 1. A device or the leader's attach bearer. Valid only from `verifying`, else `409 assignment_refused` with `reason: "not_verifying"`. |
 | `GET /bots/:name/inbox` | — | `BotInboxResponse` | agent-inbox 1. One thread per assignment `:name` leads or answers. Device only. |
 | `GET /bots/:name/inbox/:threadId/messages` | — | `BotInboxMessagesResponse` | agent-inbox 1. The leader's brief and the assignee's reply. `404` for a thread that is not `:name`'s. Device only. |
+| `GET /bots/:name/team` | — | `BotTeam` | agent-inbox 1. `{role, reports}`, `{role: "member", reports: []}` when the bot leads nothing. A device, or `:name`'s own attach bearer; another bot's bearer is `403`. This is how a runtime peer learns its role: the config lane never carries `role` or `reports`. |
 | `GET /bots/:name/presentation` | — | `BotPresentationResponse` | Capability 80. The synced roster presentation from `ui_meta["hermes-bots"]`. |
 | `PATCH /bots/:name/presentation` | `BotPresentationPatch` | `BotPresentationResponse` | Capability 80. Compare-and-swap write of only the patched keys; `409 conflict` after three lost races. |
 | `GET /bots/:name/avatar` | — | image bytes | Capability 81. The profile's avatar asset, or `404`. |
@@ -1798,6 +1799,9 @@ client joins it to `GET /bots/:name/assignments` by `threadId`. Its messages use
 
 A bot that is not a live party gets the same `404` from `GET /assignments/:taskId` as for a Task
 that does not exist.
+
+`GET /bots/:name/team` is the one read a runtime peer needs to know whether it leads: the config
+lane never carries `role` or `reports`, so a peer asks here with its own attach bearer.
 
 **Frame.** `bot_inbox_activity` `{bot, threadId, updatedAt, taskId, state}` is sent once per live
 participant whenever an assignment may have moved: on assign, cancel, acknowledgement, the

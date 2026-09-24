@@ -1,6 +1,6 @@
 import { type Static, Type } from "@sinclair/typebox";
 
-import { BotGroupMessageSchema } from "./ext-bots.ts";
+import { BotGroupMessageSchema, BotTeamRoleSchema } from "./ext-bots.ts";
 
 /** Capability `com.cozylabs.agent-inbox` 1: leader assignments. An assignment wraps one
  * capability-64 Task and is addressed by that Task's own id, so one `taskId` names the work in
@@ -91,6 +91,15 @@ export const AssignmentCancelRequestSchema = Type.Object({
   reason: Type.Optional(Type.String({ maxLength: 1024 })),
 }, { additionalProperties: false });
 export type AssignmentCancelRequest = Static<typeof AssignmentCancelRequestSchema>;
+
+/** `GET /bots/:name/team`: the one read a runtime peer needs to know whether it leads, since the
+ * config lane never carries `role` or `reports` (they are gateway-owned). `{role: "member",
+ * reports: []}` when the gateway holds no team row for the bot. */
+export const BotTeamSchema = Type.Object({
+  role: BotTeamRoleSchema,
+  reports: Type.Array(Name, { maxItems: 16 }),
+});
+export type BotTeam = Static<typeof BotTeamSchema>;
 
 /** `GET /bots/:name/inbox`: one thread per assignment the bot leads or answers. The thread carries
  * no state of its own; a client joins it to `GET /bots/:name/assignments` by `threadId`. */

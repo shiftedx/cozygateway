@@ -29,7 +29,9 @@ is one durable Task under one id, with a deadline (30 minutes by default, 4 hour
 report's parsed `Result:` block, and the leader's acknowledgement. Caps are 8 open assignments per
 leader, 1 per report, and 16 reports. The Agent Inbox returns as `com.cozylabs.agent-inbox` 1,
 backed by these assignment rows (ADR 0082 is superseded), so the phone can read every assignment
-thread. Nothing changes for an install until a bot is made a leader.
+thread. A runtime peer learns whether it leads with its own attach bearer over the new
+`GET /bots/:name/team`, since the config lane never carries `role` or `reports`. Nothing changes
+for an install until a bot is made a leader.
 
 ## 0.8.6 (2026-09-19): Hermes gateway identity
 

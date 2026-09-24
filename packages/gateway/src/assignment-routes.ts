@@ -67,6 +67,16 @@ export function registerAssignmentRoutes(
 
   // A bot that is not a party gets the same answer as for a Task that does not exist, so the
   // route cannot be used to probe other teams' Task ids.
+  // The one read a runtime peer needs to know whether it leads: the config lane never carries
+  // role or reports (they are gateway-owned), so a peer asks here with its own bearer.
+  app.get("/bots/:name/team", either, (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const agent = peerOf(c);
+    if (agent !== undefined && agent !== resolved.name) return forbidden(c);
+    return c.json(assignments.team(resolved.name) ?? { role: "member", reports: [] });
+  });
+
   app.get("/assignments/:taskId", either, (c) => {
     const taskId = c.req.param("taskId");
     const agent = peerOf(c);

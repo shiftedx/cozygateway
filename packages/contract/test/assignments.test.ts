@@ -10,6 +10,7 @@ import {
   AssignmentViewSchema,
   BotInboxActivityFrameSchema,
   BotInboxThreadSchema,
+  BotTeamSchema,
   ServerFrameSchema,
   check,
 } from "../src/index.ts";
@@ -51,5 +52,12 @@ describe("agent-inbox 1 assignment boundary", () => {
     expect(check(ServerFrameSchema, frame)).toBe(true);
     expect(check(BotInboxThreadSchema, { id: "assignment:t1", peers: ["lead", "scout"], startedAt: 1, lastActiveAt: 2, preview: "Check CI", messageCount: 2 })).toBe(true);
     expect(check(BotInboxThreadSchema, { id: "assignment:t1", peers: ["lead"], startedAt: 1, lastActiveAt: 2, preview: "", messageCount: 0 })).toBe(false);
+  });
+
+  it("publishes the team read: role plus at most sixteen reports", () => {
+    expect(check(BotTeamSchema, { role: "leader", reports: ["scout"] })).toBe(true);
+    expect(check(BotTeamSchema, { role: "member", reports: [] })).toBe(true);
+    expect(check(BotTeamSchema, { role: "boss", reports: [] })).toBe(false);
+    expect(check(BotTeamSchema, { role: "leader", reports: Array.from({ length: 17 }, (_, i) => `b${i}`) })).toBe(false);
   });
 });

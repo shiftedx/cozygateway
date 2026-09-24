@@ -129,4 +129,13 @@ describe("assignment routes", () => {
     expect(await (await h.device(`/assignments/${second.taskId}/cancel`, post({ reason: "changed plans" }))).json()).toMatchObject({ state: "queued", cancelledBy: "user" });
     expect((await h.device("/assignments/no-such/cancel", post({}))).status).toBe(404);
   });
+
+  it("answers a bot its own team over its attach bearer, and a member with an empty team", async () => {
+    const h = await setup();
+    expect(await (await h.peer("lead", "/bots/lead/team")).json()).toEqual({ role: "leader", reports: ["scout", "sage"] });
+    expect(await (await h.peer("scout", "/bots/scout/team")).json()).toEqual({ role: "member", reports: [] });
+    expect((await h.peer("scout", "/bots/lead/team")).status).toBe(403);
+    expect((await h.device("/bots/lead/team")).status).toBe(200);
+    expect((await h.app.request("/bots/lead/team")).status).toBe(401);
+  });
 });
