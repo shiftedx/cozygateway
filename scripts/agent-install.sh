@@ -724,18 +724,24 @@ ensure_replace_backup_dir() {
 # profile .env from it, so re-homing starts by stopping the profile. It is left
 # stopped: `ensure_hermes_gateways` starts it again once the new plugin, config
 # and env are all in place, and only then does it read the new target.
+#
+# A profile a multiplexed host serves is the exception. Stopping it would stop
+# every bot on the host; the host rebuilds a served profile from its files, so
+# it keeps running, and a live adapter whose keys change gets the one host
+# restart at the end instead (ensure_host_gateway).
 stop_profile_gateway() {
-  local profile="$1" target state what
-  # A profile the multiplexed host serves is loaded in the host process, so the host is what stops.
-  target="$(lifecycle_profile "$profile")"
-  what="the Hermes gateway for profile $profile"
-  [ "$target" = "$profile" ] || what="the host Hermes gateway (it serves profile $profile)"
-  if [ "$DRY_RUN" = 1 ]; then say "DRY   stop $what before changing its CozyGateway keys"; return; fi
-  state="$(gateway_state "$target")"
+  local profile="$1" state
+  if served_by_host "$profile"; then
+    if [ "$DRY_RUN" = 1 ]; then say "DRY   keep the host Hermes gateway running while profile $profile's CozyGateway keys change"; return; fi
+    record_profile_change "$profile"
+    return 0
+  fi
+  if [ "$DRY_RUN" = 1 ]; then say "DRY   stop the Hermes gateway for profile $profile before changing its CozyGateway keys"; return; fi
+  state="$(gateway_state "$profile")"
   [ "$state" = running ] || return 0
-  "$HERMES_BIN" -p "$target" gateway stop >/dev/null || \
-    die "could not stop $what; it would rewrite its own .env from memory"
-  say "OK    stopped $what before changing its CozyGateway keys"
+  "$HERMES_BIN" -p "$profile" gateway stop >/dev/null || \
+    die "could not stop the Hermes gateway for profile $profile; it would rewrite its own .env from memory"
+  say "OK    stopped the Hermes gateway for profile $profile before changing its CozyGateway keys"
   return 0
 }
 backup_profile_env_keys() {
@@ -776,6 +782,9 @@ backup_profile_plugin() {
 # decides what to do with a folder it does not own.
 rehome_profile() {
   local profile="$1"
+  # A re-homed profile's keys are about to be minted afresh, but its adapter may be live: it is
+  # never a hot-add, which only a profile with no attach of its own yet can be.
+  REHOMED_PROFILES+=("$profile")
   stop_profile_gateway "$profile"
   backup_profile_env_keys "$profile" "$(profile_home "$profile")/.env"
 }
@@ -968,9 +977,15 @@ lifecycle_profile() { if served_by_host "$1"; then printf '%s' "$HOST_PROFILE"; 
 # the running host holds them yet, so the host is not stopped around their .env write; it picks them
 # up hot through Hermes' own control verbs instead (hot_add_to_host).
 HOT_ADD_PROFILES=()
+REHOMED_PROFILES=()
 hot_add_candidate() {
   local profile
   for profile in "${HOT_ADD_PROFILES[@]:-}"; do [ "$profile" = "$1" ] && return 0; done
+  return 1
+}
+rehomed() {
+  local profile
+  for profile in "${REHOMED_PROFILES[@]:-}"; do [ "$profile" = "$1" ] && return 0; done
   return 1
 }
 # One Hermes control verb on the running host's socket (gateway/control_socket.py):
@@ -1592,13 +1607,13 @@ prepare_dashboard_credential() {
 # that this run stopped it. A profile re-homed by --replace-gateway is already
 # stopped and stays that way until `ensure_hermes_gateways` starts it.
 stop_profile_gateway_for_env() {
-  local profile="$1" target
+  local profile="$1"
   [ "$DRY_RUN" = 1 ] && return 0
-  # Served profiles share the host: it is stopped once, for the first of them, and started once.
-  target="$(lifecycle_profile "$profile")"
-  [ "$(gateway_state "$target")" = running ] || return 0
+  # A served profile keeps the host running (stop_profile_gateway records it for the one restart).
+  if served_by_host "$profile"; then stop_profile_gateway "$profile"; return 0; fi
+  [ "$(gateway_state "$profile")" = running ] || return 0
   stop_profile_gateway "$profile"
-  ENV_RESTART_PROFILES+=("$target")
+  ENV_RESTART_PROFILES+=("$profile")
   return 0
 }
 start_profiles_stopped_for_env() {
@@ -1655,7 +1670,7 @@ write_gateway_env() {
     token="$(env_get "$profile_env" COZYGATEWAY_TOKEN)"
     if ! safe_secret "$token" || [ "$(env_get "$profile_env" COZYGATEWAY_SPOOL_PATH)" != "$spool_path" ]; then
       token="$(new_token)"
-      [ "$p" = "$HOST_PROFILE" ] || ! served_by_host "$p" || HOT_ADD_PROFILES+=("$p")
+      [ "$p" = "$HOST_PROFILE" ] || rehomed "$p" || ! served_by_host "$p" || HOT_ADD_PROFILES+=("$p")
     fi
     for seen_token in "${TOKENS[@]:-}"; do [ "$token" != "$seen_token" ] || die "Hermes profiles must have distinct CozyGateway attach tokens"; done
     for seen_name in "${TOKEN_ENVS[@]:-}"; do [ "$env_name" != "$seen_name" ] || die "profile names produce the same token environment variable: $env_name"; done

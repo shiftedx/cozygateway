@@ -2598,13 +2598,13 @@ make_mux_hermes "$mux_hermes" running
 if ! mux_output="$(HOME="$tmp/mux-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"hermes":{"configured":4,"online":4},"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$mux_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --no-qr --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mux" 2>&1)"; then
   printf 'install on a multiplexed Hermes host failed:\n%s\n--- commands ---\n%s\n' "$mux_output" "$(cat "$tmp/mux-commands" 2>/dev/null)" >&2; exit 1
 fi
-# Served profiles never get a per-profile gateway verb; the host takes each step once: stopped
-# around the env writes, started again, then ONE restart for the new plugin and config.
+# Served profiles never get a per-profile gateway verb, and the host is never stopped around their
+# .env writes: the host rebuilds a served profile from disk. It takes ONE restart, for the new plugin.
 if grep -Eq '^(alpha|beta):gateway:' "$tmp/mux-commands"; then
   printf 'a served profile got its own gateway lifecycle command:\n%s\n' "$(cat "$tmp/mux-commands")" >&2; exit 1
 fi
-test "$(grep -c '^default:gateway:stop$' "$tmp/mux-commands")" = 1
-test "$(grep -c '^default:gateway:start$' "$tmp/mux-commands")" = 1
+test "$(grep -c '^default:gateway:stop$' "$tmp/mux-commands")" = 0
+test "$(grep -c '^default:gateway:start$' "$tmp/mux-commands")" = 0
 test "$(grep -c '^default:gateway:restart$' "$tmp/mux-commands")" = 1
 expect_contains "$mux_output" 'restarted the host Hermes gateway once; it serves profiles default, alpha, beta'
 # The standalone profile keeps its own gateway, on today's path.
@@ -2671,6 +2671,15 @@ test "$(grep -c ':gateway:' "$tmp/mux-quiet-commands")" = 1
 grep -q '^default:gateway:restart$' "$tmp/mux-quiet-commands"
 
 
+# A LIVE served profile whose keys are repaired: its adapter keeps the settings it was built with, so
+# the host restarts once, and is never stopped around the write.
+sed -i.bak '/^COZYGATEWAY_HOME_CHANNEL=/d' "$mux_hermes/profiles/alpha/.env" && rm -f "$mux_hermes/profiles/alpha/.env.bak"
+if ! mux_repair_output="$(HOME="$tmp/mux-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"hermes":{"configured":6,"online":6},"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$mux_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-repair-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --no-qr --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mux" 2>&1)"; then
+  printf 'repairing a live served profile failed:\n%s\n' "$mux_repair_output" >&2; exit 1
+fi
+test "$(grep -c ':gateway:' "$tmp/mux-repair-commands")" = 1
+grep -q '^default:gateway:restart$' "$tmp/mux-repair-commands"
+grep -q '^COZYGATEWAY_HOME_CHANNEL=thread$' "$mux_hermes/profiles/alpha/.env"
 
 # A stopped host is started once, even when the default profile itself is not selected.
 mux_stopped="$tmp/hermes-mux-stopped"
