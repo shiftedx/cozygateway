@@ -9,7 +9,7 @@ import { blocksToText } from "../adapters/attach/blocks-to-text.ts";
 import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
 import type { BotAssignmentRow, BotTeamRow, Storage } from "../storage.ts";
 import {
-  ASSIGNMENT_DEFAULT_DEADLINE_MS, ASSIGNMENT_MAX_OPEN_PER_LEADER, ASSIGNMENT_OPEN_STATES,
+  ASSIGNMENT_DEFAULT_DEADLINE_MS, ASSIGNMENT_MAX_OPEN_PER_LEADER, ASSIGNMENT_MAX_REPORTS, ASSIGNMENT_OPEN_STATES,
   ASSIGNMENT_VERIFYING_AUTO_COMPLETE_MS, buildAssignmentPrompt, deriveAssignmentState, parseResultBlock,
   refusalMessage,
 } from "./assignment-protocol.ts";
@@ -56,6 +56,8 @@ export interface AssignmentRoomsOptions {
 }
 
 const THREAD_PREFIX = "assignment:";
+/** Bot names are case-insensitive and trimmed everywhere else (`normalizeProfileName`). */
+const botName = (name: string): string => name.trim().toLowerCase();
 /** The oldest an assignment can be and still be open: the longest deadline plus the verifying window. */
 const OPEN_HORIZON_MS = 4 * 60 * 60_000 + ASSIGNMENT_VERIFYING_AUTO_COMPLETE_MS;
 
@@ -76,8 +78,7 @@ export class AssignmentRooms {
   readonly #formatDeadline: (at: number) => string;
   readonly #flushTaskCommands: () => void;
   readonly #timer: ReturnType<typeof setInterval>;
-  #endpoint: Pick<NativeGroupTurnEndpoint, "sendNativeTurn"> | undefined;
-  #sweptAt: number;
+  #endpoint: Pick<NativeGroupTurnEndpoint, "sendNativeTurn" | "sendInterrupt"> | undefined;
 
   constructor(opts: AssignmentRoomsOptions) {
     this.#storage = opts.storage;
@@ -88,13 +89,12 @@ export class AssignmentRooms {
     this.#isAttached = opts.isAttached;
     this.#formatDeadline = opts.formatDeadline ?? ((at) => new Date(at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZoneName: "short" }));
     this.#flushTaskCommands = opts.flushTaskCommands ?? ((): void => {});
-    this.#sweptAt = this.#now();
     this.#timer = setInterval(() => this.reconcile(), opts.sweepMs ?? 30_000);
     this.#timer.unref?.();
   }
 
   /** The ingress is assembled after this, exactly as it is for rooms. */
-  setNativeTurns(endpoint: Pick<NativeGroupTurnEndpoint, "sendNativeTurn">): void {
+  setNativeTurns(endpoint: Pick<NativeGroupTurnEndpoint, "sendNativeTurn" | "sendInterrupt">): void {
     this.#endpoint = endpoint;
   }
 
@@ -120,28 +120,66 @@ export class AssignmentRooms {
     if (!this.#knownBot(bot)) throw new AssignmentInvalid(`${bot} is not a bot on this gateway`);
     const stored = this.#storage.botTeam(bot);
     const role = patch.role ?? stored?.role ?? "member";
-    if (patch.reports !== undefined) {
+    const asked = patch.reports === undefined ? undefined : [...new Set(patch.reports.map(botName))];
+    if (asked !== undefined) {
       if (role !== "leader") throw new AssignmentInvalid("reports require role: leader");
-      if (patch.reports.includes(bot)) throw new AssignmentInvalid("a bot cannot report to itself");
-      const missing = patch.reports.filter((name) => !this.#knownBot(name));
+      if (asked.length > ASSIGNMENT_MAX_REPORTS) throw new AssignmentInvalid(`a leader has at most ${ASSIGNMENT_MAX_REPORTS} reports`);
+      if (asked.includes(bot)) throw new AssignmentInvalid("a bot cannot report to itself");
+      const missing = asked.filter((name) => !this.#knownBot(name));
       if (missing.length > 0) throw new AssignmentInvalid(`not a bot on this gateway: ${missing.join(", ")}`);
     }
-    const reports = role === "member" ? [] : [...new Set(patch.reports ?? stored?.reports ?? [])];
+    // No nested delegation: a leader's reports are members, so no report can lead in turn.
+    if (role === "leader") {
+      const leads = this.#storage.botTeamLeadersOf(bot).filter((leader) => leader !== bot);
+      if (leads.length > 0) throw new AssignmentInvalid(`${bot} reports to ${leads.join(", ")} and cannot lead`);
+      const leaders = (asked ?? []).filter((name) => this.#storage.botTeam(name)?.role === "leader");
+      if (leaders.length > 0) throw new AssignmentInvalid(`a leader cannot report to another leader: ${leaders.join(", ")}`);
+    }
+    const reports = role === "member" ? [] : asked ?? stored?.reports ?? [];
     return { bot, role, reports, updatedAt: this.#now() };
   }
 
-  /** The bot's attach identity is gone. Work it led is cancelled; work it held is cancelled by the
-   * Task's own owner-deleted rule. */
+  /** The bot's attach identity is gone. Work it led is cancelled. Work it held loses its Task with
+   * the bot's other private Tasks, so its state is frozen now, while the Task can still say it:
+   * open work reads `cancelled` with failure `assignee deleted`, and delivered work that was
+   * waiting on the leader closes as an unacknowledged window would. */
   botDeleted(bot: string): void {
     this.#cancelLed(bot);
+    const now = this.#now();
+    for (const row of this.#storage.botAssignments({ assignee: bot, createdSince: now - OPEN_HORIZON_MS })) {
+      if (row.acknowledgedOutcome !== undefined) continue;
+      const state = this.#state(row);
+      const frozen = state === "verifying" ? (this.#result(row)?.status === "blocked" ? "failed" : "completed")
+        : ASSIGNMENT_OPEN_STATES.has(state) ? "cancelled" : state;
+      this.#storage.updateBotAssignment(row.taskId, {
+        frozenState: frozen, updatedAt: now,
+        ...(frozen === "cancelled" && row.failure === undefined ? { failure: "assignee deleted" } : {}),
+      });
+      this.#emit(this.#storage.botAssignment(row.taskId)!);
+    }
+  }
+
+  /** Which side of this assignment `bot` is, if it is still that party. A deleted party is no one,
+   * so a later bot of the same name reaches nothing. */
+  partyOf(taskId: string, bot: string): "leader" | "assignee" | undefined {
+    const row = this.#storage.botAssignment(taskId);
+    return row === undefined ? undefined : this.#party(row, bot);
+  }
+
+  #party(row: BotAssignmentRow, bot: string): "leader" | "assignee" | undefined {
+    if (row.leader === bot && row.leaderDeletedAt === undefined) return "leader";
+    if (row.assignee === bot && row.assigneeDeletedAt === undefined) return "assignee";
+    return undefined;
   }
 
   assign(leader: string, request: AssignmentCreateRequest): AssignmentView {
-    const to = request.to;
+    const to = botName(request.to);
     if (request.idempotencyKey !== undefined) {
       const prior = this.#storage.botAssignmentByKey(leader, request.idempotencyKey);
-      if (prior !== undefined) {
-        if (prior.assignee !== to || prior.brief !== request.brief || prior.doneCriteria !== request.doneCriteria)
+      if (prior !== undefined && prior.leaderDeletedAt === undefined) {
+        if (prior.assignee !== to || prior.brief !== request.brief || prior.doneCriteria !== request.doneCriteria
+          || prior.outputFormat !== request.outputFormat
+          || prior.deadlineAt - prior.createdAt !== (request.deadlineMs ?? ASSIGNMENT_DEFAULT_DEADLINE_MS))
           throw new AssignmentConflict("idempotencyKey already names a different assignment");
         return this.#view(prior);
       }
@@ -218,7 +256,7 @@ export class AssignmentRooms {
   acknowledge(taskId: string, by: AssignmentCaller, outcome: "completed" | "failed"): AssignmentView {
     const row = this.#storage.botAssignment(taskId);
     if (row === undefined) throw new AssignmentNotFound(taskId);
-    if (typeof by === "string" && by !== row.leader) throw new AssignmentForbidden(`only ${row.leader} may acknowledge this assignment`);
+    if (typeof by === "string" && this.#party(row, by) !== "leader") throw new AssignmentForbidden("only the leader may acknowledge this assignment");
     if (this.#state(row) !== "verifying")
       throw new AssignmentRefused("not_verifying", refusalMessage("not_verifying", { leader: row.leader, assignee: row.assignee }));
     const now = this.#now();
@@ -242,7 +280,7 @@ export class AssignmentRooms {
   /** `undefined` when the thread is not one of this bot's. */
   inboxMessages(bot: string, threadId: string): BotGroupMessage[] | undefined {
     const row = this.#storage.botAssignmentByThread(threadId);
-    if (row === undefined || (row.leader !== bot && row.assignee !== bot)) return undefined;
+    if (row === undefined || this.#party(row, bot) === undefined) return undefined;
     return this.#messages(row);
   }
 
@@ -265,6 +303,8 @@ export class AssignmentRooms {
     // Only the Task's current Run speaks for the assignment; a stale or foreign turn does not.
     if (this.#storage.tasks.run(agentId, event.turnId)?.taskId !== row.taskId) return true;
     const now = this.#now();
+    // A reply past a recorded failure (a late answer after the deadline) does not reopen the work.
+    if (row.failure !== undefined) return true;
     if (event.kind === "commit") {
       if (event.continues === true) return true;
       const text = blocksToText(event.blocks).trim().slice(0, 65536);
@@ -273,10 +313,9 @@ export class AssignmentRooms {
         finalText: text, finalAt: now, finalTurnId: event.turnId, updatedAt: now,
         ...(result === undefined ? {} : { resultJson: JSON.stringify(result) }),
       });
-    } else if (row.failure === undefined && row.cancelledBy === undefined) {
+    } else if (row.cancelledBy === undefined) {
+      // The Task already recorded the harness's own `run_failed`; the assignment only notes why.
       this.#storage.updateBotAssignment(row.taskId, { failure: (event.message ?? "the assignee's turn failed").slice(0, 1024), updatedAt: now });
-      // The assignment is over; settle its Task too rather than leave it blocked.
-      this.#cancelTask(row.taskId, "failed");
     }
     this.#emit(this.#storage.botAssignment(row.taskId)!);
     return true;
@@ -285,23 +324,29 @@ export class AssignmentRooms {
   /** Called from the Task observer: a Task transition is an assignment transition. */
   onTaskUpdated(view: TaskView): void {
     const row = this.#storage.botAssignment(view.taskId);
-    if (row !== undefined) this.#emit(row);
+    if (row === undefined) return;
+    if (view.lastEvent.at > row.updatedAt) this.#storage.updateBotAssignment(row.taskId, { updatedAt: view.lastEvent.at });
+    this.#emit(this.#storage.botAssignment(row.taskId)!);
   }
 
-  /** Ends open work at its deadline and announces a verifying window that lapsed. */
+  /** Ends open work at its deadline and announces, once and across restarts, a verifying window
+   * that lapsed (including one that lapsed while the gateway was down). */
   reconcile(now = this.#now()): void {
-    const since = this.#sweptAt;
-    this.#sweptAt = now;
     for (const row of this.#storage.botAssignments({ createdSince: now - OPEN_HORIZON_MS })) {
+      if (row.frozenState !== undefined) continue;
       const task = this.#storage.tasks.read(row.taskId)?.view;
       const live = task !== undefined && !["completed", "failed", "cancelled"].includes(task.state);
       if (live && now >= row.deadlineAt && row.failure === undefined && row.cancelledBy === undefined) {
         this.#storage.updateBotAssignment(row.taskId, { failure: "deadline", updatedAt: now });
-        this.#cancelTask(row.taskId, "deadline");
+        // The gateway's own timeout, exactly as a room member turn times out: the Task records
+        // `run_timed_out` by the gateway, never a person's cancel, and the peer is interrupted.
+        this.#storage.tasks.nativeTerminal(task.bot, task.sessionId, task.currentRun.runId, "timed_out", now);
+        this.#endpoint?.sendInterrupt?.(task.bot, { threadId: task.sessionId, turnId: task.currentRun.runId });
         this.#emit(this.#storage.botAssignment(row.taskId)!);
-      } else if (task?.state === "completed" && row.acknowledgedOutcome === undefined) {
-        const lapse = task.at + ASSIGNMENT_VERIFYING_AUTO_COMPLETE_MS;
-        if (lapse > since && lapse <= now) this.#emit(row);
+      } else if (task?.state === "completed" && row.acknowledgedOutcome === undefined && row.lapseAnnouncedAt === undefined
+        && now >= task.at + ASSIGNMENT_VERIFYING_AUTO_COMPLETE_MS) {
+        this.#storage.updateBotAssignment(row.taskId, { lapseAnnouncedAt: now, updatedAt: now });
+        this.#emit(this.#storage.botAssignment(row.taskId)!);
       }
     }
   }
@@ -324,9 +369,16 @@ export class AssignmentRooms {
     return ASSIGNMENT_OPEN_STATES.has(this.#state(row));
   }
 
+  #result(row: BotAssignmentRow): AssignmentResult | undefined {
+    return row.resultJson === undefined ? undefined : JSON.parse(row.resultJson) as AssignmentResult;
+  }
+
   #state(row: BotAssignmentRow, task = this.#storage.tasks.read(row.taskId)?.view): AssignmentView["state"] {
+    const resultStatus = this.#result(row)?.status;
     return deriveAssignmentState({
       deadlineAt: row.deadlineAt,
+      ...(row.frozenState === undefined ? {} : { frozenState: row.frozenState }),
+      ...(resultStatus === undefined ? {} : { resultStatus }),
       ...(row.acknowledgedOutcome === undefined ? {} : { acknowledgedOutcome: row.acknowledgedOutcome }),
       ...(row.cancelledBy === undefined ? {} : { cancelledBy: row.cancelledBy }),
       ...(row.failure === undefined ? {} : { failure: row.failure }),
@@ -362,8 +414,8 @@ export class AssignmentRooms {
 
   #emit(row: BotAssignmentRow): void {
     const state = this.#state(row);
-    const updatedAt = this.#now();
-    for (const bot of [row.leader, row.assignee])
+    const updatedAt = row.updatedAt;
+    for (const bot of [row.leaderDeletedAt === undefined ? row.leader : undefined, row.assigneeDeletedAt === undefined ? row.assignee : undefined].filter((name) => name !== undefined))
       this.#broadcast({ type: "bot_inbox_activity", bot, threadId: row.threadId, updatedAt, taskId: row.taskId, state });
   }
 }

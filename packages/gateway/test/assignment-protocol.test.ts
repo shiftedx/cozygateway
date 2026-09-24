@@ -52,6 +52,17 @@ describe("Result: block", () => {
   });
 });
 
+describe("Result: block tolerance", () => {
+  it("accepts a bolded header, bolded keys, and a status on the header line", () => {
+    expect(parseResultBlock("Done.\n**Result:**\n**Status:** partial\nHalf of it.")).toEqual({ status: "partial", summary: "Half of it.", artifacts: [] });
+    expect(parseResultBlock("**Result**:\nstatus: done")?.status).toBe("done");
+    expect(parseResultBlock("Result: done\nAll green.\nartifacts: a.txt")).toEqual({ status: "done", summary: "All green.", artifacts: ["a.txt"] });
+    expect(parseResultBlock("Result: blocked")?.status).toBe("blocked");
+    expect(parseResultBlock("Result: it went fine")).toBeUndefined();
+    expect(parseResultBlock("Resulting in nothing\nstatus: done")).toBeUndefined();
+  });
+});
+
 describe("state derivation", () => {
   const base = { deadlineAt: 1_000 };
   it("mirrors a live Task, with a device wait as blocked and a Task still proving its work as running", () => {
@@ -76,6 +87,13 @@ describe("state derivation", () => {
     expect(deriveAssignmentState({ ...base, taskState: "cancelled", failure: "deadline" }, 2_000)).toBe("failed");
     expect(deriveAssignmentState({ ...base, taskState: "cancelled" }, 0)).toBe("cancelled");
     expect(deriveAssignmentState({ ...base, taskState: "failed" }, 0)).toBe("failed");
+  });
+
+  it("ignores a cancel that lost the race to a completed Task, and closes a blocked result as failed", () => {
+    expect(deriveAssignmentState({ ...base, taskState: "completed", taskAt: 0, cancelledBy: "leader" }, 5)).toBe("verifying");
+    expect(deriveAssignmentState({ ...base, taskState: "completed", taskAt: 0, resultStatus: "blocked" }, ASSIGNMENT_VERIFYING_AUTO_COMPLETE_MS)).toBe("failed");
+    expect(deriveAssignmentState({ ...base, taskState: "completed", taskAt: 0, resultStatus: "partial" }, ASSIGNMENT_VERIFYING_AUTO_COMPLETE_MS)).toBe("completed");
+    expect(deriveAssignmentState({ ...base, frozenState: "cancelled" }, 0)).toBe("cancelled");
   });
 
   it("exports the caps and the open set the spec names", () => {

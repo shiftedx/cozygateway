@@ -33,20 +33,26 @@ export function buildAssignmentPrompt(input: AssignmentBrief, formatDeadline: (a
 }
 
 const STATUSES = new Set(["done", "partial", "blocked"]);
+/** `Result:`, also bolded (`**Result:**`, `**Result**:`) and with text after it on the same line. */
+const RESULT_LINE = /^(?:\*\*|__)?Result(?::(?:\*\*|__)?|(?:\*\*|__):)(.*)$/;
 const SUMMARY_KEY = /^(?:summary|changed|what changed)\s*:\s*(.*)$/i;
 
 /** The last `Result:` block in the reply, or `undefined` when there is none or its status is not
  * one of the three words. A missing result is recorded as missing and never invented. */
 export function parseResultBlock(text: string): AssignmentResult | undefined {
-  const lines = text.split(/\r?\n/);
-  const start = lines.map((line) => line.trim()).lastIndexOf("Result:");
+  const lines = text.split(/\r?\n/).map((line) => line.trim());
+  const start = lines.findLastIndex((line) => RESULT_LINE.test(line));
   if (start < 0) return undefined;
   let status: string | undefined;
   const summary: string[] = [];
   const artifacts: string[] = [];
   let listing = false;
-  for (const raw of lines.slice(start + 1)) {
-    const line = raw.trim();
+  // `Result: done` names the status on the header line; other text there is summary.
+  const inline = RESULT_LINE.exec(lines[start]!)![1]!.trim();
+  const body = inline.length === 0 ? [] : [STATUSES.has(inline.toLowerCase().replace(/[.*_]/g, "")) ? `status: ${inline.replace(/[.*_]/g, "")}` : inline];
+  for (const raw of [...body, ...lines.slice(start + 1)]) {
+    // Markdown emphasis around a key (`**Status:** done`) is formatting, not content.
+    const line = raw.replace(/\*\*|__/g, "").trim();
     if (line.length === 0) continue;
     const bullet = /^[-*]\s+/.test(line);
     const content = line.replace(/^[-*]\s+/, "");
@@ -80,6 +86,10 @@ export interface AssignmentFacts {
   acknowledgedOutcome?: "completed" | "failed";
   cancelledBy?: "leader" | "user";
   failure?: string;
+  /** The parsed `Result:` status, which decides how an unacknowledged window closes. */
+  resultStatus?: AssignmentResult["status"];
+  /** The state recorded when a party was deleted and its Task went with it. */
+  frozenState?: AssignmentState;
   /** Absent only when the Task itself is gone. */
   taskState?: TaskState;
   /** When the Task last changed state; for a completed Task, when it completed. */
@@ -93,14 +103,20 @@ const TERMINAL_TASK = new Set<TaskState>(["completed", "failed", "cancelled"]);
  * assignment's own promise, and a read never shows a live state past it. */
 export function deriveAssignmentState(facts: AssignmentFacts, now: number): AssignmentState {
   if (facts.acknowledgedOutcome !== undefined) return facts.acknowledgedOutcome;
+  if (facts.frozenState !== undefined) return facts.frozenState;
   const task = facts.taskState;
+  // Work that was delivered stays deliverable: a cancel that lost the race to the reply is moot,
+  // and the leader can still acknowledge it. A window that closes unacknowledged closes on what
+  // the assignee said, so a `blocked` result is not quietly counted as done.
+  if (task === "completed" && facts.failure === undefined) {
+    if (now - (facts.taskAt ?? now) < ASSIGNMENT_VERIFYING_AUTO_COMPLETE_MS) return "verifying";
+    return facts.resultStatus === "blocked" ? "failed" : "completed";
+  }
   if (task === undefined || TERMINAL_TASK.has(task)) {
     if (facts.cancelledBy !== undefined) return "cancelled";
     if (facts.failure !== undefined) return "failed";
     if (task === "cancelled") return "cancelled";
     if (task === "failed") return "failed";
-    if (task === "completed")
-      return now - (facts.taskAt ?? now) >= ASSIGNMENT_VERIFYING_AUTO_COMPLETE_MS ? "completed" : "verifying";
     return now >= facts.deadlineAt ? "failed" : "queued";
   }
   if (facts.failure !== undefined || now >= facts.deadlineAt) return "failed";

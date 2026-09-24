@@ -32,12 +32,13 @@ afterEach(async () => {
   for (const storage of storages.splice(0)) storage.close();
 });
 
-async function setup() {
+async function setup(opts: { configure?: () => unknown } = {}) {
+  const known = new Set(["scout", "sage"]);
   const server = await startFakeHermesServer({
     methods: {
       "profiles.list": () => ({ profiles: [{ name: "scout", description: "", has_avatar: false }, { name: "sage", description: "", has_avatar: false }], bot_mode_protocol: true }),
       "profiles.describe": () => describeResult,
-      "profiles.configure": () => ({ applied: { soul: true } }),
+      "profiles.configure": () => opts.configure?.() ?? { applied: { soul: true } },
     },
   });
   servers.push(server);
@@ -48,7 +49,7 @@ async function setup() {
   bridges.push(bridge);
   const assignments = new AssignmentRooms({
     storage, broadcast: () => {}, now: () => 1_000, displayName: (name) => name,
-    knownBot: (name) => ["scout", "sage"].includes(name), isAttached: () => true,
+    knownBot: (name) => known.has(name), isAttached: () => true,
   });
   rooms.push(assignments);
   const app = createApp({
@@ -67,7 +68,7 @@ async function setup() {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   const authed = (path: string, init?: RequestInit) => app.request(path, { ...init, headers: { ...(init?.headers ?? {}), authorization: `Bearer ${deviceToken}` } });
-  return { server, storage, authed };
+  return { server, storage, authed, known };
 }
 
 const patch = (body: unknown): RequestInit => ({ method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -103,5 +104,21 @@ describe("team fields on the bot profile", () => {
     const call = h.server.callsOf("profiles.configure").at(-1)!;
     expect(JSON.stringify(call.params)).not.toMatch(/reports|role|leader/);
     expect(h.storage.botTeam("scout")).toMatchObject({ role: "leader", reports: ["sage"] });
+  });
+
+  it("stores the team only when the forwarded half applied", async () => {
+    const h = await setup({ configure: () => ({ applied: { soul: false } }) });
+    const res = await h.authed("/bots/scout/profile", patch({ role: "leader", reports: ["sage"], soul: "# Scout" }));
+    expect(await res.json()).toMatchObject({ ok: false, applied: { soul: false, team: false } });
+    expect(h.storage.botTeam("scout")).toBeUndefined();
+  });
+
+  it("answers 400, not 500, when a report stops being a bot during the forward", async () => {
+    let known: Set<string> | undefined;
+    const h = await setup({ configure: () => { known?.delete("sage"); return { applied: { soul: true } }; } });
+    known = h.known;
+    const res = await h.authed("/bots/scout/profile", patch({ role: "leader", reports: ["sage"], soul: "# Scout" }));
+    expect(res.status).toBe(400);
+    expect(h.storage.botTeam("scout")).toBeUndefined();
   });
 });

@@ -98,7 +98,9 @@ actors instead of parsing them back out of the prompt header. `context` is absen
 On a leader ASSIGNMENT turn (bots capability 88, on a gateway-owned `assignment:<taskId>` thread)
 `room` is absent and `context` instead carries `task` (`id`, the gateway Task id; `assignedBy`,
 `brief`, `doneCriteria`, optional `outputFormat`, and `deadlineAt`) beside the leader and the
-assignee as `actors`. The same byte-identical `text` rule holds.
+assignee as `actors`. The same byte-identical `text` rule holds. A peer that reads `context`
+MUST accept one with `task` and no `room`; CozyAgents currently dereferences `context.room.name`
+and must handle this before its bots can be assignees.
 
 Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `delegation`,
 `thinking`, `approval`, `clarify`, `scheduled`, `media`, and `presence`.

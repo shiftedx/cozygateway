@@ -10,6 +10,7 @@ import {
   MOBILE_REQUEST_TERMINAL_STATES,
 } from "cozygateway-contract";
 import type {
+  AssignmentState,
   AttachmentBlock,
   BotChatAttachment,
   DeviceKind,
@@ -548,7 +549,14 @@ CREATE TABLE IF NOT EXISTS bot_assignments (
   failure TEXT,
   cancelled_by TEXT CHECK (cancelled_by IN ('leader', 'user')),
   acknowledged_at INTEGER,
-  acknowledged_outcome TEXT CHECK (acknowledged_outcome IN ('completed', 'failed'))
+  acknowledged_outcome TEXT CHECK (acknowledged_outcome IN ('completed', 'failed')),
+  -- The 24 h verifying window's lapse was announced (once, across restarts).
+  lapse_announced_at INTEGER,
+  -- A deleted party loses the row; a later bot of the same name never inherits it. The surviving
+  -- party keeps reading it, with the state it had when its Task went away frozen here.
+  leader_deleted_at INTEGER,
+  assignee_deleted_at INTEGER,
+  frozen_state TEXT
 ) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS bot_assignments_idempotency ON bot_assignments(leader, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS bot_assignments_leader ON bot_assignments(leader, created_at);
@@ -1368,19 +1376,26 @@ export interface BotAssignmentRow {
   cancelledBy?: "leader" | "user";
   acknowledgedAt?: number;
   acknowledgedOutcome?: "completed" | "failed";
+  lapseAnnouncedAt?: number;
+  leaderDeletedAt?: number;
+  assigneeDeletedAt?: number;
+  frozenState?: AssignmentState;
 }
-export type BotAssignmentPatch = Partial<Pick<BotAssignmentRow, "resultJson" | "finalText" | "finalAt" | "finalTurnId" | "failure" | "cancelledBy" | "acknowledgedAt" | "acknowledgedOutcome">> & { updatedAt: number };
+export type BotAssignmentPatch = Partial<Pick<BotAssignmentRow, "resultJson" | "finalText" | "finalAt" | "finalTurnId" | "failure" | "cancelledBy" | "acknowledgedAt" | "acknowledgedOutcome" | "lapseAnnouncedAt" | "frozenState">> & { updatedAt: number };
 
 const BOT_ASSIGNMENT_SELECT = `SELECT task_id AS taskId, leader, assignee, thread_id AS threadId, brief,
   done_criteria AS doneCriteria, output_format AS outputFormat, deadline_at AS deadlineAt,
   created_at AS createdAt, updated_at AS updatedAt, idempotency_key AS idempotencyKey,
   result_json AS resultJson, final_text AS finalText, final_at AS finalAt, final_turn_id AS finalTurnId,
   failure, cancelled_by AS cancelledBy, acknowledged_at AS acknowledgedAt,
-  acknowledged_outcome AS acknowledgedOutcome FROM bot_assignments`;
+  acknowledged_outcome AS acknowledgedOutcome, lapse_announced_at AS lapseAnnouncedAt,
+  leader_deleted_at AS leaderDeletedAt, assignee_deleted_at AS assigneeDeletedAt,
+  frozen_state AS frozenState FROM bot_assignments`;
 const BOT_ASSIGNMENT_COLUMNS: Record<keyof BotAssignmentPatch, string> = {
   resultJson: "result_json", finalText: "final_text", finalAt: "final_at", finalTurnId: "final_turn_id",
   failure: "failure", cancelledBy: "cancelled_by", acknowledgedAt: "acknowledged_at",
-  acknowledgedOutcome: "acknowledged_outcome", updatedAt: "updated_at",
+  acknowledgedOutcome: "acknowledged_outcome", lapseAnnouncedAt: "lapse_announced_at",
+  frozenState: "frozen_state", updatedAt: "updated_at",
 };
 
 /** Optional columns become absent keys, never `null`. */
@@ -3217,6 +3232,7 @@ export class Storage {
       this.#db.prepare("DELETE FROM bot_canonical_chats WHERE bot = ?").run(from);
       this.#db.prepare(`UPDATE OR ${conflict} bot_routine_overrides SET bot = ? WHERE bot = ?`).run(to, from);
       this.#db.prepare("DELETE FROM bot_routine_overrides WHERE bot = ?").run(from);
+      this.#renameTeam(from, to, conflict);
       this.#db.exec("COMMIT");
     } catch (err) {
       this.#db.exec("ROLLBACK");
@@ -3356,6 +3372,22 @@ export class Storage {
     return rows.map(toBotGroupTurnRow);
   }
 
+  /** Capability 88. A team role and every mention in another leader's `reports` follow the renamed
+   *  bot, as do both sides of its live assignments, so the old name keeps no authority a later bot
+   *  of that name could pick up. Called inside `renameBotState`'s transaction. */
+  #renameTeam(from: string, to: string, conflict: "REPLACE" | "IGNORE"): void {
+    this.#db.prepare(`UPDATE OR ${conflict} bot_team SET bot = ? WHERE bot = ?`).run(to, from);
+    this.#db.prepare("DELETE FROM bot_team WHERE bot = ?").run(from);
+    const rows = this.#db.prepare(`SELECT DISTINCT team.bot AS bot, team.reports_json AS reports FROM bot_team AS team, json_each(team.reports_json) AS report
+      WHERE report.value = ?`).all(from) as { bot: string; reports: string }[];
+    for (const row of rows) {
+      const reports = [...new Set((JSON.parse(row.reports) as string[]).map((name) => name === from ? to : name))].filter((name) => name !== row.bot);
+      this.#db.prepare("UPDATE bot_team SET reports_json = ? WHERE bot = ?").run(JSON.stringify(reports), row.bot);
+    }
+    this.#db.prepare("UPDATE bot_assignments SET leader = ? WHERE leader = ? AND leader_deleted_at IS NULL").run(to, from);
+    this.#db.prepare("UPDATE bot_assignments SET assignee = ? WHERE assignee = ? AND assignee_deleted_at IS NULL").run(to, from);
+  }
+
   botTeam(bot: string): BotTeamRow | undefined {
     const row = this.#db.prepare("SELECT bot, role, reports_json AS reports, updated_at AS updatedAt FROM bot_team WHERE bot = ?")
       .get(bot) as { bot: string; role: BotTeamRow["role"]; reports: string; updatedAt: number } | undefined;
@@ -3366,6 +3398,20 @@ export class Storage {
     this.#db.prepare(`INSERT INTO bot_team (bot, role, reports_json, updated_at) VALUES (?, ?, ?, ?)
       ON CONFLICT(bot) DO UPDATE SET role = excluded.role, reports_json = excluded.reports_json, updated_at = excluded.updated_at`)
       .run(row.bot, row.role, JSON.stringify(row.reports), row.updatedAt);
+  }
+
+  /** The leaders whose `reports` name this bot. */
+  botTeamLeadersOf(report: string): string[] {
+    return (this.#db.prepare(`SELECT DISTINCT team.bot AS bot FROM bot_team AS team, json_each(team.reports_json) AS report
+      WHERE team.role = 'leader' AND report.value = ? ORDER BY team.bot`).all(report) as { bot: string }[]).map((row) => row.bot);
+  }
+
+  /** Every bot name the team and assignment rows hold, for the `previous_names` re-link. */
+  botTeamNames(): string[] {
+    return (this.#db.prepare(`SELECT bot AS name FROM bot_team
+      UNION SELECT report.value FROM bot_team, json_each(bot_team.reports_json) AS report
+      UNION SELECT leader FROM bot_assignments WHERE leader_deleted_at IS NULL
+      UNION SELECT assignee FROM bot_assignments WHERE assignee_deleted_at IS NULL`).all() as { name: string }[]).map((row) => row.name);
   }
 
   createBotAssignment(row: Omit<BotAssignmentRow, "updatedAt" | "resultJson" | "finalText" | "finalAt" | "finalTurnId" | "failure" | "cancelledBy" | "acknowledgedAt" | "acknowledgedOutcome">): void {
@@ -3390,14 +3436,18 @@ export class Storage {
     return row === undefined ? undefined : toBotAssignmentRow(row);
   }
 
-  /** Newest first. `participant` matches either side. */
+  /** Newest first. `participant` matches either side. A party that was deleted no longer matches
+   *  its own name, so a later bot of that name sees none of it. */
   botAssignments(filter: { leader?: string; assignee?: string; participant?: string; createdSince?: number } = {}): BotAssignmentRow[] {
     const where: string[] = [];
     const params: Array<string | number> = [];
     if (filter.createdSince !== undefined) { where.push("created_at >= ?"); params.push(filter.createdSince); }
-    if (filter.leader !== undefined) { where.push("leader = ?"); params.push(filter.leader); }
-    if (filter.assignee !== undefined) { where.push("assignee = ?"); params.push(filter.assignee); }
-    if (filter.participant !== undefined) { where.push("(leader = ? OR assignee = ?)"); params.push(filter.participant, filter.participant); }
+    if (filter.leader !== undefined) { where.push("leader = ? AND leader_deleted_at IS NULL"); params.push(filter.leader); }
+    if (filter.assignee !== undefined) { where.push("assignee = ? AND assignee_deleted_at IS NULL"); params.push(filter.assignee); }
+    if (filter.participant !== undefined) {
+      where.push("((leader = ? AND leader_deleted_at IS NULL) OR (assignee = ? AND assignee_deleted_at IS NULL))");
+      params.push(filter.participant, filter.participant);
+    }
     const rows = this.#db.prepare(`${BOT_ASSIGNMENT_SELECT}${where.length === 0 ? "" : ` WHERE ${where.join(" AND ")}`}
       ORDER BY created_at DESC, rowid DESC`).all(...params) as Record<string, unknown>[];
     return rows.map(toBotAssignmentRow);
@@ -6360,10 +6410,8 @@ export class Storage {
       // operations are deliberately NOT purged, because the `delete_runtime` this delete enqueues
       // is the record of the cleanup a runner still owes.
       ["runtimeBot", "runtime_bots", "id"],
-      // Capability 88. The deleted bot's own team row, and the assignments it answered, whose Tasks
-      // go with its other non-room Tasks. Assignments it led stay as the assignee's history.
+      // Capability 88. The deleted bot's own team row. Its assignments are handled below.
       ["team", "bot_team", "bot"],
-      ["assignments", "bot_assignments", "assignee"],
     ];
     const purged: Record<string, number> = {};
     this.#db.exec("BEGIN IMMEDIATE");
@@ -6413,6 +6461,22 @@ export class Storage {
           AND NOT EXISTS (SELECT 1 FROM artifacts WHERE room IS NOT NULL
             AND created_by = attach_media.agent_id AND media_id = attach_media.media_id)`).run(bot, bot).changes);
       if (media > 0) purged["attachMedia"] = media;
+      // Capability 88. No later bot of this name inherits a place on anyone's team or any
+      // assignment. The surviving party keeps the row: an assignee still reads the work it did for
+      // a deleted leader, and a leader reads a deleted assignee's work as cancelled (its Task goes
+      // with the assignee's other private Tasks, so whatever state was not frozen already is).
+      const teams = this.#db.prepare(`SELECT DISTINCT team.bot AS bot, team.reports_json AS reports FROM bot_team AS team, json_each(team.reports_json) AS report
+        WHERE report.value = ?`).all(bot) as { bot: string; reports: string }[];
+      for (const row of teams)
+        this.#db.prepare("UPDATE bot_team SET reports_json = ? WHERE bot = ?").run(JSON.stringify((JSON.parse(row.reports) as string[]).filter((name) => name !== bot)), row.bot);
+      if (teams.length > 0) purged["teamReports"] = teams.length;
+      const now = Date.now();
+      const answered = Number(this.#db.prepare(`UPDATE bot_assignments SET assignee_deleted_at = ?, updated_at = ?,
+          frozen_state = COALESCE(frozen_state, 'cancelled'), failure = COALESCE(failure, 'assignee deleted')
+        WHERE assignee = ? AND assignee_deleted_at IS NULL`).run(now, now, bot).changes);
+      if (answered > 0) purged["assignmentsAnswered"] = answered;
+      const led = Number(this.#db.prepare("UPDATE bot_assignments SET leader_deleted_at = ?, updated_at = ? WHERE leader = ? AND leader_deleted_at IS NULL").run(now, now, bot).changes);
+      if (led > 0) purged["assignmentsLed"] = led;
       for (const [area, table, column] of areas) {
         const changes = Number(
           this.#db.prepare(`DELETE FROM ${table} WHERE ${column} = ?`).run(bot).changes,

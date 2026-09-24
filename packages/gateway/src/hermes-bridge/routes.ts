@@ -1450,12 +1450,22 @@ export function registerBotRoutes(
       const result = Object.keys(forwarded).length === 0
         ? { outcome: "applied" as const, ok: true, applied: {}, requested: [] }
         : await bots.configureProfile(name, forwarded);
-      if (teamRequested.length > 0) team!.write(name, membership);
+      // The team half lands only when the forwarded half did, and is re-checked as it lands: a
+      // report deleted during the forward is still a 400, never a 500.
+      const teamApplied = teamRequested.length > 0 && result.ok;
+      if (teamApplied) {
+        try {
+          team!.write(name, membership);
+        } catch (err) {
+          if (err instanceof AssignmentInvalid) return c.json(errorBody("invalid_request", err.message), 400);
+          throw err;
+        }
+      }
       return c.json({
         name,
         outcome: result.outcome,
         ok: result.ok,
-        applied: teamRequested.length === 0 ? result.applied : { ...result.applied, team: true },
+        applied: teamRequested.length === 0 ? result.applied : { ...result.applied, team: teamApplied },
         ...("ignored" in result && result.ignored !== undefined ? { ignored: result.ignored } : {}),
         requested: [...result.requested, ...teamRequested],
       });

@@ -26,6 +26,7 @@ function harness(opts: { reply?: string; silent?: boolean; attached?: (bot: stri
   const frames: ServerFrame[] = [];
   const commands: Array<{ agentId: string; threadId: string; turnId: string; text: string; context?: unknown }> = [];
   const sequences = new Map<string, number>();
+  const interrupts: Array<{ agentId: string; turnId: string }> = [];
   const room = new AssignmentRooms({
     storage, broadcast: (frame) => frames.push(frame), now: () => now,
     displayName: (name) => name[0]!.toUpperCase() + name.slice(1),
@@ -43,6 +44,7 @@ function harness(opts: { reply?: string; silent?: boolean; attached?: (bot: stri
     expect(room.handleAttachEvent(agentId, frame)).toBe(true);
   };
   room.setNativeTurns({
+    sendInterrupt: (agentId, input) => { interrupts.push({ agentId, turnId: input.turnId }); return true; },
     sendNativeTurn: (agentId, input) => {
       commands.push({ agentId, threadId: input.threadId, turnId: input.turnId, text: input.text, context: input.context });
       const command = storage.enqueueAttachCommand(agentId, `cmd-${input.turnId}`, { kind: "turn", ...input }, now);
@@ -55,7 +57,7 @@ function harness(opts: { reply?: string; silent?: boolean; attached?: (bot: stri
     },
   });
   storage.setBotTeam({ bot: "lead", role: "leader", reports: ["scout", "sage"], updatedAt: now });
-  return { storage, room, frames, commands, event, tick: (ms: number) => { now += ms; } };
+  return { storage, room, frames, commands, interrupts, event, now: () => now, tick: (ms: number) => { now += ms; } };
 }
 
 const request = { to: "scout", brief: "Check CI", doneCriteria: "main is green" };
@@ -129,7 +131,7 @@ describe("assign", () => {
 });
 
 describe("deadline, failure, cancel, acknowledge", () => {
-  it("fails a silent assignee at the deadline and cancels its Task", async () => {
+  it("fails a silent assignee at the deadline as the gateway's timeout, never a person's cancel", async () => {
     const h = harness({ silent: true });
     const view = h.room.assign("lead", { ...request, deadlineMs: 60_000 });
     await settle();
@@ -139,20 +141,25 @@ describe("deadline, failure, cancel, acknowledge", () => {
     expect(h.room.view(view.taskId)?.state).toBe("failed");
     h.room.reconcile();
     expect(h.room.view(view.taskId)).toMatchObject({ state: "failed", failure: "deadline" });
-    expect(h.storage.tasks.read(view.taskId)?.view.pendingIntent?.command).toBe("cancel");
-    // The peer honours the interrupt; the Task settles and the assignment still reads failed.
-    h.event("scout", { kind: "interrupted", threadId: view.threadId, turnId: h.commands[0]!.turnId, messageId: "m" });
-    expect(h.storage.tasks.read(view.taskId)?.view.state).toBe("cancelled");
-    expect(h.room.view(view.taskId)?.state).toBe("failed");
+    const task = h.storage.tasks.read(view.taskId)!.view;
+    expect(task.lastEvent).toMatchObject({ reason: "run_timed_out", actor: "gateway" });
+    expect(task.pendingIntent).toBeUndefined();
+    expect(h.storage.tasks.events(view.taskId).some((event) => event.actor === "user")).toBe(false);
+    expect(h.interrupts).toEqual([{ agentId: "scout", turnId: h.commands[0]!.turnId }]);
+    // A late answer after the deadline does not reopen the work.
+    h.event("scout", { kind: "commit", threadId: view.threadId, turnId: h.commands[0]!.turnId, messageId: "late", blocks: [{ type: "paragraph", text: REPLY }] });
+    expect(h.room.view(view.taskId)).toMatchObject({ state: "failed" });
+    expect(h.room.view(view.taskId)?.finalText).toBeUndefined();
   });
 
-  it("fails on the assignee turn's own failure and settles the Task", async () => {
+  it("fails on the assignee turn's own failure, which the Task records as the harness's", async () => {
     const h = harness({ silent: true });
     const view = h.room.assign("lead", request);
     await settle();
     h.event("scout", { kind: "failed", threadId: view.threadId, turnId: h.commands[0]!.turnId, messageId: "m", message: "model unavailable" });
     expect(h.room.view(view.taskId)).toMatchObject({ state: "failed", failure: "model unavailable" });
-    expect(h.storage.tasks.read(view.taskId)?.view.state).toBe("cancelled");
+    expect(h.storage.tasks.read(view.taskId)?.view.lastEvent).toMatchObject({ reason: "run_failed", actor: "harness" });
+    expect(h.storage.tasks.events(view.taskId).some((event) => event.actor === "user")).toBe(false);
   });
 
   it("cancels through the Task and reads cancelled only once the turn settles", async () => {
@@ -172,7 +179,7 @@ describe("deadline, failure, cancel, acknowledge", () => {
     const view = h.room.assign("lead", request);
     await settle();
     expect(h.room.view(view.taskId)?.state).toBe("verifying");
-    expect(() => h.room.acknowledge(view.taskId, "scout", "completed")).toThrow(/only lead/);
+    expect(() => h.room.acknowledge(view.taskId, "scout", "completed")).toThrow(/only the leader/);
     expect(h.room.acknowledge(view.taskId, { device: true }, "failed")).toMatchObject({ state: "failed", acknowledgedAt: expect.any(Number) });
     expect(() => h.room.acknowledge(view.taskId, "lead", "completed")).toThrow(expect.objectContaining({ reason: "not_verifying" }));
     expect(() => h.room.acknowledge("no-such-task", "lead", "completed")).toThrow(/no assignment/);
@@ -216,8 +223,9 @@ describe("team", () => {
     expect(() => h.room.setTeam("scout", { reports: ["sage"] })).toThrow(/role: leader/);
     expect(() => h.room.setTeam("scout", { role: "leader", reports: ["scout"] })).toThrow(/itself/);
     expect(() => h.room.setTeam("scout", { role: "leader", reports: ["nobody"] })).toThrow(/not a bot on this gateway: nobody/);
-    h.room.setTeam("scout", { role: "leader", reports: ["sage", "sage"] });
-    expect(h.room.team("scout")).toEqual({ role: "leader", reports: ["sage"] });
+    h.room.setTeam("r0", { role: "leader", reports: ["R1 ", "r1", "r2"] });
+    expect(h.room.team("r0")).toEqual({ role: "leader", reports: ["r1", "r2"] });
+    expect(() => h.room.setTeam("r3", { role: "leader", reports: Array.from({ length: 17 }, (_, i) => `x${i}`) })).toThrow(/at most 16/);
 
     const view = h.room.assign("lead", request);
     await settle();
@@ -225,5 +233,121 @@ describe("team", () => {
     expect(h.room.team("lead")).toEqual({ role: "member", reports: [] });
     expect(h.room.view(view.taskId)?.cancelledBy).toBe("user");
     expect(h.storage.tasks.read(view.taskId)?.view.pendingIntent?.command).toBe("cancel");
+  });
+
+  it("refuses nested delegation both ways", () => {
+    const h = harness({ silent: true });
+    // lead's reports are scout and sage: neither may lead, and a leader may not be a report.
+    expect(() => h.room.setTeam("scout", { role: "leader", reports: ["r0"] })).toThrow(/scout reports to lead and cannot lead/);
+    expect(() => h.room.setTeam("scout", { role: "leader" })).toThrow(/cannot lead/);
+    h.room.setTeam("r0", { role: "leader", reports: ["r1"] });
+    expect(() => h.room.setTeam("r2", { role: "leader", reports: ["r0"] })).toThrow(/cannot report to another leader: r0/);
+    expect(() => h.storage.setBotTeam({ bot: "x", role: "member", reports: [], updatedAt: 1 })).not.toThrow();
+  });
+});
+
+describe("races, windows and restarts", () => {
+  it("a cancel that lost the race to a delivered reply leaves the work acknowledgeable", async () => {
+    const h = harness({ silent: true });
+    const view = h.room.assign("lead", request);
+    await settle();
+    h.room.cancel(view.taskId, "leader");
+    h.event("scout", { kind: "commit", threadId: view.threadId, turnId: h.commands[0]!.turnId, messageId: "r", blocks: [{ type: "paragraph", text: REPLY }] });
+    expect(h.storage.tasks.read(view.taskId)?.view.state).toBe("completed");
+    expect(h.room.view(view.taskId)?.state).toBe("verifying");
+    expect(h.room.acknowledge(view.taskId, "lead", "completed").state).toBe("completed");
+  });
+
+  it("closes an unacknowledged blocked result as failed, not completed", async () => {
+    const h = harness({ reply: "Stuck.\nResult:\nstatus: blocked\nNo access." });
+    const view = h.room.assign("lead", request);
+    await settle();
+    h.tick(24 * 60 * 60_000);
+    expect(h.room.view(view.taskId)?.state).toBe("failed");
+  });
+
+  it("announces a verifying window that lapsed while the gateway was down, once", async () => {
+    const h = harness();
+    const view = h.room.assign("lead", request);
+    await settle();
+    h.room.close();
+    h.tick(25 * 60 * 60_000);
+    // The restarted orchestrator over the same durable store.
+    const frames: ServerFrame[] = [];
+    const restarted = new AssignmentRooms({
+      storage: h.storage, broadcast: (frame) => frames.push(frame), now: h.now,
+      displayName: (name) => name, knownBot: (name) => BOTS.includes(name), isAttached: () => true,
+    });
+    rooms.push(restarted);
+    restarted.reconcile();
+    expect(frames).toEqual([
+      expect.objectContaining({ type: "bot_inbox_activity", bot: "lead", taskId: view.taskId, state: "completed" }),
+      expect.objectContaining({ type: "bot_inbox_activity", bot: "scout", taskId: view.taskId, state: "completed" }),
+    ]);
+    restarted.reconcile();
+    expect(frames).toHaveLength(2);
+  });
+
+  it("stamps the frame with the row's own updatedAt", async () => {
+    const h = harness({ silent: true });
+    const view = h.room.assign("lead", request);
+    h.tick(500);
+    h.room.cancel(view.taskId, "leader");
+    const last = h.frames.at(-1) as BotInboxActivityFrame;
+    expect(last.updatedAt).toBe(h.storage.botAssignment(view.taskId)!.updatedAt);
+    expect(last.updatedAt).toBe(1_500);
+  });
+
+  it("compares the whole request under an idempotency key and matches names case-insensitively", () => {
+    const h = harness({ silent: true });
+    const first = h.room.assign("lead", { ...request, to: " Scout ", idempotencyKey: "k" });
+    expect(first.assignee).toBe("scout");
+    expect(h.room.assign("lead", { ...request, idempotencyKey: "k" }).taskId).toBe(first.taskId);
+    expect(() => h.room.assign("lead", { ...request, deadlineMs: 60_000, idempotencyKey: "k" })).toThrow(/idempotencyKey/);
+    expect(() => h.room.assign("lead", { ...request, outputFormat: "JSON", idempotencyKey: "k" })).toThrow(/idempotencyKey/);
+  });
+});
+
+describe("deleted bots", () => {
+  it("a deleted assignee leaves its leader a readable cancelled view, and a same-name bot inherits nothing", async () => {
+    const h = harness({ silent: true });
+    const view = h.room.assign("lead", request);
+    await settle();
+    h.storage.tasks.ownerDeleted("scout", h.now());
+    h.room.botDeleted("scout");
+    h.storage.purgeBot("scout");
+    expect(h.room.view(view.taskId)).toMatchObject({ state: "cancelled", failure: "assignee deleted" });
+    expect(h.room.list({ leader: "lead" }).map((row) => row.taskId)).toEqual([view.taskId]);
+    expect(h.room.team("lead")?.reports).toEqual(["sage"]);
+    // A recreated scout sees none of it.
+    expect(h.room.list({ participant: "scout" })).toEqual([]);
+    expect(h.room.partyOf(view.taskId, "scout")).toBeUndefined();
+    expect(h.room.inboxMessages("scout", view.threadId)).toBeUndefined();
+    expect(h.room.inboxMessages("lead", view.threadId)).toHaveLength(1);
+  });
+
+  it("keeps delivered work a deleted assignee finished for its leader", async () => {
+    const h = harness();
+    const view = h.room.assign("lead", request);
+    await settle();
+    h.storage.tasks.ownerDeleted("scout", h.now());
+    h.room.botDeleted("scout");
+    h.storage.purgeBot("scout");
+    expect(h.room.view(view.taskId)).toMatchObject({ state: "completed", result: { status: "done" } });
+  });
+
+  it("a deleted leader's work is cancelled and a same-name bot can neither read nor acknowledge it", async () => {
+    const h = harness();
+    const view = h.room.assign("lead", request);
+    await settle();
+    expect(h.room.view(view.taskId)?.state).toBe("verifying");
+    h.room.botDeleted("lead");
+    h.storage.purgeBot("lead");
+    expect(h.room.team("lead")).toBeUndefined();
+    expect(h.room.list({ participant: "lead" })).toEqual([]);
+    expect(h.room.inboxMessages("lead", view.threadId)).toBeUndefined();
+    expect(() => h.room.acknowledge(view.taskId, "lead", "completed")).toThrow(/only the leader/);
+    // The assignee still reads the work it did.
+    expect(h.room.inboxMessages("scout", view.threadId)).toHaveLength(2);
   });
 });

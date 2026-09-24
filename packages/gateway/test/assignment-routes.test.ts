@@ -95,6 +95,12 @@ describe("assignment routes", () => {
     expect((await h.device("/bots/lead/assignments", post(request))).status).toBe(401);
     expect((await h.peer("lead", "/bots/lead/assignments", post({ ...request, brief: "" }))).status).toBe(400);
     expect((await h.peer("sage", "/bots/lead/assignments")).status).toBe(403);
+    // Not a party reads exactly like no such Task.
+    const created = await (await h.peer("lead", "/bots/lead/assignments", post(request))).json() as { taskId: string };
+    const notMine = await h.peer("sage", `/assignments/${created.taskId}`);
+    const missing = await h.peer("sage", "/assignments/no-such");
+    expect(notMine.status).toBe(404);
+    expect(await notMine.json()).toEqual(await missing.json());
     expect((await h.app.request("/bots/lead/inbox", { headers: { authorization: "Bearer tok-lead" } })).status).toBe(401);
   });
 

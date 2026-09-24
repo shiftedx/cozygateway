@@ -1289,6 +1289,8 @@ export class HermesBridge implements BotControlSurface {
     };
     for (const room of this.#storage.botGroups()) for (const member of room.members) consider(member);
     for (const { bot } of this.#storage.canonicalBotChats()) consider(bot);
+    // Capability 88: a team role, a report, or either side of an assignment follows the rename too.
+    for (const bot of this.#storage.botTeamNames()) consider(bot);
     const rooms = new Set<string>();
     for (const old of stranded) {
       const claims = profiles.filter((profile) => profile.previousNames?.includes(old) === true);

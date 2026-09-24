@@ -65,19 +65,20 @@ export function registerAssignmentRoutes(
     return c.json({ assignments: assignments.list({ participant: resolved.name }) });
   });
 
+  // A bot that is not a party gets the same answer as for a Task that does not exist, so the
+  // route cannot be used to probe other teams' Task ids.
   app.get("/assignments/:taskId", either, (c) => {
-    const view = assignments.view(c.req.param("taskId"));
-    if (view === undefined) return error(c, 404, "not_found", "no such assignment");
+    const taskId = c.req.param("taskId");
     const agent = peerOf(c);
-    if (agent !== undefined && agent !== view.leader && agent !== view.assignee) return forbidden(c);
-    return c.json(view);
+    const view = agent !== undefined && assignments.partyOf(taskId, agent) === undefined ? undefined : assignments.view(taskId);
+    return view === undefined ? error(c, 404, "not_found", "no such assignment") : c.json(view);
   });
 
   app.post("/assignments/:taskId/cancel", either, async (c) => {
     const view = assignments.view(c.req.param("taskId"));
     if (view === undefined) return error(c, 404, "not_found", "no such assignment");
     const agent = peerOf(c);
-    if (agent !== undefined && agent !== view.leader) return forbidden(c);
+    if (agent !== undefined && assignments.partyOf(view.taskId, agent) !== "leader") return forbidden(c);
     if (!check(AssignmentCancelRequestSchema, await body(c))) return error(c, 400, "invalid_request", "invalid cancel");
     try {
       return c.json(assignments.cancel(view.taskId, agent === undefined ? "user" : "leader"));

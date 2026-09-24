@@ -58,14 +58,44 @@ describe("bot_assignments", () => {
     expect(storage.botAssignments({ participant: "lead" })).toHaveLength(2);
   });
 
-  it("purges a deleted bot's team row and the assignments it answered, keeping those it led", () => {
+  it("purges a deleted bot's team row and its place in other teams, and tombstones its side of assignments", () => {
     const storage = open();
     storage.setBotTeam({ bot: "scout", role: "leader", reports: ["sage"], updatedAt: 1 });
+    storage.setBotTeam({ bot: "lead", role: "leader", reports: ["scout", "sage"], updatedAt: 1 });
     storage.createBotAssignment(assignment);
     storage.createBotAssignment({ ...assignment, taskId: "t2", leader: "scout", assignee: "sage", threadId: "assignment:t2" });
-    storage.purgeBot("scout");
+    const purged = storage.purgeBot("scout");
+    expect(purged).toMatchObject({ team: 1, teamReports: 1, assignmentsAnswered: 1, assignmentsLed: 1 });
     expect(storage.botTeam("scout")).toBeUndefined();
-    expect(storage.botAssignment("t1")).toBeUndefined();
-    expect(storage.botAssignment("t2")).toBeDefined();
+    expect(storage.botTeam("lead")?.reports).toEqual(["sage"]);
+    expect(storage.botAssignment("t1")).toMatchObject({ frozenState: "cancelled", failure: "assignee deleted", assigneeDeletedAt: expect.any(Number) });
+    expect(storage.botAssignments({ participant: "scout" })).toEqual([]);
+    expect(storage.botAssignments({ participant: "lead" }).map((row) => row.taskId)).toEqual(["t1"]);
+    expect(storage.botAssignments({ participant: "sage" }).map((row) => row.taskId)).toEqual(["t2"]);
+    expect(storage.purgeBot("scout")).toEqual({});
+  });
+
+  it("moves team rows, reports and both sides of assignments on a rename", () => {
+    const storage = open();
+    storage.setBotTeam({ bot: "lead", role: "leader", reports: ["scout", "sage"], updatedAt: 1 });
+    storage.setBotTeam({ bot: "boss", role: "leader", reports: ["lead"], updatedAt: 1 });
+    storage.createBotAssignment(assignment);
+    storage.renameBotState("lead", "chief");
+    storage.renameBotState("scout", "ranger");
+    expect(storage.botTeam("lead")).toBeUndefined();
+    expect(storage.botTeam("chief")).toMatchObject({ role: "leader", reports: ["ranger", "sage"] });
+    expect(storage.botTeam("boss")?.reports).toEqual(["chief"]);
+    expect(storage.botAssignment("t1")).toMatchObject({ leader: "chief", assignee: "ranger" });
+    expect(storage.botAssignments({ participant: "lead" })).toEqual([]);
+    expect(storage.botTeamNames().sort()).toEqual(["boss", "chief", "ranger", "sage"]);
+  });
+
+  it("the previous_names re-link keeps the live bot's own team row", () => {
+    const storage = open();
+    storage.setBotTeam({ bot: "old", role: "leader", reports: ["sage"], updatedAt: 1 });
+    storage.setBotTeam({ bot: "new", role: "member", reports: [], updatedAt: 2 });
+    storage.renameBotState("old", "new", "to");
+    expect(storage.botTeam("old")).toBeUndefined();
+    expect(storage.botTeam("new")).toMatchObject({ role: "member" });
   });
 });
