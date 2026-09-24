@@ -712,6 +712,13 @@ CREATE TABLE IF NOT EXISTS bot_native_messages (
   PRIMARY KEY (bot, session_id, seq),
   UNIQUE (bot, message_id)
 ) STRICT, WITHOUT ROWID;
+-- Capability 86. Each bot's canonical Hermes "Bot Chat" registry id, durable so a restarted gateway
+-- still archives it on "Clear chat" and never lets a newer desktop session displace it.
+CREATE TABLE IF NOT EXISTS bot_canonical_chats (
+  bot TEXT PRIMARY KEY,
+  hermes_session_id TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
 -- Capability 86. Tapback reactions: at most one per author per message (Hermes's own rule).
 CREATE TABLE IF NOT EXISTS bot_message_reactions (
   bot TEXT NOT NULL,
@@ -5020,6 +5027,27 @@ export class Storage {
       ).run(input.bot, input.messageId, input.author, input.emoji, input.now);
     }
     return { sessionId: owner.sessionId, reactions: this.botMessageReactions(input.bot, input.messageId) };
+  }
+
+  canonicalBotChat(bot: string): string | undefined {
+    return (this.#db.prepare("SELECT hermes_session_id AS id FROM bot_canonical_chats WHERE bot = ?")
+      .get(bot) as { id: string } | undefined)?.id;
+  }
+
+  setCanonicalBotChat(bot: string, hermesSessionId: string | null, now: number): void {
+    if (hermesSessionId === null) {
+      this.#db.prepare("DELETE FROM bot_canonical_chats WHERE bot = ?").run(bot);
+      return;
+    }
+    this.#db.prepare(
+      `INSERT INTO bot_canonical_chats (bot, hermes_session_id, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(bot) DO UPDATE SET hermes_session_id = excluded.hermes_session_id, updated_at = excluded.updated_at`,
+    ).run(bot, hermesSessionId, now);
+  }
+
+  canonicalBotChats(): Array<{ bot: string; hermesSessionId: string }> {
+    return this.#db.prepare("SELECT bot, hermes_session_id AS hermesSessionId FROM bot_canonical_chats")
+      .all() as Array<{ bot: string; hermesSessionId: string }>;
   }
 
   /** Capability 86: the bot's profile model changed, so every per-chat override of this bot yields

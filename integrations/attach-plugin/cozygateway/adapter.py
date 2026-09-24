@@ -87,6 +87,8 @@ logger = logging.getLogger(__name__)
 # The registered platform name. It is also the value the harness stamps into the
 # per-turn session context, so the tool hooks can filter to this platform's turns.
 PLATFORM_NAME = "cozygateway"
+# Upstream Bot Mode's canonical chat title (hermes_state CANONICAL_BOT_CHAT_TITLE).
+CANONICAL_BOT_CHAT_TITLE = "Bot Chat"
 
 # The harness binds these task-local session identifiers per turn and propagates
 # them into the tool worker thread. They are harness-defined identifiers, used only
@@ -2375,7 +2377,12 @@ class AttachAdapter:
             session_db = self._sync_session_db(runner, store)
             raw = session_db.get_session(raw_id) if session_db is not None else None
             raw_source = str(raw.get("source") or "").strip().lower() if isinstance(raw, dict) else ""
-            if not isinstance(raw, dict) or raw_source not in INTERACTIVE_SESSION_SOURCES:
+            # Bot parity S2: the profile's canonical "Bot Chat" stays adoptable after a gateway turn
+            # re-stamped its source ``cozygateway``; the exact title is Hermes's own UNIQUE identity.
+            canonical_bot_chat = (raw_source == PLATFORM_NAME and isinstance(raw, dict)
+                                  and str(raw.get("title") or "") == CANONICAL_BOT_CHAT_TITLE)
+            if not isinstance(raw, dict) or (raw_source not in INTERACTIVE_SESSION_SOURCES
+                                             and not canonical_bot_chat):
                 return
             target = session_db.resolve_resume_session_id(raw_id)
             target_row = session_db.get_session(target) if isinstance(target, str) and target else None

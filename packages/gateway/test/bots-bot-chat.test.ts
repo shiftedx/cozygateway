@@ -160,6 +160,32 @@ describe("capability 86 on the native data plane", () => {
     h.close();
   });
 
+  it("the Bot Chat binding survives a gateway restart: no displacement, and Clear chat still retires", async () => {
+    const h = plane();
+    const opening = h.surface.openBotChat!("sage");
+    await vi.waitFor(() => expect(h.resumes).toHaveLength(1));
+    h.confirm();
+    await opening;
+    h.plane.close();
+    // A fresh plane on the same database, no roster open since: the durable row is all it has.
+    const resumes: unknown[] = [];
+    const restarted = new NativeBotDataPlane({
+      control: h.control, storage: h.storage,
+      ingress: { sendNativeTurn: () => true, sendNativeDesktopResume: (_p: string, r: unknown) => { resumes.push(r); return true; } } as unknown as AttachV1Ingress,
+      nativeBots: ["sage"], chatSuggestion: "", broadcast: () => undefined, staleTurnSweepMs: 0,
+    });
+    const surface = restarted.surface();
+    // The newer desktop scratch session does not take the chat over.
+    await surface.canonicalChat("sage");
+    expect(resumes).toEqual([]);
+    // Clear chat still archives the Hermes Bot Chat, and forgets it durably.
+    await surface.resetChat("sage");
+    expect(h.control.archiveHermesSession).toHaveBeenCalledWith("sage", "bot-chat-1");
+    expect(h.storage.canonicalBotChat("sage")).toBeUndefined();
+    restarted.close();
+    h.storage.close();
+  });
+
   it("clearing a bound Bot Chat retires it in Hermes (archive + hide)", async () => {
     const h = plane();
     const opening = h.surface.openBotChat!("sage");

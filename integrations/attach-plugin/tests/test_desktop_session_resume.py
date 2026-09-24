@@ -28,7 +28,8 @@ from cozygateway.attach_spool import AttachSpool
 
 
 class _SessionDb:
-    def __init__(self, rows, resolved=None, source="tui", messages=None, chat_id=None, hidden=False):
+    def __init__(self, rows, resolved=None, source="tui", messages=None, chat_id=None, hidden=False, title=None):
+        self.title = title
         self.rows = set(rows)
         self.resolved = resolved or {}
         self.source = source
@@ -40,7 +41,7 @@ class _SessionDb:
     def get_session(self, session_id):
         self.lookups.append(session_id)
         return ({"id": session_id, "source": self.source, "chat_id": self.chat_id,
-                 "hidden": self.hidden} if session_id in self.rows else None)
+                 "hidden": self.hidden, "title": self.title} if session_id in self.rows else None)
 
     def resolve_resume_session_id(self, session_id):
         return self.resolved.get(session_id, session_id)
@@ -196,11 +197,12 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
                 sys.modules[key] = value
 
     def _adapter(self, *, rows=("desktop-raw",), resolved=None, running=False, switched=None,
-                 production_shapes=False, source="tui", messages=None, chat_id=None, hidden=False):
+                 production_shapes=False, source="tui", messages=None, chat_id=None, hidden=False,
+                 title=None):
         adapter = AttachAdapter()
         adapter._attach_init(types.SimpleNamespace(extra={}))
         adapter._profile = "sage"
-        db = _SessionDb(rows, resolved, source, messages, chat_id, hidden)
+        db = _SessionDb(rows, resolved, source, messages, chat_id, hidden, title)
         store = _AsyncStore(db, switched) if production_shapes else _Store(db, switched)
         runner = _Runner(store, running)
         client = _Client()
@@ -313,6 +315,31 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.switches, [])
         self.assertEqual(runner.evicted, [])
         self.assertEqual(client.confirmations, [])
+
+    async def test_readopts_the_canonical_bot_chat_after_gateway_turns_restamped_it(self):
+        # Bot parity S2: once a gateway turn ran, Hermes re-stamps the Bot Chat ``cozygateway``.
+        # Its exact title keeps it adoptable, so a gateway that lost its binding can re-bind it.
+        adapter, _runner, store, client = self._adapter(source="cozygateway", title="Bot Chat")
+        spool = self._spool()
+        self.addCleanup(spool.close)
+        adapter._spool = spool
+
+        await adapter._handle_desktop_resume_command({
+            "threadId": "native:sage:2", "hermesSessionId": "desktop-raw", "resumeId": "resume-bc",
+        })
+
+        self.assertEqual(store.switches, [("agent:main:cozygateway:dm:native:sage:2", "desktop-raw")])
+        self.assertEqual(client.confirmations, [("native:sage:2", "desktop-raw", "resume-bc")])
+
+    async def test_a_cozygateway_row_with_any_other_title_is_still_refused(self):
+        for title in (None, "bot chat", "Bot Chat 2"):
+            with self.subTest(title=title):
+                adapter, _runner, store, client = self._adapter(source="cozygateway", title=title)
+                await adapter._handle_desktop_resume_command({
+                    "threadId": "native:sage:1", "hermesSessionId": "desktop-raw", "resumeId": "r",
+                })
+                self.assertEqual(store.switches, [])
+                self.assertEqual(client.confirmations, [])
 
     async def test_accepts_desktop_tui_and_cli_rows_with_their_exact_origin(self):
         for origin in ("desktop", "tui", "cli"):
