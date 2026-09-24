@@ -95,6 +95,10 @@ of `member` or `user`), and `cause` (`{ kind, seq }`: what this member is being 
 It is strictly decoration. The `text` a peer receives is byte-identical with and without it, so a
 peer that ignores `context` behaves exactly as it did before, and a peer that reads it gets typed
 actors instead of parsing them back out of the prompt header. `context` is absent on a 1:1 turn.
+On a leader ASSIGNMENT turn (bots capability 88, on a gateway-owned `assignment:<taskId>` thread)
+`room` is absent and `context` instead carries `task` (`id`, the gateway Task id; `assignedBy`,
+`brief`, `doneCriteria`, optional `outputFormat`, and `deadlineAt`) beside the leader and the
+assignee as `actors`. The same byte-identical `text` rule holds.
 
 Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `delegation`,
 `thinking`, `approval`, `clarify`, `scheduled`, `media`, and `presence`.

@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by capability com.cozylabs.agent-inbox 1
 ---
 
 # ADR 0082: Agent Inbox stays hidden until Hermes proves A2A identity
@@ -26,3 +26,9 @@ bumping that version. `com.cozylabs.agent-inbox` is reserved but has no version 
 future advertisement. Reintroduce the page and advertise that independent capability only after
 Hermes offers durable structured A2A sender, delivery/reply, and conversation metadata with
 bounded replay. This ADR then becomes superseded.
+
+## Superseded
+
+`com.cozylabs.agent-inbox` 1 (leader assignments) reintroduces the inbox routes and frame without
+waiting on Hermes: its identity is gateway-owned assignment rows, each wrapping one Task, rather
+than a heuristic reading of Hermes session text.
