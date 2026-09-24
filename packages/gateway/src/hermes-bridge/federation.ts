@@ -1,8 +1,8 @@
 import type {
   BotCatalog, BotCreateRequest, BotCreateResponse, BotDeleteResponse, BotGroup,
-  BotGroupDetail, BotGroupMessage, BotModelConfig, BotModelConfigPatch, BotProfile,
+  BotGroupDetail, BotGroupMessage, BotGroupPatchRequest, BotModelConfig, BotModelConfigPatch, BotProfile,
   BotModelProviderOAuthSession, BotModelProviderSetupCatalog, BotProfilePatch,
-  BotRoutineCreateRequest, BotRoutinePatch, BotSummary, BridgeLiveness,
+  BotRoutine, BotRoutineBlueprint, BotRoutineCreateRequest, BotRoutinePatch, BotRoutineRunRecord, BotSummary, BridgeLiveness,
   BotDesktopHermesSession, BotVoice, BotPresentationPatch, BotPresentationResponse,
   BotAvatarGenerateRequest, BotAvatarGenerateResponse, BotAvatarPetGallery, BotAvatarPetThumbResponse,
   BotAvatarSetResponse,
@@ -11,11 +11,11 @@ import { BackendUnavailable } from "../errors.ts";
 import { ProfileOpInvalid } from "./profile-ops.ts";
 import { BotNotFound } from "./crud.ts";
 import type { Storage } from "../storage.ts";
-import type { BotControlSurface, BotFocusScreen, BotProfileOp, BotRoutineList, BotRosterView } from "./bridge.ts";
+import type { BotControlSurface, BotFocusScreen, BotProfileOp, BotRoutineList, BotRoutineRunStarted, BotRosterView } from "./bridge.ts";
 import type { GatewayRoomHost, RoomHost } from "./group-rooms.ts";
 import type { BotSpeech } from "./voice.ts";
 import type { ProfileConfigureResult } from "./profile.ts";
-import type { RoutineWriteResult } from "./routines.ts";
+import { RoutineNotFound, type RoutineWriteResult } from "./routines.ts";
 
 export interface FederationMember {
   id: string;
@@ -128,7 +128,10 @@ export class FederatedBotControlSurface implements BotControlSurface {
     roomMembers?: (key: string) => readonly string[] | undefined,
     roomOwner?: (key: string) => string | undefined,
     backfillRoomOwner?: (key: string, owner: string) => void,
+    /** Capability 84: a renamed room keeps its key, so a displayed name resolves to it first. */
+    resolveRoomKey?: (name: string) => string | undefined,
   ) {
+    this.#resolveRoomKey = resolveRoomKey;
     this.#members = new Map(members.map((member) => [member.id, member]));
     this.#broadcast = broadcast;
     this.#rooms = rooms;
@@ -137,6 +140,7 @@ export class FederatedBotControlSurface implements BotControlSurface {
     this.#backfillRoomOwner = backfillRoomOwner;
   }
   readonly #roomOwner: ((key: string) => string | undefined) | undefined;
+  readonly #resolveRoomKey: ((name: string) => string | undefined) | undefined;
   readonly #backfillRoomOwner: ((key: string, owner: string) => void) | undefined;
   #cachedHost(key: string): string | undefined {
     const cached = this.#roomHosts.get(key);
@@ -216,6 +220,8 @@ export class FederatedBotControlSurface implements BotControlSurface {
   async botProfile(name: string): Promise<BotProfile> { const r = this.#route(name); return r.member.bridge.botProfile(r.profile); }
   async configureProfile(name: string, patch: BotProfilePatch): Promise<ProfileConfigureResult> { const r = this.#route(name); return r.member.bridge.configureProfile(r.profile, patch); }
   async botPresentation(name: string): Promise<BotPresentationResponse> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.botPresentation === undefined) throw new BotNotFound(name); return { ...(await bridge.botPresentation(r.profile)), name }; }
+  async canonicalBotChat(name: string, create: boolean): Promise<{ hermesSessionId: string; created: boolean } | null> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.canonicalBotChat === undefined) throw new BotNotFound(name); return bridge.canonicalBotChat(r.profile, create); }
+  async archiveHermesSession(name: string, hermesSessionId: string): Promise<void> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.archiveHermesSession === undefined) throw new BotNotFound(name); return bridge.archiveHermesSession(r.profile, hermesSessionId); }
   async configurePresentation(name: string, patch: BotPresentationPatch): Promise<BotPresentationResponse> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.configurePresentation === undefined) throw new BotNotFound(name); return { ...(await bridge.configurePresentation(r.profile, patch)), name }; }
   async botAvatar(name: string): Promise<{ mime: string; bytes: Buffer } | undefined> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.botAvatar === undefined) throw new BotNotFound(name); return bridge.botAvatar(r.profile); }
   async setBotAvatar(name: string, data: string | null): Promise<BotAvatarSetResponse> { const r = this.#route(name); const bridge = r.member.bridge; if (bridge.setBotAvatar === undefined) throw new BotNotFound(name); return { ...(await bridge.setBotAvatar(r.profile, data)), name }; }
@@ -250,6 +256,11 @@ export class FederatedBotControlSurface implements BotControlSurface {
   async createRoutine(name: string, input: BotRoutineCreateRequest): Promise<RoutineWriteResult> { const r = this.#route(name); return r.member.bridge.createRoutine(r.profile, input); }
   async patchRoutine(name: string, id: string, patch: BotRoutinePatch): Promise<RoutineWriteResult> { const r = this.#route(name); return r.member.bridge.patchRoutine(r.profile, id, patch); }
   async deleteRoutine(name: string, id: string): Promise<void> { const r = this.#route(name); return r.member.bridge.deleteRoutine(r.profile, id); }
+  async runRoutine(name: string, id: string): Promise<BotRoutineRunStarted> { const r = this.#route(name); if (r.member.bridge.runRoutine === undefined) throw new RoutineNotFound(id); return r.member.bridge.runRoutine(r.profile, id); }
+  async routineRuns(name: string, id: string, limit?: number): Promise<BotRoutineRunRecord[]> { const r = this.#route(name); if (r.member.bridge.routineRuns === undefined) throw new RoutineNotFound(id); return r.member.bridge.routineRuns(r.profile, id, limit); }
+  async routineRunOutput(name: string, id: string, runId: string): Promise<string | null> { const r = this.#route(name); if (r.member.bridge.routineRunOutput === undefined) throw new RoutineNotFound(runId); return r.member.bridge.routineRunOutput(r.profile, id, runId); }
+  async routineBlueprints(name: string): Promise<BotRoutineBlueprint[]> { const r = this.#route(name); return r.member.bridge.routineBlueprints?.(r.profile) ?? []; }
+  async instantiateRoutineBlueprint(name: string, key: string, values: Record<string, string>): Promise<BotRoutine> { const r = this.#route(name); if (r.member.bridge.instantiateRoutineBlueprint === undefined) throw new RoutineNotFound(key); return r.member.bridge.instantiateRoutineBlueprint(r.profile, key, values); }
   setFocus(deviceId: string, screen: BotFocusScreen | null): void { for (const member of this.#members.values()) member.bridge.setFocus(deviceId, screen); }
   /** The endpoint that owns a public bot name, or `GATEWAY_HOST` when no endpoint does. A gateway
    *  runtime bot is named bare on every gateway shape and belongs to no endpoint; so does a name
@@ -283,8 +294,8 @@ export class FederatedBotControlSurface implements BotControlSurface {
   /** The host of an existing room. A durable owner avoids a membership walk; only a legacy NULL
    * derives once from immutable membership and backfills. Surface-only tests without storage retain
    * F8's original membership guard. */
-  #hostOf(name: string): RoomHost {
-    const key = name.trim().toLowerCase();
+  #hostOf(name: string, byKey = false): RoomHost {
+    const key = (byKey ? undefined : this.#resolveRoomKey?.(name)) ?? name.trim().toLowerCase();
     const remembered = this.#cachedHost(key);
     // The durable owner backs the cache. Its tombstone is also the sole ownership source after a
     // room has been deleted, while its attach turn rows still exist.
@@ -322,7 +333,8 @@ export class FederatedBotControlSurface implements BotControlSurface {
     const resolved = this.#resolveHost(members);
     if ("spans" in resolved) throw new BackendUnavailable(CROSS_ENDPOINT_ROOMS);
     const group = await this.#hostById(resolved.host).createGroup(name, members, resolved.host);
-    this.#rememberHost(group.name.trim().toLowerCase(), resolved.host);
+    // The room's own key: a renamed room may still hold the key its name would fold to.
+    this.#rememberHost(group.id ?? group.name.trim().toLowerCase(), resolved.host);
     return group;
   }
   deleteGroup(name: string): void {
@@ -332,12 +344,32 @@ export class FederatedBotControlSurface implements BotControlSurface {
     this.#hostOf(name).deleteGroup(name);
   }
   groupDetail(name: string): BotGroupDetail { return this.#hostOf(name).groupDetail(name); }
-  sendGroupMessage(name: string, text: string, opts?: { clientId?: string }): BotGroupMessage { return this.#hostOf(name).sendGroupMessage(name, text, opts ?? {}); }
+  sendGroupMessage(name: string, text: string, opts?: { clientId?: string; threadId?: string }): BotGroupMessage { return this.#hostOf(name).sendGroupMessage(name, text, opts ?? {}); }
+  async updateGroup(name: string, patch: BotGroupPatchRequest): Promise<BotGroup> {
+    const host = this.#hostOf(name);
+    // F8: a members edit may not move a room to another endpoint.
+    if (patch.members !== undefined) {
+      const resolved = this.#resolveHost(patch.members);
+      if ("spans" in resolved) throw new BackendUnavailable(CROSS_ENDPOINT_ROOMS);
+      if (this.#hostById(resolved.host) !== host && resolved.host !== GATEWAY_HOST) {
+        throw new RoomEndpointMismatch(name.trim(), "(this room's host)", [hostLabel(resolved.host)]);
+      }
+    }
+    return host.updateGroup(name, patch);
+  }
+  stopGroup(name: string): BotGroup { return this.#hostOf(name).stopGroup(name); }
+  compressGroupMember(name: string, member: string): Promise<{ member: string; text: string }> { return this.#hostOf(name).compressGroupMember(name, member); }
+  /** The first online endpoint generates; a picture belongs to no endpoint in particular. */
+  async generateGroupPicture(prompt: string): Promise<string> {
+    const member = [...this.#members.values()].find((item) => item.bridge.health().online) ?? [...this.#members.values()][0];
+    if (member?.bridge.generateGroupPicture === undefined) throw new BackendUnavailable("no Hermes endpoint is configured");
+    return member.bridge.generateGroupPicture(prompt);
+  }
   /** The host that drives a room, for the server's attach-event and room-turn wiring. Never
    *  throws: an event for a room whose ownership no longer resolves has no host to project it. */
   roomHostFor(key: string): RoomHost | undefined {
     try {
-      return this.#hostOf(key);
+      return this.#hostOf(key, true);
     } catch {
       return undefined;
     }

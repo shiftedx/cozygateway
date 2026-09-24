@@ -15,6 +15,7 @@ import type {
   DeviceKind,
   DeviceScope,
   BotChatMessage,
+  BotMessageReaction,
   BotMobileReceipt,
   BotComposerDraft,
   BotMobilePreferredDevice,
@@ -715,6 +716,22 @@ CREATE TABLE IF NOT EXISTS bot_native_messages (
   PRIMARY KEY (bot, session_id, seq),
   UNIQUE (bot, message_id)
 ) STRICT, WITHOUT ROWID;
+-- Capability 86. Each bot's canonical Hermes "Bot Chat" registry id, durable so a restarted gateway
+-- still archives it on "Clear chat" and never lets a newer desktop session displace it.
+CREATE TABLE IF NOT EXISTS bot_canonical_chats (
+  bot TEXT PRIMARY KEY,
+  hermes_session_id TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+-- Capability 86. Tapback reactions: at most one per author per message (Hermes's own rule).
+CREATE TABLE IF NOT EXISTS bot_message_reactions (
+  bot TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  author TEXT NOT NULL,
+  emoji TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  PRIMARY KEY (bot, message_id, author)
+) STRICT, WITHOUT ROWID;
 -- Proof a HUMAN saw a row, which no other durable record in this gateway carries: a transcript row
 -- proves only that the gateway holds the message, and push is fire-and-forget. First write wins and
 -- rows are never deleted, so a receipt outlives the session selection that produced it.
@@ -1217,6 +1234,19 @@ export interface BotGroupRow {
   epoch: number;
   needsYou: boolean;
   nextSeq: number;
+  /** Row 84 room state: per-thread marks, holds, held replay, picture, holdDetection. */
+  meta: BotGroupMeta;
+}
+
+/** Row 84. `marks` is thread -> member -> seq; `held` is member -> remembered seqs to replay. */
+export interface BotGroupMeta {
+  marks?: Record<string, Record<string, number>>;
+  holds?: Record<string, { at: number; seq?: number; thread?: string; noted?: boolean }>;
+  held?: Record<string, number[]>;
+  holdDetection?: boolean;
+  picture?: string;
+  /** Threads queued behind the live drive, so a restart still drives them. */
+  queue?: string[];
 }
 
 /** One transcript entry. `kind` is `user` for the human and `member` for a bot; `name` is the bot's
@@ -1236,6 +1266,10 @@ export interface BotGroupLogRow {
   epoch?: number;
   cause?: BotGroupCause;
   attachTurn?: { threadId: string; turnId: string };
+  /** Row 84. The thread this entry belongs to; absent on legacy rows. */
+  threadId?: string;
+  /** Row 84. Mirrored from the member's own thread outside a room turn. */
+  external?: boolean;
 }
 
 /** The highest room seq a member had been shown when its turn started, and whose message that was.
@@ -1307,6 +1341,7 @@ interface BotGroupDbRow {
   epoch: number;
   needsYou: number;
   nextSeq: number;
+  metaJson: string | null;
 }
 
 function toBotGroupRow(row: BotGroupDbRow): BotGroupRow {
@@ -1320,7 +1355,18 @@ function toBotGroupRow(row: BotGroupDbRow): BotGroupRow {
     epoch: row.epoch,
     needsYou: row.needsYou === 1,
     nextSeq: row.nextSeq,
+    meta: parseGroupMeta(row.metaJson),
   };
+}
+
+function parseGroupMeta(raw: string | null): BotGroupMeta {
+  if (raw === null) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as BotGroupMeta : {};
+  } catch {
+    return {};
+  }
 }
 
 function toBotGroupTurnRow(row: Record<string, unknown>): BotGroupTurnRow {
@@ -2801,7 +2847,7 @@ export class Storage {
     const rows = this.#db
       .prepare(
         `SELECT key, name, members_json AS membersJson, owning_host AS owningHost, created_at AS createdAt, epoch,
-                needs_you AS needsYou, next_seq AS nextSeq
+                needs_you AS needsYou, next_seq AS nextSeq, meta_json AS metaJson
          FROM bot_groups ORDER BY created_at, key`,
       )
       .all() as unknown as BotGroupDbRow[];
@@ -2812,7 +2858,7 @@ export class Storage {
     const row = this.#db
       .prepare(
         `SELECT key, name, members_json AS membersJson, owning_host AS owningHost, created_at AS createdAt, epoch,
-                needs_you AS needsYou, next_seq AS nextSeq
+                needs_you AS needsYou, next_seq AS nextSeq, meta_json AS metaJson
          FROM bot_groups WHERE key = ?`,
       )
       .get(key) as BotGroupDbRow | undefined;
@@ -2871,13 +2917,14 @@ export class Storage {
       this.#db
         .prepare(
           `INSERT INTO bot_group_log (group_key, seq, from_kind, from_name, display_name, text, at, client_id,
-             message_id, turn_id, epoch, cause_kind, cause_seq, attach_thread_id, attach_turn_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             message_id, turn_id, epoch, cause_kind, cause_seq, attach_thread_id, attach_turn_id, thread_id, external)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(key, seq, entry.kind, entry.name, entry.displayName, entry.text, entry.at, entry.clientId ?? null,
           entry.messageId ?? null, entry.turnId ?? null, entry.epoch ?? null,
           entry.cause?.kind ?? null, entry.cause?.seq ?? null,
-          entry.attachTurn?.threadId ?? null, entry.attachTurn?.turnId ?? null);
+          entry.attachTurn?.threadId ?? null, entry.attachTurn?.turnId ?? null,
+          entry.threadId ?? null, entry.external === true ? 1 : null);
       this.#db.prepare("UPDATE bot_groups SET next_seq = ? WHERE key = ?").run(seq + 1, key);
       this.#db.exec("COMMIT");
       return { ...entry, seq };
@@ -2893,13 +2940,15 @@ export class Storage {
         `SELECT seq, from_kind AS kind, from_name AS name, display_name AS displayName, text, at,
                 client_id AS clientId, message_id AS messageId, turn_id AS turnId, epoch,
                 cause_kind AS causeKind, cause_seq AS causeSeq,
-                attach_thread_id AS attachThreadId, attach_turn_id AS attachTurnId
+                attach_thread_id AS attachThreadId, attach_turn_id AS attachTurnId,
+                thread_id AS threadId, external
          FROM bot_group_log WHERE group_key = ? ORDER BY seq`,
       )
-      .all(key) as unknown as Array<BotGroupLogRow & {
+      .all(key) as unknown as Array<Omit<BotGroupLogRow, "external" | "threadId"> & {
         clientId: string | null; messageId: string | null; turnId: string | null; epoch: number | null;
         causeKind: string | null; causeSeq: number | null;
         attachThreadId: string | null; attachTurnId: string | null;
+        threadId: string | null; external: number | null;
       }>;
     return rows.map((row) => {
       const entry: BotGroupLogRow = {
@@ -2918,6 +2967,8 @@ export class Storage {
         entry.cause = { kind: row.causeKind, seq: row.causeSeq };
       if (row.attachThreadId !== null && row.attachTurnId !== null)
         entry.attachTurn = { threadId: row.attachThreadId, turnId: row.attachTurnId };
+      if (row.threadId !== null) entry.threadId = row.threadId;
+      if (row.external === 1) entry.external = true;
       return entry;
     });
   }
@@ -2982,6 +3033,46 @@ export class Storage {
 
   setBotGroupNeedsYou(key: string, needsYou: boolean): void {
     this.#db.prepare("UPDATE bot_groups SET needs_you = ? WHERE key = ?").run(needsYou ? 1 : 0, key);
+  }
+
+  // --- Row 84: room settings. The key is the room's stable identity; the name is only its label. ---
+
+  /** The key of the live room DISPLAYED under this case-insensitive name, if any. */
+  botGroupKeyByName(name: string): string | undefined {
+    // Folded in JavaScript, like every room key: SQLite's lower() folds ASCII only.
+    const wanted = name.trim().toLowerCase();
+    const rows = this.#db.prepare("SELECT key, name FROM bot_groups").all() as unknown as Array<{ key: string; name: string }>;
+    return rows.find((row) => row.name.toLowerCase() === wanted)?.key;
+  }
+
+  setBotGroupMeta(key: string, meta: BotGroupMeta): void {
+    this.#db.prepare("UPDATE bot_groups SET meta_json = ? WHERE key = ?").run(JSON.stringify(meta), key);
+  }
+
+  renameBotGroup(key: string, name: string): void {
+    this.#db.prepare("UPDATE bot_groups SET name = ? WHERE key = ?").run(name, key);
+  }
+
+  /** New members get their deterministic thread; a removed member's row stays (harmless). */
+  setBotGroupMembers(key: string, members: string[]): void {
+    this.#db.prepare("UPDATE bot_groups SET members_json = ? WHERE key = ?").run(JSON.stringify(members), key);
+    for (const member of members) this.ensureBotGroupThread(key, member);
+  }
+
+  /** The room and member whose gateway-owned attach thread this is. */
+  botGroupMemberBySession(sessionId: string): { key: string; member: string } | undefined {
+    return this.#db.prepare(
+      "SELECT group_key AS key, member FROM bot_group_members WHERE session_id = ? LIMIT 1",
+    ).get(sessionId) as { key: string; member: string } | undefined;
+  }
+
+  /** Stop: every pending turn of the room is cancelled, the same shape `deleteBotGroup` uses. */
+  cancelPendingBotGroupTurns(key: string, detail: string, completedAt: number): BotGroupTurnRow[] {
+    const pending = this.pendingBotGroupTurns().filter((turn) => turn.key === key);
+    this.#db.prepare(
+      "UPDATE bot_group_turns SET state = 'cancelled', detail = ?, completed_at = ? WHERE group_key = ? AND state = 'pending'",
+    ).run(detail, completedAt, key);
+    return pending;
   }
 
   /** Returns the gateway-owned attach thread for this member.  Older rooms gain the deterministic
@@ -4637,6 +4728,10 @@ export class Storage {
       this.#db.prepare(`DELETE FROM bot_message_receipts WHERE bot = ? AND message_id IN
         (SELECT message_id FROM bot_native_messages WHERE bot = ? AND session_id = ?)`)
         .run(input.bot, input.bot, input.sessionId);
+      // Capability 86: a deleted conversation's Tapbacks go with it.
+      this.#db.prepare(`DELETE FROM bot_message_reactions WHERE bot = ? AND message_id IN
+        (SELECT message_id FROM bot_native_messages WHERE bot = ? AND session_id = ?)`)
+        .run(input.bot, input.bot, input.sessionId);
       this.#db.prepare(`DELETE FROM bot_turn_media_deliveries WHERE bot = ? AND message_id IN
         (SELECT message_id FROM bot_native_messages WHERE bot = ? AND session_id = ?)`)
         .run(input.bot, input.bot, input.sessionId);
@@ -4970,7 +5065,85 @@ export class Storage {
          FROM bot_native_messages WHERE bot = ? AND session_id = ? ORDER BY seq`,
       )
       .all(bot, sessionId) as unknown as NativeBotMessageDbRow[];
-    return rows.map(nativeBotMessage);
+    const reactions = this.#reactionsBySession(bot, sessionId);
+    return rows.map((row) => withReactions(nativeBotMessage(row), reactions.get(row.id)));
+  }
+
+  /** Capability 86. Every reacted row of one session, by message id, in author order. */
+  #reactionsBySession(bot: string, sessionId: string): Map<string, BotMessageReaction[]> {
+    const rows = this.#db.prepare(
+      `SELECT r.message_id AS messageId, r.author, r.emoji, r.at FROM bot_message_reactions r
+       JOIN bot_native_messages m ON m.bot = r.bot AND m.message_id = r.message_id
+       WHERE r.bot = ? AND m.session_id = ? ORDER BY r.at`,
+    ).all(bot, sessionId) as Array<{ messageId: string; author: string; emoji: string; at: number }>;
+    const out = new Map<string, BotMessageReaction[]>();
+    for (const row of rows) {
+      const list = out.get(row.messageId) ?? [];
+      list.push(reactionRow(row));
+      out.set(row.messageId, list);
+    }
+    return out;
+  }
+
+  botMessageReactions(bot: string, messageId: string): BotMessageReaction[] {
+    return (this.#db.prepare(
+      `SELECT author, emoji, at FROM bot_message_reactions WHERE bot = ? AND message_id = ? ORDER BY at`,
+    ).all(bot, messageId) as Array<{ author: string; emoji: string; at: number }>).map(reactionRow);
+  }
+
+  /** Capability 86, Tapback semantics (`tui_gateway` `message.react`): one reaction per author, the
+   *  same emoji again retracts it, null clears. Undefined when the message is not this bot's. */
+  setBotMessageReaction(input: {
+    bot: string; messageId: string; author: "user" | "agent"; emoji: string | null; now: number;
+  }): { sessionId: string; reactions: BotMessageReaction[] } | undefined {
+    const owner = this.#db.prepare(
+      "SELECT session_id AS sessionId FROM bot_native_messages WHERE bot = ? AND message_id = ?",
+    ).get(input.bot, input.messageId) as { sessionId: string } | undefined;
+    if (owner === undefined) return undefined;
+    const mine = this.#db.prepare(
+      "SELECT emoji FROM bot_message_reactions WHERE bot = ? AND message_id = ? AND author = ?",
+    ).get(input.bot, input.messageId, input.author) as { emoji: string } | undefined;
+    if (input.emoji === null || mine?.emoji === input.emoji) {
+      this.#db.prepare("DELETE FROM bot_message_reactions WHERE bot = ? AND message_id = ? AND author = ?")
+        .run(input.bot, input.messageId, input.author);
+    } else {
+      this.#db.prepare(
+        `INSERT INTO bot_message_reactions (bot, message_id, author, emoji, at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(bot, message_id, author) DO UPDATE SET emoji = excluded.emoji, at = excluded.at`,
+      ).run(input.bot, input.messageId, input.author, input.emoji, input.now);
+    }
+    return { sessionId: owner.sessionId, reactions: this.botMessageReactions(input.bot, input.messageId) };
+  }
+
+  canonicalBotChat(bot: string): string | undefined {
+    return (this.#db.prepare("SELECT hermes_session_id AS id FROM bot_canonical_chats WHERE bot = ?")
+      .get(bot) as { id: string } | undefined)?.id;
+  }
+
+  setCanonicalBotChat(bot: string, hermesSessionId: string | null, now: number): void {
+    if (hermesSessionId === null) {
+      this.#db.prepare("DELETE FROM bot_canonical_chats WHERE bot = ?").run(bot);
+      return;
+    }
+    this.#db.prepare(
+      `INSERT INTO bot_canonical_chats (bot, hermes_session_id, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(bot) DO UPDATE SET hermes_session_id = excluded.hermes_session_id, updated_at = excluded.updated_at`,
+    ).run(bot, hermesSessionId, now);
+  }
+
+  canonicalBotChats(): Array<{ bot: string; hermesSessionId: string }> {
+    return this.#db.prepare("SELECT bot, hermes_session_id AS hermesSessionId FROM bot_canonical_chats")
+      .all() as Array<{ bot: string; hermesSessionId: string }>;
+  }
+
+  /** Capability 86: the bot's profile model changed, so every per-chat override of this bot yields
+   *  to it again (upstream: a chat's pick sticks "until you change the Bot's profile model"). The
+   *  row stays explicitly configured, so the next turn's preparation clears the harness override. */
+  clearNativeChatModels(bot: string, now: number): number {
+    return Number(this.#db.prepare(
+      `UPDATE bot_chat_configurations SET model_json = NULL, updated_at = ?
+       WHERE bot = ? AND model_json IS NOT NULL`,
+    ).run(now, bot).changes);
   }
 
   /** First write wins on requestId. Only metadata is accepted by this API. */
@@ -5264,7 +5437,8 @@ export class Storage {
          FROM bot_native_messages WHERE bot = ? AND message_id = ?`,
       )
       .get(bot, messageId) as NativeBotMessageDbRow | undefined;
-    return row === undefined ? undefined : nativeBotMessage(row);
+    return row === undefined ? undefined
+      : withReactions(nativeBotMessage(row), this.botMessageReactions(bot, messageId));
   }
 
   #insertNativeBotSession(bot: string, now: number): string {
@@ -5929,6 +6103,9 @@ export class Storage {
       ["sessions", "bot_native_sessions", "bot"],
       ["messages", "bot_native_messages", "bot"],
       ["receipts", "bot_message_receipts", "bot"],
+      // Capability 86.
+      ["reactions", "bot_message_reactions", "bot"],
+      ["canonicalBotChat", "bot_canonical_chats", "bot"],
       ["mobileReceipts", "bot_mobile_receipts", "bot"],
       // Capability 68. A lifecycle record names a device, a turn and the purpose a person was
       // shown. Deleting the bot takes them with it rather than leaving them keyed to an identity
@@ -6396,6 +6573,15 @@ function chatExecution(row: ChatExecutionDbRow): ChatExecutionRow {
   };
 }
 
+function reactionRow(row: { author: string; emoji: string; at: number }): BotMessageReaction {
+  // Hermes stamps reactions in SECONDS; this table stores the gateway's milliseconds.
+  return { emoji: row.emoji, author: row.author === "agent" ? "agent" : "user", at: row.at / 1000 };
+}
+
+function withReactions(message: BotChatMessage, reactions: BotMessageReaction[] | undefined): BotChatMessage {
+  return reactions === undefined || reactions.length === 0 ? message : { ...message, reactions };
+}
+
 function nativeBotMessage(row: NativeBotMessageDbRow): BotChatMessage {
   return {
     id: row.id,
@@ -6567,6 +6753,8 @@ export function openStorage(dbPath: string): Storage {
       ["cause_seq", "ALTER TABLE bot_group_log ADD COLUMN cause_seq INTEGER"],
       ["attach_thread_id", "ALTER TABLE bot_group_log ADD COLUMN attach_thread_id TEXT"],
       ["attach_turn_id", "ALTER TABLE bot_group_log ADD COLUMN attach_turn_id TEXT"],
+      ["thread_id", "ALTER TABLE bot_group_log ADD COLUMN thread_id TEXT"],
+      ["external", "ALTER TABLE bot_group_log ADD COLUMN external INTEGER"],
     ]],
     ["bot_group_turns", [
       ["cause_kind", "ALTER TABLE bot_group_turns ADD COLUMN cause_kind TEXT"],
@@ -6576,6 +6764,8 @@ export function openStorage(dbPath: string): Storage {
     // before this column and persist it. A NULL must remain NULL until that reader has evidence.
     ["bot_groups", [
       ["owning_host", "ALTER TABLE bot_groups ADD COLUMN owning_host TEXT"],
+      // Row 84 room state (marks, holds, picture). NULL reads as an empty object.
+      ["meta_json", "ALTER TABLE bot_groups ADD COLUMN meta_json TEXT"],
     ]],
     ["bot_native_messages", [
       ["turn_id", "ALTER TABLE bot_native_messages ADD COLUMN turn_id TEXT"],

@@ -160,6 +160,14 @@ export interface HermesEvent {
 
 export type HermesState = "absent" | "connecting" | "online";
 
+/** One server->client request off the Hermes stream (capability 85). `id` is Hermes's own string
+ *  id (`srq-...`), answered verbatim through `respond`. */
+export interface HermesServerRequest {
+  id: string;
+  method: string;
+  params: Record<string, unknown>;
+}
+
 /** A snapshot of the client's own connection state, for a health surface to report (issue #63: a
  *  monitor watching only the advertised capability cannot tell "online" from "stuck reconnecting
  *  for six hours", because the capability itself never goes away). `since` is when `state` last
@@ -239,6 +247,12 @@ export interface HermesClient {
    *  `cron.changed` broadcasts. Handlers cannot be removed. */
   onEvent(handler: (event: HermesEvent) => void): void;
   onStateChange(handler: (state: HermesState) => void): void;
+  /** Capability 85. Server->client JSON-RPC requests (`{ id, method, params }` with no `result` or
+   *  `error`), such as `display.install.sudo`. Optional so hand-rolled test clients keep compiling;
+   *  the real client always implements both. Unanswered requests simply time out Hermes-side. */
+  onServerRequest?(handler: (request: HermesServerRequest) => void): void;
+  /** Answers one server request on the CURRENT socket. False when the link is not open. */
+  respond?(id: string, result: unknown): boolean;
   /** Idempotent. Begins the connect and reconnect loop. */
   start(): void;
   /** Idempotent. Cancels reconnects, fails every in-flight request, closes the socket. */
@@ -268,6 +282,21 @@ function replyOf(
   }
   if ("result" in frame) return { id, ok: true, result: frame["result"] };
   return undefined;
+}
+
+/** Reads a server->client request: an id, a string method other than `event`, and no result or
+ *  error (which `replyOf` already claimed). */
+function serverRequestOf(frame: Record<string, unknown>): HermesServerRequest | undefined {
+  const rawId = frame["id"];
+  const method = frame["method"];
+  if (rawId === undefined || rawId === null || typeof method !== "string" || method === "event") return undefined;
+  if ("result" in frame || "error" in frame) return undefined;
+  const params = frame["params"];
+  return {
+    id: String(rawId),
+    method,
+    params: typeof params === "object" && params !== null ? (params as Record<string, unknown>) : {},
+  };
 }
 
 /** Reads an event frame. Hermes sends `{ method: "event", params: { type, session_id, payload } }`;
@@ -341,6 +370,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
   const pending = new Map<string, Pending>();
   const eventHandlers: Array<(event: HermesEvent) => void> = [];
   const stateHandlers: Array<(state: HermesState) => void> = [];
+  const serverRequestHandlers: Array<(request: HermesServerRequest) => void> = [];
 
   function setState(next: HermesState): void {
     if (state === next) return;
@@ -470,6 +500,18 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
       if (entry === undefined) return;
       if (reply.ok) entry.resolve(reply.result);
       else entry.reject(reply.error);
+      return;
+    }
+
+    const serverRequest = serverRequestOf(frame);
+    if (serverRequest !== undefined) {
+      for (const handler of serverRequestHandlers) {
+        try {
+          handler(serverRequest);
+        } catch (err) {
+          log(`server request handler threw on "${serverRequest.method}"; continuing (${(err as Error).message})`);
+        }
+      }
       return;
     }
 
@@ -835,6 +877,17 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
 
     onStateChange(handler: (state: HermesState) => void): void {
       stateHandlers.push(handler);
+    },
+
+    onServerRequest(handler: (request: HermesServerRequest) => void): void {
+      serverRequestHandlers.push(handler);
+    },
+
+    respond(id: string, result: unknown): boolean {
+      const socket = ws;
+      if (socket === undefined || socket.readyState !== WebSocket.OPEN) return false;
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id, result }));
+      return true;
     },
 
     start(): void {

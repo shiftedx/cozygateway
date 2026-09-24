@@ -183,7 +183,7 @@ describe("native group turns", () => {
     storage.close();
   });
 
-  it("serializes a superseding user send behind the in-flight member and settles only the replacement", async () => {
+  it("queues a send made during a member turn behind the live drive and settles once (row 84)", async () => {
     const storage = openStorage(":memory:");
     const states: BotGroupStateFrame[] = [];
     const commands: Array<{
@@ -233,7 +233,7 @@ describe("native group turns", () => {
     rooms.send("Release", "Investigate first @scout");
     expect(commands.map((command) => command.agentId)).toEqual(["scout"]);
 
-    rooms.send("Release", "This supersedes it @luna");
+    rooms.send("Release", "This queues behind it @luna");
     expect(commands.map((command) => command.agentId)).toEqual(["scout"]);
     commands[0]!.complete("The first turn still completed.");
 
@@ -243,11 +243,12 @@ describe("native group turns", () => {
 
     expect(storage.botGroupLog("release").map((entry) => entry.text)).toEqual([
       "Investigate first @scout",
-      "This supersedes it @luna",
+      "This queues behind it @luna",
       "The first turn still completed.",
     ]);
-    expect(states.filter((frame) => frame.epoch === 1 && frame.state !== "running")).toEqual([]);
-    expect(states.at(-1)).toMatchObject({ group: "Release", state: "settled", epoch: 2 });
+    // One drive, one epoch, one settlement: the queued thread ran after the first, not instead of it.
+    expect(states.filter((frame) => frame.state !== "running")).toHaveLength(1);
+    expect(states.at(-1)).toMatchObject({ group: "Release", state: "settled", epoch: 1 });
     await rooms.close();
     storage.close();
   });
