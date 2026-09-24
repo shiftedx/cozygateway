@@ -499,7 +499,7 @@ class MemoryManager:
             provider = str((section if isinstance(section, dict) else {}).get("provider") or "").strip().lower()
             return {"memoryEnabled": bool(memory), "userProfileEnabled": bool(user), "holographicEnabled": provider == "holographic"}
         except Exception as error:
-            logger.debug("memory: setup state unavailable (%s)", type(error).__name__)
+            logger.warning("memory: setup state unavailable (%s)", type(error).__name__)
             return None
     def _stated(self, result: Dict[str, Any]) -> Dict[str, Any]:
         state = self.setup_state()

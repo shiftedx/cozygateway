@@ -132,9 +132,14 @@ class MemoryDispatchTests(unittest.TestCase):
         module.load_config_readonly = lambda: (_ for _ in ()).throw(OSError("config unreadable"))
         package = types.ModuleType("hermes_cli"); package.__path__ = []  # type: ignore[attr-defined]
         with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.config": module, "tools.memory_tool": builtin_memory_tool()}):
-            overview = self.manager.execute("overview", {})
+            # A warning, not a debug line: a renamed Hermes flag reader must be visible in the log
+            # rather than silently dropping the field from every reply.
+            with self.assertLogs("cozygateway.memory", level="WARNING") as captured:
+                overview = self.manager.execute("overview", {})
         self.assertNotIn("setup", overview)
         self.assertTrue(overview["sources"])
+        self.assertTrue(any("setup state unavailable" in line and "OSError" in line for line in captured.output), captured.output)
+        self.assertFalse(any("config unreadable" in line for line in captured.output), captured.output)
 
     def test_setup_uses_the_native_merge_writer_for_only_allowlisted_memory_settings(self):
         state, writes, preserves, modules = self._config_writer({
