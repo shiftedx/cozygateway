@@ -30,6 +30,8 @@ SERVICE_PLATFORM=Windows DRY_RUN=0 DASHBOARD_PORT=9119 DASHBOARD_OWNER_PS1="$tmp
 powershell.exe() {
   local script="${*: -1}" fake
   case "$FAKE_NETTCPIP" in
+    # Assumes a POSIX pwsh host, which has no NetTCPIP module to autoload; on Windows this
+    # mode would reach the real inbox cmdlet instead of a missing command.
     none) fake='' ;;
     empty) fake='function Get-NetTCPConnection { [CmdletBinding()] param($State) }' ;;
     other-port) fake='function Get-NetTCPConnection { [CmdletBinding()] param($State) [pscustomobject]@{ LocalAddress = "127.0.0.1"; LocalPort = 135 } }' ;;
