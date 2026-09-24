@@ -2867,13 +2867,24 @@ export const BotMemoryItemSchema = Type.Object({
   owner: Type.Optional(Type.Union([Type.Literal("person"), Type.Literal("bot")])),
 }, { additionalProperties: false });
 export type BotMemoryItem = Static<typeof BotMemoryItemSchema>;
+/** The three capability-42 setup switches as the PEER's effective configuration reads them now,
+ * named as the setup request names them so a client compares the two directly. Unlike the
+ * request, all three may be false. Sources are not a substitute: they name adapters, and a peer
+ * lists an adapter whether or not its switch is on, so a client never infers these from them. */
+export const BotMemorySetupStateSchema = Type.Object({
+  memoryEnabled: Type.Boolean(), userProfileEnabled: Type.Boolean(), holographicEnabled: Type.Boolean(),
+}, { additionalProperties: false });
+export type BotMemorySetupState = Static<typeof BotMemorySetupStateSchema>;
 /** `setupAvailable` is the GATEWAY's own answer, never the peer's: it is true exactly when the
  * attached peer negotiated capability-42 `memory_setup`, so a client knows whether
  * `PATCH /bots/:name/memory/setup` is offered by this bot without probing it with a mutation.
  * Absent means this deployment cannot observe the negotiation at all; it is never a promise that
  * setup will succeed, only that the lane is there. A bot that already reports sources can still
- * carry `true`, which is what lets a settings screen exist alongside a non-empty memory. */
-export const BotMemoryOverviewResponseSchema = Type.Object({ sources: Type.Array(BotMemorySourceSchema, { maxItems: 32 }), setupAvailable: Type.Optional(Type.Boolean()) }, { additionalProperties: false });
+ * carry `true`, which is what lets a settings screen exist alongside a non-empty memory.
+ *
+ * `setup` is the PEER's answer, passed through: present only from a peer that negotiated attach-v1
+ * `memory_setup_state`, and absent means the peer did not say, never that the switches are off. */
+export const BotMemoryOverviewResponseSchema = Type.Object({ sources: Type.Array(BotMemorySourceSchema, { maxItems: 32 }), setupAvailable: Type.Optional(Type.Boolean()), setup: Type.Optional(BotMemorySetupStateSchema) }, { additionalProperties: false });
 export type BotMemoryOverviewResponse = Static<typeof BotMemoryOverviewResponseSchema>;
 /** Capability 42: exact credential-free setup choices. The union makes "at least one true" part
  * of the normative schema while every branch remains a closed, three-required-boolean object. */
@@ -2883,7 +2894,7 @@ export const BotMemorySetupRequestSchema = Type.Union([
   Type.Object({ memoryEnabled: Type.Boolean(), userProfileEnabled: Type.Boolean(), holographicEnabled: Type.Literal(true) }, { additionalProperties: false }),
 ]);
 export type BotMemorySetupRequest = Static<typeof BotMemorySetupRequestSchema>;
-export const BotMemoryItemsResponseSchema = Type.Object({ items: Type.Array(BotMemoryItemSchema, { maxItems: 100 }), sources: Type.Optional(Type.Array(BotMemorySourceSchema, { maxItems: 32 })), setupAvailable: Type.Optional(Type.Boolean()) }, { additionalProperties: false });
+export const BotMemoryItemsResponseSchema = Type.Object({ items: Type.Array(BotMemoryItemSchema, { maxItems: 100 }), sources: Type.Optional(Type.Array(BotMemorySourceSchema, { maxItems: 32 })), setupAvailable: Type.Optional(Type.Boolean()), setup: Type.Optional(BotMemorySetupStateSchema) }, { additionalProperties: false });
 export type BotMemoryItemsResponse = Static<typeof BotMemoryItemsResponseSchema>;
 export const BotMemoryGraphResponseSchema = Type.Object({ nodes: Type.Array(BotMemoryItemSchema, { maxItems: 200 }), edges: Type.Array(Type.Object({ from: Type.String({ maxLength: 512 }), to: Type.String({ maxLength: 512 }), kind: Type.Union([Type.Literal("entity"), Type.Literal("wikilink")]) }, { additionalProperties: false }), { maxItems: 400 }) }, { additionalProperties: false });
 export type BotMemoryGraphResponse = Static<typeof BotMemoryGraphResponseSchema>;

@@ -32,6 +32,9 @@ import {
   MOBILE_REQUEST_STATES,
   MOBILE_REQUEST_TERMINAL_STATES,
   BotMemorySetupRequestSchema,
+  BotMemorySetupStateSchema,
+  BotMemoryOverviewResponseSchema,
+  BotMemoryItemsResponseSchema,
   BotChatResetFrameSchema,
   BotChatResetResponseSchema,
   BotChatStopResponseSchema,
@@ -1064,6 +1067,28 @@ describe("capability advertisement", () => {
     expect(check(BotMemorySetupRequestSchema, {
       memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false, provider: "external",
     })).toBe(false);
+  });
+
+  it("carries the peer's current setup switches as an optional closed block beside the sources", () => {
+    const setup = { memoryEnabled: false, userProfileEnabled: true, holographicEnabled: false };
+    // All three off is a real state a bot can be in, unlike a setup REQUEST, which needs one on.
+    const allOff = { memoryEnabled: false, userProfileEnabled: false, holographicEnabled: false };
+    expect(check(BotMemorySetupStateSchema, setup)).toBe(true);
+    expect(check(BotMemorySetupStateSchema, allOff)).toBe(true);
+    expect(check(BotMemorySetupStateSchema, { memoryEnabled: true, userProfileEnabled: true })).toBe(false);
+    expect(check(BotMemorySetupStateSchema, { ...setup, provider: "external" })).toBe(false);
+    expect(check(BotMemorySetupStateSchema, { ...setup, memoryEnabled: "yes" })).toBe(false);
+
+    for (const [schema, base] of [
+      [BotMemoryOverviewResponseSchema, { sources: [] }],
+      [BotMemoryItemsResponseSchema, { items: [], sources: [] }],
+    ] as const) {
+      // Absent stays valid: an older peer never says, and the client must not guess.
+      expect(check(schema, base)).toBe(true);
+      expect(check(schema, { ...base, setupAvailable: true, setup })).toBe(true);
+      expect(check(schema, { ...base, setup: allOff })).toBe(true);
+      expect(check(schema, { ...base, setup: { ...setup, extra: true } })).toBe(false);
+    }
   });
 
   it("keeps mobile receipts closed and metadata-only", () => {
