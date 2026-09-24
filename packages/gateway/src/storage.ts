@@ -629,6 +629,10 @@ CREATE TABLE IF NOT EXISTS attach_scheduled_deliveries (
 CREATE TABLE IF NOT EXISTS bot_native_chats (
   bot TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,
+  -- Deprecated by issue #191: never read or written, and cleared to NULL at open. It stays only so
+  -- a rolled-back gateway (whose SQL still names it) can boot on this database; drop it in a later
+  -- release once no supported rollback target reads it.
+  active_turn_id TEXT,
   updated_at INTEGER NOT NULL
 ) STRICT;
 -- bot_native_chats is deliberately only the active-session pointer. A bot can have more than
@@ -6684,20 +6688,27 @@ export function openStorage(dbPath: string): Storage {
   db.exec("PRAGMA foreign_keys = ON");
   db.exec(SCHEMA);
   // Issue #191. bot_native_chats once carried its own copy of the selected session's turn beside
-  // the per-session truth in bot_native_sessions. Before dropping that copy, restore any missing
+  // the per-session truth in bot_native_sessions. Before retiring that copy, restore any missing
   // companion session row from the pointer (a pre-session-table database or a damaged pointer), so
-  // its in-flight turn survives. Where both rows exist the session value already won every read
-  // and is kept. One transaction, and the column test makes a restart run it harmlessly again.
-  const nativeChatColumns = new Set(
-    (db.prepare("PRAGMA table_info(bot_native_chats)").all() as unknown as Array<{ name: string }>)
-      .map((column) => column.name),
-  );
-  if (nativeChatColumns.has("active_turn_id")) {
-    db.exec("BEGIN IMMEDIATE");
+  // its in-flight turn survives; where both rows exist the session value already won every read
+  // and is kept. The column is cleared, not dropped: every earlier migration is additive so that a
+  // rolled-back release still boots here. Nothing writes the copy any more, so once cleared this
+  // is one cheap probe of a one-row-per-bot table. A second process opening at the same moment
+  // waits briefly for the write lock instead of failing, then re-probes and finds the work done.
+  const legacyChatTurn = db.prepare("SELECT 1 FROM bot_native_chats WHERE active_turn_id IS NOT NULL LIMIT 1");
+  if (legacyChatTurn.get() !== undefined) {
+    db.exec("PRAGMA busy_timeout = 5000");
     try {
-      db.exec(`INSERT OR IGNORE INTO bot_native_sessions (bot, session_id, created_at, updated_at, active_turn_id)
-        SELECT bot, session_id, updated_at, updated_at, active_turn_id FROM bot_native_chats`);
-      db.exec("ALTER TABLE bot_native_chats DROP COLUMN active_turn_id");
+      db.exec("BEGIN IMMEDIATE");
+    } finally {
+      db.exec("PRAGMA busy_timeout = 0");
+    }
+    try {
+      if (legacyChatTurn.get() !== undefined) {
+        db.exec(`INSERT OR IGNORE INTO bot_native_sessions (bot, session_id, created_at, updated_at, active_turn_id)
+          SELECT bot, session_id, updated_at, updated_at, active_turn_id FROM bot_native_chats`);
+        db.exec("UPDATE bot_native_chats SET active_turn_id = NULL WHERE active_turn_id IS NOT NULL");
+      }
       db.exec("COMMIT");
     } catch (error) {
       db.exec("ROLLBACK");
