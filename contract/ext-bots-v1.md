@@ -1803,6 +1803,12 @@ that does not exist.
 `GET /bots/:name/team` is the one read a runtime peer needs to know whether it leads: the config
 lane never carries `role` or `reports`, so a peer asks here with its own attach bearer.
 
+`team` joins `assignments` in the reserved room names (`/bots/groups/:name` and
+`/bots/:name/<suffix>` are both three-segment addresses, so a room named `team` would sit exactly
+where this route lives): `POST /bots/groups` refuses to create one, `400 invalid_request`. A room
+already named `team` from before this route existed is not renamed or deleted; it is simply
+shadowed and unreachable at `/bots/groups/team` until it is renamed.
+
 A leader's roster row (`BotSummary`, both a Hermes profile's and a runtime bot's) carries
 `role: "leader"`; a member's carries no `role` key at all, the same absent-means-member rule
 `BotProfile.role` already follows.
