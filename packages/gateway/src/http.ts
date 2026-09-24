@@ -3,6 +3,8 @@ import { observeRoutes } from "./observe/routes.ts";
 import { registerObserveDashboard } from "./observe/dashboard.ts";
 import { registerArtifactRoutes } from "./artifact-routes.ts";
 import { registerTaskRoutes } from "./task-routes.ts";
+import { registerAssignmentRoutes } from "./assignment-routes.ts";
+import type { AssignmentRooms } from "./hermes-bridge/assignments.ts";
 import { createHash, randomUUID } from "node:crypto";
 
 import { Hono } from "hono";
@@ -197,6 +199,9 @@ export interface AppDeps {
   bots?: BotControlSurface | BotsSurface;
   /** Capability 85, bot screen. Present whenever a Hermes endpoint is configured. */
   botScreen?: BotScreenSurface;
+  /** agent-inbox 1. Leader assignments and the team fields on the profile. Absent leaves the
+   * assignment and inbox routes unregistered. */
+  assignments?: AssignmentRooms;
   /** Profile-local memory travels only over the attached plugin's bounded management lane. */
   memory?: MemorySurface;
   /** Capability 50. A runtime bot's own checkpointed workspace history, over the attached peer's
@@ -1701,6 +1706,13 @@ export function createApp(deps: AppDeps): Hono<Env> {
     });
   }
 
+  // agent-inbox 1. Before the per-bot routes and the rooms behind them, exactly as those are
+  // ordered among themselves; `assignments` and `inbox` are reserved room names for that reason.
+  if (deps.assignments !== undefined) {
+    registerAssignmentRoutes(app, requireDevice, (c) => deps.attachTokens === undefined
+      ? undefined : resolveAttachBearer(deps.attachTokens, c.req.header("authorization")), deps.assignments);
+  }
+
   // Vendor extension, registered last so it cannot shadow a core route (contract/ext-bots-v1.md).
   if (deps.bots !== undefined) {
     if (deps.botScreen !== undefined) registerBotScreenRoutes(app, requireDevice, deps.botScreen);
@@ -1737,6 +1749,11 @@ export function createApp(deps: AppDeps): Hono<Env> {
       deps.history,
       deps.chatConfiguration,
       deps.integrations,
+      deps.assignments === undefined ? undefined : {
+        read: (bot) => deps.assignments!.team(bot),
+        check: (bot, patch) => deps.assignments!.checkTeam(bot, patch),
+        write: (bot, patch) => deps.assignments!.setTeam(bot, patch),
+      },
     );
   }
 

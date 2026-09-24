@@ -350,6 +350,22 @@ describe("rename carries rooms, the Bot Chat binding and routines", () => {
     expect(bots.bots.find((bot) => bot.name === "default")?.previousNames).toBeUndefined();
   });
 
+  it("re-links team rows and assignments through previous_names even when no room names the bot", async () => {
+    const h = await setup({
+      rows: [
+        { name: "default", is_default: true, path: "/home/h/.hermes" },
+        { name: "lookout", path: "/home/h/.hermes/profiles/lookout", previous_names: ["scout"] },
+      ],
+      seed: (storage) => {
+        storage.setBotTeam({ bot: "default", role: "leader", reports: ["scout"], updatedAt: 1 });
+        storage.createBotAssignment({ taskId: "t1", leader: "default", assignee: "scout", threadId: "assignment:t1", brief: "b", doneCriteria: "d", deadlineAt: 9, createdAt: 1 });
+      },
+    });
+    await until(() => h.storage.botTeam("default")?.reports.includes("lookout") === true);
+    expect(h.storage.botTeam("default")?.reports).toEqual(["lookout"]);
+    expect(h.storage.botAssignment("t1")?.assignee).toBe("lookout");
+  });
+
   it("the live bot's state wins over a deleted bot of the new name still listed in the room", async () => {
     const h = await setup({
       seed: (storage) => {

@@ -61,6 +61,19 @@ describe("attach-v1 protocol", () => {
     }))).toBe(false);
   });
 
+  it("carries an optional task context in place of room on an assignment turn, text unchanged", () => {
+    const turn = { kind: "turn", threadId: "assignment:t1", turnId: "run", messageId: "run:assignment", text: "[Task from Lead] Check CI" };
+    const frame = (command: Record<string, unknown>): unknown =>
+      ({ kind: "command", sequence: 1, commandId: "cmd-1", command });
+    const task = { id: "t1", assignedBy: "lead", brief: "Check CI", doneCriteria: "main is green", deadlineAt: 10 };
+    const withTask = { ...turn, context: { actors: [], task } };
+    expect(check(AttachV1ServerFrameSchema, frame(withTask))).toBe(true);
+    expect(check(AttachV1ServerFrameSchema, frame({ ...turn, context: { actors: [], task: { ...task, outputFormat: "JSON" } } }))).toBe(true);
+    expect(check(AttachV1ServerFrameSchema, frame({ ...turn, context: { actors: [], task: { ...task, deadlineAt: -1 } } }))).toBe(false);
+    expect(check(AttachV1ServerFrameSchema, frame({ ...turn, context: { actors: [], task: { ...task, extra: true } } }))).toBe(false);
+    expect(withTask.text).toBe(turn.text);
+  });
+
   it("negotiates capabilities, cursor and backpressure limits with one hello shape", () => {
     expect(check(AttachV1HelloSchema, {
       kind: "hello",

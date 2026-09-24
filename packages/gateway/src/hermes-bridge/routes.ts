@@ -67,7 +67,7 @@ import {
   ChatConfigurationWorkspaceLocked,
   type GatewayChatConfiguration,
 } from "../chat-configuration.ts";
-import type { BotMemoryKind } from "cozygateway-contract";
+import type { BotMemoryKind, BotTeamRole } from "cozygateway-contract";
 
 import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
@@ -96,6 +96,7 @@ import {
   normalizeProfileName,
 } from "./crud.ts";
 import { GroupBusy, GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
+import { AssignmentInvalid } from "./assignments.ts";
 import { PresentationConflict, PresentationNotApplied } from "./presentation.ts";
 import { normalizeRelayAgents } from "./relay.ts";
 import { AvatarInvalid, decodeAvatar } from "./avatar.ts";
@@ -149,6 +150,14 @@ import {
  *  reworded, and `error.message` stays a stable, human-readable summary. */
 
 export type Env = { Variables: { deviceId: string } };
+
+/** Capability 88. What the profile routes need of the gateway's team rows. */
+export interface BotTeamStore {
+  read(bot: string): { role: BotTeamRole; reports: string[] } | undefined;
+  /** Throws `AssignmentInvalid` for a patch the gateway will not store. */
+  check(bot: string, patch: { role?: BotTeamRole; reports?: string[] }): void;
+  write(bot: string, patch: { role?: BotTeamRole; reports?: string[] }): void;
+}
 
 /** How many sessions `GET /bots/:name/sessions` asks Hermes for. Matches the design's cap. */
 export const SESSION_LIST_LIMIT = 200;
@@ -497,6 +506,9 @@ export function registerBotRoutes(
   /** Capability com.cozylabs.integrations v1. It exists only after one configured Dashboard
    * launch profile passed a live, schema-checked integration-list probe at startup. */
   integrations?: HermesDashboardIntegrations,
+  /** Capability 88. Gateway-owned team role and reports: merged into the profile read, and taken
+   *  out of a profile patch before the rest is forwarded. Absent, a patch naming them is refused. */
+  team?: BotTeamStore,
 ): void {
   const chat = bots as BotsSurface;
   // One limiter per registered app, created here rather than at module scope so two gateways in one
@@ -1368,7 +1380,10 @@ export function registerBotRoutes(
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;
     try {
-      return c.json(await bots.botProfile(resolved.name));
+      const profile = await bots.botProfile(resolved.name);
+      const membership = team?.read(resolved.name);
+      return c.json(membership === undefined ? profile
+        : { ...profile, role: membership.role, ...(membership.role === "leader" ? { reports: membership.reports } : {}) });
     } catch (err) {
       return failure(c, err);
     }
@@ -1404,25 +1419,55 @@ export function registerBotRoutes(
       parsed.enabledMcpServers === undefined &&
       // Capability 57: a guardrailLevel-only patch is a real request too, even though this
       // gateway does no work for it beyond forwarding it to a runtime bot's peer.
-      parsed.guardrailLevel === undefined
+      parsed.guardrailLevel === undefined &&
+      // Capability 88: so is a team-only patch, which touches no peer at all.
+      parsed.role === undefined &&
+      parsed.reports === undefined
     ) {
       return c.json(
         errorBody(
           "invalid_request",
-          "at least one of soul, disabledSkills, enabledSkills, enabledToolsets, enabledMcpServers, guardrailLevel is required",
+          "at least one of soul, disabledSkills, enabledSkills, enabledToolsets, enabledMcpServers, guardrailLevel, role, reports is required",
         ),
         400,
       );
     }
+    // Capability 88. The team half is checked before anything is forwarded and stored after the
+    // forward succeeds, so a refused write leaves neither half behind.
+    const { role, reports, ...forwarded } = parsed;
+    const membership = { ...(role === undefined ? {} : { role }), ...(reports === undefined ? {} : { reports }) };
+    const teamRequested = (["role", "reports"] as const).filter((key) => parsed[key] !== undefined);
+    if (teamRequested.length > 0) {
+      if (team === undefined) return c.json(errorBody("invalid_request", "team roles are not available on this gateway"), 400);
+      try {
+        team.check(name, membership);
+      } catch (err) {
+        if (err instanceof AssignmentInvalid) return c.json(errorBody("invalid_request", err.message), 400);
+        throw err;
+      }
+    }
     try {
-      const result = await bots.configureProfile(name, parsed);
+      const result = Object.keys(forwarded).length === 0
+        ? { outcome: "applied" as const, ok: true, applied: {}, requested: [] }
+        : await bots.configureProfile(name, forwarded);
+      // The team half lands only when the forwarded half did, and is re-checked as it lands: a
+      // report deleted during the forward is still a 400, never a 500.
+      const teamApplied = teamRequested.length > 0 && result.ok;
+      if (teamApplied) {
+        try {
+          team!.write(name, membership);
+        } catch (err) {
+          if (err instanceof AssignmentInvalid) return c.json(errorBody("invalid_request", err.message), 400);
+          throw err;
+        }
+      }
       return c.json({
         name,
         outcome: result.outcome,
         ok: result.ok,
-        applied: result.applied,
-        ...(result.ignored === undefined ? {} : { ignored: result.ignored }),
-        requested: result.requested,
+        applied: teamRequested.length === 0 ? result.applied : { ...result.applied, team: teamApplied },
+        ...("ignored" in result && result.ignored !== undefined ? { ignored: result.ignored } : {}),
+        requested: [...result.requested, ...teamRequested],
       });
     } catch (err) {
       return failure(c, err);

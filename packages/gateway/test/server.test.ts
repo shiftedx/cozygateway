@@ -341,6 +341,8 @@ describe("GatewayInfo.capabilities wiring", () => {
     try {
       const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
       expect(health.capabilities).toMatchObject({ approvals: 1, "com.cozylabs.bots": expect.any(Number) });
+      // agent-inbox 1: the assignment store is always present, so every shape advertises it.
+      expect(health.capabilities?.["com.cozylabs.agent-inbox"]).toBe(1);
       expect(health.botRuntimes).toEqual(["hermes"]);
     } finally {
       await gw.close();
@@ -389,6 +391,7 @@ describe("GatewayInfo.capabilities wiring", () => {
     try {
       const health = (await (await fetch(`${gw.url}/health`)).json()) as GatewayInfo;
       expect(health.botRuntimes).toEqual([]);
+      expect(health.capabilities?.["com.cozylabs.agent-inbox"]).toBe(1);
       const paired = await fetch(`${gw.url}/pair`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -495,6 +498,7 @@ describe("GatewayInfo.capabilities wiring", () => {
         approvals: 1,
         "com.cozylabs.cozyapps": 2,
         "com.cozylabs.bots": expect.any(Number),
+        "com.cozylabs.agent-inbox": 1,
         "com.cozylabs.hermes-desktop-sessions": 4,
         "com.cozylabs.harness-settings": 1,
         "com.cozylabs.chat-configuration": 1,

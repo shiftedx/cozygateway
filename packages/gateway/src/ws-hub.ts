@@ -66,6 +66,8 @@ const CAPABILITY_GATED_FRAMES: Record<string, { capability: string; minimum: num
   bot_screen_install_done: { capability: "com.cozylabs.bots", minimum: 85 },
   bot_screen_install_sudo: { capability: "com.cozylabs.bots", minimum: 85 },
   bot_screen_request_cancel: { capability: "com.cozylabs.bots", minimum: 85 },
+  // agent-inbox 1. Leader assignments.
+  bot_inbox_activity: { capability: "com.cozylabs.agent-inbox", minimum: 1 },
 };
 
 function understands(client: Client, frame: ServerFrame): boolean {

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { BotGroup, BotGroupMessage, BotSummary, ServerFrame } from "../src/index.ts";
 import {
   AGENT_INBOX_CAPABILITY_ID,
+  AGENT_INBOX_CAPABILITY_VERSION,
   RunnerSchema,
   RunnerDeleteResponseSchema,
   RunnerChoiceRequiredBodySchema,
@@ -942,7 +943,21 @@ describe("capability advertisement", () => {
     // originals, tombstoned deletion, supersession, and an independent delivery lifecycle.
     // Capability 66 adds the typed scoped-approval block, payload-hash binding, standing once and
     // category grants, the always-require list no grant may cover, and the revocation view.
-    expect(BOTS_CAPABILITY_VERSION).toBe(87);
+    // Capability 88 adds gateway-owned team roles and the assignment turn context.
+    expect(BOTS_CAPABILITY_VERSION).toBe(88);
+  });
+
+  it("versions the agent inbox on its own id, never on the bots scalar", () => {
+    expect(AGENT_INBOX_CAPABILITY_VERSION).toBe(1);
+  });
+
+  it("accepts role and reports on the profile read and patch, bounded at 16", () => {
+    const base = { name: "lead", description: "", soul: "", skills: [], toolsets: [], toolsetsPinned: false, mcpServers: [], model: { provider: "p", default: "m" }, runtimeInert: [] };
+    expect(check(BotProfileSchema, { ...base, role: "leader", reports: ["a", "b"] })).toBe(true);
+    expect(check(BotProfileSchema, { ...base, role: "ceo" })).toBe(false);
+    expect(check(BotProfilePatchSchema, { role: "leader", reports: Array.from({ length: 16 }, (_, i) => `r${i}`) })).toBe(true);
+    expect(check(BotProfilePatchSchema, { reports: Array.from({ length: 17 }, (_, i) => `r${i}`) })).toBe(false);
+    expect(check(BotProfilePatchSchema, { reports: [" "] })).toBe(false);
   });
 
   it("accepts a capability-49 runtime create and its runtime projection", () => {

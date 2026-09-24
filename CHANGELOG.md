@@ -5,6 +5,18 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## Unreleased: leader assignments
+
+A bot can now lead a team. Set a bot's role to leader and name its reports from the profile
+(`com.cozylabs.bots` 88); the gateway stores both itself, so a Hermes profile carries them with
+no plugin change. A leader assigns one bounded piece of work to a report with its own attach
+bearer, and the report answers it as an ordinary turn on a gateway-owned thread. Each assignment
+is one durable Task under one id, with a deadline (30 minutes by default, 4 hours at most), the
+report's parsed `Result:` block, and the leader's acknowledgement. Caps are 8 open assignments per
+leader, 1 per report, and 16 reports. The Agent Inbox returns as `com.cozylabs.agent-inbox` 1,
+backed by these assignment rows (ADR 0082 is superseded), so the phone can read every assignment
+thread. Nothing changes for an install until a bot is made a leader.
+
 ## 0.8.6 (2026-09-19): Hermes gateway identity
 
 CozyGateway is again the Hermes-compatible gateway for CozyChat, including the
