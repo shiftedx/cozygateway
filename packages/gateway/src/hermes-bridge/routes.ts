@@ -79,6 +79,9 @@ import {
 import { GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
 import { PresentationConflict, PresentationNotApplied } from "./presentation.ts";
 import { AvatarInvalid, decodeAvatar } from "./avatar.ts";
+
+/** A 2 MB image as base64 in a JSON envelope, with headroom. */
+const AVATAR_PUT_MAX_BYTES = 3_000_000;
 import {
   MEDIA_CACHE_CONTROL,
   MEDIA_MAX_CONCURRENT,
@@ -1133,6 +1136,12 @@ export function registerBotRoutes(
     const jsonBody = async (c: Context<Env>): Promise<unknown> => {
       try { return await c.req.json(); } catch { return undefined; }
     };
+    // The PUT body is read against a hard cap whether or not the sender declared a length: a
+    // chunked upload declares nothing, and `c.req.json()` would buffer whatever arrived.
+    const cappedJson = async (c: Context<Env>): Promise<unknown> => {
+      const bytes = await readCappedBody(c.req.raw.body, AVATAR_PUT_MAX_BYTES);
+      try { return JSON.parse(new TextDecoder().decode(bytes)); } catch { return undefined; }
+    };
     const invalidBody = (c: Context<Env>, err: unknown): Response =>
       c.json(errorBody("invalid_request", err instanceof Error ? err.message : "malformed body"), 400);
 
@@ -1430,6 +1439,12 @@ export function registerBotRoutes(
     const jsonBody = async (c: Context<Env>): Promise<unknown> => {
       try { return await c.req.json(); } catch { return undefined; }
     };
+    // The PUT body is read against a hard cap whether or not the sender declared a length: a
+    // chunked upload declares nothing, and `c.req.json()` would buffer whatever arrived.
+    const cappedJson = async (c: Context<Env>): Promise<unknown> => {
+      const bytes = await readCappedBody(c.req.raw.body, AVATAR_PUT_MAX_BYTES);
+      try { return JSON.parse(new TextDecoder().decode(bytes)); } catch { return undefined; }
+    };
     const invalid = (c: Context<Env>, err: unknown) =>
       c.json(errorBody("invalid_request", err instanceof ContractViolation ? err.message : "malformed body"), 400);
     const imageResponse = (image: { mime: string; bytes: Uint8Array }) =>
@@ -1461,12 +1476,18 @@ export function registerBotRoutes(
       const resolved = canonicalName(c);
       if ("response" in resolved) return resolved.response;
       const declared = Number(c.req.header("content-length") ?? "0");
-      if (Number.isFinite(declared) && declared > 3_000_000) {
+      if (Number.isFinite(declared) && declared > AVATAR_PUT_MAX_BYTES) {
+        return c.json(errorBody("invalid_request", "avatar is larger than 2 MB"), 413);
+      }
+      let body: unknown;
+      try {
+        body = await cappedJson(c);
+      } catch {
         return c.json(errorBody("invalid_request", "avatar is larger than 2 MB"), 413);
       }
       let parsed;
       try {
-        parsed = assertValid(BotAvatarSetRequestSchema, await jsonBody(c));
+        parsed = assertValid(BotAvatarSetRequestSchema, body);
         decodeAvatar(parsed.data);
       } catch (err) {
         if (err instanceof AvatarInvalid) return failure(c, err);

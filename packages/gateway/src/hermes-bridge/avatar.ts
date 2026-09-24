@@ -176,12 +176,29 @@ export function rosterAvatar(
 
 /** How long a fingerprint is trusted before the asset is read again, when nothing else moved. */
 export const AVATAR_FINGERPRINT_TTL_MS = 60_000;
+/** Asset reads in flight at once, and how long one may take, so a slow host never stalls the roster. */
+export const AVATAR_FINGERPRINT_CONCURRENCY = 4;
+export const AVATAR_FINGERPRINT_TIMEOUT_MS = 5_000;
+
+/** The roster fields the fingerprint reads and writes. */
+export interface FingerprintedProfile {
+  name: string;
+  hasAvatar: boolean;
+  meta?: Record<string, unknown> | null;
+  metaRevision?: number;
+  avatarFingerprint?: string;
+}
 
 /** A short content hash of each profile's avatar asset, so the roster's `imageUrl` changes when the
  *  PICTURE changes, not only when the look is rewritten. Hermes exposes no asset mtime or hash
- *  (`profiles.list` has only `has_avatar`), and a desktop or CLI can replace the asset without a
- *  `ui_meta` write, or between its `ui_meta` write and its `set_asset`. So the gateway reads the
- *  asset, at most once a minute per profile unless `has_avatar` or the blob revision moved. */
+ *  (`profiles.list` has only `has_avatar`), and a desktop or the CLI can replace the asset without a
+ *  `ui_meta` write, or between its `ui_meta` write and its `set_asset`.
+ *
+ *  Two halves, so the roster never waits on an asset read: `applyCached` stamps what is already
+ *  known (synchronously, before the roster publishes), and `refresh` reads what is due in the
+ *  background, at most `AVATAR_FINGERPRINT_CONCURRENCY` at a time, each bounded by a timeout, and
+ *  reports whether anything changed so the caller can republish. A profile whose look is a drawn
+ *  face (`imageKind: "shape"`) draws no image, so its asset is never read. */
 export class AvatarFingerprints {
   readonly #cache = new Map<string, { revision: number; hash: string | undefined; at: number }>();
 
@@ -190,31 +207,55 @@ export class AvatarFingerprints {
     this.#cache.delete(name);
   }
 
-  async stamp(
-    rpc: HermesRpc,
-    profiles: Array<{ name: string; hasAvatar: boolean; metaRevision?: number; avatarFingerprint?: string }>,
-    now: number,
-  ): Promise<void> {
+  static #draws(profile: FingerprintedProfile): boolean {
+    return profile.hasAvatar && profile.meta?.["imageKind"] !== "shape";
+  }
+
+  /** Stamp every profile from the cache and prune entries for profiles that no longer draw one. */
+  applyCached(profiles: FingerprintedProfile[]): void {
+    const drawing = new Set(profiles.filter(AvatarFingerprints.#draws).map((p) => p.name));
+    for (const name of [...this.#cache.keys()]) if (!drawing.has(name)) this.#cache.delete(name);
     for (const profile of profiles) {
-      if (!profile.hasAvatar) {
-        this.#cache.delete(profile.name);
-        continue;
-      }
-      const revision = profile.metaRevision ?? 0;
-      const cached = this.#cache.get(profile.name);
-      if (cached !== undefined && cached.revision === revision && now - cached.at < AVATAR_FINGERPRINT_TTL_MS) {
-        profile.avatarFingerprint = cached.hash;
-        continue;
-      }
-      let hash: string | undefined;
-      try {
-        const image = await readAvatar(rpc, profile.name);
-        hash = image === undefined ? undefined : createHash("sha256").update(image.bytes).digest("hex").slice(0, 12);
-      } catch {
-        hash = cached?.hash;
-      }
-      this.#cache.set(profile.name, { revision, hash, at: now });
-      profile.avatarFingerprint = hash;
+      const hash = this.#cache.get(profile.name)?.hash;
+      if (drawing.has(profile.name) && hash !== undefined) profile.avatarFingerprint = hash;
     }
+  }
+
+  /** Read the assets that are due and stamp them. True when any stamp changed. */
+  async refresh(rpc: HermesRpc, profiles: FingerprintedProfile[], now: number): Promise<boolean> {
+    const due = profiles.filter((profile) => {
+      if (!AvatarFingerprints.#draws(profile)) return false;
+      const cached = this.#cache.get(profile.name);
+      return cached === undefined || cached.revision !== (profile.metaRevision ?? 0)
+        || now - cached.at >= AVATAR_FINGERPRINT_TTL_MS;
+    });
+    let changed = false;
+    let next = 0;
+    const worker = async () => {
+      while (next < due.length) {
+        const profile = due[next++]!;
+        const cached = this.#cache.get(profile.name);
+        let hash = cached?.hash;
+        try {
+          const image = await Promise.race([
+            readAvatar(rpc, profile.name),
+            new Promise<never>((_, reject) => {
+              setTimeout(() => reject(new Error("avatar read timed out")), AVATAR_FINGERPRINT_TIMEOUT_MS).unref?.();
+            }),
+          ]);
+          hash = image === undefined ? undefined : createHash("sha256").update(image.bytes).digest("hex").slice(0, 12);
+        } catch {
+          // Keep the last hash: a slow read must not flap the URL. Retried after the TTL.
+        }
+        this.#cache.set(profile.name, { revision: profile.metaRevision ?? 0, hash, at: now });
+        if (profile.avatarFingerprint !== hash) {
+          changed = true;
+          if (hash === undefined) delete profile.avatarFingerprint;
+          else profile.avatarFingerprint = hash;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(AVATAR_FINGERPRINT_CONCURRENCY, due.length) }, worker));
+    return changed;
   }
 }

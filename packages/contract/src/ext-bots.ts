@@ -1495,6 +1495,8 @@ export const BotCozyLookSchema = Type.Object({
   seed: Type.Optional(PresentationText),
   prism: Type.Optional(Type.String({ pattern: "^#[0-9a-fA-F]{6}$" })),
   shape: Type.Optional(LookShape),
+  /** The desktop `color` written beside it: a colour-only desktop change also retires the record. */
+  color: Type.Optional(PresentationText),
 }, { additionalProperties: false });
 export type BotCozyLook = Static<typeof BotCozyLookSchema>;
 const ImageKind = Type.Union([Type.Literal("photo"), Type.Literal("shape")]);
@@ -1529,6 +1531,10 @@ export const BotPresentationPatchSchema = Type.Object({
   custom: Type.Optional(Type.Union([Type.Boolean(), Type.Null()])),
   imageKind: Type.Optional(Type.Union([ImageKind, Type.Null()])),
   cozychat: Type.Optional(Type.Union([BotCozyLookSchema, Type.Null()])),
+  /** Capability 81: a backfill. Written only if the blob, re-read inside the compare-and-swap loop,
+   *  still has NO look key; otherwise the write is skipped and the current presentation answered.
+   *  This is how a phone's first sync can never overwrite a look another client wrote meanwhile. */
+  lookIfAbsent: Type.Optional(Type.Boolean()),
 }, { additionalProperties: false });
 export type BotPresentationPatch = Static<typeof BotPresentationPatchSchema>;
 

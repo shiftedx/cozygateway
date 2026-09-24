@@ -250,6 +250,23 @@ describe("GET/PUT/DELETE /bots/:name/avatar", () => {
     expect(h.asset.current).toBeNull();
   });
 
+  it("caps a PUT body that declares no length (chunked)", async () => {
+    const h = await setup();
+    const big = "x".repeat(3_100_000);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const bytes = new TextEncoder().encode(`{"data":"${big}"}`);
+        for (let at = 0; at < bytes.length; at += 64 * 1024) controller.enqueue(bytes.slice(at, at + 64 * 1024));
+        controller.close();
+      },
+    });
+    const res = await h.authed("/bots/pixel/avatar", {
+      method: "PUT", headers: { "content-type": "application/json" }, body: stream, duplex: "half",
+    } as RequestInit);
+    expect(res.status).toBe(413);
+    expect(h.calls.filter((c) => c.method === "profiles.set_asset")).toHaveLength(0);
+  });
+
   it("refuses a GIF, junk, and an unknown bot without calling set_asset", async () => {
     const h = await setup();
     expect((await h.authed("/bots/pixel/avatar", json("PUT", { data: "data:image/gif;base64,R0lGODlhAQABAAAAACw=" }))).status).toBe(400);
@@ -314,29 +331,48 @@ describe("roster image version", () => {
 });
 
 describe("avatar fingerprints", () => {
-  it("re-reads a desktop's silent replace after the TTL, and at once when has_avatar or the revision moves", async () => {
-    let bytes = PNG;
-    let reads = 0;
-    const rpc = {
-      request: async () => {
-        reads += 1;
-        return { found: true, mime: "image/png", data: `data:image/png;base64,${bytes.toString("base64")}` };
-      },
-    };
-    const prints = new AvatarFingerprints();
-    const row = (revision = 2) => ({ name: "pixel", hasAvatar: true, metaRevision: revision } as { name: string; hasAvatar: boolean; metaRevision: number; avatarFingerprint?: string });
-    const a = row(); await prints.stamp(rpc, [a], 0);
-    bytes = Buffer.concat([PNG, Buffer.from([0])]);   // a desktop replaces the file, no ui_meta write
-    const b = row(); await prints.stamp(rpc, [b], 30_000);
-    expect(b.avatarFingerprint).toBe(a.avatarFingerprint);   // inside the TTL: no read
-    expect(reads).toBe(1);
-    const c = row(); await prints.stamp(rpc, [c], 61_000);
-    expect(c.avatarFingerprint).not.toBe(a.avatarFingerprint);
-    const d = row(3); await prints.stamp(rpc, [d], 61_001);   // a look write: read again at once
-    expect(reads).toBe(3);
-    await prints.stamp(rpc, [{ name: "pixel", hasAvatar: false }], 61_002);
-    expect(reads).toBe(3);
+  const png = (tail: number[]) => Buffer.concat([PNG, Buffer.from(tail)]);
+  const fakeRpc = (state: { bytes: Buffer; reads: number; slow?: boolean }) => ({
+    request: async () => {
+      state.reads += 1;
+      if (state.slow) await new Promise((resolve) => setTimeout(resolve, 6_000));
+      return { found: true, mime: "image/png", data: `data:image/png;base64,${state.bytes.toString("base64")}` };
+    },
   });
+  type Row = { name: string; hasAvatar: boolean; meta?: Record<string, unknown> | null; metaRevision?: number; avatarFingerprint?: string };
+  const row = (revision = 2, extra: Partial<Row> = {}): Row => ({ name: "pixel", hasAvatar: true, meta: { imageKind: "photo" }, metaRevision: revision, ...extra });
+
+  it("re-reads a desktop's silent replace after the TTL, and at once when the revision moves", async () => {
+    const state = { bytes: PNG, reads: 0 };
+    const prints = new AvatarFingerprints();
+    const a = row(); expect(await prints.refresh(fakeRpc(state), [a], 0)).toBe(true);
+    state.bytes = png([0]);   // a desktop replaces the file, no ui_meta write
+    const b = row(); prints.applyCached([b]);
+    expect(await prints.refresh(fakeRpc(state), [b], 30_000)).toBe(false);   // inside the TTL
+    expect(b.avatarFingerprint).toBe(a.avatarFingerprint);
+    expect(state.reads).toBe(1);
+    const c = row(); prints.applyCached([c]);
+    expect(await prints.refresh(fakeRpc(state), [c], 61_000)).toBe(true);
+    expect(c.avatarFingerprint).not.toBe(a.avatarFingerprint);
+    const d = row(3); prints.applyCached([d]);
+    await prints.refresh(fakeRpc(state), [d], 61_001);   // a look write: read again at once
+    expect(state.reads).toBe(3);
+  });
+
+  it("never reads a drawn face's raster, prunes vanished profiles, and bounds a slow read", async () => {
+    const state = { bytes: PNG, reads: 0 };
+    const prints = new AvatarFingerprints();
+    await prints.refresh(fakeRpc(state), [row(2, { meta: { imageKind: "shape" } }), row(2, { name: "gone", hasAvatar: false })], 0);
+    expect(state.reads).toBe(0);
+    const a = row(); await prints.refresh(fakeRpc(state), [a], 0);
+    const pruned = row(); prints.applyCached([{ name: "other", hasAvatar: false }]);
+    prints.applyCached([pruned]);
+    expect(pruned.avatarFingerprint).toBeUndefined();
+    const slow = { bytes: png([9]), reads: 0, slow: true };
+    const started = Date.now();
+    const s2 = row(); await prints.refresh(fakeRpc(slow), [s2], 100_000);
+    expect(Date.now() - started).toBeLessThan(5_900);
+  }, 10_000);
 });
 
 describe("pets", () => {
@@ -349,12 +385,16 @@ describe("pets", () => {
     expect(h.calls.at(-1)).toEqual({ method: "pet.gallery", params: { localOnly: true } });
   });
 
-  it("crops a thumbnail through pet.thumb, and serves a legacy pet slug as bytes", async () => {
+  it("crops a thumbnail through pet.thumb with the gallery's own URL, and serves a legacy slug as bytes", async () => {
     const h = await setup();
     const url = "https://assets.petdex.dev/pets/homelander-dbbb6a60a484/sprite.webp";
-    const thumb = await (await h.authed("/bots/pixel/avatar/pets/thumb", json("POST", { slug: "homelander", url }))).json();
+    // The client's URL is ignored: a thumbnail is cached by slug on the host, so a client naming
+    // another sheet must not be able to poison it.
+    const thumb = await (await h.authed("/bots/pixel/avatar/pets/thumb", json("POST", { slug: "homelander", url: "https://evil.example/x.webp" }))).json();
     expect(thumb).toEqual({ ok: true, image: PNG_URL });
     expect(h.calls.at(-1)).toEqual({ method: "pet.thumb", params: { slug: "homelander", url } });
+    await h.authed("/bots/pixel/avatar/pets/thumb", json("POST", { slug: "mochi" }));
+    expect(h.calls.filter((c) => c.method === "pet.gallery")).toHaveLength(1);   // cached
     const bytes = await h.authed("/bots/pixel/avatar/pets/mochi");
     expect(bytes.headers.get("content-type")).toBe("image/png");
     expect((await h.authed("/bots/pixel/avatar/pets/missing")).status).toBe(404);
@@ -397,6 +437,29 @@ describe("the look on the presentation route", () => {
     expect(res.status).toBe(200);
     expect(h.blob.current?.["custom"]).toBeNull();
     expect((await res.json()).presentation).toEqual({});
+  });
+
+  it("a backfill (lookIfAbsent) yields to a look written after the phone's snapshot", async () => {
+    const h = await setup();
+    // A desktop has written a look; the phone's stale roster still thinks the blob has none.
+    h.blob.current = { chat: "c", shape: "blobatar::sun", custom: true };
+    const res = await h.authed("/bots/pixel/presentation", json("PATCH", {
+      lookIfAbsent: true, shape: "blobatar::boxy", color: "#1F2A44", custom: true, imageKind: "shape",
+    }));
+    expect(res.status).toBe(200);
+    expect(h.calls.filter((c) => c.method === "profiles.configure")).toHaveLength(0);
+    expect(h.blob.current).toEqual({ chat: "c", shape: "blobatar::sun", custom: true });
+    // With no look there, the same backfill is written.
+    h.blob.current = { chat: "c" };
+    await h.authed("/bots/pixel/presentation", json("PATCH", { lookIfAbsent: true, shape: "blobatar::boxy" }));
+    expect(h.blob.current).toEqual({ chat: "c", shape: "blobatar::boxy" });
+  });
+
+  it("keeps the desktop colour beside the namespaced record", async () => {
+    const h = await setup();
+    await h.authed("/bots/pixel/presentation", json("PATCH", { cozychat: { jelly: "ink-quill", shape: "blobatar::boxy", color: "#1F2A44" } }));
+    const body = await (await h.authed("/bots/pixel/presentation")).json();
+    expect(body.presentation.cozychat).toEqual({ jelly: "ink-quill", shape: "blobatar::boxy", color: "#1F2A44" });
   });
 
   it("refuses a malformed look", async () => {

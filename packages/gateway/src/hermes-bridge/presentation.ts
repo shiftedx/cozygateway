@@ -71,12 +71,19 @@ function cozyLook(value: unknown): BotPresentation["cozychat"] | undefined {
   const record = asRecord(value);
   if (record === undefined) return undefined;
   const out: NonNullable<BotPresentation["cozychat"]> = {};
-  for (const key of ["jelly", "seed", "prism", "shape"] as const) {
+  for (const key of ["jelly", "seed", "prism", "shape", "color"] as const) {
     const s = text(record[key]);
     if (s !== undefined && s.length <= (key === "shape" ? 256 : 128)) out[key] = s;
   }
   return Object.keys(out).length === 0 ? undefined : out;
 }
+
+/** Whether a stored blob carries any look key at all. */
+export function hasLook(blob: Record<string, unknown>): boolean {
+  return LOOK_KEYS.some((key) => blob[key] !== undefined && blob[key] !== null);
+}
+
+const LOOK_KEYS = ["shape", "color", "custom", "imageKind", "cozychat"] as const;
 
 /** Every key a presentation patch may name, in the one order the merge applies them. */
 const PATCH_KEYS = [
@@ -126,6 +133,9 @@ export async function writePresentation(
   for (let attempt = 0; attempt < attempts; attempt++) {
     const current = await readPresentation(rpc, name);
     if (current === undefined) return undefined;
+    // A backfill (`lookIfAbsent`) yields to any look already there, decided on THIS read, inside
+    // the CAS loop, so a desktop look that landed after the phone's roster snapshot always wins.
+    if (patch.lookIfAbsent === true && hasLook(current.blob)) return current;
     const next = mergePresentation(current.blob, patch);
     if (uiMetaBytes(next) > UI_META_MAX_BYTES) throw new PresentationNotApplied(name);
     const result = asRecord(await rpc.request("profiles.configure", {

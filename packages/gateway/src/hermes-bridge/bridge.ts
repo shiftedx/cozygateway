@@ -491,6 +491,8 @@ export interface HermesBridgeOptions {
 export class HermesBridge implements BotControlSurface {
   readonly #client: HermesClient;
   readonly #avatarFingerprints = new AvatarFingerprints();
+  #rosterGeneration = 0;
+  #petGallery: { at: number; pets: Map<string, string> } | undefined;
   readonly #storage: Storage;
   readonly #broadcast: (frame: ServerFrame) => void;
   readonly #now: () => number;
@@ -1006,21 +1008,31 @@ export class HermesBridge implements BotControlSurface {
     const run = (async () => {
       try {
         const at = this.#now();
-        const { profiles } = parseProfilesList(
+        const { profiles: listed } = parseProfilesList(
           await this.#client.request("profiles.list", {}),
         );
-        await this.#avatarFingerprints.stamp(this.#client, profiles, at);
-        const bots = buildRoster(profiles.filter((profile) => !this.#storage.isBotDeleted(profile.name)), {
-          hidden: this.#hidden,
-          routedProfile: null,
-          gatewayState: "idle",
-          now: at,
-        });
-        this.#storage.replaceBotRoster(
-          bots.map((summary) => ({ name: summary.name, summary })),
-          at,
-        );
-        this.#publish(bots, at);
+        const profiles = listed.filter((profile) => !this.#storage.isBotDeleted(profile.name));
+        const publish = () => {
+          const bots = buildRoster(profiles, {
+            hidden: this.#hidden,
+            routedProfile: null,
+            gatewayState: "idle",
+            now: at,
+          });
+          this.#storage.replaceBotRoster(
+            bots.map((summary) => ({ name: summary.name, summary })),
+            at,
+          );
+          this.#publish(bots, at);
+        };
+        // Publish with the fingerprints already known, then read what is due in the background
+        // and republish only if a picture changed, and only if no newer refresh has run since.
+        this.#avatarFingerprints.applyCached(profiles);
+        publish();
+        const generation = ++this.#rosterGeneration;
+        void this.#avatarFingerprints.refresh(this.#client, profiles, at).then((changed) => {
+          if (changed && generation === this.#rosterGeneration && !this.#closed) publish();
+        }, () => {});
       } catch (error) {
         this.#log(
           `roster refresh failed (${reason}): ${error instanceof Error ? error.message : "unknown failure"}`,
@@ -1102,7 +1114,8 @@ export class HermesBridge implements BotControlSurface {
     return { name, presentation: written.presentation, revision: written.revision ?? 0 };
   }
   async botAvatar(name: string): Promise<{ mime: string; bytes: Buffer } | undefined> {
-    await this.#assertBotKnown(name);
+    // Every row image is a GET; the cached roster answers "is this a bot" without a profiles.list.
+    if (!this.#storage.botRoster().bots.some((bot) => bot.name === name)) await this.#assertBotKnown(name);
     return readAvatar(this.#client, name);
   }
   async setBotAvatar(name: string, data: string | null): Promise<BotAvatarSetResponse> {
@@ -1128,8 +1141,16 @@ export class HermesBridge implements BotControlSurface {
   async botAvatarPets(_name: string, localOnly: boolean): Promise<BotAvatarPetGallery> {
     return { pets: await petGallery(this.#client, localOnly) };
   }
-  async botAvatarPetThumb(_name: string, slug: string, url: string): Promise<BotAvatarPetThumbResponse> {
-    const image = await petThumb(this.#client, slug, url);
+  /** The spritesheet URL is resolved HERE, from Hermes's own gallery, never taken from the client:
+   *  Hermes caches a thumbnail by slug, so a client naming another sheet could poison that slug's
+   *  thumbnail for every desktop. The gallery is cached for five minutes. */
+  async botAvatarPetThumb(_name: string, slug: string, _clientUrl: string): Promise<BotAvatarPetThumbResponse> {
+    const now = this.#now();
+    if (this.#petGallery === undefined || now - this.#petGallery.at > 300_000) {
+      const pets = await petGallery(this.#client, false);
+      this.#petGallery = { at: now, pets: new Map(pets.map((pet) => [pet.slug, pet.spritesheetUrl])) };
+    }
+    const image = await petThumb(this.#client, slug, this.#petGallery.pets.get(slug) ?? "");
     return image === undefined ? { ok: false } : { ok: true, image };
   }
   async modelConfig(name: string): Promise<BotModelConfig> {
