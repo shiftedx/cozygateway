@@ -142,8 +142,11 @@ describe("deadline, failure, cancel, acknowledge", () => {
     h.room.reconcile();
     expect(h.room.view(view.taskId)).toMatchObject({ state: "failed", failure: "deadline" });
     const task = h.storage.tasks.read(view.taskId)!.view;
+    expect(task.state).toBe("failed");
     expect(task.lastEvent).toMatchObject({ reason: "run_timed_out", actor: "gateway" });
     expect(task.pendingIntent).toBeUndefined();
+    expect(h.storage.tasks.list({ bot: "scout", state: "blocked" })).toEqual([]);
+    expect(h.storage.tasks.command(view.taskId, "retry", { idempotencyKey: "r" }).outcome).toBe("conflict");
     expect(h.storage.tasks.events(view.taskId).some((event) => event.actor === "user")).toBe(false);
     expect(h.interrupts).toEqual([{ agentId: "scout", turnId: h.commands[0]!.turnId }]);
     // A late answer after the deadline does not reopen the work.
@@ -152,14 +155,18 @@ describe("deadline, failure, cancel, acknowledge", () => {
     expect(h.room.view(view.taskId)?.finalText).toBeUndefined();
   });
 
-  it("fails on the assignee turn's own failure, which the Task records as the harness's", async () => {
+  it("fails on the assignee turn's own failure and settles its Task terminally, with no retry", async () => {
     const h = harness({ silent: true });
     const view = h.room.assign("lead", request);
     await settle();
     h.event("scout", { kind: "failed", threadId: view.threadId, turnId: h.commands[0]!.turnId, messageId: "m", message: "model unavailable" });
     expect(h.room.view(view.taskId)).toMatchObject({ state: "failed", failure: "model unavailable" });
-    expect(h.storage.tasks.read(view.taskId)?.view.lastEvent).toMatchObject({ reason: "run_failed", actor: "harness" });
+    const task = h.storage.tasks.read(view.taskId)!.view;
+    expect(task.state).toBe("failed");
+    expect(task.lastEvent).toMatchObject({ reason: "run_failed", actor: "gateway" });
     expect(h.storage.tasks.events(view.taskId).some((event) => event.actor === "user")).toBe(false);
+    expect(h.storage.tasks.list({ bot: "scout", state: "blocked" })).toEqual([]);
+    expect(h.storage.tasks.command(view.taskId, "retry", { idempotencyKey: "r" }).outcome).toBe("conflict");
   });
 
   it("cancels through the Task and reads cancelled only once the turn settles", async () => {
@@ -214,6 +221,35 @@ describe("retry", () => {
     expect(sent).toHaveLength(1);
     h.event("scout", { kind: "commit", threadId: view.threadId, turnId: sent[0]!, messageId: "again", blocks: [{ type: "paragraph", text: REPLY }] });
     expect(h.room.view(view.taskId)).toMatchObject({ state: "verifying", result: { status: "done" } });
+  });
+});
+
+describe("a failed assignment is over", () => {
+  it("refuses to run a retry on a failed assignment's thread even if its Task could retry", async () => {
+    const h = harness({ silent: true });
+    const view = h.room.assign("lead", request);
+    await settle();
+    h.event("scout", { kind: "interrupted", threadId: view.threadId, turnId: h.commands[0]!.turnId, messageId: "m" });
+    h.storage.updateBotAssignment(view.taskId, { failure: "deadline", updatedAt: h.now() });
+    expect(h.storage.tasks.command(view.taskId, "retry", { idempotencyKey: "r" }).outcome).toBe("accepted");
+    const sent: string[] = [];
+    h.storage.tasks.dispatch((peer, id, command) => {
+      const queued = h.storage.enqueueTaskCommand(peer, id, command, h.now());
+      if (queued && command.kind === "turn") sent.push(command.turnId);
+      return queued;
+    });
+    expect(sent).toEqual([]);
+  });
+
+  it("reads failed when the Task completed only after the deadline, before any sweep", async () => {
+    const h = harness({ silent: true });
+    const view = h.room.assign("lead", { ...request, deadlineMs: 60_000 });
+    await settle();
+    h.tick(60_000);
+    expect(h.room.view(view.taskId)?.state).toBe("failed");
+    h.event("scout", { kind: "commit", threadId: view.threadId, turnId: h.commands[0]!.turnId, messageId: "late", blocks: [{ type: "paragraph", text: REPLY }] });
+    expect(h.storage.tasks.read(view.taskId)?.view.state).toBe("completed");
+    expect(h.room.view(view.taskId)?.state).toBe("failed");
   });
 });
 
@@ -334,6 +370,45 @@ describe("deleted bots", () => {
     h.room.botDeleted("scout");
     h.storage.purgeBot("scout");
     expect(h.room.view(view.taskId)).toMatchObject({ state: "completed", result: { status: "done" } });
+  });
+
+  it("history that already finished keeps its outcome when the assignee is deleted", async () => {
+    const h = harness();
+    const view = h.room.assign("lead", request);
+    await settle();
+    h.tick(30 * 60 * 60_000);
+    expect(h.room.view(view.taskId)?.state).toBe("completed");
+    h.storage.purgeBot("scout");
+    expect(h.room.view(view.taskId)?.state).toBe("completed");
+  });
+
+  it("a same-name leader can reuse an idempotency key its deleted namesake held", async () => {
+    const h = harness({ silent: true });
+    const first = h.room.assign("lead", { ...request, idempotencyKey: "k" });
+    h.room.botDeleted("lead");
+    h.storage.purgeBot("lead");
+    h.storage.setBotTeam({ bot: "lead", role: "leader", reports: ["sage"], updatedAt: h.now() });
+    const again = h.room.assign("lead", { ...request, to: "sage", idempotencyKey: "k" });
+    expect(again.taskId).not.toBe(first.taskId);
+    expect(again.assignee).toBe("sage");
+  });
+
+  it("a rename onto a name whose deleted rows held the same key, or whose live rows do, still commits", async () => {
+    const h = harness({ silent: true });
+    h.room.assign("lead", { ...request, idempotencyKey: "k" });
+    h.room.botDeleted("lead");
+    h.storage.purgeBot("lead");
+    h.storage.setBotTeam({ bot: "r0", role: "leader", reports: ["sage"], updatedAt: h.now() });
+    const moved = h.room.assign("r0", { ...request, to: "sage", idempotencyKey: "k" });
+    expect(() => h.storage.renameBotState("r0", "lead")).not.toThrow();
+    expect(h.storage.botAssignment(moved.taskId)?.leader).toBe("lead");
+    // Both live under one name with the same key: the moved row gives its key up.
+    h.storage.setBotTeam({ bot: "r1", role: "leader", reports: ["r2"], updatedAt: h.now() });
+    const other = h.room.assign("r1", { ...request, to: "r2", idempotencyKey: "k" });
+    expect(() => h.storage.renameBotState("r1", "lead")).not.toThrow();
+    expect(h.storage.botAssignment(other.taskId)).toMatchObject({ leader: "lead" });
+    expect(h.storage.botAssignment(other.taskId)?.idempotencyKey).toBeUndefined();
+    expect(h.storage.botAssignmentByKey("lead", "k")?.taskId).toBe(moved.taskId);
   });
 
   it("a deleted leader's work is cancelled and a same-name bot can neither read nor acknowledge it", async () => {

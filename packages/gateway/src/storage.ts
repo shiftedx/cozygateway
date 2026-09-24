@@ -1,6 +1,7 @@
 import { Artifacts } from "./artifacts.ts";
 import { ObserveStore } from "./observe/store.ts";
 import { Tasks } from "./tasks.ts";
+import { deriveAssignmentState, frozenOnDelete } from "./hermes-bridge/assignment-protocol.ts";
 import { CachedDatabaseSync } from "./sqlite.ts";
 import type { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
@@ -10,6 +11,7 @@ import {
   MOBILE_REQUEST_TERMINAL_STATES,
 } from "cozygateway-contract";
 import type {
+  AssignmentResult,
   AssignmentState,
   AttachmentBlock,
   BotChatAttachment,
@@ -3384,8 +3386,19 @@ export class Storage {
       const reports = [...new Set((JSON.parse(row.reports) as string[]).map((name) => name === from ? to : name))].filter((name) => name !== row.bot);
       this.#db.prepare("UPDATE bot_team SET reports_json = ? WHERE bot = ?").run(JSON.stringify(reports), row.bot);
     }
+    // An idempotency key is scoped to one leader. Where both names used the same key, the moved
+    // row gives its key up rather than collide: its Task already exists and needs no replay.
+    this.#db.prepare(`UPDATE bot_assignments SET idempotency_key = NULL WHERE leader = ? AND idempotency_key IN
+      (SELECT idempotency_key FROM bot_assignments WHERE leader = ? AND idempotency_key IS NOT NULL)`).run(from, to);
     this.#db.prepare("UPDATE bot_assignments SET leader = ? WHERE leader = ? AND leader_deleted_at IS NULL").run(to, from);
     this.#db.prepare("UPDATE bot_assignments SET assignee = ? WHERE assignee = ? AND assignee_deleted_at IS NULL").run(to, from);
+  }
+
+  /** Capability 88. Only the assignee runs on its assignment thread, and never once the assignment
+   *  has failed: that Task is terminal and the leader assigns again. */
+  #assignmentRunnable(threadId: string, peer: string): boolean {
+    const row = this.botAssignmentByThread(threadId);
+    return row !== undefined && row.assignee === peer && row.assigneeDeletedAt === undefined && row.failure === undefined;
   }
 
   botTeam(bot: string): BotTeamRow | undefined {
@@ -3432,7 +3445,7 @@ export class Storage {
   }
 
   botAssignmentByKey(leader: string, idempotencyKey: string): BotAssignmentRow | undefined {
-    const row = this.#db.prepare(`${BOT_ASSIGNMENT_SELECT} WHERE leader = ? AND idempotency_key = ?`).get(leader, idempotencyKey) as Record<string, unknown> | undefined;
+    const row = this.#db.prepare(`${BOT_ASSIGNMENT_SELECT} WHERE leader = ? AND idempotency_key = ? AND leader_deleted_at IS NULL`).get(leader, idempotencyKey) as Record<string, unknown> | undefined;
     return row === undefined ? undefined : toBotAssignmentRow(row);
   }
 
@@ -3524,7 +3537,7 @@ export class Storage {
           this.setNativeBotTurn(view.bot, command.threadId, command.turnId, at);
           this.appendNativeBotMessage({ bot: view.bot, sessionId: command.threadId, messageId: command.messageId, role: "user", text: command.text, turnId: command.turnId, at });
         // Capability 88: an assignment thread is gateway-owned too, and only its assignee may run on it.
-        } else if (this.threadById(command.threadId)?.agentId !== peer && this.botAssignmentByThread(command.threadId)?.assignee !== peer) return false;
+        } else if (this.threadById(command.threadId)?.agentId !== peer && !this.#assignmentRunnable(command.threadId, peer)) return false;
       }
       this.enqueueAttachCommand(peer, commandId, command, at);
       return true;
@@ -6435,6 +6448,38 @@ export class Storage {
       const catalogs = Number(this.#db.prepare(`DELETE FROM task_slash_catalogs
         WHERE peer IN (SELECT execution_id FROM chat_executions WHERE bot = ?)`).run(bot).changes);
       if (catalogs > 0) purged["executionSlashCatalogs"] = catalogs;
+      // Capability 88. No later bot of this name inherits a place on anyone's team or any
+      // assignment. The surviving party keeps the row: an assignee still reads the work it did for
+      // a deleted leader, and a leader reads a deleted assignee's work frozen at the state it had,
+      // derived here while its Task (purged just below) can still say it.
+      const teams = this.#db.prepare(`SELECT DISTINCT team.bot AS bot, team.reports_json AS reports FROM bot_team AS team, json_each(team.reports_json) AS report
+        WHERE report.value = ?`).all(bot) as { bot: string; reports: string }[];
+      for (const row of teams)
+        this.#db.prepare("UPDATE bot_team SET reports_json = ? WHERE bot = ?").run(JSON.stringify((JSON.parse(row.reports) as string[]).filter((name) => name !== bot)), row.bot);
+      if (teams.length > 0) purged["teamReports"] = teams.length;
+      const now = Date.now();
+      let answered = 0;
+      for (const row of this.botAssignments({ assignee: bot })) {
+        const task = this.tasks.read(row.taskId)?.view;
+        const result = row.resultJson === undefined ? undefined : (JSON.parse(row.resultJson) as { status: AssignmentResult["status"] }).status;
+        const frozen = row.frozenState ?? frozenOnDelete(deriveAssignmentState({
+          deadlineAt: row.deadlineAt,
+          ...(row.acknowledgedOutcome === undefined ? {} : { acknowledgedOutcome: row.acknowledgedOutcome }),
+          ...(row.cancelledBy === undefined ? {} : { cancelledBy: row.cancelledBy }),
+          ...(row.failure === undefined ? {} : { failure: row.failure }),
+          ...(result === undefined ? {} : { resultStatus: result }),
+          ...(task === undefined ? {} : { taskState: task.state, taskAt: task.at }),
+        }, now), result);
+        this.#db.prepare(`UPDATE bot_assignments SET assignee_deleted_at = ?, updated_at = ?, frozen_state = ?,
+            failure = CASE WHEN ? = 'cancelled' THEN COALESCE(failure, 'assignee deleted') ELSE failure END
+          WHERE task_id = ?`).run(now, now, frozen, frozen, row.taskId);
+        answered += 1;
+      }
+      if (answered > 0) purged["assignmentsAnswered"] = answered;
+      // A tombstoned row gives its idempotency key up, so a later bot of this name can use it.
+      const led = Number(this.#db.prepare(`UPDATE bot_assignments SET leader_deleted_at = ?, updated_at = ?, idempotency_key = NULL
+        WHERE leader = ? AND leader_deleted_at IS NULL`).run(now, now, bot).changes);
+      if (led > 0) purged["assignmentsLed"] = led;
       // Private Task history belongs to the deleted bot. Room Tasks belong to the shared room;
       // ownerDeleted already settled those and the room's history remains readable.
       for (const [area, count] of Object.entries(this.tasks.purgeBot(bot))) if (count > 0) purged[area] = count;
@@ -6461,22 +6506,6 @@ export class Storage {
           AND NOT EXISTS (SELECT 1 FROM artifacts WHERE room IS NOT NULL
             AND created_by = attach_media.agent_id AND media_id = attach_media.media_id)`).run(bot, bot).changes);
       if (media > 0) purged["attachMedia"] = media;
-      // Capability 88. No later bot of this name inherits a place on anyone's team or any
-      // assignment. The surviving party keeps the row: an assignee still reads the work it did for
-      // a deleted leader, and a leader reads a deleted assignee's work as cancelled (its Task goes
-      // with the assignee's other private Tasks, so whatever state was not frozen already is).
-      const teams = this.#db.prepare(`SELECT DISTINCT team.bot AS bot, team.reports_json AS reports FROM bot_team AS team, json_each(team.reports_json) AS report
-        WHERE report.value = ?`).all(bot) as { bot: string; reports: string }[];
-      for (const row of teams)
-        this.#db.prepare("UPDATE bot_team SET reports_json = ? WHERE bot = ?").run(JSON.stringify((JSON.parse(row.reports) as string[]).filter((name) => name !== bot)), row.bot);
-      if (teams.length > 0) purged["teamReports"] = teams.length;
-      const now = Date.now();
-      const answered = Number(this.#db.prepare(`UPDATE bot_assignments SET assignee_deleted_at = ?, updated_at = ?,
-          frozen_state = COALESCE(frozen_state, 'cancelled'), failure = COALESCE(failure, 'assignee deleted')
-        WHERE assignee = ? AND assignee_deleted_at IS NULL`).run(now, now, bot).changes);
-      if (answered > 0) purged["assignmentsAnswered"] = answered;
-      const led = Number(this.#db.prepare("UPDATE bot_assignments SET leader_deleted_at = ?, updated_at = ? WHERE leader = ? AND leader_deleted_at IS NULL").run(now, now, bot).changes);
-      if (led > 0) purged["assignmentsLed"] = led;
       for (const [area, table, column] of areas) {
         const changes = Number(
           this.#db.prepare(`DELETE FROM ${table} WHERE ${column} = ?`).run(bot).changes,
@@ -6927,6 +6956,12 @@ export function openStorage(dbPath: string): Storage {
   );
   for (const column of ["detail", "error_text"])
     if (!toolColumns.has(column)) db.exec(`ALTER TABLE bot_chat_tool_steps ADD COLUMN ${column} TEXT`);
+  // Capability 88. Columns added to bot_assignments during its own review, before any release.
+  const assignmentColumns = new Set(
+    (db.prepare("PRAGMA table_info(bot_assignments)").all() as Array<{ name: string }>).map(row => row.name),
+  );
+  for (const [column, type] of [["lapse_announced_at", "INTEGER"], ["leader_deleted_at", "INTEGER"], ["assignee_deleted_at", "INTEGER"], ["frozen_state", "TEXT"]] as const)
+    if (!assignmentColumns.has(column)) db.exec(`ALTER TABLE bot_assignments ADD COLUMN ${column} ${type}`);
   db.exec(`CREATE INDEX IF NOT EXISTS bot_chat_tool_steps_detail_compaction
     ON bot_chat_tool_steps (ended_at, bot, turn_id, step_id)
     WHERE detail IS NOT NULL OR error_text IS NOT NULL`);

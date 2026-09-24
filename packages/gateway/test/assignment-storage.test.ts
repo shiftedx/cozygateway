@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { openStorage, type Storage } from "../src/storage.ts";
@@ -62,7 +66,8 @@ describe("bot_assignments", () => {
     const storage = open();
     storage.setBotTeam({ bot: "scout", role: "leader", reports: ["sage"], updatedAt: 1 });
     storage.setBotTeam({ bot: "lead", role: "leader", reports: ["scout", "sage"], updatedAt: 1 });
-    storage.createBotAssignment(assignment);
+    // Never admitted and not yet due: still open, so deletion freezes it cancelled.
+    storage.createBotAssignment({ ...assignment, deadlineAt: Number.MAX_SAFE_INTEGER });
     storage.createBotAssignment({ ...assignment, taskId: "t2", leader: "scout", assignee: "sage", threadId: "assignment:t2" });
     const purged = storage.purgeBot("scout");
     expect(purged).toMatchObject({ team: 1, teamReports: 1, assignmentsAnswered: 1, assignmentsLed: 1 });
@@ -97,5 +102,27 @@ describe("bot_assignments", () => {
     storage.renameBotState("old", "new", "to");
     expect(storage.botTeam("old")).toBeUndefined();
     expect(storage.botTeam("new")).toMatchObject({ role: "member" });
+  });
+
+  it("adds the review-era columns to a table created by the earlier branch build", () => {
+    const dir = mkdtempSync(join(tmpdir(), "assignment-schema-"));
+    try {
+      const path = join(dir, "gateway.db");
+      const old = new DatabaseSync(path);
+      old.exec(`CREATE TABLE bot_assignments (task_id TEXT PRIMARY KEY, leader TEXT NOT NULL, assignee TEXT NOT NULL,
+        thread_id TEXT NOT NULL UNIQUE, brief TEXT NOT NULL, done_criteria TEXT NOT NULL, output_format TEXT,
+        deadline_at INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, idempotency_key TEXT,
+        result_json TEXT, final_text TEXT, final_at INTEGER, final_turn_id TEXT, failure TEXT, cancelled_by TEXT,
+        acknowledged_at INTEGER, acknowledged_outcome TEXT) STRICT`);
+      old.close();
+      const storage = openStorage(path);
+      storages.push(storage);
+      storage.createBotAssignment(assignment);
+      storage.updateBotAssignment("t1", { frozenState: "cancelled", lapseAnnouncedAt: 2, updatedAt: 2 });
+      expect(storage.botAssignment("t1")).toMatchObject({ frozenState: "cancelled", lapseAnnouncedAt: 2 });
+    } finally {
+      for (const storage of storages.splice(0)) storage.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

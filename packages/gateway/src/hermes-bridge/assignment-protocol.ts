@@ -109,6 +109,9 @@ export function deriveAssignmentState(facts: AssignmentFacts, now: number): Assi
   // and the leader can still acknowledge it. A window that closes unacknowledged closes on what
   // the assignee said, so a `blocked` result is not quietly counted as done.
   if (task === "completed" && facts.failure === undefined) {
+    // Past the deadline is failed, always: a Task that completed only after it (before the sweep
+    // could settle it) never turns a `failed` read back into `verifying`.
+    if ((facts.taskAt ?? now) >= facts.deadlineAt) return "failed";
     if (now - (facts.taskAt ?? now) < ASSIGNMENT_VERIFYING_AUTO_COMPLETE_MS) return "verifying";
     return facts.resultStatus === "blocked" ? "failed" : "completed";
   }
@@ -124,6 +127,14 @@ export function deriveAssignmentState(facts: AssignmentFacts, now: number): Assi
   if (task === "verifying") return "running";
   if (task === "waiting_for_device") return "blocked";
   return task;
+}
+
+/** The state an assignment keeps once its deleted assignee's Task is gone: finished work keeps its
+ * outcome, work still waiting on the leader closes as a lapsed window would, and open work is
+ * cancelled. */
+export function frozenOnDelete(state: AssignmentState, resultStatus: AssignmentResult["status"] | undefined): AssignmentState {
+  if (state === "verifying") return resultStatus === "blocked" ? "failed" : "completed";
+  return ASSIGNMENT_OPEN_STATES.has(state) ? "cancelled" : state;
 }
 
 export function refusalMessage(reason: AssignmentRefusal, detail: { leader: string; assignee: string }): string {

@@ -1685,8 +1685,10 @@ id: `taskId` is the same string in the create response, every assignment route, 
 /tasks/:taskId`, the attach turn's `context.task.id` and the `bot_inbox_activity` frame. The
 assignee's turn runs on a gateway-owned thread, `assignment:<taskId>`, and the assignment row, the
 Task and the attach outbox record are written in one transaction, so a refused enqueue leaves
-nothing behind. Every Task rule (waits, owner absence, cancel, retry) applies unchanged; a retried
-Task runs again on the same thread and its reply answers the assignment.
+nothing behind. Every Task rule (waits, owner absence, cancel, retry) applies unchanged while the
+assignment is open: a Task retried from `blocked` runs again on the same thread and its reply
+answers the assignment. A FAILED assignment's Task is terminal (below) and refuses a retry; to try
+again, the leader creates a new assignment.
 
 **Assign.** `POST /bots/:name/assignments` takes `AssignmentCreateRequest`
 (`{to, brief, doneCriteria, outputFormat?, deadlineMs?, idempotencyKey?}`) and answers
@@ -1736,7 +1738,8 @@ projection in v1 and are acknowledged so the peer's stream keeps moving.
 
 1. The leader (or a device) acknowledged: that outcome, `completed` or `failed`.
 2. A party was deleted and its Task went with it: the state recorded at that moment (below).
-3. The Task completed and no failure was recorded: `verifying` for 24 hours, even if a cancel
+3. The Task completed and no failure was recorded: `failed` when it completed only at or after
+   the deadline (a read that said `failed` never turns back), else `verifying` for 24 hours, even if a cancel
    was asked and lost the race to the reply, so delivered work stays acknowledgeable. When the
    window lapses unacknowledged it closes as `completed`, or as `failed` when the `Result:` status
    was `blocked`.
@@ -1750,11 +1753,12 @@ projection in v1 and are acknowledged so the peer's stream keeps moving.
 
 A cancel asks the Task to cancel and answers the resulting state; it reads `cancelled` only once
 the Task has settled, never before (`cancelledBy` says it was asked). The deadline and a failed
-turn are never recorded on the Task as a person's cancel: at the deadline the gateway records
-`failure: "deadline"`, appends the Task's own gateway `run_timed_out`, and interrupts the peer,
-exactly as a room member turn times out; a failed turn is the harness's `run_failed` on the Task
-and its message on the assignment. A reply that arrives after a recorded failure does not reopen
-the work. Open means any state but `completed`, `failed` and `cancelled`, so `verifying` still
+turn are never recorded on the Task as a person's cancel. The deadline is hard: the gateway
+records `failure: "deadline"`, settles the Task `failed` with its own `run_timed_out`
+(actor `gateway`), and interrupts the peer. A failed turn records its message as the assignment's
+`failure` and settles the Task `failed` with `run_failed` (actor `gateway`) after the harness's
+own `run_failed`. Either way the Task is terminal, has no retry edge, and never sits `blocked`; a
+reply that arrives after a recorded failure does not reopen the work. Open means any state but `completed`, `failed` and `cancelled`, so `verifying` still
 holds the assignee.
 
 **Rename and delete.** A rename moves the bot's team row, every `reports` entry naming it, and

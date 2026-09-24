@@ -11,7 +11,7 @@ import type { BotAssignmentRow, BotTeamRow, Storage } from "../storage.ts";
 import {
   ASSIGNMENT_DEFAULT_DEADLINE_MS, ASSIGNMENT_MAX_OPEN_PER_LEADER, ASSIGNMENT_MAX_REPORTS, ASSIGNMENT_OPEN_STATES,
   ASSIGNMENT_VERIFYING_AUTO_COMPLETE_MS, buildAssignmentPrompt, deriveAssignmentState, parseResultBlock,
-  refusalMessage,
+  frozenOnDelete, refusalMessage,
 } from "./assignment-protocol.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
 
@@ -148,9 +148,7 @@ export class AssignmentRooms {
     const now = this.#now();
     for (const row of this.#storage.botAssignments({ assignee: bot, createdSince: now - OPEN_HORIZON_MS })) {
       if (row.acknowledgedOutcome !== undefined) continue;
-      const state = this.#state(row);
-      const frozen = state === "verifying" ? (this.#result(row)?.status === "blocked" ? "failed" : "completed")
-        : ASSIGNMENT_OPEN_STATES.has(state) ? "cancelled" : state;
+      const frozen = frozenOnDelete(this.#state(row), this.#result(row)?.status);
       this.#storage.updateBotAssignment(row.taskId, {
         frozenState: frozen, updatedAt: now,
         ...(frozen === "cancelled" && row.failure === undefined ? { failure: "assignee deleted" } : {}),
@@ -314,8 +312,10 @@ export class AssignmentRooms {
         ...(result === undefined ? {} : { resultJson: JSON.stringify(result) }),
       });
     } else if (row.cancelledBy === undefined) {
-      // The Task already recorded the harness's own `run_failed`; the assignment only notes why.
+      // The harness's `run_failed` left the Task blocked, which has a retry edge. The assignment
+      // is over, so its Task settles terminally too, attributed to the gateway.
       this.#storage.updateBotAssignment(row.taskId, { failure: (event.message ?? "the assignee's turn failed").slice(0, 1024), updatedAt: now });
+      this.#settleFailed(row.taskId, "run_failed", now);
     }
     this.#emit(this.#storage.botAssignment(row.taskId)!);
     return true;
@@ -336,11 +336,11 @@ export class AssignmentRooms {
       if (row.frozenState !== undefined) continue;
       const task = this.#storage.tasks.read(row.taskId)?.view;
       const live = task !== undefined && !["completed", "failed", "cancelled"].includes(task.state);
-      if (live && now >= row.deadlineAt && row.failure === undefined && row.cancelledBy === undefined) {
-        this.#storage.updateBotAssignment(row.taskId, { failure: "deadline", updatedAt: now });
-        // The gateway's own timeout, exactly as a room member turn times out: the Task records
-        // `run_timed_out` by the gateway, never a person's cancel, and the peer is interrupted.
-        this.#storage.tasks.nativeTerminal(task.bot, task.sessionId, task.currentRun.runId, "timed_out", now);
+      if (live && now >= row.deadlineAt) {
+        // The deadline is hard. The Task settles `failed` with the gateway's own `run_timed_out`
+        // (never a person's cancel, and with no retry edge), and the peer is interrupted.
+        if (row.failure === undefined) this.#storage.updateBotAssignment(row.taskId, { failure: "deadline", updatedAt: now });
+        this.#settleFailed(row.taskId, "run_timed_out", now);
         this.#endpoint?.sendInterrupt?.(task.bot, { threadId: task.sessionId, turnId: task.currentRun.runId });
         this.#emit(this.#storage.botAssignment(row.taskId)!);
       } else if (task?.state === "completed" && row.acknowledgedOutcome === undefined && row.lapseAnnouncedAt === undefined
@@ -358,6 +358,15 @@ export class AssignmentRooms {
   #cancelLed(leader: string): void {
     for (const row of this.#storage.botAssignments({ leader, createdSince: this.#now() - OPEN_HORIZON_MS }))
       if (this.#open(row)) this.cancel(row.taskId, "user");
+  }
+
+  /** A failed assignment's Task is terminal: a retry would run work whose answer the assignment can
+   * no longer accept. The leader assigns again instead. */
+  #settleFailed(taskId: string, reason: "run_timed_out" | "run_failed", at: number): void {
+    const tasks = this.#storage.tasks;
+    const view = tasks.read(taskId)?.view;
+    if (view === undefined || ["completed", "failed", "cancelled"].includes(view.state)) return;
+    tasks.atomic(() => tasks.append(taskId, `assignment:${view.currentRun.runId}:${reason}`, "failed", reason, "gateway", at, { kind: "run", id: view.currentRun.runId }));
   }
 
   #cancelTask(taskId: string, why: string): void {
