@@ -1,7 +1,7 @@
 import { Artifacts } from "./artifacts.ts";
 import { ObserveStore } from "./observe/store.ts";
 import { Tasks } from "./tasks.ts";
-import { deriveAssignmentState, frozenOnDelete } from "./hermes-bridge/assignment-protocol.ts";
+import { deriveAssignmentState, frozenOnDelete } from "./assignment-state.ts";
 import { CachedDatabaseSync } from "./sqlite.ts";
 import type { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
@@ -3569,6 +3569,17 @@ export class Storage {
           };
           })(),
     }));
+  }
+
+  /** Capability 88. Cancels a turn command the peer has not acknowledged, through the same path a
+   *  Task cancel uses, so a peer that never took it never runs it. False when it was already taken. */
+  cancelUnackedTurn(agentId: string, turnId: string, reason: string, cancelledAt: number): boolean {
+    const row = this.#db.prepare(`SELECT sequence, command_id AS commandId FROM attach_command_outbox WHERE agent_id = ?
+      AND json_extract(command_json, '$.kind') = 'turn' AND json_extract(command_json, '$.turnId') = ?
+      AND acked_at IS NULL AND cancelled_at IS NULL`).get(agentId, turnId) as { sequence: number; commandId: string } | undefined;
+    if (row === undefined) return false;
+    this.cancelAttachCommand(agentId, row.sequence, row.commandId, reason, cancelledAt);
+    return true;
   }
 
   cancelAttachCommand(agentId: string, sequence: number, commandId: string, reason: string, cancelledAt: number): AttachV1CommandFrame | undefined {

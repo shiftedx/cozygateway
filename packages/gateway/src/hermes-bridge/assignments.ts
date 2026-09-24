@@ -89,6 +89,15 @@ export class AssignmentRooms {
     this.#isAttached = opts.isAttached;
     this.#formatDeadline = opts.formatDeadline ?? ((at) => new Date(at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZoneName: "short" }));
     this.#flushTaskCommands = opts.flushTaskCommands ?? ((): void => {});
+    // A failed assignment is a durable decision that no recovery remains for its Task, so Task
+    // reconciliation closes it `blocked -> failed` (`no_recovery_remaining`, actor gateway) once
+    // its Run has ended. The reader slot is single; compose with whatever holds it.
+    const prior = this.#storage.tasks.recoveryDecisionReader();
+    this.#storage.tasks.recoveryDecisions((source) => {
+      const row = this.#storage.botAssignment(source.taskId);
+      if (row?.failure === undefined) return prior?.(source);
+      return { taskId: source.taskId, runId: source.runId, issuer: "assignment", decisionId: source.taskId, reason: `assignment failed: ${row.failure}` };
+    });
     this.#timer = setInterval(() => this.reconcile(), opts.sweepMs ?? 30_000);
     this.#timer.unref?.();
   }
@@ -296,13 +305,23 @@ export class AssignmentRooms {
   handleAttachEvent(agentId: string, frame: AttachV1EventFrame): boolean {
     if (!this.canAcceptAttachEvent(agentId, frame)) return false;
     const event = frame.event;
-    if (event.kind !== "commit" && event.kind !== "failed") return true;
+    const terminal = event.kind === "commit" || event.kind === "failed" || event.kind === "cancelled" || event.kind === "interrupted";
+    if (!terminal) return true;
     const row = this.#storage.botAssignmentByThread(event.threadId)!;
+    if (event.kind === "cancelled" || event.kind === "interrupted") {
+      // The Task applied it; a failed assignment's Task may now close.
+      if (row.failure !== undefined) this.#storage.tasks.reconcile(this.#now());
+      return true;
+    }
     // Only the Task's current Run speaks for the assignment; a stale or foreign turn does not.
     if (this.#storage.tasks.run(agentId, event.turnId)?.taskId !== row.taskId) return true;
     const now = this.#now();
-    // A reply past a recorded failure (a late answer after the deadline) does not reopen the work.
-    if (row.failure !== undefined) return true;
+    // A reply past a recorded failure (a late answer after the deadline) does not reopen the work,
+    // but it may be the Run's end the failed Task was waiting for: close it now.
+    if (row.failure !== undefined) {
+      this.#storage.tasks.reconcile(now);
+      return true;
+    }
     if (event.kind === "commit") {
       if (event.continues === true) return true;
       const text = blocksToText(event.blocks).trim().slice(0, 65536);
@@ -312,10 +331,10 @@ export class AssignmentRooms {
         ...(result === undefined ? {} : { resultJson: JSON.stringify(result) }),
       });
     } else if (row.cancelledBy === undefined) {
-      // The harness's `run_failed` left the Task blocked, which has a retry edge. The assignment
-      // is over, so its Task settles terminally too, attributed to the gateway.
+      // The harness's own `run_failed` already moved the Task to `blocked`. Recording the failure
+      // is the no-recovery decision, and the Run has ended, so reconciliation closes it now.
       this.#storage.updateBotAssignment(row.taskId, { failure: (event.message ?? "the assignee's turn failed").slice(0, 1024), updatedAt: now });
-      this.#settleFailed(row.taskId, "run_failed", now);
+      this.#storage.tasks.reconcile(now);
     }
     this.#emit(this.#storage.botAssignment(row.taskId)!);
     return true;
@@ -336,12 +355,18 @@ export class AssignmentRooms {
       if (row.frozenState !== undefined) continue;
       const task = this.#storage.tasks.read(row.taskId)?.view;
       const live = task !== undefined && !["completed", "failed", "cancelled"].includes(task.state);
-      if (live && now >= row.deadlineAt) {
-        // The deadline is hard. The Task settles `failed` with the gateway's own `run_timed_out`
-        // (never a person's cancel, and with no retry edge), and the peer is interrupted.
-        if (row.failure === undefined) this.#storage.updateBotAssignment(row.taskId, { failure: "deadline", updatedAt: now });
-        this.#settleFailed(row.taskId, "run_timed_out", now);
-        this.#endpoint?.sendInterrupt?.(task.bot, { threadId: task.sessionId, turnId: task.currentRun.runId });
+      if (live && now >= row.deadlineAt && row.failure === undefined) {
+        // The deadline is hard: the gateway's own `run_timed_out` blocks the Task (never a person's
+        // cancel), and the recorded failure is the decision that no recovery remains. A turn the
+        // peer never took is withdrawn from the outbox; a running one is interrupted. The Task
+        // closes `blocked -> failed` once its Run has ended, here or on the Run's terminal event.
+        this.#storage.updateBotAssignment(row.taskId, { failure: "deadline", updatedAt: now });
+        const runId = task.currentRun.runId;
+        // A Task already blocked (its owner unreachable, say) keeps that reason.
+        if (task.state !== "blocked") this.#storage.tasks.nativeTerminal(task.bot, task.sessionId, runId, "timed_out", now);
+        if (!this.#storage.cancelUnackedTurn(task.bot, runId, "assignment deadline", now))
+          this.#endpoint?.sendInterrupt?.(task.bot, { threadId: task.sessionId, turnId: runId });
+        this.#storage.tasks.reconcile(now);
         this.#emit(this.#storage.botAssignment(row.taskId)!);
       } else if (task?.state === "completed" && row.acknowledgedOutcome === undefined && row.lapseAnnouncedAt === undefined
         && now >= task.at + ASSIGNMENT_VERIFYING_AUTO_COMPLETE_MS) {
@@ -358,15 +383,6 @@ export class AssignmentRooms {
   #cancelLed(leader: string): void {
     for (const row of this.#storage.botAssignments({ leader, createdSince: this.#now() - OPEN_HORIZON_MS }))
       if (this.#open(row)) this.cancel(row.taskId, "user");
-  }
-
-  /** A failed assignment's Task is terminal: a retry would run work whose answer the assignment can
-   * no longer accept. The leader assigns again instead. */
-  #settleFailed(taskId: string, reason: "run_timed_out" | "run_failed", at: number): void {
-    const tasks = this.#storage.tasks;
-    const view = tasks.read(taskId)?.view;
-    if (view === undefined || ["completed", "failed", "cancelled"].includes(view.state)) return;
-    tasks.atomic(() => tasks.append(taskId, `assignment:${view.currentRun.runId}:${reason}`, "failed", reason, "gateway", at, { kind: "run", id: view.currentRun.runId }));
   }
 
   #cancelTask(taskId: string, why: string): void {

@@ -1687,8 +1687,9 @@ assignee's turn runs on a gateway-owned thread, `assignment:<taskId>`, and the a
 Task and the attach outbox record are written in one transaction, so a refused enqueue leaves
 nothing behind. Every Task rule (waits, owner absence, cancel, retry) applies unchanged while the
 assignment is open: a Task retried from `blocked` runs again on the same thread and its reply
-answers the assignment. A FAILED assignment's Task is terminal (below) and refuses a retry; to try
-again, the leader creates a new assignment.
+answers the assignment. A FAILED assignment is a durable decision that no recovery remains for
+its Task (below): the Task refuses retry and resume, closes `failed`, and the leader creates a new
+assignment to try again.
 
 **Assign.** `POST /bots/:name/assignments` takes `AssignmentCreateRequest`
 (`{to, brief, doneCriteria, outputFormat?, deadlineMs?, idempotencyKey?}`) and answers
@@ -1753,12 +1754,17 @@ projection in v1 and are acknowledged so the peer's stream keeps moving.
 
 A cancel asks the Task to cancel and answers the resulting state; it reads `cancelled` only once
 the Task has settled, never before (`cancelledBy` says it was asked). The deadline and a failed
-turn are never recorded on the Task as a person's cancel. The deadline is hard: the gateway
-records `failure: "deadline"`, settles the Task `failed` with its own `run_timed_out`
-(actor `gateway`), and interrupts the peer. A failed turn records its message as the assignment's
-`failure` and settles the Task `failed` with `run_failed` (actor `gateway`) after the harness's
-own `run_failed`. Either way the Task is terminal, has no retry edge, and never sits `blocked`; a
-reply that arrives after a recorded failure does not reopen the work. Open means any state but `completed`, `failed` and `cancelled`, so `verifying` still
+turn are never recorded on the Task as a person's cancel, and both follow the capability-64 state
+machine (ADR 0004). The deadline is hard: the gateway records `failure: "deadline"` and appends
+its own `run_timed_out`, which moves the Task `running -> blocked` (actor `gateway`); a turn the
+peer has not acknowledged is withdrawn from the outbox, and a running one is interrupted. A failed
+turn is the harness's own `run_failed`, `running -> blocked`, and its message becomes the
+assignment's `failure`. In both cases the recorded failure is the durable decision that no
+recovery remains (issuer `assignment`): Task reconciliation appends `blocked -> failed`
+`no_recovery_remaining` (actor `gateway`) as soon as the Run has ended, at once for a failed or
+withdrawn turn and on the interrupted Run's terminal otherwise. Until then the Task reads
+`blocked` and refuses retry and resume, and no retry is ever dispatched on the thread. A reply
+that arrives after a recorded failure does not reopen the work. Open means any state but `completed`, `failed` and `cancelled`, so `verifying` still
 holds the assignee.
 
 **Rename and delete.** A rename moves the bot's team row, every `reports` entry naming it, and

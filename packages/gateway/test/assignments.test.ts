@@ -61,6 +61,8 @@ function harness(opts: { reply?: string; silent?: boolean; attached?: (bot: stri
 }
 
 const request = { to: "scout", brief: "Check CI", doneCriteria: "main is green" };
+const transitions = (h: { storage: Storage }, taskId: string): string[] =>
+  h.storage.tasks.events(taskId).filter((event) => event.from !== event.to).map((event) => `${event.from}->${event.to} ${event.reason} ${event.actor}`);
 const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe("assign", () => {
@@ -131,7 +133,7 @@ describe("assign", () => {
 });
 
 describe("deadline, failure, cancel, acknowledge", () => {
-  it("fails a silent assignee at the deadline as the gateway's timeout, never a person's cancel", async () => {
+  it("at the deadline blocks the Task as the gateway's timeout, then fails it once the Run ends", async () => {
     const h = harness({ silent: true });
     const view = h.room.assign("lead", { ...request, deadlineMs: 60_000 });
     await settle();
@@ -141,30 +143,46 @@ describe("deadline, failure, cancel, acknowledge", () => {
     expect(h.room.view(view.taskId)?.state).toBe("failed");
     h.room.reconcile();
     expect(h.room.view(view.taskId)).toMatchObject({ state: "failed", failure: "deadline" });
-    const task = h.storage.tasks.read(view.taskId)!.view;
-    expect(task.state).toBe("failed");
-    expect(task.lastEvent).toMatchObject({ reason: "run_timed_out", actor: "gateway" });
-    expect(task.pendingIntent).toBeUndefined();
-    expect(h.storage.tasks.list({ bot: "scout", state: "blocked" })).toEqual([]);
-    expect(h.storage.tasks.command(view.taskId, "retry", { idempotencyKey: "r" }).outcome).toBe("conflict");
-    expect(h.storage.tasks.events(view.taskId).some((event) => event.actor === "user")).toBe(false);
+    // The Run is still executing: the Task stays blocked, and no retry is permitted.
     expect(h.interrupts).toEqual([{ agentId: "scout", turnId: h.commands[0]!.turnId }]);
+    expect(h.storage.tasks.read(view.taskId)?.view.state).toBe("blocked");
+    expect(h.storage.tasks.command(view.taskId, "retry", { idempotencyKey: "r" }).outcome).toBe("conflict");
+    expect(transitions(h, view.taskId)).toEqual([
+      "null->queued task_created gateway", "queued->running run_started harness", "running->blocked run_timed_out gateway",
+    ]);
+    // The peer honours the interrupt; the Run has ended, so the Task closes.
+    h.event("scout", { kind: "interrupted", threadId: view.threadId, turnId: h.commands[0]!.turnId, messageId: "m" });
+    expect(transitions(h, view.taskId).slice(3)).toEqual(["blocked->failed no_recovery_remaining gateway"]);
+    expect(h.storage.tasks.events(view.taskId).some((event) => event.actor === "user")).toBe(false);
+    expect(h.room.view(view.taskId)?.state).toBe("failed");
     // A late answer after the deadline does not reopen the work.
     h.event("scout", { kind: "commit", threadId: view.threadId, turnId: h.commands[0]!.turnId, messageId: "late", blocks: [{ type: "paragraph", text: REPLY }] });
-    expect(h.room.view(view.taskId)).toMatchObject({ state: "failed" });
     expect(h.room.view(view.taskId)?.finalText).toBeUndefined();
   });
 
-  it("fails on the assignee turn's own failure and settles its Task terminally, with no retry", async () => {
+  it("at the deadline withdraws a turn the peer never took, and closes the Task at once", () => {
+    const h = harness({ silent: true });
+    const view = h.room.assign("lead", { ...request, deadlineMs: 60_000 });
+    // No settle: the command was never acknowledged.
+    h.tick(60_000);
+    h.room.reconcile();
+    expect(h.interrupts).toEqual([]);
+    expect(h.storage.pendingAttachCommands("scout", 0, 10).filter((frame) => frame.command.kind === "turn")).toEqual([]);
+    expect(transitions(h, view.taskId)).toEqual([
+      "null->queued task_created gateway", "queued->blocked run_timed_out gateway", "blocked->failed no_recovery_remaining gateway",
+    ]);
+  });
+
+  it("fails on the assignee turn's own failure: the harness blocks the Task, the gateway closes it", async () => {
     const h = harness({ silent: true });
     const view = h.room.assign("lead", request);
     await settle();
     h.event("scout", { kind: "failed", threadId: view.threadId, turnId: h.commands[0]!.turnId, messageId: "m", message: "model unavailable" });
     expect(h.room.view(view.taskId)).toMatchObject({ state: "failed", failure: "model unavailable" });
-    const task = h.storage.tasks.read(view.taskId)!.view;
-    expect(task.state).toBe("failed");
-    expect(task.lastEvent).toMatchObject({ reason: "run_failed", actor: "gateway" });
-    expect(h.storage.tasks.events(view.taskId).some((event) => event.actor === "user")).toBe(false);
+    expect(transitions(h, view.taskId)).toEqual([
+      "null->queued task_created gateway", "queued->running run_started harness",
+      "running->blocked run_failed harness", "blocked->failed no_recovery_remaining gateway",
+    ]);
     expect(h.storage.tasks.list({ bot: "scout", state: "blocked" })).toEqual([]);
     expect(h.storage.tasks.command(view.taskId, "retry", { idempotencyKey: "r" }).outcome).toBe("conflict");
   });
@@ -230,8 +248,9 @@ describe("a failed assignment is over", () => {
     const view = h.room.assign("lead", request);
     await settle();
     h.event("scout", { kind: "interrupted", threadId: view.threadId, turnId: h.commands[0]!.turnId, messageId: "m" });
-    h.storage.updateBotAssignment(view.taskId, { failure: "deadline", updatedAt: h.now() });
+    // A retry accepted just before the assignment failed must still never be sent.
     expect(h.storage.tasks.command(view.taskId, "retry", { idempotencyKey: "r" }).outcome).toBe("accepted");
+    h.storage.updateBotAssignment(view.taskId, { failure: "deadline", updatedAt: h.now() });
     const sent: string[] = [];
     h.storage.tasks.dispatch((peer, id, command) => {
       const queued = h.storage.enqueueTaskCommand(peer, id, command, h.now());

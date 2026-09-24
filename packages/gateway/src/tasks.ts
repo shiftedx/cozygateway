@@ -103,6 +103,9 @@ export class Tasks {
 
   recoveryDecisions(reader: TaskRecoveryDecisionReader): void { this.#recoveryDecision = reader; }
 
+  /** The reader in place, so a second producer can compose with it rather than replace it. */
+  recoveryDecisionReader(): TaskRecoveryDecisionReader | undefined { return this.#recoveryDecision; }
+
   artifactReferences(reader: TaskArtifactReader): void { this.#artifacts = reader; }
 
   /** Capability 65: the canonical Artifact producer says a declared reference moved. The Task is
@@ -345,6 +348,8 @@ export class Tasks {
       if (prior !== undefined) return prior.payload === encoded ? JSON.parse(prior.result) as { outcome: "accepted"; view: TaskView } : { outcome: "conflict", view: this.#read(taskId)?.view };
       const view = this.#read(taskId)?.view;
       if (view === undefined) return { outcome: "conflict" };
+      // A durable decision that no recovery remains is exactly a refusal to start another Run.
+      if ((action === "retry" || action === "resume") && this.#recoveryDecision?.({ taskId, bot: view.bot, runId: view.currentRun.runId })?.taskId === taskId) return { outcome: "conflict", view };
       const transition = [...this.events(taskId)].reverse().find((event) => event.from !== event.to);
       const accepted = action === "cancel" ? !TERMINAL.has(view.state) || view.state === "cancelled" : action === "scope" ? !TERMINAL.has(view.state) : action === "pause" ? ["queued", "running", "verifying", "waiting_for_approval", "waiting_for_device"].includes(view.state) : action === "resume" ? view.state === "waiting_for_user_input" && transition?.reason === "user_paused" : view.state === "blocked";
       if (!accepted || (view.pendingIntent?.command === "cancel" && action !== "cancel" && action !== "scope")) return { outcome: "conflict", view };
