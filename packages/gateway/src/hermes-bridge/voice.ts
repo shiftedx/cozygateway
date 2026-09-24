@@ -1,7 +1,7 @@
 import { WebSocket, type RawData } from "ws";
 import type { BotVoice } from "cozygateway-contract";
 
-import { HermesRpcError, HermesUnavailable, type HermesClient } from "./client.ts";
+import { HermesRpcError, HermesTimeout, HermesUnavailable, type HermesClient } from "./client.ts";
 
 /** Capability 86 (voice): a bot speaks with its OWN profile's `tts.*` on its own Hermes, exactly as
  *  upstream Bot Mode does (docs `bot-mode.md#voices`). The gateway adds no speech engine. It asks
@@ -79,11 +79,28 @@ export function decodeDataUrl(value: unknown): { mimeType: string; bytes: Uint8A
   return bytes.length === 0 ? undefined : { mimeType, bytes: new Uint8Array(bytes) };
 }
 
-async function speakWhole(client: HermesClient, profile: string, spoken: string): Promise<BotSpeech> {
-  const body = await client.dashboardJson<Record<string, unknown>>(
-    `/api/audio/speak?profile=${encodeURIComponent(profile)}`,
-    { method: "POST", body: { text: spoken } },
-  );
+/** Synthesis of a long reply can take a while; the ordinary 10 s dashboard budget cannot. */
+export const SPEAK_WHOLE_TIMEOUT_MS = 120_000;
+
+async function speakWhole(client: HermesClient, profile: string, spoken: string,
+                          signal: AbortSignal | undefined, timeoutMs: number): Promise<BotSpeech> {
+  const path = `/api/audio/speak?profile=${encodeURIComponent(profile)}`;
+  let response: Response;
+  try {
+    response = await client.dashboardResponse(path, {
+      method: "POST", body: { text: spoken }, timeoutMs, ...(signal === undefined ? {} : { signal }),
+    });
+  } catch (err) {
+    if (signal?.aborted === true) throw err;
+    if ((err as Error).name === "TimeoutError") throw new HermesTimeout("POST /api/audio/speak", timeoutMs);
+    throw new HermesUnavailable(`hermes speech request failed: ${(err as Error).message}`);
+  }
+  const body = record(await response.json().catch(() => undefined));
+  if (!response.ok) {
+    const detail = typeof body?.["detail"] === "string"
+      ? body["detail"] : `hermes speech request failed (HTTP ${response.status})`;
+    throw new HermesRpcError(detail, response.status, body);
+  }
   const decoded = decodeDataUrl(body?.["data_url"]);
   if (decoded === undefined) throw new HermesRpcError("hermes answered speech without audio", undefined, undefined);
   return { kind: "encoded", ...decoded };
@@ -95,20 +112,32 @@ function toBytes(data: RawData): Uint8Array {
   return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
 }
 
-/** Synthesizes `spoken` with profile `profile`'s own voice. Resolves once Hermes has said which of the
- *  two shapes it will answer with; PCM keeps arriving through `chunks` after that. */
+/** Hermes may run ahead of a slow phone. Above this many queued bytes the socket is paused (TCP
+ *  back-pressure reaches Hermes) and resumed as the phone drains it. About 10 s of 24 kHz mono. */
+export const SPEAK_QUEUE_HIGH_WATER_BYTES = 512 * 1024;
+
+/** Synthesizes `spoken` with profile `profile`'s own voice. Resolves once the first audio exists (the
+ *  first PCM frame, or the whole file), so a synthesis that produces nothing is an error, not an
+ *  empty 200. PCM keeps arriving through `chunks` after that. An abort of `signal` at any point,
+ *  including before the first frame, tells Hermes to stop and closes the socket. */
 export async function speakThroughHermes(
   client: HermesClient,
   profile: string,
   spoken: string,
-  opts: { firstFrameTimeoutMs?: number } = {},
+  opts: { firstFrameTimeoutMs?: number; wholeTimeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<BotSpeech> {
+  const { signal } = opts;
+  const wholeTimeoutMs = opts.wholeTimeoutMs ?? SPEAK_WHOLE_TIMEOUT_MS;
+  signal?.throwIfAborted();
   // A client without the sibling-socket seam can still speak, just not incrementally.
-  if (client.sidecarSocketUrl === undefined) return speakWhole(client, profile, spoken);
+  if (client.sidecarSocketUrl === undefined) return speakWhole(client, profile, spoken, signal, wholeTimeoutMs);
   const url = await client.sidecarSocketUrl(SPEAK_STREAM_PATH, { profile });
+  signal?.throwIfAborted();
   const socket = new WebSocket(url, { perMessageDeflate: false });
 
   const queue: Uint8Array[] = [];
+  let queued = 0;
+  let paused = false;
   let finished = false;
   let wake: (() => void) | undefined;
   const settle = () => {
@@ -121,21 +150,48 @@ export async function speakThroughHermes(
         socket.send(JSON.stringify({ stop: true }));
       } catch { /* closing anyway */ }
     }
-    socket.close();
+    if (socket.readyState === WebSocket.CONNECTING) socket.terminate();
+    else socket.close();
     settle();
   };
+  const onAbort = () => stop();
+  signal?.addEventListener("abort", onAbort, { once: true });
 
+  let format: { sampleRate: number; channels: number } | undefined;
   const first = await new Promise<"fallback" | { sampleRate: number; channels: number }>((resolve, reject) => {
-    const timer = setTimeout(() => {
+    let answered = false;
+    const answer = (fn: () => void) => {
+      if (answered) return;
+      answered = true;
+      clearTimeout(timer);
+      fn();
+    };
+    const timer = setTimeout(() => answer(() => {
       socket.terminate();
       reject(new HermesUnavailable("hermes did not start speaking in time"));
-    }, opts.firstFrameTimeoutMs ?? SPEAK_FIRST_FRAME_TIMEOUT_MS);
-    let started = false;
+    }), opts.firstFrameTimeoutMs ?? SPEAK_FIRST_FRAME_TIMEOUT_MS);
+    signal?.addEventListener("abort", () => answer(() => reject(signal.reason ?? new Error("aborted"))), { once: true });
     socket.on("open", () => socket.send(JSON.stringify({ text: spoken, done: true })));
+    // Refused before the upgrade (a gated dashboard answers the HTTP request itself).
+    socket.on("unexpected-response", (_request, response) => {
+      const status = response.statusCode ?? 0;
+      response.resume();
+      socket.terminate();
+      answer(() => reject(status === 401 || status === 403
+        ? new HermesRpcError(`hermes refused the speech socket (HTTP ${status})`, status)
+        : new HermesUnavailable(`hermes answered the speech socket with HTTP ${status}`)));
+    });
     socket.on("message", (data, isBinary) => {
       if (isBinary) {
-        queue.push(toBytes(data));
+        const bytes = toBytes(data);
+        queue.push(bytes);
+        queued += bytes.byteLength;
+        if (queued > SPEAK_QUEUE_HIGH_WATER_BYTES && !paused) {
+          paused = true;
+          socket.pause();
+        }
         wake?.();
+        if (format !== undefined) answer(() => resolve(format!));
         return;
       }
       let frame: Record<string, unknown> | undefined;
@@ -145,48 +201,56 @@ export async function speakThroughHermes(
         frame = undefined;
       }
       const type = frame?.["type"];
-      if (type === "fallback" && !started) {
-        clearTimeout(timer);
+      if (type === "fallback" && format === undefined) {
         socket.close();
-        resolve("fallback");
-      } else if (type === "start" && !started) {
-        started = true;
-        clearTimeout(timer);
+        answer(() => resolve("fallback"));
+      } else if (type === "start" && format === undefined) {
         const sampleRate = Number(frame?.["sample_rate"]);
         const channels = Number(frame?.["channels"] ?? 1);
-        resolve({
+        format = {
           sampleRate: Number.isInteger(sampleRate) && sampleRate > 0 ? sampleRate : 24_000,
           channels: Number.isInteger(channels) && channels > 0 ? channels : 1,
-        });
+        };
+        if (queue.length > 0) answer(() => resolve(format!));
       } else if (type === "end") {
         socket.close();
         settle();
+        // `end` before any audio: Hermes's synthesis failed (it logs and ends the session).
+        answer(() => reject(new HermesRpcError("hermes synthesized no audio for this text", undefined, undefined)));
       }
     });
     socket.on("error", (err) => {
-      clearTimeout(timer);
       settle();
-      reject(new HermesUnavailable(`hermes speech socket failed: ${err.message}`));
+      answer(() => reject(new HermesUnavailable(`hermes speech socket failed: ${err.message}`)));
     });
     socket.on("close", (code) => {
-      clearTimeout(timer);
       settle();
-      if (!started) {
-        // 4401/4403 are Hermes refusing the credential; anything else before a first frame is a drop.
-        reject(code === 4401 || code === 4403
-          ? new HermesRpcError(`hermes refused the speech socket (close code ${code})`, code)
-          : new HermesUnavailable(`hermes closed the speech socket before speaking (close code ${code})`));
-      }
+      // 4401/4403 are Hermes refusing the credential; anything else before audio is a drop.
+      answer(() => reject(code === 4401 || code === 4403
+        ? new HermesRpcError(`hermes refused the speech socket (close code ${code})`, code)
+        : new HermesUnavailable(`hermes closed the speech socket before speaking (close code ${code})`)));
     });
+  }).catch((err: unknown) => {
+    signal?.removeEventListener("abort", onAbort);
+    stop();
+    throw err;
   });
 
-  if (first === "fallback") return speakWhole(client, profile, spoken);
+  if (first === "fallback") {
+    signal?.removeEventListener("abort", onAbort);
+    return speakWhole(client, profile, spoken, signal, wholeTimeoutMs);
+  }
 
   async function* chunks(): AsyncGenerator<Uint8Array> {
     try {
       for (;;) {
         const next = queue.shift();
         if (next !== undefined) {
+          queued -= next.byteLength;
+          if (paused && queued <= SPEAK_QUEUE_HIGH_WATER_BYTES / 2) {
+            paused = false;
+            socket.resume();
+          }
           yield next;
           continue;
         }
@@ -197,6 +261,7 @@ export async function speakThroughHermes(
         wake = undefined;
       }
     } finally {
+      signal?.removeEventListener("abort", onAbort);
       stop();
     }
   }

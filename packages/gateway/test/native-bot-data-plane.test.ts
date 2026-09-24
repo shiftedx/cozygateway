@@ -2334,8 +2334,10 @@ describe("native runtime bots", () => {
     const storage = openStorage(":memory:");
     const botProfile = vi.fn();
     const routines = vi.fn();
+    const botVoice = vi.fn();
+    const speakBot = vi.fn();
     const plane = new NativeBotDataPlane({
-      control: { botProfile, routines } as unknown as BotsSurface,
+      control: { botProfile, routines, botVoice, speakBot } as unknown as BotsSurface,
       storage,
       ingress: {} as AttachV1Ingress,
       nativeBots: ["sage"],
@@ -2345,6 +2347,11 @@ describe("native runtime bots", () => {
     });
 
     await expect(plane.surface().botProfile("SAGE")).rejects.toBeInstanceOf(UnsupportedForRuntime);
+    // Row 86 (voice): a runtime bot has no Hermes profile voice, so both routes answer 409.
+    await expect(plane.surface().botVoice!("sage")).rejects.toBeInstanceOf(UnsupportedForRuntime);
+    await expect(plane.surface().speakBot!("sage", "hello")).rejects.toBeInstanceOf(UnsupportedForRuntime);
+    expect(botVoice).not.toHaveBeenCalled();
+    expect(speakBot).not.toHaveBeenCalled();
     await expect(plane.surface().routines("sage")).rejects.toMatchObject({
       feature: "routines",
       runtime: "cozyagents",

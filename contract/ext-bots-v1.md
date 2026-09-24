@@ -1200,16 +1200,21 @@ active profile's voice. Speech-to-text is not part of this row. The gateway adds
   - **Streamed PCM.** When Hermes sends `{"type":"start","sample_rate","channels"}`, the answer is
     `200` with `Content-Type: audio/pcm;rate=<sample_rate>;channels=<channels>` (also as
     `X-Audio-Sample-Rate` and `X-Audio-Channels`) and a chunked body of raw little-endian int16 PCM,
-    passed through as Hermes synthesizes it, ending at Hermes's `{"type":"end"}`. A client that
-    closes the response early is barge-in: the gateway sends Hermes `{"stop": true}` and closes.
+    passed through as Hermes synthesizes it, ending at Hermes's `{"type":"end"}`. The `200` is sent
+    only once the first audio frame exists; `end` before any audio is a failed synthesis (`502`).
+    A client that closes the request at any point, including before the first frame, is barge-in:
+    the gateway sends Hermes `{"stop": true}` and closes. The gateway pauses the socket while more
+    than about 512 KiB is waiting for a slow client, so back-pressure reaches Hermes.
   - **A whole file.** When Hermes answers `{"type":"fallback"}` (the voice has no chunked API, such
-    as `edge`), the gateway calls `POST /api/audio/speak?profile=<bot>` and answers `200` with the
-    decoded audio and its own type (`audio/mpeg`, `audio/ogg`, `audio/wav`, `audio/flac`).
+    as `edge`), the gateway calls `POST /api/audio/speak?profile=<bot>` with a 120 s synthesis
+    budget and answers `200` with the decoded audio and its own type (`audio/mpeg`, `audio/ogg`,
+    `audio/wav`, `audio/flac`). Running out of that budget is `504` with `timedOut: true`.
 - `voice.tts {profile}` is deliberately not used: it plays on the Hermes host's own speakers.
 - Errors follow the other `/bots/:name/*` routes: a blank or oversized `text` is `400
   invalid_request`, an unknown bot `404`, a runtime-served bot `409 unsupported_for_runtime`, and a
   synthesis Hermes refused (for example a provider whose package or key is missing) `502` with
-  `hermesError` carrying Hermes's own sentence.
+  `hermesError` carrying Hermes's own sentence. The 20000-character cap is per request: a client
+  splits a longer reply and speaks the pieces in order.
 - Additive: new routes only; no frame changes. A client offers speech only on `>= 86`.
 
 ## Interactive Hermes session continuation

@@ -9,7 +9,10 @@ import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
 import { createHermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
-import { decodeDataUrl, voiceFromConfig } from "../src/hermes-bridge/voice.ts";
+import { SPEAK_QUEUE_HIGH_WATER_BYTES, decodeDataUrl, speakThroughHermes, voiceFromConfig } from "../src/hermes-bridge/voice.ts";
+import { HermesRpcError, HermesTimeout, type HermesClient } from "../src/hermes-bridge/client.ts";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { startFakeHermesServer, type FakeHermesBehavior, type FakeHermesServer } from "./support/fake-hermes-server.ts";
 
 /** Capability 86 (voice): `GET /bots/:name/voice` and `POST /bots/:name/speak`, over the bot's OWN
@@ -83,9 +86,11 @@ async function setup(behavior: FakeHermesBehavior) {
   const { deviceToken } = (await pairRes.json()) as { deviceToken: string };
   bridge.start();
   await until(() => client.state() === "online");
+  lastClient = client;
   return (path: string, init?: RequestInit) =>
     app.request(path, { ...init, headers: { ...(init?.headers ?? {}), authorization: `Bearer ${deviceToken}` } });
 }
+let lastClient: HermesClient | undefined;
 
 const speak = (text: unknown): RequestInit => ({
   method: "POST",
@@ -243,5 +248,90 @@ describe("POST /bots/:name/speak", () => {
     await reader.cancel();
     await until(() => closed);
     expect(frames).toContainEqual({ stop: true });
+  });
+});
+
+describe("POST /bots/:name/speak: review fixes", () => {
+  it("stops Hermes when the phone hangs up before the first frame", async () => {
+    const frames: unknown[] = [];
+    let closed = false;
+    let connected = false;
+    const authed = await setup({
+      sidecars: {
+        "/api/audio/speak-stream": (ws: WebSocket) => {
+          connected = true;
+          ws.on("close", () => void (closed = true));
+          // Resolving the voice: nothing is sent yet.
+          ws.on("message", (data) => frames.push(JSON.parse(data.toString())));
+        },
+      },
+    });
+    const hangUp = new AbortController();
+    const pending = authed("/bots/cleo/speak", { ...speak("Hello."), signal: hangUp.signal });
+    await until(() => connected && frames.length > 0);
+    hangUp.abort();
+    const res = await Promise.resolve(pending).catch(() => undefined);
+    await until(() => closed);
+    expect(frames).toContainEqual({ stop: true });
+    if (res !== undefined) expect(res.status).not.toBe(200);
+  });
+
+  it("answers 502 when Hermes ends without any audio", async () => {
+    const authed = await setup({
+      sidecars: {
+        "/api/audio/speak-stream": (ws: WebSocket) => {
+          ws.on("message", () => {
+            ws.send(JSON.stringify({ type: "start", sample_rate: 24_000, channels: 1 }));
+            ws.send(JSON.stringify({ type: "end" }));
+          });
+        },
+      },
+    });
+    const res = await authed("/bots/cleo/speak", speak("hello"));
+    expect(res.status).toBe(502);
+  });
+
+  it("streams past the back-pressure mark without losing a byte", async () => {
+    const total = SPEAK_QUEUE_HIGH_WATER_BYTES * 3;
+    const authed = await setup({
+      sidecars: {
+        "/api/audio/speak-stream": (ws: WebSocket) => {
+          ws.on("message", () => {
+            ws.send(JSON.stringify({ type: "start", sample_rate: 24_000, channels: 1 }));
+            for (let sent = 0; sent < total; sent += 64 * 1024) ws.send(Buffer.alloc(64 * 1024, 7));
+            ws.send(JSON.stringify({ type: "end" }));
+          });
+        },
+      },
+    });
+    const res = await authed("/bots/cleo/speak", speak("A long reply."));
+    expect(res.status).toBe(200);
+    expect((await res.arrayBuffer()).byteLength).toBe(total);
+  });
+
+  it("gives the whole-file synthesis its own budget and maps running out to a timeout", async () => {
+    await setup({
+      sidecars: { "/api/audio/speak-stream": (ws: WebSocket) => ws.send(JSON.stringify({ type: "fallback" })) },
+      dashboard: () => new Promise((resolve) => setTimeout(() => resolve({ body: {} }), 400)),
+    });
+    await expect(speakThroughHermes(lastClient!, "cleo", "hello", { wholeTimeoutMs: 50 }))
+      .rejects.toBeInstanceOf(HermesTimeout);
+  });
+
+  it("treats an HTTP 403 before the upgrade as a refused credential", async () => {
+    const server = createServer((_req, res) => res.end());
+    server.on("upgrade", (_req, socket) => {
+      socket.end("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const client = { sidecarSocketUrl: async () => `ws://127.0.0.1:${port}/api/audio/speak-stream` } as unknown as HermesClient;
+      const failure = await speakThroughHermes(client, "cleo", "hello").catch((err: unknown) => err);
+      expect(failure).toBeInstanceOf(HermesRpcError);
+      expect((failure as HermesRpcError).code).toBe(403);
+    } finally {
+      server.close();
+    }
   });
 });

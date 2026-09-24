@@ -1615,10 +1615,14 @@ export function registerBotRoutes(
         const detail = err instanceof ContractViolation ? err.message : "malformed body";
         return c.json(errorBody("invalid_request", detail), 400);
       }
+      // Read BEFORE the await: a phone that hangs up while Hermes is still resolving its voice
+      // must end the speech socket too, not leave Hermes synthesizing to nobody.
+      const hangUp = c.req.raw.signal;
       let speech;
       try {
-        speech = await speak(resolved.name, parsed.text);
+        speech = await speak(resolved.name, parsed.text, hangUp);
       } catch (err) {
+        if (hangUp.aborted) return new Response(null, { status: 499 });
         return failure(c, err);
       }
       if (speech.kind === "encoded") {
@@ -1629,8 +1633,12 @@ export function registerBotRoutes(
       }
       // Streamed as it is synthesized. The phone hanging up is barge-in: Hermes stops too.
       const live = speech;
+      if (hangUp.aborted) {
+        live.stop();
+        return new Response(null, { status: 499 });
+      }
       const iterator = live.chunks[Symbol.asyncIterator]();
-      c.req.raw.signal.addEventListener("abort", () => live.stop(), { once: true });
+      hangUp.addEventListener("abort", () => live.stop(), { once: true });
       const body = new ReadableStream<Uint8Array>({
         async pull(controller) {
           const next = await iterator.next();
