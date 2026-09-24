@@ -1224,6 +1224,8 @@ export interface BotGroupMeta {
   held?: Record<string, number[]>;
   holdDetection?: boolean;
   picture?: string;
+  /** Threads queued behind the live drive, so a restart still drives them. */
+  queue?: string[];
 }
 
 /** One transcript entry. `kind` is `user` for the human and `member` for a bot; `name` is the bot's
@@ -3012,9 +3014,10 @@ export class Storage {
 
   /** The key of the live room DISPLAYED under this case-insensitive name, if any. */
   botGroupKeyByName(name: string): string | undefined {
-    const row = this.#db.prepare("SELECT key FROM bot_groups WHERE lower(name) = lower(?) LIMIT 1").get(name.trim()) as
-      | { key: string } | undefined;
-    return row?.key;
+    // Folded in JavaScript, like every room key: SQLite's lower() folds ASCII only.
+    const wanted = name.trim().toLowerCase();
+    const rows = this.#db.prepare("SELECT key, name FROM bot_groups").all() as unknown as Array<{ key: string; name: string }>;
+    return rows.find((row) => row.name.toLowerCase() === wanted)?.key;
   }
 
   setBotGroupMeta(key: string, meta: BotGroupMeta): void {

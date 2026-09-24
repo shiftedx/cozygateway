@@ -327,8 +327,11 @@ export class GroupRooms {
    *  means the successor chains behind the corpse, and the generation means the corpse can tell
    *  that the room it was driving is gone even though a room of the same name is back. */
   readonly #drives = new Map<string, { promise: Promise<void>; generation: number; epoch: number }>();
-  /** Capability 84. Threads queued behind the live drive, by room key. */
+  /** Capability 84. Threads queued behind the live drive (or a compress), by room key. Mirrored
+   *  into the room's `meta.queue` so a restart still drives them. */
   readonly #queues = new Map<string, string[]>();
+  /** Capability 84. Rooms whose compress turn holds the room's one pending-turn slot. */
+  readonly #compressing = new Set<string>();
   /** Bumped every time a room key is deleted. In memory on purpose: it only has to outlive the
    *  drives of THIS process, and a restart has no drives to disambiguate. */
   readonly #generations = new Map<string, number>();
@@ -529,7 +532,8 @@ export class GroupRooms {
     this.#storage.setBotGroupNeedsYou(key, false);
     // Capability 84: a send while a drive is live QUEUES its thread behind it under the same epoch;
     // otherwise the epoch bump opens a new drive, stamped before the append as before.
-    const live = this.#driving(key);
+    // A compress turn holds the room's one pending-turn slot too, so a send behind it queues.
+    const live = this.#driving(key) || this.#compressing.has(key);
     const epoch = live ? room.epoch : this.#storage.bumpBotGroupEpoch(key);
     const messageId = randomUUID();
     const threadId = opts.threadId ?? messageId;
@@ -546,9 +550,9 @@ export class GroupRooms {
     });
     this.#applyHolds(key, text, entry);
     if (live) {
-      const queue = this.#queues.get(key) ?? [];
+      const queue = this.#queue(key);
       if (!queue.includes(threadId)) queue.push(threadId);
-      this.#queues.set(key, queue);
+      this.#saveQueue(key);
     } else {
       this.#startDrive(key, epoch, threadId);
     }
@@ -576,6 +580,11 @@ export class GroupRooms {
     }
     const room = this.#storage.botGroup(key);
     if (room === undefined) throw new GroupNotFound(rawName.trim());
+    // Checked again after the members await: another rename may have taken the name meanwhile.
+    if (name !== undefined) {
+      const holder = this.#storage.botGroupKeyByName(name);
+      if (holder !== undefined && holder !== key) throw new GroupExists(name);
+    }
     const meta: BotGroupMeta = { ...room.meta };
     if (patch.picture === null) delete meta.picture;
     else if (patch.picture !== undefined) meta.picture = patch.picture;
@@ -602,7 +611,7 @@ export class GroupRooms {
     const room = this.#storage.botGroup(key);
     if (room === undefined) throw new GroupNotFound(rawName.trim());
     this.#storage.bumpBotGroupEpoch(key);
-    this.#queues.delete(key);
+    this.#queues.set(key, []);
     for (const turn of this.#storage.cancelPendingBotGroupTurns(key, "stopped", this.#now())) {
       this.#nativeTurns?.sendInterrupt?.(turn.agentId, { threadId: turn.threadId, turnId: turn.turnId });
       this.#endDraft(turn.turnId);
@@ -614,6 +623,7 @@ export class GroupRooms {
       for (const member of room.members) holds[member] ??= { at: this.#now() };
       this.#storage.setBotGroupMeta(key, { ...room.meta, holds });
     }
+    this.#saveQueue(key);
     return this.#emitRoom(key, undefined, { member: GROUP_USER_LABEL, kind: "stopped" });
   }
 
@@ -624,7 +634,9 @@ export class GroupRooms {
     if (room === undefined) throw new GroupNotFound(rawName.trim());
     const member = normalizeProfileName(rawMember);
     if (!room.members.includes(member)) throw new GroupInvalid(`${member} is not a member of ${room.name}`);
-    if (this.#driving(key)) throw new GroupBusy("the room is still talking; stop it or wait for it to settle");
+    if (this.#driving(key) || this.#compressing.has(key)) {
+      throw new GroupBusy("the room is still talking; stop it or wait for it to settle");
+    }
     const endpoint = this.#nativeTurns;
     if (endpoint === undefined) throw new GroupInvalid("native attach-v1 group transport is not configured");
     const members = this.#storage.botGroupMembers(key);
@@ -637,9 +649,20 @@ export class GroupRooms {
       if (started.outcome === "failed" && started.detail.includes("already pending")) throw new GroupBusy(started.detail);
       throw new GroupInvalid("detail" in started ? started.detail : "compress could not start");
     }
-    // Upstream's focused-chat /compress budget: a summary can legitimately take minutes.
-    const result = await this.#waitForTurn(key, started.turnId, this.#generation(key), COMPRESS_TIMEOUT_MS);
-    return { member, text: result.outcome === "spoke" ? result.text : "detail" in result ? result.detail : "Compressed." };
+    // Upstream's focused-chat /compress budget: a summary can legitimately take minutes. Sends made
+    // meanwhile queue (see `send`) and drive once the compress turn has let go of the room.
+    this.#compressing.add(key);
+    try {
+      const result = await this.#waitForTurn(key, started.turnId, this.#generation(key), COMPRESS_TIMEOUT_MS);
+      return { member, text: result.outcome === "spoke" ? result.text : "detail" in result ? result.detail : "Compressed." };
+    } finally {
+      this.#compressing.delete(key);
+      if (!this.#closed && !this.#driving(key) && this.#storage.botGroup(key) !== undefined) {
+        const next = this.#queue(key).shift();
+        this.#saveQueue(key);
+        if (next !== undefined) this.#startDrive(key, this.#storage.bumpBotGroupEpoch(key), next);
+      }
+    }
   }
 
   /** True while a round loop holds the room. Test seam. */
@@ -676,6 +699,26 @@ export class GroupRooms {
   }
 
   // --- internals ---------------------------------------------------------------------------------
+
+  /** Capability 84. The room's queued threads, hydrated from `meta.queue` after a restart. */
+  #queue(key: string): string[] {
+    let queue = this.#queues.get(key);
+    if (queue === undefined) {
+      queue = [...(this.#storage.botGroup(key)?.meta.queue ?? [])];
+      this.#queues.set(key, queue);
+    }
+    return queue;
+  }
+
+  #saveQueue(key: string): void {
+    const room = this.#storage.botGroup(key);
+    if (room === undefined) return;
+    const queue = this.#queues.get(key) ?? [];
+    const meta: BotGroupMeta = { ...room.meta };
+    if (queue.length > 0) meta.queue = [...queue];
+    else delete meta.queue;
+    this.#storage.setBotGroupMeta(key, meta);
+  }
 
   /** Capability 84: a room is found by its DISPLAYED name first, since a rename keeps the key. */
   #key(rawName: string): string {
@@ -825,7 +868,8 @@ export class GroupRooms {
         if (this.#drives.get(key)?.promise !== run) return;
         this.#drives.delete(key);
         // A thread queued in the instant the drive was exiting still gets its drive.
-        const next = this.#queues.get(key)?.shift();
+        const next = this.#closed ? undefined : this.#queue(key).shift();
+        if (next !== undefined) this.#saveQueue(key);
         const room = next === undefined || this.#closed ? undefined : this.#storage.botGroup(key);
         if (next !== undefined && room !== undefined) this.#startDrive(key, room.epoch, next);
       });
@@ -842,7 +886,8 @@ export class GroupRooms {
         round = await this.#runRounds(key, epoch, generation, thread);
         if (this.#closed || this.#generation(key) !== generation) return;
         if (this.#storage.botGroup(key)?.epoch !== epoch) return;
-        thread = this.#queues.get(key)?.shift();
+        thread = this.#queue(key).shift();
+        if (thread !== undefined) this.#saveQueue(key);
       }
     } finally {
       // Checked BEFORE the read: a closed bridge has a closed database.

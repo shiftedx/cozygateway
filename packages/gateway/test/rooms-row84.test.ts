@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Hono } from "hono";
 import type { MiddlewareHandler } from "hono";
 import type { BotGroupStateFrame, ServerFrame } from "cozygateway-contract";
@@ -236,6 +239,87 @@ describe("row 84 rooms engine", () => {
 });
 
 describe("row 84 routes", () => {
+  it("queues a send made during compress and drives it once compress settles", async () => {
+    const h = harness({ manual: true });
+    await h.rooms.create("Launch", ["scout", "luna"]);
+    const compressing = h.rooms.compress("Launch", "scout");
+    await expect.poll(() => h.commands.length).toBe(1);
+    h.rooms.send("Launch", "anyone there?");
+    // Nothing is handed over while the compress turn holds the room.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(h.commands.map((command) => command.text)).toEqual(["/compress"]);
+    h.commit(h.commands[0]!, "Compressed.");
+    await compressing;
+    await expect.poll(() => h.commands.length).toBeGreaterThan(1);
+    for (const command of h.commands.slice(1)) h.commit(command, "(pass)");
+    await expect.poll(() => h.commands.length).toBe(3);
+    h.commit(h.commands[2]!, "(pass)");
+    await h.rooms.settled("Launch");
+    expect(h.states().some((frame) => frame.note?.detail.includes("already pending"))).toBe(false);
+    expect(h.commands.slice(1).map((command) => command.agentId).sort()).toEqual(["luna", "scout"]);
+  });
+
+  it("keeps a queued thread across a restart and drives it on recovery", async () => {
+    const path = join(mkdtempSync(join(tmpdir(), "rooms-row84-restart-")), "gateway.sqlite");
+    let storage = openStorage(path);
+    const first = new GroupRooms({
+      storage, now: () => Date.now(), broadcast: () => undefined,
+      memberInfo: (name) => ({ name, handle: name, displayName: name }), missingMembers: async () => [],
+      nativeTurns: { canQueue: () => true, sendNativeTurn: () => true },
+      pollMs: 1, turnTimeoutMs: 60_000, chainDelayMs: 0,
+    });
+    await first.create("Launch", ["scout", "luna"]);
+    first.send("Launch", "first @scout");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    first.send("Launch", "queued @luna");
+    await first.close();
+    storage.close();
+
+    storage = openStorage(path);
+    const commands: Command[] = [];
+    let second: GroupRooms;
+    second = new GroupRooms({
+      storage, now: () => Date.now(), broadcast: () => undefined,
+      memberInfo: (name) => ({ name, handle: name, displayName: name }), missingMembers: async () => [],
+      nativeTurns: {
+        canQueue: () => true,
+        sendNativeTurn: (agentId, command) => {
+          commands.push({ agentId, ...command });
+          queueMicrotask(() => second.handleAttachEvent(agentId, {
+            kind: "event", sequence: commands.length, eventId: `c:${command.turnId}`,
+            event: { kind: "commit", threadId: command.threadId, turnId: command.turnId, messageId: `r:${command.turnId}`,
+              blocks: [{ type: "paragraph", text: "(pass)" }] },
+          }));
+          return true;
+        },
+      },
+      pollMs: 1, turnTimeoutMs: 500, chainDelayMs: 0,
+    });
+    // The first turn's late commit arrives after the restart and recovery resumes the room.
+    const pending = storage.pendingBotGroupTurns()[0]!;
+    second.handleAttachEvent(pending.agentId, {
+      kind: "event", sequence: 1, eventId: "late", event: { kind: "commit", threadId: pending.threadId,
+        turnId: pending.turnId, messageId: "late", blocks: [{ type: "paragraph", text: "(pass)" }] },
+    });
+    await expect.poll(() => commands.some((command) => command.agentId === "luna")).toBe(true);
+    await second.settled("Launch");
+    await second.close();
+    storage.close();
+  });
+
+  it("checks rename uniqueness after the members await, case-folded in JavaScript", async () => {
+    const h = harness();
+    await h.rooms.create("Launch", ["scout", "luna"]);
+    await h.rooms.create("Other", ["scout", "luna"]);
+    const renaming = h.rooms.update("Launch", { name: "Release", members: ["scout", "luna"] });
+    await h.rooms.update("Other", { name: "RELEASE" });
+    await expect(renaming).rejects.toBeInstanceOf(GroupExists);
+    // SQLite's lower() folds ASCII only; the room key folds in JavaScript.
+    await h.rooms.create("Émile", ["scout", "luna"]);
+    await expect(h.rooms.create("émile", ["scout", "luna"])).rejects.toBeInstanceOf(GroupExists);
+    await expect(h.rooms.update("Other", { name: "ÉMILE" })).rejects.toBeInstanceOf(GroupExists);
+  });
+
   it("serves PATCH, stop, compress and picture with the room error mapping", async () => {
     const h = harness({ reply: () => "done" });
     await h.rooms.create("Launch", ["scout", "luna"]);

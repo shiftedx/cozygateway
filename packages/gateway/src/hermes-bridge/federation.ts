@@ -287,7 +287,8 @@ export class FederatedBotControlSurface implements BotControlSurface {
     const resolved = this.#resolveHost(members);
     if ("spans" in resolved) throw new BackendUnavailable(CROSS_ENDPOINT_ROOMS);
     const group = await this.#hostById(resolved.host).createGroup(name, members, resolved.host);
-    this.#rememberHost(group.name.trim().toLowerCase(), resolved.host);
+    // The room's own key: a renamed room may still hold the key its name would fold to.
+    this.#rememberHost(group.id ?? group.name.trim().toLowerCase(), resolved.host);
     return group;
   }
   deleteGroup(name: string): void {
