@@ -379,5 +379,81 @@ os.replace = replace
         self.assertEqual(len(json.loads(self.config.read_text())["hermesEndpoints"][0]["profiles"]), 3)
 
 
+    def multiplexed_served_profile(self, answers=None):
+        """A multiplexed host serving `served-bot`, with Hermes' control verbs answered by the
+        fixtures/hermes-control stand-in so the deprovisioner's own answer handling runs for real."""
+        (self.hermes / "config.yaml").write_text("gateway:\n  multiplex_profiles: true\n")
+        served = self.profiles / "served-bot"
+        served.mkdir()
+        (served / "config.yaml").write_text("plugins:\n  enabled:\n    - cozygateway\n")
+        self.seed(["keeper", "served-bot"])
+        (self.loaded / "ai.hermes.gateway-served-bot").unlink()
+        (self.home / "Library/LaunchAgents/ai.hermes.gateway-served-bot.plist").unlink()
+        interpreter = self.hermes / "hermes-agent/venv/bin/python"
+        interpreter.write_text("""#!/bin/sh
+case "$2" in --hermes-config-bool|--hermes-control) exec python3 -S "$@" ;; esac
+cat >/dev/null
+exit 1
+""")
+        self.control = self.base / "control"
+        self.env.update(PYTHONPATH=str(ROOT / "scripts/test/fixtures/hermes-control"),
+                        COZY_TEST_CONTROL_LOG=str(self.control), COZY_TEST_CONTROL_STATE=str(self.base / "control-state"),
+                        COZY_TEST_CONTROL_ANSWERS=json.dumps(answers or {}),
+                        HOST_UNSERVE_WAIT_SECONDS="1", HOST_UNSERVE_POLL_SECONDS="0.1")
+        self.hermes_calls = self.base / "hermes-calls"
+        self.executable("hermes", f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {self.hermes_calls}\nexit 0\n")
+        return served
+
+    def test_multiplexed_host_unserves_a_served_profile_before_its_directory_goes(self):
+        # One multiplexed Hermes host serves every profile, so a served bot has no launchd job of
+        # its own and Hermes refuses its per-profile gateway verbs. Hermes' own profile delete asks
+        # the host to unserve the profile before removing the tree (a host still serving it
+        # recreates files under it); a manual deprovision must do the same.
+        served = self.multiplexed_served_profile()
+        self.run_script("deprovision-bot.sh", "served-bot")
+        self.assertEqual(self.control.read_text().splitlines(), ["unserve-profile served-bot dir-present=1"])
+        self.assertFalse(served.exists())
+        self.assertFalse(self.hermes_calls.exists() and " gateway " in self.hermes_calls.read_text())
+        self.assertEqual(list(json.loads(self.config.read_text())["hermesEndpoints"][0]["profiles"]), ["keeper"])
+        self.assertEqual((self.profiles / "keeper/sessions.db").read_bytes(), b"keeper history")
+
+    def test_a_pending_unserve_that_never_completes_keeps_the_directory(self):
+        # `pending` means the host's teardown outlasted the verb's bound (run_profile_reconcile.py):
+        # still running. Removing the tree under it is exactly what the unserve exists to prevent.
+        still_served = {"multiplex": True, "served_profiles": ["default", "keeper", "served-bot"]}
+        served = self.multiplexed_served_profile({"unserve-profile": [{"pending": True, "served_profiles": still_served["served_profiles"]}],
+                                                  "rescan-profiles": [still_served]})
+        result = self.run_script("deprovision-bot.sh", "served-bot", succeeds=False)
+        self.assertTrue(served.exists())
+        self.assertIn("still serves served-bot", result.stdout + result.stderr)
+
+    def test_a_pending_unserve_that_completes_removes_the_directory(self):
+        served = self.multiplexed_served_profile({
+            "unserve-profile": [{"pending": True, "served_profiles": ["default", "keeper", "served-bot"]}],
+            "rescan-profiles": [{"multiplex": True, "served_profiles": ["default", "keeper", "served-bot"]},
+                                {"multiplex": True, "served_profiles": ["default", "keeper"]}]})
+        self.run_script("deprovision-bot.sh", "served-bot")
+        self.assertFalse(served.exists())
+
+    def test_standalone_profile_on_a_multiplexed_host_keeps_todays_teardown(self):
+        (self.hermes / "config.yaml").write_text("gateway:\n  multiplex_profiles: true\n")
+        solo = self.profiles / "deleted-a"
+        solo.mkdir()
+        (solo / "config.yaml").write_text("gateway:\n  standalone: true\n")
+        control = self.base / "control"
+        interpreter = self.hermes / "hermes-agent/venv/bin/python"
+        interpreter.write_text(f"""#!/bin/sh
+if [ "$2" = --hermes-config-bool ]; then exec python3 -S "$@"; fi
+if [ "$2" = --hermes-control ]; then cat >/dev/null; printf '%s\\n' "$4" >> {control}; exit 0; fi
+cat >/dev/null
+exit 1
+""")
+        self.run_script("deprovision-bot.sh", "deleted-a")
+        self.assertFalse((self.loaded / "ai.hermes.gateway-deleted-a").exists())
+        self.assertFalse((self.home / "Library/LaunchAgents/ai.hermes.gateway-deleted-a.plist").exists())
+        self.assertFalse(solo.exists())
+        self.assertFalse(control.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

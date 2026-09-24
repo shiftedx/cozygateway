@@ -93,6 +93,9 @@ PYTHON="$HERMES_HOME_ROOT/hermes-agent/venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3 || true)"
 [ -n "$PYTHON" ] || { log "sweep aborted: no python3"; exit 1; }
 [ -d "$SRC_DIR" ] || { log "sweep aborted: staged attach plugin is missing: $SRC_DIR"; exit 1; }
+[ -f "$SCRIPT_DIR/hermes-host.sh" ] || { log "sweep aborted: staged hermes-host.sh is missing"; exit 1; }
+# shellcheck source=hermes-host.sh
+. "$SCRIPT_DIR/hermes-host.sh"
 
 # NOTE on PyYAML: this read, unlike the streaming read below, still REQUIRES
 # PyYAML and stops the run without it. That is deliberate and unchanged: these
@@ -456,7 +459,9 @@ missing_reason() {
   # ~/.hermes/plugin-data/... path) fails it.
   grep -q "^COZYGATEWAY_SPOOL_PATH=$dir/" "$dir/.env" 2>/dev/null \
     || { printf 'env not scoped to this profile'; return 0; }
-  launchctl print "gui/$(id -u)/ai.hermes.gateway-$profile" >/dev/null 2>&1 \
+  # A profile the multiplexed host serves has no job of its own, by design (hermes-host.sh).
+  served_by_host "$profile" \
+    || launchctl print "gui/$(id -u)/ai.hermes.gateway-$profile" >/dev/null 2>&1 \
     || { printf 'no launchd gateway service'; return 0; }
   # Wired but mute, or wired and streaming at Telegram's one-edit-a-second
   # envelope: every profile created before the gateway's seed wrote these keys

@@ -724,8 +724,18 @@ ensure_replace_backup_dir() {
 # profile .env from it, so re-homing starts by stopping the profile. It is left
 # stopped: `ensure_hermes_gateways` starts it again once the new plugin, config
 # and env are all in place, and only then does it read the new target.
+#
+# A profile a multiplexed host serves is the exception. Stopping it would stop
+# every bot on the host; the host rebuilds a served profile from its files, so
+# it keeps running, and a live adapter whose keys change gets the one host
+# restart at the end instead (ensure_host_gateway).
 stop_profile_gateway() {
   local profile="$1" state
+  if served_by_host "$profile"; then
+    if [ "$DRY_RUN" = 1 ]; then say "DRY   keep the host Hermes gateway running while profile $profile's CozyGateway keys change"; return; fi
+    record_profile_change "$profile"
+    return 0
+  fi
   if [ "$DRY_RUN" = 1 ]; then say "DRY   stop the Hermes gateway for profile $profile before changing its CozyGateway keys"; return; fi
   state="$(gateway_state "$profile")"
   [ "$state" = running ] || return 0
@@ -772,6 +782,9 @@ backup_profile_plugin() {
 # decides what to do with a folder it does not own.
 rehome_profile() {
   local profile="$1"
+  # A re-homed profile's keys are about to be minted afresh, but its adapter may be live: it is
+  # never a hot-add, which only a profile with no attach of its own yet can be.
+  REHOMED_PROFILES+=("$profile")
   stop_profile_gateway "$profile"
   backup_profile_env_keys "$profile" "$(profile_home "$profile")/.env"
 }
@@ -817,6 +830,218 @@ gateway_state() {
     *"Gateway is supervised"*|*"Gateway is running"*|*"Gateway is active"*|*"Gateway process running"*) printf 'running' ;;
     *) die "could not determine Hermes gateway service state for profile $1: $status" ;;
   esac
+}
+# One Hermes gateway per host can serve every profile: the default profile's
+# gateway with `gateway.multiplex_profiles: true` in the root config.yaml, the
+# key Hermes itself writes once it multiplexes (hermes_cli/gateway_multiplex_mode.py
+# `persist_resolved_default`). A profile it serves has no gateway of its own:
+# Hermes refuses `hermes -p <profile> gateway start|stop|restart|install` for it
+# (exit 78, "Manage the host gateway instead: hermes -p default gateway restart",
+# hermes_cli/gateway.py), and the attach plugin reads that profile's .env through
+# the host's per-profile scope. So each lifecycle step for a served profile is
+# taken on the host instead, once for all of them. A profile whose own
+# config.yaml says `gateway.standalone: true` opted out and keeps its own gateway.
+HOST_PROFILE=default
+HOST_MULTIPLEXES=""
+# Prints `true` or `false` for a boolean Hermes config key, or nothing when the
+# key is unset or the file is not simple enough to be sure; the caller then
+# keeps the single-gateway path it always took. With several keys, the first
+# one present wins, which is Hermes' own precedence for `multiplex_profiles`.
+hermes_config_bool() {
+  local python="$1"; shift
+  "$python" - "$@" <<'PY' | tr -d '\r'
+import re
+import sys
+from pathlib import Path
+
+TRUE = {"true", "yes", "on", "1"}
+FALSE = {"false", "no", "off", "0"}
+KEY = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z0-9_][A-Za-z0-9_.\-]*):(?:[ \t]+(?P<value>.*))?$")
+
+
+def verdict(value):
+    if isinstance(value, bool) or isinstance(value, int):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        token = value.strip().lower()
+        return "true" if token in TRUE else "false" if token in FALSE else ""
+    return ""
+
+
+def with_yaml(text, yaml, paths):
+    data = yaml.safe_load(text)
+    for path in paths:
+        node = data
+        for segment in path:
+            node = node.get(segment) if isinstance(node, dict) else None
+        if node is not None:
+            return verdict(node)
+    return ""
+
+
+def scalar(raw):
+    value = re.split(r"[ \t]#", raw, maxsplit=1)[0].strip()
+    if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+        return value[1:-1]
+    if not value or value[0] in "&*!|>[{%@`\"'#":
+        raise ValueError("not a plain scalar")
+    return value
+
+
+def without_yaml(text, paths):
+    """Top-level and one-level block mappings only. Anything that could hide a
+    wanted key (a flow mapping, an anchor, a tag, a sequence, a line this cannot
+    parse, a tab, a second document) raises, and the answer is then unknown."""
+    wanted = set(paths)
+    sections = {path[0] for path in paths if len(path) == 2}
+    found = {}
+    section = child_indent = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        leading = line[: len(line) - len(line.lstrip())]
+        if "\t" in leading or stripped.startswith(("---", "...", "%")):
+            raise ValueError("unsupported layout")
+        match = KEY.match(line)
+        if not leading:
+            section = child_indent = None
+            if match is None:
+                raise ValueError("unparsed top-level line")
+            key, value = match.group("key"), match.group("value") or ""
+            if (key,) in wanted:
+                found[(key,)] = scalar(value)
+            elif key in sections:
+                if re.split(r"(?:^|[ \t])#", value, maxsplit=1)[0].strip():
+                    raise ValueError("inline section")
+                section = key
+            continue
+        if section is None:
+            continue
+        if child_indent is None:
+            child_indent = len(leading)
+        if len(leading) > child_indent:
+            continue
+        if len(leading) < child_indent or match is None:
+            raise ValueError("unparsed section line")
+        if (section, match.group("key")) in wanted:
+            found[(section, match.group("key"))] = scalar(match.group("value") or "")
+    for path in paths:
+        if path in found:
+            return verdict(found[path])
+    return ""
+
+
+def main():
+    try:
+        text = Path(sys.argv[1]).read_text(encoding="utf-8")
+    except Exception:
+        return
+    paths = [tuple(arg.split(".")) for arg in sys.argv[2:]]
+    try:
+        import yaml
+    except ImportError:
+        yaml = None
+    try:
+        answer = with_yaml(text, yaml, paths) if yaml is not None else without_yaml(text, paths)
+    except Exception:
+        answer = ""
+    sys.stdout.write(answer)
+
+
+main()
+PY
+}
+host_multiplexes() {
+  local python
+  if [ -z "$HOST_MULTIPLEXES" ]; then
+    HOST_MULTIPLEXES=0
+    if python="$(streaming_python)" && [ "$(hermes_config_bool "$python" "$HERMES_ROOT/config.yaml" multiplex_profiles gateway.multiplex_profiles)" = true ]; then
+      HOST_MULTIPLEXES=1
+    fi
+  fi
+  [ "$HOST_MULTIPLEXES" = 1 ]
+}
+# The default profile IS the host, so it is always served by it.
+served_by_host() {
+  local profile="$1" python
+  host_multiplexes || return 1
+  [ "$profile" = "$HOST_PROFILE" ] && return 0
+  python="$(streaming_python)" || return 0
+  [ "$(hermes_config_bool "$python" "$(profile_home "$profile")/config.yaml" gateway.standalone)" != true ]
+}
+# Named served profiles this run gave their FIRST attach settings (a phone-created bot). Nothing in
+# the running host holds them yet, so the host is not stopped around their .env write; it picks them
+# up hot through Hermes' own control verbs instead (hot_add_to_host).
+HOT_ADD_PROFILES=()
+REHOMED_PROFILES=()
+# Served profiles whose spools the running host still held during uninstall; released together.
+HOST_HELD_SPOOLS=()
+hot_add_candidate() {
+  local profile
+  for profile in "${HOT_ADD_PROFILES[@]:-}"; do [ "$profile" = "$1" ] && return 0; done
+  return 1
+}
+rehomed() {
+  local profile
+  for profile in "${REHOMED_PROFILES[@]:-}"; do [ "$profile" = "$1" ] && return 0; done
+  return 1
+}
+# One Hermes control verb on the running host's socket (gateway/control_socket.py):
+# `reload-plugins <profile>` or `rescan-profiles`. Fails when nothing answered.
+#   * A rescan that outlasts Hermes' 5-second bound answers `pending` while the new
+#     adapter still connects (gateway/run.py: "not an error"); that is an answer,
+#     and the attach health gate proves the rest.
+#   * reload-plugins refuses a home the host does not serve yet
+#     (gateway/run_plugin_rewire.py): rescan once so it does, and retry once.
+host_control() {
+  local python="$HERMES_ROOT/hermes-agent/venv/bin/python"
+  [ -x "$python" ] || return 1
+  HERMES_HOME="$HERMES_ROOT" "$python" - --hermes-control "$HERMES_ROOT" "$@" <<'PY' >/dev/null 2>&1
+import sys
+from pathlib import Path
+
+root, verb = Path(sys.argv[2]), sys.argv[3]
+try:
+    from gateway import control_socket
+except Exception:
+    sys.exit(3)
+
+
+def rescanned():
+    answer = control_socket.rescan_gateway_profiles(root)
+    return isinstance(answer, dict) and answer.get("multiplex") is not False and "served_profiles" in answer
+
+
+def reloaded(home):
+    answer = control_socket.reload_gateway_plugins(root, profile_home=home)
+    return isinstance(answer, dict) and answer.get("reloaded") is True
+
+
+if verb == "reload-plugins":
+    home = root / "profiles" / sys.argv[4]
+    sys.exit(0 if reloaded(home) or (rescanned() and reloaded(home)) else 1)
+if verb == "rescan-profiles":
+    sys.exit(0 if rescanned() else 1)
+sys.exit(2)
+PY
+}
+# The host's 30-second reconcile rediscovers plugins only on a forced pass, and rebuilds a profile's
+# adapters only when its config.yaml or .env changed after it last looked. So: reload the profile's
+# plugins, change its .env once more, and ask for the rescan now. Prints the profiles it could not
+# hot-add, one per line; the caller restarts the host once for those.
+hot_add_to_host() {
+  local profile failed=()
+  for profile in "$@"; do
+    if host_control reload-plugins "$profile"; then
+      touch "$(profile_home "$profile")/.env"
+    else
+      failed+=("$profile")
+    fi
+  done
+  if [ "${#failed[@]}" -lt "$#" ] && ! host_control rescan-profiles; then failed=("$@"); fi
+  [ "${#failed[@]}" = 0 ] || printf '%s\n' "${failed[@]}"
 }
 
 # Profiles whose Hermes gateway must be restarted before the change takes: a
@@ -1384,6 +1609,8 @@ prepare_dashboard_credential() {
 stop_profile_gateway_for_env() {
   local profile="$1"
   [ "$DRY_RUN" = 1 ] && return 0
+  # A served profile keeps the host running (stop_profile_gateway records it for the one restart).
+  if served_by_host "$profile"; then stop_profile_gateway "$profile"; return 0; fi
   [ "$(gateway_state "$profile")" = running ] || return 0
   stop_profile_gateway "$profile"
   ENV_RESTART_PROFILES+=("$profile")
@@ -1441,7 +1668,10 @@ write_gateway_env() {
     # the copied one belongs to the default profile. The spool path is the marker only this
     # installer writes, and it names the profile it was written for.
     token="$(env_get "$profile_env" COZYGATEWAY_TOKEN)"
-    if ! safe_secret "$token" || [ "$(env_get "$profile_env" COZYGATEWAY_SPOOL_PATH)" != "$spool_path" ]; then token="$(new_token)"; fi
+    if ! safe_secret "$token" || [ "$(env_get "$profile_env" COZYGATEWAY_SPOOL_PATH)" != "$spool_path" ]; then
+      token="$(new_token)"
+      [ "$p" = "$HOST_PROFILE" ] || rehomed "$p" || ! served_by_host "$p" || HOT_ADD_PROFILES+=("$p")
+    fi
     for seen_token in "${TOKENS[@]:-}"; do [ "$token" != "$seen_token" ] || die "Hermes profiles must have distinct CozyGateway attach tokens"; done
     for seen_name in "${TOKEN_ENVS[@]:-}"; do [ "$env_name" != "$seen_name" ] || die "profile names produce the same token environment variable: $env_name"; done
     TOKENS+=("$token"); TOKEN_ENVS+=("$env_name")
@@ -1449,7 +1679,7 @@ write_gateway_env() {
     # in memory, so an edit made while it runs is undone seconds later. Stop it
     # first, write, read the file back, and start it again below. A profile whose
     # keys are already exactly right needs no edit and therefore no interruption.
-    if profile_env_needs_rewrite "$profile_env" "$token" "$spool_path"; then
+    if profile_env_needs_rewrite "$profile_env" "$token" "$spool_path" && ! hot_add_candidate "$p"; then
       stop_profile_gateway_for_env "$p"
     fi
     claim_profile_env "$profile_env"
@@ -1560,11 +1790,25 @@ profile_attach_log_origin() {
 }
 origin_authority() { local rest="${1#*://}"; printf '%s' "${rest%%/*}"; }
 ensure_hermes_gateways() {
-  local profile state prior action observed
+  local profile state prior action observed host_changed="" host_served=0
   for profile in "${SELECTED[@]}"; do
-    state="$(gateway_state "$profile")"; prior="$(prior_service_action "$profile")"
     # No log is no answer: a rerun must not bounce healthy profiles on a guess.
     observed="$(profile_attach_log_origin "$(profile_home "$profile")" || true)"
+    if served_by_host "$profile"; then
+      host_served=1
+      if hot_add_candidate "$profile"; then
+        :
+      elif profile_changed_for "$profile"; then
+        host_changed="$host_changed, $profile"
+      elif [ -n "$observed" ] && [ "$(origin_authority "$observed")" != "$(origin_authority "$(gateway_origin)")" ]; then
+        host_changed="$host_changed, $profile"
+        say "INFO  the live attach target for Hermes profile $profile was $observed, not $(gateway_origin)"
+      fi
+      # The host serves every profile on this machine, not only CozyGateway's: never ours to remove.
+      record_service_action "$profile" preexisting
+      continue
+    fi
+    state="$(gateway_state "$profile")"; prior="$(prior_service_action "$profile")"
     case "$state" in
       running)
         if profile_changed_for "$profile"; then
@@ -1591,6 +1835,49 @@ ensure_hermes_gateways() {
     esac
     record_service_action "$profile" "$action"
   done
+  [ "$host_served" = 0 ] || ensure_host_gateway "${host_changed#, }"
+}
+# One step on the multiplexed host for every served profile: Hermes' own verb for a
+# served profile is `hermes -p default gateway restart`. A restart reloads the attach
+# plugin and rereads every served profile's config and .env.
+ensure_host_gateway() {
+  local changed="$1" state profile hot=() failed
+  state="$(gateway_state "$HOST_PROFILE")"
+  for profile in "${HOT_ADD_PROFILES[@]:-}"; do [ -n "$profile" ] && hot+=("$profile"); done
+  # A stopped or absent host starts with every profile's current plugin and .env anyway.
+  if [ "$state" = running ] && [ "${#hot[@]}" -gt 0 ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+      say "DRY   ask the host Hermes gateway to reload plugins for ${hot[*]} and rescan its profiles"
+    else
+      failed="$(hot_add_to_host "${hot[@]}")"
+      for profile in "${hot[@]}"; do
+        case $'\n'"$failed"$'\n' in *$'\n'"$profile"$'\n'*) changed="${changed:+$changed, }$profile" ;; esac
+      done
+      if [ -z "$failed" ]; then
+        say "OK    the host Hermes gateway picked up profiles ${hot[*]} without a restart"
+      else
+        say "INFO  the host Hermes gateway did not answer its control verbs; restarting it once instead"
+      fi
+    fi
+  fi
+  case "$state" in
+    running)
+      if [ -n "$changed" ]; then
+        run "$HERMES_BIN" -p "$HOST_PROFILE" gateway restart
+        say "OK    restarted the host Hermes gateway once; it serves profiles $changed"
+      else
+        say "OK    the host Hermes gateway is already running with the current attach plugin and config"
+      fi
+      ;;
+    stopped)
+      run "$HERMES_BIN" -p "$HOST_PROFILE" gateway start
+      say "OK    started the host Hermes gateway; it serves every selected profile"
+      ;;
+    absent)
+      run "$HERMES_BIN" -p "$HOST_PROFILE" gateway install --start-now --start-on-login
+      say "OK    installed and started the host Hermes gateway; it serves every selected profile"
+      ;;
+  esac
 }
 write_state() {
   local profile staged="$STATE_FILE.tmp.$$"
@@ -3338,6 +3625,9 @@ uninstall() {
     valid_profile "$p" || die "unsafe profile in installer state"; home="$(profile_home "$p")"; plugin="$home/plugins/cozygateway"; spool="$home/plugin-data/cozygateway/attach-v1.sqlite"
     action="$(prior_service_action "$p")"
     case "$action" in installed|started|preexisting|unknown) ;; '') die "missing Hermes gateway lifecycle state for profile $p" ;; *) die "unsafe Hermes gateway lifecycle state for profile $p" ;; esac
+    # State written before the host multiplexed can name a per-profile service Hermes now refuses
+    # to touch; the shared host is left running, like any gateway CozyGateway did not start.
+    if served_by_host "$p"; then action=preexisting; fi
     if [ "$hermes_available" = 1 ]; then
       case "$action" in
         installed) run "$HERMES_RESOLVED" -p "$p" gateway uninstall; say "OK    removed Hermes gateway service installed by CozyGateway for profile $p" ;;
@@ -3356,6 +3646,12 @@ uninstall() {
       [ "$SERVICE_PLATFORM" = Windows ] && [ "$hermes_available" = 1 ] || die "could not remove the CozyGateway spool for profile $p"
       case "$action" in
         preexisting)
+          # One multiplexed host holds every served profile's spool: restart it once, after every
+          # served profile's plugin is disabled, instead of once per profile.
+          if served_by_host "$p"; then
+            HOST_HELD_SPOOLS+=("$p")
+            continue
+          fi
           say "INFO  restarting the pre-existing Hermes gateway for profile $p to release the disabled CozyGateway spool"
           "$HERMES_RESOLVED" -p "$p" gateway restart >/dev/null || die "could not restart the pre-existing Hermes gateway for profile $p during cleanup"
           rm -f "$spool" "$spool-wal" "$spool-shm" || die "Hermes restarted, but the CozyGateway spool for profile $p is still in use"
@@ -3374,6 +3670,15 @@ uninstall() {
       rmdir "$home/plugin-data/cozygateway" 2>/dev/null || true
     fi
   done
+  if [ "${#HOST_HELD_SPOOLS[@]}" -gt 0 ]; then
+    say "INFO  restarting the host Hermes gateway once to release the disabled CozyGateway spools of ${HOST_HELD_SPOOLS[*]}"
+    "$HERMES_RESOLVED" -p "$HOST_PROFILE" gateway restart >/dev/null || die "could not restart the host Hermes gateway during cleanup"
+    for p in "${HOST_HELD_SPOOLS[@]}"; do
+      spool="$(profile_home "$p")/plugin-data/cozygateway/attach-v1.sqlite"
+      rm -f "$spool" "$spool-wal" "$spool-shm" || die "the host Hermes gateway restarted, but the CozyGateway spool for profile $p is still in use"
+      rmdir "$(profile_home "$p")/plugin-data/cozygateway" 2>/dev/null || true
+    done
+  fi
   remove_gateway_home; say "OK    removed only CozyGateway-owned state; Hermes profiles and Hermes services remain"
 }
 status_install() {

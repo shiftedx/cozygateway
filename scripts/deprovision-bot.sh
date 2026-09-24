@@ -100,6 +100,12 @@ while [ "$#" -gt 0 ]; do
 done
 for arg in ${@+"$@"}; do PROFILES+=("$arg"); done
 
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="$HERMES_HOME_ROOT/hermes-agent/venv/bin/python"
+[ -x "$PYTHON" ] || PYTHON="$(command -v python3 || true)"
+# shellcheck source=hermes-host.sh
+. "$SCRIPT_DIR/hermes-host.sh"
+
 # Quote each remote argument for the SSH login shell (including custom paths).
 shell_quote() { local value="$1"; value=${value//\'/\'\\\'\'}; printf "'%s'" "$value"; }
 
@@ -359,6 +365,22 @@ remove_profile_dir() {
     "$HERMES_HOME_ROOT/profiles/$profile") ;;
     *) die "[$profile] refusing to remove an unexpected path: $dir" ;;
   esac
+  # A multiplexed host serving this profile would recreate files under it. Hermes' own profile
+  # delete asks the host to unserve it first; so does this, and removes nothing until the host has
+  # confirmed (hermes-host.sh host_unserve). No answer means no host is serving it now.
+  if served_by_host "$profile"; then
+    if [ "$DRY_RUN" = 1 ]; then
+      say "  DRY  ask the host Hermes gateway to unserve $profile"
+    else
+      local unserved=0
+      host_unserve "$profile" || unserved=$?
+      case "$unserved" in
+        0) say "  host Hermes gateway unserved $profile" ;;
+        4) say "  no host Hermes gateway answered unserve-profile; nothing is serving $profile" ;;
+        *) warn "[$profile] the host Hermes gateway still serves $profile; its directory was kept"; return 1 ;;
+      esac
+    fi
+  fi
   if [ "$DRY_RUN" = 1 ]; then say "  DRY  rm -rf $dir"; return 0; fi
   rm -rf "$dir"
   say "  profile dir removed: $dir"
@@ -418,7 +440,7 @@ for profile in "${PROFILES[@]}"; do
   remove_service "$profile" || overall_rc=1
   # In automatic mode a recreated directory is never removed, even if it
   # appeared after orphan discovery. The next sweep will provision it again.
-  [ "$ORPHANS_ONLY" = 1 ] || remove_profile_dir "$profile" "$HERMES_HOME_ROOT/profiles/$profile"
+  [ "$ORPHANS_ONLY" = 1 ] || remove_profile_dir "$profile" "$HERMES_HOME_ROOT/profiles/$profile" || overall_rc=1
 done
 if [ "$needs_restart" = 1 ]; then
   ssh -o BatchMode=yes "$BOX_SSH" "cd $(shell_quote "$BOX_REPO") && docker compose up -d --force-recreate gateway" >/dev/null \

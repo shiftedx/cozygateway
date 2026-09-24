@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
+from .profile_env import profile_env, profile_home
+
 
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl): raise HTTPError(req.full_url, code, "redirect refused", headers, fp)
@@ -19,8 +21,8 @@ class _NoRedirect(HTTPRedirectHandler):
 
 class ProviderConnectionStore:
     def __init__(self, path: Optional[Path] = None) -> None:
-        home = Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes"))
-        self._path = path or Path(os.getenv("COZYGATEWAY_PROVIDER_CONNECTIONS_PATH") or (home / "cozygateway-provider-connections.json"))
+        home = Path(profile_home() or (Path.home() / ".hermes"))
+        self._path = path or Path(profile_env("COZYGATEWAY_PROVIDER_CONNECTIONS_PATH") or (home / "cozygateway-provider-connections.json"))
 
     def catalog(self) -> Dict[str, List[Dict[str, Any]]]: return {"connections": [self._public(row) for row in self._read()]}
 
@@ -126,8 +128,8 @@ class BotModelDefaultStore:
     catalog.  This file never contains an endpoint credential; resolution happens at turn time.
     """
     def __init__(self, path: Optional[Path] = None) -> None:
-        home = Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes"))
-        self._path = path or Path(os.getenv("COZYGATEWAY_BOT_MODEL_PATH") or (home / "cozygateway-bot-model.json"))
+        home = Path(profile_home() or (Path.home() / ".hermes"))
+        self._path = path or Path(profile_env("COZYGATEWAY_BOT_MODEL_PATH") or (home / "cozygateway-bot-model.json"))
 
     def read(self) -> Dict[str, Optional[str]]:
         try:

@@ -210,6 +210,26 @@ writeFileSync(path, JSON.stringify(disabled) + '\n');
 NODE
   exit 0
 fi
+# A multiplexed host, modeled on Hermes 0.21 (hermes_cli/gateway.py): with
+# `gateway.multiplex_profiles: true` in the root config.yaml the DEFAULT profile's
+# gateway serves every named profile whose own config is not `gateway.standalone:
+# true`. Such a profile reports the host's state, and every lifecycle verb for it
+# is refused with exit 78 ("Manage the host gateway instead").
+if [ "$1" = "-p" ] && [ "$3" = "gateway" ] && [ "$profile" != default ] \
+  && grep -Eq '^  multiplex_profiles: true' "$root/config.yaml" 2>/dev/null \
+  && ! grep -Eq '^  standalone: true' "$root/profiles/$profile/config.yaml" 2>/dev/null; then
+  if [ "$4" = status ]; then
+    if [ "$(cat "$root/gateway-default.state" 2>/dev/null)" = running ]; then
+      printf '✓ Gateway is running via the default-profile multiplexer\n  Manage it from the default profile: hermes gateway status\n'
+    else
+      printf '✗ Gateway is not running\n\nTo start:\n  hermes gateway run      # Run in foreground\n'
+    fi
+    exit 0
+  fi
+  log "refused-$4"
+  printf "✗ The host gateway already serves profile '%s'.\n  Manage the host gateway instead:\n\n    hermes -p default gateway restart\n" "$profile" >&2
+  exit 78
+fi
 if [ "$1" = "-p" ] && [ "$3" = "gateway" ] && [ "$4" = "status" ]; then
   if [ "${COZYGATEWAY_TEST_WINDOWS_STATUS:-}" = 1 ] && [ "$profile" = active ]; then
     printf '✓ Scheduled Task registered: Hermes_Gateway\n  Status: Ready\n✓ Gateway process running (PID: 33036)\n'
@@ -228,6 +248,12 @@ if [ "$1" = "-p" ] && [ "$3" = "gateway" ]; then
       [ "$(state)" = running ] || exit 2
       log restart
       set_state running
+      # The restarted host no longer loads a plugin disabled before the restart; any other it reloads.
+      if [ -n "${COZYGATEWAY_TEST_HOST_SPOOL_LOCK:-}" ] && [ "$profile" = default ]; then
+        for disabled in "$COZYGATEWAY_TEST_HOST_SPOOL_LOCK".disabled-*; do
+          [ -f "$disabled" ] && : > "$COZYGATEWAY_TEST_HOST_SPOOL_LOCK.released-${disabled##*.disabled-}"
+        done
+      fi
       if [ -n "${COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER:-}" ] && [ "$profile" = "${COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE:-}" ]; then
         : > "$COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER.unlocked"
       fi
@@ -272,6 +298,7 @@ if [ "$1" = "-p" ] && [ "$3" = "plugins" ] && [ "$4" = "enable" ]; then
   exit 0
 fi
 if [ "$1" = "-p" ] && [ "$3" = "plugins" ] && [ "$4" = "disable" ]; then
+  [ -z "${COZYGATEWAY_TEST_HOST_SPOOL_LOCK:-}" ] || : > "$COZYGATEWAY_TEST_HOST_SPOOL_LOCK.disabled-$2"
   if [ -n "${COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER:-}" ] && [ "$profile" = "${COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE:-}" ]; then
     : > "$COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER"
   fi
@@ -1785,6 +1812,14 @@ cat > "$tmp/locked-spool-bin/rm" <<'LOCKED_RM'
 if [[ "$*" == *attach-v1.sqlite* ]] && [ -n "${COZYGATEWAY_TEST_LOCKED_SPOOL_RM_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$COZYGATEWAY_TEST_LOCKED_SPOOL_RM_LOG"
 fi
+# A multiplexed host holds every served profile's spool while it loads that profile's plugin.
+if [[ "$*" == *attach-v1.sqlite* ]] && [ -n "${COZYGATEWAY_TEST_HOST_SPOOL_LOCK:-}" ]; then
+  held="${!#}"; held="${held##*/profiles/}"; held="${held%%/*}"
+  if [ ! -f "$COZYGATEWAY_TEST_HOST_SPOOL_LOCK.released-$held" ]; then
+    printf 'Device or resource busy\n' >&2
+    exit 1
+  fi
+fi
 if [[ "$*" == *attach-v1.sqlite* ]] && [ -f "${COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER:?}" ] && { [ "${COZYGATEWAY_TEST_LOCKED_SPOOL_PERSISTS:-}" = 1 ] || [ ! -f "$COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER.unlocked" ]; }; then
   printf 'Device or resource busy\n' >&2
   exit 1
@@ -2035,6 +2070,35 @@ test "$(cat "$tmp/hermes/profiles/unrelated/plugin-data/unrelated/sentinel")" = 
 ! grep -q '^unrelated:' "$tmp/windows-locked-commands"
 test ! -e "$tmp/gateway-windows-locked"
 test ! -e "$tmp/hermes/profiles/locked-windows/plugin-data/cozygateway/attach-v1.sqlite"
+
+
+# On a multiplexed host ONE process holds every served profile's spool, so a Windows uninstall that
+# finds them in use restarts that host once, after the loop, and not once per profile.
+mux_windows="$tmp/hermes-mux-windows"
+mkdir -p "$tmp/gateway-mux-windows/local" "$mux_windows"
+printf 'gateway:\n  multiplex_profiles: true\n' > "$mux_windows/config.yaml"
+mkdir -p "$mux_windows/hermes-agent/venv/bin"
+cp "$tmp/hermes/hermes-agent/venv/bin/python" "$mux_windows/hermes-agent/venv/bin/python"
+for name in alpha beta; do
+  mkdir -p "$mux_windows/profiles/$name/plugins/cozygateway" "$mux_windows/profiles/$name/plugin-data/cozygateway"
+  printf 'plugins:\n  enabled:\n    - cozygateway\n' > "$mux_windows/profiles/$name/config.yaml"
+  : > "$mux_windows/profiles/$name/plugins/cozygateway/.cozygateway-installer-owned"
+  : > "$mux_windows/profiles/$name/plugin-data/cozygateway/attach-v1.sqlite"
+done
+printf 'running\n' > "$mux_windows/gateway-default.state"
+cat > "$tmp/gateway-mux-windows/local/install-state" <<MUX_WINDOWS_STATE
+profiles=alpha,beta
+hermes_root=$mux_windows
+hermes_bin=$tmp/bin/hermes
+service_alpha=preexisting
+service_beta=preexisting
+MUX_WINDOWS_STATE
+HOME="$tmp/mux-windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/locked-spool-bin:$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HOST_SPOOL_LOCK="$tmp/mux-windows-spools" COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER="$tmp/mux-windows-unused-marker" COZYGATEWAY_TEST_HERMES_ROOT="$mux_windows" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-windows-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/mux-windows-native-commands" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-mux-windows" >/dev/null
+test "$(grep -c ':gateway:' "$tmp/mux-windows-commands")" = 1
+grep -q '^default:gateway:restart$' "$tmp/mux-windows-commands"
+test ! -e "$mux_windows/profiles/alpha/plugin-data/cozygateway/attach-v1.sqlite"
+test ! -e "$mux_windows/profiles/beta/plugin-data/cozygateway/attach-v1.sqlite"
+test ! -e "$mux_windows/profiles/beta/plugin-data/cozygateway"
 
 # Hermes can report a successful service uninstall while its directly spawned
 # gateway remains alive and keeps the SQLite spool locked. Recover only for the
@@ -2547,5 +2611,137 @@ const profiles = config.hermesEndpoints?.[0]?.profiles ?? {};
 if (profiles.phone?.tokenEnv !== 'COZYGATEWAY_ATTACH_TOKEN_PHONE') process.exit(1);
 if (profiles.default?.tokenEnv !== 'COZYGATEWAY_ATTACH_TOKEN_DEFAULT') process.exit(1);
 NODE
+
+# A multiplexed Hermes host (`hermes gateway migrate --multiplex`): ONE host gateway, the default
+# profile's, serves every profile, and Hermes refuses a served profile's own lifecycle verbs with
+# exit 78. The installer must drive the host instead, once for all of them, while a profile that
+# opted out with `gateway.standalone: true` keeps its own gateway exactly as before.
+mux_profile_yaml='display:
+  streaming: true
+  platforms:
+    cozygateway:
+      streaming: true
+streaming:
+  edit_interval: 0.05
+  buffer_threshold: 1'
+make_mux_hermes() {
+  local root="$1" host_state="$2" name
+  mkdir -p "$root/hermes-agent/venv/bin"
+  cp "$tmp/hermes/hermes-agent/venv/bin/python" "$root/hermes-agent/venv/bin/python"
+  printf '%s\ngateway:\n  multiplex_profiles: true\n' "$mux_profile_yaml" > "$root/config.yaml"
+  for name in alpha beta solo; do
+    mkdir -p "$root/profiles/$name"
+    printf '%s\n' "$mux_profile_yaml" > "$root/profiles/$name/config.yaml"
+  done
+  printf 'gateway:\n  standalone: true\n' >> "$root/profiles/solo/config.yaml"
+  printf '%s\n' "$host_state" > "$root/gateway-default.state"
+  printf 'running\n' > "$root/gateway-solo.state"
+}
+mux_hermes="$tmp/hermes-mux"
+make_mux_hermes "$mux_hermes" running
+if ! mux_output="$(HOME="$tmp/mux-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"hermes":{"configured":4,"online":4},"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$mux_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --no-qr --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mux" 2>&1)"; then
+  printf 'install on a multiplexed Hermes host failed:\n%s\n--- commands ---\n%s\n' "$mux_output" "$(cat "$tmp/mux-commands" 2>/dev/null)" >&2; exit 1
+fi
+# Served profiles never get a per-profile gateway verb, and the host is never stopped around their
+# .env writes: the host rebuilds a served profile from disk. It takes ONE restart, for the new plugin.
+if grep -Eq '^(alpha|beta):gateway:' "$tmp/mux-commands"; then
+  printf 'a served profile got its own gateway lifecycle command:\n%s\n' "$(cat "$tmp/mux-commands")" >&2; exit 1
+fi
+test "$(grep -c '^default:gateway:stop$' "$tmp/mux-commands")" = 0
+test "$(grep -c '^default:gateway:start$' "$tmp/mux-commands")" = 0
+test "$(grep -c '^default:gateway:restart$' "$tmp/mux-commands")" = 1
+expect_contains "$mux_output" 'restarted the host Hermes gateway once; it serves profiles default, alpha, beta'
+# The standalone profile keeps its own gateway, on today's path.
+grep -q '^solo:gateway:stop$' "$tmp/mux-commands"
+grep -q '^solo:gateway:restart$' "$tmp/mux-commands"
+# One host, still N independent attachments: each profile has its own token and its own spool.
+mux_tokens=""
+for name in alpha beta solo; do
+  token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$mux_hermes/profiles/$name/.env")"
+  test -n "$token"
+  mux_tokens="$mux_tokens$token"$'\n'
+  test "$(sed -n 's/^COZYGATEWAY_SPOOL_PATH=//p' "$mux_hermes/profiles/$name/.env")" = "$mux_hermes/profiles/$name/plugin-data/cozygateway/attach-v1.sqlite"
+done
+test "$(printf '%s' "$mux_tokens" | sort -u | wc -l | tr -d ' ')" = 3
+# The shared host is not CozyGateway's to remove: served profiles are recorded as pre-existing.
+grep -q '^service_alpha=preexisting$' "$tmp/gateway-mux/local/install-state"
+grep -q '^service_default=preexisting$' "$tmp/gateway-mux/local/install-state"
+
+# A repair with nothing to change does not bounce the host (or anything else).
+if ! mux_rerun_output="$(HOME="$tmp/mux-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"hermes":{"configured":4,"online":4},"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$mux_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-rerun-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --no-qr --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mux" 2>&1)"; then
+  printf 'repair on a multiplexed Hermes host failed:\n%s\n' "$mux_rerun_output" >&2; exit 1
+fi
+if grep -q ':gateway:' "$tmp/mux-rerun-commands" 2>/dev/null; then
+  printf 'an unchanged repair bounced a gateway:\n%s\n' "$(cat "$tmp/mux-rerun-commands")" >&2; exit 1
+fi
+expect_contains "$mux_rerun_output" 'the host Hermes gateway is already running with the current attach plugin and config'
+
+
+# A bot created later from the phone: Hermes `profiles.create` makes the profile (with a copy of the
+# launch profile's .env) and the gateway's provisioner reruns this installer. The running host must
+# pick the new profile up through Hermes' own control verbs, with no stop and no restart that would
+# bounce every other bot: plugins reloaded for its home, a change to its .env after that, a rescan.
+mkdir -p "$mux_hermes/profiles/phone"
+printf '%s\n' "$mux_profile_yaml" > "$mux_hermes/profiles/phone/config.yaml"
+cp "$mux_hermes/.env" "$mux_hermes/profiles/phone/.env"
+# Hermes' control verbs answer through the fixtures/hermes-control stand-in, so the installer's own
+# answer handling runs: a rescan that outlasts Hermes' 5 s bound answers `pending` ("not an error"),
+# and a reload for a home the host does not serve yet is retried once after a rescan.
+mux_control_answers='{"reload-plugins": [{"reloaded": false, "error": "home is not served by this gateway"}, {"reloaded": true}], "rescan-profiles": [{"multiplex": true, "pending": true, "served_profiles": ["default", "alpha", "beta"]}]}'
+if ! mux_phone_output="$(HOME="$tmp/mux-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" PYTHONPATH="$repo_root/scripts/test/fixtures/hermes-control" COZY_TEST_CONTROL_LOG="$tmp/mux-phone-control" COZY_TEST_CONTROL_STATE="$tmp/mux-phone-control-state" COZY_TEST_CONTROL_ANSWERS="$mux_control_answers" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"hermes":{"configured":5,"online":5},"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$mux_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-phone-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --no-qr --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mux" 2>&1)"; then
+  printf 'provisioning a phone-created bot on a multiplexed host failed:\n%s\n' "$mux_phone_output" >&2; exit 1
+fi
+if grep -q ':gateway:' "$tmp/mux-phone-commands" 2>/dev/null; then
+  printf 'a phone-created bot bounced a gateway:\n%s\n' "$(cat "$tmp/mux-phone-commands")" >&2; exit 1
+fi
+test "$(cat "$tmp/mux-phone-control")" = "reload-plugins phone env-scoped=1
+rescan-profiles
+reload-plugins phone env-scoped=1
+rescan-profiles"
+phone_mux_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$mux_hermes/profiles/phone/.env")"
+test -n "$phone_mux_token"
+test "$phone_mux_token" != "$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$mux_hermes/.env")"
+test "$(sed -n 's/^COZYGATEWAY_SPOOL_PATH=//p' "$mux_hermes/profiles/phone/.env")" = "$mux_hermes/profiles/phone/plugin-data/cozygateway/attach-v1.sqlite"
+expect_contains "$mux_phone_output" 'the host Hermes gateway picked up profiles phone without a restart'
+
+# If the host does not answer its control verbs, the fallback is ONE host restart.
+mkdir -p "$mux_hermes/profiles/quiet"
+printf '%s\n' "$mux_profile_yaml" > "$mux_hermes/profiles/quiet/config.yaml"
+cp "$mux_hermes/.env" "$mux_hermes/profiles/quiet/.env"
+if ! mux_quiet_output="$(PYTHONPATH="$repo_root/scripts/test/fixtures/hermes-control" COZY_TEST_CONTROL_STATE="$tmp/mux-quiet-control-state" COZY_TEST_CONTROL_ANSWERS='{"reload-plugins": [null], "rescan-profiles": [null]}' HOME="$tmp/mux-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"hermes":{"configured":6,"online":6},"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$mux_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-quiet-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --no-qr --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mux" 2>&1)"; then
+  printf 'the control-verb fallback failed:\n%s\n' "$mux_quiet_output" >&2; exit 1
+fi
+test "$(grep -c ':gateway:' "$tmp/mux-quiet-commands")" = 1
+grep -q '^default:gateway:restart$' "$tmp/mux-quiet-commands"
+
+
+# A LIVE served profile whose keys are repaired: its adapter keeps the settings it was built with, so
+# the host restarts once, and is never stopped around the write.
+sed -i.bak '/^COZYGATEWAY_HOME_CHANNEL=/d' "$mux_hermes/profiles/alpha/.env" && rm -f "$mux_hermes/profiles/alpha/.env.bak"
+if ! mux_repair_output="$(HOME="$tmp/mux-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"hermes":{"configured":6,"online":6},"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$mux_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-repair-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --no-qr --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mux" 2>&1)"; then
+  printf 'repairing a live served profile failed:\n%s\n' "$mux_repair_output" >&2; exit 1
+fi
+test "$(grep -c ':gateway:' "$tmp/mux-repair-commands")" = 1
+grep -q '^default:gateway:restart$' "$tmp/mux-repair-commands"
+grep -q '^COZYGATEWAY_HOME_CHANNEL=thread$' "$mux_hermes/profiles/alpha/.env"
+
+# A stopped host is started once, even when the default profile itself is not selected.
+mux_stopped="$tmp/hermes-mux-stopped"
+make_mux_hermes "$mux_stopped" stopped
+if ! mux_stopped_output="$(HOME="$tmp/mux-stopped-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"hermes":{"configured":2,"online":2},"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$mux_stopped" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-stopped-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --no-qr --profiles alpha,beta --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mux-stopped" 2>&1)"; then
+  printf 'install on a stopped multiplexed Hermes host failed:\n%s\n' "$mux_stopped_output" >&2; exit 1
+fi
+test "$(grep -c ':gateway:' "$tmp/mux-stopped-commands")" = 1
+grep -q '^default:gateway:start$' "$tmp/mux-stopped-commands"
+
+# Uninstall never runs a per-profile verb for a served profile, even when older install state
+# recorded one from before the host was multiplexed.
+sed -i.bak 's/^service_alpha=.*/service_alpha=installed/' "$tmp/gateway-mux/local/install-state" && rm -f "$tmp/gateway-mux/local/install-state.bak"
+: > "$tmp/mux-uninstall-commands"
+HOME="$tmp/mux-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$mux_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-uninstall-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-mux" >/dev/null
+if grep -Eq '^(alpha|beta):gateway:' "$tmp/mux-uninstall-commands"; then
+  printf 'uninstall ran a per-profile verb for a served profile:\n%s\n' "$(cat "$tmp/mux-uninstall-commands")" >&2; exit 1
+fi
+test ! -e "$mux_hermes/profiles/alpha/plugins/cozygateway"
 
 echo 'hermes installer dry-run tests passed'

@@ -49,6 +49,14 @@
 #   inside a plugins/ dir it is about to touch; move backups OUTSIDE
 #   plugins/ (e.g. ~/Documents/backups/hermes-plugin-backups-<date>/).
 #
+# MULTIPLEXED HERMES HOST (scripts/hermes-host.sh)
+#   When one host gateway serves every profile (`gateway.multiplex_profiles:
+#   true` in the root config.yaml), a served profile has no launchd job of its
+#   own. Its new plugin code only loads when the host process restarts, so every
+#   served profile is synced and quiesced first, then the host restarts ONCE
+#   (`hermes -p default gateway restart`), and only when none of them is still
+#   busy. A profile with `gateway.standalone: true` keeps its own kickstart.
+#
 # Idempotent and safe to re-run. Use -n/--dry-run to see the plan with zero
 # side effects (no file writes, no launchctl, no network).
 set -euo pipefail
@@ -136,6 +144,10 @@ have python3 || die "python3 not found on PATH"
 # structurally read config.yaml; a grep would also match plugins.disabled.
 PYTHON="$HERMES_HOME/hermes-agent/venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
+HERMES_HOME_ROOT="$HERMES_HOME"
+HERMES_BIN="${HERMES_BIN:-hermes}"
+# shellcheck source=hermes-host.sh
+. "$SCRIPT_DIR/hermes-host.sh"
 
 discover_opted_in_profiles() {
   "$PYTHON" - "$HERMES_HOME" <<'PY'
@@ -315,6 +327,9 @@ except Exception:
 # --- main loop -----------------------------------------------------------
 declare -a SUMMARY
 overall_rc=0
+# Served by the multiplexed host: quiesced here, restarted together after the loop.
+HOST_READY=()
+HOST_BUSY=()
 
 for p in "${PROFILES[@]}"; do
   say ""
@@ -344,6 +359,18 @@ for p in "${PROFILES[@]}"; do
     quiesce_result="$(quiesce_profile "$p")" || quiesce_rc=$?
   fi
 
+  if served_by_host "$p"; then
+    if [ "$quiesce_rc" -ne 0 ]; then
+      HOST_BUSY+=("$p")
+      SUMMARY+=("$p: synced, quiesce=$quiesce_result, served by the host Hermes gateway (re-run with --force)")
+      overall_rc=1
+    else
+      HOST_READY+=("$p")
+      SUMMARY+=("$p: synced, quiesce=$quiesce_result, served by the host Hermes gateway")
+    fi
+    continue
+  fi
+
   if [ "$quiesce_rc" -ne 0 ]; then
     SUMMARY+=("$p: synced, quiesce=$quiesce_result, NOT kickstarted (re-run with --force)")
     overall_rc=1
@@ -363,6 +390,25 @@ for p in "${PROFILES[@]}"; do
     overall_rc=1
   fi
 done
+
+if [ "${#HOST_BUSY[@]}" -gt 0 ]; then
+  warn "host Hermes gateway NOT restarted: ${HOST_BUSY[*]} did not quiesce, and a restart would interrupt it (re-run with --force)"
+  SUMMARY+=("host Hermes gateway: NOT restarted (busy: ${HOST_BUSY[*]})")
+elif [ "${#HOST_READY[@]}" -gt 0 ]; then
+  say ""
+  say "Restarting the host Hermes gateway once for ${HOST_READY[*]}..."
+  if [ "$DRY_RUN" = 1 ]; then
+    run "$HERMES_BIN" -p "$HOST_PROFILE" gateway restart
+    SUMMARY+=("host Hermes gateway: restart planned for ${HOST_READY[*]}")
+  elif host_restart; then
+    say "  restarted the host Hermes gateway once; it serves ${HOST_READY[*]}"
+    SUMMARY+=("host Hermes gateway: restarted once for ${HOST_READY[*]}")
+  else
+    warn "host Hermes gateway restart failed"
+    SUMMARY+=("host Hermes gateway: RESTART FAILED")
+    overall_rc=1
+  fi
+fi
 
 say ""
 say "Verifying reconnect via $READY_URL ..."

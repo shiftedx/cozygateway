@@ -6,12 +6,13 @@ resolved before use, and every selected path is checked again before Hermes rece
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from .profile_env import profile_env
 
 
 class ChatContextError(Exception): pass
@@ -26,7 +27,7 @@ class Project:
 
 
 def _env_projects() -> List[Project]:
-    raw = os.getenv("HERMES_CHAT_PROJECTS_JSON") or os.getenv("COZYGATEWAY_CHAT_PROJECTS_JSON") or "[]"
+    raw = profile_env("HERMES_CHAT_PROJECTS_JSON") or profile_env("COZYGATEWAY_CHAT_PROJECTS_JSON") or "[]"
     try: entries = json.loads(raw)
     except json.JSONDecodeError as exc: raise ChatContextError("local chat project registry is invalid") from exc
     if not isinstance(entries, list): raise ChatContextError("local chat project registry must be an array")
@@ -40,14 +41,14 @@ def _env_projects() -> List[Project]:
         configured = Path(root).expanduser()
         if configured.is_symlink() or not resolved.is_dir(): raise ChatContextError("configured project root is not a real directory")
         result.append(Project(computer_id, project_id, resolved, str(item.get("name") or resolved.name)))
-    if not result and (default_root := os.getenv("HERMES_CHAT_WORKSPACE_ROOT")):
+    if not result and (default_root := profile_env("HERMES_CHAT_WORKSPACE_ROOT")):
         configured = Path(default_root).expanduser()
         resolved = configured.resolve(strict=True)
         if configured.is_symlink() or not resolved.is_dir(): raise ChatContextError("configured Hermes workspace root is not a real directory")
         result.append(Project(
-            os.getenv("HERMES_CHAT_COMPUTER_ID") or "hermes:default",
-            os.getenv("HERMES_CHAT_PROJECT_ID") or "default", resolved,
-            os.getenv("HERMES_CHAT_PROJECT_NAME") or resolved.name,
+            profile_env("HERMES_CHAT_COMPUTER_ID") or "hermes:default",
+            profile_env("HERMES_CHAT_PROJECT_ID") or "default", resolved,
+            profile_env("HERMES_CHAT_PROJECT_NAME") or resolved.name,
         ))
     return result
 
@@ -57,9 +58,9 @@ class HermesChatContext:
         self._profile = profile or "default"
 
     @property
-    def computer_id(self) -> str: return os.getenv("HERMES_CHAT_COMPUTER_ID") or f"hermes:{self._profile}"
+    def computer_id(self) -> str: return profile_env("HERMES_CHAT_COMPUTER_ID") or f"hermes:{self._profile}"
     @property
-    def computer_name(self) -> str: return os.getenv("HERMES_CHAT_COMPUTER_NAME") or "This Hermes computer"
+    def computer_name(self) -> str: return profile_env("HERMES_CHAT_COMPUTER_NAME") or "This Hermes computer"
     @property
     def computer_available(self) -> bool: return any(project.computer_id == self.computer_id for project in _env_projects())
 
@@ -88,7 +89,7 @@ class HermesChatContext:
         source = requested or self._git_text(project.root, "branch", "--show-current")
         if not source or self._git_run(project.root, "rev-parse", "--verify", f"refs/heads/{source}", check=False) is None:
             raise ChatContextError("selected source branch does not exist")
-        base = Path(os.getenv("COZYGATEWAY_CHAT_WORKTREES_DIR") or (Path.home() / ".hermes" / "cozygateway-worktrees")).expanduser()
+        base = Path(profile_env("COZYGATEWAY_CHAT_WORKTREES_DIR") or (Path.home() / ".hermes" / "cozygateway-worktrees")).expanduser()
         base.mkdir(mode=0o700, parents=True, exist_ok=True)
         base = base.resolve(strict=True)
         target = base / f"{session_id[:40]}-{uuid.uuid4().hex[:10]}"
