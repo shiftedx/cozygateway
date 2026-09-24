@@ -313,13 +313,18 @@ Capability 89 (`com.cozylabs.bots >= 89`): `profile.write` MAY carry `declareMcp
 `transport` is the literal `http`, and no stdio field exists). A peer receives either field only if
 it offered the separate capability `mcp_server_declarations` in `hello`, as `memory_ownership` sits
 beside `memory_management`; the gateway refuses such a write to any other peer before the frame is
-built. A harness offers it only when its operator turned client declarations on. A header value is
-one `${COZY_MCP_<NAME>}` placeholder the peer fills from the operator's environment when the server
-starts, never a value, and the peer never resolves a placeholder outside that prefix for a client
-declaration. The peer applies removals, then declarations, then `enabledMcpServers`; a declaration
-never changes enablement; a name the client did not declare is refused by name in `ignored`; every
-tool of a client-declared server is a possible effect. A `profile.read` row MAY carry `declaration`,
-read-only, exactly on a server a client declared. The Hermes attach plugin never offers the
+built, and builds every `profile.write` input from the published patch keys only. A harness offers
+the capability only when its operator turned client declarations on. The peer MUST: expand a header's
+`${COZY_MCP_<NAME>}` only when the declaration's URL origin is listed in the operator-set
+`COZY_MCP_<NAME>_ORIGINS`, refusing the declaration by name in `ignored` otherwise; put every
+client-declared URL through its URL policy on the resolved address (private, loopback, link-local
+and `.local` blocked unless the operator allowed private hosts for client declarations
+specifically), pinning that address or re-checking every redirect hop; treat every tool of a
+client-declared server as mutating regardless of an absent `mutating`; apply removals, then
+declarations, then `enabledMcpServers`; never change enablement from a declaration; and refuse by
+name in `ignored` any name the client did not declare. A `profile.read` row MAY carry
+`declaration`, read-only and closed, exactly on a server a client declared; it is validated whole
+with the frame, so growing it needs a new capability. The Hermes attach plugin never offers the
 capability.
 
 `status` is `ok`, `not_found`, `invalid_request`, or `unavailable`, and the four are kept apart

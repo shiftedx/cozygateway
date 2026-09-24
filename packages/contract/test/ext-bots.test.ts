@@ -642,7 +642,7 @@ describe("client-declared MCP servers (capability 89)", () => {
   const home = {
     name: "home",
     transport: "http" as const,
-    url: "http://homeassistant.local:8123/api/mcp",
+    url: "https://ha.example.com/api/mcp",
     headers: { Authorization: "Bearer ${COZY_MCP_HOME_TOKEN}" },
     description: "lights and climate",
     tools: ["GetLiveContext", "HassTurnOn"],
@@ -747,6 +747,66 @@ describe("client-declared MCP servers (capability 89)", () => {
       expect(problem({ declareMcpServers: [{ ...home, url }] }), url).toBeDefined();
     }
     expect(problem({ soul: "x" })).toBeUndefined();
+  });
+
+  // Defence in depth for SSRF. The literal forms are refusable without DNS; WHATWG normalization
+  // means decimal, hex and shorthand IPv4 and every IPv6 spelling arrive in one canonical form.
+  // A LAN name or private address is NOT refused here: whether a client declaration may reach one
+  // is the peer's URL policy behind a separate operator opt-in (row 89), checked on the resolved
+  // address, which a gateway without the peer's DNS view cannot decide.
+  it("refuses literal loopback, unspecified, link-local and metadata hosts, and a backslash", () => {
+    const refused = [
+      "http://127.0.0.1/mcp", "http://127.8.9.10:8080/mcp", "http://2130706433/mcp", "http://0x7f.1/mcp",
+      "http://localhost:3000/mcp", "http://LOCALHOST/mcp", "http://api.localhost/mcp", "http://localhost./mcp",
+      "http://0.0.0.0/mcp", "http://[::]/mcp", "http://[::1]/mcp", "http://[0:0:0:0:0:0:0:1]/mcp",
+      "http://169.254.169.254/latest/meta-data", "http://169.254.1.1/mcp", "http://[fe80::1]/mcp",
+      "http://[febf::1]/mcp", "http://[::ffff:127.0.0.1]/mcp", "http://[::ffff:7f00:1]/mcp",
+      "http://[::ffff:169.254.169.254]/mcp", "http://[fd00:ec2::254]/mcp",
+      "https://ha.example.com\\@127.0.0.1/mcp", "https:\\\\ha.example.com/mcp",
+    ];
+    for (const url of refused) {
+      expect(mcpServerDeclarationProblem({ declareMcpServers: [{ ...home, url }] }), url).toBeDefined();
+    }
+    for (const url of ["https://ha.example.com/api/mcp", "http://192.168.1.20:8123/api/mcp", "http://10.0.0.5/mcp", "http://ha.local/mcp", "http://[fec0::1]/mcp", "http://127.example.com/mcp"]) {
+      expect(mcpServerDeclarationProblem({ declareMcpServers: [{ ...home, url }] }), url).toBeUndefined();
+    }
+  });
+
+  it("refuses the framing, routing and cookie headers, in any case", () => {
+    for (const header of ["Host", "content-length", "Transfer-Encoding", "CONNECTION", "Keep-Alive", "Upgrade", "TE", "Trailer", "Cookie", "Proxy-Authorization", "proxy-connection"]) {
+      const declaration = { ...home, headers: { [header]: "${COZY_MCP_A}" } };
+      expect(check(BotMcpServerDeclarationSchema, declaration), header).toBe(true);
+      expect(mcpServerDeclarationProblem({ declareMcpServers: [declaration] }), header).toContain("may not set header");
+    }
+    expect(mcpServerDeclarationProblem({ declareMcpServers: [{ ...home, headers: { "X-Api-Key": "${COZY_MCP_A}" } }] })).toBeUndefined();
+  });
+
+  // The `_ORIGINS` variables are the operator's allowlists binding a secret to origins; a header
+  // that named one would be reading the policy rather than a credential.
+  it("refuses a header that names an _ORIGINS allowlist variable", () => {
+    const declaration = { ...home, headers: { Authorization: "Bearer ${COZY_MCP_HOME_TOKEN_ORIGINS}" } };
+    expect(mcpServerDeclarationProblem({ declareMcpServers: [declaration] })).toContain("_ORIGINS");
+  });
+
+  // Parsed from JSON, as the route parses them, so `__proto__` is a real own key and not a setter.
+  it("refuses prototype keys as server, tool, action and header names", () => {
+    const parse = (text: string) => JSON.parse(text) as Parameters<typeof mcpServerDeclarationProblem>[0];
+    const base = `"name":"home","transport":"http","url":"https://ha.example.com/api/mcp"`;
+    const bodies = [
+      `{"removeMcpServers":["constructor"]}`,
+      `{"removeMcpServers":["prototype"]}`,
+      `{"declareMcpServers":[{"name":"constructor","transport":"http","url":"https://ha.example.com/mcp"}]}`,
+      `{"declareMcpServers":[{${base},"tools":["__proto__"]}]}`,
+      `{"declareMcpServers":[{${base},"tools":["constructor"],"actions":{"constructor":["x"]}}]}`,
+      `{"declareMcpServers":[{${base},"tools":["a"],"actions":{"__proto__":["x"]}}]}`,
+      `{"declareMcpServers":[{${base},"tools":["a"],"actions":{"a":["prototype"]}}]}`,
+      `{"declareMcpServers":[{${base},"headers":{"constructor":"\${COZY_MCP_A}"}}]}`,
+    ];
+    for (const body of bodies) {
+      expect(mcpServerDeclarationProblem(parse(body)), body).toBeDefined();
+    }
+    // `__proto__` never even passes the server-name pattern, which starts with a letter or digit.
+    expect(check(BotProfilePatchSchema, parse(`{"removeMcpServers":["__proto__"]}`))).toBe(false);
   });
 
   // The read side marks the rows a client may edit: `declaration` is present exactly on a server a

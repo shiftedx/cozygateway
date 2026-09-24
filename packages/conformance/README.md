@@ -47,7 +47,13 @@ client-declared remote MCP servers (`contract/ext-bots-v1.md` row 89). The write
 capability-48 `bot_config` `profile.write` to a peer that negotiated `mcp_server_declarations`, so
 the portable check is the payload itself: one patch that declares, removes and enables, a profile
 read that projects the declaration back on its row, the stdio shapes, literal secrets and foreign
-variables the schema refuses, and the bodies `mcpServerDeclarationProblem` refuses after it.
+variables the schema refuses, and the bodies `mcpServerDeclarationProblem` refuses after it
+(credential slots in the URL, literal loopback, link-local and metadata hosts, framing and cookie
+headers, `_ORIGINS` variables, prototype keys). What the fixture cannot pin is the peer's half of
+the row: expanding a `COZY_MCP_<NAME>` header only for an origin listed in the operator's
+`COZY_MCP_<NAME>_ORIGINS`, its URL policy on the resolved address (private, loopback, link-local and
+`.local` blocked unless the operator allowed private hosts for client declarations; redirects pinned
+or re-checked), and treating every tool of a client-declared server as mutating.
 
 ## The reference Hermes/attach echo peer
 

@@ -11,10 +11,14 @@ release; everything older is marked pre-release so installers resolve one "lates
   `PATCH /bots/:name/profile` gains `declareMcpServers` and `removeMcpServers`, carried on the
   existing `bot_config` `profile.write`, and `BotMcpServer` gains a read-only `declaration`. Remote
   only: `transport` is `http` and no stdio field exists, so no request starts a host command. A
-  header names one `COZY_MCP_*` environment variable the harness fills at start, never a value. The
+  header names one `COZY_MCP_*` environment variable, never a value, and the peer expands it only
+  for a URL origin the operator listed in `COZY_MCP_<NAME>_ORIGINS`. The gateway refuses credential
+  slots in the URL and literal loopback, link-local and cloud metadata hosts; the peer's URL policy
+  owns resolved addresses and redirects, and every tool of a client-declared server asks. The
   gateway forwards either field only to a peer that offered the new attach-v1 capability
-  `mcp_server_declarations`; any other runtime bot and every Hermes bot answer
-  `409 unsupported_for_runtime` with nothing written.
+  `mcp_server_declarations`, and only the published patch keys ever reach a peer; any other runtime
+  bot and every Hermes bot answer `409 unsupported_for_runtime` with nothing written.
+
 ## Unreleased: leader assignments
 
 A bot can now lead a team. Set a bot's role to leader and name its reports from the profile

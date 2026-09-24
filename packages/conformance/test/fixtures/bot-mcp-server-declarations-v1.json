@@ -3,17 +3,28 @@
     "id": "com.cozylabs.bots",
     "minimumVersion": 89
   },
-  "note": "Capability 89, contract/ext-bots-v1.md row 89. A chat client declares a bot's REMOTE MCP servers on the capability-48 bot_config profile.write, forwarded only to a peer that negotiated the attach-v1 capability mcp_server_declarations. transport is the literal http: no stdio shape exists. A header value names one COZY_MCP_ environment variable the harness fills at start, so no secret crosses the wire. The url carries no userinfo, query, fragment or placeholder. A declared row is projected back read-only as BotMcpServer.declaration.",
+  "note": "Capability 89, contract/ext-bots-v1.md row 89. A chat client declares a bot's REMOTE MCP servers on the capability-48 bot_config profile.write, forwarded only to a peer that negotiated the attach-v1 capability mcp_server_declarations. transport is the literal http: no stdio shape exists. A header value names one COZY_MCP_ environment variable, never a value, and the peer expands it only for a url origin the operator listed in COZY_MCP_<NAME>_ORIGINS. The gateway refuses userinfo, query, fragment, backslash, placeholders and literal loopback, link-local and metadata hosts; the peer's url policy owns resolved addresses, .local and private hosts (a separate operator opt-in) and redirects. Every tool of a client-declared server asks. A declared row is projected back read-only as BotMcpServer.declaration, closed: growing it needs a new capability.",
   "patch": {
     "declareMcpServers": [
       {
         "name": "home",
         "transport": "http",
-        "url": "http://homeassistant.local:8123/api/mcp",
-        "headers": { "Authorization": "Bearer ${COZY_MCP_HOME_TOKEN}" },
+        "url": "https://ha.example.com/api/mcp",
+        "headers": {
+          "Authorization": "Bearer ${COZY_MCP_HOME_TOKEN}"
+        },
         "description": "lights, climate and scenes",
-        "tools": ["GetLiveContext", "HassTurnOn", "HassTurnOff"],
-        "actions": { "HassTurnOn": ["light", "switch"] }
+        "tools": [
+          "GetLiveContext",
+          "HassTurnOn",
+          "HassTurnOff"
+        ],
+        "actions": {
+          "HassTurnOn": [
+            "light",
+            "switch"
+          ]
+        }
       },
       {
         "name": "docs",
@@ -21,8 +32,12 @@
         "url": "https://mcp.example.com/mcp"
       }
     ],
-    "removeMcpServers": ["old-search"],
-    "enabledMcpServers": ["home"]
+    "removeMcpServers": [
+      "old-search"
+    ],
+    "enabledMcpServers": [
+      "home"
+    ]
   },
   "profileRead": {
     "name": "sage",
@@ -40,11 +55,22 @@
         "declaration": {
           "name": "home",
           "transport": "http",
-          "url": "http://homeassistant.local:8123/api/mcp",
-          "headers": { "Authorization": "Bearer ${COZY_MCP_HOME_TOKEN}" },
+          "url": "https://ha.example.com/api/mcp",
+          "headers": {
+            "Authorization": "Bearer ${COZY_MCP_HOME_TOKEN}"
+          },
           "description": "lights, climate and scenes",
-          "tools": ["GetLiveContext", "HassTurnOn", "HassTurnOff"],
-          "actions": { "HassTurnOn": ["light", "switch"] }
+          "tools": [
+            "GetLiveContext",
+            "HassTurnOn",
+            "HassTurnOff"
+          ],
+          "actions": {
+            "HassTurnOn": [
+              "light",
+              "switch"
+            ]
+          }
         }
       },
       {
@@ -54,24 +80,188 @@
         "transport": "stdio"
       }
     ],
-    "model": { "provider": "anthropic", "default": "claude-sonnet" },
+    "model": {
+      "provider": "anthropic",
+      "default": "claude-sonnet"
+    },
     "runtimeInert": []
   },
   "schemaRefused": [
-    { "name": "comfy", "transport": "stdio", "command": "npx", "args": ["-y", "comfyui-mcp"] },
-    { "name": "home", "transport": "http", "url": "https://ha.example.com/api/mcp", "command": "sh" },
-    { "name": "home", "transport": "http", "url": "https://ha.example.com/api/mcp", "env": { "A": "${COZY_MCP_A}" } },
-    { "name": "home", "transport": "http", "url": "https://ha.example.com/api/mcp", "headers": { "Authorization": "Bearer abc123" } },
-    { "name": "home", "transport": "http", "url": "https://ha.example.com/api/mcp", "headers": { "Authorization": "${OPENAI_API_KEY}" } },
-    { "name": "home", "transport": "http", "url": "https://ha.example.com/api/mcp", "mutating": [] },
-    { "name": "home", "transport": "http", "url": "https://ha.example.com/api/mcp", "repair": "auto_refresh" },
-    { "name": "Home", "transport": "http", "url": "https://ha.example.com/api/mcp" }
+    {
+      "name": "comfy",
+      "transport": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "comfyui-mcp"
+      ]
+    },
+    {
+      "name": "home",
+      "transport": "http",
+      "url": "https://ha.example.com/api/mcp",
+      "command": "sh"
+    },
+    {
+      "name": "home",
+      "transport": "http",
+      "url": "https://ha.example.com/api/mcp",
+      "env": {
+        "A": "${COZY_MCP_A}"
+      }
+    },
+    {
+      "name": "home",
+      "transport": "http",
+      "url": "https://ha.example.com/api/mcp",
+      "headers": {
+        "Authorization": "Bearer abc123"
+      }
+    },
+    {
+      "name": "home",
+      "transport": "http",
+      "url": "https://ha.example.com/api/mcp",
+      "headers": {
+        "Authorization": "${OPENAI_API_KEY}"
+      }
+    },
+    {
+      "name": "home",
+      "transport": "http",
+      "url": "https://ha.example.com/api/mcp",
+      "mutating": []
+    },
+    {
+      "name": "home",
+      "transport": "http",
+      "url": "https://ha.example.com/api/mcp",
+      "repair": "auto_refresh"
+    },
+    {
+      "name": "Home",
+      "transport": "http",
+      "url": "https://ha.example.com/api/mcp"
+    }
   ],
   "checkRefused": [
-    { "declareMcpServers": [{ "name": "home", "transport": "http", "url": "https://me:pw@ha.example.com/api/mcp" }] },
-    { "declareMcpServers": [{ "name": "home", "transport": "http", "url": "https://ha.example.com/api/mcp?key=abc" }] },
-    { "declareMcpServers": [{ "name": "home", "transport": "http", "url": "https://${COZY_MCP_HOST}/api/mcp" }] },
-    { "declareMcpServers": [{ "name": "home", "transport": "http", "url": "https://ha.example.com/api/mcp" }], "removeMcpServers": ["home"] },
-    { "declareMcpServers": [{ "name": "home", "transport": "http", "url": "https://ha.example.com/api/mcp", "actions": { "HassTurnOn": ["light"] } }] }
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "https://me:pw@ha.example.com/api/mcp"
+        }
+      ]
+    },
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "https://ha.example.com/api/mcp?key=abc"
+        }
+      ]
+    },
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "https://${COZY_MCP_HOST}/api/mcp"
+        }
+      ]
+    },
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "https://ha.example.com/api/mcp"
+        }
+      ],
+      "removeMcpServers": [
+        "home"
+      ]
+    },
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "https://ha.example.com/api/mcp",
+          "actions": {
+            "HassTurnOn": [
+              "light"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "http://127.0.0.1:8123/api/mcp"
+        }
+      ]
+    },
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "http://169.254.169.254/latest/meta-data"
+        }
+      ]
+    },
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "http://[::ffff:7f00:1]/mcp"
+        }
+      ]
+    },
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "http://localhost:8123/api/mcp"
+        }
+      ]
+    },
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "https://ha.example.com/api/mcp",
+          "headers": {
+            "Host": "${COZY_MCP_A}"
+          }
+        }
+      ]
+    },
+    {
+      "declareMcpServers": [
+        {
+          "name": "home",
+          "transport": "http",
+          "url": "https://ha.example.com/api/mcp",
+          "headers": {
+            "Authorization": "Bearer ${COZY_MCP_HOME_TOKEN_ORIGINS}"
+          }
+        }
+      ]
+    },
+    {
+      "removeMcpServers": [
+        "constructor"
+      ]
+    }
   ]
 }

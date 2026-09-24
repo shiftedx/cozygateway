@@ -1446,23 +1446,40 @@ const McpToolNameSchema = Type.String({ pattern: "^[A-Za-z0-9_./:-]{1,128}$" });
  *  field: no body a client can send reaches host command execution. A stdio server stays the
  *  operator's to declare in the bot's own environment, as capability 63's policy does.
  *
- *  NO SECRET CROSSES THE WIRE. A header value is exactly one `${COZY_MCP_<NAME>}` placeholder,
- *  optionally after one auth scheme word (`Bearer`, `Basic`, `Token`); the harness fills it from
- *  the operator's environment when the server starts and at no other time, so the phone, this
- *  gateway and every projection only ever hold the variable's NAME. The `COZY_MCP_` prefix is the
- *  operator's opt-in: a variable not exported under it (a model provider's key, say) cannot be
- *  named at all, so a declaration cannot point one of those at a URL of its choosing. The URL
- *  itself carries no placeholder, no userinfo, no query and no fragment (`mcpServerDeclarationProblem`),
- *  which keeps a credential from riding in the address.
+ *  NO SECRET VALUE CROSSES THE WIRE, AND A SECRET GOES ONLY WHERE THE OPERATOR SAID. A header value
+ *  is exactly one `${COZY_MCP_<NAME>}` placeholder, optionally after one auth scheme word
+ *  (`Bearer`, `Basic`, `Token`), so the phone, this gateway and every projection hold only the
+ *  variable's NAME. The `COZY_MCP_` prefix is the operator's opt-in: no other variable can be
+ *  named. Naming is not sending: the peer expands `${COZY_MCP_<NAME>}` ONLY when the declaration's
+ *  URL origin (scheme, host, port) is listed in the operator-set `COZY_MCP_<NAME>_ORIGINS` (a comma
+ *  list of origins), and otherwise refuses the whole declaration by name in `ignored`, before
+ *  anything is dialled. So a device that can write this patch still cannot aim an operator secret
+ *  at a URL of its choosing: the origin allowlist is set on the harness, never through this lane,
+ *  and a header may not name an `_ORIGINS` variable itself.
  *
- *  Harness-owned settings are absent for the same reason: `mutating` (a client listing none would
- *  lift every approval), capability 63's `repair`, `groups` and the budgets are the operator's. The
- *  harness treats EVERY tool of a client-declared server as a possible effect, so each call asks
- *  under the bot's guardrails, and applies its own `approve_once` repair default.
+ *  THE URL. `mcpServerDeclarationProblem` refuses userinfo, query, fragment, backslash and
+ *  placeholders (the obvious credential slots; a path can still hold anything, so a client must not
+ *  put a secret there) and, as defence in depth, a literal loopback, unspecified, link-local or cloud
+ *  metadata host and `localhost`. The peer is the real SSRF boundary: it puts every client-declared
+ *  URL through its URL policy with private, loopback and link-local addresses blocked, refuses
+ *  `.local` hosts, and allows private hosts only under an operator setting for CLIENT declarations
+ *  that is separate from the one its own servers use; it checks the RESOLVED address and either
+ *  pins it for the connection or re-checks every redirect hop (or refuses redirects).
+ *
+ *  Harness-owned settings are absent for the same reason: `mutating`, capability 63's `repair`,
+ *  `groups` and the budgets are the operator's. The harness MUST treat EVERY tool of a
+ *  client-declared server as mutating, a possible effect that asks under the bot's guardrails,
+ *  whatever an absent `mutating` means for an operator's server (CozyAgents reads an absent list as
+ *  "every tool investigates", which is the opposite and must not apply here), and applies its
+ *  `approve_once` repair default.
  *
  *  `tools` is the allowlist of tools the harness exposes (absent: every tool the server publishes,
  *  each still asking); `actions` narrows a tool whose calls take an `action` argument, and needs
- *  `tools` so every key it names is one the allowlist admits. */
+ *  `tools` so every key it names is one the allowlist admits.
+ *
+ *  CLOSED ON READ TOO. The projected `BotMcpServer.declaration` is validated whole with the rest of
+ *  the `profile.read`, the lane's convention, so a field added here later would make every older
+ *  gateway refuse the frame: growing this shape needs a new capability, not an optional field. */
 export const BotMcpServerDeclarationSchema = Type.Object({
   name: McpServerNameSchema,
   transport: Type.Literal("http"),
@@ -1513,7 +1530,9 @@ export const BotMcpServerSchema = Type.Object({
   /** Capability 89. READ-ONLY: present exactly on a server a chat client declared through
    *  `declareMcpServers`, and it is that declaration back, which by construction holds no secret.
    *  Its presence is what tells an edit screen the row is the client's to edit or remove; a row
-   *  without it (operator-declared, built-in, a catalog template) is not. */
+   *  without it (operator-declared, built-in, a catalog template) is not. A peer emits it only
+   *  after the gateway advertised `>= 89`, and only in this closed shape: an invalid one fails the
+   *  whole read, as every `bot_config` projection does. */
   declaration: Type.Optional(BotMcpServerDeclarationSchema),
 });
 export type BotMcpServer = Static<typeof BotMcpServerSchema>;
@@ -1869,19 +1888,77 @@ export const BotProfilePatchSchema = Type.Object({
 });
 export type BotProfilePatch = Static<typeof BotProfilePatchSchema>;
 
+/** Capability 89. Names a peer may keep in a plain object map, where these three reach the
+ *  prototype rather than an own entry. Refused as server, tool, action and header names. */
+const PROTOTYPE_KEYS: ReadonlySet<string> = new Set(["__proto__", "constructor", "prototype"]);
+
+/** Capability 89. Headers a declaration may not set: the transport's own framing and routing
+ *  (a smuggled `Host` or `Transfer-Encoding` re-aims or re-frames the request), and ambient
+ *  credentials (`Cookie`). Compared case-insensitively; every `Proxy-*` header is included. */
+const DENIED_HEADERS: ReadonlySet<string> = new Set([
+  "host", "content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer", "cookie",
+]);
+
+/** Capability 89. Why a URL's host is one the gateway refuses outright, or `undefined`. Defence in
+ *  depth only: the literal forms are refusable here without a DNS lookup, and everything a name
+ *  resolves to (a private address, a `.local` host, a redirect) is the peer's URL policy to check
+ *  at connect time, as row 89 requires. `hostname` is the WHATWG-normalized one, so an IPv4 in
+ *  decimal, hex or shorthand has already been rewritten to dotted quads, and IPv6 is compressed. */
+function refusedHost(hostname: string): string | undefined {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (host === "localhost" || host.endsWith(".localhost")) return "a loopback host";
+  const v4 = (text: string): string | undefined => {
+    const match = /^(\d+)\.(\d+)\.\d+\.\d+$/.exec(text);
+    if (match === null) return undefined;
+    const [a, b] = [Number(match[1]), Number(match[2])];
+    if (a === 127) return "a loopback address";
+    if (a === 0) return "an unspecified address";
+    if (a === 169 && b === 254) return "a link-local or cloud metadata address";
+    return undefined;
+  };
+  const ipv4 = v4(host);
+  if (ipv4 !== undefined) return ipv4;
+  if (!host.includes(":")) return undefined;
+  if (host === "::1") return "a loopback address";
+  if (host === "::") return "an unspecified address";
+  if (/^fe[89ab][0-9a-f]:/.test(host)) return "a link-local address";
+  if (host === "fd00:ec2::254") return "a cloud metadata address";
+  // IPv4-mapped (`::ffff:127.0.0.1`, which WHATWG prints as `::ffff:7f00:1`) is the IPv4 address.
+  const mapped = /^::ffff:(?:([0-9a-f]{1,4}):([0-9a-f]{1,4})|(\d+\.\d+\.\d+\.\d+))$/.exec(host);
+  if (mapped !== null) {
+    const dotted = mapped[3] ?? (() => {
+      const high = parseInt(mapped[1]!, 16);
+      const low = parseInt(mapped[2]!, 16);
+      return `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
+    })();
+    return v4(dotted);
+  }
+  return undefined;
+}
+
 /** Capability 89. What `BotProfilePatchSchema` cannot say about `declareMcpServers` and
  *  `removeMcpServers`, as one sentence, or `undefined` when the patch is fine. The gateway answers
  *  `400 invalid_request` with it after the schema passes; a client may run the same check first.
  *
  *  A name declared twice, or both declared and removed, is ambiguous about which one wins, and the
  *  answer must not depend on a peer's iteration order. A header named twice under different cases
- *  is the same header on the wire. `actions` needs `tools`, and names only tools in it. The URL
- *  must parse as http or https and carry no userinfo, query, fragment or `${...}` placeholder: a
- *  credential belongs in a `COZY_MCP_` header, never in an address a projection shows. */
+ *  is the same header on the wire, and the framing, routing and cookie headers are refused. A
+ *  prototype key is refused as any name. `actions` needs `tools`, and names only tools in it. A
+ *  header may not name a `COZY_MCP_*_ORIGINS` variable: those are the operator's allowlists.
+ *
+ *  The URL must parse as http or https and carry no userinfo, query, fragment, backslash or `${...}`
+ *  placeholder, which keeps the obvious credential slots out of an address every projection shows
+ *  (a path segment can still hold anything, so a client must not put a secret there). Its host may
+ *  not be a literal loopback, unspecified, link-local or cloud metadata address, nor `localhost`:
+ *  defence in depth only, since the peer's URL policy is what checks a NAME's resolved address. */
 export function mcpServerDeclarationProblem(patch: BotProfilePatch): string | undefined {
+  for (const name of patch.removeMcpServers ?? []) {
+    if (PROTOTYPE_KEYS.has(name)) return `removeMcpServers may not name ${name}`;
+  }
   const declared = patch.declareMcpServers ?? [];
   const names = new Set<string>();
   for (const server of declared) {
+    if (PROTOTYPE_KEYS.has(server.name)) return `declareMcpServers may not name ${server.name}`;
     if (names.has(server.name)) return `declareMcpServers names ${server.name} more than once`;
     names.add(server.name);
     if (patch.removeMcpServers?.includes(server.name) === true) {
@@ -1889,6 +1966,7 @@ export function mcpServerDeclarationProblem(patch: BotProfilePatch): string | un
     }
     const where = `declareMcpServers ${server.name}`;
     if (server.url.includes("${")) return `${where} url must not carry a placeholder; put credentials in headers`;
+    if (server.url.includes("\\")) return `${where} url must not carry a backslash`;
     let url: URL;
     try {
       url = new URL(server.url);
@@ -1900,16 +1978,28 @@ export function mcpServerDeclarationProblem(patch: BotProfilePatch): string | un
     if (url.search !== "" || url.hash !== "" || server.url.includes("?") || server.url.includes("#")) {
       return `${where} url must not carry a query or fragment; put credentials in headers`;
     }
+    const host = refusedHost(url.hostname);
+    if (host !== undefined) return `${where} url must not point at ${host}`;
     const headers = new Set<string>();
-    for (const header of Object.keys(server.headers ?? {})) {
+    for (const [header, value] of Object.entries(server.headers ?? {})) {
       const lower = header.toLowerCase();
+      if (PROTOTYPE_KEYS.has(lower)) return `${where} may not name header ${header}`;
+      if (DENIED_HEADERS.has(lower) || lower.startsWith("proxy-")) return `${where} may not set header ${header}`;
       if (headers.has(lower)) return `${where} names header ${header} more than once`;
       headers.add(lower);
+      if (/_ORIGINS\}$/.test(value)) return `${where} header ${header} may not name an _ORIGINS allowlist`;
+    }
+    for (const tool of server.tools ?? []) {
+      if (PROTOTYPE_KEYS.has(tool)) return `${where} tools may not name ${tool}`;
     }
     if (server.actions !== undefined) {
       if (server.tools === undefined) return `${where} actions needs tools`;
-      for (const tool of Object.keys(server.actions)) {
+      for (const [tool, actions] of Object.entries(server.actions)) {
+        if (PROTOTYPE_KEYS.has(tool)) return `${where} actions may not name ${tool}`;
         if (!server.tools.includes(tool)) return `${where} actions names ${tool}, which is not in tools`;
+        for (const action of actions) {
+          if (PROTOTYPE_KEYS.has(action)) return `${where} actions for ${tool} may not name ${action}`;
+        }
       }
     }
   }
@@ -3759,28 +3849,30 @@ export type BotScreenRequestCancelFrame = Static<typeof BotScreenRequestCancelFr
  *
  * REMOTE ONLY. `transport` is the literal `http` and the declaration is closed, so no body reaches
  * host command execution; a stdio server stays the operator's to declare in the bot's environment.
- * A header value is one `${COZY_MCP_<NAME>}` variable name the harness fills from the operator's
- * environment at start, so no secret crosses the wire and only variables the operator exported
- * under that prefix are nameable. The URL carries no userinfo, query, fragment or placeholder.
- * Cross-field rules live in `mcpServerDeclarationProblem`; the route answers `400` on either.
+ * A header value is one `${COZY_MCP_<NAME>}` variable name, never a value, and the peer expands it
+ * only for a URL origin the operator listed in `COZY_MCP_<NAME>_ORIGINS`, refusing the declaration
+ * by name otherwise. The gateway refuses userinfo, query, fragment, backslash, placeholders and a
+ * literal loopback, link-local or metadata host (`mcpServerDeclarationProblem`, `400`); the peer's
+ * URL policy owns the resolved address, `.local`, private hosts (a separate operator opt-in for
+ * client declarations) and redirects. Every tool of a client-declared server asks.
  *
  * GATED THREE WAYS. The route is the write-scoped paired device's (capability 72 refuses a
  * read-scoped one `403`). The gateway forwards either field only to a peer that offered the
  * attach-v1 capability `mcp_server_declarations`, which a harness offers only when its operator
  * turned client declarations on; any other runtime peer answers `409 unsupported_for_runtime` and
  * nothing is sent. A Hermes bot answers the same `409` and nothing is written: its
- * `profiles.configure` would take a stdio definition, which this row never grants.
+ * `profiles.configure` would take a stdio definition, which this row never grants. The lane input
+ * is rebuilt from the published patch keys, so an unknown body key never reaches a peer.
  *
  * The peer owns the semantics: removals, then declarations, then `enabledMcpServers`, so one save
  * can declare and switch on. A declaration never changes enablement (a new server lands OFF), a
  * name the client did not declare (operator, built-in, template) is refused by name in `ignored`,
- * every tool of a client-declared server is a possible effect that asks, and its repair policy is
- * the harness default `approve_once`. `applied` answers `mcp_servers_declared` and
- * `mcp_servers_removed`.
+ * and its repair policy is the harness default `approve_once`. `applied` answers
+ * `mcp_servers_declared` and `mcp_servers_removed`.
  *
  * Additive: a client below 89 sends neither field and reads no `declaration`, and a peer receives
  * either field only after negotiating `mcp_server_declarations`. A client offers the editor only on
- * `>= 89`. */
+ * `>= 89`. The declaration is closed on read, so growing it needs a new capability. */
 export const BOTS_CAPABILITY_VERSION = 89;
 
 /** Capability 82. At least one field. `title` is the friendly name; the empty string clears it. */
