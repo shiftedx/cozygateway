@@ -1170,7 +1170,12 @@ export class HermesBridge implements BotControlSurface {
             routedProfile: null,
             gatewayState: "idle",
             now: at,
-            teamRole: (name) => this.#storage.botTeam(name)?.role,
+            // Team rows are keyed by the PUBLIC name (what `PATCH /bots/:name/profile` was
+            // called with), but `profile.name` here is the bare Hermes profile id. On a
+            // namespaced endpoint those differ, and the underlying team table is shared gateway-
+            // wide, so a bare lookup here would both miss this endpoint's own leader and risk
+            // picking up an unrelated bot's row that happens to share the bare name.
+            teamRole: (name) => this.#storage.botTeam(this.#publicName(name))?.role,
           });
           this.#storage.replaceBotRoster(
             bots.map((summary) => ({ name: summary.name, summary })),
