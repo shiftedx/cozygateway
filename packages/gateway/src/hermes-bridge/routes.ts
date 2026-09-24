@@ -1630,6 +1630,12 @@ export function registerBotRoutes(
     return profileOp(c, name, { kind: "import", archive }, 201);
   });
 
+  app.get("/bots/:name/model-pin", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    return profileOp(c, resolved.name, { kind: "modelPin" });
+  });
+
   app.put("/bots/:name/model-pin", requireDevice, async (c) => {
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;

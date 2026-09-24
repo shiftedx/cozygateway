@@ -306,6 +306,18 @@ export async function importProfileArchive(client: HermesClient, name: string, b
 
 // MARK: Model pin
 
+/** The profile's own model pin, as the Bots editor reads it (`profiles.describe` -> `model`). An
+ *  empty provider or model is no pin: the launch profile's model applies. */
+export async function readProfileModelPin(client: HermesClient, name: string): Promise<BotModelPinResponse> {
+  const described = record(await client.request("profiles.describe", { name }));
+  const model = record(described?.["model"]);
+  const provider = text(model?.["provider"]);
+  const id = text(model?.["default"]);
+  return provider.length > 0 && id.length > 0
+    ? { pinned: true, model: { provider, model: id } }
+    : { pinned: false };
+}
+
 export async function pinProfileModel(
   client: HermesClient, name: string, request: BotModelPinRequest,
 ): Promise<BotModelPinResponse> {

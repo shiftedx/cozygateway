@@ -113,6 +113,7 @@ import {
   importProfileArchive,
   installHubSkill,
   pinProfileModel,
+  readProfileModelPin,
   renameProfile,
   saveProviderKey,
   searchSkillsHub,
@@ -255,6 +256,7 @@ export type BotProfileOp =
   | { kind: "duplicate"; newName?: string }
   | { kind: "export" }
   | { kind: "import"; archive: Uint8Array }
+  | { kind: "modelPin" }
   | { kind: "pinModel"; request: BotModelPinRequest }
   | { kind: "unpinModel" }
   | { kind: "saveProviderKey"; provider: string; apiKey: string }
@@ -1174,6 +1176,8 @@ export class HermesBridge implements BotControlSurface {
       }
       case "export":
         return exportProfileArchive(client, name);
+      case "modelPin":
+        return readProfileModelPin(client, name);
       case "pinModel":
         return this.#chain(name, () => pinProfileModel(client, name, op.request));
       case "unpinModel":

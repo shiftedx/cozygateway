@@ -353,6 +353,14 @@ describe("capability 82: model pin, provider keys, skills hub", () => {
     ]);
   });
 
+  it("reads the pin from profiles.describe, where an empty model is no pin", async () => {
+    let described = { provider: "nous", default: "hermes-4" };
+    const h = await setup({ methods: { "profiles.describe": () => ({ model: described, skills: [], toolsets: [] }) } });
+    expect(await (await h.authed("/bots/scout/model-pin")).json()).toEqual({ pinned: true, model: { provider: "nous", model: "hermes-4" } });
+    described = { provider: "", default: "" };
+    expect(await (await h.authed("/bots/scout/model-pin")).json()).toEqual({ pinned: false });
+  });
+
   it("unpins by unsetting the profile's model key", async () => {
     const h = await setup({ methods: { "cli.exec": () => ({ blocked: false, code: 0, output: "ok" }) } });
     const res = await h.authed("/bots/scout/model-pin", { method: "DELETE" });

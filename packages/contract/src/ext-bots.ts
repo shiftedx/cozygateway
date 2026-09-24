@@ -3082,7 +3082,7 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * the Hermes profile itself. `POST /bots/:name/describe-auto` asks Hermes to write a description.
  * `POST /bots/:name/duplicate` clones the whole profile plus its look and avatar. `POST
  * /bots/:name/export` answers the profile's `.tar.gz` (credentials excluded by Hermes) and `POST
- * /bots/import?name=` creates a bot from one. `PUT`/`DELETE /bots/:name/model-pin` pins the
+ * /bots/import?name=` creates a bot from one. `GET`/`PUT`/`DELETE /bots/:name/model-pin` reads, the
  * profile's model with the expensive-model handshake, or unpins it so the launch profile's model
  * applies. `PUT`/`DELETE /bots/:name/provider-keys/:provider` save or disconnect a provider key.
  * `GET /bots/:name/skills-hub?q=` and `POST /bots/:name/skills-hub/install` search the Skills Hub
