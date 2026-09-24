@@ -3480,16 +3480,23 @@ stop_owned_windows_dashboard_for_uninstall() {
   if [ ! -f "$DASHBOARD_OWNER_PS1" ]; then
     local listener_code
     set +e
+    # A failed inspection (NetTCPIP unavailable, CIM error) must not read as "no listener":
+    # exit 43 unless the listener table was actually read, as the owner helper does.
     MSYS_NO_PATHCONV=1 COZYGATEWAY_EXPECTED_PORT="$DASHBOARD_PORT" COZYGATEWAY_CHECK_TARGET_PORT=1 powershell.exe -NoProfile -NonInteractive -Command '
-      $listener = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-        Where-Object { $_.LocalAddress -eq "127.0.0.1" -and $_.LocalPort -eq [int]$env:COZYGATEWAY_EXPECTED_PORT } |
-        Select-Object -First 1
+      try {
+        $listener = Get-NetTCPConnection -State Listen -ErrorAction Stop |
+          Where-Object { $_.LocalAddress -eq "127.0.0.1" -and $_.LocalPort -eq [int]$env:COZYGATEWAY_EXPECTED_PORT } |
+          Select-Object -First 1
+      } catch { exit 43 }
       if ($null -eq $listener) { exit 0 }; exit 42
     ' >/dev/null 2>&1
     listener_code=$?
     set -e
-    [ "$listener_code" -eq 0 ] && { say "INFO  Dashboard owner helper is missing, but no listener is present on port $DASHBOARD_PORT"; return; }
-    die "Dashboard owner helper is missing; refusing to remove recovery state while port $DASHBOARD_PORT may still be owned"
+    case "$listener_code" in
+      0) say "INFO  Dashboard owner helper is missing, but no listener is present on port $DASHBOARD_PORT"; return ;;
+      42) die "Dashboard owner helper is missing; refusing to remove recovery state while port $DASHBOARD_PORT may still be owned" ;;
+      *) die "Dashboard owner helper is missing and listeners on port $DASHBOARD_PORT could not be inspected; refusing to remove recovery state" ;;
+    esac
   fi
   local root_native hermes_native launcher_native owner_helper_native elevation_helper_native code
   root_native="$(to_windows_path "$HERMES_ROOT")"
