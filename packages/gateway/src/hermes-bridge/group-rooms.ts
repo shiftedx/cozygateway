@@ -1140,6 +1140,10 @@ export class GroupRooms {
       if (this.#now() >= deadline + (row === undefined ? 0 : this.#storage.tasks.suspended(row.agentId, turnId, deadline - timeoutMs, this.#now()))) {
         const detail = `no reply within ${Math.round(timeoutMs / 1000)}s`;
         this.#storage.timeoutBotGroupTurn(key, turnId, detail, this.#now());
+        // #325: this loop owns the timeout, so it consumes the row now; a late terminal then finds it
+        // already claimed and cannot re-drive the sealed round. The peer is told to stop, as `stop()` does.
+        const timedOut = this.#storage.consumeBotGroupTurn(key, turnId, this.#now());
+        if (timedOut !== undefined) this.#nativeTurns?.sendInterrupt?.(timedOut.agentId, { threadId: timedOut.threadId, turnId });
         // The member stopped mid-sentence. Nothing is coming to close its bubble, so the gateway
         // closes it: this is the settlement no attach event will ever announce.
         this.#endDraft(turnId);

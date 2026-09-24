@@ -253,6 +253,51 @@ describe("native group turns", () => {
     storage.close();
   });
 
+  it("interrupts a timed-out member turn and ignores its late terminal (#325)", async () => {
+    const storage = openStorage(":memory:");
+    const states: BotGroupStateFrame[] = [];
+    const sent: Array<{ agentId: string; threadId: string; turnId: string }> = [];
+    const interrupts: Array<{ agentId: string; threadId: string; turnId: string }> = [];
+    const rooms = new GroupRooms({
+      storage, now: () => Date.now(),
+      broadcast: (frame) => { if (frame.type === "bot_group_state") states.push(frame); },
+      memberInfo: (name) => ({ name, handle: name, displayName: name }), missingMembers: async () => [],
+      nativeTurns: {
+        canQueue: () => true,
+        // The member never answers in time.
+        sendNativeTurn: (agentId, turn) => { sent.push({ agentId, threadId: turn.threadId, turnId: turn.turnId }); return true; },
+        sendInterrupt: (agentId, input) => { interrupts.push({ agentId, ...input }); return true; },
+      },
+      pollMs: 1, turnTimeoutMs: 20, chainDelayMs: 0,
+    });
+    await rooms.create("Launch", ["scout", "luna"]);
+    rooms.send("Launch", "@scout please answer");
+    await rooms.settled("Launch");
+
+    expect(sent).toHaveLength(1);
+    const turn = sent[0]!;
+    // The peer is told to stop, the same way `stop()` tells it.
+    expect(interrupts).toEqual([turn]);
+    const row = storage.botGroupTurn("launch", turn.turnId)!;
+    expect(row.state).toBe("timeout");
+    expect(row.consumedAt).toBeDefined();
+
+    const stateCount = states.length;
+    expect(rooms.handleAttachEvent(turn.agentId, {
+      kind: "event", sequence: 1, eventId: "late", event: {
+        kind: "commit", threadId: turn.threadId, turnId: turn.turnId, messageId: "late-message",
+        blocks: [{ type: "paragraph", text: "too late" }],
+      },
+    })).toBe(true);
+    // The sealed round is not re-driven and the late text never reaches the room.
+    expect(rooms.running("Launch")).toBe(false);
+    await rooms.settled("Launch");
+    expect(states.length).toBe(stateCount);
+    expect(storage.botGroupLog("launch").map((entry) => entry.text)).toEqual(["@scout please answer"]);
+    await rooms.close();
+    storage.close();
+  });
+
   it("shows an attach member failure as a note, fabricates no reply, and still settles", async () => {
     const storage = openStorage(":memory:");
     const states: BotGroupStateFrame[] = [];
