@@ -238,6 +238,11 @@ export interface HermesClient {
     signal?: AbortSignal;
     timeoutMs?: number;
   }): Promise<Response>;
+  /** Capability 86 (voice). The authenticated address of a SIBLING dashboard WebSocket on this same
+   *  Hermes (for example `/api/audio/speak-stream`), with the credential of the moment on it: the
+   *  loopback token, or a freshly minted single-use ticket. Optional so hand-rolled test clients
+   *  keep compiling; the real client always implements it. The URL carries a secret: never log it. */
+  sidecarSocketUrl?(path: string, query?: Readonly<Record<string, string>>): Promise<string>;
   /** Subscribes to every event frame, including the optional `sessions.changed` /
    *  `cron.changed` broadcasts. Handlers cannot be removed. */
   onEvent(handler: (event: HermesEvent) => void): void;
@@ -757,6 +762,17 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
     return body as T;
   }
 
+  async function sidecarSocketUrl(path: string, query: Readonly<Record<string, string>> = {}): Promise<string> {
+    const credential = await resolveCredential();
+    const url = new URL(opts.url);
+    url.pathname = path;
+    url.search = "";
+    url.hash = "";
+    for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
+    url.searchParams.set(credential.param, credential.value);
+    return url.toString();
+  }
+
   function dashboardResponse(
     path: string,
     init: {
@@ -853,6 +869,7 @@ export function createHermesClient(opts: HermesClientOptions): HermesClient {
 
     dashboardJson,
     dashboardResponse,
+    sidecarSocketUrl,
 
     onEvent(handler: (event: HermesEvent) => void): void {
       eventHandlers.push(handler);

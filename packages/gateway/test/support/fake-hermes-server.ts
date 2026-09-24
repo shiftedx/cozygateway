@@ -47,6 +47,9 @@ export interface FakeHermesBehavior {
   /** Gated mode: ticket lifetime in ms. 0 means every minted ticket is already expired, which is
    *  how the expiry path is exercised. Default 30000, matching upstream TTL_SECONDS. */
   ticketTtlMs?: number;
+  /** Sibling dashboard WebSockets (for example `/api/audio/speak-stream`), keyed by path. The
+   *  socket is handed over as accepted; it is not counted as a gateway connection. */
+  sidecars?: Record<string, (ws: WebSocket, query: URLSearchParams) => void>;
   /** Optional authenticated dashboard REST handler for bridge features that use the same
    *  connection's HTTP surface. */
   dashboard?: (request: {
@@ -246,6 +249,12 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
   let totalConnections = 0;
 
   wss.on("connection", (ws, req) => {
+    const [upgradePath = "/", upgradeQuery = ""] = (req.url ?? "").split("?");
+    const sidecar = cfg.sidecars?.[upgradePath];
+    if (sidecar !== undefined) {
+      sidecar(ws, new URLSearchParams(upgradeQuery));
+      return;
+    }
     totalConnections += 1;
     const query = (req.url ?? "").split("?")[1] ?? "";
     queries.push(query);

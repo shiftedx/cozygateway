@@ -129,7 +129,7 @@ and does not register `/bots` routes.
 | 83 | Hermes routines v2. `BotRoutine` gains optional `deliver` (the backend's own target word: `local` is run history only, `bot-chat` injects each result into the bot's canonical Bot Chat), `BotRoutineListResponse` gains optional `schedulerRunning` (Hermes's `gateway_running` from `cron.manage list`; `false` means the routines are saved but will not fire), and create/patch accept `deliver`. A patch that changes anything but `enabled` is now an IN-PLACE update through Hermes's `PUT /api/cron/jobs/:id?profile=`: the routine keeps its id, `prompt` is optional, and `replacedId`/`orphanedId` are never sent. `repeat` on a patch still counts runs from now (the gateway adds the completed runs), and `repeat: null` clears the cap so the routine runs until stopped. The list's `prompt` is the full instruction the routine was created with, read from `GET /api/cron/jobs?profile=` and unwrapped from the gateway's own delegation wrapper, falling back to Hermes's 100-character preview when that read fails. New routes, all scoped to the bot's routine namespace (an id outside it is 404): `POST /bots/:name/routines/:id/run` fires Hermes's own trigger and answers `BotRoutineRunResponse` once Hermes has accepted it (the run continues in the background and a `bot_routines` frame follows when it ends); `GET /bots/:name/routines/:id/runs?limit=` answers `BotRoutineRunsResponse`; `GET /bots/:name/routines/:id/runs/:runId/output` answers `BotRoutineRunOutputResponse` (the run id must belong to that routine); `GET /bots/:name/routine-blueprints` answers `BotRoutineBlueprintsResponse`; `POST /bots/:name/routine-blueprints/:key/instantiate` takes `BotRoutineBlueprintInstantiateRequest` and answers `201 BotRoutineWriteResponse`. |
 | 84 | Rooms reach Desktop parity. Threads: `BotGroupSendRequest.threadId` replies in a thread, absent starts one, and every entry from 84 carries `threadId` (a root send's thread is its own `messageId`). Sends while a drive is live queue behind it instead of superseding it. Stop directives: a user `stop`/`halt`/`pause` within two words of an `@mention` holds that member (`@all stop` holds everyone), a non-stop mention releases it, `@all` releases everyone, and code, quotes and blockquotes are ignored; a held member is skipped and the entries it missed replay in its next turn. `BotGroup` gains `holds`, `holdDetection`, `picture` and `id` (a stable identity that survives a rename). `PATCH /bots/groups/:group` renames (the room keeps its identity), edits members (2 to 6), sets or clears the picture and toggles stop-directive detection. `POST /bots/groups/:group/stop` stops the drive, interrupts the member on turn and holds every member when detection is on. `POST /bots/groups/:group/compress` runs `/compress` in one member's room thread. `POST /bots/groups/picture` generates a picture through Hermes `image.generate`. A member's commit on its room thread outside a room turn is mirrored in once with `external: true`. `bot_group_state` gains `activity` (`working`, `replied`, `passed`, `held`, `stopped`) and `room`/`renamedFrom` whenever settings or holds change. A send starting with a slash command is refused with 400. |
 | 85 | Bot screen (Hermes Bot Screen, a bot's headless Linux desktop). Routes, each passing the Hermes `display.*` result through VERBATIM (snake_case, so a client shares one decoder with a direct Hermes connection): `GET /bots/:name/screen` (`display.status`), `GET /bots/:name/screen/thumbnail` (`{data_url, suppressed?}`), `POST /bots/:name/screen/start`, `POST /bots/:name/screen/stop {force?}`, `POST /bots/:name/screen/install`, `POST /bots/:name/screen/lease/acquire {viewerId, reason?}` and `POST /bots/:name/screen/lease/release {viewerId?, force?}` (both answer `{lease}`). Hermes error 5300 answers 409 `conflict` with `hermesErrorCode: 5300` and `reason` (`viewer_mismatch` when a human holds control; retry with `force`). `POST /bots/:name/screen/install/sudo {requestId, password}` answers 204 and relays the password ONCE to the pending Hermes `display.install.sudo` server request (`""` skips); the gateway never logs or stores it; 404 when that request is not open. `POST /bots/:name/screen/observe {viewerId?}` answers the Hermes observe result plus `ticket` (the gateway's own: single-use, 30 s, bound to the device, the bot and the Hermes viewer id), `path` (`/bots/<name>/screen/ws`) and `viewer_id` (Hermes's minted id; `sha256(viewer_id)[:12]` matches `lease.viewer_hash` while this viewer holds control). The WebSocket `GET /bots/:name/screen/ws?ticket=` takes no device token: a bad, used or expired ticket is closed 4401 after accept; otherwise the gateway mints a fresh Hermes ticket and splices raw RFB binary frames both ways to Hermes `/api/display/ws?display_ticket=`, forwarding Hermes's close code (4000 control-taken, 4001 screen gone, 4401) and a client's clean 1000/1001 close (which hands the lease back); an abnormal client drop cuts the Hermes leg and keeps a human's lease, as upstream does. `GET`/`PATCH /bots/:name/screen/config` read and deep-merge `{geometry, autoStart, minFreeMemoryMb, idleStopMinutes, browserHeaded}` (`bot_desktop.*`, `browser.headed`) through the dashboard config route. `GET`/`PUT /bots/:name/screen/auto-open {enabled}` read and compare-and-swap `ui_meta['hermes-bots'].screenAutoOpen` without clobbering other keys (superseded by row 80's presentation route). Frames, sent only to clients that declare bots >= 85 (or declare nothing): `bot_screen_status {bot, status}`, `bot_screen_lease {bot, lease}`, `bot_screen_install_log {bot, line}`, `bot_screen_install_done {bot, code, status?}` (0 ok, -1 cancelled, -2 no sudo), `bot_screen_install_sudo {bot, requestId}` (to the device that pressed Install when it is connected, else broadcast) and `bot_screen_request_cancel {bot, requestId}`. |
-| 86 | Chat semantics, reactions and voice. See [Row 86 (chat semantics and reactions)](#row-86-chat-semantics-and-reactions) below. |
+| 86 | Chat semantics, reactions and voice. See [Row 86 (chat semantics and reactions)](#row-86-chat-semantics-and-reactions) and [Row 86 (voice)](#row-86-voice-per-bot-read-aloud-and-auto-speak) below. |
 
 ### Row 86 (chat semantics and reactions)
 
@@ -146,6 +146,41 @@ and does not register `/bots` routes.
 **Mirror.** The binding is durable per bot, and the attach plugin mirrors the bound Bot Chat's external rows (a teammate's `message_agent` DM and its reply) as `desktop_session_message` whatever the session's current source (Hermes re-stamps it `cozygateway` after a gateway turn); the per-turn baseline keeps the gateway's own turn rows from echoing, also across a plugin restart, and the gateway dedupes by Hermes row id.
 
 Additive: new routes, one new frame, one optional message field; a client below 86 sees none of them.
+
+### Row 86 (voice): per-bot Read Aloud and auto-speak
+
+A bot speaks with its **own** Hermes profile's `tts.*` on its own Hermes, as upstream Bot Mode does
+(`bot-mode.md#voices`): two bots with different voices sound different, and nothing borrows the
+active profile's voice. Speech-to-text is not part of this row. The gateway adds no speech engine.
+
+- `GET /bots/:name/voice` answers `BotVoice` `{ name, configured, provider?, voice? }`, read from the
+  profile's config (`GET /api/config?profile=`). `configured` is false when the profile has no `tts`
+  block or its provider is switched off (`none`, `off`, `false`, `disabled`); a client then hides
+  its Read Aloud and auto-speak controls. A block with no provider is Hermes's default (`edge`).
+  `voice` is the provider section's `voice` (or ElevenLabs's `voice_id`) when it names one.
+- `POST /bots/:name/speak` takes `BotSpeakRequest` `{ text }` (1 to 20000 characters, not blank)
+  and synthesizes it under the bot's profile. The gateway opens Hermes's sibling socket
+  `/api/audio/speak-stream?profile=<bot>` with the link's own credential, sends
+  `{text, done: true}`, and answers in one of two shapes, told apart by `Content-Type`:
+  - **Streamed PCM.** When Hermes sends `{"type":"start","sample_rate","channels"}`, the answer is
+    `200` with `Content-Type: audio/pcm;rate=<sample_rate>;channels=<channels>` (also as
+    `X-Audio-Sample-Rate` and `X-Audio-Channels`) and a chunked body of raw little-endian int16 PCM,
+    passed through as Hermes synthesizes it, ending at Hermes's `{"type":"end"}`. The `200` is sent
+    only once the first audio frame exists; `end` before any audio is a failed synthesis (`502`).
+    A client that closes the request at any point, including before the first frame, is barge-in:
+    the gateway sends Hermes `{"stop": true}` and closes. The gateway pauses the socket while more
+    than about 512 KiB is waiting for a slow client, so back-pressure reaches Hermes.
+  - **A whole file.** When Hermes answers `{"type":"fallback"}` (the voice has no chunked API, such
+    as `edge`), the gateway calls `POST /api/audio/speak?profile=<bot>` with a 120 s synthesis
+    budget and answers `200` with the decoded audio and its own type (`audio/mpeg`, `audio/ogg`,
+    `audio/wav`, `audio/flac`). Running out of that budget is `504` with `timedOut: true`.
+- `voice.tts {profile}` is deliberately not used: it plays on the Hermes host's own speakers.
+- Errors follow the other `/bots/:name/*` routes: a blank or oversized `text` is `400
+  invalid_request`, an unknown bot `404`, a runtime-served bot `409 unsupported_for_runtime`, and a
+  synthesis Hermes refused (for example a provider whose package or key is missing) `502` with
+  `hermesError` carrying Hermes's own sentence. The 20000-character cap is per request: a client
+  splits a longer reply and speaks the pieces in order.
+- Additive: new routes only; no frame changes. A client offers speech only on `>= 86`.
 
 ### Capability 69 F2b amendment
 
@@ -988,6 +1023,8 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `GET /bots/:name/avatar/pets` | optional `localOnly` | `BotAvatarPetGallery` | Capability 81. The petdex gallery. |
 | `POST /bots/:name/avatar/pets/thumb` | `BotAvatarPetThumbRequest` | `BotAvatarPetThumbResponse` | Capability 81. A pet's first idle frame as a PNG data URI. |
 | `GET /bots/:name/avatar/pets/:slug` | — | PNG bytes | Capability 81. The same thumbnail, for a legacy `meta.pet` roster row. |
+| `GET /bots/:name/voice` | — | `BotVoice` | Capability 86 (voice). The bot's own profile `tts.*` voice: `{ name, configured, provider?, voice? }`. |
+| `POST /bots/:name/speak` | `BotSpeakRequest` | audio | Capability 86 (voice). Streamed `audio/pcm;rate=<n>;channels=<n>` (int16 LE) or a whole `audio/*` file. |
 | `GET /bots/:name/model-config` | — | `BotModelConfig` | Owning runtime's primary, effort, and supported subagent and vision model settings. |
 | `PUT /bots/:name/model-config` | `BotModelConfigPatch` | `BotModelConfig` | Validated model settings update in the owning runtime. |
 | `GET /bots/:name/model-providers` | — | `BotModelProviderSetupCatalog` | Capability 41 compatibility route. New clients use `com.cozylabs.harness-settings`. For a runtime bot, the `cozyagents` harness's read-only projection of the peer's `model.read`. |

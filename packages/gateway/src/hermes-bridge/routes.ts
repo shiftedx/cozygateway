@@ -24,6 +24,7 @@ import {
   BotModelProviderFieldUpdateSchema,
   BotModelProviderOAuthCodeSchema,
   BotProfilePatchSchema,
+  BotSpeakRequestSchema,
   BotDescribeAutoRequestSchema,
   BotDuplicateRequestSchema,
   BotIdentityPatchSchema,
@@ -1615,6 +1616,77 @@ export function registerBotRoutes(
         }
       });
     }
+  }
+
+  // Capability 86 (voice): Read Aloud and auto-speak with the bot's OWN profile voice. Registered only
+  // on a surface that can answer, so a gateway with no Hermes profile behind it answers 404.
+  if (bots.botVoice !== undefined && bots.speakBot !== undefined) {
+    const readVoice = bots.botVoice.bind(bots);
+    const speak = bots.speakBot.bind(bots);
+    app.get("/bots/:name/voice", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        return c.json(await readVoice(resolved.name));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+
+    app.post("/bots/:name/speak", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      let parsed;
+      try {
+        parsed = assertValid(BotSpeakRequestSchema, await c.req.json().catch(() => undefined));
+      } catch (err) {
+        const detail = err instanceof ContractViolation ? err.message : "malformed body";
+        return c.json(errorBody("invalid_request", detail), 400);
+      }
+      // Read BEFORE the await: a phone that hangs up while Hermes is still resolving its voice
+      // must end the speech socket too, not leave Hermes synthesizing to nobody.
+      const hangUp = c.req.raw.signal;
+      let speech;
+      try {
+        speech = await speak(resolved.name, parsed.text, hangUp);
+      } catch (err) {
+        if (hangUp.aborted) return new Response(null, { status: 499 });
+        return failure(c, err);
+      }
+      if (speech.kind === "encoded") {
+        return new Response(Buffer.from(speech.bytes), {
+          status: 200,
+          headers: { "content-type": speech.mimeType, "cache-control": "no-store" },
+        });
+      }
+      // Streamed as it is synthesized. The phone hanging up is barge-in: Hermes stops too.
+      const live = speech;
+      if (hangUp.aborted) {
+        live.stop();
+        return new Response(null, { status: 499 });
+      }
+      const iterator = live.chunks[Symbol.asyncIterator]();
+      hangUp.addEventListener("abort", () => live.stop(), { once: true });
+      const body = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          const next = await iterator.next();
+          if (next.done === true) controller.close();
+          else controller.enqueue(next.value);
+        },
+        cancel() {
+          live.stop();
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: {
+          "content-type": `audio/pcm;rate=${live.sampleRate};channels=${live.channels}`,
+          "x-audio-sample-rate": String(live.sampleRate),
+          "x-audio-channels": String(live.channels),
+          "cache-control": "no-store",
+        },
+      });
+    });
   }
 
   app.get("/bots/:name/model-config", requireDevice, async (c) => {
