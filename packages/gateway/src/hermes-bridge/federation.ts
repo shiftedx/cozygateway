@@ -7,7 +7,7 @@ import type {
 } from "cozygateway-contract";
 import { BackendUnavailable } from "../errors.ts";
 import type { Storage } from "../storage.ts";
-import type { BotControlSurface, BotFocusScreen, BotRoutineList, BotRosterView } from "./bridge.ts";
+import type { BotControlSurface, BotFocusScreen, BotProfileOp, BotRoutineList, BotRosterView } from "./bridge.ts";
 import type { GatewayRoomHost, RoomHost } from "./group-rooms.ts";
 import type { ProfileConfigureResult } from "./profile.ts";
 import type { RoutineWriteResult } from "./routines.ts";
@@ -181,6 +181,24 @@ export class FederatedBotControlSurface implements BotControlSurface {
     const route = this.#route(input.name);
     const result = await route.member.bridge.createBot({ ...input, name: route.profile });
     return { ...result, bot: summary(route.member.id, result.bot) };
+  }
+  /** Capability 82. A new name (rename, duplicate) must sit on the same endpoint as the bot, and a
+   *  roster row coming back is qualified exactly as the roster's own rows are. */
+  async profileOp(name: string, op: BotProfileOp): Promise<unknown> {
+    const r = this.#route(name);
+    const local = (qualified: string): string => {
+      const parsed = splitFederatedBotName(qualified.trim().toLowerCase());
+      if (parsed === undefined) return qualified;
+      if (parsed.endpointId !== r.member.id) throw new BackendUnavailable(`"${qualified}" is not on the same computer as "${name}"`);
+      return parsed.profileId;
+    };
+    const routed: BotProfileOp = op.kind === "rename" ? { ...op, newName: local(op.newName) }
+      : op.kind === "duplicate" && op.newName !== undefined ? { ...op, newName: local(op.newName) }
+      : op;
+    if (r.member.bridge.profileOp === undefined) throw new BackendUnavailable("this endpoint has no profile operations");
+    const result = await r.member.bridge.profileOp(r.profile, routed);
+    const bot = (result as { bot?: BotSummary } | undefined)?.bot;
+    return bot === undefined ? result : { ...(result as object), bot: summary(r.member.id, bot) };
   }
   async deleteBot(name: string, opts?: { force?: boolean }): Promise<BotDeleteResponse> { const r = this.#route(name); const result = await r.member.bridge.deleteBot(r.profile, opts); return { ...result, name }; }
   async botProfile(name: string): Promise<BotProfile> { const r = this.#route(name); return r.member.bridge.botProfile(r.profile); }

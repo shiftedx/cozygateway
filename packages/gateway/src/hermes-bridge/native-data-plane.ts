@@ -385,6 +385,7 @@ type NativeRowOverlay = Pick<
  * about a profile that does not exist and answer 404. Chat, readiness and desktop-session methods
  * are absent on purpose: the native plane owns those for every bot it handles. */
 const DASHBOARD_ONLY: ReadonlySet<string> = new Set([
+  "profileOp",
   "botProfile",
   "configureProfile",
   "modelConfig",

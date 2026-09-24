@@ -20,6 +20,13 @@ import {
   BotModelProviderFieldUpdateSchema,
   BotModelProviderOAuthCodeSchema,
   BotProfilePatchSchema,
+  BotDescribeAutoRequestSchema,
+  BotDuplicateRequestSchema,
+  BotIdentityPatchSchema,
+  BotModelPinRequestSchema,
+  BotProviderKeyRequestSchema,
+  BotRenameRequestSchema,
+  BotSkillsHubInstallRequestSchema,
   IntegrationCreateRequestSchema,
   IntegrationCatalogInstallRequestSchema,
   IntegrationEnabledRequestSchema,
@@ -52,6 +59,8 @@ import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
 import { ModelConfigInvalid } from "./model-config.ts";
 import { ProviderSetupInvalid } from "./provider-setup.ts";
+import { PROFILE_IMPORT_MAX_BYTES, ProfileOpInvalid } from "./profile-ops.ts";
+import type { BotProfileOp } from "./bridge.ts";
 import {
   HermesDashboardIntegrations,
   IntegrationFlowNotFound,
@@ -1527,6 +1536,147 @@ export function registerBotRoutes(
     } catch (err) {
       return failure(c, err);
     }
+  });
+
+  // Capability 82: profile operations (contract/ext-bots-v1.md row 82). Every route is one call
+  // through `profileOp`, whose bridge half is `profile-ops.ts`.
+  const profileOp = async (c: Context<Env>, name: string, op: BotProfileOp, status: 200 | 201 = 200): Promise<Response> => {
+    try {
+      if (bots.profileOp === undefined) throw new BackendUnavailable("this gateway has no Hermes profile operations");
+      return c.json((await bots.profileOp(name, op)) as object, status);
+    } catch (error) {
+      if (error instanceof BotNameInvalid || error instanceof ProfileOpInvalid)
+        return c.json(errorBody("invalid_request", error.message), 400);
+      if (error instanceof BotNameTaken)
+        return c.json(extensionErrorBody("conflict", error.message), 409);
+      if (error instanceof BotTurnActive)
+        return c.json({ ...extensionErrorBody("conflict", error.message), turnId: error.turnId }, 409);
+      return failure(c, error);
+    }
+  };
+  const profileOpBody = async <T,>(c: Context<Env>, schema: Parameters<typeof assertValid>[0], optional = false): Promise<T | Response> => {
+    let body: unknown;
+    try { body = await c.req.json(); } catch { body = optional ? {} : undefined; }
+    try {
+      return assertValid(schema, body) as T;
+    } catch (err) {
+      return c.json(errorBody("invalid_request", err instanceof ContractViolation ? err.message : "malformed body"), 400);
+    }
+  };
+
+  app.patch("/bots/:name/identity", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const patch = await profileOpBody<{ title?: string; description?: string }>(c, BotIdentityPatchSchema);
+    if (patch instanceof Response) return patch;
+    if (patch.title === undefined && patch.description === undefined)
+      return c.json(errorBody("invalid_request", "at least one of title, description is required"), 400);
+    return profileOp(c, resolved.name, { kind: "identity", patch });
+  });
+
+  app.post("/bots/:name/rename", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ newName: string }>(c, BotRenameRequestSchema);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, { kind: "rename", newName: body.newName });
+  });
+
+  app.post("/bots/:name/describe-auto", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ overwrite?: boolean }>(c, BotDescribeAutoRequestSchema, true);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, { kind: "describeAuto", overwrite: body.overwrite === true });
+  });
+
+  app.post("/bots/:name/duplicate", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ newName?: string }>(c, BotDuplicateRequestSchema, true);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, {
+      kind: "duplicate", ...(body.newName === undefined ? {} : { newName: body.newName }),
+    }, 201);
+  });
+
+  app.post("/bots/:name/export", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      if (bots.profileOp === undefined) throw new BackendUnavailable("this gateway has no Hermes profile operations");
+      const exported = (await bots.profileOp(resolved.name, { kind: "export" })) as { filename: string; bytes: Uint8Array<ArrayBuffer> };
+      const filename = exported.filename.replace(/[^A-Za-z0-9._-]/g, "_");
+      return new Response(exported.bytes, {
+        headers: {
+          "content-type": "application/gzip",
+          "content-length": String(exported.bytes.byteLength),
+          "content-disposition": `attachment; filename="${filename}"`,
+          "cache-control": "no-store",
+        },
+      });
+    } catch (error) {
+      return failure(c, error);
+    }
+  });
+
+  app.post("/bots/import", requireDevice, async (c) => {
+    const name = (c.req.query("name") ?? "").trim();
+    if (name.length === 0) return c.json(errorBody("invalid_request", "name is required"), 400);
+    const declared = Number(c.req.header("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > PROFILE_IMPORT_MAX_BYTES)
+      return c.json(errorBody("invalid_request", "the archive is larger than 256 MiB"), 413);
+    const archive = new Uint8Array(await c.req.arrayBuffer());
+    return profileOp(c, name, { kind: "import", archive }, 201);
+  });
+
+  app.put("/bots/:name/model-pin", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ model: string; provider: string; confirmExpensiveModel?: boolean }>(c, BotModelPinRequestSchema);
+    if (body instanceof Response) return body;
+    const response = await profileOp(c, resolved.name, { kind: "pinModel", request: body });
+    if (response.ok) chat.contextConfigurationChanged?.(resolved.name);
+    return response;
+  });
+
+  app.delete("/bots/:name/model-pin", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const response = await profileOp(c, resolved.name, { kind: "unpinModel" });
+    if (response.ok) chat.contextConfigurationChanged?.(resolved.name);
+    return response;
+  });
+
+  app.put("/bots/:name/provider-keys/:provider", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ apiKey: string }>(c, BotProviderKeyRequestSchema);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, { kind: "saveProviderKey", provider: c.req.param("provider"), apiKey: body.apiKey });
+  });
+
+  app.delete("/bots/:name/provider-keys/:provider", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    return profileOp(c, resolved.name, { kind: "disconnectProvider", provider: c.req.param("provider") });
+  });
+
+  app.get("/bots/:name/skills-hub", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const query = (c.req.query("q") ?? "").trim();
+    if (query.length === 0 || query.length > CATALOG_QUERY_MAX)
+      return c.json(errorBody("invalid_request", `q must be 1 to ${CATALOG_QUERY_MAX} characters`), 400);
+    return profileOp(c, resolved.name, { kind: "skillsHubSearch", query });
+  });
+
+  app.post("/bots/:name/skills-hub/install", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ identifier: string }>(c, BotSkillsHubInstallRequestSchema);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, { kind: "skillsHubInstall", identifier: body.identifier });
   });
 
   app.get("/bots/:name/chat", requireDevice, async (c) => {

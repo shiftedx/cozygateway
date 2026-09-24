@@ -142,6 +142,12 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
   const http: Server = createServer((req, res) => {
     const path = (req.url ?? "").split("?")[0] ?? "/";
     const send = (status: number, body: unknown, headers: Record<string, string | string[]> = {}): void => {
+      // Raw bytes (a file download) go out as they are; everything else is a JSON body.
+      if (body instanceof Uint8Array) {
+        res.writeHead(status, { "content-type": "application/octet-stream", ...headers });
+        res.end(body);
+        return;
+      }
       res.writeHead(status, { "content-type": "application/json", ...headers });
       res.end(JSON.stringify(body));
     };

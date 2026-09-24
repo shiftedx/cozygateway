@@ -128,6 +128,16 @@ export const BotCreateRequestSchema = Type.Object({
    * a client that names a machine that is not there is a client bug rather than a missing
    * machine. */
   runnerId: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+  /** Capability 82. Start from another bot on the same Hermes host: its config, skills and SOUL,
+   * or with `cloneAll` its whole state (memory and sessions too). Absent is a fresh bot with the
+   * bundled skills, which is every create written before 82. */
+  cloneFrom: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+  cloneAll: Type.Optional(Type.Boolean()),
+  /** Capability 82. Skip the bundled skills. Hermes refuses it beside `cloneFrom`. */
+  noSkills: Type.Optional(Type.Boolean()),
+  /** Capability 82. Default true: provider keys are copied and OAuth logins are shared from the
+   * launch profile (`mirror_credentials` + `share_auth`). False starts the bot with no keys. */
+  shareKeys: Type.Optional(Type.Boolean()),
 });
 export type BotCreateRequest = Static<typeof BotCreateRequestSchema>;
 
@@ -3064,4 +3074,93 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * Capability 78: optional attach heartbeat turn-health reports let the gateway detect an interim
  * delivery seal while a turn remains active; native chat state may expose `deliveryStatus` as
  * `checking` without changing its execution lifecycle. */
-export const BOTS_CAPABILITY_VERSION = 78;
+/** Capability 79 is reserved for runtime-bot settings; 80 (presentation) and 81 (avatars) are
+ * other Hermes bot parity slices.
+ * Capability 82: profile operations. `PATCH /bots/:name/identity` writes the friendly title into
+ * `ui_meta["hermes-bots"].title` (a per-key compare-and-swap that re-reads once on a revision
+ * conflict and never touches another key) and the description. `POST /bots/:name/rename` renames
+ * the Hermes profile itself. `POST /bots/:name/describe-auto` asks Hermes to write a description.
+ * `POST /bots/:name/duplicate` clones the whole profile plus its look and avatar. `POST
+ * /bots/:name/export` answers the profile's `.tar.gz` (credentials excluded by Hermes) and `POST
+ * /bots/import?name=` creates a bot from one. `PUT`/`DELETE /bots/:name/model-pin` pins the
+ * profile's model with the expensive-model handshake, or unpins it so the launch profile's model
+ * applies. `PUT`/`DELETE /bots/:name/provider-keys/:provider` save or disconnect a provider key.
+ * `GET /bots/:name/skills-hub?q=` and `POST /bots/:name/skills-hub/install` search the Skills Hub
+ * and install into this bot. `POST /bots` gains `cloneFrom`, `cloneAll`, `noSkills` and
+ * `shareKeys`. Additive: every route is new and a client below 82 sends none of the fields. */
+export const BOTS_CAPABILITY_VERSION = 82;
+
+/** Capability 82. At least one field. `title` is the friendly name; the empty string clears it. */
+export const BotIdentityPatchSchema = Type.Object({
+  title: Type.Optional(Type.String({ maxLength: 120 })),
+  description: Type.Optional(Type.String({ maxLength: 2_000 })),
+});
+export type BotIdentityPatch = Static<typeof BotIdentityPatchSchema>;
+
+export const BotIdentitySchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  title: Type.String(),
+  description: Type.String(),
+});
+export type BotIdentity = Static<typeof BotIdentitySchema>;
+
+/** Capability 82. `newName` is the Hermes profile name (lowercase letters, digits, `-`, `_`). */
+export const BotRenameRequestSchema = Type.Object({
+  newName: Type.String({ minLength: 1, maxLength: 64 }),
+});
+export type BotRenameRequest = Static<typeof BotRenameRequestSchema>;
+
+/** Capability 82. `newName` absent picks `<name>-2`, `-3`, ... the first free one. */
+export const BotDuplicateRequestSchema = Type.Object({
+  newName: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+});
+export type BotDuplicateRequest = Static<typeof BotDuplicateRequestSchema>;
+
+export const BotDescribeAutoRequestSchema = Type.Object({
+  overwrite: Type.Optional(Type.Boolean()),
+});
+export type BotDescribeAutoRequest = Static<typeof BotDescribeAutoRequestSchema>;
+
+/** `ok: false` is Hermes' own inline refusal (no auxiliary model, say), not an HTTP error. */
+export const BotDescribeAutoResponseSchema = Type.Object({
+  ok: Type.Boolean(),
+  description: Type.Optional(Type.String()),
+  reason: Type.Optional(Type.String()),
+});
+export type BotDescribeAutoResponse = Static<typeof BotDescribeAutoResponseSchema>;
+
+export const BotModelPinRequestSchema = Type.Object({
+  model: Type.String({ minLength: 1, maxLength: 200 }),
+  provider: Type.String({ minLength: 1, maxLength: 120 }),
+  confirmExpensiveModel: Type.Optional(Type.Boolean()),
+});
+export type BotModelPinRequest = Static<typeof BotModelPinRequestSchema>;
+
+/** `confirmRequired` means NOTHING was written: resend with `confirmExpensiveModel: true` once the
+ * person agrees to `confirmMessage`. */
+export const BotModelPinResponseSchema = Type.Object({
+  pinned: Type.Boolean(),
+  confirmRequired: Type.Optional(Type.Boolean()),
+  confirmMessage: Type.Optional(Type.String()),
+  model: Type.Optional(Type.Object({ provider: Type.String(), model: Type.String() })),
+});
+export type BotModelPinResponse = Static<typeof BotModelPinResponseSchema>;
+
+export const BotProviderKeyRequestSchema = Type.Object({
+  apiKey: Type.String({ minLength: 1, maxLength: 4_096 }),
+});
+export type BotProviderKeyRequest = Static<typeof BotProviderKeyRequestSchema>;
+
+export const BotSkillsHubResultSchema = Type.Object({
+  name: Type.String(),
+  description: Type.String(),
+});
+export const BotSkillsHubSearchSchema = Type.Object({
+  results: Type.Array(BotSkillsHubResultSchema),
+});
+export type BotSkillsHubSearch = Static<typeof BotSkillsHubSearchSchema>;
+
+export const BotSkillsHubInstallRequestSchema = Type.Object({
+  identifier: Type.String({ minLength: 1, maxLength: 300 }),
+});
+export type BotSkillsHubInstallRequest = Static<typeof BotSkillsHubInstallRequestSchema>;
