@@ -72,7 +72,12 @@ function listRow(job: Job): Record<string, unknown> {
   };
 }
 
-async function setup(opts: { gatewayRunning?: boolean | null; triggerDelayMs?: number } = {}) {
+async function setup(opts: {
+  gatewayRunning?: boolean | null;
+  triggerDelayMs?: number;
+  dashboardStatus?: number;
+  messages?: unknown[];
+} = {}) {
   const jobs = new Map<string, Job>();
   jobs.set("j1", {
     id: "j1",
@@ -109,6 +114,7 @@ async function setup(opts: { gatewayRunning?: boolean | null; triggerDelayMs?: n
       },
     },
     dashboard: async (request) => {
+      if (opts.dashboardStatus !== undefined) return { status: opts.dashboardStatus, body: { detail: "Unauthorized" } };
       if (request.query.get("profile") !== BOT) return { status: 400, body: { detail: "wrong profile" } };
       if (request.method === "GET" && request.path === "/api/cron/jobs") return { body: [...jobs.values()] };
       const run = /^\/api\/cron\/jobs\/([^/]+)\/(trigger|runs)$/.exec(request.path);
@@ -153,7 +159,7 @@ async function setup(opts: { gatewayRunning?: boolean | null; triggerDelayMs?: n
       if (messages !== null) {
         return {
           body: {
-            messages: [
+            messages: opts.messages ?? [
               { role: "user", content: "run it" },
               { role: "assistant", content: "Here is the digest. Saved to /Users/k/.hermes/out.md" },
               { role: "assistant", content: "" },
@@ -293,8 +299,9 @@ describe("bot routines v2 (capability 83)", () => {
     expect(puts).toEqual([{
       name: `[bot:${BOT}] Digest v2`, schedule: "every 2h", repeat: 3, deliver: "bot-chat",
       context_from: ["other-job", "self"],
+      // The rename re-wraps the same instruction under the new title.
+      prompt: routinePrompt({ bot: BOT, title: "Digest v2", instruction: `Summarize ${"the news ".repeat(20)}` }),
     }]);
-    // The instruction was not named, so it was not touched.
     expect(jobs.get("j1")?.prompt).toContain("Summarize");
   });
 
@@ -315,6 +322,80 @@ describe("bot routines v2 (capability 83)", () => {
     expect(body["routine"]).toMatchObject({ id: "j1", enabled: false, prompt: "Say it's done" });
     expect(routineInstruction(jobs.get("j1")?.prompt ?? "")).toBe("Say it's done");
     expect(jobs.get("j1")?.prompt).toMatch(/^\[bot-mode:routine:v2\] /);
+  });
+
+  it("caps a forever routine that has already run from the stored completed count", async () => {
+    const { call, jobs, puts } = await setup();
+    // `cron.manage list` shows "forever" for this job however often it ran; the record says 5.
+    jobs.set("daily", {
+      id: "daily", name: `[bot:${BOT}] Daily`, schedule: "0 9 * * *",
+      prompt: routinePrompt({ bot: BOT, title: "Daily", instruction: "go" }), enabled: true, deliver: "local",
+      repeat: { times: null, completed: 5 }, context_from: null,
+    });
+    const { status } = await call(`/bots/${BOT}/routines/daily`, { method: "PATCH", body: { repeat: 2 } });
+    expect(status).toBe(200);
+    expect(puts).toEqual([{ repeat: 7 }]);
+  });
+
+  it("keeps a bare prompt bare when its instruction is edited", async () => {
+    const { call, jobs, puts } = await setup();
+    jobs.set("bp", {
+      id: "bp", name: `[bot:${BOT}] Morning briefing`, schedule: "0 8 * * *", prompt: "brief me", enabled: true,
+      deliver: "local", repeat: { times: null, completed: 0 }, context_from: null,
+    });
+    jobs.set("quiet", {
+      id: "quiet", name: `[bot:${BOT}] Quiet`, schedule: "0 8 * * *",
+      prompt: routinePrompt({ bot: BOT, title: "Quiet", instruction: "old", schedulerProfile: BOT }), enabled: true,
+      deliver: "local", repeat: { times: null, completed: 0 }, context_from: null,
+    });
+    expect((await call(`/bots/${BOT}/routines/bp`, { method: "PATCH", body: { prompt: "brief me twice" } })).status).toBe(200);
+    expect(jobs.get("bp")?.prompt).toBe("brief me twice");
+    // A rename of a bare job leaves its prompt alone.
+    expect((await call(`/bots/${BOT}/routines/bp`, { method: "PATCH", body: { title: "Brief" } })).status).toBe(200);
+    expect(puts.at(-1)).toEqual({ name: `[bot:${BOT}] Brief` });
+    expect((await call(`/bots/${BOT}/routines/quiet`, { method: "PATCH", body: { prompt: "new" } })).status).toBe(200);
+    expect(jobs.get("quiet")?.prompt).toBe(routinePrompt({ bot: BOT, title: "Quiet", instruction: "new", schedulerProfile: BOT }));
+  });
+
+  it("re-wraps the wrapper with the new title on a rename", async () => {
+    const { call, jobs } = await setup();
+    const { status, body } = await call(`/bots/${BOT}/routines/j1`, { method: "PATCH", body: { title: "Headlines" } });
+    expect(status).toBe(200);
+    const instruction = `Summarize ${"the news ".repeat(20)}`;
+    expect(jobs.get("j1")?.prompt).toBe(routinePrompt({ bot: BOT, title: "Headlines", instruction }));
+    expect(jobs.get("j1")?.prompt).not.toContain("Digest");
+    expect(body["routine"]).toMatchObject({ title: "Headlines", prompt: instruction });
+  });
+
+  it("reports a dashboard 401 or 403 as the backend being unavailable", async () => {
+    for (const status of [401, 403]) {
+      const { call } = await setup({ dashboardStatus: status });
+      const reply = await call(`/bots/${BOT}/routines/j1`, { method: "PATCH", body: { schedule: "every 2h" } });
+      expect(reply.status).toBe(502);
+      expect(reply.body).toMatchObject({ error: { code: "backend_unavailable" } });
+    }
+  });
+
+  it("cleans a run's output like any transcript, content-part arrays included", async () => {
+    const { call } = await setup({
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Done.\u0007 See ~/notes/today.md" },
+            { type: "image", image_url: "data:x" },
+            { type: "text", text: "MEDIA:/tmp/chart.png and /etc/hosts" },
+          ],
+        },
+      ],
+    });
+    const output = await call(`/bots/${BOT}/routines/j1/runs/cron_j1_1/output`);
+    expect(output.status).toBe(200);
+    const text = String(output.body["output"]);
+    expect(text).toContain("Done. See <path>");
+    expect(text).not.toContain("\u0007");
+    expect(text).not.toContain("/tmp");
+    expect(text).not.toContain("/etc");
   });
 
   it("reports Hermes's refusal of an edit as the client's input", async () => {
@@ -405,6 +486,10 @@ describe("bot routines v2 (capability 83)", () => {
     const desktop = `[bot-mode:routine:v2] You are running the scheduled routine "T" for agent 'scout'. Execute it AS that agent so the run lands in its own history: run this in the terminal and relay the output:\n\nhermes -p 'scout' chat -c 'Routine: T' -q '[Scheduled routine] it'"'"'s fine'\n\nIf the command fails, report the error instead.`;
     expect(routineInstruction(desktop)).toBe("it's fine");
     expect(routineInstruction("plain words")).toBe("plain words");
+    // A title that itself contains ` -q '` (and the whole anchor) does not move the unwrap.
+    for (const title of ["a -q 'b", "x -q '[Scheduled routine] y"]) {
+      expect(routineInstruction(routinePrompt({ bot: BOT, title, instruction }))).toBe(instruction);
+    }
     expect(routineCompletedRuns({ repeat: "1/3" })).toBe(1);
     expect(routineCompletedRuns({ repeat: "3 times" })).toBe(0);
     expect(routineCompletedRuns({ repeat: "forever" })).toBe(0);

@@ -8,7 +8,7 @@ import type {
 
 import { asRecord, asString } from "./rpc.ts";
 import type { HermesRpc } from "./rpc.ts";
-import { redactHermesSessionPaths } from "./session-management.ts";
+import { projectHermesSessionText, redactHermesSessionPaths } from "./session-management.ts";
 
 /** The routines surface stores new bot routines as ordinary Hermes cron jobs named
  * `[bot:<name>] <title>`. Existing untagged cron jobs are also shown because `cron.manage` scopes
@@ -231,13 +231,14 @@ export function routineTimestamp(value: unknown): number | null {
  * data. Delivery adapters commonly include their spool/config path in failures, so every absolute
  * POSIX, drive-letter, UNC and home-relative path family is removed before the bound is applied.
  * Whitespace is flattened for a routine-row label and control bytes are discarded. */
+/** `~/...` paths, which the absolute-path rules of `redactHermesSessionPaths` do not cover. */
+function redactHomePaths(value: string): string {
+  return value.replace(/(^|[\s("'`])~[\\/][^\s"'<>]*/g, "$1<path>");
+}
+
 export function routineDeliveryError(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
-  const withoutHomePaths = value.replace(
-    /(^|[\s("'`])~[\\/][^\s"'<>]*/g,
-    "$1<path>",
-  );
-  const clean = redactHermesSessionPaths(withoutHomePaths)
+  const clean = redactHermesSessionPaths(redactHomePaths(value))
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -394,17 +395,21 @@ async function withFullInstruction(port: HermesRoutinesPort, bot: string, job: C
   }
 }
 
+const SCHEDULED_ARGUMENT = " -q '[Scheduled routine] ";
+
 /** The instruction a user wrote, out of the prompt a routine is stored with: the reverse of
  *  `routinePrompt`, and of the desktop's own wrapper (which has no silence-first line). A prompt
  *  that is not one of those shapes is returned whole, because it IS the instruction. */
 export function routineInstruction(prompt: string): string {
   let text = prompt;
   if (text.startsWith(SAFE_ROUTINE_MARKER)) {
-    const open = text.indexOf(" -q '");
+    // The LAST ` -q '[Scheduled routine] `: the title also appears raw in the wrapper's first
+    // sentence, so a title carrying that text must not be taken for the quoted argument. Inside a
+    // shell-quoted argument every `'` is escaped, so the real one is the last literal match.
+    const open = text.lastIndexOf(SCHEDULED_ARGUMENT);
     const close = text.lastIndexOf("'\n\nIf the command fails");
     if (open === -1 || close <= open) return prompt;
-    text = text.slice(open + 5, close).replaceAll(`'"'"'`, "'");
-    if (text.startsWith("[Scheduled routine] ")) text = text.slice("[Scheduled routine] ".length);
+    text = text.slice(open + SCHEDULED_ARGUMENT.length, close).replaceAll(`'"'"'`, "'");
   }
   if (text.startsWith(`${SILENCE_FIRST}\n\n`)) text = text.slice(SILENCE_FIRST.length + 2);
   return text;
@@ -510,6 +515,36 @@ export function routineCompletedRuns(job: CronJob): number {
   return Number.isFinite(done) && done > 0 ? done : 0;
 }
 
+/** The prompt an EDITED instruction is stored with, in the shape the job already has. Only a job
+ *  that carries the gateway's own delegation wrapper is re-wrapped (with its current title); a bare
+ *  prompt stays bare, keeping the silence-first line only if it was there. A blueprint's job is a
+ *  bare prompt whose `skills` load into the outer agent, and wrapping it would run the instruction
+ *  in a nested agent without them. A job whose stored prompt could not be read is wrapped as a
+ *  create would wrap it. */
+export function rewrapRoutinePrompt(input: {
+  stored: string | undefined;
+  bot: string;
+  title: string;
+  instruction: string;
+  schedulerProfile?: string | undefined;
+}): string {
+  const { stored, bot, title, instruction } = input;
+  if (stored === undefined) return routinePrompt(input);
+  if (stored.startsWith(SAFE_ROUTINE_MARKER)) return routinePrompt({ bot, title, instruction });
+  if (stored.startsWith(`${SILENCE_FIRST}\n\n`)) return `${SILENCE_FIRST}\n\n${instruction}`;
+  return instruction;
+}
+
+/** Runs the job has completed, from the stored record's `repeat.completed`. The `cron.manage`
+ *  display string cannot be trusted for this: it reads `forever` for any uncapped job, however
+ *  many times it has run. The display string is only the fallback. */
+function storedCompletedRuns(stored: Record<string, unknown> | undefined, job: CronJob): number {
+  const completed = asRecord(stored?.["repeat"])?.["completed"];
+  return typeof completed === "number" && Number.isFinite(completed) && completed >= 0
+    ? Math.trunc(completed)
+    : routineCompletedRuns(job);
+}
+
 export interface RoutineWriteResult {
   routine: BotRoutine;
   /** The id this routine had before a rewrite replaced it. */
@@ -569,10 +604,10 @@ export async function deleteBotRoutine(rpc: HermesRpc, bot: string, jobId: strin
  *  its id and everything it did not name. Before 83 this was a pause-add-remove rewrite, because
  *  `cron.manage` has no update action; Hermes's dashboard has had one all along.
  *
- *  - `prompt` is re-wrapped exactly as a create wraps it, so the job keeps landing in the bot's own
- *    history.
- *  - `repeat` counts runs from now: the completed runs are added back, because Hermes stores a total
- *    and keeps its completed counter across an update.
+ *  - `prompt` keeps the stored prompt's shape (`rewrapRoutinePrompt`): the gateway's wrapper is
+ *    re-wrapped, a bare prompt stays bare. A rename re-wraps the wrapper with the new title.
+ *  - `repeat` counts runs from now: the completed runs (the stored `repeat.completed`) are added
+ *    back, because Hermes stores a total and keeps its completed counter across an update.
  *  - `continuity` is Hermes's `self` entry in `context_from`; other references are kept. */
 export async function patchBotRoutine(
   port: HermesRoutinesPort,
@@ -586,18 +621,30 @@ export async function patchBotRoutine(
   if (patchNeedsRewrite(patch)) {
     const call = dashboard(port, "edit");
     const updates: Record<string, unknown> = {};
-    const title = patch.title ?? routineTitle(existing);
-    if (patch.title !== undefined) updates["name"] = routineJobName(bot, patch.title.trim());
+    const title = patch.title?.trim() ?? routineTitle(existing);
+    // The stored record: the full prompt (to keep its shape), the real completed-run count and the
+    // continuity references. Read once, and only when the patch needs one of them.
+    const needsStored =
+      patch.title !== undefined || patch.prompt !== undefined || typeof patch.repeat === "number" ||
+      patch.continuity !== undefined;
+    const stored = needsStored ? asRecord(await call<unknown>(cronJobPath(jobId, bot))) : undefined;
+    const storedPrompt = asString(stored?.["prompt"]);
+    if (patch.title !== undefined) updates["name"] = routineJobName(bot, title);
     if (patch.schedule !== undefined) updates["schedule"] = patch.schedule.trim();
-    if (patch.prompt !== undefined) {
-      updates["prompt"] = routinePrompt({ bot, title, instruction: patch.prompt.trim(), schedulerProfile });
+    // A rename re-wraps the gateway's wrapper too, since the wrapper names the routine's title.
+    const instruction =
+      patch.prompt?.trim() ??
+      (patch.title !== undefined && storedPrompt?.startsWith(SAFE_ROUTINE_MARKER) === true
+        ? routineInstruction(storedPrompt)
+        : undefined);
+    if (instruction !== undefined) {
+      updates["prompt"] = rewrapRoutinePrompt({ stored: storedPrompt, bot, title, instruction, schedulerProfile });
     }
     // `null` is "forever": Hermes's update_job stores `{times: None}` and keeps the completed count.
     if (patch.repeat !== undefined)
-      updates["repeat"] = patch.repeat === null ? null : patch.repeat + routineCompletedRuns(existing);
+      updates["repeat"] = patch.repeat === null ? null : patch.repeat + storedCompletedRuns(stored, existing);
     if (patch.deliver !== undefined) updates["deliver"] = patch.deliver;
     if (patch.continuity !== undefined) {
-      const stored = asRecord(await call<unknown>(cronJobPath(jobId, bot)));
       const raw = stored?.["context_from"];
       const refs = (Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [])
         .flatMap((ref) => (typeof ref === "string" ? [ref] : []))
@@ -714,11 +761,28 @@ export async function readBotRoutineRunOutput(
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = asRecord(messages[index]);
     if (message?.["role"] !== "assistant") continue;
-    const content = asString(message["content"])?.trim();
-    if (content === undefined || content.length === 0) continue;
-    return redactHermesSessionPaths(content).slice(0, ROUTINE_RUN_OUTPUT_MAX_LENGTH);
+    const text = messageText(message["content"]);
+    if (text === undefined) continue;
+    // The same projection every other transcript surface applies (control bytes, image directives,
+    // host paths), plus the `~/` rule routine delivery errors use.
+    const output = projectHermesSessionText(redactHomePaths(text), ROUTINE_RUN_OUTPUT_MAX_LENGTH);
+    if (output.length > 0) return output;
   }
   return null;
+}
+
+/** A message's text: a plain string, or the text parts of a content-part array. */
+function messageText(content: unknown): string | undefined {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  const parts = content.flatMap((part) => {
+    if (typeof part === "string") return [part];
+    const record = asRecord(part);
+    const type = record?.["type"];
+    const text = asString(record?.["text"]);
+    return text === undefined || (type !== undefined && type !== "text") ? [] : [text];
+  });
+  return parts.length === 0 ? undefined : parts.join("\n");
 }
 
 /** Hermes's automation blueprint catalog, for this bot's profile (the deliver slot's options are

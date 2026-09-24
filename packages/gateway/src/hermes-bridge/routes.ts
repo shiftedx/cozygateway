@@ -437,7 +437,12 @@ function failure(c: Context<Env>, err: unknown) {
 function routineFailure(c: Context<Env>, err: unknown) {
   if (err instanceof RoutineDashboardUnavailable)
     return c.json(errorBody("backend_unavailable", err.message), 503);
-  if (err instanceof HermesRpcError && err.code !== undefined && err.code >= 400 && err.code < 500) {
+  // A dashboard 401/403 is the gateway's own credential failing, not the client's input: it falls
+  // through to `failure`, which reports `backend_unavailable`.
+  if (
+    err instanceof HermesRpcError && err.code !== undefined && err.code >= 400 && err.code < 500 &&
+    err.code !== 401 && err.code !== 403
+  ) {
     if (err.code === 404)
       return c.json({ ...errorBody("not_found", "hermes has no such routine"), hermesError: err.message }, 404);
     if (err.code === 409)
