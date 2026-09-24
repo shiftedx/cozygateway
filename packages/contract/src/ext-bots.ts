@@ -3059,9 +3059,71 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
 /** Capability 75: read-only observer API, bounded subscriptions and content-free live projections. */
 /** Capability 76: a reply push optionally carries its Task id and suppresses its same-turn
  * completion banner for ten seconds. */
+/** Capability 85, bot screen: a bot's headless Linux desktop (Hermes Bot Screen). The status and
+ *  lease objects are Hermes's own `display.status` / `display.lease` payloads passed through
+ *  VERBATIM (snake_case), so a client shares one decoder between a direct Hermes connection and
+ *  this gateway. They are deliberately open records: the gateway is a courier for them, not their
+ *  author, and a Hermes that grows a field must not make the frame invalid. */
+const BotScreenPayloadSchema = Type.Record(Type.String(), Type.Unknown());
+
+/** A screen started, stopped, finished installing or crashed. Full-replace status snapshot. */
+export const BotScreenStatusFrameSchema = Type.Object({
+  type: Type.Literal("bot_screen_status"),
+  bot: Type.String(),
+  status: BotScreenPayloadSchema,
+});
+export type BotScreenStatusFrame = Static<typeof BotScreenStatusFrameSchema>;
+
+/** Who drives the screen changed. `lease.epoch` is monotonic; a client drops an older one. */
+export const BotScreenLeaseFrameSchema = Type.Object({
+  type: Type.Literal("bot_screen_lease"),
+  bot: Type.String(),
+  lease: BotScreenPayloadSchema,
+});
+export type BotScreenLeaseFrame = Static<typeof BotScreenLeaseFrameSchema>;
+
+/** One line of the host package install's output. */
+export const BotScreenInstallLogFrameSchema = Type.Object({
+  type: Type.Literal("bot_screen_install_log"),
+  bot: Type.String(),
+  line: Type.String(),
+});
+export type BotScreenInstallLogFrame = Static<typeof BotScreenInstallLogFrameSchema>;
+
+/** The install ended: 0 ok, -1 cancelled, -2 no sudo, anything else failed. */
+export const BotScreenInstallDoneFrameSchema = Type.Object({
+  type: Type.Literal("bot_screen_install_done"),
+  bot: Type.String(),
+  code: Type.Integer(),
+  status: Type.Optional(BotScreenPayloadSchema),
+});
+export type BotScreenInstallDoneFrame = Static<typeof BotScreenInstallDoneFrameSchema>;
+
+/** The host needs its sudo password to install. Answered once with
+ *  `POST /bots/:name/screen/install/sudo {requestId, password}`; the gateway never stores it. */
+export const BotScreenInstallSudoFrameSchema = Type.Object({
+  type: Type.Literal("bot_screen_install_sudo"),
+  bot: Type.String(),
+  requestId: Type.String(),
+});
+export type BotScreenInstallSudoFrame = Static<typeof BotScreenInstallSudoFrameSchema>;
+
+/** Hermes withdrew a sudo request (timeout or cancel): tear the card down. */
+export const BotScreenRequestCancelFrameSchema = Type.Object({
+  type: Type.Literal("bot_screen_request_cancel"),
+  bot: Type.String(),
+  requestId: Type.String(),
+});
+export type BotScreenRequestCancelFrame = Static<typeof BotScreenRequestCancelFrameSchema>;
+
 /** Capability 77: room pending approvals expose the durable writing turn cause before a reply
  * exists. Delivery approval pushes alone may request the time-sensitive APNs interruption level.
  * Capability 78: optional attach heartbeat turn-health reports let the gateway detect an interim
  * delivery seal while a turn remains active; native chat state may expose `deliveryStatus` as
  * `checking` without changing its execution lifecycle. */
-export const BOTS_CAPABILITY_VERSION = 78;
+/** Capability 85: bot screen. Rows 79-84 are reserved for sibling slices (79 runtime-bot settings,
+ * 80 presentation, 81 avatars, 82 profile ops, 83 routines, 84 rooms). `/bots/:name/screen*` routes
+ * pass Hermes `display.*` results through verbatim, `POST /bots/:name/screen/observe` mints a
+ * gateway-owned single-use 30 s ticket redeemed on the `GET /bots/:name/screen/ws` WebSocket, which
+ * splices raw RFB to Hermes `/api/display/ws`, and the six `bot_screen_*` frames carry live state. */
+export const BOTS_CAPABILITY_VERSION = 85;

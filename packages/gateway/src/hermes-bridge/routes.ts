@@ -118,7 +118,7 @@ import {
  *  text VERBATIM. Client feature probes match `/unknown method/i` against it, so it is never
  *  reworded, and `error.message` stays a stable, human-readable summary. */
 
-type Env = { Variables: { deviceId: string } };
+export type Env = { Variables: { deviceId: string } };
 
 /** How many sessions `GET /bots/:name/sessions` asks Hermes for. Matches the design's cap. */
 export const SESSION_LIST_LIMIT = 200;
@@ -226,7 +226,7 @@ export function resolveByteRange(
  *  identity regardless of casing or surrounding whitespace.
  *
  *  Returns the canonical name, or a 400 response for a name that cannot name a profile at all. */
-function canonicalName(
+export function canonicalName(
   c: Context<Env>,
 ): { name: string } | { response: Response } {
   try {
@@ -269,7 +269,7 @@ function routineBotName(
   return { name: resolved.name };
 }
 
-function failure(c: Context<Env>, err: unknown) {
+export function failure(c: Context<Env>, err: unknown) {
   // Checked first: a name that names no Hermes profile is a 404, not a backend failure, on every
   // configured `/bots/:name/*` route.
   if (err instanceof BotNotFound)

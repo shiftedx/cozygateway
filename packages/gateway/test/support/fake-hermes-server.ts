@@ -92,6 +92,10 @@ export interface FakeHermesServer {
   /** Every query string the server has seen on an upgrade, in connection order. */
   queries(): string[];
   sendEvent(type: string, payload?: unknown, sessionId?: string): void;
+  /** Capability 85: pushes any frame verbatim (a server->client request, say). */
+  sendRaw(frame: unknown): void;
+  /** Capability 85: every client frame that was NOT a request (responses to server requests). */
+  clientResponses(): Array<Record<string, unknown>>;
   /** The token-event sequence a real Hermes 0.20.3 emits for one assistant turn, modeled on the
    *  probe capture of 2026-08-18: `message.start`, one `message.delta` per token with the text in
    *  `payload.text`, and `message.complete` carrying the whole reply plus a usage block. Every frame
@@ -221,6 +225,7 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
   const wss = new WebSocketServer({ server: http });
   const sockets = new Set<WebSocket>();
   const calls: HermesCall[] = [];
+  const clientResponses: Array<Record<string, unknown>> = [];
   const queries: string[] = [];
   let totalConnections = 0;
 
@@ -266,7 +271,10 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
         return;
       }
       const frame = parsed as { id?: unknown; method?: unknown; params?: unknown };
-      if (typeof frame.method !== "string") return;
+      if (typeof frame.method !== "string") {
+        if (typeof parsed === "object" && parsed !== null) clientResponses.push(parsed as Record<string, unknown>);
+        return;
+      }
       const params = (typeof frame.params === "object" && frame.params !== null ? frame.params : {}) as Record<
         string,
         unknown
@@ -337,6 +345,13 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
     totalConnections: () => totalConnections,
     connectionCount: () => sockets.size,
     queries: () => [...queries],
+    sendRaw(frame: unknown): void {
+      const raw = JSON.stringify(frame);
+      for (const ws of sockets) {
+        if (ws.readyState === WebSocket.OPEN) ws.send(raw);
+      }
+    },
+    clientResponses: () => [...clientResponses],
     sendEvent(type: string, payload?: unknown, sessionId?: string): void {
       const raw = JSON.stringify({
         method: "event",
