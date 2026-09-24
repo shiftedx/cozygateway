@@ -77,7 +77,7 @@ import { TurnRunner } from "./turns.ts";
 import { RelayNotifier, taskCompletionPayload, type ChatMessagePushEvent } from "./push-notifier.ts";
 import { LiveActivityNotifier } from "./live-activity-notifier.ts";
 import { roomApprovalPush, type ApprovalPushPayload } from "./push-crypto.ts";
-import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
+import { SETUP_CODE_TTL_MS, hashToken, newSetupCode } from "./auth.ts";
 import { BotScreenSurface } from "./hermes-bridge/bot-screen.ts";
 import {
   createUpgradeDispatcher,
@@ -585,6 +585,7 @@ export async function startGateway(
         })),
         broadcast: (frame) => hub.broadcast(frame),
         sendToDevice: (deviceId, frame) => hub.sendFrameToDevice(deviceId, frame),
+        deviceForToken: (token) => storage.deviceByTokenHash(hashToken(token))?.id,
       });
   // Capability 46 and 52, findings V1-F1 (R1) and F8. The gateway's OWN room host, built for every
   // shape that goes through the federated control surface: no Hermes endpoint at all, or two or

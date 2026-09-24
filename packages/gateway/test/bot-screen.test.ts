@@ -7,10 +7,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
 
 import { testHermes } from "./support/test-config.ts";
-import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
+import { SETUP_CODE_TTL_MS, hashToken, newSetupCode } from "../src/auth.ts";
 import { createHermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
-import { BotScreenSurface, SCREEN_TICKET_TTL_MS } from "../src/hermes-bridge/bot-screen.ts";
+import { BotScreenSurface, SCREEN_TICKET_TTL_MS, sendableCloseCode } from "../src/hermes-bridge/bot-screen.ts";
 import { createApp } from "../src/http.ts";
 import { openStorage } from "../src/storage.ts";
 import { createUpgradeDispatcher } from "../src/upgrade-dispatcher.ts";
@@ -87,6 +87,7 @@ async function setup(opts: { now?: () => number } = {}) {
   let uiMeta: Record<string, unknown> = { "hermes-bots": { pinned: true, title: "Pixel" } };
   let revision = 4;
   let conflictsLeft = 0;
+  let unapplied = false;
   const configWrites: unknown[] = [];
   const server: FakeHermesServer = await startFakeHermesServer({
     methods: {
@@ -105,6 +106,7 @@ async function setup(opts: { now?: () => number } = {}) {
         }
         uiMeta = { ...uiMeta, ...(params["ui_meta"] as object) };
         revision += 1;
+        if (unapplied) return { applied: { ui_meta: false } };
         return { applied: { ui_meta: true } };
       },
       "display.status": (params) => {
@@ -159,6 +161,7 @@ async function setup(opts: { now?: () => number } = {}) {
       return true;
     },
     ...(opts.now === undefined ? {} : { now: opts.now }),
+    deviceForToken: (token) => storage.deviceByTokenHash(hashToken(token))?.id,
     logSink: () => {},
   });
   const app = createApp({
@@ -186,6 +189,13 @@ async function setup(opts: { now?: () => number } = {}) {
     body: JSON.stringify({ setupCode: code, deviceName: "phone" }),
   });
   const pairedBody = (await paired.json()) as { deviceToken: string };
+  const secondCode = newSetupCode();
+  storage.createSetupCode(secondCode, Date.now() + SETUP_CODE_TTL_MS);
+  const secondBody = (await (await app.request("/pair", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ setupCode: secondCode, deviceName: "other phone" }),
+  })).json()) as { deviceToken: string };
 
   // The gateway's own listener, carrying only the screen WebSocket route.
   const http = createServer();
@@ -201,20 +211,26 @@ async function setup(opts: { now?: () => number } = {}) {
     await bridge.close();
     storage.close();
   });
-  const authed = (path: string, init?: RequestInit) =>
+  const as = (token: string) => (path: string, init?: RequestInit) =>
     app.request(path, {
       ...init,
-      headers: { "content-type": "application/json", ...(init?.headers ?? {}), authorization: `Bearer ${pairedBody.deviceToken}` },
+      headers: { "content-type": "application/json", ...(init?.headers ?? {}), authorization: `Bearer ${token}` },
     });
+  const authed = as(pairedBody.deviceToken);
+  const other = as(secondBody.deviceToken);
+  // The screen socket carries the phone's own token (GatewayClient.webSocketTask sends it).
+  const dialAs = (token: string) => (port: number, path: string) => dial(port, path, token);
   return {
-    server, rfb, screen, frames, targeted, configWrites, authed, gatewayPort,
+    server, rfb, screen, frames, targeted, configWrites, authed, other, gatewayPort,
+    dial: dialAs(pairedBody.deviceToken), dialOther: dialAs(secondBody.deviceToken),
+    setUnapplied: (value: boolean) => { unapplied = value; },
     uiMeta: () => uiMeta,
     setConflicts: (n: number) => { conflictsLeft = n; },
   };
 }
 
-function dial(port: number, path: string): Promise<{ ws: WebSocket; messages: Buffer[]; closed: Promise<{ code: number; reason: string }> }> {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}${path}`);
+function dial(port: number, path: string, token?: string): Promise<{ ws: WebSocket; messages: Buffer[]; closed: Promise<{ code: number; reason: string }> }> {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}${path}`, token === undefined ? {} : { headers: { authorization: `Bearer ${token}` } });
   const messages: Buffer[] = [];
   ws.on("message", (data) => messages.push(Buffer.from(data as Buffer)));
   const closed = new Promise<{ code: number; reason: string }>((resolve) =>
@@ -235,7 +251,7 @@ async function observe(authed: (p: string, i?: RequestInit) => Response | Promis
 
 describe("bot screen splice", () => {
   it("splices the RFB banner and bytes both ways on a gateway ticket, re-minting the Hermes ticket", async () => {
-    const { authed, gatewayPort, rfb, server } = await setup();
+    const { authed, gatewayPort, rfb, server, dial } = await setup();
     const observed = await observe(authed);
     expect(observed.path).toBe("/bots/pixel/screen/ws");
     expect(observed.viewer_id).toBe("viewer-A");
@@ -263,7 +279,7 @@ describe("bot screen splice", () => {
 
   it("refuses a used, foreign-bot or expired ticket with 4401 after accept", async () => {
     let clock = 1_000_000;
-    const { authed, gatewayPort } = await setup({ now: () => clock });
+    const { authed, gatewayPort, dial } = await setup({ now: () => clock });
     const observed = await observe(authed);
     const first = await dial(gatewayPort, `${observed.path}?ticket=${observed.ticket}`);
     await until(() => first.messages.length >= 1);
@@ -284,8 +300,31 @@ describe("bot screen splice", () => {
     expect((await expired.closed).code).toBe(4401);
   });
 
+  it("redeems a ticket only on the device that minted it", async () => {
+    const { authed, gatewayPort, dial, dialOther } = await setup();
+    const mine = await observe(authed);
+    // Another paired phone holding a leaked ticket is refused, and the ticket is spent.
+    const stolen = await dialOther(gatewayPort, `${mine.path}?ticket=${mine.ticket}`);
+    expect((await stolen.closed).code).toBe(4401);
+    const after = await dial(gatewayPort, `${mine.path}?ticket=${mine.ticket}`);
+    expect((await after.closed).code).toBe(4401);
+    // No device token at all is refused too.
+    const fresh = await observe(authed);
+    const bare = await new Promise<{ code: number }>((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${gatewayPort}${fresh.path}?ticket=${fresh.ticket}`);
+      ws.on("close", (code) => resolve({ code }));
+      ws.on("error", () => {});
+    });
+    expect(bare.code).toBe(4401);
+  });
+
+  it("forwards every sendable close code unchanged and reports reserved ones as a lost stream", () => {
+    for (const code of [1000, 1001, 1002, 1003, 1007, 1011, 1014, 3000, 4000, 4999]) expect(sendableCloseCode(code)).toBe(true);
+    for (const code of [999, 1004, 1005, 1006, 1015, 2999, 5000]) expect(sendableCloseCode(code)).toBe(false);
+  });
+
   it("forwards Hermes's 4000 control-taken close, and cuts (not closes) Hermes on a dropped viewer", async () => {
-    const { authed, gatewayPort, rfb } = await setup();
+    const { authed, gatewayPort, rfb, dial } = await setup();
     const observed = await observe(authed, "viewer-B");
     expect(observed.viewer_id).toBe("viewer-B");
     const evicted = await dial(gatewayPort, `${observed.path}?ticket=${observed.ticket}`);
@@ -336,7 +375,7 @@ describe("bot screen routes", () => {
   });
 
   it("relays the sudo request to the installing phone, answers Hermes once, and forwards install events", async () => {
-    const { authed, server, frames, targeted } = await setup();
+    const { authed, other, server, frames, targeted } = await setup();
     expect(await (await authed("/bots/pixel/screen/install", { method: "POST" })).json()).toMatchObject({ started: true });
     server.sendRaw({ jsonrpc: "2.0", id: "srq-abc123", method: "display.install.sudo", params: { session_id: "", profile_key: PROFILE_KEY } });
     await until(() => targeted.length === 1);
@@ -345,6 +384,11 @@ describe("bot screen routes", () => {
     expect((await authed("/bots/pixel/screen/install/sudo", {
       method: "POST", body: JSON.stringify({ requestId: "srq-nope", password: "x" }),
     })).status).toBe(404);
+    // The card went to the installing phone; nobody else may answer it.
+    expect((await other("/bots/pixel/screen/install/sudo", {
+      method: "POST", body: JSON.stringify({ requestId: "srq-abc123", password: "guess" }),
+    })).status).toBe(404);
+    expect(frames.some((frame) => frame.type === "bot_screen_install_sudo")).toBe(false);
     expect((await authed("/bots/pixel/screen/install/sudo", {
       method: "POST", body: JSON.stringify({ requestId: "srq-abc123", password: "hunter2" }),
     })).status).toBe(204);
@@ -377,5 +421,22 @@ describe("bot screen routes", () => {
     // The concurrent writer's `hidden` survived the retry, and so did the older keys.
     expect(uiMeta()["hermes-bots"]).toEqual({ pinned: true, title: "Pixel", hidden: true, screenAutoOpen: true });
     expect(await (await authed("/bots/pixel/screen/auto-open")).json()).toEqual({ enabled: true });
+  });
+
+  it("does not report an auto-open write Hermes did not apply as a success", async () => {
+    const { authed, setUnapplied } = await setup();
+    setUnapplied(true);
+    const response = await authed("/bots/pixel/screen/auto-open", { method: "PUT", body: JSON.stringify({ enabled: true }) });
+    expect(response.status).toBe(502);
+  });
+
+  it("skips a sudo request no installing phone can answer, instead of broadcasting it", async () => {
+    const { authed, server, frames } = await setup();
+    // Teach the gateway the profile key, then ask for sudo with no install from this gateway.
+    expect((await authed("/bots/pixel/screen")).status).toBe(200);
+    server.sendRaw({ jsonrpc: "2.0", id: "srq-orphan", method: "display.install.sudo", params: { session_id: "", profile_key: PROFILE_KEY } });
+    await until(() => server.clientResponses().length === 1);
+    expect(server.clientResponses()[0]).toEqual({ jsonrpc: "2.0", id: "srq-orphan", result: { value: "" } });
+    expect(frames.some((frame) => frame.type === "bot_screen_install_sudo")).toBe(false);
   });
 });

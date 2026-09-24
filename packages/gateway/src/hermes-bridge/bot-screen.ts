@@ -32,6 +32,7 @@ export const SCREEN_TICKET_TTL_MS = 30_000;
  *  cannot tell (and need not care) which hop refused it. */
 export const SCREEN_CLOSE_BAD_TICKET = 4401;
 export const SCREEN_CLOSE_DESKTOP_GONE = 4001;
+export const SCREEN_PING_INTERVAL_MS = 30_000;
 const SCREEN_WS_PATH_RE = /^\/bots\/([^/]+)\/screen\/ws$/;
 /** Pause a source once the sink has this much queued; resume when it drains below the low mark. */
 const HIGH_WATER_BYTES = 1024 * 1024;
@@ -76,6 +77,12 @@ export interface BotScreenSurfaceOptions {
   broadcast: (frame: ServerFrame) => void;
   /** Sends to one device's sockets; false when it has none open (the frame then broadcasts). */
   sendToDevice?: (deviceId: string, frame: ServerFrame) => boolean;
+  /** Resolves a device token (the `Authorization: Bearer` on the screen WebSocket upgrade) to its
+   *  device id. A ticket is redeemed only by the device it was minted for; without this nothing
+   *  can redeem one. */
+  deviceForToken?: (token: string) => string | undefined;
+  /** How often the splice pings the phone; a phone that misses one ping is cut. */
+  pingIntervalMs?: number;
   now?: () => number;
   logSink?: (line: string) => void;
 }
@@ -97,6 +104,8 @@ export class BotScreenSurface {
   readonly #endpoints: readonly BotScreenEndpoint[];
   readonly #broadcast: (frame: ServerFrame) => void;
   readonly #sendToDevice: ((deviceId: string, frame: ServerFrame) => boolean) | undefined;
+  readonly #deviceForToken: ((token: string) => string | undefined) | undefined;
+  readonly #pingIntervalMs: number;
   readonly #now: () => number;
   readonly #log: (line: string) => void;
   /** profile_key (the profile's HERMES_HOME) -> public bot name, per endpoint client. Learned from
@@ -104,7 +113,7 @@ export class BotScreenSurface {
   readonly #keys = new Map<HermesClient, Map<string, string>>();
   readonly #tickets = new Map<string, Ticket>();
   /** Open `display.install.sudo` requests, by Hermes request id. */
-  readonly #sudo = new Map<string, { client: HermesClient; bot: string }>();
+  readonly #sudo = new Map<string, { client: HermesClient; bot: string; device: string }>();
   /** Who pressed Install, per bot: the sudo card goes to that phone. */
   readonly #installer = new Map<string, string>();
   readonly #wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
@@ -113,6 +122,8 @@ export class BotScreenSurface {
     this.#endpoints = opts.endpoints;
     this.#broadcast = opts.broadcast;
     this.#sendToDevice = opts.sendToDevice;
+    this.#deviceForToken = opts.deviceForToken;
+    this.#pingIntervalMs = opts.pingIntervalMs ?? SCREEN_PING_INTERVAL_MS;
     this.#now = opts.now ?? Date.now;
     this.#log = opts.logSink ?? ((line) => void process.stderr.write(`[bot-screen] ${line}\n`));
     this.#wss.on("error", () => {});
@@ -185,15 +196,27 @@ export class BotScreenSurface {
     return this.#call(name, "display.stop", force ? { force: true } : {}, START_TIMEOUT_MS);
   }
 
+  /** The installer is recorded BEFORE the call (Hermes may ask for sudo before its reply to
+   *  `display.install` is written) and forgotten if the call fails, so a refused or busy install
+   *  never leaves a device named for a card it did not ask for. */
   async install(name: string, deviceId: string): Promise<Payload> {
+    const previous = this.#installer.get(name);
     this.#installer.set(name, deviceId);
-    return this.#call(name, "display.install");
+    try {
+      return await this.#call(name, "display.install");
+    } catch (err) {
+      if (previous === undefined) this.#installer.delete(name);
+      else this.#installer.set(name, previous);
+      throw err;
+    }
   }
 
-  /** Answers one open sudo request. The password is written to the socket and nowhere else. */
-  answerSudo(name: string, requestId: string, password: string): void {
+  /** Answers one open sudo request, from the device it was sent to only. The password is written
+   *  to the socket and nowhere else. */
+  answerSudo(name: string, requestId: string, password: string, deviceId: string): void {
     const open = this.#sudo.get(requestId);
-    if (open === undefined || open.bot !== name) throw new ScreenRequestNotFound(`no open sudo request ${requestId} for ${name}`);
+    if (open === undefined || open.bot !== name || open.device !== deviceId)
+      throw new ScreenRequestNotFound(`no open sudo request ${requestId} for ${name}`);
     this.#sudo.delete(requestId);
     if (open.client.respond?.(requestId, { value: password }) !== true) {
       throw new ScreenRequestNotFound(`the Hermes link that asked for sudo request ${requestId} is gone`);
@@ -225,10 +248,12 @@ export class BotScreenSurface {
   }
 
   /** Single use: a ticket is gone the moment it is presented, valid or not for this bot. */
-  consumeTicket(ticket: string, bot: string): Ticket | undefined {
+  consumeTicket(ticket: string, bot: string, device: string | undefined): Ticket | undefined {
     const found = this.#tickets.get(ticket);
     this.#tickets.delete(ticket);
     if (found === undefined || found.bot !== bot || found.expiresAt <= this.#now()) return undefined;
+    // Bound to the device that minted it: a leaked ticket is worth nothing to anyone else.
+    if (device === undefined || found.deviceId !== device) return undefined;
     return found;
   }
 
@@ -306,7 +331,11 @@ export class BotScreenSurface {
       );
       const applied = record(result["applied"] ?? result);
       const conflicts = applied["ui_meta_conflicts"] ?? result["ui_meta_conflicts"];
-      if (conflicts === undefined || (Array.isArray(conflicts) && conflicts.length === 0)) return { enabled };
+      const clean = conflicts === undefined || (Array.isArray(conflicts) && conflicts.length === 0);
+      // Only a write Hermes says it applied is a success; a conflict retries once, anything else
+      // (a refused or skipped section) is an error rather than a toggle that silently did nothing.
+      if (clean && applied["ui_meta"] === true) return { enabled };
+      if (clean) throw new HermesRpcError("hermes did not apply the screenAutoOpen write");
     }
     throw new HermesRpcError("ui_meta changed twice while writing screenAutoOpen; try again");
   }
@@ -367,10 +396,20 @@ export class BotScreenSurface {
       client.respond?.(request.id, { value: "" });
       return;
     }
-    this.#sudo.set(request.id, { client, bot });
-    const frame: ServerFrame = { type: "bot_screen_install_sudo", bot, requestId: request.id };
+    // The masked card goes to the phone that pressed Install and to nobody else. With no such
+    // phone reachable the request is skipped at once (Hermes reports the install cancelled)
+    // rather than broadcast to every device or left waiting its 300 s.
     const device = this.#installer.get(bot);
-    if (device === undefined || this.#sendToDevice?.(device, frame) !== true) this.#broadcast(frame);
+    const frame: ServerFrame = { type: "bot_screen_install_sudo", bot, requestId: request.id };
+    if (device === undefined) {
+      client.respond?.(request.id, { value: "" });
+      return;
+    }
+    this.#sudo.set(request.id, { client, bot, device });
+    if (this.#sendToDevice?.(device, frame) !== true) {
+      this.#sudo.delete(request.id);
+      client.respond?.(request.id, { value: "" });
+    }
   }
 
   // MARK: The RFB splice
@@ -390,10 +429,13 @@ export class BotScreenSurface {
       bot = undefined;
     }
     const ticketText = url.searchParams.get("ticket") ?? "";
+    const header = req.headers.authorization ?? "";
+    const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
+    const device = token === "" ? undefined : this.#deviceForToken?.(token);
     this.#wss.handleUpgrade(req, socket, head, (phone) => {
       // Accept first, refuse after: a close frame carries a code, an HTTP 403 does not, and the
       // viewer has to tell "re-observe" (4401) from "the screen is gone" (4001).
-      const ticket = bot === undefined ? undefined : this.consumeTicket(ticketText, bot);
+      const ticket = bot === undefined ? undefined : this.consumeTicket(ticketText, bot, device);
       if (bot === undefined || ticket === undefined) {
         phone.close(SCREEN_CLOSE_BAD_TICKET, "screen ticket missing, expired or used");
         return;
@@ -413,6 +455,17 @@ export class BotScreenSurface {
       phoneClosed = { code, reason: reason.toString() };
     });
     phone.on("error", () => {});
+    // An idle viewer is still a viewer, but a vanished one must not hold both legs and the Xvnc
+    // connection open: one missed ping cuts it (which terminates the Hermes leg below).
+    let alive = true;
+    phone.on("pong", () => { alive = true; });
+    const pinger = setInterval(() => {
+      if (!alive) { phone.terminate(); return; }
+      alive = false;
+      if (phone.readyState === WebSocket.OPEN) phone.ping();
+    }, this.#pingIntervalMs);
+    pinger.unref();
+    phone.once("close", () => clearInterval(pinger));
 
     let hermesUrl: string;
     try {
@@ -438,8 +491,9 @@ export class BotScreenSurface {
     });
     hermes.once("close", (code, reason) => {
       if (phone.readyState !== WebSocket.OPEN && phone.readyState !== WebSocket.CONNECTING) return;
-      // 1005/1006 are reserved and cannot be sent; a drop on the Hermes side is a lost stream.
-      if (code === 1000 || (code >= 3000 && code <= 4999)) phone.close(code, reason.toString());
+      // Every code a close frame may carry passes through unchanged; 1004-1006 and 1015 are
+      // reserved and never sent, so a drop on the Hermes side is reported as a lost stream.
+      if (sendableCloseCode(code)) phone.close(code, reason.toString());
       else phone.close(1011, "screen stream lost");
     });
     phone.once("close", (code) => {
@@ -459,6 +513,11 @@ export class BotScreenSurface {
     for (const client of this.#wss.clients) client.terminate();
     this.#wss.close();
   }
+}
+
+/** RFC 6455 / IANA codes a close frame may carry: 1000-1003, 1007-1014 and 3000-4999. */
+export function sendableCloseCode(code: number): boolean {
+  return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) || (code >= 3000 && code <= 4999);
 }
 
 /** Forward every frame from `from` to `to`, pausing `from` while `to` has too much queued. */

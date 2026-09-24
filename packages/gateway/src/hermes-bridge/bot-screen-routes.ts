@@ -101,7 +101,7 @@ export function registerBotScreenRoutes(
     // "" is Hermes's own "skip": the install then reports no sudo and prints the command instead.
     const password = optionalString(input, "password", 4096) ?? "";
     if (requestId === undefined || requestId === "") throw new InvalidScreenBody("requestId is required");
-    screen.answerSudo(name, requestId, password);
+    screen.answerSudo(name, requestId, password, c.get("deviceId"));
     return c.body(null, 204);
   }));
   app.post("/bots/:name/screen/observe", requireDevice, route(async (c, name) => {
