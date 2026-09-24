@@ -237,44 +237,15 @@ function ConvertTo-PowerShellSingleQuotedLiteral {
     return "'" + $Value.Replace("'", "''") + "'"
 }
 
-function New-FakeUserNetTCPIPModule {
-    param([string] $MarkerPath)
-    $documents = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
-    Assert-True (-not [string]::IsNullOrWhiteSpace($documents)) 'Windows must expose the current user Documents directory for the PSModulePath regression test'
-    $windowsPowerShellRoot = Join-Path $documents 'WindowsPowerShell'
-    $modulesRoot = Join-Path $windowsPowerShellRoot 'Modules'
-    $moduleRoot = Join-Path $modulesRoot 'NetTCPIP'
-    Assert-True (-not (Test-Path -LiteralPath $moduleRoot)) "PSModulePath regression test refuses to replace an existing user NetTCPIP module at $moduleRoot"
-    $module = [pscustomobject]@{
-        ModuleRoot = $moduleRoot
-        ModulesRoot = $modulesRoot
-        WindowsPowerShellRoot = $windowsPowerShellRoot
-        OwnsModuleRoot = $false
-        CreatedModulesRoot = $false
-        CreatedWindowsPowerShellRoot = $false
-    }
-    try {
-        if (-not (Test-Path -LiteralPath $windowsPowerShellRoot)) {
-            try {
-                New-Item -ItemType Directory -Path $windowsPowerShellRoot -ErrorAction Stop | Out-Null
-                $module.CreatedWindowsPowerShellRoot = $true
-            } catch {
-                if (-not (Test-Path -LiteralPath $windowsPowerShellRoot -PathType Container)) { throw }
-            }
-        }
-        if (-not (Test-Path -LiteralPath $modulesRoot)) {
-            try {
-                New-Item -ItemType Directory -Path $modulesRoot -ErrorAction Stop | Out-Null
-                $module.CreatedModulesRoot = $true
-            } catch {
-                if (-not (Test-Path -LiteralPath $modulesRoot -PathType Container)) { throw }
-            }
-        }
-        New-Item -ItemType Directory -Path $moduleRoot -ErrorAction Stop | Out-Null
-        $module.OwnsModuleRoot = $true
-        $markerLiteral = ConvertTo-PowerShellSingleQuotedLiteral $MarkerPath
-        $body = @"
-[IO.File]::AppendAllText($markerLiteral, "fake-user-NetTCPIP-executed``r``n")
+function New-FakeNetTCPIPModule {
+    param([string] $ModulesRoot, [string] $MarkerPath)
+    # The shadowing module lives under the fixture temp root, never the real user's
+    # Documents\WindowsPowerShell\Modules. Tests expose it through PSModulePath instead.
+    $moduleRoot = Join-Path $ModulesRoot 'NetTCPIP'
+    New-Item -ItemType Directory -Force -Path $moduleRoot | Out-Null
+    $markerLiteral = ConvertTo-PowerShellSingleQuotedLiteral $MarkerPath
+    $body = @"
+[IO.File]::AppendAllText($markerLiteral, "fake-NetTCPIP-executed``r``n")
 function Get-NetTCPConnection {
     [CmdletBinding()]
     param([string]`$State)
@@ -282,38 +253,22 @@ function Get-NetTCPConnection {
 }
 Export-ModuleMember -Function Get-NetTCPConnection
 "@
-        Write-Utf8NoBom (Join-Path $moduleRoot 'NetTCPIP.psm1') $body
-        return $module
-    } catch {
-        Remove-FakeUserNetTCPIPModule $module
-        throw
-    }
-}
-
-function Remove-FakeUserNetTCPIPModule {
-    param($Module)
-    if ($null -eq $Module) { return }
-    if ($Module.OwnsModuleRoot -and (Test-Path -LiteralPath $Module.ModuleRoot)) {
-        Remove-Item -LiteralPath $Module.ModuleRoot -Recurse -Force -ErrorAction Stop
-    }
-    if ($Module.OwnsModuleRoot -and (Test-Path -LiteralPath $Module.ModuleRoot)) { throw "failed to remove temporary user NetTCPIP module: $($Module.ModuleRoot)" }
-    if ($Module.CreatedModulesRoot -and (Test-Path -LiteralPath $Module.ModulesRoot) -and @((Get-ChildItem -LiteralPath $Module.ModulesRoot -Force)).Count -eq 0) {
-        Remove-Item -LiteralPath $Module.ModulesRoot -Force -ErrorAction Stop
-    }
-    if ($Module.CreatedWindowsPowerShellRoot -and (Test-Path -LiteralPath $Module.WindowsPowerShellRoot) -and @((Get-ChildItem -LiteralPath $Module.WindowsPowerShellRoot -Force)).Count -eq 0) {
-        Remove-Item -LiteralPath $Module.WindowsPowerShellRoot -Force -ErrorAction Stop
-    }
+    Write-Utf8NoBom (Join-Path $moduleRoot 'NetTCPIP.psm1') $body
 }
 
 function Invoke-OwnerHelperScript {
-    param([string] $ScriptPath, [int] $Port)
+    param([string] $ScriptPath, [int] $Port, [string] $ShadowModulesRoot)
     $previousPreference = $ErrorActionPreference
+    $previousModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Process')
     try {
         $ErrorActionPreference = 'Continue'
+        # The helper inherits this shadowing root first; it must reset PSModulePath itself.
+        if ($ShadowModulesRoot) { $env:PSModulePath = $ShadowModulesRoot + ';' + $previousModulePath }
         $output = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $ScriptPath 'C:\Expected Hermes Root' 'C:\Expected Hermes Root\bin\hermes.exe' 'C:\Expected Hermes Root\bin\hermes.exe' $Port 2>&1
         return @{ ExitCode = $LASTEXITCODE; Output = ($output -join "`n") }
     } finally {
         $ErrorActionPreference = $previousPreference
+        [Environment]::SetEnvironmentVariable('PSModulePath', $previousModulePath, 'Process')
     }
 }
 
@@ -593,7 +548,6 @@ $temp = Join-Path ([IO.Path]::GetTempPath()) ("cozygateway-windows-bootstrap-" +
 New-Item -ItemType Directory -Force -Path $temp | Out-Null
 . (Join-Path $PSScriptRoot 'windows-fixture-environment.ps1')
 $installer = New-IsolatedInstallerFixture $installer $temp
-$fakeUserNetTCPIP = $null
 
 try {
     Assert-True (Test-Path -LiteralPath $installer) 'scripts/install.ps1 must exist'
@@ -1655,18 +1609,16 @@ stop_owned_windows_gateway 0
     $portReservation.Start()
     $ownerProbePort = ([Net.IPEndPoint]$portReservation.LocalEndpoint).Port
     $portReservation.Stop()
-    $fakeUserNetTCPIP = New-FakeUserNetTCPIPModule $fakeModuleMarker
-    try {
-        $wrapperResult = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths 0
-        $ownerProbeResult = Invoke-OwnerHelperScript $instrumentedOwner $ownerProbePort
-        $failedImportResult = Invoke-OwnerHelperScript $failedImportOwner $ownerProbePort
-    } finally {
-        Remove-FakeUserNetTCPIPModule $fakeUserNetTCPIP
-        $fakeUserNetTCPIP = $null
-    }
+    # The elevation harness poisons its PSModulePath with exactly this directory, so the
+    # shadowing module is live for both the elevated child and the owner helper.
+    $shadowModulesRoot = Join-Path (Join-Path $temp 'poisoned-installer-environment') 'PSModulePath'
+    New-FakeNetTCPIPModule $shadowModulesRoot $fakeModuleMarker
+    $wrapperResult = Invoke-ElevationWrapperHarness $elevationWrapper $wrapperHarness $startCapture $childCapture $wrapperPaths 0
+    $ownerProbeResult = Invoke-OwnerHelperScript $instrumentedOwner $ownerProbePort $shadowModulesRoot
+    $failedImportResult = Invoke-OwnerHelperScript $failedImportOwner $ownerProbePort $shadowModulesRoot
     Assert-True ($wrapperResult.ExitCode -eq 0) "elevation wrapper must return elevated child 0: $($wrapperResult.Output)"
     $fakeModuleEvidence = if (Test-Path -LiteralPath $fakeModuleMarker) { Get-Content -LiteralPath $fakeModuleMarker -Raw } else { '<none>' }
-    Assert-True (-not (Test-Path -LiteralPath $fakeModuleMarker)) "fake user-scope NetTCPIP module must never execute in the elevated PS5.1 child; marker: $fakeModuleEvidence"
+    Assert-True (-not (Test-Path -LiteralPath $fakeModuleMarker)) "fake NetTCPIP module on the inherited PSModulePath must never execute in the elevated PS5.1 child or the owner helper; marker: $fakeModuleEvidence"
     Assert-True ($ownerProbeResult.ExitCode -eq 0) "instrumented production owner helper must succeed on an absent listener: $($ownerProbeResult.Output)"
     Assert-True ($failedImportResult.ExitCode -eq 43) "trusted module setup failure must remain an indeterminate pre-inspection result (actual $($failedImportResult.ExitCode)): $($failedImportResult.Output)"
     $ownerProbeResult = Import-Clixml -LiteralPath $ownerProbeCapture
@@ -1752,6 +1704,5 @@ stop_owned_windows_gateway 0
 
     Write-Host 'windows bootstrap tests passed'
 } finally {
-    Remove-FakeUserNetTCPIPModule $fakeUserNetTCPIP
     Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
 }
