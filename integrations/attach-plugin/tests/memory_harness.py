@@ -15,7 +15,7 @@ import sys
 import threading
 import types
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 #: Any content containing this marker is treated as a threat by the stub scanner.
 THREAT_MARKER = "ignore all previous instructions"
@@ -46,6 +46,24 @@ def install_threat_scanner(test: Any, blocked: Optional[str] = None) -> None:
             else: sys.modules[name] = value
 
     test.addCleanup(restore)
+
+
+def builtin_memory_tool() -> types.ModuleType:
+    """A ``tools.memory_tool`` carrying the one flag reader the setup state asks Hermes for.
+
+    It reads the two curated switches out of a config mapping the way Hermes'
+    ``get_builtin_memory_store_flags`` does: absent means on.
+    """
+    module = types.ModuleType("tools.memory_tool")
+
+    def get_builtin_memory_store_flags(config: Optional[Dict[str, Any]] = None) -> Tuple[bool, bool]:
+        section = config.get("memory") if isinstance(config, dict) else None
+        section = section if isinstance(section, dict) else {}
+        memory, user = (bool(section.get(key, True)) for key in ("memory_enabled", "user_profile_enabled"))
+        return memory, user
+
+    module.get_builtin_memory_store_flags = get_builtin_memory_store_flags  # type: ignore[attr-defined]
+    return module
 
 
 class FakeCuratedStore:

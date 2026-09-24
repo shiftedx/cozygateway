@@ -136,6 +136,26 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["reason"], "unknown_turn")
         self.assertNotIn("message", event)
 
+    async def _negotiate(self, capabilities):
+        await self.client.connect()
+        await self.client._dispatch_inbound(json.dumps({
+            "kind": "hello_ack", "capabilities": capabilities,
+            "resume": {"eventSequence": 0, "commandSequence": 0},
+            "limits": {"maxInFlightEvents": 64, "maxInFlightBytes": 4194304},
+        }))
+
+    async def test_a_memory_result_states_the_setup_switches_only_where_negotiated(self):
+        """cozychat#411. A gateway that did not grant ``memory_setup_state`` validates the
+        overview as a closed object, so the field it does not know would fail the whole reply."""
+        setup = {"memoryEnabled": True, "userProfileEnabled": False, "holographicEnabled": False}
+        await self._negotiate(["memory_management", "memory_setup"])
+        await self.client.send_memory_result("old", "ok", result={"sources": [], "setup": setup})
+        self.assertEqual(self.socket.sent[-1]["result"], {"sources": []})
+
+        await self._negotiate(["memory_management", "memory_setup", "memory_setup_state"])
+        await self.client.send_memory_result("new", "ok", result={"sources": [], "setup": setup})
+        self.assertEqual(self.socket.sent[-1]["result"], {"sources": [], "setup": setup})
+
     async def test_a_refusal_below_69_is_byte_identical_to_its_pre_69_self(self):
         await self.client.connect()
         await self.client._dispatch_inbound(json.dumps({
@@ -423,7 +443,7 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(HELLO_CAPABILITIES), {
             "draft", "media", "tools", "approvals", "clarify", "scheduled",
             "mobile_node", "mobile_location", "mobile_media", "mobile_notifications",
-            "memory_management", "memory_setup", "delivery_receipts", "delegation", "thinking",
+            "memory_management", "memory_setup", "memory_setup_state", "delivery_receipts", "delegation", "thinking",
             "desktop_session_resume", "desktop_session_sync", "cozyapps", "bot_config", "chat_configuration", "provider_connections", "chat_context",
         })
 

@@ -40,6 +40,10 @@ export const AttachV1CapabilitySchema = Type.Union([
   Type.Literal("mobile_notifications"),
   Type.Literal("memory_management"),
   Type.Literal("memory_setup"),
+  /** cozychat#411: the peer states its current setup switches (`BotMemorySetupState`) on its
+   * `overview`, `setup` and `items` results. A literal of its own because a gateway that does not
+   * grant it validates those results as closed objects without the field. */
+  Type.Literal("memory_setup_state"),
   /** Capability 60: authoritative ownership metadata on memory mutations. */
   Type.Literal("memory_ownership"),
   Type.Literal("delivery_receipts"),

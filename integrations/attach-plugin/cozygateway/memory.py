@@ -480,6 +480,30 @@ class MemoryManager:
         except Exception as error:
             logger.debug("memory: provider row unavailable (%s)", type(error).__name__)
         return rows
+    def setup_state(self) -> Optional[Dict[str, bool]]:
+        """The three capability-42 switches as Hermes' effective configuration reads them now.
+
+        Read from configuration, never from ``sources()``: every adapter is listed whether or not
+        its switch is on (Holographic reads ``unavailable`` when it is not the provider), so a
+        source row is not a switch (cozychat#411). The curated pair comes from Hermes' own flag
+        reader, the one its store uses; Holographic is on exactly when it is the selected
+        provider, the adapter's own test. ``None`` when configuration cannot be read, so the
+        reply omits the field rather than guessing.
+        """
+        try:
+            from hermes_cli.config import load_config_readonly
+            from tools.memory_tool import get_builtin_memory_store_flags
+            config = load_config_readonly()
+            memory, user = get_builtin_memory_store_flags(config)
+            section = config.get("memory") if isinstance(config, dict) else None
+            provider = str((section if isinstance(section, dict) else {}).get("provider") or "").strip().lower()
+            return {"memoryEnabled": bool(memory), "userProfileEnabled": bool(user), "holographicEnabled": provider == "holographic"}
+        except Exception as error:
+            logger.warning("memory: setup state unavailable (%s)", type(error).__name__)
+            return None
+    def _stated(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        state = self.setup_state()
+        return result if state is None else {**result, "setup": state}
     def setup(self, input: Dict[str, Any]) -> Dict[str, Any]:
         """Apply the capability-42 settings through Hermes' atomic publisher.
 
@@ -548,7 +572,7 @@ class MemoryManager:
             logger.debug("memory: setup failed (%s)", type(error).__name__)
             raise MemoryError("memory settings could not be applied") from None
         try:
-            return {"sources": self.sources()}
+            return self._stated({"sources": self.sources()})
         except Exception as error:
             logger.debug("memory: setup projection failed (%s)", type(error).__name__)
             raise MemoryError("memory settings could not be confirmed") from None
@@ -567,7 +591,7 @@ class MemoryManager:
             if row.get("id") == source and row.get("status") == "available":
                 row["status"], row["detail"] = "degraded", detail[:512]
     def execute(self, operation: str, input: Dict[str, Any]) -> Dict[str, Any]:
-        if operation == "overview": return {"sources": self.sources()}
+        if operation == "overview": return self._stated({"sources": self.sources()})
         if operation == "setup": return self.setup(input)
         source = input.get("sourceId")
         if operation == "items":
@@ -582,7 +606,7 @@ class MemoryManager:
             items = [item for item in items if (not kind or item["kind"] == kind) and (not isinstance(since, int) or item.get("createdAt", -1) >= since) and (not isinstance(until, int) or item.get("createdAt", until + 1) <= until)]
             items.sort(key=lambda item: (int(item.get("updatedAt", 0)), item["id"]), reverse=True)
             limit = min(_MAX_ITEMS, max(1, int(input.get("limit", _MAX_ITEMS))))
-            return {"items": items[:limit], "sources": statuses}
+            return self._stated({"items": items[:limit], "sources": statuses})
         if operation == "graph":
             if isinstance(source, str) and source:
                 return self._adapter(source).graph(**input)

@@ -3,7 +3,7 @@ import { once } from "node:events";
 
 import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { BOTS_CAPABILITY_VERSION, type BotMemoryItem } from "cozygateway-contract";
+import { BOTS_CAPABILITY_VERSION, type BotMemoryItem, type BotMemorySetupState } from "cozygateway-contract";
 
 import { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
 import type { AttachV1MemoryRequest, AttachV1ServerFrame } from "../src/adapters/attach/protocol-v1.ts";
@@ -105,19 +105,21 @@ describe("capability-42 memory setup for a runtime bot", () => {
     storage.close();
   });
 
-  /** A peer that answers `overview`, `items` and `setup` the way the CozyAgents peer does. */
-  async function dial(capabilities: string[]): Promise<{ ws: WebSocket; requests: AttachV1MemoryRequest[] }> {
+  /** A peer that answers `overview`, `items` and `setup` the way the CozyAgents peer does. Given a
+   *  `setup` state, it states it on those three projections once `memory_setup_state` is granted. */
+  async function dial(capabilities: string[], setup?: BotMemorySetupState): Promise<{ ws: WebSocket; requests: AttachV1MemoryRequest[]; granted: string[] }> {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, { headers: { authorization: "Bearer secret" } });
     const requests: AttachV1MemoryRequest[] = [];
-    let acked = false;
+    let granted: string[] | undefined;
     ws.on("message", (data) => {
       const frame = JSON.parse(String(data)) as AttachV1ServerFrame;
-      if (frame.kind === "hello_ack") { acked = true; return; }
+      if (frame.kind === "hello_ack") { granted = frame.capabilities; return; }
       if (frame.kind !== "memory_request") return;
       requests.push(frame);
-      const result = frame.operation === "items" ? { items: [item], sources: [source] }
+      const stated = setup !== undefined && granted?.includes("memory_setup_state") === true ? { setup } : {};
+      const result = frame.operation === "items" ? { items: [item], sources: [source], ...stated }
         : frame.operation === "create" ? { item }
-          : { sources: [source] };
+          : { sources: [source], ...stated };
       ws.send(JSON.stringify({ kind: "memory_result", requestId: frame.requestId, status: "ok", result }));
     });
     await once(ws, "open");
@@ -125,8 +127,8 @@ describe("capability-42 memory setup for a runtime bot", () => {
       kind: "hello", version: 2, instanceId: "peer", capabilities,
       resume: { eventSequence: 0, commandSequence: 0 },
     }));
-    await until(() => acked);
-    return { ws, requests };
+    await until(() => granted !== undefined);
+    return { ws, requests, granted: granted ?? [] };
   }
 
   const setupBody = { memoryEnabled: true, userProfileEnabled: true, holographicEnabled: false };
@@ -183,6 +185,24 @@ describe("capability-42 memory setup for a runtime bot", () => {
     expect(await items.json()).toEqual({ items: [item], sources: [source], setupAvailable: true });
     const overview = await authed("/bots/sage/memory");
     expect(await overview.json()).toEqual({ sources: [source], setupAvailable: true });
+    peer.ws.close();
+  });
+
+  // cozychat#411: which switches are on is the peer's to state, from its configuration, and the
+  // gateway's only job is to grant the capability and pass the answer on unchanged to every
+  // projection a settings screen reads. `holographic` off with a source listed is deliberate: the
+  // sources list is not the switches.
+  it("grants memory_setup_state and passes the peer's current switches through unchanged", async () => {
+    const state = { memoryEnabled: false, userProfileEnabled: true, holographicEnabled: false };
+    const peer = await dial(["memory_management", "memory_setup", "memory_setup_state"], state);
+    expect(peer.granted).toContain("memory_setup_state");
+    const items = await authed("/bots/sage/memory/items");
+    expect(await items.json()).toEqual({ items: [item], sources: [source], setupAvailable: true, setup: state });
+    const overview = await authed("/bots/sage/memory");
+    expect(await overview.json()).toEqual({ sources: [source], setupAvailable: true, setup: state });
+    const applied = await patchSetup();
+    expect(applied.status).toBe(200);
+    expect(await applied.json()).toEqual({ sources: [source], setupAvailable: true, setup: state });
     peer.ws.close();
   });
 

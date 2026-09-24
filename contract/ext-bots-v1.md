@@ -1135,6 +1135,17 @@ fact about the peer and not about the memory: a bot that already reports sources
 `true`, which is what lets a settings screen exist next to a non-empty memory rather than only on a
 first-run empty one.
 
+`BotMemoryOverviewResponse.setup` and `BotMemoryItemsResponse.setup` are the PEER's optional
+statement of the three capability-42 switches as its effective configuration reads them now:
+`BotMemorySetupState` `{ memoryEnabled, userProfileEnabled, holographicEnabled }`, closed, all three
+required booleans, named as the setup request names them. Unlike the request, all three may be
+false. A peer includes it only after negotiating attach-v1 `memory_setup_state`, and the gateway
+passes it through unchanged; the `PATCH /bots/:name/memory/setup` answer carries it re-read after
+the write. Absent means the peer did not say, never that the switches are off, and a client must
+not infer the switches from `sources` instead: sources name adapters, which a peer lists whether or
+not their switch is on (a Hermes profile always lists `holographic`, as `unavailable` when it is not
+the provider). The field is additive and needs no capability row: a client reads its presence.
+
 Capability 42 setup additionally negotiates `memory_setup`. Its closed request requires
 `memoryEnabled`, `userProfileEnabled`, and `holographicEnabled`, all booleans, with at least one
 true. The plugin changes only `memory.memory_enabled`, `memory.user_profile_enabled`, and the

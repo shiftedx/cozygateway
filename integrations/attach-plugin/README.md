@@ -134,6 +134,8 @@ Dependencies: Python 3.10+ and the `websockets` package.
   sends memory content through the durable event spool. After a coordinated upgrade, a missing
   negotiated capability produces a bounded unavailable response instead of accepting or retaining
   the mutation for reconnect; it is evidence that the final matched-version cutover is incomplete.
+  When `memory_setup_state` is also negotiated, overview, setup and item listings state which of
+  the three switches Hermes' effective configuration has on, so a settings screen opens on them.
 - Disconnects re-dial with capped, jittered backoff. Two closes are terminal: a rejected
   token (close 1008) and being superseded by a newer connection (close 4000).
 

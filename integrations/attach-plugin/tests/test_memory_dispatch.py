@@ -25,7 +25,7 @@ from unittest.mock import patch
 
 from cozygateway.memory import CuratedAdapter, HolographicAdapter, MemoryConflict, MemoryError, MemoryManager, VaultAdapter
 
-from tests.memory_harness import FakeCuratedStore, FakeHolographicStore, install_threat_scanner
+from tests.memory_harness import FakeCuratedStore, FakeHolographicStore, builtin_memory_tool, install_threat_scanner
 
 CONTRACT = Path(__file__).resolve().parents[3] / "packages" / "contract" / "src" / "ext-bots.ts"
 
@@ -96,7 +96,50 @@ class MemoryDispatchTests(unittest.TestCase):
 
         module.save_config = save_config
         package = types.ModuleType("hermes_cli"); package.__path__ = []  # type: ignore[attr-defined]
-        return state, writes, preserves, patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.config": module})
+        return state, writes, preserves, patch.dict(sys.modules, {
+            "hermes_cli": package, "hermes_cli.config": module, "tools.memory_tool": builtin_memory_tool(),
+        })
+
+    def test_every_projection_states_the_switches_from_configuration_not_from_sources(self):
+        """cozychat#411. Every adapter is listed whether or not its switch is on, so a source
+        row cannot say which switches are on; the effective configuration can."""
+        _, _, _, modules = self._config_writer({"memory": {"memory_enabled": False, "provider": "external"}})
+        with modules:
+            overview = self.manager.execute("overview", {})
+            listing = self.manager.execute("items", {})
+        expected = {"memoryEnabled": False, "userProfileEnabled": True, "holographicEnabled": False}
+        self.assertEqual(overview["setup"], expected)
+        self.assertEqual(listing["setup"], expected)
+        self.assertLessEqual({"curated-memory", "curated-user", "holographic"}, {row["id"] for row in overview["sources"]})
+
+    def test_holographic_is_on_exactly_when_it_is_the_selected_provider(self):
+        for provider, expected in (("holographic", True), (" Holographic ", True), ("external", False), (None, False)):
+            with self.subTest(provider=provider):
+                _, _, _, modules = self._config_writer({"memory": {"provider": provider}})
+                with modules:
+                    self.assertIs(self.manager.execute("overview", {})["setup"]["holographicEnabled"], expected)
+
+    def test_setup_answers_with_the_switches_re_read_after_the_write(self):
+        _, _, _, modules = self._config_writer({"memory": {"provider": "external"}})
+        with modules:
+            answer = self.manager.execute("setup", {
+                "memoryEnabled": True, "userProfileEnabled": False, "holographicEnabled": True,
+            })
+        self.assertEqual(answer["setup"], {"memoryEnabled": True, "userProfileEnabled": False, "holographicEnabled": True})
+
+    def test_an_unreadable_configuration_omits_the_switches_rather_than_guessing(self):
+        module = types.ModuleType("hermes_cli.config")
+        module.load_config_readonly = lambda: (_ for _ in ()).throw(OSError("config unreadable"))
+        package = types.ModuleType("hermes_cli"); package.__path__ = []  # type: ignore[attr-defined]
+        with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.config": module, "tools.memory_tool": builtin_memory_tool()}):
+            # A warning, not a debug line: a renamed Hermes flag reader must be visible in the log
+            # rather than silently dropping the field from every reply.
+            with self.assertLogs("cozygateway.memory", level="WARNING") as captured:
+                overview = self.manager.execute("overview", {})
+        self.assertNotIn("setup", overview)
+        self.assertTrue(overview["sources"])
+        self.assertTrue(any("setup state unavailable" in line and "OSError" in line for line in captured.output), captured.output)
+        self.assertFalse(any("config unreadable" in line for line in captured.output), captured.output)
 
     def test_setup_uses_the_native_merge_writer_for_only_allowlisted_memory_settings(self):
         state, writes, preserves, modules = self._config_writer({
@@ -185,7 +228,10 @@ class MemoryDispatchTests(unittest.TestCase):
             answer = self.manager.execute("setup", {
                 "memoryEnabled": False, "userProfileEnabled": False, "holographicEnabled": True,
             })
-        self.assertEqual(answer, {"sources": projection})
+        # The switch reads on while its source is degraded, which is what keeps a repair re-apply open.
+        self.assertEqual(answer, {"sources": projection, "setup": {
+            "memoryEnabled": False, "userProfileEnabled": False, "holographicEnabled": True,
+        }})
 
     def test_setup_applies_each_supported_curated_combination(self):
         cases = (
