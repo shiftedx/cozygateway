@@ -81,6 +81,13 @@ describe("parseMentions", () => {
     expect(parsed.members.size).toBe(0);
   });
 
+  it("resolves a renamed member's old handle, but never over a live name", () => {
+    const lookout = { name: "lookout", handle: "lookout", displayName: "Lookout", previousNames: ["scout", "luna"] };
+    const room = [lookout, members.find((member) => member.name === "luna")!];
+    expect(parseMentions("@scout are you there", room).members).toEqual(new Set(["lookout"]));
+    expect(parseMentions("@luna go", room).members).toEqual(new Set(["luna"]));
+  });
+
   it("ignores a mention that names nobody in the room", () => {
     expect(parseMentions("@nobody hello", members).members.size).toBe(0);
   });
