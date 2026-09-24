@@ -20,6 +20,7 @@ import {
   BotModelProviderFieldUpdateSchema,
   BotModelProviderOAuthCodeSchema,
   BotProfilePatchSchema,
+  BotPresentationPatchSchema,
   IntegrationCreateRequestSchema,
   IntegrationCatalogInstallRequestSchema,
   IntegrationEnabledRequestSchema,
@@ -73,6 +74,7 @@ import {
   normalizeProfileName,
 } from "./crud.ts";
 import { GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
+import { PresentationConflict, PresentationNotApplied } from "./presentation.ts";
 import {
   MEDIA_CACHE_CONTROL,
   MEDIA_MAX_CONCURRENT,
@@ -291,6 +293,10 @@ function failure(c: Context<Env>, err: unknown) {
     );
   if (err instanceof ProviderSetupInvalid)
     return c.json(errorBody("invalid_request", err.message), 400);
+  if (err instanceof PresentationConflict)
+    return c.json(extensionErrorBody("conflict", err.message), 409);
+  if (err instanceof PresentationNotApplied)
+    return c.json(errorBody("backend_unavailable", err.message), 503);
   if (err instanceof BotSessionConflict) {
     return c.json(extensionErrorBody("conflict", err.message), 409);
   }
@@ -1365,6 +1371,49 @@ export function registerBotRoutes(
       return failure(c, err);
     }
   });
+
+  // Capability 80: the synced roster presentation (pin, hide, user section, title). Registered only
+  // on a surface that can answer it, so a gateway without a Hermes profile behind it answers 404.
+  if (bots.botPresentation !== undefined && bots.configurePresentation !== undefined) {
+    const readPresentation = bots.botPresentation.bind(bots);
+    const writePresentation = bots.configurePresentation.bind(bots);
+    app.get("/bots/:name/presentation", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        return c.json(await readPresentation(resolved.name));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+
+    app.patch("/bots/:name/presentation", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      let body: unknown;
+      try {
+        body = await c.req.json();
+      } catch {
+        body = undefined;
+      }
+      let parsed;
+      try {
+        parsed = assertValid(BotPresentationPatchSchema, body);
+      } catch (err) {
+        const detail = err instanceof ContractViolation ? err.message : "malformed body";
+        return c.json(errorBody("invalid_request", detail), 400);
+      }
+      // An empty patch is a client bug; an empty success would hide it.
+      if (Object.keys(parsed).length === 0) {
+        return c.json(errorBody("invalid_request", "at least one of pinned, hidden, sectionId, sectionName, title is required"), 400);
+      }
+      try {
+        return c.json(await writePresentation(resolved.name, parsed));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+  }
 
   app.get("/bots/:name/model-config", requireDevice, async (c) => {
     const resolved = canonicalName(c);

@@ -1467,6 +1467,42 @@ export type BotProfile = Static<typeof BotProfileSchema>;
  *  rather than through this gateway, so the field is `Type.Optional(Type.Never())` -- present at
  *  all, with any value, is `400 invalid_request` naming the field, the same shape every other
  *  boundary refusal on this route already answers. */
+/** Capability 80. The per-bot presentation the Hermes desktop plugin syncs through
+ *  `ui_meta["hermes-bots"]`: roster pin, roster hide, user-section membership (id plus the name that
+ *  lets another client rebuild a section it never made) and the friendly title. Every field is
+ *  optional because the blob simply lacks a key nobody wrote; an absent key is NOT `false`, which is
+ *  what lets a client push a device-local pin the first time it syncs. */
+const PresentationText = Type.String({ minLength: 1, maxLength: 128, pattern: "\\S" });
+export const BotPresentationSchema = Type.Object({
+  pinned: Type.Optional(Type.Boolean()),
+  hidden: Type.Optional(Type.Boolean()),
+  sectionId: Type.Optional(PresentationText),
+  sectionName: Type.Optional(PresentationText),
+  title: Type.Optional(PresentationText),
+}, { additionalProperties: false });
+export type BotPresentation = Static<typeof BotPresentationSchema>;
+
+/** Capability 80. `PATCH /bots/:name/presentation` body. Only the keys present are written, `null`
+ *  clears a section or title, and every other key in the profile's `ui_meta["hermes-bots"]` blob is
+ *  kept verbatim (the gateway re-reads and re-applies on a revision conflict, never overwrites). */
+export const BotPresentationPatchSchema = Type.Object({
+  pinned: Type.Optional(Type.Boolean()),
+  hidden: Type.Optional(Type.Boolean()),
+  sectionId: Type.Optional(Type.Union([PresentationText, Type.Null()])),
+  sectionName: Type.Optional(Type.Union([PresentationText, Type.Null()])),
+  title: Type.Optional(Type.Union([PresentationText, Type.Null()])),
+}, { additionalProperties: false });
+export type BotPresentationPatch = Static<typeof BotPresentationPatchSchema>;
+
+/** Capability 80. `GET` and `PATCH /bots/:name/presentation` answer. `revision` is Hermes's own
+ *  per-key compare-and-swap counter for `ui_meta["hermes-bots"]` (0 when never written). */
+export const BotPresentationResponseSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 128 }),
+  presentation: BotPresentationSchema,
+  revision: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotPresentationResponse = Static<typeof BotPresentationResponseSchema>;
+
 const NameItem = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
 
 export const BotProfilePatchSchema = Type.Object({
@@ -3063,5 +3099,9 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * exists. Delivery approval pushes alone may request the time-sensitive APNs interruption level.
  * Capability 78: optional attach heartbeat turn-health reports let the gateway detect an interim
  * delivery seal while a turn remains active; native chat state may expose `deliveryStatus` as
- * `checking` without changing its execution lifecycle. */
-export const BOTS_CAPABILITY_VERSION = 78;
+ * `checking` without changing its execution lifecycle.
+ * Capability 79: reserved, runtime-bot settings (CozyAgents gateway). Not advertised meaning here.
+ * Capability 80: `GET`/`PATCH /bots/:name/presentation` reads and writes the synced roster
+ * presentation (pin, hide, user section, title) in `ui_meta["hermes-bots"]` with Hermes's own
+ * per-key compare-and-swap; a revision conflict re-reads and re-applies only the patched keys. */
+export const BOTS_CAPABILITY_VERSION = 80;
