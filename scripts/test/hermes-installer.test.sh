@@ -2640,24 +2640,20 @@ expect_contains "$mux_rerun_output" 'the host Hermes gateway is already running 
 mkdir -p "$mux_hermes/profiles/phone"
 printf '%s\n' "$mux_profile_yaml" > "$mux_hermes/profiles/phone/config.yaml"
 cp "$mux_hermes/.env" "$mux_hermes/profiles/phone/.env"
-cat > "$mux_hermes/hermes-agent/venv/bin/python" <<'MUX_PYTHON'
-#!/bin/sh
-if [ "$2" = --hermes-control ]; then
-  cat >/dev/null
-  printf '%s %s\n' "$4" "${5:-}" >> "${MUX_CONTROL_LOG:?}"
-  exit 0
-fi
-exec python3 -S "$@"
-MUX_PYTHON
-chmod 700 "$mux_hermes/hermes-agent/venv/bin/python"
-if ! mux_phone_output="$(HOME="$tmp/mux-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" MUX_CONTROL_LOG="$tmp/mux-phone-control" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"hermes":{"configured":5,"online":5},"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$mux_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-phone-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --no-qr --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mux" 2>&1)"; then
+# Hermes' control verbs answer through the fixtures/hermes-control stand-in, so the installer's own
+# answer handling runs: a rescan that outlasts Hermes' 5 s bound answers `pending` ("not an error"),
+# and a reload for a home the host does not serve yet is retried once after a rescan.
+mux_control_answers='{"reload-plugins": [{"reloaded": false, "error": "home is not served by this gateway"}, {"reloaded": true}], "rescan-profiles": [{"multiplex": true, "pending": true, "served_profiles": ["default", "alpha", "beta"]}]}'
+if ! mux_phone_output="$(HOME="$tmp/mux-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" PYTHONPATH="$repo_root/scripts/test/fixtures/hermes-control" COZY_TEST_CONTROL_LOG="$tmp/mux-phone-control" COZY_TEST_CONTROL_STATE="$tmp/mux-phone-control-state" COZY_TEST_CONTROL_ANSWERS="$mux_control_answers" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"hermes":{"configured":5,"online":5},"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$mux_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-phone-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --no-qr --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mux" 2>&1)"; then
   printf 'provisioning a phone-created bot on a multiplexed host failed:\n%s\n' "$mux_phone_output" >&2; exit 1
 fi
 if grep -q ':gateway:' "$tmp/mux-phone-commands" 2>/dev/null; then
   printf 'a phone-created bot bounced a gateway:\n%s\n' "$(cat "$tmp/mux-phone-commands")" >&2; exit 1
 fi
-test "$(cat "$tmp/mux-phone-control")" = "reload-plugins phone
-rescan-profiles "
+test "$(cat "$tmp/mux-phone-control")" = "reload-plugins phone env-scoped=1
+rescan-profiles
+reload-plugins phone env-scoped=1
+rescan-profiles"
 phone_mux_token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$mux_hermes/profiles/phone/.env")"
 test -n "$phone_mux_token"
 test "$phone_mux_token" != "$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$mux_hermes/.env")"
@@ -2668,12 +2664,13 @@ expect_contains "$mux_phone_output" 'the host Hermes gateway picked up profiles 
 mkdir -p "$mux_hermes/profiles/quiet"
 printf '%s\n' "$mux_profile_yaml" > "$mux_hermes/profiles/quiet/config.yaml"
 cp "$mux_hermes/.env" "$mux_hermes/profiles/quiet/.env"
-cp "$tmp/hermes/hermes-agent/venv/bin/python" "$mux_hermes/hermes-agent/venv/bin/python"
-if ! mux_quiet_output="$(HOME="$tmp/mux-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"hermes":{"configured":6,"online":6},"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$mux_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-quiet-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --no-qr --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mux" 2>&1)"; then
+if ! mux_quiet_output="$(PYTHONPATH="$repo_root/scripts/test/fixtures/hermes-control" COZY_TEST_CONTROL_STATE="$tmp/mux-quiet-control-state" COZY_TEST_CONTROL_ANSWERS='{"reload-plugins": [null], "rescan-profiles": [null]}' HOME="$tmp/mux-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_ATTACH_HEALTH='{"attach":{"hermes":{"configured":6,"online":6},"deadLetters":0}}' COZYGATEWAY_TEST_HERMES_ROOT="$mux_hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-quiet-commands" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_HERMES_BIN="$tmp/bin/hermes" COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --no-qr --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-mux" 2>&1)"; then
   printf 'the control-verb fallback failed:\n%s\n' "$mux_quiet_output" >&2; exit 1
 fi
 test "$(grep -c ':gateway:' "$tmp/mux-quiet-commands")" = 1
 grep -q '^default:gateway:restart$' "$tmp/mux-quiet-commands"
+
+
 
 # A stopped host is started once, even when the default profile itself is not selected.
 mux_stopped="$tmp/hermes-mux-stopped"

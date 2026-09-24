@@ -975,6 +975,11 @@ hot_add_candidate() {
 }
 # One Hermes control verb on the running host's socket (gateway/control_socket.py):
 # `reload-plugins <profile>` or `rescan-profiles`. Fails when nothing answered.
+#   * A rescan that outlasts Hermes' 5-second bound answers `pending` while the new
+#     adapter still connects (gateway/run.py: "not an error"); that is an answer,
+#     and the attach health gate proves the rest.
+#   * reload-plugins refuses a home the host does not serve yet
+#     (gateway/run_plugin_rewire.py): rescan once so it does, and retry once.
 host_control() {
   local python="$HERMES_ROOT/hermes-agent/venv/bin/python"
   [ -x "$python" ] || return 1
@@ -987,13 +992,23 @@ try:
     from gateway import control_socket
 except Exception:
     sys.exit(3)
-if verb == "reload-plugins":
-    answer = control_socket.reload_gateway_plugins(root, profile_home=root / "profiles" / sys.argv[4])
-    sys.exit(0 if isinstance(answer, dict) and answer.get("reloaded") else 1)
-if verb == "rescan-profiles":
+
+
+def rescanned():
     answer = control_socket.rescan_gateway_profiles(root)
-    sys.exit(0 if isinstance(answer, dict) and answer.get("multiplex") is not False
-             and "served_profiles" in answer and not answer.get("pending") else 1)
+    return isinstance(answer, dict) and answer.get("multiplex") is not False and "served_profiles" in answer
+
+
+def reloaded(home):
+    answer = control_socket.reload_gateway_plugins(root, profile_home=home)
+    return isinstance(answer, dict) and answer.get("reloaded") is True
+
+
+if verb == "reload-plugins":
+    home = root / "profiles" / sys.argv[4]
+    sys.exit(0 if reloaded(home) or (rescanned() and reloaded(home)) else 1)
+if verb == "rescan-profiles":
+    sys.exit(0 if rescanned() else 1)
 sys.exit(2)
 PY
 }
