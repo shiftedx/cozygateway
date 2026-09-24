@@ -117,6 +117,8 @@ have ssh || die "ssh not found on PATH"
 # --dry-run on a machine without a Hermes install still reports honestly.
 PYTHON="$HERMES_HOME_ROOT/hermes-agent/venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
+# shellcheck source=hermes-host.sh
+. "$SCRIPT_DIR/hermes-host.sh"
 
 # The env-var name the gateway config points at, derived the way the six live
 # entries were: upper-cased, every non-alphanumeric run folded to one _.
@@ -897,6 +899,39 @@ ensure_service() {
   say "  service $label running"
 }
 
+# A profile the multiplexed host serves has no service of its own (hermes-host.sh).
+# A newly wired one is hot-added: plugins reloaded for its home before its .env is
+# written (see the loop below), then one rescan. A live one whose plugin or config
+# changed waits for the single host restart after the loop. Either way nothing here
+# ever runs a per-profile gateway verb, which Hermes refuses for a served profile.
+HOST_RESTART_PROFILES=()
+host_reload_before_env() {
+  local profile="$1"
+  if [ "$DRY_RUN" = 1 ]; then say "  DRY  ask the host Hermes gateway to reload plugins for $profile"; return 0; fi
+  if host_control reload-plugins "$profile"; then
+    say "  host Hermes gateway reloaded plugins for $profile"
+    return 0
+  fi
+  say "  host Hermes gateway did not answer reload-plugins; it will be restarted once after this run"
+  return 1
+}
+host_pickup() {
+  local profile="$1" hot_add="$2" reloaded="$3" changed="$4"
+  if [ "$hot_add" = 1 ] && [ "$reloaded" = 1 ]; then
+    if [ "$DRY_RUN" = 1 ]; then say "  DRY  ask the host Hermes gateway to rescan profiles"; return 0; fi
+    if host_control rescan-profiles; then
+      say "  the host Hermes gateway serves it (plugins reloaded, profiles rescanned; no restart)"
+      return 0
+    fi
+    say "  host Hermes gateway did not answer rescan-profiles; it will be restarted once after this run"
+  elif [ "$hot_add" = 0 ] && [ "$changed" = 0 ]; then
+    say "  the host Hermes gateway serves it (nothing changed)"
+    return 0
+  fi
+  HOST_RESTART_PROFILES+=("$profile")
+  return 1
+}
+
 # The only proof that matters: the box says this profile negotiated an attach
 # hello. /ready alone would only say the fleet count moved, which a concurrent
 # reconnect could also explain.
@@ -975,6 +1010,16 @@ for profile in "${PROFILES[@]}"; do
   provisioning_pending="$profile_dir/.cozygateway-provision-pending"
   pending_before=0
   [ ! -f "$provisioning_pending" ] || pending_before=1
+  # Served by a multiplexed host: a profile with no working attach of its own yet is hot-added,
+  # which needs its plugins reloaded in the host BEFORE the .env writes below.
+  served=0; hot_add=0; reloaded=0
+  if served_by_host "$profile"; then
+    served=1
+    if [ "$token_changed" = 1 ] || [ "$pending_before" = 1 ]; then
+      hot_add=1
+      ! host_reload_before_env "$profile" || reloaded=1
+    fi
+  fi
   if [ "$DRY_RUN" != 1 ]; then
     # Written before local/remote credentials change; a failed handoff remains
     # visible even when the next attempt finds matching env and plugin files.
@@ -1004,13 +1049,40 @@ for profile in "${PROFILES[@]}"; do
   recreate_box_gateway
   restart_needed=0
   { [ "$PLUGIN_SYNC_CHANGED" = 1 ] || [ "$STREAMING_CONFIG_CHANGED" = 1 ] || [ "$token_changed" = 1 ] || [ "$pending_before" = 1 ]; } && restart_needed=1
-  ensure_service "$profile" "$restart_needed"
+  if [ "$served" = 1 ]; then
+    # The host rebuilds a profile only after its .env or config.yaml changed since its last look,
+    # so mark one change after the reload even when every value above was already right.
+    [ "$hot_add" = 0 ] || [ "$DRY_RUN" = 1 ] || touch "$env_file"
+    # Verified after the one host restart instead, when this profile needs it.
+    host_pickup "$profile" "$hot_add" "$reloaded" "$restart_needed" || continue
+  else
+    ensure_service "$profile" "$restart_needed"
+  fi
   if verify_attached "$profile"; then
     [ "$DRY_RUN" = 1 ] || rm -f "$provisioning_pending"
   else
     overall_rc=1
   fi
 done
+
+# One restart of the multiplexed host for every served profile that needed it.
+if [ "${#HOST_RESTART_PROFILES[@]}" -gt 0 ]; then
+  say ""
+  say "=== host Hermes gateway ==="
+  if [ "$DRY_RUN" = 1 ]; then
+    say "  DRY  $HERMES_BIN -p $HOST_PROFILE gateway restart (it serves ${HOST_RESTART_PROFILES[*]})"
+  else
+    host_restart >/dev/null || die "could not restart the host Hermes gateway for ${HOST_RESTART_PROFILES[*]}"
+    say "  restarted the host Hermes gateway once; it serves ${HOST_RESTART_PROFILES[*]}"
+  fi
+  for profile in "${HOST_RESTART_PROFILES[@]}"; do
+    if verify_attached "$profile"; then
+      [ "$DRY_RUN" = 1 ] || rm -f "$HERMES_HOME_ROOT/profiles/$profile/.cozygateway-provision-pending"
+    else
+      overall_rc=1
+    fi
+  done
+fi
 
 say ""
 if [ "$overall_rc" = 0 ]; then say "provision-bot: all profiles provisioned"; fi

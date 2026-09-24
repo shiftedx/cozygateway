@@ -179,7 +179,7 @@ cleanup() { rm -rf "$staging" "$next"; rm -f "$plist_tmp" "$prior_plist"; }
 trap cleanup EXIT
 
 mkdir -p "$staging/scripts" "$staging/integrations/attach-plugin" "$(dirname "$PLIST")"
-rsync -a "$SCRIPT_DIR/bot-provisioner-watch.sh" "$SCRIPT_DIR/provision-bot.sh" "$SCRIPT_DIR/deprovision-bot.sh" "$staging/scripts/"
+rsync -a "$SCRIPT_DIR/bot-provisioner-watch.sh" "$SCRIPT_DIR/provision-bot.sh" "$SCRIPT_DIR/deprovision-bot.sh" "$SCRIPT_DIR/hermes-host.sh" "$staging/scripts/"
 rsync -a --delete \
   --exclude '__pycache__/' --exclude '.pytest_cache/' --exclude '*.pyc' \
   "$REPO_ROOT/integrations/attach-plugin/" "$staging/integrations/attach-plugin/"

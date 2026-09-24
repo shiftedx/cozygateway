@@ -23,6 +23,8 @@ grep -Fq "<string>$HOME/.local/bin/hermes</string>" "$PLIST"
 grep -Fq "<string>$HOME/.local/bin:/opt/homebrew/bin" "$PLIST"
 test -x "$TMP/stage/current/scripts/deprovision-bot.sh"
 cmp "$ROOT/scripts/deprovision-bot.sh" "$TMP/stage/current/scripts/deprovision-bot.sh"
+# Sourced by the staged provisioner, watcher and deprovisioner: it must ship with them.
+cmp "$ROOT/scripts/hermes-host.sh" "$TMP/stage/current/scripts/hermes-host.sh"
 printf 'bot provisioner installer: ok\n'
 
 python3 "$ROOT/scripts/test/bot-deprovision.test.py"

@@ -37,7 +37,11 @@ make_fake_bin() {
 #!/bin/sh
 printf '%s\n' "$*" >> "$COZY_TEST_LAUNCHCTL_LOG"
 case "$1" in
-  print|list) exit 0 ;;
+  # COZY_TEST_LAUNCHCTL_LOADED: only these space-separated labels are loaded.
+  print)
+    [ -n "${COZY_TEST_LAUNCHCTL_LOADED+x}" ] || exit 0
+    case " $COZY_TEST_LAUNCHCTL_LOADED " in *" ${2##*/} "*) exit 0 ;; *) exit 113 ;; esac ;;
+  list) exit 0 ;;
   *) exit 0 ;;
 esac
 SH
@@ -62,6 +66,15 @@ SH
   cat > "$bin/hermes" <<'SH'
 #!/bin/sh
 printf '%s\n' "$*" >> "${COZY_TEST_HERMES_LOG:-/dev/null}"
+# A multiplexed host (hermes_cli/gateway.py): with `gateway.multiplex_profiles: true` in the root
+# config.yaml, a named profile that is not `gateway.standalone: true` has no gateway of its own and
+# every lifecycle verb for it exits 78.
+if { [ "$1" = "-p" ] || [ "$1" = "--profile" ]; } && [ "$3" = "gateway" ] && [ "$2" != default ] \
+  && grep -Eq '^  multiplex_profiles: true' "$COZY_TEST_HERMES_HOME/config.yaml" 2>/dev/null \
+  && ! grep -Eq '^  standalone: true' "$COZY_TEST_HERMES_HOME/profiles/$2/config.yaml" 2>/dev/null; then
+  printf "The host gateway already serves profile '%s'.\n" "$2" >&2
+  exit 78
+fi
 if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "set" ]; then
   [ -n "${COZY_TEST_HERMES_WRITER_FAILS:-}" ] && exit 1
   [ -n "${COZY_TEST_HERMES_NOOP_WRITER:-}" ] && exit 0
@@ -151,8 +164,17 @@ make_fake_python() {
 # The streaming-key read is a REAL structural read. \`python3 -S\` skips
 # site-packages, so PyYAML is guaranteed absent and the reader's stdlib probe is
 # what answers, which is the shape a hosted runner has.
-if [ "\$2" = "--streaming-keys" ]; then
+if [ "\$2" = "--streaming-keys" ] || [ "\$2" = "--hermes-config-bool" ]; then
   exec python3 -S "\$@"
+fi
+# Hermes' control verbs: recorded with whether the profile's .env was already scoped to it when
+# the verb arrived, answered with COZY_TEST_CONTROL_RC (0: the host answered).
+if [ "\$2" = "--hermes-control" ]; then
+  cat >/dev/null
+  scoped=0
+  [ -z "\${5:-}" ] || ! grep -q "^COZYGATEWAY_SPOOL_PATH=\$3/profiles/\$5/" "\$3/profiles/\$5/.env" 2>/dev/null || scoped=1
+  printf '%s %s env-scoped=%s\n' "\$4" "\${5:-}" "\$scoped" >> "\${COZY_TEST_CONTROL_LOG:-/dev/null}"
+  exit "\${COZY_TEST_CONTROL_RC:-0}"
 fi
 if [ "\$1" = "-" ] && [ "\$2" = "$hermes" ]; then
   printf '%s\\n' '$profiles'
@@ -193,7 +215,7 @@ SH
 test_watcher_ignores_checkout_pytest_cache() {
   local repo="$TMP/cache-repo" hermes="$TMP/cache-hermes" bin="$TMP/cache-bin" log="$TMP/cache.log" calls="$TMP/cache-calls"
   mkdir -p "$repo/scripts" "$repo/integrations/attach-plugin/.pytest_cache/v/cache"
-  cp "$ROOT/scripts/bot-provisioner-watch.sh" "$ROOT/scripts/deprovision-bot.sh" "$repo/scripts/"
+  cp "$ROOT/scripts/bot-provisioner-watch.sh" "$ROOT/scripts/deprovision-bot.sh" "$ROOT/scripts/hermes-host.sh" "$repo/scripts/"
   printf 'name: cozygateway\n' > "$repo/integrations/attach-plugin/plugin.yaml"
   printf '[]\n' > "$repo/integrations/attach-plugin/.pytest_cache/v/cache/nodeids"
   make_fake_bin "$bin"
@@ -222,7 +244,7 @@ SH
 test_provisioner_ignores_checkout_pytest_cache() {
   local repo="$TMP/provision-cache-repo" hermes="$TMP/provision-cache-hermes" bin="$TMP/provision-cache-bin" launch_log="$TMP/provision-cache-launchctl"
   mkdir -p "$repo/scripts" "$repo/integrations/attach-plugin/.pytest_cache/v/cache"
-  cp "$ROOT/scripts/provision-bot.sh" "$repo/scripts/"
+  cp "$ROOT/scripts/provision-bot.sh" "$ROOT/scripts/hermes-host.sh" "$repo/scripts/"
   printf 'name: cozygateway\n' > "$repo/integrations/attach-plugin/plugin.yaml"
   printf '[]\n' > "$repo/integrations/attach-plugin/.pytest_cache/v/cache/nodeids"
   make_fake_bin "$bin"
@@ -615,7 +637,7 @@ SH
 test_watcher_picks_up_a_wired_profile_that_cannot_stream() {
   local repo="$TMP/stream-repo" hermes="$TMP/stream-hermes" bin="$TMP/stream-bin" log="$TMP/stream.log" calls="$TMP/stream-calls"
   mkdir -p "$repo/scripts" "$repo/integrations/attach-plugin"
-  cp "$ROOT/scripts/bot-provisioner-watch.sh" "$ROOT/scripts/deprovision-bot.sh" "$repo/scripts/"
+  cp "$ROOT/scripts/bot-provisioner-watch.sh" "$ROOT/scripts/deprovision-bot.sh" "$ROOT/scripts/hermes-host.sh" "$repo/scripts/"
   printf 'name: cozygateway\n' > "$repo/integrations/attach-plugin/plugin.yaml"
   make_fake_bin "$bin"
   make_profile "$hermes" silent
@@ -860,6 +882,154 @@ YAML
   fi
 }
 
+# ── Multiplexed Hermes host ─────────────────────────────────────────────────
+# ONE host gateway (the default profile's, `gateway.multiplex_profiles: true`) serves every
+# profile. A served profile never gets an `ai.hermes.gateway-<p>` job; Hermes refuses its
+# per-profile gateway verbs. A newly wired profile is hot-added through Hermes' own control verbs:
+# `reload-plugins` for its home BEFORE its .env is written (the host's reconcile only rediscovers
+# plugins on a forced pass, and only rebuilds a profile whose config/.env changed after that), then
+# `rescan-profiles`. Plugin code for a LIVE adapter only changes on a host restart, once per run.
+make_multiplexed_root() {
+  local hermes="$1"
+  mkdir -p "$hermes"
+  printf 'gateway:\n  multiplex_profiles: true\n' > "$hermes/config.yaml"
+}
+
+# The .env a phone-created profile arrives with: a copy of the launch profile's, so nothing in it
+# is scoped to this profile.
+make_inherited_env() {
+  printf 'COZYGATEWAY_TOKEN=launch-profile-token\nCOZYGATEWAY_SPOOL_PATH=%s/plugin-data/cozygateway/attach-v1.sqlite\n' "$1" \
+    > "$1/profiles/$2/.env"
+}
+
+test_provisioner_hot_adds_a_new_profile_to_a_multiplexed_host() {
+  local hermes="$TMP/mux-new-hermes" bin="$TMP/mux-new-bin" hermes_log="$TMP/mux-new-hermes-calls"
+  local launch_log="$TMP/mux-new-launchctl" control_log="$TMP/mux-new-control" output="$TMP/mux-new.out" token
+  make_fake_bin "$bin"
+  make_multiplexed_root "$hermes"
+  make_profile "$hermes" fresh
+  make_inherited_env "$hermes" fresh
+  make_fake_python "$hermes" ''
+
+  if ! HOME="$TMP/mux-new-home" PATH="$bin:/usr/bin:/bin" COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOADED='' COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/mux-new-ssh" \
+    COZY_TEST_HERMES_LOG="$hermes_log" COZY_TEST_CONTROL_LOG="$control_log" \
+    "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake fresh > "$output" 2>&1; then
+    cat "$output" >&2; fail 'provisioning a new profile on a multiplexed host failed'
+  fi
+  # Its own attach settings, and no per-profile gateway of any kind.
+  token="$(sed -n 's/^COZYGATEWAY_TOKEN=//p' "$hermes/profiles/fresh/.env")"
+  [ -n "$token" ] && [ "$token" != launch-profile-token ] || fail 'new served profile did not get its own token'
+  assert_contains "$hermes/profiles/fresh/.env" "COZYGATEWAY_SPOOL_PATH=$hermes/profiles/fresh/plugin-data/cozygateway/attach-v1.sqlite"
+  if grep -q ' gateway ' "$hermes_log" 2>/dev/null; then fail "a served profile got a gateway verb: $(cat "$hermes_log")"; fi
+  if grep -Eq 'bootstrap|kickstart' "$launch_log" 2>/dev/null; then fail "a served profile got a launchd job: $(cat "$launch_log")"; fi
+  # Hermes picks it up hot: plugins reloaded for its home before its .env was scoped, then a rescan.
+  [ "$(cat "$control_log")" = "reload-plugins fresh env-scoped=0
+rescan-profiles  env-scoped=0" ] || fail "unexpected host control sequence: $(cat "$control_log")"
+  assert_contains "$output" 'the host Hermes gateway serves it'
+}
+
+test_provisioner_restarts_a_multiplexed_host_once_for_changed_live_profiles() {
+  local hermes="$TMP/mux-live-hermes" bin="$TMP/mux-live-bin" hermes_log="$TMP/mux-live-hermes-calls"
+  local launch_log="$TMP/mux-live-launchctl" control_log="$TMP/mux-live-control" output="$TMP/mux-live.out"
+  make_fake_bin "$bin"
+  make_multiplexed_root "$hermes"
+  make_profile "$hermes" first-live
+  make_profile "$hermes" second-live
+  copy_stale_plugin "$hermes/profiles/first-live/plugins/cozygateway"
+  copy_stale_plugin "$hermes/profiles/second-live/plugins/cozygateway"
+  make_fake_python "$hermes" ''
+
+  if ! HOME="$TMP/mux-live-home" PATH="$bin:/usr/bin:/bin" COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOADED='' COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/mux-live-ssh" \
+    COZY_TEST_HERMES_LOG="$hermes_log" COZY_TEST_CONTROL_LOG="$control_log" \
+    "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake first-live second-live > "$output" 2>&1; then
+    cat "$output" >&2; fail 'refreshing live profiles on a multiplexed host failed'
+  fi
+  # New plugin code for a live adapter needs the process restarted: once, on the host.
+  [ "$(grep -c 'gateway restart' "$hermes_log")" = 1 ] || fail "expected one host restart: $(cat "$hermes_log")"
+  assert_contains "$hermes_log" '-p default gateway restart'
+  if grep -Eq -- '-(p|-profile) (first|second)-live gateway' "$hermes_log"; then fail 'a served profile got a gateway verb'; fi
+  if grep -Eq 'bootstrap|kickstart' "$launch_log" 2>/dev/null; then fail 'a served profile got a launchd job'; fi
+  [ ! -s "$control_log" ] || fail "a live profile's code change was left to a rescan: $(cat "$control_log")"
+}
+
+test_provisioner_falls_back_to_one_host_restart_when_the_host_does_not_answer() {
+  local hermes="$TMP/mux-quiet-hermes" bin="$TMP/mux-quiet-bin" hermes_log="$TMP/mux-quiet-hermes-calls" output="$TMP/mux-quiet.out"
+  make_fake_bin "$bin"
+  make_multiplexed_root "$hermes"
+  make_profile "$hermes" first-new
+  make_profile "$hermes" second-new
+  make_inherited_env "$hermes" first-new
+  make_inherited_env "$hermes" second-new
+  make_fake_python "$hermes" ''
+
+  if ! HOME="$TMP/mux-quiet-home" PATH="$bin:/usr/bin:/bin" COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOADED='' COZY_TEST_LAUNCHCTL_LOG="$TMP/mux-quiet-launchctl" COZY_TEST_SSH_LOG="$TMP/mux-quiet-ssh" \
+    COZY_TEST_HERMES_LOG="$hermes_log" COZY_TEST_CONTROL_LOG="$TMP/mux-quiet-control" COZY_TEST_CONTROL_RC=1 \
+    "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake first-new second-new > "$output" 2>&1; then
+    cat "$output" >&2; fail 'provisioning with an unresponsive host control socket failed'
+  fi
+  [ "$(grep -c 'gateway restart' "$hermes_log")" = 1 ] || fail "expected exactly one fallback host restart: $(cat "$hermes_log")"
+  assert_contains "$hermes_log" '-p default gateway restart'
+}
+
+test_provisioner_keeps_a_standalone_profile_on_its_own_service() {
+  local hermes="$TMP/mux-solo-hermes" bin="$TMP/mux-solo-bin" hermes_log="$TMP/mux-solo-hermes-calls"
+  local launch_log="$TMP/mux-solo-launchctl" control_log="$TMP/mux-solo-control"
+  make_fake_bin "$bin"
+  make_multiplexed_root "$hermes"
+  make_profile "$hermes" solo
+  printf 'gateway:\n  standalone: true\n' >> "$hermes/profiles/solo/config.yaml"
+  copy_stale_plugin "$hermes/profiles/solo/plugins/cozygateway"
+  make_fake_python "$hermes" ''
+
+  HOME="$TMP/mux-solo-home" PATH="$bin:/usr/bin:/bin" COZY_TEST_HERMES_HOME="$hermes" \
+    COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/mux-solo-ssh" \
+    COZY_TEST_HERMES_LOG="$hermes_log" COZY_TEST_CONTROL_LOG="$control_log" \
+    "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake solo >/dev/null
+
+  assert_contains "$launch_log" 'kickstart -k gui/'
+  assert_contains "$launch_log" '/ai.hermes.gateway-solo'
+  if grep -q 'gateway restart' "$hermes_log" 2>/dev/null; then fail 'a standalone profile restarted the host'; fi
+  [ ! -s "$control_log" ] || fail 'a standalone profile was sent to the host'
+}
+
+test_watcher_does_not_demand_a_launchd_job_for_a_served_profile() {
+  local repo="$TMP/mux-watch-repo" hermes="$TMP/mux-watch-hermes" bin="$TMP/mux-watch-bin" log="$TMP/mux-watch.log" calls="$TMP/mux-watch-calls"
+  mkdir -p "$repo/scripts" "$repo/integrations"
+  cp "$ROOT/scripts/bot-provisioner-watch.sh" "$ROOT/scripts/deprovision-bot.sh" "$ROOT/scripts/hermes-host.sh" "$repo/scripts/"
+  cp -R "$ROOT/integrations/attach-plugin" "$repo/integrations/attach-plugin"
+  make_fake_bin "$bin"
+  make_multiplexed_root "$hermes"
+  for name in served solo; do
+    make_profile "$hermes" "$name"
+    mkdir -p "$hermes/profiles/$name/plugins"
+    cp -R "$repo/integrations/attach-plugin" "$hermes/profiles/$name/plugins/cozygateway"
+  done
+  printf 'gateway:\n  standalone: true\n' >> "$hermes/profiles/solo/config.yaml"
+  make_fake_python "$hermes" ''
+  cat > "$bin/provision" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" > "$COZY_TEST_PROVISION_CALLS"
+SH
+  chmod +x "$bin/provision"
+  mkdir -p "$TMP/mux-watch-runtime"
+  date +%s > "$TMP/mux-watch.lock.reconcile"
+
+  HOME="$TMP/mux-watch-home" TMPDIR="$TMP/mux-watch-runtime" PATH="$bin:/usr/bin:/bin" \
+    COZY_TEST_HERMES_HOME="$hermes" COZY_TEST_LAUNCHCTL_LOADED='' \
+    COZY_TEST_LAUNCHCTL_LOG="$TMP/mux-watch-launchctl" COZY_TEST_SSH_LOG="$TMP/mux-watch-ssh" \
+    COZY_TEST_PROVISION_CALLS="$calls" COZY_PROVISION_COMMAND="$bin/provision" \
+    COZY_PROVISIONER_LOCK="$TMP/mux-watch.lock" COZY_PROVISIONER_RECONCILE_SECONDS=999999 \
+    "$repo/scripts/bot-provisioner-watch.sh" --dry-run --hermes-home "$hermes" --log "$log"
+
+  # A served profile is wired with no job of its own; a standalone one still needs its job.
+  if grep -q 'pending: served' "$log"; then fail "watcher re-provisions a served profile every sweep: $(cat "$log")"; fi
+  assert_contains "$log" 'pending: solo (no launchd gateway service)'
+  assert_contains "$calls" '--dry-run solo'
+}
+
 test_watcher_repairs_content_drift
 test_streaming_reader_answers_without_pyyaml
 test_watcher_picks_up_a_wired_profile_that_cannot_stream
@@ -878,4 +1048,8 @@ test_provisioner_copies_existing_chat_registry_to_new_profile
 test_provisioner_preserves_partial_chat_registry
 test_deploy_discovers_every_opted_in_profile
 test_deploy_rejects_partial_configured_fleet
+test_provisioner_hot_adds_a_new_profile_to_a_multiplexed_host
+test_provisioner_restarts_a_multiplexed_host_once_for_changed_live_profiles
+test_provisioner_falls_back_to_one_host_restart_when_the_host_does_not_answer
+test_provisioner_keeps_a_standalone_profile_on_its_own_service
 printf 'plugin rollout: ok\n'
