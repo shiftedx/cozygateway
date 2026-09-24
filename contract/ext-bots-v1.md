@@ -131,6 +131,8 @@ and does not register `/bots` routes.
 | 85 | Bot screen (Hermes Bot Screen, a bot's headless Linux desktop). Routes, each passing the Hermes `display.*` result through VERBATIM (snake_case, so a client shares one decoder with a direct Hermes connection): `GET /bots/:name/screen` (`display.status`), `GET /bots/:name/screen/thumbnail` (`{data_url, suppressed?}`), `POST /bots/:name/screen/start`, `POST /bots/:name/screen/stop {force?}`, `POST /bots/:name/screen/install`, `POST /bots/:name/screen/lease/acquire {viewerId, reason?}` and `POST /bots/:name/screen/lease/release {viewerId?, force?}` (both answer `{lease}`). Hermes error 5300 answers 409 `conflict` with `hermesErrorCode: 5300` and `reason` (`viewer_mismatch` when a human holds control; retry with `force`). `POST /bots/:name/screen/install/sudo {requestId, password}` answers 204 and relays the password ONCE to the pending Hermes `display.install.sudo` server request (`""` skips); the gateway never logs or stores it; 404 when that request is not open. `POST /bots/:name/screen/observe {viewerId?}` answers the Hermes observe result plus `ticket` (the gateway's own: single-use, 30 s, bound to the device, the bot and the Hermes viewer id), `path` (`/bots/<name>/screen/ws`) and `viewer_id` (Hermes's minted id; `sha256(viewer_id)[:12]` matches `lease.viewer_hash` while this viewer holds control). The WebSocket `GET /bots/:name/screen/ws?ticket=` takes no device token: a bad, used or expired ticket is closed 4401 after accept; otherwise the gateway mints a fresh Hermes ticket and splices raw RFB binary frames both ways to Hermes `/api/display/ws?display_ticket=`, forwarding Hermes's close code (4000 control-taken, 4001 screen gone, 4401) and a client's clean 1000/1001 close (which hands the lease back); an abnormal client drop cuts the Hermes leg and keeps a human's lease, as upstream does. `GET`/`PATCH /bots/:name/screen/config` read and deep-merge `{geometry, autoStart, minFreeMemoryMb, idleStopMinutes, browserHeaded}` (`bot_desktop.*`, `browser.headed`) through the dashboard config route. `GET`/`PUT /bots/:name/screen/auto-open {enabled}` read and compare-and-swap `ui_meta['hermes-bots'].screenAutoOpen` without clobbering other keys (superseded by row 80's presentation route). Frames, sent only to clients that declare bots >= 85 (or declare nothing): `bot_screen_status {bot, status}`, `bot_screen_lease {bot, lease}`, `bot_screen_install_log {bot, line}`, `bot_screen_install_done {bot, code, status?}` (0 ok, -1 cancelled, -2 no sudo), `bot_screen_install_sudo {bot, requestId}` (to the device that pressed Install when it is connected, else broadcast) and `bot_screen_request_cancel {bot, requestId}`. |
 | 86 | Chat semantics, reactions and voice. See [Row 86 (chat semantics and reactions)](#row-86-chat-semantics-and-reactions) and [Row 86 (voice)](#row-86-voice-per-bot-read-aloud-and-auto-speak) below. |
 | 87 | The foreground relay courier (Hermes Desktop parity, `relay.ts`). A phone that holds this gateway and another Hermes connection carries `message_agent` DMs between them while it is in the foreground; the gateway only forwards the four upstream doors to its own Hermes, in Hermes's own shapes. `GET /bot-relay/identity` answers `{connectionId, label, installId?}` (`installId` is the Hermes install behind the gateway, so a phone that also reaches that install directly treats the two as one connection): the id this gateway goes by on the relay, built from server facts only (the configured name, slugged, plus the first six characters of the Hermes `install_id` from `/api/status`), so every phone derives the same id and a change on one phone never shifts it. `POST /bot-relay/roster` takes `{ agents }` and admits rows one by one as Hermes's `_normalize_roster_row` does: a row whose `profile`, `handle` or `connection_id` does not match `^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$` is dropped, `connection_label`, `title` and `description` are cut to 80, 120 and 160 characters (the description on one line), and the rest is forwarded to `bot_relay.roster.sync`, answering `{count}`; a bad row never refuses the push. `POST /bot-relay/drain` calls `bot_relay.outbox.drain` and answers `{envelopes}` verbatim (claimed envelopes are Hermes's to re-offer). `POST /bot-relay/deliver` takes `{profile, message, fromProfile?, fromHandle?, fromConnection?}` (`message` at most 32,400 UTF-16 units; Hermes owns the exact 16,000-character limit), calls `bot_relay.deliver` with `from_*` params and the upstream 1,500 s budget, and answers `{reply}` or, for a failed or refused turn, `{error, reason?}` with Hermes's typed `data.reason` (`provider_auth_or_access`, `provider_quota_limit`, `provider_rate_limit`, `provider_server_error`, `context_overflow`, `missing_config`, `model_unavailable`, `runtime_offline`, `queued_expired`, `delivery_timeout`, `target_busy`, `unknown`); a failed turn is a 200 outcome, not an HTTP error, so the code survives. `POST /bot-relay/reply` takes `{id, reply?, error?, reason?}` (no cap on `reply`: a refused reply would leave the sender's waiter to time out and the envelope to be re-delivered) and calls `bot_relay.reply` with only the keys given. The `bot_relay_pending` frame (no payload) is broadcast whenever Hermes emits `bot_relay.outbox.pending`. `BotSummary.workerActiveAt` (milliseconds or null) carries `profiles.list` `worker_session.last_active`, and `BotSummary.workerActive` is that stamp read against the gateway's own clock when the row was built (under 150 s), so a skewed phone clock cannot misread it. Routes are registered only on a single-Hermes gateway; a federated gateway answers 404 and is left out of the relay. Additive: new routes, one new frame, one optional field. |
+| 88 | Team roles and the assignment turn context. `BotProfile` and `BotProfilePatch` gain optional `role` (`leader` or `member`; absent means member) and `reports` (at most 16 bot names, leader only). The gateway stores both itself and merges them into `GET /bots/:name/profile`; `PATCH` checks them, forwards only the remaining fields to the peer, and stores them once that forward succeeds, so a patch carrying only these two touches no peer and answers `applied: { team: true }`. `reports` on a member, a report naming the bot itself, and a name that is not a bot on this gateway are `400 invalid_request`; setting `role: "member"` clears `reports` and cancels the open assignments that bot led. No nested delegation: a leader may not be a report, and a report may not become a leader (`400`). Attach-v1 `TurnContext` gains an optional `task` beside `room` (`{id, assignedBy, brief, doneCriteria, outputFormat?, deadlineAt}`, `id` being the Task id) and `room` becomes optional, because an assignment turn has no room; `text` is byte-identical with and without `context`, exactly as 47 promised. The assignment surface itself is `com.cozylabs.agent-inbox` 1, never inferred from this scalar. Additive. |
+| 89 | A chat client declares a bot's REMOTE MCP servers over the `bot_config` lane. `BotProfilePatch` gains `declareMcpServers` (1-16 `BotMcpServerDeclaration`, each a whole upsert by name) and `removeMcpServers` (1-64 server names), carried on the existing capability-48 `profile.write`; no new route and no new operation. A declaration is closed: `name` (a card name, `^[a-z0-9][a-z0-9_-]{0,63}$`), `transport` (the literal `http`: Streamable HTTP, which the harness falls back to SSE on), `url` (http or https), optional `headers` (at most 8), `description` (1-200 characters, no control character), `tools` (the allowlist the harness exposes, 1-128 unique names) and `actions` (per-tool action allowlists; needs `tools` and names only tools in it). TRUST MODEL: (1) REMOTE ONLY. There is no stdio shape: `command`, `args`, `env` and `cwd` are not fields, so no request reaches host command execution; a stdio server stays the operator's to declare in the bot's environment. (2) SECRETS BY NAME, BOUND TO ORIGINS. A header value is exactly one `${COZY_MCP_<NAME>}` placeholder, optionally after one scheme word (`Bearer`, `Basic`, `Token`), so the phone, the gateway and every projection hold only the variable's name; no other variable can be named. The peer MUST expand `${COZY_MCP_<NAME>}` only when the declaration's URL origin (scheme, host, port) is listed in the operator-set `COZY_MCP_<NAME>_ORIGINS` (a comma list of origins), and otherwise MUST refuse the declaration by name in `ignored` before dialling anything. Each entry is compared EXACTLY against the WHATWG `URL.origin` serialization of the declaration's URL (`https://ha.example.com`, `http://10.0.0.5:8123`): no wildcards, no prefix or suffix match, and an origin that serializes as `null` never matches. The binding is per ORIGIN, not per path, so an operator should list only origins whose whole surface they trust with that token; a missing variable fails that server's start by name and shows in its `requires`. The allowlist is set on the harness, never through this lane, and a header may not name an `_ORIGINS` variable. So a device that can write this patch still cannot aim an operator secret at an origin the operator did not list. (3) URL AND SSRF. The gateway refuses userinfo, query, fragment, backslash and `${...}` in the URL (the obvious credential slots; a path can still hold anything, so a client must not put a secret there) and, as defence in depth, a literal loopback (127/8, `::1`), unspecified (0/8, `::`), link-local (169.254/16, fe80::/10), deprecated site-local (fec0::/10) or cloud metadata (169.254.169.254, 100.100.100.200, 192.0.0.192, fd00:ec2::254) address, an IPv6 form carrying such an IPv4 address (IPv4-mapped `::ffff:0:0/96`, IPv4-compatible `::/96`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`), and the host names `localhost`, `*.localhost`, `localhost.localdomain`, `ip6-localhost`, `ip6-loopback` and `metadata.google.internal`. The peer is the SSRF boundary and MUST put every client-declared URL through its URL policy on the RESOLVED address with private, loopback and link-local addresses blocked and `.local` hosts refused, unless the operator allowed private hosts for CLIENT declarations specifically (a setting separate from the one its own servers use); it MUST pin the resolved address for the connection AND re-check every redirect hop against the same policy (or refuse redirects). Once any header of a declaration has been expanded, the peer MUST NOT follow a redirect that leaves the allowlisted origin: `fetch` keeps a custom header such as `X-Api-Key` across a cross-origin redirect, so following one would hand the secret to the redirect target. (4) HARNESS-OWNED SETTINGS STAY ON THE HARNESS: `mutating`, capability 63's `repair`, `groups` and the budgets are refused. The peer MUST treat EVERY tool of a client-declared server as mutating, a possible effect that asks under the bot's guardrails, regardless of the absent `mutating` field (CozyAgents reads an absent `mutating` as "every tool investigates" for an operator's server, which is the opposite and must not apply here), and uses its `approve_once` repair default. (5) GATED. The route needs a write-scoped paired device (capability 72 answers a read-scoped one `403`). The gateway forwards either field only to a peer that offered the attach-v1 capability `mcp_server_declarations`, which a harness offers only when its operator turned client declarations on (default off); any other runtime peer answers `409 unsupported_for_runtime` and no frame is sent. A Hermes bot answers the same `409` and NOTHING in the patch is written, because Hermes's `profiles.configure` would accept a stdio definition. The `profile.write` input is rebuilt from the published `BotProfilePatch` keys, so a body key the open schema passes but does not model (an `mcpServers` map, a mis-cased `DeclareMcpServers`) never reaches any peer. Cross-field rules the schema cannot state (a name declared twice or both declared and removed, a header named twice across case, the `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Expect`, `Mcp-Session-Id`, `Cookie` and `Proxy-*` headers, `__proto__`, `constructor` and `prototype` as any name, `actions` without or outside `tools`, the URL rules) are `mcpServerDeclarationProblem`, and the route answers `400 invalid_request` with its sentence. SEMANTICS (the peer's): removals, then declarations, then `enabledMcpServers`, so one save can declare and switch on; a declaration never changes enablement, so a new server lands OFF; a name the client did not declare (operator, built-in, template) is refused by name in `ignored`, for a declare or a remove. `applied` answers `mcp_servers_declared` and `mcp_servers_removed`. READ: `BotMcpServer` gains optional read-only `declaration`, present exactly on a row a client declared and equal to that declaration, which marks the row as the client's to edit or remove. It is validated whole with the rest of `profile.read`, the lane's convention (as capability 63's `repair` is): an invalid one refuses the `config_result` frame and closes the socket, so a peer emits `declaration` only after the gateway advertised `>= 89` and only in this closed shape, and GROWING THE DECLARATION NEEDS A NEW CAPABILITY, never an optional field an older gateway would refuse. Additive: a client below 89 sends neither field and reads no `declaration`; a peer receives either field only after negotiating `mcp_server_declarations`; a client offers the editor only on `>= 89`. |
 
 ### Row 86 (chat semantics and reactions)
 
@@ -197,11 +199,13 @@ field or peer behavior, and applies identically to Hermes and CozyAgents peers.
 Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
 and unknown server frames are ignored.
 
-`com.cozylabs.agent-inbox` is a reserved, dormant capability id and the sole future advertisement
-for Agent Inbox. It has no advertised version: do not advertise it or expose an inbox page until
-Hermes supplies durable structured A2A sender, delivery/reply, and conversation metadata plus
-bounded replay. It is deliberately separate from `com.cozylabs.bots`: clients must not infer the
-withdrawn capability-17 surface from any later `com.cozylabs.bots` version.
+`com.cozylabs.agent-inbox` is the sole advertisement for Agent Inbox, separate from
+`com.cozylabs.bots` so that no client infers the withdrawn capability-17 surface from any later
+bots version. Version 1 is leader assignments (see
+[Leader assignments](#leader-assignments-comcozylabsagent-inbox-1) below): its identity is
+gateway-owned assignment rows, not a reading of Hermes session text, which is what ADR 0082
+waited for. Every gateway advertises it, because the assignment store is part of every
+gateway's storage.
 
 ## Resources
 
@@ -1013,8 +1017,15 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `DELETE /runners/:id` | no body | `200 RunnerDeleteResponse` | Capability 52. Revokes that runner's token and closes its socket. `404 not_found` for an unknown id, exactly as `DELETE /devices/:id` answers. The `legacy` row is revoked by unsetting the environment variable and answers `400 invalid_request`. Capability 54: the body carries `botCount`, the runtime bots left on that computer, and `reassignedOperations` (with `reassignedTo` when there was a default) for the not-yet-sent work it re-addressed. Unsetting `COZYGATEWAY_RUNNER_TOKEN` is NOT this route and re-addresses nothing: a bot created on the legacy row keeps `runnerId: "legacy"`, and after the variable is unset its queued work is deliverable only in that its `delete_runtime` is then addressed to nobody and picked up by the account default. A deployment that pairs a real computer should do so before unsetting the variable, and treat those bots as bots to recreate. |
 | `POST /bots/focus` | `BotFocusRequest` | `{ ok: true }` | Hints control-plane polling while roster/routines UI is visible. |
 | `GET /bots/catalog` | optional `q` | `BotCatalog` | Hermes profile/catalog read. |
-| `GET /bots/:name/profile` | — | `BotProfile` | Hermes profile read. Capability 57: for a runtime bot this is the peer's `profile.read` answer over the `bot_config` lane, and `guardrailLevel` rides along exactly as the peer sent it, absent for a Hermes bot and for a peer below 57. Capability 58: `guardrailCeiling` rides along the same way, read-only, absent for a Hermes bot and for a peer below 58. Capability 63: each `mcpServers` row may carry `repair`, the peer's own per-server repair policy, read-only in the same sense. It is absent for Hermes and peers below 63, or when a peer does not project it. A known CozyAgents peer may project its effective `approve_once` default after negotiating 63. |
-| `PATCH /bots/:name/profile` | `BotProfilePatch` | `BotProfileConfigureResponse` | Hermes profile update. Capability 57: `guardrailLevel` in the body is forwarded to a runtime bot's peer over the `bot_config` lane unchanged and is not acted on for a Hermes bot. Capability 58: `guardrailCeiling` is never accepted in the body; a body naming it is `400 invalid_request` naming the field. Capability 63: the per-server `repair` policy has no representation in this body at all, because `enabledMcpServers` names servers by name; it is changed on the harness, never here. |
+| `GET /bots/:name/profile` | — | `BotProfile` | Hermes profile read. Capability 57: for a runtime bot this is the peer's `profile.read` answer over the `bot_config` lane, and `guardrailLevel` rides along exactly as the peer sent it, absent for a Hermes bot and for a peer below 57. Capability 58: `guardrailCeiling` rides along the same way, read-only, absent for a Hermes bot and for a peer below 58. Capability 63: each `mcpServers` row may carry `repair`, the peer's own per-server repair policy, read-only in the same sense. It is absent for Hermes and peers below 63, or when a peer does not project it. A known CozyAgents peer may project its effective `approve_once` default after negotiating 63. Capability 88: `role` and `reports` are merged in from the gateway's own team row. |
+| `PATCH /bots/:name/profile` | `BotProfilePatch` | `BotProfileConfigureResponse` | Hermes profile update. Capability 57: `guardrailLevel` in the body is forwarded to a runtime bot's peer over the `bot_config` lane unchanged and is not acted on for a Hermes bot. Capability 58: `guardrailCeiling` is never accepted in the body; a body naming it is `400 invalid_request` naming the field. Capability 63: the per-server `repair` policy has no representation in this body at all, because `enabledMcpServers` names servers by name and a capability-89 declaration has no `repair`; it is changed on the harness, never here. Capability 88: `role` and `reports` are checked and stored by the gateway and never forwarded. Capability 89: `declareMcpServers` and `removeMcpServers` reach only a runtime peer that negotiated `mcp_server_declarations`; otherwise `409 unsupported_for_runtime` and nothing is written (a Hermes bot always), team fields included. |
+| `POST /bots/:name/assignments` | `AssignmentCreateRequest` | `201 AssignmentView` | agent-inbox 1. The one route here a device token does NOT open: it takes `:name`'s own attach bearer (`401` without one, `403` for another bot's). Refusals are `409 assignment_refused` with a typed `reason`; see [Leader assignments](#leader-assignments-comcozylabsagent-inbox-1). |
+| `GET /bots/:name/assignments` | — | `AssignmentList` | agent-inbox 1. The assignments `:name` leads or answers, newest first. Also open to `:name`'s own attach bearer; another bot's bearer is `403`. |
+| `GET /assignments/:taskId` | — | `AssignmentView` | agent-inbox 1. Also open to the attach bearer of the leader or the assignee. `404` when no assignment wraps that Task, and the same `404` for a bot that is not a live party to it. |
+| `POST /assignments/:taskId/cancel` | `AssignmentCancelRequest` or no body | `AssignmentView` | agent-inbox 1. A device cancels as `user`; the leader's attach bearer cancels as `leader`; the assignee's is `403`. |
+| `POST /assignments/:taskId/acknowledge` | `AssignmentAcknowledgeRequest` | `AssignmentView` | agent-inbox 1. A device or the leader's attach bearer. Valid only from `verifying`, else `409 assignment_refused` with `reason: "not_verifying"`. |
+| `GET /bots/:name/inbox` | — | `BotInboxResponse` | agent-inbox 1. One thread per assignment `:name` leads or answers. Device only. |
+| `GET /bots/:name/inbox/:threadId/messages` | — | `BotInboxMessagesResponse` | agent-inbox 1. The leader's brief and the assignee's reply. `404` for a thread that is not `:name`'s. Device only. |
 | `GET /bots/:name/presentation` | — | `BotPresentationResponse` | Capability 80. The synced roster presentation from `ui_meta["hermes-bots"]`. |
 | `PATCH /bots/:name/presentation` | `BotPresentationPatch` | `BotPresentationResponse` | Capability 80. Compare-and-swap write of only the patched keys; `409 conflict` after three lost races. |
 | `GET /bots/:name/avatar` | — | image bytes | Capability 81. The profile's avatar asset, or `404`. |
@@ -1315,6 +1326,9 @@ All frames travel on the existing authenticated `/ws` and are members of the clo
   session, so a client can join a `bot_chat_delta`, `bot_chat_state`, or `bot_tool_activity` frame
   to the roster row it belongs to.
 - `bot_presence`: complete active profile-name set.
+- `bot_inbox_activity` (agent-inbox 1): `{bot, threadId, updatedAt, taskId, state}`, once per
+  participant whenever a leader assignment may have moved. See
+  [Leader assignments](#leader-assignments-comcozylabsagent-inbox-1).
 - `bot_chat`: native transcript delta. `messages` contains only newly committed rows.
 - `bot_chat_state`: current native-turn phase: `polling`, `complete`, `timeout`, or `failed`.
   Capability 23 additionally carries exact `status`: `queued`, `executing`, `using_tools`,
@@ -1669,6 +1683,129 @@ in `GET /tasks/:taskId`'s `artifacts`.
 `taskId` on `POST /attach/v1/artifacts` is accepted for the first row 65 clients and IGNORED: it
 is dropped rather than stored, because a Task id a peer supplies is a claim this gateway did not
 resolve. A peer reads the record's `taskId` back from the declare or commit response.
+
+### Leader assignments (com.cozylabs.agent-inbox 1)
+
+A leader is a bot whose gateway-owned `role` is `leader` (capability 88). It may assign one
+bounded piece of work to a bot in its `reports`; a member cannot assign, and there is no nested
+delegation: a leader's `reports` may not name another leader, and a bot that is in anyone's
+`reports` may not become a leader (both `400 invalid_request`). Bot names are trimmed and
+lowercased, as everywhere else. The schemas are in `packages/contract/src/assignments.ts`.
+
+**One id.** An assignment wraps exactly one capability-64 Task and is addressed by that Task's own
+id: `taskId` is the same string in the create response, every assignment route, `GET
+/tasks/:taskId`, the attach turn's `context.task.id` and the `bot_inbox_activity` frame. The
+assignee's turn runs on a gateway-owned thread, `assignment:<taskId>`, and the assignment row, the
+Task and the attach outbox record are written in one transaction, so a refused enqueue leaves
+nothing behind. Every Task rule (waits, owner absence, cancel, retry) applies unchanged while the
+assignment is open: a Task retried from `blocked` runs again on the same thread and its reply
+answers the assignment. A FAILED assignment is a durable decision that no recovery remains for
+its Task (below): the Task refuses retry and resume, closes `failed`, and the leader creates a new
+assignment to try again.
+
+**Assign.** `POST /bots/:name/assignments` takes `AssignmentCreateRequest`
+(`{to, brief, doneCriteria, outputFormat?, deadlineMs?, idempotencyKey?}`) and answers
+`201 AssignmentView`. It is authenticated by `:name`'s OWN attach bearer: no device token is
+involved in a bot-to-bot call, a device token is `401`, and another bot's bearer is `403`.
+`idempotencyKey` is scoped to the leader: a repeated delivery answers the same Task and queues
+nothing, and the same key with a different `to`, `brief` or `doneCriteria` is `409 conflict`. The
+deadline defaults to 30 minutes and is 1 minute to 4 hours; it is the turn's own timeout. The
+comparison under an `idempotencyKey` covers the whole request, `deadlineMs` and `outputFormat`
+included.
+
+**Refusals** are typed. A refused assign or acknowledge answers `409` with
+`AssignmentRefusalBody`, `{ error: { code: "assignment_refused", message }, reason }`:
+
+| `reason` | When |
+| --- | --- |
+| `not_leader` | The caller's role is not `leader`. |
+| `not_a_report` | `to` is not in the leader's `reports`, or is no longer a bot on this gateway. |
+| `assignee_unavailable` | `to` is not attached right now. Nothing is created. |
+| `assignee_busy` | `to` already holds an open assignment from any leader. |
+| `leader_task_cap` | The leader already has 8 open assignments. |
+| `not_verifying` | An acknowledgement arrived while the assignment was not `verifying`. |
+
+**The turn.** The assignee receives an ordinary attach-v1 `turn` whose `text` is, verbatim:
+
+```
+[Task from <leader display name>] <brief>
+Done when: <doneCriteria>
+Reply format: <outputFormat, or "a short result followed by a `Result:` block">
+Deadline: <local time>
+End your reply with a `Result:` block listing status (done | partial | blocked), what changed, and any artifacts as paths or links.
+```
+
+and whose `context` carries `task` (capability 88) with the same facts typed and NO `room`. A
+stock Hermes profile answers it with no plugin change (the Hermes plugin ignores `context`). A
+runtime peer that reads `context` must accept a context with `task` and no `room` before it can
+be an assignee: CozyAgents today dereferences `context.room.name` (`prompt-size.ts`,
+`runtime.ts`) and must be fixed before CozyAgents assignees ship. Its final reply is stored as `finalText`; the last line
+that starts with `Result:` (also `**Result:**` or `**Result**:`; a status word after it on the
+same line counts as the status) opens a block whose `status:` must be `done`, `partial` or `blocked`,
+whose `artifacts:` (a comma list and/or `- ` bullets) become up to 32 references, and whose other
+lines become `summary`. A reply with no valid block has no `result`: its absence is recorded and
+never invented. Drafts, tool steps, approvals and clarifications on an assignment thread have no
+projection in v1 and are acknowledged so the peer's stream keeps moving.
+
+**State** is derived on every read and never stored. First match wins:
+
+1. The leader (or a device) acknowledged: that outcome, `completed` or `failed`.
+2. A party was deleted and its Task went with it: the state recorded at that moment (below).
+3. The Task completed and no failure was recorded: `failed` when it completed only at or after
+   the deadline (a read that said `failed` never turns back), else `verifying` for 24 hours, even if a cancel
+   was asked and lost the race to the reply, so delivered work stays acknowledgeable. When the
+   window lapses unacknowledged it closes as `completed`, or as `failed` when the `Result:` status
+   was `blocked`.
+4. The Task has otherwise settled (or is gone): `cancelled` when cancellation was asked, `failed`
+   when a failure was recorded (`deadline`, or the turn's own failure text), else the Task's own
+   `cancelled` or `failed`.
+5. The Task is live: `failed` once a failure is recorded or the deadline has passed, so a read
+   never shows live work past its deadline; a Task still proving its own work (`verifying`) reads
+   `running`; `waiting_for_device` reads `blocked`; every other live state is itself (`queued`,
+   `running`, `waiting_for_approval`, `waiting_for_user_input`, `blocked`).
+
+A cancel asks the Task to cancel and answers the resulting state; it reads `cancelled` only once
+the Task has settled, never before (`cancelledBy` says it was asked). The deadline and a failed
+turn are never recorded on the Task as a person's cancel, and both follow the capability-64 state
+machine (ADR 0004). The deadline is hard: the gateway records `failure: "deadline"` and blocks
+the Task on the edge that fits where it stands, all with actor `gateway`: its own `run_timed_out`
+from `running`, `verifying` or any wait (a paused Task included), after which a running turn is
+interrupted; `command_discarded` from `queued`, where nothing ran, and a turn still in the outbox is
+withdrawn unsent. A failed turn is the harness's own `run_failed`, `running -> blocked`, and its
+message becomes the assignment's `failure`. Only the Task's CURRENT Run speaks for the assignment:
+a reply or failure from a Run a retry superseded records nothing. A Task left live after its
+assignment failed (a retry accepted just before, then never dispatched) is blocked the same way by
+the sweep. In both cases the recorded failure is the durable decision that no
+recovery remains (issuer `assignment`): Task reconciliation appends `blocked -> failed`
+`no_recovery_remaining` (actor `gateway`) as soon as the Run has ended, at once for a failed or
+withdrawn turn and on the interrupted Run's terminal otherwise. Until then the Task reads
+`blocked` and refuses retry and resume, and no retry is ever dispatched on the thread. A reply
+that arrives after a recorded failure does not reopen the work. Open means any state but `completed`, `failed` and `cancelled`, so `verifying` still
+holds the assignee.
+
+**Rename and delete.** A rename moves the bot's team row, every `reports` entry naming it, and
+its side of every assignment (through `previous_names` too). Demoting or deleting a leader
+cancels its open assignments as `user`. Deleting a bot removes its team row and its name from
+every other leader's `reports`, and the deleted side of each assignment is tombstoned: a later bot
+of the same name cannot list, read, acknowledge or cancel it, nor see it in its inbox. A deleted
+assignee's Task goes with its other private Tasks, so the leader keeps a readable view frozen at
+deletion: open work reads `cancelled` with `failure: "assignee deleted"`, and delivered work that
+was waiting on the leader closes as an unacknowledged window would.
+
+**Reads.** The inbox thread is the assignment's `threadId`; it carries no state of its own, and a
+client joins it to `GET /bots/:name/assignments` by `threadId`. Its messages use the room
+`BotGroupMessage` shape: the leader's brief, then the assignee's reply once there is one.
+
+A bot that is not a live party gets the same `404` from `GET /assignments/:taskId` as for a Task
+that does not exist.
+
+**Frame.** `bot_inbox_activity` `{bot, threadId, updatedAt, taskId, state}` is sent once per live
+participant whenever an assignment may have moved: on assign, cancel, acknowledgement, the
+assignee's reply or failure, every update of the wrapped Task, the deadline, a deletion, and the
+lapse of the 24 hour verifying window (announced once, including a lapse that happened while the
+gateway was down). `updatedAt` is the assignment's own `updatedAt`, which follows its Task. Like
+every capability-gated frame it goes to every paired client except one whose `auth` frame declared
+`com.cozylabs.agent-inbox` below `1`; a client that did not declare the id receives it.
 
 ### Derived records, for peers that never declare one
 

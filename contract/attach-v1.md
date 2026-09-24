@@ -95,6 +95,12 @@ of `member` or `user`), and `cause` (`{ kind, seq }`: what this member is being 
 It is strictly decoration. The `text` a peer receives is byte-identical with and without it, so a
 peer that ignores `context` behaves exactly as it did before, and a peer that reads it gets typed
 actors instead of parsing them back out of the prompt header. `context` is absent on a 1:1 turn.
+On a leader ASSIGNMENT turn (bots capability 88, on a gateway-owned `assignment:<taskId>` thread)
+`room` is absent and `context` instead carries `task` (`id`, the gateway Task id; `assignedBy`,
+`brief`, `doneCriteria`, optional `outputFormat`, and `deadlineAt`) beside the leader and the
+assignee as `actors`. The same byte-identical `text` rule holds. A peer that reads `context`
+MUST accept one with `task` and no `room`; CozyAgents currently dereferences `context.room.name`
+and must handle this before its bots can be assignees.
 
 Events are `draft`, `commit`, `failed`, `cancelled`, `interrupted`, `tool`, `delegation`,
 `thinking`, `approval`, `clarify`, `scheduled`, `media`, and `presence`.
@@ -307,6 +313,28 @@ the reconnect still asks for approval, not that repair permission was granted. U
 `repair` on an `approval` event above, this one is inside a published schema on a lane whose results
 are validated whole, so an unknown value makes the `config_result` frame invalid and the ingress
 refuses the frame and closes the socket: the two names are the entire vocabulary.
+
+Capability 89 (`com.cozylabs.bots >= 89`): `profile.write` MAY carry `declareMcpServers` and
+`removeMcpServers`, a chat client's REMOTE MCP server declarations (`BotMcpServerDeclaration`:
+`transport` is the literal `http`, and no stdio field exists). A peer receives either field only if
+it offered the separate capability `mcp_server_declarations` in `hello`, as `memory_ownership` sits
+beside `memory_management`; the gateway refuses such a write to any other peer before the frame is
+built, and builds every `profile.write` input from the published patch keys only. A harness offers
+the capability only when its operator turned client declarations on. The peer MUST: expand a header's
+`${COZY_MCP_<NAME>}` only when the declaration's URL origin is listed in the operator-set
+`COZY_MCP_<NAME>_ORIGINS` (each entry compared exactly against the URL's WHATWG `URL.origin`; no
+wildcards, `null` never matches; the binding is per origin, not per path), refusing the declaration
+by name in `ignored` otherwise; put every
+client-declared URL through its URL policy on the resolved address (private, loopback, link-local
+and `.local` blocked unless the operator allowed private hosts for client declarations
+specifically), pinning that address AND re-checking every redirect hop, and never following a
+redirect off the allowlisted origin once any header has been expanded; treat every tool of a
+client-declared server as mutating regardless of an absent `mutating`; apply removals, then
+declarations, then `enabledMcpServers`; never change enablement from a declaration; and refuse by
+name in `ignored` any name the client did not declare. A `profile.read` row MAY carry
+`declaration`, read-only and closed, exactly on a server a client declared; it is validated whole
+with the frame, so growing it needs a new capability. The Hermes attach plugin never offers the
+capability.
 
 `status` is `ok`, `not_found`, `invalid_request`, or `unavailable`, and the four are kept apart
 because they are four different things an operator has to do: nothing, fix the id, fix the input,

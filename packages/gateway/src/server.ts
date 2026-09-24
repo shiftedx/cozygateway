@@ -3,6 +3,8 @@ import { createServer as createHttpsServer } from "node:https";
 
 import { serve } from "@hono/node-server";
 import {
+  AGENT_INBOX_CAPABILITY_ID,
+  AGENT_INBOX_CAPABILITY_VERSION,
   APPROVALS_CAPABILITY_ID,
   APPROVALS_CAPABILITY_VERSION,
   BOTS_CAPABILITY_ID,
@@ -89,6 +91,7 @@ import { HermesBridge, type BotsSurface } from "./hermes-bridge/bridge.ts";
 import { HermesDashboardIntegrations } from "./hermes-bridge/integrations.ts";
 import { FederatedBotControlSurface, endpointStorage } from "./hermes-bridge/federation.ts";
 import { GatewayRoomHost, type RoomHost } from "./hermes-bridge/group-rooms.ts";
+import { AssignmentRooms } from "./hermes-bridge/assignments.ts";
 import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
 import { AttachChatConfigurationDriver, AttachConfigSurface } from "./hermes-bridge/bot-config.ts";
 import { GatewayChatConfiguration } from "./chat-configuration.ts";
@@ -247,6 +250,7 @@ export function gatewayInfoForConfig(
   hermesGlobalSkills = false,
   maintenance = false,
   integrations = false,
+  agentInbox = false,
 ): GatewayInfo {
   const configuredCapabilities = Object.fromEntries(
     Object.entries(config.capabilities ?? {})
@@ -300,6 +304,10 @@ export function gatewayInfoForConfig(
         : {}),
       ...(integrations
         ? { [INTEGRATIONS_CAPABILITY_ID]: INTEGRATIONS_CAPABILITY_VERSION }
+        : {}),
+      // Leader assignments. Never inferred from the bots scalar (ADR 0082, superseded).
+      ...(agentInbox
+        ? { [AGENT_INBOX_CAPABILITY_ID]: AGENT_INBOX_CAPABILITY_VERSION }
         : {}),
     },
     botRuntimes: hermesEndpoints(config).length === 0 ? [] : ["hermes"],
@@ -475,6 +483,8 @@ export async function startGateway(
     hermesGlobalSkills !== undefined,
     maintenance !== undefined,
     integrations !== undefined,
+    // The assignment store is part of every gateway's storage.
+    true,
   );
   // Dashboard packet D2. The observation ring: what the gateway already measures on every turn,
   // heartbeat and sweep, kept for a week instead of thrown away. OFF BY DEFAULT; constructed
@@ -664,6 +674,17 @@ export async function startGateway(
     const key = owned?.key ?? storage.botGroupMemberBySession(event.threadId, agentId)?.key;
     return key === undefined ? undefined : roomHostFor(key);
   };
+  // agent-inbox 1. Built before the ingress it drives; every closure below reaches the ingress only
+  // once the listener is bound.
+  const assignments = new AssignmentRooms({
+    storage,
+    broadcast: (frame) => hub.broadcast(frame),
+    now: () => Date.now(),
+    displayName: (name) => bridge.roster().bots.find((bot) => bot.name === name)?.displayName ?? name,
+    knownBot: (name) => attachV1Ingress.canQueue(name),
+    isAttached: (name) => attachV1Ingress.isAttached(name),
+    flushTaskCommands: () => attachV1Ingress.flushTaskCommands(),
+  });
   // Every configured Hermes profile has one attach identity shared by the core thread surface and
   // Bot Mode. Token resolution fails closed before the listener opens.
   const nativeBotIds = profileEntries.map(([profileId]) => profileId);
@@ -713,6 +734,7 @@ export async function startGateway(
       },
       canAcceptEvent: (agentId, frame) => {
         if (storage.chatExecutionById(agentId)?.harness === "hermes") return nativeBotPlane?.canAccept(agentId, frame) === true;
+        if (assignments.canAcceptAttachEvent(agentId, frame)) return true;
         if (roomHostForEvent(agentId, frame)?.canAcceptGroupAttachEvent(agentId, frame) === true) return true;
         if (nativeBotPlane?.canAccept(agentId, frame)) return true;
         if (!("threadId" in frame.event))
@@ -793,6 +815,7 @@ export async function startGateway(
           }
           return false;
         }
+        if (assignments.handleAttachEvent(agentId, frame)) return true;
         if (roomHostForEvent(agentId, frame)?.handleGroupAttachEvent(agentId, frame) === true) return true;
         if (router.onV1Event(agentId, frame)) return true;
         if (nativeBotPlane?.handle(agentId, frame)) return true;
@@ -884,6 +907,7 @@ export async function startGateway(
       attachV1Ingress.sendNativeTurn(agentId, input),
     sendInterrupt: (agentId, input) => attachV1Ingress.sendNativeInterrupt(agentId, input),
   });
+  assignments.setNativeTurns({ sendNativeTurn: (agentId, input) => attachV1Ingress.sendNativeTurn(agentId, input) });
   const adapters = new Map<string, ReturnType<typeof createAttachAdapter>>();
   /** Each configured Hermes profile has one attach-v1 turn adapter. */
   const registerAttachAdapter = (agentId: string): void => {
@@ -909,6 +933,7 @@ export async function startGateway(
       ...[...attachTokens].filter(([, owner]) => owner === name).map(([token]) => token),
     ], Date.now());
     storage.tasks.ownerDeleted(name, Date.now());
+    assignments.botDeleted(name);
     mobileNode?.disconnectAgent(name);
     const revoked = revokeAttachTokens(attachTokens, name);
     attachV1Ingress.disconnectAgent(name);
@@ -1080,7 +1105,10 @@ export async function startGateway(
   // Always bounded. Derivation retains every delivered attachment until an explicit deletion, so
   // an operator who sets nothing gets the conservative default rather than an unbounded store.
   storage.artifacts.capacity(config.artifactStoreBytes ?? DEFAULT_ARTIFACT_STORE_BYTES);
-  storage.tasks.observe((frame) => hub.broadcast(frame), BOTS_CAPABILITY_VERSION);
+  storage.tasks.observe((frame) => {
+    hub.broadcast(frame);
+    if (frame.type === "bot_task_updated") assignments.onTaskUpdated(frame.view);
+  }, BOTS_CAPABILITY_VERSION);
   // Capability 68: a backgrounded phone learns its Task finished. A device holding a live socket
   // got the frame above and is excluded inside the notifier, and the announcement itself fires
   // only on the transition that wrote capability 64's completion notification record.
@@ -1104,6 +1132,7 @@ export async function startGateway(
     observe,
     storage,
     flushTaskCommands: () => attachV1Ingress.flushTaskCommands(),
+    assignments,
     config,
     gatewayInfo,
     ...(options.notifierLog === undefined ? {} : { pushRelayLog: options.notifierLog }),
@@ -1337,6 +1366,7 @@ export async function startGateway(
       await Promise.all(bridgeMembers.map((member) => member.bridge.close()));
       await roomHost?.close();
       nativeBotPlane.close();
+      assignments.close();
       mobileNode?.close();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));

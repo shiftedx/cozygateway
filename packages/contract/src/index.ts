@@ -24,6 +24,7 @@ export * from "./chat-context.ts";
 export * from "./provider-connections.ts";
 export * from "./integrations.ts";
 export * from "./tasks.ts";
+export * from "./assignments.ts";
 export * from "./artifacts.ts";
 /** Dashboard packet D3 (capability 75): the observer's read-only websocket subscription. */
 export * from "./observe.ts";

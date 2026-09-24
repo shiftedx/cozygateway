@@ -62,6 +62,12 @@ export const AttachV1CapabilitySchema = Type.Union([
    * administration merely by supporting per-chat context. */
   Type.Literal("chat_configuration"),
   Type.Literal("provider_connections"),
+  /** Capability 89 of `com.cozylabs.bots`. The peer accepts client-declared remote MCP servers
+   * (`declareMcpServers` / `removeMcpServers`) on `bot_config` `profile.write`. Negotiated apart
+   * from `bot_config` so a peer never receives a declaration it did not opt into, exactly as
+   * `memory_ownership` sits beside `memory_management`. A harness offers it only when its operator
+   * turned client declarations on. */
+  Type.Literal("mcp_server_declarations"),
   Type.Literal("bot_history"),
   /** Capability 60: durable metadata-only local search tombstone. */
   Type.Literal("session_deletion"),
@@ -155,11 +161,23 @@ const TurnActor = Type.Object({
   kind: Type.Union([Type.Literal("user"), Type.Literal("member")]),
 }, { additionalProperties: false });
 
-/** Typed provenance for one turn. Sent on ROOM turns only, and it is decoration in the strictest
- * sense: the `text` a peer receives is byte-identical with and without it, so a peer that ignores
- * `context` behaves exactly as it did before capability 47. */
+/** Capability 88. The assignment a leader handed this turn's bot. The Task id is the same one
+ * `GET /tasks/:taskId` and the assignment routes use. */
+const TurnTask = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 256 }),
+  assignedBy: Type.String({ minLength: 1, maxLength: 128 }),
+  brief: Type.String({ minLength: 1, maxLength: 8192 }),
+  doneCriteria: Type.String({ minLength: 1, maxLength: 4096 }),
+  outputFormat: Type.Optional(Type.String({ maxLength: 2048 })),
+  deadlineAt: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+
+/** Typed provenance for one turn. Sent on room and assignment turns, and it is decoration in the
+ * strictest sense: the `text` a peer receives is byte-identical with and without it, so a peer that
+ * ignores `context` behaves exactly as it did before capability 47. */
 const TurnContext = Type.Object({
-  room: Type.Object({
+  /** Present on room turns. Absent on an assignment turn, which has no room (capability 88). */
+  room: Type.Optional(Type.Object({
     key: Type.String({ minLength: 1, maxLength: 128 }),
     name: Type.String({ minLength: 1, maxLength: 128 }),
     epoch: Type.Integer({ minimum: 0 }),
@@ -167,12 +185,14 @@ const TurnContext = Type.Object({
      * there is nothing to name: zero is a real seq in a room whose log was trimmed, so a
      * placeholder would be a claim the gateway cannot make. */
     seq: Type.Optional(Type.Integer({ minimum: 0 })),
-  }, { additionalProperties: false }),
+  }, { additionalProperties: false })),
   actors: Type.Array(TurnActor, { maxItems: 8 }),
   cause: Type.Optional(Type.Object({
     kind: Type.Union([Type.Literal("user"), Type.Literal("member")]),
     seq: Type.Integer({ minimum: 0 }),
   }, { additionalProperties: false })),
+  /** Present on assignment turns only (capability 88). */
+  task: Type.Optional(TurnTask),
 }, { additionalProperties: false });
 export type AttachV1TurnContext = Static<typeof TurnContext>;
 

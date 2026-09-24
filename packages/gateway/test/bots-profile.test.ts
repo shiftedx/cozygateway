@@ -769,6 +769,69 @@ describe("PATCH /bots/:name/profile", () => {
     expect("guardrailCeiling" in body).toBe(false);
   });
 
+  // Capability 89. Client-declared MCP servers are a runtime peer's to honour. Hermes's
+  // `profiles.configure` would accept a stdio definition, which this row never grants, so a patch
+  // naming either field is refused WHOLE for a Hermes bot: no section of it is written.
+  describe("client-declared MCP servers (capability 89)", () => {
+    const home = {
+      name: "home",
+      transport: "http" as const,
+      url: "https://ha.example.com/api/mcp",
+      headers: { Authorization: "Bearer ${COZY_MCP_HOME_TOKEN}" },
+    };
+
+    it("409s a Hermes bot and writes nothing, even the other sections of the same patch", async () => {
+      const { authed, server } = await setup({ methods: { "profiles.configure": () => ({ applied: { soul: true } }) } });
+      for (const body of [
+        { declareMcpServers: [home] },
+        { removeMcpServers: ["home"] },
+        { soul: "# Scout", declareMcpServers: [home] },
+      ]) {
+        const res = await authed("/bots/scout/profile", patch(body));
+        expect(res.status, JSON.stringify(body)).toBe(409);
+        const reply = (await res.json()) as { error: { code: string }; feature: string };
+        expect(reply.error.code).toBe("unsupported_for_runtime");
+        expect(reply.feature).toBe("declareMcpServers");
+      }
+      expect(server.callsOf("profiles.configure")).toHaveLength(0);
+    });
+
+    // No body reaches host command execution: the stdio fields are not fields, so they are refused
+    // at the boundary with the ordinary 400 naming where, before any backend is asked anything.
+    it("400s a stdio declaration before any backend is asked", async () => {
+      const { authed, server } = await setup({ methods: { "profiles.configure": () => ({ applied: {} }) } });
+      for (const declaration of [
+        { ...home, command: "npx" },
+        { name: "comfy", transport: "stdio", command: "npx", args: ["-y", "comfyui-mcp"] },
+        { ...home, headers: { Authorization: "Bearer sk-live-abc" } },
+        { ...home, headers: { Authorization: "${OPENAI_API_KEY}" } },
+      ]) {
+        const res = await authed("/bots/scout/profile", patch({ declareMcpServers: [declaration] }));
+        expect(res.status, JSON.stringify(declaration)).toBe(400);
+        const body = (await res.json()) as { error: { code: string; message: string } };
+        expect(body.error.code).toBe("invalid_request");
+        expect(body.error.message).toContain("declareMcpServers");
+      }
+      expect(server.callsOf("profiles.configure")).toHaveLength(0);
+    });
+
+    it("400s what the schema cannot say, with the contract's own sentence", async () => {
+      const { authed, server } = await setup({ methods: { "profiles.configure": () => ({ applied: {} }) } });
+      for (const [body, says] of [
+        [{ declareMcpServers: [{ ...home, url: "https://ha.example.com/api/mcp?token=abc" }] }, "query"],
+        [{ declareMcpServers: [{ ...home, url: "https://me:pw@ha.example.com/api/mcp" }] }, "credentials"],
+        [{ declareMcpServers: [home], removeMcpServers: ["home"] }, "both"],
+      ] as const) {
+        const res = await authed("/bots/scout/profile", patch(body));
+        expect(res.status).toBe(400);
+        const reply = (await res.json()) as { error: { code: string; message: string } };
+        expect(reply.error.code).toBe("invalid_request");
+        expect(reply.error.message).toContain(says);
+      }
+      expect(server.callsOf("profiles.configure")).toHaveLength(0);
+    });
+  });
+
   // `""` is not "leave it alone", it writes a zero-byte SOUL.md, and the distinction between an
   // absent field and an empty one is the whole reason this body is a PATCH.
   it("sends an empty soul on the wire, because it CLEARS the file rather than being a no-op", async () => {

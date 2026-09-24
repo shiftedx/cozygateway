@@ -61,7 +61,7 @@ import type {
   ServerFrame,
 } from "cozygateway-contract";
 import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
-import { BackendUnavailable } from "../errors.ts";
+import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import type { Storage } from "../storage.ts";
 import {
   HermesRpcError,
@@ -1289,6 +1289,8 @@ export class HermesBridge implements BotControlSurface {
     };
     for (const room of this.#storage.botGroups()) for (const member of room.members) consider(member);
     for (const { bot } of this.#storage.canonicalBotChats()) consider(bot);
+    // Capability 88: a team role, a report, or either side of an assignment follows the rename too.
+    for (const bot of this.#storage.botTeamNames()) consider(bot);
     const rooms = new Set<string>();
     for (const old of stranded) {
       const claims = profiles.filter((profile) => profile.previousNames?.includes(old) === true);
@@ -1425,6 +1427,12 @@ export class HermesBridge implements BotControlSurface {
     patch: BotProfilePatch,
   ): Promise<ProfileConfigureResult> {
     await this.#assertBotKnown(name);
+    // Capability 89. Client-declared MCP servers are a runtime peer's, gated on its
+    // `mcp_server_declarations`. Hermes's `profiles.configure` would take a stdio definition, which
+    // that row never grants, so the WHOLE patch is refused before any section of it is written.
+    if (patch.declareMcpServers !== undefined || patch.removeMcpServers !== undefined) {
+      throw new UnsupportedForRuntime(name, "declareMcpServers", "hermes");
+    }
     return this.#chain(name, () =>
       configureBotProfile(this.#client, name, patch),
     );

@@ -20,6 +20,9 @@ import { BotNotFound } from "../src/hermes-bridge/crud.ts";
 import { RoutineNotFound } from "../src/hermes-bridge/routines.ts";
 import { BackendUnavailable, UnsupportedForRuntime } from "../src/errors.ts";
 import { openStorage, type Storage } from "../src/storage.ts";
+import { createApp } from "../src/http.ts";
+import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
+import { testHermes } from "./support/test-config.ts";
 import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
 
 const profile: BotProfile = {
@@ -412,6 +415,205 @@ describe("attach-v1 config lane", () => {
     expect(code).toBe(1008);
     expect(String(reason)).toBe("attach-v1 invalid config_result frame");
     quick.close();
+  });
+
+  // Capability 89. A remote MCP server a chat client declares rides `profile.write` to a peer that
+  // offered `mcp_server_declarations`, byte for byte, and the peer's own `applied` and `ignored`
+  // answer comes straight back. The declaration names a variable, never a value.
+  describe("client-declared MCP servers (capability 89)", () => {
+    const home = {
+      name: "home",
+      transport: "http" as const,
+      url: "https://ha.example.com/api/mcp",
+      headers: { Authorization: "Bearer ${COZY_MCP_HOME_TOKEN}" },
+      tools: ["GetLiveContext", "HassTurnOn"],
+    };
+
+    it("forwards declarations and removals unchanged to a peer that offered mcp_server_declarations", async () => {
+      const written = {
+        name: "sage", outcome: "applied", ok: true,
+        applied: { mcp_servers_declared: true, mcp_servers_removed: true, mcp_servers: true },
+        ignored: { mcp_servers_removed: ["comfyui"] },
+        requested: ["declareMcpServers", "removeMcpServers", "enabledMcpServers"],
+      };
+      const peer = await dial({ "profile.write": written }, ["bot_config", "mcp_server_declarations"]);
+      const patch = { declareMcpServers: [home], removeMcpServers: ["comfyui"], enabledMcpServers: ["home"] };
+
+      await expect(config.configureProfile("sage", patch)).resolves.toEqual({
+        outcome: "applied", ok: true, applied: written.applied, ignored: written.ignored, requested: written.requested,
+      });
+      expect(peer.requests.map((request) => [request.operation, request.input])).toEqual([["profile.write", patch]]);
+      // Live only, exactly as every other config operation: nothing is retained on the way past.
+      expect(storage.attachCommandCursor("sage")).toBe(0);
+      expect(storage.attachEventCursor("sage")).toBe(0);
+      peer.ws.close();
+    });
+
+    // The gate. A peer that speaks `bot_config` but never offered declarations receives NOTHING
+    // carrying either field: the refusal happens before the frame is written, so a peer that does
+    // not know the fields cannot misread or half-apply them. Its other profile writes still flow.
+    it("sends a peer without mcp_server_declarations nothing, and says the runtime does not support it", async () => {
+      const peer = await dial({
+        "profile.write": { name: "sage", outcome: "applied", ok: true, applied: { soul: true }, requested: ["soul"] },
+      });
+      await expect(config.configureProfile("sage", { declareMcpServers: [home] })).rejects.toBeInstanceOf(ConfigNotNegotiated);
+      await expect(config.configureProfile("sage", { removeMcpServers: ["home"] })).rejects.toBeInstanceOf(ConfigNotNegotiated);
+      await expect(config.configureProfile("sage", { soul: "# new", declareMcpServers: [home] })).rejects.toBeInstanceOf(ConfigNotNegotiated);
+      expect(peer.requests).toEqual([]);
+
+      await expect(config.configureProfile("sage", { soul: "# new" })).resolves.toMatchObject({ ok: true });
+      expect(peer.requests.map((request) => request.input)).toEqual([{ soul: "# new" }]);
+
+      // Through the data plane the same refusal is the runtime's 409, never a 503 to retry.
+      const { plane, storage: planeStorage } = planeWith(config, { configureProfile: vi.fn() } as unknown as Partial<BotsSurface>);
+      await expect(plane.surface().configureProfile("sage", { declareMcpServers: [home] })).rejects.toBeInstanceOf(UnsupportedForRuntime);
+      expect(peer.requests).toHaveLength(1);
+      plane.close();
+      planeStorage.close();
+      peer.ws.close();
+    });
+
+    // The patch schema is open, as every object on the contract is, so an unmodeled key passes the
+    // boundary. It must still never reach a peer: the lane input is rebuilt from the published keys,
+    // for a peer with the declaration capability and one without it alike.
+    it("never forwards an unknown patch key to the peer, whatever the peer negotiated", async () => {
+      const smuggled = {
+        soul: "# new",
+        mcpServers: { evil: { command: "sh", args: ["-c", "id"] } },
+        DeclareMcpServers: [{ name: "evil", transport: "stdio", command: "sh" }],
+        enabled_mcp_servers: ["evil"],
+      };
+      for (const capabilities of [["bot_config"], ["bot_config", "mcp_server_declarations"]]) {
+        const peer = await dial({
+          "profile.write": { name: "sage", outcome: "applied", ok: true, applied: { soul: true }, requested: ["soul"] },
+        }, capabilities);
+        await config.configureProfile("sage", smuggled as never);
+        expect(peer.requests.map((request) => request.input), capabilities.join()).toEqual([{ soul: "# new" }]);
+        peer.ws.close();
+        await until(() => peer.ws.readyState === peer.ws.CLOSED);
+      }
+    });
+
+    // Capability 88's `role` and `reports` are published patch keys but GATEWAY-OWNED: the route
+    // strips them before forwarding, and the lane refuses to carry them even if a caller did not.
+    it("never forwards the gateway-owned team fields to a peer", async () => {
+      const peer = await dial({
+        "profile.write": { name: "sage", outcome: "applied", ok: true, applied: { soul: true }, requested: ["soul"] },
+      }, ["bot_config", "mcp_server_declarations"]);
+      await config.configureProfile("sage", { soul: "# new", role: "leader", reports: ["scout"] });
+      expect(peer.requests.map((request) => request.input)).toEqual([{ soul: "# new" }]);
+      peer.ws.close();
+    });
+
+    // The whole HTTP route over a real attached runtime peer: the ordinary PATCH a phone sends.
+    describe("through PATCH /bots/:name/profile", () => {
+      async function appFor() {
+        const { plane, storage: planeStorage } = planeWith(config, { configureProfile: vi.fn() } as unknown as Partial<BotsSurface>);
+        const appStorage = openStorage(":memory:");
+        const app = createApp({
+          storage: appStorage,
+          config: { name: "g", port: 8787, dbPath: ":memory:", turnTimeoutSeconds: 0, hermesEndpoints: [{ id: "default", ...testHermes() }] },
+          bots: plane.surface(),
+          gatewayInfo: { name: "g", version: "0.1.0", contract: "v1", capabilities: { "com.cozylabs.bots": 89 } },
+          presenceOf: () => "online",
+          submitUserMessage: () => { throw new Error("unused"); },
+          interruptThread: () => "idle",
+          resolveApproval: () => Promise.resolve("unknown" as const),
+          onDeviceRevoked: () => {},
+          now: () => 1_000,
+        });
+        const pair = async (kind?: "observer") => {
+          const code = newSetupCode();
+          appStorage.createSetupCode(code, 1_000 + SETUP_CODE_TTL_MS, kind ?? "device");
+          const res = await app.request("/pair", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ setupCode: code, deviceName: kind ?? "phone", ...(kind === undefined ? {} : { kind }) }),
+          });
+          return ((await res.json()) as { deviceToken: string }).deviceToken;
+        };
+        const [phone, observer] = [await pair(), await pair("observer")];
+        const send = (token: string, body: unknown) => app.request("/bots/sage/profile", {
+          method: "PATCH",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify(body),
+        });
+        const close = () => { plane.close(); planeStorage.close(); appStorage.close(); };
+        return { phone, observer, send, close };
+      }
+      const written = { name: "sage", outcome: "applied", ok: true, applied: { mcp_servers_declared: true }, requested: ["declareMcpServers"] };
+
+      it("409s a runtime bot whose peer never offered mcp_server_declarations, sending it nothing", async () => {
+        const peer = await dial({ "profile.write": written });
+        const route = await appFor();
+        const res = await route.send(route.phone, { declareMcpServers: [home] });
+        expect(res.status).toBe(409);
+        expect(await res.json()).toMatchObject({ error: { code: "unsupported_for_runtime" }, runtime: "cozyagents" });
+        expect(peer.requests).toEqual([]);
+        route.close();
+        peer.ws.close();
+      });
+
+      it("forwards to a peer that offered it, and only the published keys", async () => {
+        const peer = await dial({ "profile.write": written }, ["bot_config", "mcp_server_declarations"]);
+        const route = await appFor();
+        const res = await route.send(route.phone, { declareMcpServers: [home], mcpServers: { evil: { command: "sh" } } });
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual(written);
+        expect(peer.requests.map((request) => request.input)).toEqual([{ declareMcpServers: [home] }]);
+        route.close();
+        peer.ws.close();
+      });
+
+      it("403s a read-scoped observer device before anything is parsed or sent", async () => {
+        const peer = await dial({ "profile.write": written }, ["bot_config", "mcp_server_declarations"]);
+        const route = await appFor();
+        const res = await route.send(route.observer, { declareMcpServers: [home] });
+        expect(res.status).toBe(403);
+        expect(await res.json()).toMatchObject({ error: { code: "scope_read_only" } });
+        expect(peer.requests).toEqual([]);
+        route.close();
+        peer.ws.close();
+      });
+
+      it("400s a loopback or metadata url before the peer is asked", async () => {
+        const peer = await dial({ "profile.write": written }, ["bot_config", "mcp_server_declarations"]);
+        const route = await appFor();
+        for (const url of ["http://127.0.0.1:8123/mcp", "http://169.254.169.254/latest", "http://[::1]/mcp", "http://localhost/mcp"]) {
+          const res = await route.send(route.phone, { declareMcpServers: [{ ...home, url }] });
+          expect(res.status, url).toBe(400);
+          expect(await res.json()).toMatchObject({ error: { code: "invalid_request" } });
+        }
+        expect(peer.requests).toEqual([]);
+        route.close();
+        peer.ws.close();
+      });
+    });
+
+    it("carries a client declaration back on its server row, read-only", async () => {
+      const row = { name: "home", installed: true, enabled: false, declaration: home };
+      const peer = await dial({ "profile.read": { ...profile, mcpServers: [row, { name: "github", installed: true, enabled: true }] } });
+      const read = await config.botProfile("sage");
+      expect(read.mcpServers).toEqual([row, { name: "github", installed: true, enabled: true }]);
+      peer.ws.close();
+    });
+
+    // A peer that projects a stdio shape as a client declaration is refused whole, the lane's
+    // convention: a client never receives a `command` in the position it renders as editable.
+    it("refuses a projected declaration that carries a command: the frame is invalid", async () => {
+      const quick = new AttachConfigSurface(ingress, 200);
+      const peer = await dial({
+        "profile.read": {
+          ...profile,
+          mcpServers: [{ name: "home", installed: true, enabled: false, declaration: { ...home, command: "npx" } }],
+        },
+      });
+      const closed = once(peer.ws, "close");
+      await expect(quick.botProfile("sage")).rejects.toBeInstanceOf(BackendUnavailable);
+      const [code] = (await closed) as [number, Buffer];
+      expect(code).toBe(1008);
+      quick.close();
+    });
   });
 
   it("rejects per status rather than collapsing every refusal into one failure", async () => {

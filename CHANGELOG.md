@@ -5,6 +5,32 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## Unreleased: client-declared MCP servers
+
+- A chat client can declare a bot's remote MCP servers (`com.cozylabs.bots` capability 89, #362):
+  `PATCH /bots/:name/profile` gains `declareMcpServers` and `removeMcpServers`, carried on the
+  existing `bot_config` `profile.write`, and `BotMcpServer` gains a read-only `declaration`. Remote
+  only: `transport` is `http` and no stdio field exists, so no request starts a host command. A
+  header names one `COZY_MCP_*` environment variable, never a value, and the peer expands it only
+  for a URL origin the operator listed in `COZY_MCP_<NAME>_ORIGINS`. The gateway refuses credential
+  slots in the URL and literal loopback, link-local and cloud metadata hosts; the peer's URL policy
+  owns resolved addresses and redirects, and every tool of a client-declared server asks. The
+  gateway forwards either field only to a peer that offered the new attach-v1 capability
+  `mcp_server_declarations`, and only the published patch keys ever reach a peer; any other runtime
+  bot and every Hermes bot answer `409 unsupported_for_runtime` with nothing written.
+
+## Unreleased: leader assignments
+
+A bot can now lead a team. Set a bot's role to leader and name its reports from the profile
+(`com.cozylabs.bots` 88); the gateway stores both itself, so a Hermes profile carries them with
+no plugin change. A leader assigns one bounded piece of work to a report with its own attach
+bearer, and the report answers it as an ordinary turn on a gateway-owned thread. Each assignment
+is one durable Task under one id, with a deadline (30 minutes by default, 4 hours at most), the
+report's parsed `Result:` block, and the leader's acknowledgement. Caps are 8 open assignments per
+leader, 1 per report, and 16 reports. The Agent Inbox returns as `com.cozylabs.agent-inbox` 1,
+backed by these assignment rows (ADR 0082 is superseded), so the phone can read every assignment
+thread. Nothing changes for an install until a bot is made a leader.
+
 ## 0.8.6 (2026-09-19): Hermes gateway identity
 
 CozyGateway is again the Hermes-compatible gateway for CozyChat, including the

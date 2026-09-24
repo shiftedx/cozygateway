@@ -71,7 +71,7 @@ export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
  *  capability; it does NOT prove the list is complete, so adding one to the schema and forgetting
  *  it here type-checks cleanly and silently refuses the surface at negotiation. A test compares
  *  this list against the schema for exactly that reason. */
-export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "memory_setup_state", "memory_ownership", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "cozyapps_dashboard", "bot_config", "chat_configuration", "provider_connections", "bot_history", "session_deletion", "observation_snapshot", "chat_context"] as const satisfies readonly AttachV1Capability[];
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup_state", "memory_setup", "memory_ownership", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "cozyapps_dashboard", "bot_config", "chat_configuration", "provider_connections", "mcp_server_declarations", "bot_history", "session_deletion", "observation_snapshot", "chat_context"] as const satisfies readonly AttachV1Capability[];
 
 /** Why a memory request did or did not reach the attached plugin. */
 export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
@@ -906,6 +906,12 @@ export class AttachV1Ingress implements TurnEndpoint {
     const capability = input.operation.startsWith("chat.") ? "chat_configuration"
       : input.operation.startsWith("providers.connections.") ? "provider_connections" : "bot_config";
     if (!connection.capabilities.has(capability)) return "capability_not_negotiated";
+    // Capability 89. A profile write that declares or removes an MCP server reaches only a peer that
+    // opted into `mcp_server_declarations`; refused before the frame exists, so a peer that does
+    // not know the fields never sees them and cannot apply the rest of the patch without them.
+    if (input.operation === "profile.write"
+      && (input.input.declareMcpServers !== undefined || input.input.removeMcpServers !== undefined)
+      && !connection.capabilities.has("mcp_server_declarations")) return "capability_not_negotiated";
     return this.#send(connection, input) ? "sent" : "not_attached";
   }
 

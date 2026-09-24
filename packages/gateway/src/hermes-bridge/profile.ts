@@ -55,6 +55,16 @@ export const APPLIED_KEY_OF = {
   // so `patch.guardrailCeiling` is never defined and `buildConfigurePayload` never produces this
   // key: it exists only to keep this map total over every `BotProfilePatch` key.
   guardrailCeiling: "guardrail_ceiling",
+  // Capability 88. Gateway-owned: the route stores both and strips them before this map is read,
+  // so neither ever reaches `profiles.configure`. The keys keep the map total; `team` is the
+  // `applied` key the route answers for them.
+  role: "team",
+  reports: "team",
+  // Capability 89. Answered only by a runtime peer that negotiated `mcp_server_declarations`: the
+  // Hermes bridge refuses either field before `buildConfigurePayload` runs, so neither key is ever
+  // produced for Hermes. Two keys, because a declare and a remove can each succeed alone.
+  declareMcpServers: "mcp_servers_declared",
+  removeMcpServers: "mcp_servers_removed",
 } as const satisfies Record<keyof BotProfilePatch, string>;
 
 /** How a `profiles.configure` reply was understood, the same three-way reading `saveBotMeta` uses

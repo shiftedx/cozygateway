@@ -447,6 +447,12 @@ class AttachV1ClientTests(unittest.IsolatedAsyncioTestCase):
             "desktop_session_resume", "desktop_session_sync", "cozyapps", "bot_config", "chat_configuration", "provider_connections", "chat_context",
         })
 
+    def test_hello_never_offers_client_declared_mcp_servers(self):
+        # Capability 89 of com.cozylabs.bots. The gateway forwards a client's MCP server declarations
+        # only to a peer offering `mcp_server_declarations`. Hermes' own profile writer takes stdio
+        # definitions, which that row never grants, so this plugin must never offer it.
+        self.assertNotIn("mcp_server_declarations", HELLO_CAPABILITIES)
+
     async def test_provider_handoff_uses_the_attach_bearer_without_a_socket_frame(self):
         class HandoffResponse:
             def __enter__(self): return self
