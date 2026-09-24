@@ -2,7 +2,7 @@ import type {
   BotCatalog, BotCreateRequest, BotCreateResponse, BotDeleteResponse, BotGroup,
   BotGroupDetail, BotGroupMessage, BotModelConfig, BotModelConfigPatch, BotProfile,
   BotModelProviderOAuthSession, BotModelProviderSetupCatalog, BotProfilePatch,
-  BotRoutineCreateRequest, BotRoutinePatch, BotSummary, BridgeLiveness,
+  BotRoutine, BotRoutineBlueprint, BotRoutineCreateRequest, BotRoutinePatch, BotRoutineRunRecord, BotSummary, BridgeLiveness,
   BotDesktopHermesSession, BotPresentationPatch, BotPresentationResponse,
   BotAvatarGenerateRequest, BotAvatarGenerateResponse, BotAvatarPetGallery, BotAvatarPetThumbResponse,
   BotAvatarSetResponse,
@@ -11,10 +11,10 @@ import { BackendUnavailable } from "../errors.ts";
 import { ProfileOpInvalid } from "./profile-ops.ts";
 import { BotNotFound } from "./crud.ts";
 import type { Storage } from "../storage.ts";
-import type { BotControlSurface, BotFocusScreen, BotProfileOp, BotRoutineList, BotRosterView } from "./bridge.ts";
+import type { BotControlSurface, BotFocusScreen, BotProfileOp, BotRoutineList, BotRoutineRunStarted, BotRosterView } from "./bridge.ts";
 import type { GatewayRoomHost, RoomHost } from "./group-rooms.ts";
 import type { ProfileConfigureResult } from "./profile.ts";
-import type { RoutineWriteResult } from "./routines.ts";
+import { RoutineNotFound, type RoutineWriteResult } from "./routines.ts";
 
 export interface FederationMember {
   id: string;
@@ -247,6 +247,11 @@ export class FederatedBotControlSurface implements BotControlSurface {
   async createRoutine(name: string, input: BotRoutineCreateRequest): Promise<RoutineWriteResult> { const r = this.#route(name); return r.member.bridge.createRoutine(r.profile, input); }
   async patchRoutine(name: string, id: string, patch: BotRoutinePatch): Promise<RoutineWriteResult> { const r = this.#route(name); return r.member.bridge.patchRoutine(r.profile, id, patch); }
   async deleteRoutine(name: string, id: string): Promise<void> { const r = this.#route(name); return r.member.bridge.deleteRoutine(r.profile, id); }
+  async runRoutine(name: string, id: string): Promise<BotRoutineRunStarted> { const r = this.#route(name); if (r.member.bridge.runRoutine === undefined) throw new RoutineNotFound(id); return r.member.bridge.runRoutine(r.profile, id); }
+  async routineRuns(name: string, id: string, limit?: number): Promise<BotRoutineRunRecord[]> { const r = this.#route(name); if (r.member.bridge.routineRuns === undefined) throw new RoutineNotFound(id); return r.member.bridge.routineRuns(r.profile, id, limit); }
+  async routineRunOutput(name: string, id: string, runId: string): Promise<string | null> { const r = this.#route(name); if (r.member.bridge.routineRunOutput === undefined) throw new RoutineNotFound(runId); return r.member.bridge.routineRunOutput(r.profile, id, runId); }
+  async routineBlueprints(name: string): Promise<BotRoutineBlueprint[]> { const r = this.#route(name); return r.member.bridge.routineBlueprints?.(r.profile) ?? []; }
+  async instantiateRoutineBlueprint(name: string, key: string, values: Record<string, string>): Promise<BotRoutine> { const r = this.#route(name); if (r.member.bridge.instantiateRoutineBlueprint === undefined) throw new RoutineNotFound(key); return r.member.bridge.instantiateRoutineBlueprint(r.profile, key, values); }
   setFocus(deviceId: string, screen: BotFocusScreen | null): void { for (const member of this.#members.values()) member.bridge.setFocus(deviceId, screen); }
   /** The endpoint that owns a public bot name, or `GATEWAY_HOST` when no endpoint does. A gateway
    *  runtime bot is named bare on every gateway shape and belongs to no endpoint; so does a name

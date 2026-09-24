@@ -38,8 +38,10 @@ import type {
   BotRuntimeProjection,
   BotRuntimeRecoveryResponse,
   BotRoutine,
+  BotRoutineBlueprint,
   BotRoutineCreateRequest,
   BotRoutinePatch,
+  BotRoutineRunRecord,
   BotSummary,
   BotSlashCommand,
   BotTurnToolSteps,
@@ -107,8 +109,13 @@ import {
 import {
   createBotRoutine,
   deleteBotRoutine,
+  instantiateRoutineBlueprint,
+  listBotRoutineRuns,
   listBotRoutines,
+  listRoutineBlueprints,
   patchBotRoutine,
+  readBotRoutineRunOutput,
+  runBotRoutine,
   type RoutineWriteResult,
 } from "./routines.ts";
 import { readBotModelConfig, writeBotModelConfig } from "./model-config.ts";
@@ -216,6 +223,13 @@ export interface BotRoutineList {
   name: string;
   routines: BotRoutine[];
   updatedAt: number;
+  /** Capability 83: Hermes's `gateway_running`, when it reported one. */
+  schedulerRunning?: boolean;
+}
+/** Capability 83: a run-now that Hermes accepted. */
+export interface BotRoutineRunStarted {
+  routine: BotRoutine;
+  startedAt: number;
 }
 export interface BotChatHistory {
   sessionId: string;
@@ -333,6 +347,12 @@ export interface BotControlSurface {
     patch: BotRoutinePatch,
   ): Promise<RoutineWriteResult>;
   deleteRoutine(name: string, id: string): Promise<void>;
+  /** Capability 83. Optional so a surface without Hermes's dashboard leaves the routes 404. */
+  runRoutine?(name: string, id: string): Promise<BotRoutineRunStarted>;
+  routineRuns?(name: string, id: string, limit?: number): Promise<BotRoutineRunRecord[]>;
+  routineRunOutput?(name: string, id: string, runId: string): Promise<string | null>;
+  routineBlueprints?(name: string): Promise<BotRoutineBlueprint[]>;
+  instantiateRoutineBlueprint?(name: string, key: string, values: Record<string, string>): Promise<BotRoutine>;
   setFocus(deviceId: string, screen: BotFocusScreen | null): void;
   groups(): BotGroup[];
   createGroup(name: string, members: string[], owningHost?: string): Promise<BotGroup>;
@@ -1491,6 +1511,35 @@ export class HermesBridge implements BotControlSurface {
       }
     });
   }
+  async runRoutine(name: string, id: string): Promise<BotRoutineRunStarted> {
+    await this.#assertBotKnown(name);
+    const started = await runBotRoutine(this.#client, name, id, this.#now);
+    // The run finishes long after the answer; the list it changed goes out when it does.
+    void started.settled.then(() => this.#publishRoutines(name));
+    return { routine: started.routine, startedAt: started.startedAt };
+  }
+  async routineRuns(name: string, id: string, limit?: number): Promise<BotRoutineRunRecord[]> {
+    await this.#assertBotKnown(name);
+    return listBotRoutineRuns(this.#client, name, id, limit);
+  }
+  async routineRunOutput(name: string, id: string, runId: string): Promise<string | null> {
+    await this.#assertBotKnown(name);
+    return readBotRoutineRunOutput(this.#client, name, id, runId);
+  }
+  async routineBlueprints(name: string): Promise<BotRoutineBlueprint[]> {
+    await this.#assertBotKnown(name);
+    return listRoutineBlueprints(this.#client, name);
+  }
+  async instantiateRoutineBlueprint(name: string, key: string, values: Record<string, string>): Promise<BotRoutine> {
+    await this.#assertBotKnown(name);
+    return this.#chain(name, async () => {
+      try {
+        return await instantiateRoutineBlueprint(this.#client, name, key, values);
+      } finally {
+        await this.#publishRoutines(name);
+      }
+    });
+  }
   async #chain<T>(name: string, work: () => Promise<T>): Promise<T> {
     const previous = this.#chains.get(name);
     const run = (async () => {
@@ -1505,7 +1554,8 @@ export class HermesBridge implements BotControlSurface {
     }
   }
   async #readRoutines(name: string): Promise<BotRoutineList> {
-    const routines = (await listBotRoutines(this.#client, name)).routines.map(
+    const listed = await listBotRoutines(this.#client, name);
+    const routines = listed.routines.map(
       (routine) => ({
         ...routine,
         ...(this.#storage.botRoutineOverrides(name, routine.id) ?? {}),
@@ -1518,7 +1568,12 @@ export class HermesBridge implements BotControlSurface {
       this.#lastRoutines.set(name, json);
       this.#broadcast({ type: "bot_routines", bot: name, routines, updatedAt });
     }
-    return { name, routines, updatedAt };
+    return {
+      name,
+      routines,
+      updatedAt,
+      ...(listed.schedulerRunning === undefined ? {} : { schedulerRunning: listed.schedulerRunning }),
+    };
   }
   async #publishRoutines(name: string): Promise<void> {
     try {

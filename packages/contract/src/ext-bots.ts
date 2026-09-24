@@ -1839,6 +1839,10 @@ export const BotRoutineSchema = Type.Object({
    *  because the remaining count is not recoverable from it. */
   repeat: Type.Optional(Type.String()),
   continuity: Type.Optional(Type.Boolean()),
+  /** Capability 83. Where each run's result goes, the backend's own word: `local` (run history
+   *  only), `bot-chat` (injected into this bot's canonical Bot Chat), or a platform target. Absent
+   *  on a gateway below 83 and on a job the backend reported no target for. */
+  deliver: Type.Optional(Type.String()),
   /** Capability 18 accepts and preserves these selections, but current Hermes cron RPCs cannot
    *  apply both to one run. They are inert until Hermes exposes a true per-run pair. Null means
    *  follow the bot profile; absent means the routine predates this field. */
@@ -1852,6 +1856,10 @@ export const BotRoutineListResponseSchema = Type.Object({
   name: Type.String(),
   routines: Type.Array(BotRoutineSchema),
   updatedAt: Type.Integer(),
+  /** Capability 83. Hermes's own `gateway_running` from `cron.manage list`: false means the
+   *  scheduler process is not running, so these routines are saved but will not fire. Absent when
+   *  Hermes could not tell (its probe failed) or predates the field. */
+  schedulerRunning: Type.Optional(Type.Boolean()),
 });
 export type BotRoutineListResponse = Static<typeof BotRoutineListResponseSchema>;
 
@@ -1860,6 +1868,10 @@ export type BotRoutineListResponse = Static<typeof BotRoutineListResponseSchema>
  *  least one non-whitespace character. */
 const RoutineText = (max: number) =>
   Type.String({ minLength: 1, maxLength: max, pattern: "^(?![\\s\\S]*\\u0000)[\\s\\S]*\\S[\\s\\S]*$" });
+
+/** A delivery target word (`local`, `bot-chat`, `bot-chat:<profile>`, a platform name): one line,
+ *  no control characters, no spaces. */
+const RoutineDeliver = Type.String({ minLength: 1, maxLength: 200, pattern: "^[A-Za-z0-9_.:@#/+-]+$" });
 
 /** `POST /bots/:name/routines` body. `schedule` is the RAW Hermes schedule string, composed by the
  *  client exactly as the desktop's picker composes it (`30m`, `every 1h`, `0 9 * * *`,
@@ -1879,35 +1891,33 @@ export const BotRoutineCreateRequestSchema = Type.Object({
   repeat: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
   /** Each run sees the previous run's output. */
   continuity: Type.Optional(Type.Boolean()),
+  /** Capability 83. Where each run's result goes: `bot-chat` for this bot's Bot Chat, `local` for
+   *  run history only. Absent keeps Hermes's own default (`local` for a job made here). */
+  deliver: Type.Optional(RoutineDeliver),
   model: Type.Optional(Type.Union([Type.String(), Type.Null()])),
   effort: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 });
 export type BotRoutineCreateRequest = Static<typeof BotRoutineCreateRequestSchema>;
 
 /** `PATCH /bots/:name/routines/:id` body. Every field is optional and only the fields present are
- *  written. `enabled` alone is the row switch (true resumes, false pauses) and keeps the routine's
- *  `id`.
+ *  written. `enabled` alone is the row switch (true resumes, false pauses).
  *
- *  `title`, `schedule`, `prompt`, `repeat` and `continuity` are a REWRITE, and the backend has no
- *  edit action at all: the gateway pauses the old job, creates a replacement, and removes the old
- *  one, so the routine comes back with a NEW `id`. Three consequences a client must design around,
- *  all spelled out in `contract/ext-bots-v1.md`:
- *  - `prompt` is REQUIRED whenever any of those five is present, because the backend only ever
- *    reports a 100-character preview of a stored prompt and a rewrite that guessed the rest would
- *    silently truncate the user's instruction;
- *  - everything the patch does not restate is CARRIED OVER from the routine being replaced, run cap
- *    included (it is recovered from the backend's display string, and a remaining `1/3` is carried
- *    as the 2 runs that are left), so an edit to a title cannot turn a bounded routine into a
- *    forever one;
- *  - `enabled` COMPOSES with a rewrite instead of being ignored by it: the replacement ends up in
- *    the state the patch asked for, and otherwise in the state the routine already had. */
+ *  Since capability 83 every other field is an IN-PLACE update through Hermes's own cron update
+ *  (`PUT /api/cron/jobs/:id`): the routine keeps its `id`, `prompt` is optional (absent keeps the
+ *  stored instruction), and `replacedId`/`orphanedId` are never sent. `repeat` counts runs FROM
+ *  NOW, as it always has on this wire: the gateway adds the runs already completed before it
+ *  stores Hermes's total, so a routine at `1/3` patched with `repeat: 2` still runs twice more.
+ *  `enabled` composes with the other fields: the routine ends in the state the patch asked for. */
 export const BotRoutinePatchSchema = Type.Object({
   title: Type.Optional(RoutineText(200)),
   schedule: Type.Optional(RoutineText(200)),
   prompt: Type.Optional(RoutineText(32_000)),
   enabled: Type.Optional(Type.Boolean()),
-  repeat: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
+  /** Runs from now. Capability 83: `null` clears the cap, so the routine runs until stopped. */
+  repeat: Type.Optional(Type.Union([Type.Integer({ minimum: 1, maximum: 10_000 }), Type.Null()])),
   continuity: Type.Optional(Type.Boolean()),
+  /** Capability 83. See `BotRoutineCreateRequest.deliver`. */
+  deliver: Type.Optional(RoutineDeliver),
   model: Type.Optional(Type.Union([Type.String(), Type.Null()])),
   effort: Type.Optional(Type.Union([Type.String(), Type.Null()])),
 });
@@ -1938,6 +1948,75 @@ export const BotRoutineRunResponseSchema = Type.Object({
   startedAt: Type.Integer(),
 });
 export type BotRoutineRunResponse = Static<typeof BotRoutineRunResponseSchema>;
+
+/** Capability 83. One past run of a routine: a Hermes cron session (`cron_<jobId>_<stamp>`).
+ *  Times are milliseconds; `endedAt` is null while the run is still going. `status` is Hermes's
+ *  own end reason (`cron_complete`, ...), passed through. Nothing else about the session (its
+ *  system prompt, its billing) is carried. */
+export const BotRoutineRunRecordSchema = Type.Object({
+  id: Type.String(),
+  startedAt: Type.Union([Type.Integer(), Type.Null()]),
+  endedAt: Type.Union([Type.Integer(), Type.Null()]),
+  status: Type.Optional(Type.String()),
+  title: Type.Optional(Type.String()),
+  active: Type.Optional(Type.Boolean()),
+});
+export type BotRoutineRunRecord = Static<typeof BotRoutineRunRecordSchema>;
+
+/** Capability 83. `GET /bots/:name/routines/:id/runs`: newest first, at most 50. */
+export const BotRoutineRunsResponseSchema = Type.Object({
+  name: Type.String(),
+  id: Type.String(),
+  runs: Type.Array(BotRoutineRunRecordSchema),
+});
+export type BotRoutineRunsResponse = Static<typeof BotRoutineRunsResponseSchema>;
+
+/** Capability 83. `GET /bots/:name/routines/:id/runs/:runId/output`: the run's final reply, the
+ *  last non-empty assistant message of that session, bounded and path-redacted. `output` is null
+ *  when the run said nothing (a silent run, or one still going). */
+export const BotRoutineRunOutputResponseSchema = Type.Object({
+  runId: Type.String(),
+  output: Type.Union([Type.String(), Type.Null()]),
+});
+export type BotRoutineRunOutputResponse = Static<typeof BotRoutineRunOutputResponseSchema>;
+
+/** Capability 83. One slot of a Hermes automation blueprint, as Hermes's catalog describes it.
+ *  `type` is Hermes's word (`text`, `time`, `enum`, `weekdays`, ...), passed through; a client
+ *  renders one it does not know as free text. */
+export const BotRoutineBlueprintFieldSchema = Type.Object({
+  name: Type.String(),
+  type: Type.String(),
+  label: Type.String(),
+  default: Type.Optional(Type.String()),
+  options: Type.Array(Type.String()),
+  optional: Type.Boolean(),
+  help: Type.Optional(Type.String()),
+});
+export type BotRoutineBlueprintField = Static<typeof BotRoutineBlueprintFieldSchema>;
+
+export const BotRoutineBlueprintSchema = Type.Object({
+  key: Type.String(),
+  title: Type.String(),
+  description: Type.Optional(Type.String()),
+  category: Type.Optional(Type.String()),
+  scheduleHuman: Type.Optional(Type.String()),
+  fields: Type.Array(BotRoutineBlueprintFieldSchema),
+});
+export type BotRoutineBlueprint = Static<typeof BotRoutineBlueprintSchema>;
+
+/** Capability 83. `GET /bots/:name/routine-blueprints`. */
+export const BotRoutineBlueprintsResponseSchema = Type.Object({
+  name: Type.String(),
+  blueprints: Type.Array(BotRoutineBlueprintSchema),
+});
+export type BotRoutineBlueprintsResponse = Static<typeof BotRoutineBlueprintsResponseSchema>;
+
+/** Capability 83. `POST /bots/:name/routine-blueprints/:key/instantiate` body: the filled slots.
+ *  Hermes validates them; a refusal is a 400 carrying its words. */
+export const BotRoutineBlueprintInstantiateRequestSchema = Type.Object({
+  values: Type.Record(Type.String({ minLength: 1, maxLength: 64 }), Type.String({ maxLength: 2_000 })),
+});
+export type BotRoutineBlueprintInstantiateRequest = Static<typeof BotRoutineBlueprintInstantiateRequestSchema>;
 
 /** One bot's routines, as a FULL REPLACE snapshot. Sent when this gateway changed them and when a
  *  `cron.changed` broadcast made the bridge re-read a bot whose routines some device is watching. */
@@ -3238,8 +3317,14 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * `PUT`/`DELETE /bots/:name/provider-keys/:provider` save or disconnect one, on the bot's own profile.
  * `GET /bots/:name/skills-hub?q=` and `POST /bots/:name/skills-hub/install` search the Skills Hub
  * and install into this bot. `POST /bots` gains `cloneFrom`, `cloneAll`, `noSkills` and
- * `shareKeys`. Additive: every route is new and a client below 82 sends none of the fields. */
-export const BOTS_CAPABILITY_VERSION = 82;
+ * `shareKeys`. Additive: every route is new and a client below 82 sends none of the fields.
+ * Capability 83: Hermes routines v2. `BotRoutine.deliver`, `BotRoutineListResponse.schedulerRunning`,
+ * create/patch `deliver`, in-place routine edits (prompt optional, id kept), `POST
+ * /bots/:name/routines/:id/run` for Hermes bots (fires Hermes's own trigger), `GET
+ * /bots/:name/routines/:id/runs`, `GET /bots/:name/routines/:id/runs/:runId/output`, and the
+ * blueprint catalog: `GET /bots/:name/routine-blueprints` and `POST
+ * /bots/:name/routine-blueprints/:key/instantiate`. */
+export const BOTS_CAPABILITY_VERSION = 83;
 
 /** Capability 82. At least one field. `title` is the friendly name; the empty string clears it. */
 export const BotIdentityPatchSchema = Type.Object({
