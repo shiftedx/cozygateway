@@ -308,12 +308,17 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
         const record = (typeof err === "object" && err !== null ? err : {}) as {
           code?: number;
           message?: string;
+          data?: unknown;
         };
         ws.send(
           JSON.stringify({
             jsonrpc: "2.0",
             id,
-            error: { code: record.code ?? 5000, message: record.message ?? "failed" },
+            error: {
+              code: record.code ?? 5000,
+              message: record.message ?? "failed",
+              ...(record.data === undefined ? {} : { data: record.data }),
+            },
           }),
         );
       }

@@ -29,6 +29,11 @@ import type {
   BotProfilePatch,
   BotPresentationPatch,
   BotPresentationResponse,
+  BotRelayAgent,
+  BotRelayDeliverRequest,
+  BotRelayDeliverResponse,
+  BotRelayDrainResponse,
+  BotRelayReplyRequest,
   BotReadiness,
   BotRuntimeProjection,
   BotRuntimeRecoveryResponse,
@@ -74,6 +79,7 @@ import type {
 } from "./approvals.ts";
 import { GroupRooms, type RoomInteractionExpiry } from "./group-rooms.ts";
 import { readPresentation, writePresentation } from "./presentation.ts";
+import { relayDeliver, relayDrain, relayReply, relayRosterSync } from "./relay.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
 import type { ProfileChangeEvent } from "./profile-provisioner.ts";
 import type { ObservationRing } from "../observe/ring.ts";
@@ -246,6 +252,11 @@ export interface BotControlSurface {
   /** Capability 80. Optional so a surface with no Hermes profile behind it simply lacks the route. */
   botPresentation?(name: string): Promise<BotPresentationResponse>;
   configurePresentation?(name: string, patch: BotPresentationPatch): Promise<BotPresentationResponse>;
+  /** Capability 87, the relay doors. Optional so only a surface with a Hermes behind it relays. */
+  relayRosterSync?(agents: BotRelayAgent[]): Promise<{ count: number }>;
+  relayDrain?(): Promise<BotRelayDrainResponse>;
+  relayDeliver?(req: BotRelayDeliverRequest): Promise<BotRelayDeliverResponse>;
+  relayReply?(req: BotRelayReplyRequest): Promise<{ ok: true }>;
   modelConfig(name: string): Promise<BotModelConfig>;
   configureModel(
     name: string,
@@ -664,6 +675,8 @@ export class HermesBridge implements BotControlSurface {
     this.#client.onEvent((event) => {
       if (event.type === "sessions.changed") this.refreshSoon(event.type);
       if (event.type === "cron.changed") this.#refreshRoutinesSoon();
+      // Capability 87: an envelope landed in this Hermes's relay outbox. The courier is the phone.
+      if (event.type === "bot_relay.outbox.pending") this.#broadcast({ type: "bot_relay_pending" });
     });
     this.#client.start();
     // Discovery can connect the shared client before this bridge subscribes.
@@ -801,7 +814,7 @@ export class HermesBridge implements BotControlSurface {
   #adoptCreatedRow(name: string, description: string, meta: Record<string, unknown>): BotSummary {
     const at = this.#now();
     const [row] = buildRoster(
-      [{ name, description: description.length === 0 ? null : description, hasAvatar: false, meta, lastActiveAt: null, preview: null }],
+      [{ name, description: description.length === 0 ? null : description, hasAvatar: false, meta, lastActiveAt: null, workerActiveAt: null, preview: null }],
       { hidden: this.#hidden, routedProfile: null, gatewayState: "idle", now: at },
     );
     if (row === undefined) throw new BotNotFound(name);
@@ -1086,6 +1099,18 @@ export class HermesBridge implements BotControlSurface {
     // `bot_roster` carries the blob as `meta`, so every paired phone sees the write on this refresh.
     this.refreshSoon(`bot ${name} presentation`);
     return { name, presentation: written.presentation, revision: written.revision ?? 0 };
+  }
+  relayRosterSync(agents: BotRelayAgent[]): Promise<{ count: number }> {
+    return relayRosterSync(this.#client, agents);
+  }
+  relayDrain(): Promise<BotRelayDrainResponse> {
+    return relayDrain(this.#client);
+  }
+  relayDeliver(req: BotRelayDeliverRequest): Promise<BotRelayDeliverResponse> {
+    return relayDeliver(this.#client, req);
+  }
+  relayReply(req: BotRelayReplyRequest): Promise<{ ok: true }> {
+    return relayReply(this.#client, req);
   }
   async modelConfig(name: string): Promise<BotModelConfig> {
     await this.#assertBotKnown(name);

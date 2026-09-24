@@ -25,6 +25,9 @@ export interface ParsedProfile {
   meta: Record<string, unknown> | null;
   /** Milliseconds, converted from the wire's seconds. Null when the profile has no session. */
   lastActiveAt: number | null;
+  /** Milliseconds of the freshest kanban/tool worker heartbeat (`worker_session.last_active`),
+   *  null when the row has none (capability 87). */
+  workerActiveAt: number | null;
   preview: string | null;
 }
 
@@ -88,6 +91,7 @@ export function parseProfileRow(row: unknown): ParsedProfile | undefined {
 
   const lastSession = asRecord(record["last_session"]);
   const lastActiveSeconds = typeof lastSession?.["last_active"] === "number" ? lastSession["last_active"] : undefined;
+  const workerSeconds = asRecord(record["worker_session"])?.["last_active"];
 
   return {
     name,
@@ -98,6 +102,10 @@ export function parseProfileRow(row: unknown): ParsedProfile | undefined {
       lastActiveSeconds === undefined || !Number.isFinite(lastActiveSeconds)
         ? null
         : Math.round(lastActiveSeconds * 1000),
+    workerActiveAt:
+      typeof workerSeconds === "number" && Number.isFinite(workerSeconds) && workerSeconds > 0
+        ? Math.round(workerSeconds * 1000)
+        : null,
     preview: asString(lastSession?.["preview"]) ?? null,
   };
 }
@@ -205,6 +213,7 @@ export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions)
       pinned: meta?.["pinned"] === true,
       active: isBotActive(profile, opts),
       lastActiveAt: profile.lastActiveAt,
+      workerActiveAt: profile.workerActiveAt,
       chatSessionId: null,
       preview: classifyPreview(profile.preview, profile.description),
       syncState: "setup_required",

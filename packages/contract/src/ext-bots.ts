@@ -64,6 +64,10 @@ export const BotSummarySchema = Type.Object({
   pinned: Type.Boolean(),
   active: Type.Boolean(),
   lastActiveAt: Type.Union([Type.Integer(), Type.Null()]),
+  /** Capability 87. Milliseconds of the profile's freshest kanban or tool worker heartbeat
+   *  (`profiles.list` `worker_session.last_active`), or null when it has none. Absent on older
+   *  gateways. Upstream reads a stamp under 150 s old as "Active now". */
+  workerActiveAt: Type.Optional(Type.Union([Type.Integer(), Type.Null()])),
   chatSessionId: Type.Union([Type.String(), Type.Null()]),
   preview: BotPreviewSchema,
   /** Whether this Hermes profile is synchronized into the native CozyChat data plane. */
@@ -1502,6 +1506,66 @@ export const BotPresentationResponseSchema = Type.Object({
   revision: Type.Integer({ minimum: 0 }),
 }, { additionalProperties: false });
 export type BotPresentationResponse = Static<typeof BotPresentationResponseSchema>;
+
+// Capability 87: the cross-connection relay doors (upstream `tui_gateway/methods_bot_relay.py`).
+// Rows and envelopes are Hermes's own snake_case shapes, forwarded verbatim in both directions.
+const RelayHandle = Type.String({ minLength: 1, maxLength: 64, pattern: "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$" });
+
+export const BotRelayAgentSchema = Type.Object({
+  profile: RelayHandle,
+  handle: RelayHandle,
+  connection_id: RelayHandle,
+  connection_label: Type.Optional(Type.String({ maxLength: 200 })),
+  title: Type.Optional(Type.String({ maxLength: 500 })),
+  description: Type.Optional(Type.String({ maxLength: 2_000 })),
+  online: Type.Optional(Type.Boolean()),
+});
+export type BotRelayAgent = Static<typeof BotRelayAgentSchema>;
+
+/** `POST /bot-relay/roster`: the agents on the phone's OTHER connections (replaces the last push). */
+export const BotRelayRosterRequestSchema = Type.Object({
+  agents: Type.Array(BotRelayAgentSchema, { maxItems: 2_000 }),
+}, { additionalProperties: false });
+export type BotRelayRosterRequest = Static<typeof BotRelayRosterRequestSchema>;
+
+/** `POST /bot-relay/drain` answer: every envelope claimed off this gateway's Hermes outbox. */
+export const BotRelayDrainResponseSchema = Type.Object({
+  envelopes: Type.Array(Type.Record(Type.String(), Type.Unknown())),
+}, { additionalProperties: false });
+export type BotRelayDrainResponse = Static<typeof BotRelayDrainResponseSchema>;
+
+/** `POST /bot-relay/deliver`: run one relayed turn in `profile`'s Bot Chat on this gateway. */
+export const BotRelayDeliverRequestSchema = Type.Object({
+  profile: Type.String({ minLength: 1, maxLength: 128 }),
+  message: Type.String({ minLength: 1, maxLength: 16_400 }),
+  fromProfile: Type.Optional(Type.String({ maxLength: 128 })),
+  fromHandle: Type.Optional(Type.String({ maxLength: 128 })),
+  fromConnection: Type.Optional(Type.String({ maxLength: 128 })),
+}, { additionalProperties: false });
+export type BotRelayDeliverRequest = Static<typeof BotRelayDeliverRequestSchema>;
+
+/** A failed turn is an ANSWER (200) carrying the target's own typed `reason`, never an HTTP error,
+ *  so the code reaches the courier intact. */
+export const BotRelayDeliverResponseSchema = Type.Union([
+  Type.Object({ reply: Type.String() }, { additionalProperties: false }),
+  Type.Object({ error: Type.String(), reason: Type.Optional(Type.String()) }, { additionalProperties: false }),
+]);
+export type BotRelayDeliverResponse = Static<typeof BotRelayDeliverResponseSchema>;
+
+/** `POST /bot-relay/reply`: hand a reply (or a typed failure) back to the sender's waiter. */
+export const BotRelayReplyRequestSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 128 }),
+  reply: Type.Optional(Type.Union([Type.String({ maxLength: 64_000 }), Type.Null()])),
+  error: Type.Optional(Type.Union([Type.String({ maxLength: 4_000 }), Type.Null()])),
+  reason: Type.Optional(Type.Union([Type.String({ maxLength: 64 }), Type.Null()])),
+}, { additionalProperties: false });
+export type BotRelayReplyRequest = Static<typeof BotRelayReplyRequestSchema>;
+
+/** Capability 87. The gateway's Hermes queued a cross-connection envelope; a courier drains now. */
+export const BotRelayPendingFrameSchema = Type.Object({
+  type: Type.Literal("bot_relay_pending"),
+});
+export type BotRelayPendingFrame = Static<typeof BotRelayPendingFrameSchema>;
 
 const NameItem = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
 
@@ -3103,5 +3167,12 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * Capability 79: reserved, runtime-bot settings (CozyAgents gateway). Not advertised meaning here.
  * Capability 80: `GET`/`PATCH /bots/:name/presentation` reads and writes the synced roster
  * presentation (pin, hide, user section, title) in `ui_meta["hermes-bots"]` with Hermes's own
- * per-key compare-and-swap; a revision conflict re-reads and re-applies only the patched keys. */
-export const BOTS_CAPABILITY_VERSION = 80;
+ * per-key compare-and-swap; a revision conflict re-reads and re-applies only the patched keys.
+ * Capabilities 81-86: allotted to the other bot parity slices (avatars, profile ops, routines,
+ * rooms, screen, chat semantics), which merge before 87.
+ * Capability 87: the foreground relay courier. `POST /bot-relay/roster`, `/drain`, `/deliver` and
+ * `/reply` forward upstream's `bot_relay.*` RPCs to this gateway's Hermes, and the
+ * `bot_relay_pending` frame forwards `bot_relay.outbox.pending`, so a phone holding this gateway and
+ * another Hermes connection can carry `message_agent` DMs between them. `BotSummary.workerActiveAt`
+ * carries the worker heartbeat for "Active now". Additive: no existing route or frame changes. */
+export const BOTS_CAPABILITY_VERSION = 87;
