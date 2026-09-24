@@ -3107,7 +3107,7 @@ const env = { ...process.env, HERMES_HOME: hermesRoot, HERMES_DASHBOARD_SESSION_
 // running on another port (e.g. `hermes serve`), so nothing would listen on N; --isolated
 // binds N. Hermes 0.16 and older reject the flag, so it is passed unless `--help` proves
 // it absent. Windows stays plain: its ownership proof treats an isolated Dashboard as foreign.
-const help = windowsDashboardProfile === '1' ? undefined : spawnSync(hermes, ['dashboard', '--help'], { encoding: 'utf8', env, timeout: 30000 });
+const help = windowsDashboardProfile === '1' ? undefined : spawnSync(hermes, ['dashboard', '--help'], { encoding: 'utf8', env, windowsHide: true, timeout: 30000 });
 const isolated = help !== undefined && !(help.status === 0 && !`${help.stdout}${help.stderr}`.includes('--isolated'));
 const dashboardArgs = ['dashboard', ...(windowsDashboardProfile === '1' ? ['-p', 'default'] : []), '--host', '127.0.0.1', '--port', dashboardPort, '--no-open', '--skip-build', ...(isolated ? ['--isolated'] : [])];
 const child = spawn(hermes, dashboardArgs, {

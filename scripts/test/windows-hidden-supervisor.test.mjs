@@ -63,9 +63,13 @@ for (const source of supervisors) {
       queueMicrotask(() => child.emit('spawn'));
       return child;
     };
+    const spawnSync = (command, args, options) => {
+      launches.push({ command, args, options });
+      return { status: 0, stdout: '--isolated', stderr: '' };
+    };
     const context = {
       require: (name) => {
-        if (name === 'node:child_process') return { spawn };
+        if (name === 'node:child_process') return { spawn, spawnSync };
         if (name === 'node:fs') return { readFileSync: () => '', watchFile() {}, unwatchFile() {} };
         if (name === 'node:util') return { parseEnv: () => ({ DASHBOARD_SESSION_TOKEN: 'fixture' }) };
         throw new Error(name);
@@ -95,9 +99,13 @@ for (const withHermes of [false, true]) {
       return child;
     };
     let requests = 0;
+    const spawnSync = (command, args, options) => {
+      launches.push({ command, args, options });
+      return { status: 0, stdout: '--isolated', stderr: '' };
+    };
     const context = {
       require: (name) => {
-        if (name === 'node:child_process') return { spawn };
+        if (name === 'node:child_process') return { spawn, spawnSync };
         if (name === 'node:fs') return { readFileSync: () => '{}', writeFileSync() {}, renameSync() {}, watchFile() {}, unwatchFile() {} };
         if (name === 'node:util') return { parseEnv: () => ({ DASHBOARD_SESSION_TOKEN: 'fixture' }) };
         if (name === 'node:net') return {};
