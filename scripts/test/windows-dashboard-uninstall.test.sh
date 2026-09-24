@@ -43,9 +43,9 @@ $script"
 }
 
 expect() {
-  local mode="$1" expected_status="$2" expected_text="$3" output status
+  local mode="$1" expected_status="$2" expected_text="$3" precheck="${4:-}" output status
   set +e
-  output="$(FAKE_NETTCPIP="$mode" stop_owned_windows_dashboard_for_uninstall 2>&1)"
+  output="$(FAKE_NETTCPIP="$mode" stop_owned_windows_dashboard_for_uninstall 9119 $precheck 2>&1)"
   status=$?
   set -e
   if [ "$status" != "$expected_status" ] || [[ "$output" != *"$expected_text"* ]]; then
@@ -61,11 +61,22 @@ expect error 1 'could not be inspected'
 expect none 1 'could not be inspected'
 expect listener 1 'Rerun the installer (or --runtime-only) to restore dashboard-owner.ps1'
 expect error 1 'Get-NetTCPConnection -State Listen -LocalPort 9119'
+# Before removal the Gateway's own Dashboard may still listen, so the precheck refuses only when
+# it cannot inspect; the listener decision is made after the Gateway stop.
+expect empty 0 '' precheck
+expect listener 0 '' precheck
+expect error 1 'could not be inspected' precheck
+expect none 1 'could not be inspected' precheck
 
-# The probe can refuse, so uninstall must run it before deleting the task and Startup entry.
+# The precheck runs before the task and Startup entry are deleted; the full decision runs after
+# the Gateway stop.
 uninstall_body="$(sed -n '/^uninstall() {/,/^}/p' "$repo_root/scripts/agent-install.sh" | sed -n '/hydrate_dashboard_port/,$p')"
-probe_line="$(grep -n 'DASHBOARD_OWNER_PS1" ] || stop_owned_windows_dashboard_for_uninstall' <<<"$uninstall_body" | head -1 | cut -d: -f1)"
-delete_line="$(grep -n 'schtasks.exe /Delete' <<<"$uninstall_body" | head -1 | cut -d: -f1)"
-[ -n "$probe_line" ] && [ -n "$delete_line" ] && [ "$probe_line" -lt "$delete_line" ] ||
-  { echo 'FAIL  uninstall deletes the Scheduled Task before the missing-helper Dashboard probe' >&2; exit 1; }
-echo 'PASS missing Dashboard owner helper fails closed, with recovery guidance, before the task is removed'
+line_of() { grep -nF -- "$1" <<<"$uninstall_body" | head -1 | cut -d: -f1; }
+precheck_line="$(line_of 'stop_owned_windows_dashboard_for_uninstall "$dashboard_stop_port" precheck')"
+delete_line="$(line_of 'schtasks.exe /Delete')"
+gateway_line="$(line_of 'stop_owned_windows_gateway 0')"
+decision_line="$(grep -nF 'stop_owned_windows_dashboard_for_uninstall "$dashboard_stop_port"' <<<"$uninstall_body" | grep -v precheck | head -1 | cut -d: -f1)"
+[ -n "$precheck_line" ] && [ -n "$delete_line" ] && [ -n "$gateway_line" ] && [ -n "$decision_line" ] &&
+  [ "$precheck_line" -lt "$delete_line" ] && [ "$gateway_line" -lt "$decision_line" ] ||
+  { echo 'FAIL  uninstall must precheck before removal and decide after the Gateway stop' >&2; exit 1; }
+echo 'PASS missing Dashboard owner helper fails closed with recovery guidance; inspection failure refuses before removal'
