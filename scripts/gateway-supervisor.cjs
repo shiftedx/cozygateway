@@ -140,8 +140,8 @@ async function startDashboardIfNeeded(options) {
   // verification window. A Dashboard already answering on N is adopted before any
   // spawn, so a spawned one is always meant to be ours. Hermes 0.16 and older have
   // no unified server and reject the flag, so it is passed only when `--help` does
-  // not prove it absent. Windows keeps the plain launch on the preferred port: its
-  // ownership proof treats an isolated Dashboard as foreign.
+  // not prove it absent. Windows keeps the plain launch on the preferred port; the
+  // isolated private fallback is still owned by its exact port, root and launcher.
   let isolation;
   const isolatedFlag = () => {
     if (!isolation) {

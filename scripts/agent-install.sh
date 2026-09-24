@@ -251,7 +251,8 @@ NODE
 hydrate_dashboard_port() {
   local saved configured
   [ "$DASHBOARD_PORT_EXPLICIT" = 1 ] && return 0
-  if [ -f "$CONFIG_JSON" ]; then
+  # Uninstall may run after the recorded Node runtime is gone; the port file still answers then.
+  if [ -f "$CONFIG_JSON" ] && [ -x "${NODE_RESOLVED:-}" ]; then
     configured="$("$NODE_RESOLVED" - "$CONFIG_JSON" <<'NODE'
 const { readFileSync } = require('node:fs');
 const config = JSON.parse(readFileSync(process.argv[2], 'utf8'));
@@ -2208,7 +2209,6 @@ function Get-CozyDashboardProfileEvidence {
   $selectorCount = 0
   $boundaryIndex = $Tokens.Count
   $invalidSelector = $false
-  $isolated = $false
   $index = $StartIndex
   while ($index -lt $Tokens.Count) {
     $token = [string]$Tokens[$index]
@@ -2250,7 +2250,6 @@ function Get-CozyDashboardProfileEvidence {
       }
       continue
     }
-    if ($token -eq "--isolated") { $isolated = $true }
     $index++
   }
   $state = if ($invalidSelector -or $selectorCount -ne 1) {
@@ -2263,7 +2262,6 @@ function Get-CozyDashboardProfileEvidence {
   return [pscustomobject]@{
     State = $state
     BoundaryIndex = $boundaryIndex
-    Isolated = $isolated
     ProfileIndexes = $profileIndexes
     ValueIndexes = $valueIndexes
   }
@@ -2347,7 +2345,7 @@ function Test-CozyDashboardOwner {
     $dashboardIndex = Find-CozyDashboardSubcommand $tokens 2 $profileEvidence
   }
   if ($dashboardIndex -lt 0) { return "Foreign" }
-  if ($profileEvidence.State -ne "Default" -or $profileEvidence.Isolated -or $profileEvidence.BoundaryIndex -lt $tokens.Count) { return "Foreign" }
+  if ($profileEvidence.State -ne "Default" -or $profileEvidence.BoundaryIndex -lt $tokens.Count) { return "Foreign" }
 
   if ($requiresRootAncestry) {
     $runtimeUnderRoot = $false
@@ -2401,7 +2399,9 @@ function Test-CozyDashboardOwner {
       continue
     }
     if ($token.StartsWith("--host=", [StringComparison]::Ordinal) -or $token.StartsWith("--open-profile=", [StringComparison]::Ordinal)) { continue }
-    if ($token -in @("--insecure", "--skip-build", "--no-open", "--tui")) { continue }
+    # --isolated marks the supervisor private fallback Dashboard (a separate server on its own
+    # port); the exact port, root and launcher checks still decide ownership.
+    if ($token -in @("--insecure", "--skip-build", "--no-open", "--tui", "--isolated")) { continue }
     return "Foreign"
   }
   if ($portCount -eq 1 -and $portMatches) { return "Owned" }
@@ -3430,7 +3430,7 @@ const env = { ...process.env, HERMES_HOME: hermesRoot, HERMES_DASHBOARD_SESSION_
 // Hermes 0.17+ routes a plain `dashboard --port N` to a machine-level backend already
 // running on another port (e.g. `hermes serve`), so nothing would listen on N; --isolated
 // binds N. Hermes 0.16 and older reject the flag, so it is passed unless `--help` proves
-// it absent. Windows stays plain: its ownership proof treats an isolated Dashboard as foreign.
+// it absent. Windows stays plain on the preferred port; only the supervisor private fallback is isolated.
 const help = windowsDashboardProfile === '1' ? undefined : spawnSync(hermes, ['dashboard', '--help'], { encoding: 'utf8', env, windowsHide: true, timeout: 30000 });
 const isolated = help !== undefined && !(help.status === 0 && !`${help.stdout}${help.stderr}`.includes('--isolated'));
 const dashboardArgs = ['dashboard', ...(windowsDashboardProfile === '1' ? ['-p', 'default'] : []), '--host', '127.0.0.1', '--port', dashboardPort, '--no-open', '--skip-build', ...(isolated ? ['--isolated'] : [])];
@@ -3475,6 +3475,7 @@ stop_stubborn_windows_dashboard() {
   esac
 }
 stop_owned_windows_dashboard_for_uninstall() {
+  local DASHBOARD_PORT="${1:-$DASHBOARD_PORT}"
   [ "$SERVICE_PLATFORM" = Windows ] || return 0
   [ "$DRY_RUN" = 1 ] && { say "DRY   stop only a verified Hermes Dashboard on 127.0.0.1:$DASHBOARD_PORT before removing its owner helper"; return; }
   if [ ! -f "$DASHBOARD_OWNER_PS1" ]; then
@@ -3551,7 +3552,7 @@ remove_gateway_home() {
   run rm -rf "$GATEWAY_DIR"
 }
 uninstall() {
-  local profiles root hermes_bin dashboard_port p home plugin spool action hermes_available=1
+  local profiles root hermes_bin dashboard_port dashboard_stop_port p home plugin spool action hermes_available=1
   if [ ! -f "$STATE_FILE" ]; then
     resolve_platform
     say "WARN  CozyGateway install state is missing; removing recoverable current-user files only"
@@ -3638,6 +3639,14 @@ uninstall() {
   [ "$dashboard_port" -ge 1 ] && [ "$dashboard_port" -le 65535 ] || die "installer state has an unsafe Dashboard port"
   DASHBOARD_PORT="$dashboard_port"
   resolve_platform
+  # install-state records the preferred port, which the supervisor identity checks still match.
+  # The private Dashboard itself may have moved to a fallback port recorded in the config
+  # endpoint and port file, so only the Dashboard stop resolves that port. Removal is a recovery
+  # path: a corrupt config or unusable Node falls back to the port file, then install-state.
+  dashboard_stop_port="$DASHBOARD_PORT"
+  if [ "$SERVICE_PLATFORM" = Windows ]; then
+    dashboard_stop_port="$( (hydrate_dashboard_port && printf '%s' "$DASHBOARD_PORT") 2>/dev/null || (CONFIG_JSON=; hydrate_dashboard_port && printf '%s' "$DASHBOARD_PORT") )" || die "could not resolve the private Dashboard port"
+  fi
   HARNESS=hermes
   if [ "$SERVICE_PLATFORM" = Windows ]; then
     local startup_entry task_xml
@@ -3655,7 +3664,7 @@ uninstall() {
       [ ! -f "$startup_entry" ] || rm -f "$startup_entry"
       stop_owned_windows_gateway 0 || true
     fi
-    stop_owned_windows_dashboard_for_uninstall
+    stop_owned_windows_dashboard_for_uninstall "$dashboard_stop_port"
     [ "$DRY_RUN" = 1 ] || remove_windows_cli_path
   elif [ "$SERVICE_PLATFORM" = Darwin ]; then
     if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
