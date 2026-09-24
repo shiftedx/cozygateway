@@ -366,15 +366,19 @@ remove_profile_dir() {
     *) die "[$profile] refusing to remove an unexpected path: $dir" ;;
   esac
   # A multiplexed host serving this profile would recreate files under it. Hermes' own profile
-  # delete asks the host to unserve it first; so does this. No answer means no host is serving it
-  # now, or its 30-second reconcile unroutes the vanished profile on its own.
+  # delete asks the host to unserve it first; so does this, and removes nothing until the host has
+  # confirmed (hermes-host.sh host_unserve). No answer means no host is serving it now.
   if served_by_host "$profile"; then
     if [ "$DRY_RUN" = 1 ]; then
       say "  DRY  ask the host Hermes gateway to unserve $profile"
-    elif host_control unserve-profile "$profile"; then
-      say "  host Hermes gateway unserved $profile"
     else
-      say "  host Hermes gateway did not answer unserve-profile; its reconcile unroutes $profile"
+      local unserved=0
+      host_unserve "$profile" || unserved=$?
+      case "$unserved" in
+        0) say "  host Hermes gateway unserved $profile" ;;
+        4) say "  no host Hermes gateway answered unserve-profile; nothing is serving $profile" ;;
+        *) warn "[$profile] the host Hermes gateway still serves $profile; its directory was kept"; return 1 ;;
+      esac
     fi
   fi
   if [ "$DRY_RUN" = 1 ]; then say "  DRY  rm -rf $dir"; return 0; fi
@@ -436,7 +440,7 @@ for profile in "${PROFILES[@]}"; do
   remove_service "$profile" || overall_rc=1
   # In automatic mode a recreated directory is never removed, even if it
   # appeared after orphan discovery. The next sweep will provision it again.
-  [ "$ORPHANS_ONLY" = 1 ] || remove_profile_dir "$profile" "$HERMES_HOME_ROOT/profiles/$profile"
+  [ "$ORPHANS_ONLY" = 1 ] || remove_profile_dir "$profile" "$HERMES_HOME_ROOT/profiles/$profile" || overall_rc=1
 done
 if [ "$needs_restart" = 1 ]; then
   ssh -o BatchMode=yes "$BOX_SSH" "cd $(shell_quote "$BOX_REPO") && docker compose up -d --force-recreate gateway" >/dev/null \
