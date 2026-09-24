@@ -59,6 +59,13 @@ interface Client {
  *  does not know, which is what every client shipped before the declaration existed does. */
 const CAPABILITY_GATED_FRAMES: Record<string, { capability: string; minimum: number }> = {
   bot_draft_updated: { capability: "com.cozylabs.bots", minimum: 71 },
+  // Capability 85. A client that declared an older bots version has no screen to paint.
+  bot_screen_status: { capability: "com.cozylabs.bots", minimum: 85 },
+  bot_screen_lease: { capability: "com.cozylabs.bots", minimum: 85 },
+  bot_screen_install_log: { capability: "com.cozylabs.bots", minimum: 85 },
+  bot_screen_install_done: { capability: "com.cozylabs.bots", minimum: 85 },
+  bot_screen_install_sudo: { capability: "com.cozylabs.bots", minimum: 85 },
+  bot_screen_request_cancel: { capability: "com.cozylabs.bots", minimum: 85 },
 };
 
 function understands(client: Client, frame: ServerFrame): boolean {
@@ -553,6 +560,24 @@ export class WsHub {
     } catch {
       return "frame_send_failed";
     }
+  }
+
+  /** Capability 85. One frame to every write-scoped socket of ONE device (the sudo card belongs to
+   *  the phone that pressed Install, not to every phone). False when that device has none open. */
+  sendFrameToDevice(deviceId: string, frame: ServerFrame): boolean {
+    const payload = JSON.stringify(frame);
+    let sent = false;
+    for (const client of this.#clients) {
+      if (client.deviceId !== deviceId || client.scope === "read") continue;
+      if (client.socket.readyState !== WebSocket.OPEN || !understands(client, frame)) continue;
+      try {
+        client.socket.send(payload);
+        sent = true;
+      } catch {
+        // A socket that died mid-send is the heartbeat's to reap.
+      }
+    }
+    return sent;
   }
 
   sendToDevice(deviceId: string, frame: MobileNodeRequestFrame | MobileNodeCancelFrame): boolean {

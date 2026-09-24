@@ -39,6 +39,8 @@ export interface GroupLogEntry {
   displayName: string;
   text: string;
   at: number;
+  /** Capability 84. Absent on legacy entries, which form one legacy thread. */
+  threadId?: string;
 }
 
 /** Every handle form a member answers to, lowercased (dissection 9.4): its name, its name with
@@ -218,4 +220,107 @@ export function deltaSince(log: GroupLogEntry[], watermark: number): GroupLogEnt
  *  is set to once it has been shown everything. */
 export function highestSeq(log: GroupLogEntry[], floor = 0): number {
   return log.reduce((max, entry) => (entry.seq > max ? entry.seq : max), floor);
+}
+
+// --- Capability 84: threads, slash refusal, stop directives and holds (upstream group-rounds.ts) ---
+
+/** The thread an entry belongs to; legacy entries share the empty thread. */
+export function threadOf(entry: { threadId?: string }): string {
+  return entry.threadId ?? "";
+}
+
+/** Rooms cannot dispatch slash commands; paths such as `/etc/hosts` still send. */
+export function isSlashCommand(text: string): boolean {
+  return /^\/[a-z][\w-]*(?:\s|$)/i.test(text.trim());
+}
+
+/** Quoted or pasted content is not a directive: fenced blocks, inline code, straight or curly
+ *  quoted spans and `>` lines are masked to their @tokens (or one filler word). */
+function maskQuotedAndCodeSpans(value: string): string {
+  const mentionsOnly = (span: string): string => (span.match(/@[\p{L}\p{N}._-]+/gu) ?? []).join(" ") || "quoted";
+  const kept: string[] = [];
+  let fence = "";
+  for (const line of value.split("\n")) {
+    if (fence) {
+      const closing = line.trim().startsWith(fence);
+      kept.push(closing ? "" : mentionsOnly(line));
+      if (closing) fence = "";
+      continue;
+    }
+    const opened = line.match(/^\s*(`{3,}|~{3,})/);
+    if (opened) {
+      fence = opened[1]!;
+      continue;
+    }
+    if (/^\s*>/.test(line)) {
+      kept.push(mentionsOnly(line));
+      continue;
+    }
+    kept.push(line.replace(/`[^`\n]*`/g, mentionsOnly).replace(/["\u201c\u201d][^"\u201c\u201d\n]*["\u201c\u201d]/g, mentionsOnly));
+  }
+  return kept.join("\n");
+}
+
+/** `adjacent` when a stop/halt/pause token is within two tokens of an @mention, `distant` when a
+ *  stop word is present but far from every mention, null without one. */
+function stopWordPlacement(value: string): "adjacent" | "distant" | null {
+  const tokens = maskQuotedAndCodeSpans(value).toLowerCase().match(/@[\p{L}\p{N}._-]+|[\p{L}\p{N}_-]+/gu) ?? [];
+  const mentionAt: number[] = [];
+  const stopAt: number[] = [];
+  tokens.forEach((token, index) => {
+    if (token.startsWith("@")) mentionAt.push(index);
+    else if (token === "stop" || token === "halt" || token === "pause") stopAt.push(index);
+  });
+  if (stopAt.some((stop) => mentionAt.some((mention) => Math.abs(stop - mention) <= 2))) return "adjacent";
+  return stopAt.length > 0 ? "distant" : null;
+}
+
+/** A user message's effect on holds. A distant stop word is neutral: it neither holds nor releases. */
+export function classifyHoldDirective(
+  text: string,
+  mentioned: Iterable<string>,
+  everyone: boolean,
+): { hold: string[]; holdAll: boolean; release: string[]; releaseAll: boolean } {
+  const names = [...mentioned];
+  const stop = stopWordPlacement(text);
+  if (stop === "adjacent") return { hold: names, holdAll: everyone, release: [], releaseAll: false };
+  return { hold: [], holdAll: false, release: stop === "distant" ? [] : names, releaseAll: stop === null && everyone };
+}
+
+export interface GroupHold {
+  at: number;
+  seq?: number;
+  thread?: string;
+  /** The `held` activity has been announced for this hold. */
+  noted?: boolean;
+}
+
+/** The next holds after one user message; the same object when nothing changed. */
+export function applyHoldDirective(
+  holds: Record<string, GroupHold>,
+  mentions: { everyone: boolean; members: Set<string> },
+  text: string,
+  stamp: GroupHold,
+  allMembers: string[],
+): Record<string, GroupHold> {
+  const action = classifyHoldDirective(text, mentions.members, mentions.everyone);
+  if (action.releaseAll) return Object.keys(holds).length > 0 ? {} : holds;
+  let next = holds;
+  for (const name of action.holdAll ? allMembers : action.hold) {
+    if (next === holds) next = { ...holds };
+    next[name] = { ...stamp };
+  }
+  for (const name of action.release) {
+    if (!Object.hasOwn(next, name)) continue;
+    if (next === holds) next = { ...holds };
+    delete next[name];
+  }
+  return next;
+}
+
+/** Seqs a held member missed: the first (the hold instruction's neighbour) plus the newest tail. */
+export function heldSeqs(existing: readonly number[] | undefined, delta: readonly number[]): number[] {
+  const unique = [...new Set([...(existing ?? []), ...delta])];
+  if (unique.length <= GROUP_HISTORY_LIMIT) return unique;
+  return [unique[0]!, ...unique.slice(-(GROUP_HISTORY_LIMIT - 1))];
 }

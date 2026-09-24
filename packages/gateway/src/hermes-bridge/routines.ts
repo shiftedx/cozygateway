@@ -1,8 +1,14 @@
-import type { BotRoutine, BotRoutineCreateRequest, BotRoutinePatch } from "cozygateway-contract";
+import type {
+  BotRoutine,
+  BotRoutineBlueprint,
+  BotRoutineCreateRequest,
+  BotRoutinePatch,
+  BotRoutineRunRecord,
+} from "cozygateway-contract";
 
 import { asRecord, asString } from "./rpc.ts";
 import type { HermesRpc } from "./rpc.ts";
-import { redactHermesSessionPaths } from "./session-management.ts";
+import { projectHermesSessionText, redactHermesSessionPaths } from "./session-management.ts";
 
 /** The routines surface stores new bot routines as ordinary Hermes cron jobs named
  * `[bot:<name>] <title>`. Existing untagged cron jobs are also shown because `cron.manage` scopes
@@ -105,6 +111,35 @@ export class RoutineUnconfirmed extends Error {
   }
 }
 
+/** The Hermes connection the routines surface needs: the JSON-RPC socket (`cron.manage`) and, since
+ *  capability 83, the dashboard REST routes for the four things `cron.manage` cannot do (update in
+ *  place, trigger, run history, blueprints). `dashboardJson` is optional so a list still works on a
+ *  bare RPC (tests, and a dashboard read that failed only costs the full-prompt merge). */
+export interface HermesRoutinesPort extends HermesRpc {
+  dashboardJson?<T = unknown>(
+    path: string,
+    init?: { method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown },
+  ): Promise<T>;
+}
+
+/** A capability-83 operation that needs the dashboard REST surface on a connection that has none. */
+export class RoutineDashboardUnavailable extends Error {
+  constructor(operation: string) {
+    super(`this Hermes connection has no dashboard REST surface, so a routine ${operation} is not possible`);
+    this.name = "RoutineDashboardUnavailable";
+  }
+}
+
+function dashboard(port: HermesRoutinesPort, operation: string): NonNullable<HermesRoutinesPort["dashboardJson"]> {
+  const call = port.dashboardJson;
+  if (call === undefined) throw new RoutineDashboardUnavailable(operation);
+  return call.bind(port);
+}
+
+function cronJobPath(jobId: string, bot: string, suffix = ""): string {
+  return `/api/cron/jobs/${encodeURIComponent(jobId)}${suffix}?profile=${encodeURIComponent(bot)}`;
+}
+
 export interface CronJob {
   job_id?: unknown;
   name?: unknown;
@@ -196,13 +231,14 @@ export function routineTimestamp(value: unknown): number | null {
  * data. Delivery adapters commonly include their spool/config path in failures, so every absolute
  * POSIX, drive-letter, UNC and home-relative path family is removed before the bound is applied.
  * Whitespace is flattened for a routine-row label and control bytes are discarded. */
+/** `~/...` paths, which the absolute-path rules of `redactHermesSessionPaths` do not cover. */
+function redactHomePaths(value: string): string {
+  return value.replace(/(^|[\s("'`])~[\\/][^\s"'<>]*/g, "$1<path>");
+}
+
 export function routineDeliveryError(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
-  const withoutHomePaths = value.replace(
-    /(^|[\s("'`])~[\\/][^\s"'<>]*/g,
-    "$1<path>",
-  );
-  const clean = redactHermesSessionPaths(withoutHomePaths)
+  const clean = redactHermesSessionPaths(redactHomePaths(value))
     .replace(/[\u0000-\u001f\u007f]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -223,6 +259,7 @@ export function mapRoutine(job: CronJob): BotRoutine {
   const repeat = asString(job.repeat);
   const lastStatus = asString(job.last_status);
   const lastDeliveryError = routineDeliveryError(job.last_delivery_error);
+  const deliver = asString(job.deliver);
   return {
     id: asString(job.job_id) ?? "",
     title: routineTitle(job),
@@ -236,6 +273,7 @@ export function mapRoutine(job: CronJob): BotRoutine {
     ...(lastDeliveryError === undefined ? {} : { lastDeliveryError }),
     ...(repeat === undefined || repeat.length === 0 ? {} : { repeat }),
     ...(job.continuity === true ? { continuity: true } : {}),
+    ...(deliver === undefined || deliver.length === 0 ? {} : { deliver }),
   };
 }
 
@@ -297,11 +335,84 @@ export async function findBotRoutineJob(rpc: HermesRpc, bot: string, jobId: stri
 
 export interface RoutineListResult {
   routines: BotRoutine[];
+  /** Hermes's `gateway_running`, when it said true or false. */
+  schedulerRunning?: boolean;
 }
 
-/** Lists one bot's current tagged routines. */
-export async function listBotRoutines(rpc: HermesRpc, bot: string): Promise<RoutineListResult> {
-  return { routines: selectRoutineJobs(await listCronStore(rpc, bot), bot).map(mapRoutine) };
+/** Lists one bot's current tagged routines.
+ *
+ *  `cron.manage list` reports a 100-character PREVIEW of each prompt. Capability 83 reads the full
+ *  stored prompts from the dashboard (`GET /api/cron/jobs?profile=`) and unwraps the instruction
+ *  the user wrote, so an editor can show and edit the whole thing. That read is best effort: when
+ *  it fails the preview stays, exactly as before. */
+export async function listBotRoutines(port: HermesRoutinesPort, bot: string): Promise<RoutineListResult> {
+  const result = await port.request("cron.manage", { action: "list", include_disabled: true, profile: bot });
+  readCronReply("list", result);
+  const jobs = selectRoutineJobs(cronJobsOf(result), bot);
+  const full = await fullPrompts(port, bot, jobs.length);
+  const running = asRecord(result)?.["gateway_running"];
+  return {
+    routines: jobs.map((job) => {
+      const routine = mapRoutine(job);
+      const prompt = full.get(routine.id);
+      return prompt === undefined ? routine : { ...routine, prompt: routineInstruction(prompt) };
+    }),
+    ...(typeof running === "boolean" ? { schedulerRunning: running } : {}),
+  };
+}
+
+async function fullPrompts(port: HermesRoutinesPort, bot: string, count: number): Promise<Map<string, string>> {
+  const prompts = new Map<string, string>();
+  if (count === 0 || port.dashboardJson === undefined) return prompts;
+  try {
+    const rows = await port.dashboardJson<unknown>(`/api/cron/jobs?profile=${encodeURIComponent(bot)}`);
+    const list = Array.isArray(rows) ? rows : asRecord(rows)?.["jobs"];
+    if (!Array.isArray(list)) return prompts;
+    for (const row of list) {
+      const record = asRecord(row);
+      const id = asString(record?.["id"]);
+      const prompt = asString(record?.["prompt"]);
+      if (id !== undefined && prompt !== undefined) prompts.set(id, prompt);
+    }
+  } catch {
+    /* the previews stand */
+  }
+  return prompts;
+}
+
+/** A routine row with its WHOLE instruction: `cron.manage` reports a 100-character preview of the
+ *  wrapped prompt, so a write's answer would otherwise put that preview in front of an editor. The
+ *  stored prompt is read from the dashboard (best effort; the preview stands when it fails). */
+async function withFullInstruction(port: HermesRoutinesPort, bot: string, job: CronJob): Promise<BotRoutine> {
+  const routine = mapRoutine(job);
+  if (port.dashboardJson === undefined) return routine;
+  try {
+    const stored = asRecord(await port.dashboardJson<unknown>(cronJobPath(routine.id, bot)));
+    const prompt = asString(stored?.["prompt"]);
+    return prompt === undefined ? routine : { ...routine, prompt: routineInstruction(prompt) };
+  } catch {
+    return routine;
+  }
+}
+
+const SCHEDULED_ARGUMENT = " -q '[Scheduled routine] ";
+
+/** The instruction a user wrote, out of the prompt a routine is stored with: the reverse of
+ *  `routinePrompt`, and of the desktop's own wrapper (which has no silence-first line). A prompt
+ *  that is not one of those shapes is returned whole, because it IS the instruction. */
+export function routineInstruction(prompt: string): string {
+  let text = prompt;
+  if (text.startsWith(SAFE_ROUTINE_MARKER)) {
+    // The LAST ` -q '[Scheduled routine] `: the title also appears raw in the wrapper's first
+    // sentence, so a title carrying that text must not be taken for the quoted argument. Inside a
+    // shell-quoted argument every `'` is escaped, so the real one is the last literal match.
+    const open = text.lastIndexOf(SCHEDULED_ARGUMENT);
+    const close = text.lastIndexOf("'\n\nIf the command fails");
+    if (open === -1 || close <= open) return prompt;
+    text = text.slice(open + SCHEDULED_ARGUMENT.length, close).replaceAll(`'"'"'`, "'");
+  }
+  if (text.startsWith(`${SILENCE_FIRST}\n\n`)) text = text.slice(SILENCE_FIRST.length + 2);
+  return text;
 }
 
 /** Quotes a value for a POSIX shell single-quoted string, the desktop's `shellQuote` (5320-5322).
@@ -368,6 +479,7 @@ export function buildRoutineAddParams(
     profile: bot,
     ...(input.repeat === undefined ? {} : { repeat: input.repeat }),
     ...(input.continuity === true ? { continuity: true } : {}),
+    ...(input.deliver === undefined ? {} : { deliver: input.deliver }),
   };
 }
 
@@ -382,48 +494,55 @@ export function buildRoutineActionParams(
   return { action, name: jobId, profile: bot };
 }
 
-/** Which of a patch's fields need the job to be rewritten rather than merely paused or resumed.
- *
- *  `repeat` and `continuity` count, and leaving them out was not a shortcut but a silent data loss:
- *  `cron.manage` has no update action, so the ONLY way either reaches the backend is on an `add`. A
- *  patch carrying `enabled` plus `repeat` took the row-action branch, answered 200, and threw the run
- *  cap away. There is no branch here that can write them without a rewrite, so a patch that names
- *  them is a rewrite. */
+/** Whether a patch writes anything beyond the on/off switch. Since capability 83 such a patch is
+ *  an in-place update rather than a rewrite; the name is kept for the callers that ask. */
 export function patchNeedsRewrite(patch: BotRoutinePatch): boolean {
   return (
     patch.title !== undefined ||
     patch.schedule !== undefined ||
     patch.prompt !== undefined ||
     patch.repeat !== undefined ||
-    patch.continuity !== undefined
+    patch.continuity !== undefined ||
+    patch.deliver !== undefined
   );
 }
 
-/** The run cap still owed on an existing job, read back out of the DISPLAY string the backend
- *  reports (`forever`, `once`, `3 times`, `1/3`).
- *
- *  A rewrite is a delete and a create, so anything the patch does not restate is gone unless it is
- *  recovered here, and a bounded routine silently becoming a forever one because the user fixed a
- *  typo in its title is the worst version of that. `1/3` is "run 1 of 3", so what the replacement
- *  should be capped at is what REMAINS. A shape this cannot read returns undefined, which is the
- *  old behavior (uncapped) for a string nothing can honestly interpret. */
-export function routineRepeatCount(job: CronJob): number | undefined {
-  const text = (asString(job.repeat) ?? "").trim().toLowerCase();
-  if (text.length === 0 || text === "forever") return undefined;
-  if (text === "once") return 1;
-  const times = /^(\d+)\s+times?$/.exec(text);
-  if (times !== null) {
-    const count = Number(times[1]);
-    return Number.isFinite(count) && count > 0 ? count : undefined;
-  }
-  const progress = /^(\d+)\s*\/\s*(\d+)$/.exec(text);
-  if (progress !== null) {
-    const done = Number(progress[1]);
-    const total = Number(progress[2]);
-    if (!Number.isFinite(done) || !Number.isFinite(total)) return undefined;
-    return Math.max(1, total - done);
-  }
-  return undefined;
+/** Runs a job has already completed, read from the backend's run-cap display string (`1/3` means
+ *  one of three done). Every other shape has completed none that matter to a cap. */
+export function routineCompletedRuns(job: CronJob): number {
+  const progress = /^(\d+)\s*\/\s*(\d+)$/.exec((asString(job.repeat) ?? "").trim());
+  const done = progress === null ? 0 : Number(progress[1]);
+  return Number.isFinite(done) && done > 0 ? done : 0;
+}
+
+/** The prompt an EDITED instruction is stored with, in the shape the job already has. Only a job
+ *  that carries the gateway's own delegation wrapper is re-wrapped (with its current title); a bare
+ *  prompt stays bare, keeping the silence-first line only if it was there. A blueprint's job is a
+ *  bare prompt whose `skills` load into the outer agent, and wrapping it would run the instruction
+ *  in a nested agent without them. A job whose stored prompt could not be read is wrapped as a
+ *  create would wrap it. */
+export function rewrapRoutinePrompt(input: {
+  stored: string | undefined;
+  bot: string;
+  title: string;
+  instruction: string;
+  schedulerProfile?: string | undefined;
+}): string {
+  const { stored, bot, title, instruction } = input;
+  if (stored === undefined) return routinePrompt(input);
+  if (stored.startsWith(SAFE_ROUTINE_MARKER)) return routinePrompt({ bot, title, instruction });
+  if (stored.startsWith(`${SILENCE_FIRST}\n\n`)) return `${SILENCE_FIRST}\n\n${instruction}`;
+  return instruction;
+}
+
+/** Runs the job has completed, from the stored record's `repeat.completed`. The `cron.manage`
+ *  display string cannot be trusted for this: it reads `forever` for any uncapped job, however
+ *  many times it has run. The display string is only the fallback. */
+function storedCompletedRuns(stored: Record<string, unknown> | undefined, job: CronJob): number {
+  const completed = asRecord(stored?.["repeat"])?.["completed"];
+  return typeof completed === "number" && Number.isFinite(completed) && completed >= 0
+    ? Math.trunc(completed)
+    : routineCompletedRuns(job);
 }
 
 export interface RoutineWriteResult {
@@ -455,7 +574,8 @@ export async function createBotRoutine(
 ): Promise<BotRoutine> {
   const reply = readCronReply("add", await rpc.request("cron.manage", buildRoutineAddParams(bot, input, schedulerProfile)));
   const job = asRecord(reply["job"]) as CronJob | undefined;
-  if (job !== undefined) return mapRoutine(job);
+  const instruction = input.prompt.trim();
+  if (job !== undefined) return { ...mapRoutine(job), prompt: instruction };
 
   const createdId = asString(reply["job_id"]) ?? "";
   // Nothing to read back BY. The add reported success, so a routine may exist, and the only honest
@@ -468,7 +588,7 @@ export async function createBotRoutine(
   } catch (err) {
     throw new RoutineUnconfirmed(createdId, err instanceof Error ? err.message : String(err));
   }
-  return mapRoutine(stored);
+  return { ...mapRoutine(stored), prompt: instruction };
 }
 
 /** Deletes a tagged routine. An id outside this bot's namespace is a 404, never a delete. */
@@ -477,124 +597,254 @@ export async function deleteBotRoutine(rpc: HermesRpc, bot: string, jobId: strin
   readCronReply("remove", await rpc.request("cron.manage", buildRoutineActionParams("remove", bot, jobId)));
 }
 
-/** Applies a patch.
+/** Applies a patch IN PLACE (capability 83).
  *
- *  Two very different operations behind one route, and the difference is the backend's, not this
- *  API's invention:
+ *  `enabled` alone stays the row action it always was (`cron.manage` pause/resume). Anything else is
+ *  one `PUT /api/cron/jobs/:id?profile=` with only the fields the patch names, so the routine keeps
+ *  its id and everything it did not name. Before 83 this was a pause-add-remove rewrite, because
+ *  `cron.manage` has no update action; Hermes's dashboard has had one all along.
  *
- *  - `enabled` alone is a ROW ACTION (`pause` / `resume`) and keeps the routine's id.
- *  - anything else is a REWRITE, because `cron.manage` exposes no update action at all: the tool
- *    behind it has one, and the gateway does not route to it. So the routine is recreated, and its
- *    id changes. `enabled` COMPOSES with a rewrite rather than being ignored by it: the replacement
- *    ends in the state the patch asked for, and in the state the routine already had when it did
- *    not ask.
- *
- *  The rewrite order is chosen so that no failure can leave a routine firing twice or firing with
- *  half an edit applied:
- *
- *  1. PAUSE the existing job first. From here on it cannot fire, whatever else happens. A pause that
- *     fails aborts the whole rewrite, because the alternative is a window where the old schedule and
- *     the new one are both live.
- *  2. ADD the replacement. If this fails (an unparsable schedule is the common one), the old job is
- *     RESUMED back to the state it was in and the failure is reported: the user's routine is exactly
- *     as it was before they tried to edit it.
- *  3. REMOVE the old job. If THIS fails, the new routine still exists and the old one is still
- *     paused, so nothing double-fires; the leftover id is reported as `orphanedId` rather than
- *     swallowed, because it is real and it is deletable. */
+ *  - `prompt` keeps the stored prompt's shape (`rewrapRoutinePrompt`): the gateway's wrapper is
+ *    re-wrapped, a bare prompt stays bare. A rename re-wraps the wrapper with the new title.
+ *  - `repeat` counts runs from now: the completed runs (the stored `repeat.completed`) are added
+ *    back, because Hermes stores a total and keeps its completed counter across an update.
+ *  - `continuity` is Hermes's `self` entry in `context_from`; other references are kept. */
 export async function patchBotRoutine(
-  rpc: HermesRpc,
+  port: HermesRoutinesPort,
   bot: string,
   jobId: string,
   patch: BotRoutinePatch,
   schedulerProfile?: string,
 ): Promise<RoutineWriteResult> {
-  const existing = await findBotRoutineJob(rpc, bot, jobId);
+  const existing = await findBotRoutineJob(port, bot, jobId);
 
-  if (!patchNeedsRewrite(patch)) {
-    if (patch.enabled === undefined) return { routine: mapRoutine(existing) };
+  if (patchNeedsRewrite(patch)) {
+    const call = dashboard(port, "edit");
+    const updates: Record<string, unknown> = {};
+    const title = patch.title?.trim() ?? routineTitle(existing);
+    // The stored record: the full prompt (to keep its shape), the real completed-run count and the
+    // continuity references. Read once, and only when the patch needs one of them.
+    const needsStored =
+      patch.title !== undefined || patch.prompt !== undefined || typeof patch.repeat === "number" ||
+      patch.continuity !== undefined;
+    const stored = needsStored ? asRecord(await call<unknown>(cronJobPath(jobId, bot))) : undefined;
+    const storedPrompt = asString(stored?.["prompt"]);
+    if (patch.title !== undefined) updates["name"] = routineJobName(bot, title);
+    if (patch.schedule !== undefined) updates["schedule"] = patch.schedule.trim();
+    // A rename re-wraps the gateway's wrapper too, since the wrapper names the routine's title.
+    const instruction =
+      patch.prompt?.trim() ??
+      (patch.title !== undefined && storedPrompt?.startsWith(SAFE_ROUTINE_MARKER) === true
+        ? routineInstruction(storedPrompt)
+        : undefined);
+    if (instruction !== undefined) {
+      updates["prompt"] = rewrapRoutinePrompt({ stored: storedPrompt, bot, title, instruction, schedulerProfile });
+    }
+    // `null` is "forever": Hermes's update_job stores `{times: None}` and keeps the completed count.
+    if (patch.repeat !== undefined)
+      updates["repeat"] = patch.repeat === null ? null : patch.repeat + storedCompletedRuns(stored, existing);
+    if (patch.deliver !== undefined) updates["deliver"] = patch.deliver;
+    if (patch.continuity !== undefined) {
+      const raw = stored?.["context_from"];
+      const refs = (Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [])
+        .flatMap((ref) => (typeof ref === "string" ? [ref] : []))
+        .filter((ref) => ref.trim().toLowerCase() !== "self" && ref !== jobId);
+      updates["context_from"] = patch.continuity ? [...refs, "self"] : refs;
+    }
+    await call(cronJobPath(jobId, bot), { method: "PUT", body: { updates } });
+  }
+
+  let current = patchNeedsRewrite(patch) ? await findBotRoutineJob(port, bot, jobId) : existing;
+  if (patch.enabled !== undefined && patch.enabled !== routineActive(current)) {
     const action = patch.enabled ? "resume" : "pause";
-    const reply = readCronReply(action, await rpc.request("cron.manage", buildRoutineActionParams(action, bot, jobId)));
-    const job = asRecord(reply["job"]) as CronJob | undefined;
+    const reply = readCronReply(action, await port.request("cron.manage", buildRoutineActionParams(action, bot, jobId)));
     // `pause` and `resume` echo the updated row. When they do not, the local view is updated the
     // same way the desktop's optimistic switch does, rather than reporting the pre-call state.
-    return { routine: mapRoutine(job ?? { ...existing, enabled: patch.enabled, state: patch.enabled ? "active" : "paused" }) };
+    current = (asRecord(reply["job"]) as CronJob | undefined)
+      ?? { ...current, enabled: patch.enabled, state: patch.enabled ? "active" : "paused" };
   }
+  return { routine: await withFullInstruction(port, bot, current) };
+}
 
-  const wasActive = routineActive(existing);
-  // What the routine should end up as, which is NOT simply what it was: a patch may carry `enabled`
-  // alongside the fields that force the rewrite, and answering 200 while ignoring it told the user
-  // their switch had been honored when it had not.
-  const desiredActive = patch.enabled ?? wasActive;
-  if (wasActive) {
-    readCronReply("pause", await rpc.request("cron.manage", buildRoutineActionParams("pause", bot, jobId)));
-  }
+/** How long a run-now waits for Hermes to refuse before answering that the run started. Hermes's
+ *  trigger holds its HTTP answer until the whole run has finished, which can be minutes, so the
+ *  route answers once the trigger has been accepted and lets the run finish in the background. */
+export const ROUTINE_RUN_ACCEPT_MS = 1_500;
 
-  const title = patch.title ?? routineTitle(existing);
-  // Guarded by the route, which refuses a rewrite with no prompt: the backend reports a 100-char
-  // PREVIEW of a stored prompt and never the whole thing, so there is nothing here to fall back on.
-  const prompt = patch.prompt ?? "";
-  // Every field the patch did not restate is carried over from the job being replaced, because a
-  // rewrite is a delete and a create and anything not carried is DELETED. The run cap comes back out
-  // of the display string (`routineRepeatCount`), so a title edit no longer turns a bounded routine
-  // into a forever one.
-  const repeat = patch.repeat ?? routineRepeatCount(existing);
-  const continuity = patch.continuity ?? (existing.continuity === true ? true : undefined);
-  const create: BotRoutineCreateRequest = {
-    title,
-    schedule: patch.schedule ?? (asString(existing.schedule) ?? ""),
-    prompt,
-    ...(repeat === undefined ? {} : { repeat }),
-    ...(continuity === undefined ? {} : { continuity }),
-  };
+export interface RoutineRunStart {
+  routine: BotRoutine;
+  startedAt: number;
+  /** Settles when Hermes's trigger answers (the run ended, or it was refused late). Never rejects. */
+  settled: Promise<void>;
+}
 
-  let created: BotRoutine;
+/** Fires a routine now through Hermes's own trigger (`POST /api/cron/jobs/:id/trigger`), after the
+ *  namespace check every write makes. A refusal inside `acceptMs` (an unknown job, a run already
+ *  in flight) is thrown; past it the run is reported started. */
+export async function runBotRoutine(
+  port: HermesRoutinesPort,
+  bot: string,
+  jobId: string,
+  now: () => number = Date.now,
+  acceptMs: number = ROUTINE_RUN_ACCEPT_MS,
+): Promise<RoutineRunStart> {
+  const existing = await findBotRoutineJob(port, bot, jobId);
+  const call = dashboard(port, "run");
+  const startedAt = now();
+  const trigger = call<unknown>(cronJobPath(jobId, bot, "/trigger"), { method: "POST", body: {} });
+  const settled = trigger.then(() => undefined, () => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const accepted = new Promise<"accepted">((resolve) => {
+    timer = setTimeout(() => resolve("accepted"), acceptMs);
+  });
   try {
-    created = await createBotRoutine(rpc, bot, create, schedulerProfile);
+    await Promise.race([trigger, accepted]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+  return { routine: await withFullInstruction(port, bot, existing), startedAt, settled };
+}
+
+/** Milliseconds from Hermes's epoch-seconds session stamps. */
+function secondsToMs(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value * 1000) : null;
+}
+
+/** A routine's past runs, newest first. Only the handful of facts a run row shows are projected:
+ *  a Hermes session row also carries its system prompt and billing, which never leave the host. */
+export async function listBotRoutineRuns(
+  port: HermesRoutinesPort,
+  bot: string,
+  jobId: string,
+  limit = 20,
+): Promise<BotRoutineRunRecord[]> {
+  await findBotRoutineJob(port, bot, jobId);
+  const bounded = Math.max(1, Math.min(50, Math.trunc(limit)));
+  const reply = asRecord(await dashboard(port, "run history")<unknown>(
+    `${cronJobPath(jobId, bot, "/runs")}&limit=${bounded}`,
+  ));
+  const runs = Array.isArray(reply?.["runs"]) ? (reply["runs"] as unknown[]) : [];
+  return runs.flatMap((entry) => {
+    const run = asRecord(entry);
+    const id = asString(run?.["id"]);
+    if (run === undefined || id === undefined) return [];
+    const status = asString(run["end_reason"]);
+    const title = asString(run["title"]);
+    return [{
+      id,
+      startedAt: secondsToMs(run["started_at"]),
+      endedAt: secondsToMs(run["ended_at"]),
+      ...(status === undefined ? {} : { status }),
+      ...(title === undefined ? {} : { title }),
+      ...(typeof run["is_active"] === "boolean" ? { active: run["is_active"] } : {}),
+    }];
+  });
+}
+
+export const ROUTINE_RUN_OUTPUT_MAX_LENGTH = 16_000;
+
+/** One run's final reply: the last non-empty assistant message of that run's session. The run id
+ *  must be one of THIS routine's runs (`cron_<jobId>_...`), so the route cannot read an arbitrary
+ *  conversation of the bot. */
+export async function readBotRoutineRunOutput(
+  port: HermesRoutinesPort,
+  bot: string,
+  jobId: string,
+  runId: string,
+): Promise<string | null> {
+  await findBotRoutineJob(port, bot, jobId);
+  if (!runId.startsWith(`cron_${jobId}_`)) throw new RoutineNotFound(runId);
+  const reply = asRecord(await dashboard(port, "run output")<unknown>(
+    `/api/sessions/${encodeURIComponent(runId)}/messages?profile=${encodeURIComponent(bot)}`,
+  ));
+  const messages = Array.isArray(reply?.["messages"]) ? (reply["messages"] as unknown[]) : [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = asRecord(messages[index]);
+    if (message?.["role"] !== "assistant") continue;
+    const text = messageText(message["content"]);
+    if (text === undefined) continue;
+    // The same projection every other transcript surface applies (control bytes, image directives,
+    // host paths), plus the `~/` rule routine delivery errors use.
+    const output = projectHermesSessionText(redactHomePaths(text), ROUTINE_RUN_OUTPUT_MAX_LENGTH);
+    if (output.length > 0) return output;
+  }
+  return null;
+}
+
+/** A message's text: a plain string, or the text parts of a content-part array. */
+function messageText(content: unknown): string | undefined {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  const parts = content.flatMap((part) => {
+    if (typeof part === "string") return [part];
+    const record = asRecord(part);
+    const type = record?.["type"];
+    const text = asString(record?.["text"]);
+    return text === undefined || (type !== undefined && type !== "text") ? [] : [text];
+  });
+  return parts.length === 0 ? undefined : parts.join("\n");
+}
+
+/** Hermes's automation blueprint catalog, for this bot's profile (the deliver slot's options are
+ *  the platforms that profile has configured). */
+export async function listRoutineBlueprints(port: HermesRoutinesPort, bot: string): Promise<BotRoutineBlueprint[]> {
+  const reply = asRecord(await dashboard(port, "blueprint list")<unknown>(
+    `/api/cron/blueprints?profile=${encodeURIComponent(bot)}`,
+  ));
+  const list = Array.isArray(reply?.["blueprints"]) ? (reply["blueprints"] as unknown[]) : [];
+  return list.flatMap((entry) => {
+    const row = asRecord(entry);
+    const key = asString(row?.["key"]);
+    const title = asString(row?.["title"]);
+    if (row === undefined || key === undefined || title === undefined) return [];
+    const fields = (Array.isArray(row["fields"]) ? (row["fields"] as unknown[]) : []).flatMap((value) => {
+      const field = asRecord(value);
+      const name = asString(field?.["name"]);
+      if (field === undefined || name === undefined) return [];
+      const fallback = field["default"];
+      const help = asString(field["help"]);
+      return [{
+        name,
+        type: asString(field["type"]) ?? "text",
+        label: asString(field["label"]) ?? name,
+        ...(fallback === undefined || fallback === null ? {} : { default: String(fallback) }),
+        options: (Array.isArray(field["options"]) ? (field["options"] as unknown[]) : []).map(String),
+        optional: field["optional"] === true,
+        ...(help === undefined || help.length === 0 ? {} : { help }),
+      }];
+    });
+    const description = asString(row["description"]);
+    const category = asString(row["category"]);
+    const scheduleHuman = asString(row["scheduleHuman"]);
+    return [{
+      key,
+      title,
+      ...(description === undefined ? {} : { description }),
+      ...(category === undefined ? {} : { category }),
+      ...(scheduleHuman === undefined ? {} : { scheduleHuman }),
+      fields,
+    }];
+  });
+}
+
+/** Creates a blueprint's job in this bot's cron store, and answers the routine as `cron.manage`
+ *  lists it. */
+export async function instantiateRoutineBlueprint(
+  port: HermesRoutinesPort,
+  bot: string,
+  key: string,
+  values: Record<string, string>,
+): Promise<BotRoutine> {
+  const created = asRecord(await dashboard(port, "blueprint create")<unknown>(
+    `/api/cron/blueprints/instantiate?profile=${encodeURIComponent(bot)}`,
+    { method: "POST", body: { blueprint: key, values } },
+  ));
+  const job = asRecord(created?.["job"]) ?? created;
+  const id = asString(job?.["id"]) ?? asString(job?.["job_id"]);
+  if (id === undefined) throw new RoutineUnconfirmed(undefined, "the blueprint reply carried no job id");
+  try {
+    return await withFullInstruction(port, bot, await findBotRoutineJob(port, bot, id));
   } catch (err) {
-    // A replacement that could not be READ BACK may well be running: the `add` succeeded and only
-    // the confirmation failed. Resuming the old job on top of that is the one outcome this whole
-    // ordering exists to prevent, so an unconfirmed create rolls nothing back. The old job stays
-    // paused, nothing double-fires, and the next list reports whichever jobs are really there.
-    if (wasActive && !(err instanceof RoutineUnconfirmed)) {
-      // Best effort, and its failure must not replace the failure the caller needs to see: the
-      // routine that could not be edited is now paused, which the next list will report.
-      try {
-        await rpc.request("cron.manage", buildRoutineActionParams("resume", bot, jobId));
-      } catch {
-        /* reported by the next list */
-      }
-    }
-    throw err;
+    throw new RoutineUnconfirmed(id, err instanceof Error ? err.message : String(err));
   }
-
-  let orphanedId: string | undefined;
-  try {
-    readCronReply("remove", await rpc.request("cron.manage", buildRoutineActionParams("remove", bot, jobId)));
-  } catch {
-    orphanedId = jobId;
-  }
-
-  // The replacement is put into the state the patch asked for, which defaults to the state the
-  // routine already had: an edit is not a resume, and a routine the user had switched off must not
-  // come back on because they fixed a typo in its title. `add` always creates a RUNNING job, so only
-  // the off case has anything to do here.
-  let routine = created;
-  if (!desiredActive && routineActive(created)) {
-    try {
-      const reply = readCronReply(
-        "pause",
-        await rpc.request("cron.manage", buildRoutineActionParams("pause", bot, created.id)),
-      );
-      const job = asRecord(reply["job"]) as CronJob | undefined;
-      routine = job === undefined ? { ...created, enabled: false, state: "paused" } : mapRoutine(job);
-    } catch {
-      /* the routine exists and is running; the next list reports the truth */
-    }
-  }
-
-  return {
-    routine,
-    replacedId: jobId,
-    ...(orphanedId === undefined ? {} : { orphanedId }),
-  };
 }

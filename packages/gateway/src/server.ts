@@ -77,7 +77,8 @@ import { TurnRunner } from "./turns.ts";
 import { RelayNotifier, taskCompletionPayload, type ChatMessagePushEvent } from "./push-notifier.ts";
 import { LiveActivityNotifier } from "./live-activity-notifier.ts";
 import { roomApprovalPush, type ApprovalPushPayload } from "./push-crypto.ts";
-import { SETUP_CODE_TTL_MS, newSetupCode } from "./auth.ts";
+import { SETUP_CODE_TTL_MS, hashToken, newSetupCode } from "./auth.ts";
+import { BotScreenSurface } from "./hermes-bridge/bot-screen.ts";
 import {
   createUpgradeDispatcher,
   type UpgradeHandler,
@@ -571,6 +572,21 @@ export async function startGateway(
     });
     return { endpoint, client, bridge: member };
   });
+  // Capability 85, bot screen. One courier over every endpoint's existing `/api/ws` client: the
+  // screen's RPCs ride the same authenticated link, and the RFB splice dials `/api/display/ws`
+  // beside it on a ticket Hermes mints over that link.
+  const botScreen = clientMembers.length === 0
+    ? undefined
+    : new BotScreenSurface({
+        endpoints: clientMembers.map(({ endpoint, options: memberOptions, client }) => ({
+          client,
+          apiWsUrl: memberOptions.url,
+          ...(endpoint.namespace ? { namespace: endpoint.id! } : {}),
+        })),
+        broadcast: (frame) => hub.broadcast(frame),
+        sendToDevice: (deviceId, frame) => hub.sendFrameToDevice(deviceId, frame),
+        deviceForToken: (token) => storage.deviceByTokenHash(hashToken(token))?.id,
+      });
   // Capability 46 and 52, findings V1-F1 (R1) and F8. The gateway's OWN room host, built for every
   // shape that goes through the federated control surface: no Hermes endpoint at all, or two or
   // more, or one namespaced endpoint. A room is a gateway-owned attach-v1 conversation, so it owns
@@ -625,6 +641,7 @@ export async function startGateway(
         (key) => storage.botGroup(key)?.members,
         (key) => storage.botGroupOwner(key),
         (key, owner) => storage.backfillBotGroupOwner(key, owner),
+        (name) => storage.botGroupKeyByName(name),
       ));
   // Every host that can drive a room on this gateway: each endpoint's bridge, plus the gateway's
   // own host. On a single un-namespaced endpoint that is just the bridge, exactly as before.
@@ -643,7 +660,9 @@ export async function startGateway(
     const event = frame.event;
     if (!("threadId" in event) || !("turnId" in event)) return undefined;
     const owned = storage.botGroupTurnForAttach(agentId, event.threadId, event.turnId);
-    return owned === undefined ? undefined : roomHostFor(owned.key);
+    // Capability 84: a commit on a member's room thread that no room turn owns is an external write.
+    const key = owned?.key ?? storage.botGroupMemberBySession(event.threadId)?.key;
+    return key === undefined ? undefined : roomHostFor(key);
   };
   // Every configured Hermes profile has one attach identity shared by the core thread surface and
   // Bot Mode. Token resolution fails closed before the listener opens.
@@ -863,6 +882,7 @@ export async function startGateway(
     canQueue: (agentId) => attachV1Ingress.canQueue(agentId),
     sendNativeTurn: (agentId, input) =>
       attachV1Ingress.sendNativeTurn(agentId, input),
+    sendInterrupt: (agentId, input) => attachV1Ingress.sendNativeInterrupt(agentId, input),
   });
   const adapters = new Map<string, ReturnType<typeof createAttachAdapter>>();
   /** Each configured Hermes profile has one attach-v1 turn adapter. */
@@ -1108,6 +1128,7 @@ export async function startGateway(
     releaseAttachDeadLetter: (agentId, eventId) =>
       attachV1Ingress.releaseProjectionDeadLetter(agentId, eventId),
     bots: botsSurface,
+    ...(botScreen === undefined ? {} : { botScreen }),
     memory: memorySurface,
     // The plane's guard, not the raw lane: history is a runtime-bot fact, and the 409 a Hermes bot
     // gets is decided in one place rather than in each of the five routes.
@@ -1192,7 +1213,10 @@ export async function startGateway(
     attachV1Ingress.handleUpgrade(req, socket, head),
   );
   routes.set("/runner/v1", (req, socket, head) => runnerLane.handleUpgrade(req, socket, head));
-  server.on("upgrade", createUpgradeDispatcher(routes));
+  server.on("upgrade", createUpgradeDispatcher(routes, (pathname) =>
+    botScreen !== undefined && BotScreenSurface.matches(pathname)
+      ? (req, socket, head) => botScreen.handleUpgrade(req, socket, head)
+      : undefined));
   // Started after the listener is up so the first roster refresh cannot race the hub it
   // broadcasts through.
   for (const member of bridgeMembers) member.bridge.start();
@@ -1309,6 +1333,7 @@ export async function startGateway(
       attachV1Ingress.close();
       runnerLane.close();
       // The bots bridge holds a dial-out socket and its own timers; closing it cancels both.
+      botScreen?.close();
       await Promise.all(bridgeMembers.map((member) => member.bridge.close()));
       await roomHost?.close();
       nativeBotPlane.close();

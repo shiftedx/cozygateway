@@ -18,6 +18,7 @@ import type {
   BotGroup,
   BotGroupDetail,
   BotGroupMessage,
+  BotGroupPatchRequest,
   BotModelConfig,
   BotModelConfigPatch,
   BotModelProviderOAuthSession,
@@ -31,17 +32,26 @@ import type {
   BotPresentationResponse,
   BotCanonicalChatResponse,
   BotChatReactionResponse,
+  BotAvatarGenerateRequest,
+  BotAvatarGenerateResponse,
+  BotAvatarPetGallery,
+  BotAvatarPetThumbResponse,
+  BotAvatarSetResponse,
   BotReadiness,
   BotRuntimeProjection,
   BotRuntimeRecoveryResponse,
   BotRoutine,
+  BotRoutineBlueprint,
   BotRoutineCreateRequest,
   BotRoutinePatch,
+  BotRoutineRunRecord,
   BotSummary,
   BotSlashCommand,
   BotTurnToolSteps,
   BotTurnDelegations,
   BridgeLiveness,
+  BotIdentityPatch,
+  BotModelPinRequest,
   ServerFrame,
 } from "cozygateway-contract";
 import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
@@ -77,6 +87,7 @@ import type {
 import { GroupRooms, type RoomInteractionExpiry } from "./group-rooms.ts";
 import { readPresentation, writePresentation } from "./presentation.ts";
 import { createCanonicalBotChat, ensureBotModeMarker, findCanonicalBotChat } from "./bot-chat.ts";
+import { AvatarFingerprints, clearAvatar, generatePortrait, petGallery, petThumb, readAvatar, writeAvatar } from "./avatar.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
 import type { ProfileChangeEvent } from "./profile-provisioner.ts";
 import type { ObservationRing } from "../observe/ring.ts";
@@ -102,11 +113,34 @@ import {
 import {
   createBotRoutine,
   deleteBotRoutine,
+  instantiateRoutineBlueprint,
+  listBotRoutineRuns,
   listBotRoutines,
+  listRoutineBlueprints,
   patchBotRoutine,
+  readBotRoutineRunOutput,
+  runBotRoutine,
   type RoutineWriteResult,
 } from "./routines.ts";
 import { readBotModelConfig, writeBotModelConfig } from "./model-config.ts";
+import {
+  ProfileOpInvalid,
+  copyBotLook,
+  describeProfileAuto,
+  disconnectProvider,
+  exportProfileArchive,
+  freeDuplicateName,
+  importProfileArchive,
+  installHubSkill,
+  listProviderKeys,
+  pinProfileModel,
+  readProfileModelPin,
+  renameProfile,
+  saveProviderKey,
+  searchSkillsHub,
+  setBotIdentity,
+  unpinProfileModel,
+} from "./profile-ops.ts";
 import {
   cancelProviderOAuth,
   deleteProviderSetupField,
@@ -193,6 +227,13 @@ export interface BotRoutineList {
   name: string;
   routines: BotRoutine[];
   updatedAt: number;
+  /** Capability 83: Hermes's `gateway_running`, when it reported one. */
+  schedulerRunning?: boolean;
+}
+/** Capability 83: a run-now that Hermes accepted. */
+export interface BotRoutineRunStarted {
+  routine: BotRoutine;
+  startedAt: number;
 }
 export interface BotChatHistory {
   sessionId: string;
@@ -235,8 +276,27 @@ export class BotSessionConflict extends Error {
   }
 }
 
+/** Capability 82: one profile operation on a Hermes-backed bot (`profile-ops.ts`). */
+export type BotProfileOp =
+  | { kind: "identity"; patch: BotIdentityPatch }
+  | { kind: "rename"; newName: string }
+  | { kind: "describeAuto"; overwrite: boolean }
+  | { kind: "duplicate"; newName?: string; avoid?: readonly string[] }
+  | { kind: "export" }
+  | { kind: "import"; archive: ReadableStream<Uint8Array> | null }
+  | { kind: "modelPin" }
+  | { kind: "pinModel"; request: BotModelPinRequest }
+  | { kind: "unpinModel" }
+  | { kind: "providerKeys" }
+  | { kind: "saveProviderKey"; provider: string; apiKey: string }
+  | { kind: "disconnectProvider"; provider: string }
+  | { kind: "skillsHubSearch"; query: string }
+  | { kind: "skillsHubInstall"; identifier: string };
+
 export interface BotControlSurface {
   roster(): BotRosterView;
+  /** Capability 82. The result's shape is the route's own; a `bot` member is a roster row. */
+  profileOp?(name: string, op: BotProfileOp): Promise<unknown>;
   createBot(input: BotCreateRequest): Promise<BotCreateResponse>;
   deleteBot(name: string, opts?: { force?: boolean }): Promise<BotDeleteResponse>;
   health(): BridgeLiveness;
@@ -255,6 +315,12 @@ export interface BotControlSurface {
   canonicalBotChat?(name: string, create: boolean): Promise<{ hermesSessionId: string; created: boolean } | null>;
   /** Capability 86. Archive (and hide) one Hermes session, which retires a Bot Chat. */
   archiveHermesSession?(name: string, hermesSessionId: string): Promise<void>;
+  /** Capability 81. Optional for the same reason: only a Hermes profile has an avatar asset. */
+  botAvatar?(name: string): Promise<{ mime: string; bytes: Buffer } | undefined>;
+  setBotAvatar?(name: string, data: string | null): Promise<BotAvatarSetResponse>;
+  generateBotAvatar?(name: string, request: BotAvatarGenerateRequest): Promise<BotAvatarGenerateResponse>;
+  botAvatarPets?(name: string, localOnly: boolean): Promise<BotAvatarPetGallery>;
+  botAvatarPetThumb?(name: string, slug: string, url: string): Promise<BotAvatarPetThumbResponse>;
   modelConfig(name: string): Promise<BotModelConfig>;
   configureModel(
     name: string,
@@ -291,6 +357,12 @@ export interface BotControlSurface {
     patch: BotRoutinePatch,
   ): Promise<RoutineWriteResult>;
   deleteRoutine(name: string, id: string): Promise<void>;
+  /** Capability 83. Optional so a surface without Hermes's dashboard leaves the routes 404. */
+  runRoutine?(name: string, id: string): Promise<BotRoutineRunStarted>;
+  routineRuns?(name: string, id: string, limit?: number): Promise<BotRoutineRunRecord[]>;
+  routineRunOutput?(name: string, id: string, runId: string): Promise<string | null>;
+  routineBlueprints?(name: string): Promise<BotRoutineBlueprint[]>;
+  instantiateRoutineBlueprint?(name: string, key: string, values: Record<string, string>): Promise<BotRoutine>;
   setFocus(deviceId: string, screen: BotFocusScreen | null): void;
   groups(): BotGroup[];
   createGroup(name: string, members: string[], owningHost?: string): Promise<BotGroup>;
@@ -299,8 +371,14 @@ export interface BotControlSurface {
   sendGroupMessage(
     name: string,
     text: string,
-    opts?: { clientId?: string },
+    opts?: { clientId?: string; threadId?: string },
   ): BotGroupMessage;
+  /** Capability 84. */
+  updateGroup(name: string, patch: BotGroupPatchRequest): Promise<BotGroup>;
+  stopGroup(name: string): BotGroup;
+  compressGroupMember(name: string, member: string): Promise<{ member: string; text: string }>;
+  /** Capability 84. A room picture from Hermes `image.generate`; absent without a Hermes endpoint. */
+  generateGroupPicture?(prompt: string): Promise<string>;
 }
 export interface BotsSurface extends BotControlSurface {
   readiness(name: string): BotReadiness;
@@ -491,6 +569,9 @@ export interface HermesBridgeOptions {
 /** Dashboard control/read plane. All Bot Mode conversation traffic is attach-v1. */
 export class HermesBridge implements BotControlSurface {
   readonly #client: HermesClient;
+  readonly #avatarFingerprints = new AvatarFingerprints();
+  #rosterGeneration = 0;
+  #petGallery: { at: number; pets: Map<string, string> } | undefined;
   readonly #storage: Storage;
   readonly #broadcast: (frame: ServerFrame) => void;
   readonly #now: () => number;
@@ -646,9 +727,28 @@ export class HermesBridge implements BotControlSurface {
   sendGroupMessage(
     name: string,
     text: string,
-    opts: { clientId?: string } = {},
+    opts: { clientId?: string; threadId?: string } = {},
   ): BotGroupMessage {
     return this.#groups.send(name, text, opts);
+  }
+  updateGroup(name: string, patch: BotGroupPatchRequest): Promise<BotGroup> {
+    return this.#groups.update(name, patch);
+  }
+  stopGroup(name: string): BotGroup {
+    return this.#groups.stop(name);
+  }
+  compressGroupMember(name: string, member: string): Promise<{ member: string; text: string }> {
+    return this.#groups.compress(name, member);
+  }
+  /** Capability 84. Hermes answers `image_data` (a data URL) or, when its download failed, `image`. */
+  async generateGroupPicture(prompt: string): Promise<string> {
+    const result = await this.#client.request("image.generate", { prompt, aspect_ratio: "square" }, { timeoutMs: 180_000 }) as
+      { success?: boolean; image_data?: string; image?: string; error?: string } | null;
+    const image = result?.image_data ?? result?.image;
+    if (result?.success !== true || typeof image !== "string" || !image.startsWith("data:image/")) {
+      throw new BackendUnavailable(result?.error ?? "Hermes could not generate a picture");
+    }
+    return image;
   }
   setGroupNativeTurns(endpoint: NativeGroupTurnEndpoint): void {
     this.#groups.setNativeTurns(endpoint);
@@ -697,22 +797,43 @@ export class HermesBridge implements BotControlSurface {
   }
   async createBot(input: BotCreateRequest): Promise<BotCreateResponse> {
     const name = validateNewBotName(input.name);
+    const cloneFrom = input.cloneFrom === undefined ? undefined : normalizeProfileName(input.cloneFrom);
+    // Capability 82: "Share keys & accounts" is on unless the person turned it off, which is the
+    // only create any client below 82 ever sent (`share_auth: true`, keys mirrored by default).
+    const shareKeys = input.shareKeys !== false;
     try {
       await this.#client.request("profiles.create", {
         name,
         description: input.description?.trim() ?? "",
-        share_auth: true,
+        share_auth: shareKeys,
+        ...(shareKeys ? {} : { mirror_credentials: false }),
+        ...(cloneFrom === undefined ? {} : { clone_from: cloneFrom }),
+        ...(input.cloneAll === true ? { clone_all: true } : {}),
+        ...(input.noSkills === true ? { no_skills: true } : {}),
       });
     } catch (error) {
       if (
         error instanceof HermesRpcError &&
-        (error.code === 4062 || /already exists|file exists/i.test(error.message))
+        (/already exists|file exists/i.test(error.message) ||
+          (error.code === 4062 && cloneFrom === undefined && input.noSkills !== true))
       ) {
         throw new BotNameTaken(name);
       }
+      // A missing clone source or `no_skills` beside a clone: Hermes' own sentence says which.
+      if (error instanceof HermesRpcError && error.code === 4062) throw new ProfileOpInvalid(error.message);
       throw error;
     }
-
+    // A clone brings the source's skills and toolsets, and that is the point of it: the blank
+    // slate is for a bot starting from nothing.
+    return this.#settleCreatedProfile(name, input, cloneFrom === undefined);
+  }
+  /** Everything after Hermes accepted a new profile, shared by a create, a duplicate and an
+   *  import: restore, the attach-enrolling seed, the title, the roster row and the provisioner. */
+  async #settleCreatedProfile(
+    name: string,
+    input: BotCreateRequest,
+    blankSlate: boolean,
+  ): Promise<BotCreateResponse> {
     this.#storage.restoreBot(name);
 
     // The profile exists from here on. Metadata is best-effort decoration, but the idempotent seed
@@ -729,6 +850,7 @@ export class HermesBridge implements BotControlSurface {
     this.#storage.savePendingHermesProfileSeed({
       profile: name,
       selection,
+      ...(blankSlate ? {} : { blankSlate: false }),
       attempts: 1,
       nextAttemptAt: this.#now() + this.#seedRetryDelay(1),
     });
@@ -737,7 +859,7 @@ export class HermesBridge implements BotControlSurface {
     // (issue #183), so there is no configuration under which skipping this pass is correct.
     try {
       const seed = await this.#chain(name, () => seedBlankSlateProfile(this.#client, name, {
-        blankSlate: this.#seedBlankSlateBots,
+        blankSlate: this.#seedBlankSlateBots && blankSlate,
         selection,
         skillsOn: this.#blankSlateSkillsOn,
       }));
@@ -772,6 +894,7 @@ export class HermesBridge implements BotControlSurface {
       this.#storage.savePendingHermesProfileSeed({
         profile: name,
         selection,
+        ...(blankSlate ? {} : { blankSlate: false }),
         attempts: 1,
         nextAttemptAt: this.#now() + this.#seedRetryDelay(1),
       });
@@ -867,7 +990,7 @@ export class HermesBridge implements BotControlSurface {
       if (row === undefined || this.#closed) return;
       try {
         const seed = await seedBlankSlateProfile(this.#client, profile, {
-          blankSlate: this.#seedBlankSlateBots,
+          blankSlate: this.#seedBlankSlateBots && row.blankSlate !== false,
           selection: row.selection,
           skillsOn: this.#blankSlateSkillsOn,
         });
@@ -894,6 +1017,7 @@ export class HermesBridge implements BotControlSurface {
         this.#storage.savePendingHermesProfileSeed({
           profile,
           selection: row.selection,
+          ...(row.blankSlate === false ? { blankSlate: false } : {}),
           attempts,
           nextAttemptAt: this.#now() + this.#seedRetryDelay(attempts),
         });
@@ -1006,20 +1130,31 @@ export class HermesBridge implements BotControlSurface {
     const run = (async () => {
       try {
         const at = this.#now();
-        const { profiles } = parseProfilesList(
+        const { profiles: listed } = parseProfilesList(
           await this.#client.request("profiles.list", {}),
         );
-        const bots = buildRoster(profiles.filter((profile) => !this.#storage.isBotDeleted(profile.name)), {
-          hidden: this.#hidden,
-          routedProfile: null,
-          gatewayState: "idle",
-          now: at,
-        });
-        this.#storage.replaceBotRoster(
-          bots.map((summary) => ({ name: summary.name, summary })),
-          at,
-        );
-        this.#publish(bots, at);
+        const profiles = listed.filter((profile) => !this.#storage.isBotDeleted(profile.name));
+        const publish = () => {
+          const bots = buildRoster(profiles, {
+            hidden: this.#hidden,
+            routedProfile: null,
+            gatewayState: "idle",
+            now: at,
+          });
+          this.#storage.replaceBotRoster(
+            bots.map((summary) => ({ name: summary.name, summary })),
+            at,
+          );
+          this.#publish(bots, at);
+        };
+        // Publish with the fingerprints already known, then read what is due in the background
+        // and republish only if a picture changed, and only if no newer refresh has run since.
+        this.#avatarFingerprints.applyCached(profiles);
+        publish();
+        const generation = ++this.#rosterGeneration;
+        void this.#avatarFingerprints.refresh(this.#client, profiles, at).then((changed) => {
+          if (changed && generation === this.#rosterGeneration && !this.#closed) publish();
+        }, () => {});
       } catch (error) {
         this.#log(
           `roster refresh failed (${reason}): ${error instanceof Error ? error.message : "unknown failure"}`,
@@ -1072,6 +1207,92 @@ export class HermesBridge implements BotControlSurface {
       await this.#client.request("profiles.list", { include_sessions: false }),
     );
     return new Set(profiles.map((profile) => profile.name));
+  }
+  /** Capability 82. One door for the profile operations, so a federation member and the native
+   *  plane each route them with one line rather than twelve. */
+  async profileOp(name: string, op: BotProfileOp): Promise<unknown> {
+    const client = this.#client;
+    // Hermes resolves the profile name `current` to the launch profile, so an env or hub call
+    // addressed to it would change a different bot. It is reserved for new names too (crud.ts).
+    if (normalizeProfileName(name) === "current")
+      throw new BotNameInvalid(`"current" names the launch profile in Hermes and cannot be operated on here`);
+    switch (op.kind) {
+      case "import": {
+        const target = validateNewBotName(name);
+        const imported = await importProfileArchive(client, target, op.archive);
+        return this.#settleCreatedProfile(imported, { name: imported }, false);
+      }
+      case "rename": {
+        const canon = normalizeProfileName(name);
+        if (RESERVED_PROFILE_NAMES.has(canon))
+          throw new BotNameInvalid(`"${canon}" is reserved and cannot be renamed through this route`);
+        const target = validateNewBotName(op.newName);
+        await this.#assertBotKnown(canon);
+        const active = this.#storage.nativeBotActiveTurn(canon);
+        if (active !== undefined) throw new BotTurnActive(canon, active.turnId);
+        return this.#chain(canon, async () => {
+          const renamed = await renameProfile(client, canon, target);
+          // The old attach identity names a profile that no longer exists; the provisioner enrols
+          // the new name the same way it enrols a phone-created bot.
+          this.#revokeAttachIdentity(canon);
+          await this.refresh(`bot ${canon} renamed to ${renamed}`);
+          this.#profileChanged({ profile: renamed, change: "created" });
+          const bot = this.#storage.botRoster().bots.find((row) => row.name === renamed)
+            ?? this.#adoptCreatedRow(renamed, "", {});
+          return { bot };
+        });
+      }
+      case "duplicate": {
+        await this.#assertBotKnown(name);
+        const target = op.newName === undefined
+          ? await freeDuplicateName(client, name, op.avoid)
+          : validateNewBotName(op.newName);
+        const source = this.#storage.botRoster().bots.find((row) => row.name === name);
+        const created = await this.createBot({
+          name: target,
+          cloneFrom: name,
+          cloneAll: true,
+          ...(source?.description ? { description: source.description } : {}),
+        });
+        await copyBotLook(client, name, target);
+        await this.refresh(`bot ${target} duplicated from ${name}`);
+        const bot = this.#storage.botRoster().bots.find((row) => row.name === target) ?? created.bot;
+        return { ...created, bot };
+      }
+      default:
+        break;
+    }
+    await this.#assertBotKnown(name);
+    switch (op.kind) {
+      case "identity": {
+        const identity = await this.#chain(name, () => setBotIdentity(client, name, op.patch));
+        this.refreshSoon(`bot ${name} identity`);
+        return identity;
+      }
+      case "describeAuto": {
+        const described = await describeProfileAuto(client, name, op.overwrite);
+        this.refreshSoon(`bot ${name} described`);
+        return described;
+      }
+      case "export":
+        return exportProfileArchive(client, name);
+      case "modelPin":
+        return readProfileModelPin(client, name);
+      case "pinModel":
+        return this.#chain(name, () => pinProfileModel(client, name, op.request));
+      case "unpinModel":
+        return this.#chain(name, () => unpinProfileModel(client, name));
+      case "providerKeys":
+        return listProviderKeys(client, name);
+      case "saveProviderKey":
+        return this.#chain(name, () => saveProviderKey(client, name, op.provider, op.apiKey));
+      case "disconnectProvider":
+        return this.#chain(name, () => disconnectProvider(client, name, op.provider));
+      case "skillsHubSearch":
+        return searchSkillsHub(client, name, op.query);
+      case "skillsHubInstall":
+        return this.#chain(name, () => installHubSkill(client, name, op.identifier));
+    }
   }
   async botProfile(name: string): Promise<BotProfile> {
     await this.#assertBotKnown(name);
@@ -1127,6 +1348,46 @@ export class HermesBridge implements BotControlSurface {
     // `bot_roster` carries the blob as `meta`, so every paired phone sees the write on this refresh.
     this.refreshSoon(`bot ${name} presentation`);
     return { name, presentation: written.presentation, revision: written.revision ?? 0 };
+  }
+  async botAvatar(name: string): Promise<{ mime: string; bytes: Buffer } | undefined> {
+    // Every row image is a GET; the cached roster answers "is this a bot" without a profiles.list.
+    if (!this.#storage.botRoster().bots.some((bot) => bot.name === name)) await this.#assertBotKnown(name);
+    return readAvatar(this.#client, name);
+  }
+  async setBotAvatar(name: string, data: string | null): Promise<BotAvatarSetResponse> {
+    await this.#assertBotKnown(name);
+    const size = await this.#chain(name, async () => {
+      if (data === null) {
+        await clearAvatar(this.#client, name);
+        return 0;
+      }
+      return writeAvatar(this.#client, name, data);
+    });
+    // `has_avatar` rides `profiles.list`, so the roster learns of it on this refresh, and the
+    // fingerprint is re-read so the image URL moves with the picture.
+    this.#avatarFingerprints.forget(name);
+    this.refreshSoon(`bot ${name} avatar`);
+    return { name, hasAvatar: data !== null, size };
+  }
+  // Image generation and the pet gallery are host-wide in Hermes; the bot name only routes the call
+  // (federation) and scopes the device's permission. No per-call `profiles.list` for them.
+  async generateBotAvatar(_name: string, request: BotAvatarGenerateRequest): Promise<BotAvatarGenerateResponse> {
+    return generatePortrait(this.#client, request);
+  }
+  async botAvatarPets(_name: string, localOnly: boolean): Promise<BotAvatarPetGallery> {
+    return { pets: await petGallery(this.#client, localOnly) };
+  }
+  /** The spritesheet URL is resolved HERE, from Hermes's own gallery, never taken from the client:
+   *  Hermes caches a thumbnail by slug, so a client naming another sheet could poison that slug's
+   *  thumbnail for every desktop. The gallery is cached for five minutes. */
+  async botAvatarPetThumb(_name: string, slug: string, _clientUrl: string): Promise<BotAvatarPetThumbResponse> {
+    const now = this.#now();
+    if (this.#petGallery === undefined || now - this.#petGallery.at > 300_000) {
+      const pets = await petGallery(this.#client, false);
+      this.#petGallery = { at: now, pets: new Map(pets.map((pet) => [pet.slug, pet.spritesheetUrl])) };
+    }
+    const image = await petThumb(this.#client, slug, this.#petGallery.pets.get(slug) ?? "");
+    return image === undefined ? { ok: false } : { ok: true, image };
   }
   async modelConfig(name: string): Promise<BotModelConfig> {
     await this.#assertBotKnown(name);
@@ -1317,6 +1578,35 @@ export class HermesBridge implements BotControlSurface {
       }
     });
   }
+  async runRoutine(name: string, id: string): Promise<BotRoutineRunStarted> {
+    await this.#assertBotKnown(name);
+    const started = await runBotRoutine(this.#client, name, id, this.#now);
+    // The run finishes long after the answer; the list it changed goes out when it does.
+    void started.settled.then(() => this.#publishRoutines(name));
+    return { routine: started.routine, startedAt: started.startedAt };
+  }
+  async routineRuns(name: string, id: string, limit?: number): Promise<BotRoutineRunRecord[]> {
+    await this.#assertBotKnown(name);
+    return listBotRoutineRuns(this.#client, name, id, limit);
+  }
+  async routineRunOutput(name: string, id: string, runId: string): Promise<string | null> {
+    await this.#assertBotKnown(name);
+    return readBotRoutineRunOutput(this.#client, name, id, runId);
+  }
+  async routineBlueprints(name: string): Promise<BotRoutineBlueprint[]> {
+    await this.#assertBotKnown(name);
+    return listRoutineBlueprints(this.#client, name);
+  }
+  async instantiateRoutineBlueprint(name: string, key: string, values: Record<string, string>): Promise<BotRoutine> {
+    await this.#assertBotKnown(name);
+    return this.#chain(name, async () => {
+      try {
+        return await instantiateRoutineBlueprint(this.#client, name, key, values);
+      } finally {
+        await this.#publishRoutines(name);
+      }
+    });
+  }
   async #chain<T>(name: string, work: () => Promise<T>): Promise<T> {
     const previous = this.#chains.get(name);
     const run = (async () => {
@@ -1331,7 +1621,8 @@ export class HermesBridge implements BotControlSurface {
     }
   }
   async #readRoutines(name: string): Promise<BotRoutineList> {
-    const routines = (await listBotRoutines(this.#client, name)).routines.map(
+    const listed = await listBotRoutines(this.#client, name);
+    const routines = listed.routines.map(
       (routine) => ({
         ...routine,
         ...(this.#storage.botRoutineOverrides(name, routine.id) ?? {}),
@@ -1344,7 +1635,12 @@ export class HermesBridge implements BotControlSurface {
       this.#lastRoutines.set(name, json);
       this.#broadcast({ type: "bot_routines", bot: name, routines, updatedAt });
     }
-    return { name, routines, updatedAt };
+    return {
+      name,
+      routines,
+      updatedAt,
+      ...(listed.schedulerRunning === undefined ? {} : { schedulerRunning: listed.schedulerRunning }),
+    };
   }
   async #publishRoutines(name: string): Promise<void> {
     try {

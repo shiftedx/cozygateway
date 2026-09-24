@@ -7,13 +7,15 @@ import type {
   BotGroupDetail,
   BotGroupMessage,
   BotGroupNote,
+  BotGroupPatchRequest,
   BotGroupPendingInteraction,
+  BotGroupStateFrame,
   BotSummary,
   BotToolStep,
   ServerFrame,
 } from "cozygateway-contract";
 
-import type { Storage, BotGroupCause, BotGroupLogRow, BotGroupRow, BotGroupTurnRow } from "../storage.ts";
+import type { Storage, BotGroupCause, BotGroupLogRow, BotGroupMeta, BotGroupRow, BotGroupTurnRow } from "../storage.ts";
 import { sanitizeApprovalDetail, sanitizeApprovalRepair, sanitizeApprovalScope, type AttachV1EventFrame, type AttachV1TurnContext } from "../adapters/attach/protocol-v1.ts";
 import { normalizeProfileName } from "./crud.ts";
 import { botDisplayName, botHandle } from "./roster.ts";
@@ -26,7 +28,12 @@ import {
   GROUP_NAME_MAX,
   GROUP_USER_LABEL,
   USER_MENTION,
+  applyHoldDirective,
   buildTurnPrompt,
+  heldSeqs,
+  isSlashCommand,
+  parseMentions,
+  threadOf,
   deltaSince,
   highestSeq,
   isPassText,
@@ -68,6 +75,7 @@ export const RESERVED_GROUP_NAMES: ReadonlySet<string> = new Set([
   "messages",
   "catalog",
   "focus",
+  "picture",
 ]);
 
 /** True when a room name is hostile to the address it lives at. A room is addressed as
@@ -205,6 +213,19 @@ export class GroupInvalid extends Error {
   }
 }
 
+/** Capability 84. The room is mid-deliberation and cannot take this action now (409). */
+export class GroupBusy extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GroupBusy";
+  }
+}
+
+/** Capability 84. A room picture is a small image data URL. */
+const PICTURE_PATTERN = /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/;
+const PICTURE_MAX = 24_000;
+const COMPRESS_TIMEOUT_MS = 660_000;
+
 export interface GroupRoomsOptions {
   storage: Storage;
   observe?: ObservationRing;
@@ -305,7 +326,12 @@ export class GroupRooms {
    *  room, which is exactly the thing the serialization rule exists to prevent. Keeping the handle
    *  means the successor chains behind the corpse, and the generation means the corpse can tell
    *  that the room it was driving is gone even though a room of the same name is back. */
-  readonly #drives = new Map<string, { promise: Promise<void>; generation: number }>();
+  readonly #drives = new Map<string, { promise: Promise<void>; generation: number; epoch: number }>();
+  /** Capability 84. Threads queued behind the live drive (or a compress), by room key. Mirrored
+   *  into the room's `meta.queue` so a restart still drives them. */
+  readonly #queues = new Map<string, string[]>();
+  /** Capability 84. Rooms whose compress turn holds the room's one pending-turn slot. */
+  readonly #compressing = new Set<string>();
   /** Bumped every time a room key is deleted. In memory on purpose: it only has to outlive the
    *  drives of THIS process, and a restart has no drives to disambiguate. */
   readonly #generations = new Map<string, number>();
@@ -346,7 +372,35 @@ export class GroupRooms {
   canAcceptAttachEvent(agentId: string, frame: AttachV1EventFrame): boolean {
     const event = frame.event;
     if (!("threadId" in event) || !("turnId" in event)) return false;
-    return this.#storage.botGroupTurnForAttach(agentId, event.threadId, event.turnId) !== undefined;
+    return this.#storage.botGroupTurnForAttach(agentId, event.threadId, event.turnId) !== undefined
+      || this.#externalTarget(agentId, frame) !== undefined;
+  }
+
+  /** Capability 84. The room member whose own thread received a commit no room turn owns. */
+  #externalTarget(agentId: string, frame: AttachV1EventFrame): { key: string; member: string } | undefined {
+    const event = frame.event;
+    if (event.kind !== "commit") return undefined;
+    if (this.#storage.botGroupTurnForAttach(agentId, event.threadId, event.turnId) !== undefined) return undefined;
+    const owner = this.#storage.botGroupMemberBySession(event.threadId);
+    if (owner === undefined || owner.member !== agentId || this.#storage.botGroup(owner.key) === undefined) return undefined;
+    return owner;
+  }
+
+  /** Capability 84. Mirror an external write once, as the member, into its latest thread. */
+  #mirrorExternal(target: { key: string; member: string }, event: Extract<AttachV1EventFrame["event"], { kind: "commit" }>): void {
+    const messageId = `ext:${event.turnId}:${event.messageId}`;
+    const log = this.#storage.botGroupLog(target.key);
+    if (log.some((row) => row.messageId === messageId)) return;
+    const text = blocksToText(event.blocks).trim();
+    if (text.length === 0) return;
+    const own = log.filter((row) => row.kind === "member" && row.name === target.member).at(-1);
+    const threadId = own?.threadId ?? log.at(-1)?.threadId;
+    const member = this.#memberInfo(target.member);
+    const entry = this.#append(target.key, {
+      kind: "member", name: member.name, displayName: member.displayName, text, at: this.#now(),
+      messageId, external: true, ...(threadId === undefined ? {} : { threadId }),
+    });
+    this.#setMark(target.key, threadId ?? "", target.member, entry.seq);
   }
 
   /** Projects only events whose target is a durable group-member turn. Other attach consumers
@@ -355,7 +409,12 @@ export class GroupRooms {
     const event = frame.event;
     if (!("threadId" in event) || !("turnId" in event)) return false;
     const owned = this.#storage.botGroupTurnForAttach(agentId, event.threadId, event.turnId);
-    if (owned === undefined) return false;
+    if (owned === undefined) {
+      const external = this.#externalTarget(agentId, frame);
+      if (external === undefined || event.kind !== "commit") return false;
+      this.#mirrorExternal(external, event);
+      return true;
+    }
     let settled: BotGroupTurnRow | undefined;
     if (event.kind === "commit") {
       settled = this.#storage.completeBotGroupTurn(agentId, event.threadId, event.turnId, "commit", blocksToText(event.blocks), undefined, this.#now());
@@ -401,33 +460,14 @@ export class GroupRooms {
    *  written, so a room can never exist naming a bot that does not, and the caller gets one 400
    *  naming every member that is missing instead of a room that fails on its first round. */
   async create(rawName: string, rawMembers: string[], owningHost?: string): Promise<BotGroup> {
-    const name = rawName.trim();
-    if (name.length === 0) throw new GroupInvalid("a group name is required");
-    if (name.length > GROUP_NAME_MAX) {
-      throw new GroupInvalid(`a group name must be at most ${GROUP_NAME_MAX} characters`);
-    }
-    if (isHostileGroupName(name)) {
-      throw new GroupInvalid(
-        "a group name cannot contain /, \\, ?, #, % or control characters: the name IS the address the room lives at",
-      );
-    }
-    const key = name.toLowerCase();
-    if (RESERVED_GROUP_NAMES.has(key)) {
-      throw new GroupInvalid(`"${name}" is reserved by this API and cannot name a group`);
-    }
+    const name = validGroupName(rawName);
+    const canonical = name.toLowerCase();
+    if (this.#storage.botGroupKeyByName(name) !== undefined) throw new GroupExists(name);
+    // Capability 84: a renamed room keeps its key, so a new room may need a fresh one.
+    let key = canonical;
+    for (let n = 2; this.#storage.botGroup(key) !== undefined; n += 1) key = `${canonical}~${n}`;
 
-    const members: string[] = [];
-    for (const raw of rawMembers) {
-      // The same canonicalization every `/bots/:name` route applies, so a room created with `Scout`
-      // and a bot addressed as `scout` are the same bot.
-      const member = normalizeProfileName(raw);
-      if (!members.includes(member)) members.push(member);
-    }
-    if (members.length < GROUP_MIN_MEMBERS || members.length > GROUP_MAX_MEMBERS) {
-      throw new GroupInvalid(
-        `a group needs between ${GROUP_MIN_MEMBERS} and ${GROUP_MAX_MEMBERS} distinct members, got ${members.length}`,
-      );
-    }
+    const members = validGroupMembers(rawMembers);
     // One FRESH read for the whole membership, and every missing name comes back at once.
     //
     // Cache-first would be cheaper and was what this did, and it is what let the bug in: the roster
@@ -481,31 +521,148 @@ export class GroupRooms {
 
   /** Accepts a user message into a room and starts (or supersedes) the deliberation behind it.
    *  Resolves as soon as the message is durable: every reply arrives later, over `/ws`. */
-  send(rawName: string, text: string, opts: { clientId?: string } = {}): BotGroupMessage {
+  send(rawName: string, text: string, opts: { clientId?: string; threadId?: string } = {}): BotGroupMessage {
     const key = this.#key(rawName);
     const room = this.#storage.botGroup(key);
     if (room === undefined) throw new GroupNotFound(rawName.trim());
+    if (isSlashCommand(text)) throw new GroupInvalid("Slash commands do not run in rooms.");
 
     // Cleared BEFORE the message lands, so the badge cannot survive the very message that answers
     // the escalation.
     this.#storage.setBotGroupNeedsYou(key, false);
-    // The epoch bump is the supersession signal: any loop still running for the previous message
-    // sees it at its next member boundary and abandons the rest of its rounds. It happens BEFORE
-    // the append so the message can be stamped with the epoch it opens; `send` holds the thread
-    // throughout, so no drive can observe the order of these two writes.
-    const epoch = this.#storage.bumpBotGroupEpoch(key);
+    // Capability 84: a send while a drive is live QUEUES its thread behind it under the same epoch;
+    // otherwise the epoch bump opens a new drive, stamped before the append as before.
+    // A compress turn holds the room's one pending-turn slot too, so a send behind it queues.
+    const live = this.#driving(key) || this.#compressing.has(key);
+    const epoch = live ? room.epoch : this.#storage.bumpBotGroupEpoch(key);
+    const messageId = randomUUID();
+    const threadId = opts.threadId ?? messageId;
     const entry = this.#append(key, {
       kind: "user",
       name: GROUP_USER_LABEL,
       displayName: GROUP_USER_LABEL,
       text,
       at: this.#now(),
-      messageId: randomUUID(),
+      messageId,
       epoch,
+      threadId,
       ...(opts.clientId === undefined ? {} : { clientId: opts.clientId }),
     });
-    this.#startDrive(key, epoch);
+    this.#applyHolds(key, text, entry);
+    if (live) {
+      const queue = this.#queue(key);
+      if (!queue.includes(threadId)) queue.push(threadId);
+      this.#saveQueue(key);
+    } else {
+      this.#startDrive(key, epoch, threadId);
+    }
     return toWireMessage(entry);
+  }
+
+  /** Capability 84. Rename (the key stays), members, picture and stop-directive detection. */
+  async update(rawName: string, patch: BotGroupPatchRequest): Promise<BotGroup> {
+    const key = this.#key(rawName);
+    if (this.#storage.botGroup(key) === undefined) throw new GroupNotFound(rawName.trim());
+    const name = patch.name === undefined ? undefined : validGroupName(patch.name);
+    if (name !== undefined) {
+      const holder = this.#storage.botGroupKeyByName(name);
+      if (holder !== undefined && holder !== key) throw new GroupExists(name);
+    }
+    if (patch.picture != null && (patch.picture.length > PICTURE_MAX || !PICTURE_PATTERN.test(patch.picture))) {
+      throw new GroupInvalid("a room picture must be a png, jpeg or webp data URL of at most 24000 characters");
+    }
+    const members = patch.members === undefined ? undefined : validGroupMembers(patch.members);
+    if (members !== undefined) {
+      const missing = await this.#missingMembers(members);
+      if (missing.length > 0) {
+        throw new GroupInvalid(`not a bot on this gateway: ${missing.join(", ")}. A room can only name bots that exist here.`);
+      }
+    }
+    const room = this.#storage.botGroup(key);
+    if (room === undefined) throw new GroupNotFound(rawName.trim());
+    // Checked again after the members await: another rename may have taken the name meanwhile.
+    if (name !== undefined) {
+      const holder = this.#storage.botGroupKeyByName(name);
+      if (holder !== undefined && holder !== key) throw new GroupExists(name);
+    }
+    const meta: BotGroupMeta = { ...room.meta };
+    if (patch.picture === null) delete meta.picture;
+    else if (patch.picture !== undefined) meta.picture = patch.picture;
+    if (patch.holdDetection !== undefined) {
+      meta.holdDetection = patch.holdDetection;
+      if (!patch.holdDetection) delete meta.holds;
+    }
+    if (members !== undefined) {
+      this.#storage.setBotGroupMembers(key, members);
+      if (meta.holds !== undefined) {
+        meta.holds = Object.fromEntries(Object.entries(meta.holds).filter(([member]) => members.includes(member)));
+      }
+    }
+    this.#storage.setBotGroupMeta(key, meta);
+    const renamed = name !== undefined && name !== room.name;
+    if (renamed) this.#storage.renameBotGroup(key, name);
+    return this.#emitRoom(key, renamed ? room.name : undefined);
+  }
+
+  /** Capability 84. Stop: supersede the drive, drop the queue, cancel and interrupt the member on
+   *  turn, and hold everyone when stop directives are on. */
+  stop(rawName: string): BotGroup {
+    const key = this.#key(rawName);
+    const room = this.#storage.botGroup(key);
+    if (room === undefined) throw new GroupNotFound(rawName.trim());
+    this.#storage.bumpBotGroupEpoch(key);
+    this.#queues.set(key, []);
+    for (const turn of this.#storage.cancelPendingBotGroupTurns(key, "stopped", this.#now())) {
+      this.#nativeTurns?.sendInterrupt?.(turn.agentId, { threadId: turn.threadId, turnId: turn.turnId });
+      this.#endDraft(turn.turnId);
+      this.#endTurnActivity(turn.turnId, "error");
+      this.#waiters.get(turn.turnId)?.();
+    }
+    if (room.meta.holdDetection !== false) {
+      const holds = { ...room.meta.holds };
+      for (const member of room.members) holds[member] ??= { at: this.#now() };
+      this.#storage.setBotGroupMeta(key, { ...room.meta, holds });
+    }
+    this.#saveQueue(key);
+    return this.#emitRoom(key, undefined, { member: GROUP_USER_LABEL, kind: "stopped" });
+  }
+
+  /** Capability 84. `/compress` in one member's room thread, as a Hermes slash command. */
+  async compress(rawName: string, rawMember: string): Promise<{ member: string; text: string }> {
+    const key = this.#key(rawName);
+    const room = this.#storage.botGroup(key);
+    if (room === undefined) throw new GroupNotFound(rawName.trim());
+    const member = normalizeProfileName(rawMember);
+    if (!room.members.includes(member)) throw new GroupInvalid(`${member} is not a member of ${room.name}`);
+    if (this.#driving(key) || this.#compressing.has(key)) {
+      throw new GroupBusy("the room is still talking; stop it or wait for it to settle");
+    }
+    const endpoint = this.#nativeTurns;
+    if (endpoint === undefined) throw new GroupInvalid("native attach-v1 group transport is not configured");
+    const members = this.#storage.botGroupMembers(key);
+    const started = startNativeMemberTurn({
+      storage: this.#storage, endpoint, key, member, agentId: member,
+      threadId: this.#storage.ensureBotGroupThread(key, member), epoch: room.epoch,
+      watermark: members.get(member)?.watermark ?? 0, prompt: "/compress", now: this.#now, purpose: "compress",
+    });
+    if ("outcome" in started) {
+      if (started.outcome === "failed" && started.detail.includes("already pending")) throw new GroupBusy(started.detail);
+      throw new GroupInvalid("detail" in started ? started.detail : "compress could not start");
+    }
+    // Upstream's focused-chat /compress budget: a summary can legitimately take minutes. Sends made
+    // meanwhile queue (see `send`) and drive once the compress turn has let go of the room.
+    this.#compressing.add(key);
+    try {
+      const result = await this.#waitForTurn(key, started.turnId, this.#generation(key), COMPRESS_TIMEOUT_MS);
+      return { member, text: result.outcome === "spoke" ? result.text : "detail" in result ? result.detail : "Compressed." };
+    } finally {
+      this.#compressing.delete(key);
+      if (!this.#closed && !this.#driving(key) && this.#storage.botGroup(key) !== undefined) {
+        const next = this.#queue(key).shift();
+        this.#saveQueue(key);
+        if (next !== undefined) this.#startDrive(key, this.#storage.bumpBotGroupEpoch(key), next);
+      }
+    }
   }
 
   /** True while a round loop holds the room. Test seam. */
@@ -543,8 +700,29 @@ export class GroupRooms {
 
   // --- internals ---------------------------------------------------------------------------------
 
+  /** Capability 84. The room's queued threads, hydrated from `meta.queue` after a restart. */
+  #queue(key: string): string[] {
+    let queue = this.#queues.get(key);
+    if (queue === undefined) {
+      queue = [...(this.#storage.botGroup(key)?.meta.queue ?? [])];
+      this.#queues.set(key, queue);
+    }
+    return queue;
+  }
+
+  #saveQueue(key: string): void {
+    const room = this.#storage.botGroup(key);
+    if (room === undefined) return;
+    const queue = this.#queues.get(key) ?? [];
+    const meta: BotGroupMeta = { ...room.meta };
+    if (queue.length > 0) meta.queue = [...queue];
+    else delete meta.queue;
+    this.#storage.setBotGroupMeta(key, meta);
+  }
+
+  /** Capability 84: a room is found by its DISPLAYED name first, since a rename keeps the key. */
   #key(rawName: string): string {
-    return rawName.trim().toLowerCase();
+    return this.#storage.botGroupKeyByName(rawName) ?? rawName.trim().toLowerCase();
   }
 
   /** Which incarnation of this room key is the live one. */
@@ -556,13 +734,16 @@ export class GroupRooms {
    *  deleted room is winding down, not driving, so it must not make a recreated room read
    *  `running`. */
   #driving(key: string): boolean {
-    return this.#drives.get(key)?.generation === this.#generation(key);
+    const drive = this.#drives.get(key);
+    // A drive a Stop superseded is winding down, not driving (capability 84).
+    return drive?.generation === this.#generation(key) && drive.epoch === this.#storage.botGroup(key)?.epoch;
   }
 
   #view(room: BotGroupRow): BotGroup {
     const log = this.#storage.botGroupLog(room.key);
     const state = this.#driving(room.key) ? "running" : room.needsYou ? "needs_you" : "settled";
     return {
+      id: room.key,
       name: room.name,
       members: room.members,
       createdAt: room.createdAt,
@@ -573,7 +754,72 @@ export class GroupRooms {
       // Capability 51. Omitted rather than empty: a room that blocks on nothing is the room every
       // client below 51 already renders.
       ...this.#pendingInteractions(room.key),
+      ...(room.meta.picture === undefined ? {} : { picture: room.meta.picture }),
+      holdDetection: room.meta.holdDetection !== false,
+      ...(Object.keys(room.meta.holds ?? {}).length === 0 ? {} : { holds: Object.keys(room.meta.holds!) }),
     };
+  }
+
+  // --- capability 84 helpers -----------------------------------------------------------------------
+
+  /** Highest seq this member has been shown in this thread. The legacy thread keeps the per-member
+   *  watermark it always had. */
+  #mark(room: BotGroupRow, thread: string, member: string): number {
+    if (thread === "") return this.#storage.botGroupMembers(room.key).get(member)?.watermark ?? 0;
+    return room.meta.marks?.[thread]?.[member] ?? 0;
+  }
+
+  /** Advances a (thread, member) mark and the legacy per-member watermark; prunes marks for threads
+   *  the retained log no longer carries. */
+  #setMark(key: string, thread: string, member: string, seq: number): void {
+    const current = this.#storage.botGroupMembers(key).get(member)?.watermark ?? 0;
+    if (thread === "" || seq > current) this.#storage.setBotGroupWatermark(key, member, seq);
+    if (thread === "") return;
+    const room = this.#storage.botGroup(key);
+    if (room === undefined) return;
+    const live = new Set(this.#storage.botGroupLog(key).map((row) => row.threadId));
+    const marks: NonNullable<BotGroupMeta["marks"]> = {};
+    for (const [id, byMember] of Object.entries(room.meta.marks ?? {})) if (live.has(id)) marks[id] = byMember;
+    marks[thread] = { ...marks[thread], [member]: Math.max(seq, marks[thread]?.[member] ?? 0) };
+    this.#storage.setBotGroupMeta(key, { ...room.meta, marks });
+  }
+
+  /** A user send's stop directive, applied to the room's holds (upstream #93129). */
+  #applyHolds(key: string, text: string, entry: BotGroupLogRow): void {
+    const room = this.#storage.botGroup(key);
+    if (room === undefined || room.meta.holdDetection === false) return;
+    const prior = room.meta.holds ?? {};
+    const next = applyHoldDirective(
+      prior,
+      parseMentions(text, room.members.map((name) => this.#memberInfo(name))),
+      text,
+      { at: entry.at, seq: entry.seq, ...(entry.threadId === undefined ? {} : { thread: entry.threadId }) },
+      room.members,
+    );
+    if (next === prior) return;
+    this.#storage.setBotGroupMeta(key, { ...room.meta, holds: next });
+    this.#emitRoom(key);
+  }
+
+  /** Re-announces the whole room after a settings or hold change. */
+  #emitRoom(key: string, renamedFrom?: string, activity?: BotGroupStateFrame["activity"]): BotGroup {
+    const room = this.#storage.botGroup(key);
+    if (room === undefined) throw new GroupNotFound(key);
+    const view = this.#view(room);
+    this.#emitState(room, view.state, this.#rounds.get(key) ?? 0, undefined, undefined, {
+      room: view,
+      ...(renamedFrom === undefined ? {} : { renamedFrom }),
+      ...(activity === undefined ? {} : { activity }),
+    });
+    return view;
+  }
+
+  #announce(key: string, member: string, kind: NonNullable<BotGroupStateFrame["activity"]>["kind"], thread: string, epoch: number): void {
+    const room = this.#storage.botGroup(key);
+    if (room === undefined) return;
+    this.#emitState(room, "running", this.#rounds.get(key) ?? 0, undefined, epoch, {
+      activity: { member, kind, ...(thread === "" ? {} : { threadId: thread }) },
+    });
   }
 
   #append(key: string, entry: Omit<BotGroupLogRow, "seq">): BotGroupLogRow {
@@ -596,7 +842,7 @@ export class GroupRooms {
    *  the 250 ms floor. Observably identical (the old loop was going to bail at that boundary either
    *  way), and it preserves the property the protocol is built on: member turns are SERIAL, never
    *  two bots prompted at once. */
-  #startDrive(key: string, epoch: number): void {
+  #startDrive(key: string, epoch: number, thread: string): void {
     if (this.#closed) return;
     const generation = this.#generation(key);
     // Chained behind whatever holds the key, and a drive for a DELETED room still holds it. That
@@ -608,7 +854,7 @@ export class GroupRooms {
         await Promise.all([previous.catch(() => {}), sleep(this.#chainDelayMs)]);
       }
       if (this.#closed || this.#generation(key) !== generation) return;
-      await this.#runRounds(key, epoch, generation);
+      await this.#drive(key, epoch, generation, thread);
     })()
       // Belt and braces on top of the guards inside the loop. NOTHING awaits this promise on a
       // request path, so any rejection that reached here would be an UNHANDLED rejection, and the
@@ -619,168 +865,190 @@ export class GroupRooms {
         this.#log(`group drive for "${key}" failed: ${err instanceof Error ? err.message : String(err)}`);
       })
       .finally(() => {
-        if (this.#drives.get(key)?.promise === run) this.#drives.delete(key);
+        if (this.#drives.get(key)?.promise !== run) return;
+        this.#drives.delete(key);
+        // A thread queued in the instant the drive was exiting still gets its drive.
+        const next = this.#closed ? undefined : this.#queue(key).shift();
+        if (next !== undefined) this.#saveQueue(key);
+        const room = next === undefined || this.#closed ? undefined : this.#storage.botGroup(key);
+        if (next !== undefined && room !== undefined) this.#startDrive(key, room.epoch, next);
       });
-    this.#drives.set(key, { promise: run, generation });
+    this.#drives.set(key, { promise: run, generation, epoch });
   }
 
-  /** The round loop (dissection 9.3). Serial members, at most three rounds, at most ten posted
-   *  messages per user send, stopping early the moment a whole round passes. */
-  async #runRounds(key: string, startEpoch: number, startGeneration: number): Promise<void> {
+  /** Capability 84. One drive runs its first thread, then every thread queued behind it, and only
+   *  its final exit reports settled / needs_you. */
+  async #drive(key: string, epoch: number, generation: number, first: string): Promise<void> {
+    let round = 0;
+    let thread: string | undefined = first;
+    try {
+      while (thread !== undefined) {
+        round = await this.#runRounds(key, epoch, generation, thread);
+        if (this.#closed || this.#generation(key) !== generation) return;
+        if (this.#storage.botGroup(key)?.epoch !== epoch) return;
+        thread = this.#queue(key).shift();
+        if (thread !== undefined) this.#saveQueue(key);
+      }
+    } finally {
+      // Checked BEFORE the read: a closed bridge has a closed database.
+      const final =
+        this.#closed || this.#generation(key) !== generation ? undefined : this.#storage.botGroup(key);
+      // A superseded (stopped) drive says nothing: Stop already reported the room.
+      if (final !== undefined && final.epoch === epoch) {
+        this.#emitState(final, final.needsYou ? "needs_you" : "settled", round, undefined, epoch);
+      }
+      this.#rounds.delete(key);
+    }
+  }
+
+  /** The round loop (dissection 9.3) for ONE thread. Serial members, at most three rounds, at most
+   *  ten posted messages, stopping early the moment a whole round passes. Answers the round reached. */
+  async #runRounds(key: string, startEpoch: number, startGeneration: number, thread: string): Promise<number> {
     let room = this.#storage.botGroup(key);
-    if (room === undefined || this.#generation(key) !== startGeneration) return;
+    if (room === undefined || this.#generation(key) !== startGeneration) return 0;
     let round = 0;
     let posted = 0;
     this.#rounds.set(key, round);
     this.#emitState(room, "running", round, undefined, startEpoch);
-    try {
-      for (; round < GROUP_MAX_ROUNDS; round += 1) {
-        this.#rounds.set(key, round);
-        room = this.#storage.botGroup(key);
-        if (room === undefined || room.epoch !== startEpoch || this.#closed) return;
-        if (this.#generation(key) !== startGeneration) return;
-        const members = room.members.map((name) => this.#memberInfo(name));
-        const responders = rotateSpeakers(resolveResponders(this.#entries(key), members), round);
-        let spoke = 0;
+    for (; round < GROUP_MAX_ROUNDS; round += 1) {
+      this.#rounds.set(key, round);
+      room = this.#storage.botGroup(key);
+      if (room === undefined || room.epoch !== startEpoch || this.#closed) return round;
+      if (this.#generation(key) !== startGeneration) return round;
+      const members = room.members.map((name) => this.#memberInfo(name));
+      const threadLog = () => this.#entries(key).filter((entry) => threadOf(entry) === thread);
+      const responders = rotateSpeakers(resolveResponders(threadLog(), members), round);
+      let spoke = 0;
 
-        for (const member of responders) {
-          const current = this.#storage.botGroup(key);
-          // Checked at every member boundary, which is exactly where the desktop checks: a newer
-          // user message, a deleted room, or the message cap all stop the loop here. The
-          // GENERATION check is the one the desktop has no need of: it catches a room that was
-          // deleted and remade under the same name while this drive was inside a member turn, which
-          // the epoch cannot see because a remade room's epoch counts from the start again.
-          if (current === undefined || current.epoch !== startEpoch || this.#closed) return;
-          if (this.#generation(key) !== startGeneration) return;
-          if (posted >= GROUP_MAX_MESSAGES) {
-            // Said out loud rather than returned silently: a room that stopped because it hit its
-            // cap looks exactly like a room where everybody passed, and those mean opposite things
-            // to a reader deciding whether to send again.
-            this.#emitState(current, "running", round, {
-              member: member.name,
-              reason: "capped",
-              detail: `the room posted its ${GROUP_MAX_MESSAGES}-message limit for this send and stopped early`,
-            }, startEpoch);
-            return;
-          }
-          // A member deleted after the room was created is not a turn worth spending: the profile
-          // is gone, the session cannot resolve, and without this the room burns one failed turn on
-          // it every round, forever.
-          //
-          // The cache alone must NOT be allowed to end a member's participation, though, and this
-          // is the ordering that bug taught: the roster cache is built FILTERED, so a bot the
-          // gateway hides is absent from it while being perfectly real in Hermes. Left to itself
-          // this gate answered `false` for such a member every round and reported it gone forever,
-          // which is precisely the silent shrinking the gate exists to prevent. So a negative cache
-          // answer only buys the round trip: the fresh read is what decides.
-          if (this.#memberKnown(member.name) === false && !(await this.#memberExists(member.name))) {
-            // The gate now awaits, so the room it emits against has to be re-read: the same
-            // boundary conditions the top of this loop checks can all have happened meanwhile.
-            if (this.#closed || this.#generation(key) !== startGeneration) return;
-            const live = this.#storage.botGroup(key);
-            if (live === undefined || live.epoch !== startEpoch) return;
-            this.#emitState(live, "running", round, goneNote(member), startEpoch);
-            continue;
-          }
-
-          const log = this.#entries(key);
-          const state = this.#storage.botGroupMembers(key).get(member.name);
-          const watermark = state?.watermark ?? 0;
-          const delta = deltaSince(log, watermark);
-          // Nothing new since this member last spoke or passed: it has nothing to react to.
-          if (delta.length === 0) continue;
-
-          const result = await this.#turn({
-            key,
-            groupName: current.name,
-            member,
-            members,
-            delta,
-            startEpoch,
-            startGeneration,
-            ...(state?.sessionId == null ? {} : { storedId: state.sessionId }),
-          });
-          // A room DELETED while this turn was in flight gets nothing written to it: the rows are
-          // gone and the reply belongs to a conversation that no longer exists. A room merely
-          // SUPERSEDED does get the reply, which is the contract's own rule; the loop stops at the
-          // next boundary either way.
-          // `#closed` FIRST: a closed bridge has a closed database behind it, and reading the room
-          // to decide whether to write would be the read that throws.
-          if (this.#closed || this.#generation(key) !== startGeneration) return;
-          if (this.#storage.botGroup(key) === undefined) return;
-          // The member was deleted while this round was running, and the turn stopped at the
-          // boundary before it could have minted anything. Same news, same note and same skip as the
-          // pre-round gate above, and deliberately BEFORE the watermark write: a member that was
-          // never asked has not read the room, so if it ever comes back it starts from where it was.
-          if (result.outcome === "gone") {
-            const live = this.#storage.botGroup(key);
-            if (live !== undefined) this.#emitState(live, "running", round, goneNote(member), startEpoch);
-            continue;
-          }
-          // Marked as having seen everything that existed BEFORE its reply, whatever the outcome,
-          // so a member that failed or passed is not asked about the same delta forever.
-          this.#storage.setBotGroupWatermark(key, member.name, highestSeq(log, watermark));
-
-          if (result.outcome === "spoke") {
-            const entry = this.#append(key, {
-              kind: "member",
-              name: member.name,
-              displayName: member.displayName,
-              text: result.text,
-              at: this.#now(),
-              ...provenance(result.turnId === undefined ? undefined : this.#storage.botGroupTurn(key, result.turnId)),
-            });
-            this.#storage.setBotGroupWatermark(key, member.name, entry.seq);
-            posted += 1;
-            spoke += 1;
-            if (mentionsUser(result.text)) {
-              this.#storage.setBotGroupNeedsYou(key, true);
-              // The out-of-band leg (spec section 4). Durable state and the frame have already
-              // happened; this reaches a device that is not holding a socket. Guarded because a
-              // notifier failure must never take a round down with it.
-              try {
-                this.#escalate({
-                  group: current.name,
-                  member: member.name,
-                  displayName: member.displayName,
-                  text: result.text,
-                });
-              } catch (err) {
-                this.#log(
-                  `group ${current.name}: escalation for ${member.name} failed: ${err instanceof Error ? err.message : "unknown failure"}`,
-                );
-              }
-            }
-          } else if (result.outcome !== "pass") {
-            // Failure honesty: the room is told the member did not answer, and by whom and why. It
-            // is NEVER told something the member did not say.
-            const note: BotGroupNote = {
-              member: member.name, reason: result.outcome, detail: result.detail,
-              ...(result.turnId === undefined ? {} : { turnId: result.turnId }),
-            };
-            const live = this.#storage.botGroup(key);
-            if (live !== undefined) this.#emitState(live, "running", round, note, startEpoch);
-          }
+      for (const member of responders) {
+        const current = this.#storage.botGroup(key);
+        // Checked at every member boundary: a Stop, a deleted room, or the message cap end the loop.
+        // The GENERATION check catches a room deleted and remade under the same name mid-turn.
+        if (current === undefined || current.epoch !== startEpoch || this.#closed) return round;
+        if (this.#generation(key) !== startGeneration) return round;
+        if (posted >= GROUP_MAX_MESSAGES) {
+          // Said out loud: a capped room otherwise looks exactly like one where everybody passed.
+          this.#emitState(current, "running", round, {
+            member: member.name,
+            reason: "capped",
+            detail: `the room posted its ${GROUP_MAX_MESSAGES}-message limit for this send and stopped early`,
+          }, startEpoch);
+          return round;
+        }
+        // A negative cache answer only buys the fresh read; the fresh read decides (hidden bots are
+        // absent from the filtered cache while perfectly real in Hermes).
+        if (this.#memberKnown(member.name) === false && !(await this.#memberExists(member.name))) {
+          if (this.#closed || this.#generation(key) !== startGeneration) return round;
+          const live = this.#storage.botGroup(key);
+          if (live === undefined || live.epoch !== startEpoch) return round;
+          this.#emitState(live, "running", round, goneNote(member), startEpoch);
+          continue;
         }
 
-        // A whole round in which nobody had anything to add: the conversation has settled, and
-        // running further rounds would only ask the same members about the same log.
-        if (spoke === 0) return;
+        const log = threadLog();
+        const mark = this.#mark(current, thread, member.name);
+        const delta = deltaSince(log, mark);
+        // Nothing new in this thread since this member last spoke or passed.
+        if (delta.length === 0) continue;
+
+        // Capability 84: a HELD member consumes its delta exactly once and is remembered for replay.
+        const hold = current.meta.holds?.[member.name];
+        if (hold !== undefined) {
+          this.#setMark(key, thread, member.name, highestSeq(log, mark));
+          const after = this.#storage.botGroup(key)!;
+          this.#storage.setBotGroupMeta(key, {
+            ...after.meta,
+            held: { ...after.meta.held, [member.name]: heldSeqs(after.meta.held?.[member.name], delta.map((entry) => entry.seq)) },
+            holds: { ...after.meta.holds, [member.name]: { ...hold, noted: true } },
+          });
+          if (hold.noted !== true) this.#announce(key, member.name, "held", thread, startEpoch);
+          continue;
+        }
+        // Released: the entries it missed while held replay ahead of its new delta.
+        const replaySeqs = current.meta.held?.[member.name] ?? [];
+        const replay = replaySeqs.length === 0
+          ? []
+          : this.#entries(key).filter((entry) => replaySeqs.includes(entry.seq) && !delta.some((row) => row.seq === entry.seq));
+        const visible = [...replay, ...delta].sort((left, right) => left.seq - right.seq);
+
+        this.#announce(key, member.name, "working", thread, startEpoch);
+        const state = this.#storage.botGroupMembers(key).get(member.name);
+        const result = await this.#turn({
+          key,
+          groupName: current.name,
+          member,
+          members,
+          delta: visible,
+          startEpoch,
+          startGeneration,
+          ...(state?.sessionId == null ? {} : { storedId: state.sessionId }),
+        });
+        // `#closed` FIRST: a closed bridge has a closed database behind it.
+        if (this.#closed || this.#generation(key) !== startGeneration) return round;
+        const after = this.#storage.botGroup(key);
+        if (after === undefined) return round;
+        // A turn cut short by Stop leaves no note; a reply that still landed is kept.
+        if (after.epoch !== startEpoch && result.outcome !== "spoke") return round;
+        if (result.outcome === "gone") {
+          this.#emitState(after, "running", round, goneNote(member), startEpoch);
+          continue;
+        }
+        // Marked as having seen everything that existed BEFORE its reply, whatever the outcome.
+        this.#setMark(key, thread, member.name, highestSeq(log, mark));
+        if (replaySeqs.length > 0) {
+          const now = this.#storage.botGroup(key)!;
+          const held = { ...now.meta.held };
+          delete held[member.name];
+          this.#storage.setBotGroupMeta(key, { ...now.meta, held });
+        }
+
+        if (result.outcome === "spoke") {
+          const entry = this.#append(key, {
+            kind: "member",
+            name: member.name,
+            displayName: member.displayName,
+            text: result.text,
+            at: this.#now(),
+            ...(thread === "" ? {} : { threadId: thread }),
+            ...provenance(result.turnId === undefined ? undefined : this.#storage.botGroupTurn(key, result.turnId)),
+          });
+          this.#setMark(key, thread, member.name, entry.seq);
+          this.#announce(key, member.name, "replied", thread, startEpoch);
+          posted += 1;
+          spoke += 1;
+          if (mentionsUser(result.text)) {
+            this.#storage.setBotGroupNeedsYou(key, true);
+            // The out-of-band leg (spec section 4); a notifier failure must never take a round down.
+            try {
+              this.#escalate({
+                group: current.name,
+                member: member.name,
+                displayName: member.displayName,
+                text: result.text,
+              });
+            } catch (err) {
+              this.#log(
+                `group ${current.name}: escalation for ${member.name} failed: ${err instanceof Error ? err.message : "unknown failure"}`,
+              );
+            }
+          }
+        } else if (result.outcome === "pass") {
+          this.#announce(key, member.name, "passed", thread, startEpoch);
+        } else {
+          // Failure honesty: the room is told the member did not answer, and why.
+          const note: BotGroupNote = {
+            member: member.name, reason: result.outcome, detail: result.detail,
+            ...(result.turnId === undefined ? {} : { turnId: result.turnId }),
+          };
+          const live = this.#storage.botGroup(key);
+          if (live !== undefined) this.#emitState(live, "running", round, note, startEpoch);
+        }
       }
-    } finally {
-      // Checked BEFORE the read, not inside the condition below: a closed bridge has a closed
-      // database, and `botGroup` would be the call that throws out of a `finally`.
-      const final =
-        this.#closed || this.#generation(key) !== startGeneration ? undefined : this.#storage.botGroup(key);
-      // A drive that was superseded says nothing: the drive that replaced it owns the room's state
-      // now, and a `settled` from the loser would clear a badge the winner is still filling in.
-      if (final !== undefined && final.epoch === startEpoch) {
-        this.#emitState(final, final.needsYou ? "needs_you" : "settled", round, undefined, startEpoch);
-      }
-      // Drives are serial per key (a successor chains behind this promise), so this can only ever
-      // clear its own entry.
-      this.#rounds.delete(key);
+
+      // A whole round in which nobody had anything to add: the thread has settled.
+      if (spoke === 0) return round;
     }
+    return round;
   }
 
   /** One member's turn is an attach-v1 command/event round trip. No Dashboard session is resolved
@@ -823,8 +1091,8 @@ export class GroupRooms {
     return { ...result, turnId: started.turnId };
   }
 
-  async #waitForTurn(key: string, turnId: string, generation: number): Promise<GroupTurnResult> {
-    const timeoutMs = this.#turnTimeoutMs ?? 180_000;
+  async #waitForTurn(key: string, turnId: string, generation: number, timeoutOverride?: number): Promise<GroupTurnResult> {
+    const timeoutMs = timeoutOverride ?? this.#turnTimeoutMs ?? 180_000;
     const deadline = this.#now() + timeoutMs;
     while (!this.#closed && this.#generation(key) === generation) {
       const row = this.#storage.botGroupTurn(key, turnId);
@@ -860,13 +1128,22 @@ export class GroupRooms {
   #recoverSettledTurn(turn: BotGroupTurnRow): void {
     const claimed = this.#storage.consumeBotGroupTurn(turn.key, turn.turnId, this.#now());
     if (claimed === undefined || this.#closed) return;
+    // A compress turn (capability 84) is maintenance, never a room message.
+    if (claimed.messageId.endsWith(":compress")) return;
     const room = this.#storage.botGroup(claimed.key);
     if (room === undefined || room.epoch !== claimed.epoch) return;
     const result = settledGroupTurn(claimed);
+    // The thread the member was answering, read off the entry that caused its turn.
+    const thread = claimed.cause === undefined
+      ? ""
+      : threadOf(this.#storage.botGroupLog(claimed.key).find((row) => row.seq === claimed.cause!.seq) ?? {});
     if (result?.outcome === "spoke" && !isPassText(result.text)) {
       const member = this.#memberInfo(claimed.member);
-      const entry = this.#append(claimed.key, { kind: "member", name: member.name, displayName: member.displayName, text: result.text, at: this.#now(), ...provenance(claimed) });
-      this.#storage.setBotGroupWatermark(claimed.key, claimed.member, entry.seq);
+      const entry = this.#append(claimed.key, {
+        kind: "member", name: member.name, displayName: member.displayName, text: result.text, at: this.#now(),
+        ...(thread === "" ? {} : { threadId: thread }), ...provenance(claimed),
+      });
+      this.#setMark(claimed.key, thread, claimed.member, entry.seq);
       if (mentionsUser(result.text)) {
         this.#storage.setBotGroupNeedsYou(claimed.key, true);
         this.#emitState(room, "needs_you", 0, undefined, room.epoch);
@@ -877,11 +1154,12 @@ export class GroupRooms {
         }
       }
     } else {
-      this.#storage.setBotGroupWatermark(claimed.key, claimed.member, highestSeq(this.#entries(claimed.key), claimed.watermark));
+      this.#setMark(claimed.key, thread, claimed.member,
+        highestSeq(this.#entries(claimed.key).filter((entry) => threadOf(entry) === thread), claimed.watermark));
     }
     // The previous process cannot retain its loop. Resume from durable watermarks; one serial
     // drive owns any remaining responders and the outbox already owns the command replay.
-    this.#startDrive(claimed.key, room.epoch);
+    this.#startDrive(claimed.key, room.epoch, thread);
   }
 
   /** One live draft of a member turn, as the 1:1 chat frame plus `room`.
@@ -905,7 +1183,7 @@ export class GroupRooms {
    *  What survives those goes out on the 1:1 lane's coalescing rule: leading frame immediately,
    *  latest-only for each window after it. */
   #emitDraft(turn: BotGroupTurnRow, text: string): void {
-    if (isPassDraft(text)) return;
+    if (isPassDraft(text) || turn.messageId.endsWith(":compress")) return;
     if (turn.state !== "pending") return;
     const room = this.#storage.botGroup(turn.key);
     if (room === undefined || room.epoch !== turn.epoch) return;
@@ -1373,6 +1651,7 @@ export class GroupRooms {
       displayName: row.displayName,
       text: row.text,
       at: row.at,
+      ...(row.threadId === undefined ? {} : { threadId: row.threadId }),
     }));
   }
 
@@ -1382,6 +1661,7 @@ export class GroupRooms {
     round: number,
     note?: BotGroupNote,
     epoch?: number,
+    extra: Pick<BotGroupStateFrame, "activity" | "room" | "renamedFrom"> = {},
   ): void {
     this.#broadcast({
       type: "bot_group_state",
@@ -1392,8 +1672,43 @@ export class GroupRooms {
       ...(note === undefined ? {} : { note }),
       updatedAt: this.#now(),
       ...this.#pendingInteractions(room.key),
+      ...extra,
     });
   }
+}
+
+/** The name rules a room's address imposes, shared by create and rename. */
+function validGroupName(rawName: string): string {
+  const name = rawName.trim();
+  if (name.length === 0) throw new GroupInvalid("a group name is required");
+  if (name.length > GROUP_NAME_MAX) {
+    throw new GroupInvalid(`a group name must be at most ${GROUP_NAME_MAX} characters`);
+  }
+  if (isHostileGroupName(name)) {
+    throw new GroupInvalid(
+      "a group name cannot contain /, \\, ?, #, % or control characters: the name IS the address the room lives at",
+    );
+  }
+  if (RESERVED_GROUP_NAMES.has(name.toLowerCase())) {
+    throw new GroupInvalid(`"${name}" is reserved by this API and cannot name a group`);
+  }
+  return name;
+}
+
+/** Canonical, distinct, 2 to 6 members, shared by create and a members edit. */
+function validGroupMembers(rawMembers: string[]): string[] {
+  const members: string[] = [];
+  for (const raw of rawMembers) {
+    // The same canonicalization every `/bots/:name` route applies.
+    const member = normalizeProfileName(raw);
+    if (!members.includes(member)) members.push(member);
+  }
+  if (members.length < GROUP_MIN_MEMBERS || members.length > GROUP_MAX_MEMBERS) {
+    throw new GroupInvalid(
+      `a group needs between ${GROUP_MIN_MEMBERS} and ${GROUP_MAX_MEMBERS} distinct members, got ${members.length}`,
+    );
+  }
+  return members;
 }
 
 /** What a room says about a member that is no longer a bot here. One wording for both places that
@@ -1435,6 +1750,8 @@ function toWireMessage(row: BotGroupLogRow): BotGroupMessage {
     ...(row.epoch === undefined ? {} : { epoch: row.epoch }),
     ...(row.cause === undefined ? {} : { cause: row.cause }),
     ...(row.attachTurn === undefined ? {} : { attachTurn: row.attachTurn }),
+    ...(row.threadId === undefined ? {} : { threadId: row.threadId }),
+    ...(row.external === true ? { external: true } : {}),
   };
 }
 
@@ -1505,7 +1822,11 @@ export interface RoomHost {
   createGroup(name: string, members: string[], owningHost?: string): Promise<BotGroup>;
   deleteGroup(name: string): void;
   groupDetail(name: string): BotGroupDetail;
-  sendGroupMessage(name: string, text: string, opts?: { clientId?: string }): BotGroupMessage;
+  sendGroupMessage(name: string, text: string, opts?: { clientId?: string; threadId?: string }): BotGroupMessage;
+  /** Capability 84. */
+  updateGroup(name: string, patch: BotGroupPatchRequest): Promise<BotGroup>;
+  stopGroup(name: string): BotGroup;
+  compressGroupMember(name: string, member: string): Promise<{ member: string; text: string }>;
   setGroupNativeTurns(endpoint: NativeGroupTurnEndpoint): void;
   setGroupInteractionExpiry(expiry: RoomInteractionExpiry): void;
   canAcceptGroupAttachEvent(agentId: string, frame: AttachV1EventFrame): boolean;
@@ -1562,8 +1883,17 @@ export class GatewayRoomHost implements RoomHost {
   groupDetail(name: string): BotGroupDetail {
     return this.#rooms.detail(name);
   }
-  sendGroupMessage(name: string, text: string, opts: { clientId?: string } = {}): BotGroupMessage {
+  sendGroupMessage(name: string, text: string, opts: { clientId?: string; threadId?: string } = {}): BotGroupMessage {
     return this.#rooms.send(name, text, opts);
+  }
+  updateGroup(name: string, patch: BotGroupPatchRequest): Promise<BotGroup> {
+    return this.#rooms.update(name, patch);
+  }
+  stopGroup(name: string): BotGroup {
+    return this.#rooms.stop(name);
+  }
+  compressGroupMember(name: string, member: string): Promise<{ member: string; text: string }> {
+    return this.#rooms.compress(name, member);
   }
   setGroupNativeTurns(endpoint: NativeGroupTurnEndpoint): void {
     this.#rooms.setNativeTurns(endpoint);

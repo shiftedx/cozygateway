@@ -1,3 +1,4 @@
+import type { Static, TSchema } from "@sinclair/typebox";
 import type { Context, Hono, MiddlewareHandler } from "hono";
 import {
   type ErrorBody,
@@ -13,20 +14,34 @@ import {
   BotChatDisplayedRequestSchema,
   BotChatSendRequestSchema,
   BotFocusRequestSchema,
+  BotGroupCompressRequestSchema,
   BotGroupCreateRequestSchema,
+  BotGroupPatchRequestSchema,
+  BotGroupPictureRequestSchema,
   BotGroupSendRequestSchema,
   BotModelConfigPatchSchema,
   type BotModelConfig,
   BotModelProviderFieldUpdateSchema,
   BotModelProviderOAuthCodeSchema,
   BotProfilePatchSchema,
+  BotDescribeAutoRequestSchema,
+  BotDuplicateRequestSchema,
+  BotIdentityPatchSchema,
+  BotModelPinRequestSchema,
+  BotProviderKeyRequestSchema,
+  BotRenameRequestSchema,
+  BotSkillsHubInstallRequestSchema,
   BotPresentationPatchSchema,
   BotChatReactionRequestSchema,
+  BotAvatarSetRequestSchema,
+  BotAvatarGenerateRequestSchema,
+  BotAvatarPetThumbRequestSchema,
   IntegrationCreateRequestSchema,
   IntegrationCatalogInstallRequestSchema,
   IntegrationEnabledRequestSchema,
   IntegrationUpdateRequestSchema,
   BotRoutineCreateRequestSchema,
+  BotRoutineBlueprintInstantiateRequestSchema,
   BotRoutinePatchSchema,
   BotMemoryWriteRequestSchema,
   BotMemoryDeleteRequestSchema,
@@ -54,6 +69,8 @@ import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import { HermesRpcError, HermesTimeout, HermesUnavailable } from "./client.ts";
 import { ModelConfigInvalid } from "./model-config.ts";
 import { ProviderSetupInvalid } from "./provider-setup.ts";
+import { PROFILE_IMPORT_MAX_BYTES, ProfileArchiveTooLarge, ProfileOpInvalid } from "./profile-ops.ts";
+import type { BotProfileOp } from "./bridge.ts";
 import {
   HermesDashboardIntegrations,
   IntegrationFlowNotFound,
@@ -74,8 +91,12 @@ import {
   PROFILE_ID_RE,
   normalizeProfileName,
 } from "./crud.ts";
-import { GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
+import { GroupBusy, GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
 import { PresentationConflict, PresentationNotApplied } from "./presentation.ts";
+import { AvatarInvalid, decodeAvatar } from "./avatar.ts";
+
+/** A 2 MB image as base64 in a JSON envelope, with headroom. */
+const AVATAR_PUT_MAX_BYTES = 3_000_000;
 import {
   MEDIA_CACHE_CONTROL,
   MEDIA_MAX_CONCURRENT,
@@ -107,6 +128,7 @@ import {
 } from "./photos.ts";
 import { FILE_MAX_BYTES, acceptFileBytes, attachmentDisposition, safeFilename } from "./documents.ts";
 import {
+  RoutineDashboardUnavailable,
   RoutineNotFound,
   RoutineRefused,
   RoutineUnconfirmed,
@@ -121,7 +143,7 @@ import {
  *  text VERBATIM. Client feature probes match `/unknown method/i` against it, so it is never
  *  reworded, and `error.message` stays a stable, human-readable summary. */
 
-type Env = { Variables: { deviceId: string } };
+export type Env = { Variables: { deviceId: string } };
 
 /** How many sessions `GET /bots/:name/sessions` asks Hermes for. Matches the design's cap. */
 export const SESSION_LIST_LIMIT = 200;
@@ -229,7 +251,7 @@ export function resolveByteRange(
  *  identity regardless of casing or surrounding whitespace.
  *
  *  Returns the canonical name, or a 400 response for a name that cannot name a profile at all. */
-function canonicalName(
+export function canonicalName(
   c: Context<Env>,
 ): { name: string } | { response: Response } {
   try {
@@ -272,7 +294,7 @@ function routineBotName(
   return { name: resolved.name };
 }
 
-function failure(c: Context<Env>, err: unknown) {
+export function failure(c: Context<Env>, err: unknown) {
   // Checked first: a name that names no Hermes profile is a 404, not a backend failure, on every
   // configured `/bots/:name/*` route.
   if (err instanceof BotNotFound)
@@ -298,6 +320,8 @@ function failure(c: Context<Env>, err: unknown) {
     return c.json(extensionErrorBody("conflict", err.message), 409);
   if (err instanceof PresentationNotApplied)
     return c.json(errorBody("backend_unavailable", err.message), 503);
+  if (err instanceof AvatarInvalid)
+    return c.json(errorBody("invalid_request", err.message), 400);
   if (err instanceof BotSessionConflict) {
     return c.json(extensionErrorBody("conflict", err.message), 409);
   }
@@ -410,6 +434,27 @@ function failure(c: Context<Env>, err: unknown) {
     );
   }
   throw err;
+}
+
+/** `failure`, plus the answers Hermes's dashboard cron routes give (capability 83). Their errors
+ *  carry the HTTP status as the code: a 400/422 is the client's schedule or slot value, a 404 is a
+ *  job that is gone, a 409 is a run already in flight. Everything else is `failure`'s. */
+function routineFailure(c: Context<Env>, err: unknown) {
+  if (err instanceof RoutineDashboardUnavailable)
+    return c.json(errorBody("backend_unavailable", err.message), 503);
+  // A dashboard 401/403 is the gateway's own credential failing, not the client's input: it falls
+  // through to `failure`, which reports `backend_unavailable`.
+  if (
+    err instanceof HermesRpcError && err.code !== undefined && err.code >= 400 && err.code < 500 &&
+    err.code !== 401 && err.code !== 403
+  ) {
+    if (err.code === 404)
+      return c.json({ ...errorBody("not_found", "hermes has no such routine"), hermesError: err.message }, 404);
+    if (err.code === 409)
+      return c.json({ ...extensionErrorBody("conflict", "hermes refused the routine request"), hermesError: err.message }, 409);
+    return c.json({ ...errorBody("invalid_request", "hermes refused the routine request"), hermesError: err.message }, 400);
+  }
+  return failure(c, err);
 }
 
 export function registerBotRoutes(
@@ -696,7 +741,7 @@ export function registerBotRoutes(
       input = assertValid(BotCreateRequestSchema, await c.req.json());
       return c.json(await bots.createBot(input), 201);
     } catch (error) {
-      if (error instanceof ContractViolation || error instanceof BotNameInvalid)
+      if (error instanceof ContractViolation || error instanceof BotNameInvalid || error instanceof ProfileOpInvalid)
         return c.json(errorBody("invalid_request", error.message), 400);
       if (error instanceof BotNameTaken)
         return c.json(extensionErrorBody("conflict", error.message), 409);
@@ -1128,6 +1173,12 @@ export function registerBotRoutes(
     const jsonBody = async (c: Context<Env>): Promise<unknown> => {
       try { return await c.req.json(); } catch { return undefined; }
     };
+    // The PUT body is read against a hard cap whether or not the sender declared a length: a
+    // chunked upload declares nothing, and `c.req.json()` would buffer whatever arrived.
+    const cappedJson = async (c: Context<Env>): Promise<unknown> => {
+      const bytes = await readCappedBody(c.req.raw.body, AVATAR_PUT_MAX_BYTES);
+      try { return JSON.parse(new TextDecoder().decode(bytes)); } catch { return undefined; }
+    };
     const invalidBody = (c: Context<Env>, err: unknown): Response =>
       c.json(errorBody("invalid_request", err instanceof Error ? err.message : "malformed body"), 400);
 
@@ -1406,7 +1457,7 @@ export function registerBotRoutes(
       }
       // An empty patch is a client bug; an empty success would hide it.
       if (Object.keys(parsed).length === 0) {
-        return c.json(errorBody("invalid_request", "at least one of pinned, hidden, sectionId, sectionName, title is required"), 400);
+        return c.json(errorBody("invalid_request", "at least one presentation key is required"), 400);
       }
       try {
         return c.json(await writePresentation(resolved.name, parsed));
@@ -1414,6 +1465,156 @@ export function registerBotRoutes(
         return failure(c, err);
       }
     });
+  }
+
+  // Capability 81: avatars. The picture is the profile's avatar asset (`profiles.get_asset` /
+  // `set_asset`); a generated portrait and a chosen pet are returned for the phone to preview and
+  // then saved with PUT, as the desktop's picker does. Registered only on a surface that can answer.
+  if (bots.botAvatar !== undefined && bots.setBotAvatar !== undefined) {
+    const readAvatar = bots.botAvatar.bind(bots);
+    const writeAvatar = bots.setBotAvatar.bind(bots);
+    const jsonBody = async (c: Context<Env>): Promise<unknown> => {
+      try { return await c.req.json(); } catch { return undefined; }
+    };
+    // The PUT body is read against a hard cap whether or not the sender declared a length: a
+    // chunked upload declares nothing, and `c.req.json()` would buffer whatever arrived.
+    const cappedJson = async (c: Context<Env>): Promise<unknown> => {
+      const bytes = await readCappedBody(c.req.raw.body, AVATAR_PUT_MAX_BYTES);
+      try { return JSON.parse(new TextDecoder().decode(bytes)); } catch { return undefined; }
+    };
+    const invalid = (c: Context<Env>, err: unknown) =>
+      c.json(errorBody("invalid_request", err instanceof ContractViolation ? err.message : "malformed body"), 400);
+    const imageResponse = (image: { mime: string; bytes: Uint8Array }) =>
+      // Copied: a Node Buffer is a view into a shared pool, so `.buffer` would send the whole pool.
+      new Response(new Uint8Array(image.bytes), {
+        status: 200,
+        headers: {
+          "content-type": image.mime,
+          "content-length": String(image.bytes.byteLength),
+          // The URL is versioned by the look's revision, so a private cache may keep it a while.
+          "cache-control": "private, max-age=3600",
+          "x-content-type-options": "nosniff",
+        },
+      });
+
+    app.get("/bots/:name/avatar", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        const image = await readAvatar(resolved.name);
+        if (image === undefined) return c.json(errorBody("not_found", `bot "${resolved.name}" has no avatar`), 404);
+        return imageResponse(image);
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+
+    app.put("/bots/:name/avatar", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      const declared = Number(c.req.header("content-length") ?? "0");
+      if (Number.isFinite(declared) && declared > AVATAR_PUT_MAX_BYTES) {
+        return c.json(errorBody("invalid_request", "avatar is larger than 2 MB"), 413);
+      }
+      let body: unknown;
+      try {
+        body = await cappedJson(c);
+      } catch {
+        return c.json(errorBody("invalid_request", "avatar is larger than 2 MB"), 413);
+      }
+      let parsed;
+      try {
+        parsed = assertValid(BotAvatarSetRequestSchema, body);
+        decodeAvatar(parsed.data);
+      } catch (err) {
+        if (err instanceof AvatarInvalid) return failure(c, err);
+        return invalid(c, err);
+      }
+      try {
+        return c.json(await writeAvatar(resolved.name, parsed.data));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+
+    app.delete("/bots/:name/avatar", requireDevice, async (c) => {
+      const resolved = canonicalName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        return c.json(await writeAvatar(resolved.name, null));
+      } catch (err) {
+        return failure(c, err);
+      }
+    });
+
+    if (bots.generateBotAvatar !== undefined) {
+      const generate = bots.generateBotAvatar.bind(bots);
+      app.post("/bots/:name/avatar/generate", requireDevice, async (c) => {
+        const resolved = canonicalName(c);
+        if ("response" in resolved) return resolved.response;
+        let parsed;
+        try {
+          parsed = assertValid(BotAvatarGenerateRequestSchema, await jsonBody(c));
+        } catch (err) {
+          return invalid(c, err);
+        }
+        if (parsed.probe !== true && parsed.prompt === undefined) {
+          return c.json(errorBody("invalid_request", "prompt is required unless probe is true"), 400);
+        }
+        try {
+          return c.json(await generate(resolved.name, parsed));
+        } catch (err) {
+          return failure(c, err);
+        }
+      });
+    }
+
+    if (bots.botAvatarPets !== undefined && bots.botAvatarPetThumb !== undefined) {
+      const pets = bots.botAvatarPets.bind(bots);
+      const thumb = bots.botAvatarPetThumb.bind(bots);
+      app.get("/bots/:name/avatar/pets", requireDevice, async (c) => {
+        const resolved = canonicalName(c);
+        if ("response" in resolved) return resolved.response;
+        try {
+          return c.json(await pets(resolved.name, c.req.query("localOnly") === "1" || c.req.query("localOnly") === "true"));
+        } catch (err) {
+          return failure(c, err);
+        }
+      });
+
+      app.post("/bots/:name/avatar/pets/thumb", requireDevice, async (c) => {
+        const resolved = canonicalName(c);
+        if ("response" in resolved) return resolved.response;
+        let parsed;
+        try {
+          parsed = assertValid(BotAvatarPetThumbRequestSchema, await jsonBody(c));
+        } catch (err) {
+          return invalid(c, err);
+        }
+        try {
+          return c.json(await thumb(resolved.name, parsed.slug, parsed.url ?? ""));
+        } catch (err) {
+          return failure(c, err);
+        }
+      });
+
+      // A legacy `ui_meta.pet` slug drawn as bytes (the roster's `avatar.kind: "pet"` URL), so a
+      // pet the desktop once picked renders as the pet rather than as a jelly.
+      app.get("/bots/:name/avatar/pets/:slug", requireDevice, async (c) => {
+        const resolved = canonicalName(c);
+        if ("response" in resolved) return resolved.response;
+        const slug = c.req.param("slug");
+        if (!/^[A-Za-z0-9._-]{1,128}$/.test(slug)) return c.json(errorBody("invalid_request", "bad pet slug"), 400);
+        try {
+          const answer = await thumb(resolved.name, slug, "");
+          if (!answer.ok || answer.image === undefined) return c.json(errorBody("not_found", `no thumbnail for pet "${slug}"`), 404);
+          return imageResponse(decodeAvatar(answer.image));
+        } catch (err) {
+          if (err instanceof AvatarInvalid) return c.json(errorBody("not_found", `no thumbnail for pet "${slug}"`), 404);
+          return failure(c, err);
+        }
+      });
+    }
   }
 
   app.get("/bots/:name/model-config", requireDevice, async (c) => {
@@ -1577,6 +1778,167 @@ export function registerBotRoutes(
     } catch (err) {
       return failure(c, err);
     }
+  });
+
+  // Capability 82: profile operations (contract/ext-bots-v1.md row 82). Every route is one call
+  // through `profileOp`, whose bridge half is `profile-ops.ts`.
+  const profileOp = async (c: Context<Env>, name: string, op: BotProfileOp, status: 200 | 201 = 200): Promise<Response> => {
+    try {
+      if (bots.profileOp === undefined) throw new BackendUnavailable("this gateway has no Hermes profile operations");
+      return c.json((await bots.profileOp(name, op)) as object, status);
+    } catch (error) {
+      if (error instanceof BotNameInvalid || error instanceof ProfileOpInvalid)
+        return c.json(errorBody("invalid_request", error.message), 400);
+      if (error instanceof ProfileArchiveTooLarge)
+        return c.json(errorBody("invalid_request", error.message), 413);
+      if (error instanceof BotNameTaken)
+        return c.json(extensionErrorBody("conflict", error.message), 409);
+      if (error instanceof BotTurnActive)
+        return c.json({ ...extensionErrorBody("conflict", error.message), turnId: error.turnId }, 409);
+      return failure(c, error);
+    }
+  };
+  const profileOpBody = async <T,>(c: Context<Env>, schema: Parameters<typeof assertValid>[0], optional = false): Promise<T | Response> => {
+    let body: unknown;
+    try { body = await c.req.json(); } catch { body = optional ? {} : undefined; }
+    try {
+      return assertValid(schema, body) as T;
+    } catch (err) {
+      return c.json(errorBody("invalid_request", err instanceof ContractViolation ? err.message : "malformed body"), 400);
+    }
+  };
+
+  app.patch("/bots/:name/identity", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const patch = await profileOpBody<{ title?: string; description?: string }>(c, BotIdentityPatchSchema);
+    if (patch instanceof Response) return patch;
+    if (patch.title === undefined && patch.description === undefined)
+      return c.json(errorBody("invalid_request", "at least one of title, description is required"), 400);
+    return profileOp(c, resolved.name, { kind: "identity", patch });
+  });
+
+  app.post("/bots/:name/rename", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ newName: string }>(c, BotRenameRequestSchema);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, { kind: "rename", newName: body.newName });
+  });
+
+  app.post("/bots/:name/describe-auto", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ overwrite?: boolean }>(c, BotDescribeAutoRequestSchema, true);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, { kind: "describeAuto", overwrite: body.overwrite === true });
+  });
+
+  app.post("/bots/:name/duplicate", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ newName?: string }>(c, BotDuplicateRequestSchema, true);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, {
+      kind: "duplicate", ...(body.newName === undefined ? {} : { newName: body.newName }),
+    }, 201);
+  });
+
+  app.post("/bots/:name/export", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    try {
+      if (bots.profileOp === undefined) throw new BackendUnavailable("this gateway has no Hermes profile operations");
+      // Streamed from Hermes straight to the phone, never held here whole.
+      const exported = (await bots.profileOp(resolved.name, { kind: "export" })) as {
+        filename: string; body: ReadableStream<Uint8Array>; length?: number;
+      };
+      const filename = exported.filename.replace(/[^A-Za-z0-9._-]/g, "_");
+      return new Response(exported.body, {
+        headers: {
+          "content-type": "application/gzip",
+          ...(exported.length === undefined ? {} : { "content-length": String(exported.length) }),
+          "content-disposition": `attachment; filename="${filename}"`,
+          "cache-control": "no-store",
+        },
+      });
+    } catch (error) {
+      if (error instanceof BotNameInvalid) return c.json(errorBody("invalid_request", error.message), 400);
+      return failure(c, error);
+    }
+  });
+
+  // The archive is streamed into Hermes as it arrives and counted on the way: a declared length
+  // over the bound is refused before any byte moves, and a body with no length (chunked) is cut
+  // off at the bound, so the gateway never holds an archive in memory.
+  app.post("/bots/import", requireDevice, async (c) => {
+    const name = (c.req.query("name") ?? "").trim();
+    if (name.length === 0) return c.json(errorBody("invalid_request", "name is required"), 400);
+    const declared = Number(c.req.header("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > PROFILE_IMPORT_MAX_BYTES)
+      return c.json(errorBody("invalid_request", "the archive is larger than 100 MiB"), 413);
+    return profileOp(c, name, { kind: "import", archive: c.req.raw.body }, 201);
+  });
+
+  app.get("/bots/:name/model-pin", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    return profileOp(c, resolved.name, { kind: "modelPin" });
+  });
+
+  app.put("/bots/:name/model-pin", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ model: string; provider: string; confirmExpensiveModel?: boolean }>(c, BotModelPinRequestSchema);
+    if (body instanceof Response) return body;
+    const response = await profileOp(c, resolved.name, { kind: "pinModel", request: body });
+    if (response.ok) chat.contextConfigurationChanged?.(resolved.name);
+    return response;
+  });
+
+  app.delete("/bots/:name/model-pin", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const response = await profileOp(c, resolved.name, { kind: "unpinModel" });
+    if (response.ok) chat.contextConfigurationChanged?.(resolved.name);
+    return response;
+  });
+
+  app.get("/bots/:name/provider-keys", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    return profileOp(c, resolved.name, { kind: "providerKeys" });
+  });
+
+  app.put("/bots/:name/provider-keys/:provider", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ apiKey: string }>(c, BotProviderKeyRequestSchema);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, { kind: "saveProviderKey", provider: c.req.param("provider"), apiKey: body.apiKey });
+  });
+
+  app.delete("/bots/:name/provider-keys/:provider", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    return profileOp(c, resolved.name, { kind: "disconnectProvider", provider: c.req.param("provider") });
+  });
+
+  app.get("/bots/:name/skills-hub", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const query = (c.req.query("q") ?? "").trim();
+    if (query.length === 0 || query.length > CATALOG_QUERY_MAX)
+      return c.json(errorBody("invalid_request", `q must be 1 to ${CATALOG_QUERY_MAX} characters`), 400);
+    return profileOp(c, resolved.name, { kind: "skillsHubSearch", query });
+  });
+
+  app.post("/bots/:name/skills-hub/install", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    const body = await profileOpBody<{ identifier: string }>(c, BotSkillsHubInstallRequestSchema);
+    if (body instanceof Response) return body;
+    return profileOp(c, resolved.name, { kind: "skillsHubInstall", identifier: body.identifier });
   });
 
   app.get("/bots/:name/chat", requireDevice, async (c) => {
@@ -2284,25 +2646,7 @@ export function registerBotRoutes(
       return c.json(
         errorBody(
           "invalid_request",
-          "at least one of title, schedule, prompt, enabled, repeat, continuity, model or effort is required",
-        ),
-        400,
-      );
-    }
-    // The one rule a client cannot discover from the shape: an edit to anything but the on/off
-    // switch must carry the routine's instruction too. There is no update action on the backend, so
-    // such an edit is a recreate, and the backend only ever reports a 100-character PREVIEW of a
-    // stored prompt. Rebuilding a routine from that preview would silently truncate the user's own
-    // instruction, so the request is refused instead of quietly damaging the routine.
-    //
-    // `repeat` and `continuity` are on this side of the line for the same reason `title` is: they
-    // reach the backend only on an `add`, so a patch that named one without a rewrite used to answer
-    // 200 and throw it away.
-    if (patchNeedsRewrite(parsed) && parsed.prompt === undefined) {
-      return c.json(
-        errorBody(
-          "invalid_request",
-          "prompt is required when title, schedule, repeat or continuity changes: hermes has no cron update action and reports only a truncated prompt preview, so the routine is recreated",
+          "at least one of title, schedule, prompt, enabled, repeat, continuity, deliver, model or effort is required",
         ),
         400,
       );
@@ -2320,9 +2664,83 @@ export function registerBotRoutes(
           : { orphanedId: result.orphanedId }),
       });
     } catch (err) {
-      return failure(c, err);
+      return routineFailure(c, err);
     }
   });
+
+  // Capability 83. Each route is registered only where the surface implements it, so a surface
+  // without Hermes's dashboard answers 404 rather than a refusal that implies the route exists.
+  const surface = bots as Partial<BotControlSurface>;
+  if (surface.runRoutine !== undefined) {
+    const run = surface.runRoutine.bind(bots);
+    app.post("/bots/:name/routines/:id/run", requireDevice, async (c) => {
+      const resolved = routineBotName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        return c.json(await run(resolved.name, c.req.param("id") ?? ""));
+      } catch (err) {
+        return routineFailure(c, err);
+      }
+    });
+  }
+  if (surface.routineRuns !== undefined) {
+    const runs = surface.routineRuns.bind(bots);
+    app.get("/bots/:name/routines/:id/runs", requireDevice, async (c) => {
+      const resolved = routineBotName(c);
+      if ("response" in resolved) return resolved.response;
+      const id = c.req.param("id") ?? "";
+      const limit = Number(c.req.query("limit") ?? "20");
+      try {
+        return c.json({ name: resolved.name, id, runs: await runs(resolved.name, id, Number.isFinite(limit) ? limit : 20) });
+      } catch (err) {
+        return routineFailure(c, err);
+      }
+    });
+  }
+  if (surface.routineRunOutput !== undefined) {
+    const output = surface.routineRunOutput.bind(bots);
+    app.get("/bots/:name/routines/:id/runs/:runId/output", requireDevice, async (c) => {
+      const resolved = routineBotName(c);
+      if ("response" in resolved) return resolved.response;
+      const runId = c.req.param("runId") ?? "";
+      try {
+        return c.json({ runId, output: await output(resolved.name, c.req.param("id") ?? "", runId) });
+      } catch (err) {
+        return routineFailure(c, err);
+      }
+    });
+  }
+  if (surface.routineBlueprints !== undefined) {
+    const blueprints = surface.routineBlueprints.bind(bots);
+    app.get("/bots/:name/routine-blueprints", requireDevice, async (c) => {
+      const resolved = routineBotName(c);
+      if ("response" in resolved) return resolved.response;
+      try {
+        return c.json({ name: resolved.name, blueprints: await blueprints(resolved.name) });
+      } catch (err) {
+        return routineFailure(c, err);
+      }
+    });
+  }
+  if (surface.instantiateRoutineBlueprint !== undefined) {
+    const instantiate = surface.instantiateRoutineBlueprint.bind(bots);
+    app.post("/bots/:name/routine-blueprints/:key/instantiate", requireDevice, async (c) => {
+      const resolved = routineBotName(c);
+      if ("response" in resolved) return resolved.response;
+      let parsed;
+      try {
+        parsed = assertValid(BotRoutineBlueprintInstantiateRequestSchema, await c.req.json().catch(() => undefined));
+      } catch (err) {
+        return c.json(errorBody("invalid_request", err instanceof ContractViolation ? err.message : "malformed body"), 400);
+      }
+      try {
+        const routine = await instantiate(resolved.name, c.req.param("key") ?? "", parsed.values);
+        return c.json({ name: resolved.name, routine }, 201);
+      } catch (err) {
+        return routineFailure(c, err);
+      }
+    });
+  }
 
   // 204, and NOT idempotent: a second delete of the same routine is a 404. A client that cannot
   // tell "already gone" from "the delete broke" cannot decide whether to retry.
@@ -2559,8 +2977,59 @@ export function registerBotRoutes(
       const group = c.req.param("group") ?? "";
       const message = bots.sendGroupMessage(group, parsed.text, {
         ...(parsed.clientId === undefined ? {} : { clientId: parsed.clientId }),
+        ...(parsed.threadId === undefined ? {} : { threadId: parsed.threadId }),
       });
       return c.json({ group, message }, 202);
+    } catch (err) {
+      return groupFailure(c, err);
+    }
+  });
+
+  // Capability 84: room settings, Stop, per-member compress and picture generation.
+  const groupBody = async <S extends TSchema>(c: Context<Env>, schema: S): Promise<Static<S> | Response> => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      body = undefined;
+    }
+    try {
+      return assertValid(schema, body);
+    } catch (err) {
+      return c.json(errorBody("invalid_request", err instanceof ContractViolation ? err.message : "malformed body"), 400);
+    }
+  };
+  app.post("/bots/groups/picture", requireDevice, async (c) => {
+    const parsed = await groupBody(c, BotGroupPictureRequestSchema);
+    if (parsed instanceof Response) return parsed;
+    try {
+      if (bots.generateGroupPicture === undefined) throw new BackendUnavailable("picture generation needs a Hermes endpoint");
+      return c.json({ image: await bots.generateGroupPicture(parsed.prompt) });
+    } catch (err) {
+      return groupFailure(c, err);
+    }
+  });
+  app.patch("/bots/groups/:group", requireDevice, async (c) => {
+    const parsed = await groupBody(c, BotGroupPatchRequestSchema);
+    if (parsed instanceof Response) return parsed;
+    try {
+      return c.json({ group: await bots.updateGroup(c.req.param("group") ?? "", parsed) });
+    } catch (err) {
+      return groupFailure(c, err);
+    }
+  });
+  app.post("/bots/groups/:group/stop", requireDevice, (c) => {
+    try {
+      return c.json({ group: bots.stopGroup(c.req.param("group") ?? "") });
+    } catch (err) {
+      return groupFailure(c, err);
+    }
+  });
+  app.post("/bots/groups/:group/compress", requireDevice, async (c) => {
+    const parsed = await groupBody(c, BotGroupCompressRequestSchema);
+    if (parsed instanceof Response) return parsed;
+    try {
+      return c.json(await bots.compressGroupMember(c.req.param("group") ?? "", parsed.member));
     } catch (err) {
       return groupFailure(c, err);
     }
@@ -2718,7 +3187,7 @@ function photoFailure(c: Context<Env>, err: unknown) {
 function groupFailure(c: Context<Env>, err: unknown) {
   if (err instanceof GroupNotFound)
     return c.json(errorBody("not_found", err.message), 404);
-  if (err instanceof GroupExists)
+  if (err instanceof GroupExists || err instanceof GroupBusy)
     return c.json(extensionErrorBody("conflict", err.message), 409);
   if (err instanceof GroupInvalid)
     return c.json(errorBody("invalid_request", err.message), 400);
