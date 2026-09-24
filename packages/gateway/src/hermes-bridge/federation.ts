@@ -1,6 +1,6 @@
 import type {
   BotCatalog, BotCreateRequest, BotCreateResponse, BotDeleteResponse, BotGroup,
-  BotGroupDetail, BotGroupMessage, BotModelConfig, BotModelConfigPatch, BotProfile,
+  BotGroupDetail, BotGroupMessage, BotGroupPatchRequest, BotModelConfig, BotModelConfigPatch, BotProfile,
   BotModelProviderOAuthSession, BotModelProviderSetupCatalog, BotProfilePatch,
   BotRoutine, BotRoutineBlueprint, BotRoutineCreateRequest, BotRoutinePatch, BotRoutineRunRecord, BotSummary, BridgeLiveness,
   BotDesktopHermesSession, BotPresentationPatch, BotPresentationResponse,
@@ -127,7 +127,10 @@ export class FederatedBotControlSurface implements BotControlSurface {
     roomMembers?: (key: string) => readonly string[] | undefined,
     roomOwner?: (key: string) => string | undefined,
     backfillRoomOwner?: (key: string, owner: string) => void,
+    /** Capability 84: a renamed room keeps its key, so a displayed name resolves to it first. */
+    resolveRoomKey?: (name: string) => string | undefined,
   ) {
+    this.#resolveRoomKey = resolveRoomKey;
     this.#members = new Map(members.map((member) => [member.id, member]));
     this.#broadcast = broadcast;
     this.#rooms = rooms;
@@ -136,6 +139,7 @@ export class FederatedBotControlSurface implements BotControlSurface {
     this.#backfillRoomOwner = backfillRoomOwner;
   }
   readonly #roomOwner: ((key: string) => string | undefined) | undefined;
+  readonly #resolveRoomKey: ((name: string) => string | undefined) | undefined;
   readonly #backfillRoomOwner: ((key: string, owner: string) => void) | undefined;
   #cachedHost(key: string): string | undefined {
     const cached = this.#roomHosts.get(key);
@@ -285,8 +289,8 @@ export class FederatedBotControlSurface implements BotControlSurface {
   /** The host of an existing room. A durable owner avoids a membership walk; only a legacy NULL
    * derives once from immutable membership and backfills. Surface-only tests without storage retain
    * F8's original membership guard. */
-  #hostOf(name: string): RoomHost {
-    const key = name.trim().toLowerCase();
+  #hostOf(name: string, byKey = false): RoomHost {
+    const key = (byKey ? undefined : this.#resolveRoomKey?.(name)) ?? name.trim().toLowerCase();
     const remembered = this.#cachedHost(key);
     // The durable owner backs the cache. Its tombstone is also the sole ownership source after a
     // room has been deleted, while its attach turn rows still exist.
@@ -324,7 +328,8 @@ export class FederatedBotControlSurface implements BotControlSurface {
     const resolved = this.#resolveHost(members);
     if ("spans" in resolved) throw new BackendUnavailable(CROSS_ENDPOINT_ROOMS);
     const group = await this.#hostById(resolved.host).createGroup(name, members, resolved.host);
-    this.#rememberHost(group.name.trim().toLowerCase(), resolved.host);
+    // The room's own key: a renamed room may still hold the key its name would fold to.
+    this.#rememberHost(group.id ?? group.name.trim().toLowerCase(), resolved.host);
     return group;
   }
   deleteGroup(name: string): void {
@@ -334,12 +339,32 @@ export class FederatedBotControlSurface implements BotControlSurface {
     this.#hostOf(name).deleteGroup(name);
   }
   groupDetail(name: string): BotGroupDetail { return this.#hostOf(name).groupDetail(name); }
-  sendGroupMessage(name: string, text: string, opts?: { clientId?: string }): BotGroupMessage { return this.#hostOf(name).sendGroupMessage(name, text, opts ?? {}); }
+  sendGroupMessage(name: string, text: string, opts?: { clientId?: string; threadId?: string }): BotGroupMessage { return this.#hostOf(name).sendGroupMessage(name, text, opts ?? {}); }
+  async updateGroup(name: string, patch: BotGroupPatchRequest): Promise<BotGroup> {
+    const host = this.#hostOf(name);
+    // F8: a members edit may not move a room to another endpoint.
+    if (patch.members !== undefined) {
+      const resolved = this.#resolveHost(patch.members);
+      if ("spans" in resolved) throw new BackendUnavailable(CROSS_ENDPOINT_ROOMS);
+      if (this.#hostById(resolved.host) !== host && resolved.host !== GATEWAY_HOST) {
+        throw new RoomEndpointMismatch(name.trim(), "(this room's host)", [hostLabel(resolved.host)]);
+      }
+    }
+    return host.updateGroup(name, patch);
+  }
+  stopGroup(name: string): BotGroup { return this.#hostOf(name).stopGroup(name); }
+  compressGroupMember(name: string, member: string): Promise<{ member: string; text: string }> { return this.#hostOf(name).compressGroupMember(name, member); }
+  /** The first online endpoint generates; a picture belongs to no endpoint in particular. */
+  async generateGroupPicture(prompt: string): Promise<string> {
+    const member = [...this.#members.values()].find((item) => item.bridge.health().online) ?? [...this.#members.values()][0];
+    if (member?.bridge.generateGroupPicture === undefined) throw new BackendUnavailable("no Hermes endpoint is configured");
+    return member.bridge.generateGroupPicture(prompt);
+  }
   /** The host that drives a room, for the server's attach-event and room-turn wiring. Never
    *  throws: an event for a room whose ownership no longer resolves has no host to project it. */
   roomHostFor(key: string): RoomHost | undefined {
     try {
-      return this.#hostOf(key);
+      return this.#hostOf(key, true);
     } catch {
       return undefined;
     }

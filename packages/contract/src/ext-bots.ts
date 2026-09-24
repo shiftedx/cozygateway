@@ -2073,6 +2073,11 @@ export const BotGroupMessageSchema = Type.Object({
     threadId: Type.String({ maxLength: 256 }),
     turnId: Type.String({ maxLength: 256 }),
   })),
+  /** Capability 84. The room thread this entry belongs to. A root user send's thread is its own
+   *  `messageId`; member replies carry the thread they answered. Absent on pre-84 rows. */
+  threadId: Type.Optional(Type.String({ maxLength: 128 })),
+  /** Capability 84. True on a member entry mirrored from its own room thread outside a room turn. */
+  external: Type.Optional(Type.Boolean()),
 });
 export type BotGroupMessage = Static<typeof BotGroupMessageSchema>;
 
@@ -2105,6 +2110,9 @@ export const BotGroupPendingInteractionSchema = Type.Object({
 export type BotGroupPendingInteraction = Static<typeof BotGroupPendingInteractionSchema>;
 
 export const BotGroupSchema = Type.Object({
+  /** Capability 84. The room's stable identity: it survives a rename, so a client keys
+   *  device-local order and sections on it rather than on the name. */
+  id: Type.Optional(Type.String({ maxLength: 256 })),
   name: Type.String(),
   members: Type.Array(Type.String()),
   createdAt: Type.Integer(),
@@ -2118,6 +2126,12 @@ export const BotGroupSchema = Type.Object({
   /** Capability 51. Interactions a member of this room is currently waiting on. Absent when there
    *  are none, so a room that never blocks is byte-identical to what it was below 51. */
   pendingInteractions: Type.Optional(Type.Array(BotGroupPendingInteractionSchema, { maxItems: 32 })),
+  /** Capability 84. The room picture as a small image data URL. */
+  picture: Type.Optional(Type.String({ maxLength: 24_000 })),
+  /** Capability 84. Whether stop directives hold members. Always sent by 84; absent reads true. */
+  holdDetection: Type.Optional(Type.Boolean()),
+  /** Capability 84. Members currently held by a stop directive or Stop. Absent when none. */
+  holds: Type.Optional(Type.Array(Type.String(), { maxItems: 6 })),
 });
 export type BotGroup = Static<typeof BotGroupSchema>;
 
@@ -2175,6 +2189,19 @@ export const BotGroupStateFrameSchema = Type.Object({
    *  array `BotGroup` carries. A frame is emitted when one opens and when one settles, so a client
    *  holding the rooms screen can badge without re-reading the room. */
   pendingInteractions: Type.Optional(Type.Array(BotGroupPendingInteractionSchema, { maxItems: 32 })),
+  /** Capability 84. One activity-feed event. `member` is "You" for `stopped`. */
+  activity: Type.Optional(Type.Object({
+    member: Type.String(),
+    kind: Type.Union([
+      Type.Literal("working"), Type.Literal("replied"), Type.Literal("passed"),
+      Type.Literal("held"), Type.Literal("stopped"),
+    ]),
+    threadId: Type.Optional(Type.String({ maxLength: 128 })),
+  })),
+  /** Capability 84. The whole room, whenever its settings or holds change. */
+  room: Type.Optional(BotGroupSchema),
+  /** Capability 84. The room's previous name, on a rename frame only. */
+  renamedFrom: Type.Optional(Type.String()),
 });
 export type BotGroupStateFrame = Static<typeof BotGroupStateFrameSchema>;
 
@@ -2190,8 +2217,31 @@ export type BotGroupCreateRequest = Static<typeof BotGroupCreateRequestSchema>;
 export const BotGroupSendRequestSchema = Type.Object({
   text: Type.String({ minLength: 1, maxLength: 32_000 }),
   clientId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+  /** Capability 84. Reply in this thread; absent starts a new one. */
+  threadId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
 });
 export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
+
+/** Capability 84. `PATCH /bots/groups/:name`: rename, members, picture, stop-directive detection. */
+export const BotGroupPatchRequestSchema = Type.Object({
+  name: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+  members: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 64 }), { minItems: 2, maxItems: 6 })),
+  picture: Type.Optional(Type.Union([Type.String({ minLength: 11, maxLength: 24_000, pattern: "^data:image/" }), Type.Null()])),
+  holdDetection: Type.Optional(Type.Boolean()),
+}, { minProperties: 1 });
+export type BotGroupPatchRequest = Static<typeof BotGroupPatchRequestSchema>;
+
+/** Capability 84. `POST /bots/groups/:name/compress` body. */
+export const BotGroupCompressRequestSchema = Type.Object({
+  member: Type.String({ minLength: 1, maxLength: 256 }),
+});
+export type BotGroupCompressRequest = Static<typeof BotGroupCompressRequestSchema>;
+
+/** Capability 84. `POST /bots/groups/picture` body. */
+export const BotGroupPictureRequestSchema = Type.Object({
+  prompt: Type.String({ minLength: 1, maxLength: 1000 }),
+});
+export type BotGroupPictureRequest = Static<typeof BotGroupPictureRequestSchema>;
 
 /** One command the selected Hermes profile accepts through a messaging surface. The catalog is
  * profile-owned and comes from Hermes' central registry, plugins, and installed skills. */
@@ -3324,7 +3374,12 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * /bots/:name/routines/:id/runs`, `GET /bots/:name/routines/:id/runs/:runId/output`, and the
  * blueprint catalog: `GET /bots/:name/routine-blueprints` and `POST
  * /bots/:name/routine-blueprints/:key/instantiate`. */
-export const BOTS_CAPABILITY_VERSION = 83;
+/** Capability 84: rooms reach Desktop parity. Threads (`threadId` on sends and entries), queued sends
+ * behind a live drive, stop directives and holds with replay on release (`holds`, `holdDetection`),
+ * Stop, rename/members/picture via `PATCH /bots/groups/:name`, per-member compress, picture
+ * generation, external writes mirrored (`external`), and an activity feed on `bot_group_state`
+ * (`activity`, plus `room`/`renamedFrom` whenever settings change). */
+export const BOTS_CAPABILITY_VERSION = 84;
 
 /** Capability 82. At least one field. `title` is the friendly name; the empty string clears it. */
 export const BotIdentityPatchSchema = Type.Object({

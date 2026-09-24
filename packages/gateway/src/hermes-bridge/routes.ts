@@ -1,3 +1,4 @@
+import type { Static, TSchema } from "@sinclair/typebox";
 import type { Context, Hono, MiddlewareHandler } from "hono";
 import {
   type ErrorBody,
@@ -13,7 +14,10 @@ import {
   BotChatDisplayedRequestSchema,
   BotChatSendRequestSchema,
   BotFocusRequestSchema,
+  BotGroupCompressRequestSchema,
   BotGroupCreateRequestSchema,
+  BotGroupPatchRequestSchema,
+  BotGroupPictureRequestSchema,
   BotGroupSendRequestSchema,
   BotModelConfigPatchSchema,
   type BotModelConfig,
@@ -86,7 +90,7 @@ import {
   PROFILE_ID_RE,
   normalizeProfileName,
 } from "./crud.ts";
-import { GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
+import { GroupBusy, GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
 import { PresentationConflict, PresentationNotApplied } from "./presentation.ts";
 import { AvatarInvalid, decodeAvatar } from "./avatar.ts";
 
@@ -2926,8 +2930,59 @@ export function registerBotRoutes(
       const group = c.req.param("group") ?? "";
       const message = bots.sendGroupMessage(group, parsed.text, {
         ...(parsed.clientId === undefined ? {} : { clientId: parsed.clientId }),
+        ...(parsed.threadId === undefined ? {} : { threadId: parsed.threadId }),
       });
       return c.json({ group, message }, 202);
+    } catch (err) {
+      return groupFailure(c, err);
+    }
+  });
+
+  // Capability 84: room settings, Stop, per-member compress and picture generation.
+  const groupBody = async <S extends TSchema>(c: Context<Env>, schema: S): Promise<Static<S> | Response> => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      body = undefined;
+    }
+    try {
+      return assertValid(schema, body);
+    } catch (err) {
+      return c.json(errorBody("invalid_request", err instanceof ContractViolation ? err.message : "malformed body"), 400);
+    }
+  };
+  app.post("/bots/groups/picture", requireDevice, async (c) => {
+    const parsed = await groupBody(c, BotGroupPictureRequestSchema);
+    if (parsed instanceof Response) return parsed;
+    try {
+      if (bots.generateGroupPicture === undefined) throw new BackendUnavailable("picture generation needs a Hermes endpoint");
+      return c.json({ image: await bots.generateGroupPicture(parsed.prompt) });
+    } catch (err) {
+      return groupFailure(c, err);
+    }
+  });
+  app.patch("/bots/groups/:group", requireDevice, async (c) => {
+    const parsed = await groupBody(c, BotGroupPatchRequestSchema);
+    if (parsed instanceof Response) return parsed;
+    try {
+      return c.json({ group: await bots.updateGroup(c.req.param("group") ?? "", parsed) });
+    } catch (err) {
+      return groupFailure(c, err);
+    }
+  });
+  app.post("/bots/groups/:group/stop", requireDevice, (c) => {
+    try {
+      return c.json({ group: bots.stopGroup(c.req.param("group") ?? "") });
+    } catch (err) {
+      return groupFailure(c, err);
+    }
+  });
+  app.post("/bots/groups/:group/compress", requireDevice, async (c) => {
+    const parsed = await groupBody(c, BotGroupCompressRequestSchema);
+    if (parsed instanceof Response) return parsed;
+    try {
+      return c.json(await bots.compressGroupMember(c.req.param("group") ?? "", parsed.member));
     } catch (err) {
       return groupFailure(c, err);
     }
@@ -3085,7 +3140,7 @@ function photoFailure(c: Context<Env>, err: unknown) {
 function groupFailure(c: Context<Env>, err: unknown) {
   if (err instanceof GroupNotFound)
     return c.json(errorBody("not_found", err.message), 404);
-  if (err instanceof GroupExists)
+  if (err instanceof GroupExists || err instanceof GroupBusy)
     return c.json(extensionErrorBody("conflict", err.message), 409);
   if (err instanceof GroupInvalid)
     return c.json(errorBody("invalid_request", err.message), 400);

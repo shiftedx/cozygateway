@@ -18,6 +18,7 @@ import type {
   BotGroup,
   BotGroupDetail,
   BotGroupMessage,
+  BotGroupPatchRequest,
   BotModelConfig,
   BotModelConfigPatch,
   BotModelProviderOAuthSession,
@@ -361,8 +362,14 @@ export interface BotControlSurface {
   sendGroupMessage(
     name: string,
     text: string,
-    opts?: { clientId?: string },
+    opts?: { clientId?: string; threadId?: string },
   ): BotGroupMessage;
+  /** Capability 84. */
+  updateGroup(name: string, patch: BotGroupPatchRequest): Promise<BotGroup>;
+  stopGroup(name: string): BotGroup;
+  compressGroupMember(name: string, member: string): Promise<{ member: string; text: string }>;
+  /** Capability 84. A room picture from Hermes `image.generate`; absent without a Hermes endpoint. */
+  generateGroupPicture?(prompt: string): Promise<string>;
 }
 export interface BotsSurface extends BotControlSurface {
   readiness(name: string): BotReadiness;
@@ -707,9 +714,28 @@ export class HermesBridge implements BotControlSurface {
   sendGroupMessage(
     name: string,
     text: string,
-    opts: { clientId?: string } = {},
+    opts: { clientId?: string; threadId?: string } = {},
   ): BotGroupMessage {
     return this.#groups.send(name, text, opts);
+  }
+  updateGroup(name: string, patch: BotGroupPatchRequest): Promise<BotGroup> {
+    return this.#groups.update(name, patch);
+  }
+  stopGroup(name: string): BotGroup {
+    return this.#groups.stop(name);
+  }
+  compressGroupMember(name: string, member: string): Promise<{ member: string; text: string }> {
+    return this.#groups.compress(name, member);
+  }
+  /** Capability 84. Hermes answers `image_data` (a data URL) or, when its download failed, `image`. */
+  async generateGroupPicture(prompt: string): Promise<string> {
+    const result = await this.#client.request("image.generate", { prompt, aspect_ratio: "square" }, { timeoutMs: 180_000 }) as
+      { success?: boolean; image_data?: string; image?: string; error?: string } | null;
+    const image = result?.image_data ?? result?.image;
+    if (result?.success !== true || typeof image !== "string" || !image.startsWith("data:image/")) {
+      throw new BackendUnavailable(result?.error ?? "Hermes could not generate a picture");
+    }
+    return image;
   }
   setGroupNativeTurns(endpoint: NativeGroupTurnEndpoint): void {
     this.#groups.setNativeTurns(endpoint);

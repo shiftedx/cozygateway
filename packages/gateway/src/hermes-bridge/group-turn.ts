@@ -13,6 +13,8 @@ export interface NativeGroupTurnEndpoint {
      * way, so a peer that ignores it behaves exactly as it did before. */
     context?: AttachV1TurnContext;
   }): boolean;
+  /** Capability 84. Stop's interrupt for the member on turn. Optional: absent means best effort only. */
+  sendInterrupt?(agentId: string, input: { threadId: string; turnId: string }): boolean;
 }
 
 export type GroupTurnResult =
@@ -37,6 +39,8 @@ export interface StartNativeMemberTurn {
   cause?: BotGroupCause;
   context?: AttachV1TurnContext;
   now: () => number;
+  /** Capability 84. `compress` marks a maintenance turn that must never post into the room. */
+  purpose?: "group" | "compress";
 }
 
 /** Persists ownership BEFORE putting the command in the attach outbox. That ordering makes fast
@@ -46,7 +50,7 @@ export function startNativeMemberTurn(input: StartNativeMemberTurn): { turnId: s
     return { outcome: "failed", detail: `native attach-v1 profile \"${input.agentId}\" is unavailable` };
   }
   const turnId = randomUUID();
-  const messageId = `${turnId}:group`;
+  const messageId = `${turnId}:${input.purpose ?? "group"}`;
   if (!input.storage.beginBotGroupTurn({
     key: input.key, turnId, member: input.member, agentId: input.agentId, threadId: input.threadId,
     messageId, epoch: input.epoch, watermark: input.watermark,
