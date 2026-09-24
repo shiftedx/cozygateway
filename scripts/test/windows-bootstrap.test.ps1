@@ -1661,6 +1661,10 @@ stop_owned_windows_gateway 0
     $effectiveModuleRoots = @($childInvocation.PSModulePathValue -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     $unexpectedModuleRoots = @($effectiveModuleRoots | Where-Object { -not $_.Equals($trustedModuleRoot, [StringComparison]::OrdinalIgnoreCase) -and -not $_.Equals($trustedAllUsersModuleRoot, [StringComparison]::OrdinalIgnoreCase) })
     Assert-True (($effectiveModuleRoots | Where-Object { $_.Equals($trustedModuleRoot, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0 -and $unexpectedModuleRoots.Count -eq 0) "actual PowerShell 5.1 child must expose only protected system/all-users module roots (actual: $($childInvocation.PSModulePathValue))"
+    # The fixture no longer plants a module under Documents, so name the user root explicitly:
+    # Windows PowerShell 5.1 adds it by default, and it must never reach the elevated child.
+    $userModuleRoot = [IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments), 'WindowsPowerShell', 'Modules')
+    Assert-True (@($effectiveModuleRoots | Where-Object { $_.TrimEnd('\').Equals($userModuleRoot, [StringComparison]::OrdinalIgnoreCase) }).Count -eq 0) "actual PowerShell 5.1 child must not expose the user Documents module root $userModuleRoot"
     Assert-True ($childInvocation.SystemRootValue -ceq $trustedWindowsDirectory -and $childInvocation.WindirValue -ceq $trustedWindowsDirectory) 'actual PowerShell 5.1 child must receive only native-derived Windows roots'
     $trustedNetTCPIPManifest = [IO.Path]::Combine($trustedModuleRoot, 'NetTCPIP', 'NetTCPIP.psd1')
     $trustedCimCmdletsBase = [IO.Path]::Combine($trustedModuleRoot, 'CimCmdlets')
