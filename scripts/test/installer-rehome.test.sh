@@ -88,7 +88,9 @@ if [ "$1" = config ] && [ "$2" = path ]; then
 fi
 if [ "$1" = status ]; then printf 'Current model: test/model\nActive provider: test-provider\n'; exit 0; fi
 if [ "$1" = dashboard ]; then
-  [ -z "${COZYGATEWAY_TEST_DASHBOARD_LAUNCH_MARKER:-}" ] || : > "$COZYGATEWAY_TEST_DASHBOARD_LAUNCH_MARKER"
+  # Hermes 0.17+ lists --isolated; the installer probes for it before passing it.
+  if [ "${2:-}" = --help ]; then printf '  --isolated\n'; exit 0; fi
+  [ -z "${COZYGATEWAY_TEST_DASHBOARD_LAUNCH_MARKER:-}" ] || printf '%s\n' "$*" > "$COZYGATEWAY_TEST_DASHBOARD_LAUNCH_MARKER"
   exit 0
 fi
 
@@ -573,6 +575,9 @@ if ! pids_output="$(COZYGATEWAY_TEST_DASHBOARD_LAUNCH_MARKER="$tmp/dashboard-lau
   fail "the Dashboard-launching run failed:\n$pids_output"
 fi
 test -f "$tmp/dashboard-launched" || fail 'the run did not launch a Dashboard'
+# A plain `dashboard --port N` is routed to a machine-level `hermes serve` on another
+# port and never listens on N, so the installer's own launch must be isolated too.
+grep -Fq -- '--isolated' "$tmp/dashboard-launched" || fail "the installer's Dashboard launch did not pass --isolated: $(cat "$tmp/dashboard-launched")"
 grep -Fq 'record_run_pid dashboard "$dashboard_pid"' "$installer" || fail 'the launched Dashboard identity was not recorded'
 if grep -Fq 'record_profile_gateway_pid' "$installer" || grep -Fq 'record_run_pid "gateway-' "$installer"; then
   fail 'the rollback ledger must not claim Hermes-owned profile gateways'
