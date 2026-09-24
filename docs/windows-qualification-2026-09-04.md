@@ -33,6 +33,12 @@ These automated and bounded smoke results do not qualify the 29 final installed-
 
 All 29 final native cases remain open, including real predecessor-to-candidate upgrades and preservation; checksum, locked/interrupted update, rollback and repair faults; credentials and nondefault ports; foreign registration/ownership refusal; uninstall; and actual user-session and machine transitions. Scheduler and Startup fallback are distinct paths and require separate evidence where supported. Fixture coverage and prepared fault scripts do not count as successful installed-product acceptance.
 
+## Elevated acceptance harness
+
+`scripts/test/windows-elevated-acceptance.ps1` (#271) repeats one live scenario on a disposable Windows host: a fresh Hermes install with a local model provider while a stale elevated Dashboard holds the Dashboard port with a mismatched token, an unrelated listener holds the next port, and the installer inherits a poisoned `PSModulePath`. It checks authenticated `/api/config` on the Gateway's private Dashboard, Gateway `/ready`, preservation of both listeners through install and uninstall, and that the poisoned module never loads elevated. Its header lists the phases (elevated Setup and Cleanup, normal Install, Verify and Uninstall) and the exact commands; each phase writes `results-<phase>.json` under its run root. `-Phase SelfCheck` exercises only the harness's own fixtures and runs on any pwsh host.
+
+The harness covers that one scenario, not the 29-case matrix, and a passing run closes none of those cases by itself. It has not yet been run on Windows.
+
 ## Manual session and reboot checklist for Kyle
 
 Logoff/logon and reboot are deferred. Perform them only after a real candidate Gateway and Agents deployment is installed, paired, and healthy. Record each product's exact source/release version and asset hashes with the result.
