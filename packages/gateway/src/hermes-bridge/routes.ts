@@ -78,6 +78,7 @@ import {
 } from "./crud.ts";
 import { GroupExists, GroupInvalid, GroupNotFound } from "./group-rooms.ts";
 import { PresentationConflict, PresentationNotApplied } from "./presentation.ts";
+import { normalizeRelayAgents } from "./relay.ts";
 import {
   MEDIA_CACHE_CONTROL,
   MEDIA_MAX_CONCURRENT,
@@ -1445,10 +1446,10 @@ export function registerBotRoutes(
       }
     };
     app.post("/bot-relay/roster", requireDevice, async (c) => {
-      const parsed = await body<{ agents: Parameters<typeof rosterSync>[0] }>(c, BotRelayRosterRequestSchema);
+      const parsed = await body<{ agents: unknown[] }>(c, BotRelayRosterRequestSchema);
       if (parsed instanceof Response) return parsed;
       try {
-        return c.json(await rosterSync(parsed.agents));
+        return c.json(await rosterSync(normalizeRelayAgents(parsed.agents)));
       } catch (err) {
         return failure(c, err);
       }

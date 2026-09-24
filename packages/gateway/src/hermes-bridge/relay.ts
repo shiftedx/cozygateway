@@ -20,6 +20,53 @@ import { asRecord, asString, type HermesRpc } from "./rpc.ts";
  *  attempts, plus 180 s of settlement. A relayed turn blocks this long by design (#93911). */
 export const RELAY_DELIVER_TIMEOUT_MS = (120 + 600 * 2 + 180) * 1000;
 
+/** Upstream `tools/bot_relay.py _HANDLE_RE`: profile, handle and connection id share it. */
+const RELAY_HANDLE_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+
+/** `_normalize_roster_row`, applied here row by row: a row Hermes would drop is dropped, and the
+ *  free-text fields are cut to Hermes's own limits (label 80, title 120, description 160, the
+ *  description on one line). One bad row never costs the whole push. */
+export function normalizeRelayAgents(rows: readonly unknown[]): BotRelayAgent[] {
+  const out: BotRelayAgent[] = [];
+  for (const raw of rows) {
+    const row = asRecord(raw);
+    if (row === undefined) continue;
+    const profile = (asString(row["profile"]) ?? "").trim();
+    const handle = (asString(row["handle"]) ?? "").trim().replace(/^@+/, "") || (profile === "default" ? "hermes" : profile);
+    const connectionId = (asString(row["connection_id"]) ?? "").trim();
+    if (![profile, handle, connectionId].every((value) => RELAY_HANDLE_RE.test(value))) continue;
+    const agent: BotRelayAgent = {
+      profile,
+      handle,
+      connection_id: connectionId,
+      connection_label: (asString(row["connection_label"]) ?? "").trim().slice(0, 80),
+      title: (asString(row["title"]) ?? "").trim().slice(0, 120),
+      description: (asString(row["description"]) ?? "").split(/\s+/).filter(Boolean).join(" ").slice(0, 160),
+    };
+    if (typeof row["online"] === "boolean") agent.online = row["online"];
+    out.push(agent);
+  }
+  return out;
+}
+
+/** The id this gateway goes by on the relay: its configured name, slugged, plus the first six
+ *  characters of its Hermes install id. Server-side facts only, so every phone derives the same id,
+ *  and a renamed or removed connection on one phone can never shift another's. */
+export function relayConnectionId(gatewayName: string, installId: string | undefined): string {
+  const slug = gatewayName.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^[-_]+|[-_]+$/g, "").slice(0, 48) || "gateway";
+  const suffix = (installId ?? "").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 6);
+  return suffix.length === 0 ? slug : `${slug}-${suffix}`;
+}
+
+/** Hermes's stable per-install id (`GET /api/status install_id`), or undefined on an older Hermes. */
+export async function relayInstallId(client: { dashboardJson<T = unknown>(path: string): Promise<T> }): Promise<string | undefined> {
+  try {
+    return asString(asRecord(await client.dashboardJson("/api/status"))?.["install_id"]);
+  } catch {
+    return undefined;
+  }
+}
+
 export async function relayRosterSync(rpc: HermesRpc, agents: BotRelayAgent[]): Promise<{ count: number }> {
   const result = asRecord(await rpc.request("bot_relay.roster.sync", { agents }));
   return { count: typeof result?.["count"] === "number" ? result["count"] : 0 };

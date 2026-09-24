@@ -8,8 +8,8 @@ import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
 import type { GatewayConfig } from "../src/config.ts";
 import { createHermesClient } from "../src/hermes-bridge/client.ts";
 import { HermesBridge } from "../src/hermes-bridge/bridge.ts";
-import { RELAY_DELIVER_TIMEOUT_MS } from "../src/hermes-bridge/relay.ts";
-import { parseProfileRow } from "../src/hermes-bridge/roster.ts";
+import { RELAY_DELIVER_TIMEOUT_MS, relayConnectionId } from "../src/hermes-bridge/relay.ts";
+import { buildRoster, parseProfileRow } from "../src/hermes-bridge/roster.ts";
 import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
 
 /** Capability 87: the relay courier's doors. The phone is the courier (upstream `relay.ts`); the
@@ -110,7 +110,8 @@ async function setup(opts: { failDeliver?: { code: number; message: string; data
       headers: { "content-type": "application/json", ...(token === null ? {} : { authorization: `Bearer ${token}` }) },
       body: JSON.stringify(body),
     });
-  return { server, frames, post };
+  const get = (path: string) => app.request(path, { headers: { authorization: `Bearer ${deviceToken}` } });
+  return { server, frames, post, get };
 }
 
 describe("relay routes (capability 87)", () => {
@@ -125,10 +126,48 @@ describe("relay routes (capability 87)", () => {
     expect(server.callsOf("bot_relay.roster.sync").at(-1)?.params).toEqual({ agents });
   });
 
-  it("refuses a roster row whose connection id Hermes would drop", async () => {
-    const { post } = await setup();
-    const res = await post("/bot-relay/roster", { agents: [{ profile: "cleo", handle: "cleo", connection_id: "mac studio!" }] });
-    expect(res.status).toBe(400);
+  it("drops a bad roster row and trims an overlong one instead of refusing the push", async () => {
+    const { server, post } = await setup();
+    const res = await post("/bot-relay/roster", {
+      agents: [
+        { profile: "cleo", handle: "cleo", connection_id: "mac studio!" },
+        {
+          profile: "pip",
+          handle: "@pip",
+          connection_id: "mac-studio",
+          connection_label: "L".repeat(200),
+          title: "T".repeat(300),
+          description: "one\n two   three " + "d".repeat(400),
+          online: true,
+        },
+        "not a row",
+      ],
+    });
+    expect(res.status).toBe(200);
+    const pushed = (server.callsOf("bot_relay.roster.sync").at(-1)?.params as { agents: Array<Record<string, unknown>> }).agents;
+    expect(pushed).toHaveLength(1);
+    expect(pushed[0]).toMatchObject({ profile: "pip", handle: "pip", connection_id: "mac-studio", online: true });
+    expect((pushed[0]!["connection_label"] as string).length).toBe(80);
+    expect((pushed[0]!["title"] as string).length).toBe(120);
+    expect(pushed[0]!["description"]).toMatch(/^one two three d+$/);
+    expect((pushed[0]!["description"] as string).length).toBe(160);
+  });
+
+  it("takes a reply of any length and a long multi-byte message", async () => {
+    const { server, post } = await setup();
+    expect((await post("/bot-relay/reply", { id: "big", reply: "x".repeat(200_000) })).status).toBe(200);
+    expect((server.callsOf("bot_relay.reply").at(-1)?.params["reply"] as string).length).toBe(200_000);
+    // 16,000 emoji are 32,000 UTF-16 units; Hermes counts them as 16,000 and owns the exact limit.
+    expect((await post("/bot-relay/deliver", { profile: "pixel", message: "🤖".repeat(16_000) })).status).toBe(200);
+  });
+
+  it("names itself from server facts, the same on every phone", async () => {
+    const { get } = await setup();
+    const res = await get("/bot-relay/identity");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ connectionId: "g", label: "g" });
+    expect(relayConnectionId("Pixel Box!", "eda540fc24ac4a5f")).toBe("pixel-box-eda540");
+    expect(relayConnectionId("", undefined)).toBe("gateway");
   });
 
   it("drains the outbox and hands the envelopes back unchanged", async () => {
@@ -208,5 +247,18 @@ describe("worker heartbeat on the roster (capability 87)", () => {
       .toBe(1_800_000_123_400);
     expect(parseProfileRow({ name: "pixel" })?.workerActiveAt).toBeNull();
     expect(parseProfileRow({ name: "pixel", worker_session: null })?.workerActiveAt).toBeNull();
+  });
+
+  it("marks the heartbeat active against the gateway's own clock", () => {
+    const now = 1_800_000_000_000;
+    const rows = buildRoster(
+      [
+        { name: "a", description: null, hasAvatar: false, meta: null, lastActiveAt: null, workerActiveAt: now - 149_000, preview: null },
+        { name: "b", description: null, hasAvatar: false, meta: null, lastActiveAt: null, workerActiveAt: now - 150_000, preview: null },
+        { name: "c", description: null, hasAvatar: false, meta: null, lastActiveAt: null, workerActiveAt: null, preview: null },
+      ],
+      { routedProfile: null, gatewayState: "idle", now },
+    );
+    expect(Object.fromEntries(rows.map((row) => [row.name, row.workerActive]))).toEqual({ a: true, b: false, c: false });
   });
 });

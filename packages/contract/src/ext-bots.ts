@@ -68,6 +68,9 @@ export const BotSummarySchema = Type.Object({
    *  (`profiles.list` `worker_session.last_active`), or null when it has none. Absent on older
    *  gateways. Upstream reads a stamp under 150 s old as "Active now". */
   workerActiveAt: Type.Optional(Type.Union([Type.Integer(), Type.Null()])),
+  /** Capability 87. `workerActiveAt` read against the GATEWAY's clock when the row was built
+   *  (under 150 s), so a phone whose clock is skewed does not misread the heartbeat. */
+  workerActive: Type.Optional(Type.Boolean()),
   chatSessionId: Type.Union([Type.String(), Type.Null()]),
   preview: BotPreviewSchema,
   /** Whether this Hermes profile is synchronized into the native CozyChat data plane. */
@@ -1522,9 +1525,11 @@ export const BotRelayAgentSchema = Type.Object({
 });
 export type BotRelayAgent = Static<typeof BotRelayAgentSchema>;
 
-/** `POST /bot-relay/roster`: the agents on the phone's OTHER connections (replaces the last push). */
+/** `POST /bot-relay/roster`: the agents on the phone's OTHER connections (replaces the last push).
+ *  Rows are admitted one by one (`normalizeRelayAgents`): an invalid row is dropped and an overlong
+ *  field is trimmed to upstream's limits, so one bad row never costs the whole push. */
 export const BotRelayRosterRequestSchema = Type.Object({
-  agents: Type.Array(BotRelayAgentSchema, { maxItems: 2_000 }),
+  agents: Type.Array(Type.Unknown(), { maxItems: 2_000 }),
 }, { additionalProperties: false });
 export type BotRelayRosterRequest = Static<typeof BotRelayRosterRequestSchema>;
 
@@ -1537,7 +1542,9 @@ export type BotRelayDrainResponse = Static<typeof BotRelayDrainResponseSchema>;
 /** `POST /bot-relay/deliver`: run one relayed turn in `profile`'s Bot Chat on this gateway. */
 export const BotRelayDeliverRequestSchema = Type.Object({
   profile: Type.String({ minLength: 1, maxLength: 128 }),
-  message: Type.String({ minLength: 1, maxLength: 16_400 }),
+  // Hermes counts code points (16,000 + 200 attribution headroom); this cap counts UTF-16 units, so it
+  // is doubled and the exact limit is left to Hermes.
+  message: Type.String({ minLength: 1, maxLength: 32_400 }),
   fromProfile: Type.Optional(Type.String({ maxLength: 128 })),
   fromHandle: Type.Optional(Type.String({ maxLength: 128 })),
   fromConnection: Type.Optional(Type.String({ maxLength: 128 })),
@@ -1555,11 +1562,22 @@ export type BotRelayDeliverResponse = Static<typeof BotRelayDeliverResponseSchem
 /** `POST /bot-relay/reply`: hand a reply (or a typed failure) back to the sender's waiter. */
 export const BotRelayReplyRequestSchema = Type.Object({
   id: Type.String({ minLength: 1, maxLength: 128 }),
-  reply: Type.Optional(Type.Union([Type.String({ maxLength: 64_000 }), Type.Null()])),
-  error: Type.Optional(Type.Union([Type.String({ maxLength: 4_000 }), Type.Null()])),
+  // No cap on `reply`: Hermes itself relays a reply whole, and a refused reply would leave the
+  // sender's waiter to time out and the claimed envelope to be re-delivered (a duplicate turn).
+  reply: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  error: Type.Optional(Type.Union([Type.String({ maxLength: 16_000 }), Type.Null()])),
   reason: Type.Optional(Type.Union([Type.String({ maxLength: 64 }), Type.Null()])),
 }, { additionalProperties: false });
 export type BotRelayReplyRequest = Static<typeof BotRelayReplyRequestSchema>;
+
+/** Capability 87. `GET /bot-relay/identity`: the id this gateway goes by on the relay, the same on
+ *  every phone (the gateway's configured name, slugged, plus the first six characters of its Hermes
+ *  install id when Hermes reports one). */
+export const BotRelayIdentitySchema = Type.Object({
+  connectionId: RelayHandle,
+  label: Type.String(),
+}, { additionalProperties: false });
+export type BotRelayIdentity = Static<typeof BotRelayIdentitySchema>;
 
 /** Capability 87. The gateway's Hermes queued a cross-connection envelope; a courier drains now. */
 export const BotRelayPendingFrameSchema = Type.Object({

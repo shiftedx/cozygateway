@@ -79,7 +79,7 @@ import type {
 } from "./approvals.ts";
 import { GroupRooms, type RoomInteractionExpiry } from "./group-rooms.ts";
 import { readPresentation, writePresentation } from "./presentation.ts";
-import { relayDeliver, relayDrain, relayReply, relayRosterSync } from "./relay.ts";
+import { relayDeliver, relayDrain, relayInstallId, relayReply, relayRosterSync } from "./relay.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
 import type { ProfileChangeEvent } from "./profile-provisioner.ts";
 import type { ObservationRing } from "../observe/ring.ts";
@@ -254,6 +254,8 @@ export interface BotControlSurface {
   configurePresentation?(name: string, patch: BotPresentationPatch): Promise<BotPresentationResponse>;
   /** Capability 87, the relay doors. Optional so only a surface with a Hermes behind it relays. */
   relayRosterSync?(agents: BotRelayAgent[]): Promise<{ count: number }>;
+  /** The Hermes install id behind this surface, for the relay identity. */
+  relayInstallId?(): Promise<string | undefined>;
   relayDrain?(): Promise<BotRelayDrainResponse>;
   relayDeliver?(req: BotRelayDeliverRequest): Promise<BotRelayDeliverResponse>;
   relayReply?(req: BotRelayReplyRequest): Promise<{ ok: true }>;
@@ -1102,6 +1104,16 @@ export class HermesBridge implements BotControlSurface {
   }
   relayRosterSync(agents: BotRelayAgent[]): Promise<{ count: number }> {
     return relayRosterSync(this.#client, agents);
+  }
+  #installId: Promise<string | undefined> | undefined;
+  relayInstallId(): Promise<string | undefined> {
+    // Stable for the install's life; a failed read is retried on the next ask.
+    const read = this.#installId ?? relayInstallId(this.#client);
+    this.#installId = read.then((id) => {
+      if (id === undefined) this.#installId = undefined;
+      return id;
+    });
+    return this.#installId;
   }
   relayDrain(): Promise<BotRelayDrainResponse> {
     return relayDrain(this.#client);

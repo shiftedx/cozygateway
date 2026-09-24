@@ -179,6 +179,14 @@ export function isBotActive(
   return ctx.now / 1000 - bot.lastActiveAt / 1000 < ACTIVE_WINDOW_S;
 }
 
+/** Upstream `WORKER_ACTIVE_WINDOW_S`: workers heartbeat at least every 60 s while running. */
+export const WORKER_ACTIVE_WINDOW_S = 150;
+
+/** `row-helpers.ts workerActiveAt`, against THIS gateway's clock (both are milliseconds here). */
+export function isWorkerActive(workerActiveAt: number | null, now: number): boolean {
+  return workerActiveAt !== null && now / 1000 - workerActiveAt / 1000 < WORKER_ACTIVE_WINDOW_S;
+}
+
 /** Roster sort key (dissection 2.5): most recent of the bot's creation stamp and its last
  *  session activity. Both are milliseconds by the time they reach here. */
 export function botActivityAt(profile: ParsedProfile): number {
@@ -214,6 +222,7 @@ export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions)
       active: isBotActive(profile, opts),
       lastActiveAt: profile.lastActiveAt,
       workerActiveAt: profile.workerActiveAt,
+      workerActive: isWorkerActive(profile.workerActiveAt, opts.now),
       chatSessionId: null,
       preview: classifyPreview(profile.preview, profile.description),
       syncState: "setup_required",
