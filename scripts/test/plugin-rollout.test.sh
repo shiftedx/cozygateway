@@ -1030,6 +1030,62 @@ SH
   assert_contains "$calls" '--dry-run solo'
 }
 
+test_deploy_restarts_a_multiplexed_host_once() {
+  local hermes="$TMP/deploy-mux-hermes" bin="$TMP/deploy-mux-bin" output="$TMP/deploy-mux.out"
+  local launch_log="$TMP/deploy-mux-launchctl" hermes_log="$TMP/deploy-mux-hermes-calls"
+  make_fake_bin "$bin"
+  make_multiplexed_root "$hermes"
+  make_profile "$hermes" alpha
+  make_profile "$hermes" beta
+  make_profile "$hermes" solo
+  printf 'gateway:\n  standalone: true\n' >> "$hermes/profiles/solo/config.yaml"
+  make_fake_python "$hermes" $'alpha\nbeta\nsolo'
+  cat > "$bin/curl" <<'SH'
+#!/bin/sh
+printf '%s\n' '{"attach":{"configured":3,"online":3}}'
+SH
+  chmod +x "$bin/curl"
+
+  if ! HOME="$TMP/deploy-mux-home" PATH="$bin:/usr/bin:/bin" COZY_TEST_READY_COUNTS='3 3' \
+    COZY_TEST_HERMES_HOME="$hermes" COZY_TEST_HERMES_LOG="$hermes_log" \
+    COZY_TEST_LAUNCHCTL_LOG="$launch_log" COZY_TEST_SSH_LOG="$TMP/deploy-mux-ssh" \
+    "$ROOT/scripts/deploy-plugin-local.sh" --hermes-home "$hermes" --quiet-window 0 --max-wait 0 --ready-timeout 0 > "$output" 2>&1; then
+    cat "$output" >&2; fail 'deploy on a multiplexed host failed'
+  fi
+  # Served profiles: synced, then ONE host restart. The standalone profile keeps its kickstart.
+  if grep -Eq 'ai\.hermes\.gateway-(alpha|beta)' "$launch_log"; then fail "a served profile was kickstarted: $(cat "$launch_log")"; fi
+  assert_contains "$launch_log" 'kickstart -k gui/'
+  assert_contains "$launch_log" '/ai.hermes.gateway-solo'
+  [ "$(grep -c 'gateway restart' "$hermes_log" 2>/dev/null)" = 1 ] || fail "expected one host restart: $(cat "$hermes_log" 2>/dev/null)"
+  assert_contains "$hermes_log" '-p default gateway restart'
+  assert_contains "$output" 'restarted the host Hermes gateway once'
+  cmp "$ROOT/integrations/attach-plugin/plugin.yaml" "$hermes/profiles/alpha/plugins/cozygateway/plugin.yaml" \
+    || fail 'deploy did not sync a served profile'
+}
+
+test_deploy_leaves_the_host_alone_when_a_served_profile_is_busy() {
+  local hermes="$TMP/deploy-busy-hermes" bin="$TMP/deploy-busy-bin" output="$TMP/deploy-busy.out" hermes_log="$TMP/deploy-busy-hermes-calls" db
+  make_fake_bin "$bin"
+  make_multiplexed_root "$hermes"
+  make_profile "$hermes" alpha
+  make_fake_python "$hermes" 'alpha'
+  db="$hermes/profiles/alpha/plugin-data/cozygateway/attach-v1.sqlite"
+  sqlite3 "$db" 'create table event_outbox(sequence integer); insert into event_outbox values (1);'
+  # The outbox moves on every sample, so alpha never quiesces within --max-wait.
+  cat > "$bin/sqlite3" <<SH
+#!/bin/sh
+date +%s%N
+SH
+  chmod +x "$bin/sqlite3"
+  if HOME="$TMP/deploy-busy-home" PATH="$bin:/usr/bin:/bin" COZY_TEST_HERMES_HOME="$hermes" COZY_TEST_HERMES_LOG="$hermes_log" \
+    COZY_TEST_LAUNCHCTL_LOG="$TMP/deploy-busy-launchctl" COZY_TEST_SSH_LOG="$TMP/deploy-busy-ssh" \
+    "$ROOT/scripts/deploy-plugin-local.sh" --hermes-home "$hermes" --quiet-window 5 --poll-interval 1 --max-wait 1 --ready-timeout 0 > "$output" 2>&1; then
+    fail 'deploy reported success while a served profile never quiesced'
+  fi
+  if grep -q 'gateway restart' "$hermes_log" 2>/dev/null; then fail 'deploy restarted the host under a busy served profile'; fi
+  assert_contains "$output" 'host Hermes gateway NOT restarted'
+}
+
 test_watcher_repairs_content_drift
 test_streaming_reader_answers_without_pyyaml
 test_watcher_picks_up_a_wired_profile_that_cannot_stream
@@ -1053,4 +1109,6 @@ test_provisioner_restarts_a_multiplexed_host_once_for_changed_live_profiles
 test_provisioner_falls_back_to_one_host_restart_when_the_host_does_not_answer
 test_provisioner_keeps_a_standalone_profile_on_its_own_service
 test_watcher_does_not_demand_a_launchd_job_for_a_served_profile
+test_deploy_restarts_a_multiplexed_host_once
+test_deploy_leaves_the_host_alone_when_a_served_profile_is_busy
 printf 'plugin rollout: ok\n'
