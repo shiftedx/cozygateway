@@ -224,6 +224,7 @@ export class GroupBusy extends Error {
 /** Capability 84. A room picture is a small image data URL. */
 const PICTURE_PATTERN = /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/;
 const PICTURE_MAX = 24_000;
+const COMPRESS_TIMEOUT_MS = 660_000;
 
 export interface GroupRoomsOptions {
   storage: Storage;
@@ -636,7 +637,8 @@ export class GroupRooms {
       if (started.outcome === "failed" && started.detail.includes("already pending")) throw new GroupBusy(started.detail);
       throw new GroupInvalid("detail" in started ? started.detail : "compress could not start");
     }
-    const result = await this.#waitForTurn(key, started.turnId, this.#generation(key));
+    // Upstream's focused-chat /compress budget: a summary can legitimately take minutes.
+    const result = await this.#waitForTurn(key, started.turnId, this.#generation(key), COMPRESS_TIMEOUT_MS);
     return { member, text: result.outcome === "spoke" ? result.text : "detail" in result ? result.detail : "Compressed." };
   }
 
@@ -1043,8 +1045,8 @@ export class GroupRooms {
     return { ...result, turnId: started.turnId };
   }
 
-  async #waitForTurn(key: string, turnId: string, generation: number): Promise<GroupTurnResult> {
-    const timeoutMs = this.#turnTimeoutMs ?? 180_000;
+  async #waitForTurn(key: string, turnId: string, generation: number, timeoutOverride?: number): Promise<GroupTurnResult> {
+    const timeoutMs = timeoutOverride ?? this.#turnTimeoutMs ?? 180_000;
     const deadline = this.#now() + timeoutMs;
     while (!this.#closed && this.#generation(key) === generation) {
       const row = this.#storage.botGroupTurn(key, turnId);
