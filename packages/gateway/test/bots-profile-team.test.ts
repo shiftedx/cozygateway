@@ -87,6 +87,30 @@ describe("team fields on the bot profile", () => {
     expect(read).not.toHaveProperty("reports");
   });
 
+  it("refreshes the roster through the bridge's real wiring after a team-only patch, promotion and demotion both", async () => {
+    const h = await setup();
+    const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    // Let the bridge's own startup refresh (armed the moment Hermes came online) settle first, so
+    // it cannot be mistaken for the refresh this test is checking for.
+    await wait(400);
+    // The bridge's own reconnect churn can also trigger a `profiles.list` refresh, so this checks
+    // that a patch causes one PROMPTLY (inside the 250ms debounce plus slack), not that one
+    // eventually happens for some unrelated reason.
+    const callsBefore = h.server.callsOf("profiles.list").length;
+    await h.authed("/bots/scout/profile", patch({ role: "leader", reports: ["sage"] }));
+    await wait(400);
+    expect(h.server.callsOf("profiles.list").length).toBeGreaterThan(callsBefore);
+    const row = h.storage.botRoster().bots.find((bot) => bot.name === "scout") as { role?: "leader" } | undefined;
+    expect(row?.role).toBe("leader");
+
+    const callsAfterPromotion = h.server.callsOf("profiles.list").length;
+    await h.authed("/bots/scout/profile", patch({ role: "member" }));
+    await wait(400);
+    expect(h.server.callsOf("profiles.list").length).toBeGreaterThan(callsAfterPromotion);
+    const demoted = h.storage.botRoster().bots.find((bot) => bot.name === "scout") as { role?: "leader" } | undefined;
+    expect(demoted).not.toHaveProperty("role");
+  });
+
   it("refuses reports on a member, an unknown bot, and the bot itself, and writes nothing", async () => {
     const h = await setup();
     expect((await h.authed("/bots/scout/profile", patch({ reports: ["sage"] }))).status).toBe(400);

@@ -1468,6 +1468,10 @@ export function registerBotRoutes(
           if (err instanceof AssignmentInvalid) return c.json(errorBody("invalid_request", err.message), 400);
           throw err;
         }
+        // Capability 88: a team-only patch touches no peer, so nothing else triggers a roster
+        // refresh for it; without this the `role` badge on `GET /bots` and `bot_roster` goes
+        // stale until an unrelated refresh happens to run.
+        bots.refreshSoon(`bot ${name} team`);
       }
       return c.json({
         name,
