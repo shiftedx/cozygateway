@@ -96,6 +96,8 @@ chmod 700 "$tmp/bin/sleep"
 # that carries them keeps every case below about the thing it is testing.
 # `active` says false on purpose, which the installer must never overrule.
 cat > "$tmp/hermes/config.yaml" <<'PROFILE_YAML'
+plugins:
+  stream_reasoning_deltas: true
 display:
   streaming: true
   platforms:
@@ -107,6 +109,8 @@ streaming:
 PROFILE_YAML
 cp "$tmp/hermes/config.yaml" "$tmp/hermes/profiles/ops/config.yaml"
 cat > "$tmp/hermes/profiles/active/config.yaml" <<'PROFILE_YAML'
+plugins:
+  stream_reasoning_deltas: false
 display:
   streaming: false
   platforms:
@@ -170,12 +174,36 @@ if [ "$1" = status ]; then
   printf 'Current model: test/model\nActive provider: test-provider\n'
   exit 0
 fi
-if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "set" ] && [[ "$5" = display.* ]]; then
+if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "set" ] && [[ "$5" = display.* || "$5" = streaming.* || "$5" = plugins.stream_reasoning_deltas ]]; then
   printf '%s\n' "$profile:config-set:$5=$6" >> "${COZYGATEWAY_TEST_COMMAND_LOG:?}"
-  # Writes nothing, deliberately: real Hermes returns 0 without writing on a
-  # package-managed install, and the installer must read the file back rather
-  # than trust this exit code. The failing switch is the other half.
+  # Writes nothing by default, deliberately: real Hermes returns 0 without
+  # writing on a package-managed install, and the installer must read the file
+  # back rather than trust this exit code. The failing switch is the other half.
   [ -n "${COZYGATEWAY_TEST_CONFIG_SET_FAILS:-}" ] && exit 1
+  if [ -n "${COZYGATEWAY_TEST_CONFIG_SET_WRITES:-}" ]; then
+    # A writer that lands, for the restart cases. One key may be refused, the
+    # way a managed layer pinning `plugins.*` makes Hermes exit 1. The file is
+    # rebuilt from `model:` plus every key written so far, which is all these
+    # cases start from, so no YAML writer is needed.
+    [ "$5" = "${COZYGATEWAY_TEST_CONFIG_SET_FAIL_KEY:-}" ] && exit 1
+    home="$root/profiles/$profile"; [ "$profile" = default ] && home="$root"
+    printf '%s=%s\n' "$5" "$6" >> "$home/.written"
+    has() { grep -q "^$1=" "$home/.written"; }
+    {
+      printf 'model: test/model\n'
+      has plugins.stream_reasoning_deltas && printf 'plugins:\n  stream_reasoning_deltas: true\n'
+      if has display.streaming || has display.platforms.cozygateway.streaming; then
+        printf 'display:\n'
+        has display.streaming && printf '  streaming: true\n'
+        has display.platforms.cozygateway.streaming && printf '  platforms:\n    cozygateway:\n      streaming: true\n'
+      fi
+      if has streaming.edit_interval || has streaming.buffer_threshold; then
+        printf 'streaming:\n'
+        has streaming.edit_interval && printf '  edit_interval: 0.05\n'
+        has streaming.buffer_threshold && printf '  buffer_threshold: 1\n'
+      fi
+    } > "$home/config.yaml"
+  fi
   exit 0
 fi
 if [ "$1" = "-p" ] && [ "$3" = "config" ] && [ "$4" = "path" ]; then
@@ -520,6 +548,9 @@ expect_contains "$mute_profile_output" 'set display.platforms.cozygateway.stream
 # key gets is the reader's, not a bare `true`.
 expect_contains "$mute_profile_output" 'set streaming.edit_interval to 0.05 for Hermes profile ops'
 expect_contains "$mute_profile_output" 'set streaming.buffer_threshold to 1 for Hermes profile ops'
+# Issue #200. The live thinking preview rides the same repair: Hermes hands the
+# attach plugin reasoning deltas only when this key is true.
+expect_contains "$mute_profile_output" 'set plugins.stream_reasoning_deltas to true for Hermes profile ops'
 expect_contains "$mute_profile_output" 'streaming is already decided in config.yaml for Hermes profile active'
 
 # A profile ST1 already repaired: both display keys, no cadence block. Only the
@@ -535,6 +566,22 @@ if grep -Fq 'set display.streaming to true for Hermes profile ops' <<<"$cadence_
   exit 1
 fi
 expect_contains "$cadence_profile_output" 'streaming is already decided in config.yaml for Hermes profile active'
+
+# A profile the streaming repairs already reached, with no thinking preview, and
+# a list at its key's own indent (hand-edited, or PyYAML's default dump). Only that one key
+# is written, and `active`'s explicit false is still left alone.
+printf 'plugins:\n  enabled:\n  - cozygateway\ndisplay:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  edit_interval: 0.05\n  buffer_threshold: 1\n' \
+  > "$tmp/hermes/profiles/ops/config.yaml"
+thinking_profile_output="$(PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --profiles all --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-scoped" 2>&1)"
+expect_contains "$thinking_profile_output" 'set plugins.stream_reasoning_deltas to true for Hermes profile ops'
+if grep -Eq 'set (display|streaming)\.[a-z_.]* to [^ ]* for Hermes profile ops' <<<"$thinking_profile_output"; then
+  echo 'installer rewrote a streaming key the profile already carried' >&2
+  exit 1
+fi
+if grep -Fq 'set plugins.stream_reasoning_deltas to true for Hermes profile active' <<<"$thinking_profile_output"; then
+  echo 'installer overrode a thinking preview the operator turned off' >&2
+  exit 1
+fi
 
 # F16 ruling 2. The cadence knobs are TOP-LEVEL: Hermes has no per-platform
 # override for them, so seeding them on a profile that also runs Telegram would
@@ -797,6 +844,43 @@ if grep -Eq ':gateway:(restart|start|install)$' "$tmp/write-failure-commands"; t
   cat "$tmp/write-failure-commands" >&2
   exit 1
 fi
+cp "$tmp/hermes/config.yaml" "$tmp/hermes/profiles/ops/config.yaml"
+
+# Issue #200. Hermes reads `plugins.stream_reasoning_deltas` on every reply
+# (the config cache is keyed on the file's stat signature), so a profile missing
+# ONLY that key is repaired by the write alone: restarting it would drop every
+# in-flight turn for nothing.
+printf 'model: test/model\ndisplay:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  edit_interval: 0.05\n  buffer_threshold: 1\n' \
+  > "$tmp/hermes/profiles/ops/config.yaml"
+printf 'display.streaming=true\ndisplay.platforms.cozygateway.streaming=true\nstreaming.edit_interval=0.05\nstreaming.buffer_threshold=1\n' \
+  > "$tmp/hermes/profiles/ops/.written"
+if ! thinking_only_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/thinking-only-commands" COZYGATEWAY_TEST_CONFIG_SET_WRITES=1 COZYGATEWAY_TEST_MODEL_DECLINE=1 COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"; then
+  printf 'a thinking-only repair failed the install:\n%s\n' "$thinking_only_output" >&2; exit 1
+fi
+grep -Fxq 'ops:config-set:plugins.stream_reasoning_deltas=true' "$tmp/thinking-only-commands"
+expect_contains "$thinking_only_output" 'set plugins.stream_reasoning_deltas to true for Hermes profile ops'
+if grep -Eq ':gateway:(restart|start|install)$' "$tmp/thinking-only-commands"; then
+  printf 'a thinking-only repair restarted a Hermes profile:\n' >&2
+  cat "$tmp/thinking-only-commands" >&2
+  exit 1
+fi
+
+# A key that fails must not cost the keys that landed their restart: the
+# display switches only take on a gateway restart, so a profile whose
+# `plugins.*` is pinned by a managed layer still gets exactly one.
+printf 'model: test/model\n' > "$tmp/hermes/profiles/ops/config.yaml"
+rm -f "$tmp/hermes/profiles/ops/.written"
+if ! partial_write_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/partial-write-commands" COZYGATEWAY_TEST_CONFIG_SET_WRITES=1 COZYGATEWAY_TEST_CONFIG_SET_FAIL_KEY=plugins.stream_reasoning_deltas COZYGATEWAY_TEST_MODEL_DECLINE=1 COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live" 2>&1)"; then
+  printf 'a partly refused streaming repair failed the install:\n%s\n' "$partial_write_output" >&2; exit 1
+fi
+expect_contains "$partial_write_output" 'hermes could not set plugins.stream_reasoning_deltas'
+expect_contains "$partial_write_output" 'set display.streaming to true for Hermes profile ops'
+if ! grep -Eq '^ops:gateway:(restart|start)$' "$tmp/partial-write-commands"; then
+  printf 'display keys that landed were not restarted in because a later key failed:\n' >&2
+  cat "$tmp/partial-write-commands" >&2
+  exit 1
+fi
+rm -f "$tmp/hermes/profiles/ops/.written"
 cp "$tmp/hermes/config.yaml" "$tmp/hermes/profiles/ops/config.yaml"
 
 # Content equality is never allowed to cross the validated profile tree. A
@@ -2616,7 +2700,9 @@ NODE
 # profile's, serves every profile, and Hermes refuses a served profile's own lifecycle verbs with
 # exit 78. The installer must drive the host instead, once for all of them, while a profile that
 # opted out with `gateway.standalone: true` keeps its own gateway exactly as before.
-mux_profile_yaml='display:
+mux_profile_yaml='plugins:
+  stream_reasoning_deltas: true
+display:
   streaming: true
   platforms:
     cozygateway:

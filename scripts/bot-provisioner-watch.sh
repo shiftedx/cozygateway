@@ -170,6 +170,13 @@ WANTED = (
     (("display", "platforms", "cozygateway", "streaming"), "true"),
     (("streaming", "edit_interval"), "0.05"),
     (("streaming", "buffer_threshold"), "1"),
+    # The live thinking preview. Hermes hands the attach plugin's `on_stream_delta`
+    # hook reasoning deltas only when this reads true
+    # (agent/plugin_stream_hooks.py::stream_reasoning_deltas_enabled, default
+    # false), and it reads it from the CURRENT profile's config.yaml, per stream,
+    # even under a multiplexed host. Not a cadence key, so the platform guard
+    # below leaves it alone; an explicit false is kept like every other key here.
+    (("plugins", "stream_reasoning_deltas"), "true"),
 )
 WANTED_PATHS = tuple(path for path, _ in WANTED)
 KEY = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z0-9_][A-Za-z0-9_.\-]*):(?P<rest>[ \t].*|)$")
@@ -238,10 +245,18 @@ def absent_without_yaml(text):
             return None
         if stripped.startswith("---") or stripped.startswith("..."):
             return None
-        while stack and indent <= stack[-1][0]:
+        # A sequence item may sit at the SAME indent as the key that owns it
+        # (`enabled:` then `- cozygateway`). Hermes itself saves through its
+        # indenting dumper (utils.py `IndentDumper`), so this is the shape of a
+        # hand-edited file or one dumped with PyYAML's defaults. A dash line
+        # therefore closes only the keys indented deeper than itself; otherwise
+        # such a `plugins.enabled` would read as a sequence directly under
+        # `plugins`, where a wanted key lives, and the probe would give up.
+        dash = stripped.startswith("-")
+        while stack and (indent < stack[-1][0] if dash else indent <= stack[-1][0]):
             stack.pop()
         path = tuple(key for _, key in stack)
-        if stripped.startswith("-"):
+        if dash:
             # A sequence where one of the wanted keys would be a mapping.
             if on_the_way(path):
                 return None
@@ -466,9 +481,10 @@ missing_reason() {
   # Wired but mute, or wired and streaming at Telegram's one-edit-a-second
   # envelope: every profile created before the gateway's seed wrote these keys
   # is fully reachable and either never streams or shows a minute-long answer as
-  # a couple of frames. An unreadable or unjudgeable config answers "no keys
-  # absent", so an uncertain sweep leaves the profile alone rather than
-  # provisioning it every tick.
+  # a couple of frames, or streams with no live thinking preview (issue #200:
+  # `plugins.stream_reasoning_deltas` rides the same reader). An unreadable or
+  # unjudgeable config answers "no keys absent", so an uncertain sweep leaves
+  # the profile alone rather than provisioning it every tick.
   # A "!" line is a note the provisioner prints, not a key it writes, so it must
   # never read as pending work: a profile that serves another chat platform
   # keeps its own cadence forever and would otherwise be swept every tick.

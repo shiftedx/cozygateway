@@ -60,7 +60,7 @@ esac
 ''')
         for name in ("default", "keeper", "retired", "unselected"):
             self.profile(name).mkdir(parents=True, exist_ok=True)
-            (self.profile(name) / "config.yaml").write_text("display:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  edit_interval: 0.05\n  buffer_threshold: 1\n")
+            (self.profile(name) / "config.yaml").write_text("plugins:\n  stream_reasoning_deltas: true\ndisplay:\n  streaming: true\n  platforms:\n    cozygateway:\n      streaming: true\nstreaming:\n  edit_interval: 0.05\n  buffer_threshold: 1\n")
         (self.profile("unselected") / ".env").write_text("FOREIGN_SETTING=preserved\n")
         (self.assets / "cozygateway.mjs").write_text("// fixture CLI: service and readiness are isolated doubles\n")
         for source, name in (("scripts/agent-install.sh", "cozygateway-installer.sh"),

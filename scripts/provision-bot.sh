@@ -210,6 +210,13 @@ WANTED = (
     (("display", "platforms", "cozygateway", "streaming"), "true"),
     (("streaming", "edit_interval"), "0.05"),
     (("streaming", "buffer_threshold"), "1"),
+    # The live thinking preview. Hermes hands the attach plugin's `on_stream_delta`
+    # hook reasoning deltas only when this reads true
+    # (agent/plugin_stream_hooks.py::stream_reasoning_deltas_enabled, default
+    # false), and it reads it from the CURRENT profile's config.yaml, per stream,
+    # even under a multiplexed host. Not a cadence key, so the platform guard
+    # below leaves it alone; an explicit false is kept like every other key here.
+    (("plugins", "stream_reasoning_deltas"), "true"),
 )
 WANTED_PATHS = tuple(path for path, _ in WANTED)
 KEY = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z0-9_][A-Za-z0-9_.\-]*):(?P<rest>[ \t].*|)$")
@@ -278,10 +285,18 @@ def absent_without_yaml(text):
             return None
         if stripped.startswith("---") or stripped.startswith("..."):
             return None
-        while stack and indent <= stack[-1][0]:
+        # A sequence item may sit at the SAME indent as the key that owns it
+        # (`enabled:` then `- cozygateway`). Hermes itself saves through its
+        # indenting dumper (utils.py `IndentDumper`), so this is the shape of a
+        # hand-edited file or one dumped with PyYAML's defaults. A dash line
+        # therefore closes only the keys indented deeper than itself; otherwise
+        # such a `plugins.enabled` would read as a sequence directly under
+        # `plugins`, where a wanted key lives, and the probe would give up.
+        dash = stripped.startswith("-")
+        while stack and (indent < stack[-1][0] if dash else indent <= stack[-1][0]):
             stack.pop()
         path = tuple(key for _, key in stack)
-        if stripped.startswith("-"):
+        if dash:
             # A sequence where one of the wanted keys would be a mapping.
             if on_the_way(path):
                 return None
@@ -537,17 +552,27 @@ EOF
 # YAML rewrite here, so the file keeps whatever shape Hermes gives it and this
 # script never has to own a config writer.
 #
-# Set for the immediately following ensure_service call: Hermes reads config.yaml
-# at gateway start, so a repaired profile streams only after one restart.
+# Set for the immediately following ensure_service call: Hermes reads the display
+# and cadence keys at gateway start, so a repaired profile streams only after one
+# restart.
 STREAMING_CONFIG_CHANGED=0
+# Keys Hermes re-reads on every reply, so writing one is the whole repair and a
+# restart would only drop in-flight turns. `plugins.stream_reasoning_deltas` is
+# looked up per stream (agent/stream_delivery.py resets its cache per stream)
+# through a config cache keyed on the file's stat signature.
+READ_PER_REPLY_KEYS=" plugins.stream_reasoning_deltas "
+needs_restart() { case "$READ_PER_REPLY_KEYS" in *" $1 "*) return 1 ;; *) return 0 ;; esac; }
+# Set when one of those keys was written AND the read-back found it on disk.
+READ_PER_REPLY_WROTE=0
 # A "!" line from the reader is a note to say, not a key to write. Both reads
 # below drop them, so a profile that keeps its own cadence is not mistaken for a
 # write that failed to land.
 streaming_notes() { printf '%s\n' "$1" | grep '^!' || true; }
 streaming_writes() { printf '%s\n' "$1" | grep -v '^!' || true; }
 ensure_streaming_config() {
-  local profile="$1" dir="$2" answer keys note entry key value rc=0
+  local profile="$1" dir="$2" answer keys note entry key value rc=0 wrote="" missing="" restart=0
   STREAMING_CONFIG_CHANGED=0
+  READ_PER_REPLY_WROTE=0
   answer="$(streaming_keys_absent "$dir")" || rc=$?
   if [ "$rc" != 0 ]; then
     warn "[$profile] could not read config.yaml, leaving streaming settings alone"
@@ -569,27 +594,46 @@ ensure_streaming_config() {
   for entry in $keys; do
     key="${entry%%=*}"; value="${entry#*=}"
     if [ "$DRY_RUN" = 1 ]; then say "  DRY  set $key=$value"; continue; fi
-    # A profile whose config cannot be written is one profile with no draft
-    # frames, not a reason to abandon the rest of the sweep.
+    # A key whose config cannot be written is one missing setting, not a reason
+    # to abandon the rest of the sweep, nor the other keys: a managed layer
+    # pinning `plugins.*` must not cost the display keys their restart.
     if ! "$HERMES_BIN" -p "$profile" config set "$key" "$value" >/dev/null; then
-      warn "[$profile] hermes could not set $key, leaving streaming off for this profile"
-      return 0
+      if needs_restart "$key"; then
+        warn "[$profile] hermes could not set $key, leaving streaming off for this profile"
+      else
+        warn "[$profile] hermes could not set $key, leaving the thinking preview off for this profile"
+      fi
+      continue
     fi
     say "  $key set to $value"
+    wrote="$wrote $key"
   done
   [ "$DRY_RUN" = 1 ] && return 0
+  [ -n "$wrote" ] || return 0
   # Read the file back before claiming anything changed. `config set` is not
   # proof of a write: Hermes' own `set_config_value` returns 0 WITHOUT writing on
   # a package-managed install (`is_managed()`), and trusting the exit code there
-  # would kickstart this profile on every 30 second tick forever.
+  # would kickstart this profile on every 30 second tick forever. Only a key that
+  # is now really there, and that Hermes reads at start, earns the restart.
   rc=0
   answer="$(streaming_keys_absent "$dir")" || rc=$?
-  keys="$(streaming_writes "$answer")"
-  if [ "$rc" != 0 ] || [ -n "$keys" ]; then
-    warn "[$profile] hermes reported success but ${keys//$'\n'/ } is still absent; leaving streaming off and not restarting"
+  if [ "$rc" != 0 ]; then
+    warn "[$profile] could not read config.yaml back after writing it; not restarting"
     return 0
   fi
-  STREAMING_CONFIG_CHANGED=1
+  keys="$(streaming_writes "$answer")"
+  for key in $wrote; do
+    if printf '%s\n' "$keys" | grep -q "^${key//./\\.}="; then missing="$missing $key"
+    elif needs_restart "$key"; then restart=1
+    else READ_PER_REPLY_WROTE=1
+    fi
+  done
+  if [ -n "$missing" ] && [ "$restart" = 1 ]; then
+    warn "[$profile] hermes reported success but${missing} is still absent; restarting only for the keys that landed"
+  elif [ -n "$missing" ]; then
+    warn "[$profile] hermes reported success but${missing} is still absent; leaving streaming off and not restarting"
+  fi
+  STREAMING_CONFIG_CHANGED=$restart
 }
 
 # Set by sync_plugin for the immediately following ensure_service call. A
@@ -658,12 +702,18 @@ ensure_env_line() {
 # Upsert. For the handful of values that must be EXACTLY right rather than
 # merely present, because a fresh profile arrives holding a copy of the launch
 # profile's .env and an inherited value there is wrong, not pre-existing.
+#
+# SET_ENV_CHANGED goes to 1 whenever a value really changes, so the caller can
+# tell a rewritten COZYGATEWAY_URL (an adapter still dialing the old gateway
+# until its process restarts) from a line that was already right.
+SET_ENV_CHANGED=0
 set_env_line() {
   local file="$1" key="$2" value="$3"
   if [ -f "$file" ] && [ "$(env_value "$file" "$key" || true)" = "$value" ]; then
     say "  env $key already correct"
     return 0
   fi
+  SET_ENV_CHANGED=1
   if [ "$DRY_RUN" = 1 ]; then say "  DRY  set $key in $file"; return 0; fi
   mkdir -p "$(dirname "$file")"
   [ -f "$file" ] || : > "$file"
@@ -862,10 +912,14 @@ recreate_box_gateway() {
 #   Observed live: install reported success, launchctl print reported nothing,
 #   and the attach never came up. So the load is asserted here rather than
 #   assumed from the installer's exit code.
+# Set by ensure_service when it had to bring a service up that was not loaded:
+# a fresh process, so a fresh attach hello to verify.
+SERVICE_STARTED=0
 ensure_service() {
   local profile="$1" restart_for_change="${2:-0}"
   local label="ai.hermes.gateway-$profile"
   local plist="$HOME/Library/LaunchAgents/$label.plist"
+  SERVICE_STARTED=0
 
   if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
     if [ "$restart_for_change" = 1 ]; then
@@ -883,6 +937,7 @@ ensure_service() {
     fi
     return 0
   fi
+  SERVICE_STARTED=1
   if [ "$DRY_RUN" = 1 ]; then
     say "  DRY  install and bootstrap $label"
     return 0
@@ -1037,6 +1092,7 @@ for profile in "${PROFILES[@]}"; do
   # native install on this Mac, say) the copied COZYGATEWAY_URL points there. A plugin that
   # dials the wrong gateway with this gateway's token is refused forever, and the row on the box
   # never leaves setup_required (observed 2026-09-05: snug-nimbus and dewy-bayberry).
+  SET_ENV_CHANGED=0
   set_env_line "$env_file" COZYGATEWAY_URL "$GATEWAY_URL"
   ensure_env_line "$env_file" COZYGATEWAY_HOME_CHANNEL "$HOME_CHANNEL"
   ensure_env_line "$env_file" COZYGATEWAY_INSTALLER_OWNER "$INSTALLER_OWNER"
@@ -1046,14 +1102,19 @@ for profile in "${PROFILES[@]}"; do
   # and ack each other's events out of one file.
   set_env_line "$env_file" COZYGATEWAY_SPOOL_PATH \
     "$profile_dir/plugin-data/cozygateway/attach-v1.sqlite"
+  # The URL, token and spool the adapter dials with are read at process start,
+  # and a multiplexed rescan skips a live adapter, so a changed one is a restart
+  # (and a hello to verify) exactly like a new token.
+  attach_env_changed="$SET_ENV_CHANGED"
   inherit_chat_registry "$env_file"
   ensure_streaming_config "$profile" "$profile_dir"
   ensure_box_env_line "$env_name" "$token" "$profile"
   ensure_box_config_entry "$profile" "$env_name"
   [ "$pending_before" = 0 ] || BOX_CHANGED=1
+  box_recreated="$BOX_CHANGED"
   recreate_box_gateway
   restart_needed=0
-  { [ "$PLUGIN_SYNC_CHANGED" = 1 ] || [ "$STREAMING_CONFIG_CHANGED" = 1 ] || [ "$token_changed" = 1 ] || [ "$pending_before" = 1 ]; } && restart_needed=1
+  { [ "$PLUGIN_SYNC_CHANGED" = 1 ] || [ "$STREAMING_CONFIG_CHANGED" = 1 ] || [ "$token_changed" = 1 ] || [ "$attach_env_changed" = 1 ] || [ "$pending_before" = 1 ]; } && restart_needed=1
   if [ "$served" = 1 ]; then
     # The host rebuilds a profile only after its .env or config.yaml changed since its last look,
     # so mark one change after the reload even when every value above was already right.
@@ -1062,6 +1123,19 @@ for profile in "${PROFILES[@]}"; do
     host_pickup "$profile" "$hot_add" "$reloaded" "$restart_needed" || continue
   else
     ensure_service "$profile" "$restart_needed"
+  fi
+  # This run's only change was a key Hermes reads per reply (the thinking
+  # preview), confirmed on disk: same token, URL, spool and plugin code, no
+  # restart-requiring config, no hot-add, box untouched, service already up.
+  # The live connection stays live and will never log a fresh hello, so waiting
+  # for one would only time out, fail the sweep and leave the pending marker,
+  # whose presence makes the next sweep restart the bot. A run that changed
+  # NOTHING still verifies: that is how a manual run finds a broken attach.
+  if [ "$READ_PER_REPLY_WROTE" = 1 ] && [ "$restart_needed" = 0 ] && [ "$hot_add" = 0 ] \
+    && [ "$box_recreated" = 0 ] && { [ "$served" = 1 ] || [ "$SERVICE_STARTED" = 0 ]; }; then
+    say "  no attach change; not waiting for a new hello"
+    [ "$DRY_RUN" = 1 ] || rm -f "$provisioning_pending"
+    continue
   fi
   if verify_attached "$profile"; then
     [ "$DRY_RUN" = 1 ] || rm -f "$provisioning_pending"

@@ -299,7 +299,7 @@ os.replace = replace
         profile = self.profiles / "deleted-a"
         profile.mkdir()
         (profile / "config.yaml").write_text(json.dumps({
-            "plugins": {"enabled": ["cozygateway"]},
+            "plugins": {"enabled": ["cozygateway"], "stream_reasoning_deltas": True},
             "display": {"streaming": True, "platforms": {"cozygateway": {"streaming": True}}},
             "streaming": {"edit_interval": 0.05, "buffer_threshold": 1}}))
         (profile / ".env").write_text(
