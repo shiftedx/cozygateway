@@ -118,29 +118,22 @@ describe("bot routines", () => {
     expect(calls[0]).not.toHaveProperty("last_delivery_error");
   });
 
-  it("does not carry an old delivery failure through a patch rewrite", async () => {
-    const calls: Array<Record<string, unknown>> = [];
+  it("does not carry an old delivery failure into an in-place edit", async () => {
+    const puts: unknown[] = [];
     const rpc = {
-      request: async (_method: string, params: Record<string, unknown>) => {
-        calls.push(params);
-        if (params["action"] === "list") return { jobs: [{
-          job_id: "old", name: "[bot:scout] Digest", schedule: "every 60m", enabled: true,
-          last_delivery_error: "old delivery failure",
-        }] };
-        if (params["action"] === "add") return { success: true, job: {
-          job_id: "new", name: "[bot:scout] Digest v2", schedule: "every 60m", enabled: true,
-        } };
-        return { success: true };
+      request: async () => ({ jobs: [{
+        job_id: "old", name: "[bot:scout] Digest", schedule: "every 60m", enabled: true,
+        last_delivery_error: "old delivery failure",
+      }] }),
+      dashboardJson: async <T,>(_path: string, init?: { method?: string; body?: unknown }): Promise<T> => {
+        if (init?.method === "PUT") puts.push(init.body);
+        return {} as T;
       },
     };
-    const result = await patchBotRoutine(rpc, "scout", "old", {
-      title: "Digest v2", prompt: "summarize again",
-    });
-    expect(result.routine).not.toHaveProperty("lastDeliveryError");
-    const add = calls.find((call) => call["action"] === "add");
-    expect(add).not.toHaveProperty("lastDeliveryError");
-    expect(add).not.toHaveProperty("last_delivery_error");
-    expect(JSON.stringify(add)).not.toContain("old delivery failure");
+    await patchBotRoutine(rpc, "scout", "old", { title: "Digest v2", prompt: "summarize again" });
+    expect(puts).toHaveLength(1);
+    expect(JSON.stringify(puts[0])).not.toContain("old delivery failure");
+    expect(JSON.stringify(puts[0])).not.toContain("last_delivery_error");
   });
 
   it("keeps a backend add refusal truthful", async () => {

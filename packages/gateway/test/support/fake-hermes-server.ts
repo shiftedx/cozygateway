@@ -136,28 +136,44 @@ export async function startFakeHermesServer(initial: FakeHermesBehavior = {}): P
   let ticketMintCount = 0;
 
   function readBody(req: import("node:http").IncomingMessage): Promise<string> {
+    return readBytes(req).then((bytes) => bytes.toString("utf8"));
+  }
+
+  function readBytes(req: import("node:http").IncomingMessage): Promise<Buffer> {
     return new Promise((resolve) => {
-      let raw = "";
-      req.on("data", (chunk) => (raw += String(chunk)));
-      req.on("end", () => resolve(raw));
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => resolve(Buffer.concat(chunks)));
     });
   }
 
   const http: Server = createServer((req, res) => {
     const path = (req.url ?? "").split("?")[0] ?? "/";
     const send = (status: number, body: unknown, headers: Record<string, string | string[]> = {}): void => {
+      // Raw bytes (a file download) go out as they are; everything else is a JSON body.
+      if (body instanceof Uint8Array) {
+        res.writeHead(status, { "content-type": "application/octet-stream", ...headers });
+        res.end(body);
+        return;
+      }
       res.writeHead(status, { "content-type": "application/json", ...headers });
       res.end(JSON.stringify(body));
     };
     if (cfg.dashboard !== undefined && (path.startsWith("/api/") || path === "/openapi.json")) {
-      void readBody(req)
-        .then(async (raw) => {
+      void readBytes(req)
+        .then(async (bytes) => {
           let body: unknown;
-          try {
-            body = raw ? JSON.parse(raw) : undefined;
-          } catch {
-            send(400, { detail: "bad body" });
-            return;
+          // A multipart upload (the streamed files route) reaches the handler as its raw bytes.
+          if ((req.headers["content-type"] ?? "").startsWith("multipart/")) {
+            body = bytes;
+          } else {
+            const raw = bytes.toString("utf8");
+            try {
+              body = raw ? JSON.parse(raw) : undefined;
+            } catch {
+              send(400, { detail: "bad body" });
+              return;
+            }
           }
           const result = await cfg.dashboard!({
             method: req.method ?? "GET",
