@@ -3098,16 +3098,23 @@ launch_dashboard() {
   local dashboard_pid
   dashboard_pid="$("$NODE_RESOLVED" - "$DASHBOARD_ENV" "$hermes_root_arg" "$HERMES_RESOLVED" "$DASHBOARD_PORT" "$windows_dashboard_profile" <<'NODE'
 const { readFileSync } = require('node:fs');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const { parseEnv } = require('node:util');
 const [dashboardEnvPath, hermesRoot, hermes, dashboardPort, windowsDashboardProfile] = process.argv.slice(2);
 const dashboard = parseEnv(readFileSync(dashboardEnvPath, 'utf8'));
-const dashboardArgs = ['dashboard', ...(windowsDashboardProfile === '1' ? ['-p', 'default'] : []), '--host', '127.0.0.1', '--port', dashboardPort, '--no-open', '--skip-build'];
+const env = { ...process.env, HERMES_HOME: hermesRoot, HERMES_DASHBOARD_SESSION_TOKEN: dashboard.DASHBOARD_SESSION_TOKEN };
+// Hermes 0.17+ routes a plain `dashboard --port N` to a machine-level backend already
+// running on another port (e.g. `hermes serve`), so nothing would listen on N; --isolated
+// binds N. Hermes 0.16 and older reject the flag, so it is passed unless `--help` proves
+// it absent. Windows stays plain: its ownership proof treats an isolated Dashboard as foreign.
+const help = windowsDashboardProfile === '1' ? undefined : spawnSync(hermes, ['dashboard', '--help'], { encoding: 'utf8', env, windowsHide: true, timeout: 30000 });
+const isolated = help !== undefined && !(help.status === 0 && !`${help.stdout}${help.stderr}`.includes('--isolated'));
+const dashboardArgs = ['dashboard', ...(windowsDashboardProfile === '1' ? ['-p', 'default'] : []), '--host', '127.0.0.1', '--port', dashboardPort, '--no-open', '--skip-build', ...(isolated ? ['--isolated'] : [])];
 const child = spawn(hermes, dashboardArgs, {
   detached: true,
   windowsHide: process.platform === 'win32',
   stdio: 'ignore',
-  env: { ...process.env, HERMES_HOME: hermesRoot, HERMES_DASHBOARD_SESSION_TOKEN: dashboard.DASHBOARD_SESSION_TOKEN },
+  env,
 });
 child.unref();
 process.stdout.write(String(child.pid ?? ''));

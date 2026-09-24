@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const { readFileSync, writeFileSync, renameSync, unwatchFile, watchFile } = require('node:fs');
 const { createServer } = require('node:net');
 const { parseEnv } = require('node:util');
@@ -133,14 +133,26 @@ async function startDashboardIfNeeded(options) {
     HERMES_HOME: options.hermesRoot,
     HERMES_DASHBOARD_SESSION_TOKEN: dashboard.DASHBOARD_SESSION_TOKEN,
   };
-  // `--isolated` is what makes a fallback Dashboard a SEPARATE server. Hermes'
-  // unified server otherwise routes `hermes dashboard --port N` to the existing
-  // machine-level Dashboard, so the fallback never listens on the port it was
-  // given and the supervisor waits out its whole verification window against a
-  // server that was never started.
+  // `--isolated` is what makes a Dashboard the supervisor starts a SEPARATE server.
+  // Hermes 0.17+'s unified server otherwise routes `hermes dashboard --port N` to
+  // whatever machine-level backend already runs (e.g. `hermes serve` on another
+  // port), so nothing ever listens on N and the supervisor waits out its whole
+  // verification window. A Dashboard already answering on N is adopted before any
+  // spawn, so a spawned one is always meant to be ours. Hermes 0.16 and older have
+  // no unified server and reject the flag, so it is passed only when `--help` does
+  // not prove it absent. Windows keeps the plain launch on the preferred port: its
+  // ownership proof treats an isolated Dashboard as foreign.
+  let isolation;
+  const isolatedFlag = () => {
+    if (!isolation) {
+      const help = spawnSync(options.hermes, ['dashboard', '--help'], { encoding: 'utf8', env: environment, windowsHide: true, timeout: 30_000 });
+      isolation = help.status === 0 && !`${help.stdout}${help.stderr}`.includes('--isolated') ? [] : ['--isolated'];
+    }
+    return isolation;
+  };
   const start = async (port, isolated = false) => {
     const profile = options.windowsDashboardProfile ? ['-p', 'default'] : [];
-    const child = spawn(options.hermes, ['dashboard', ...profile, '--host', '127.0.0.1', '--port', String(port), '--no-open', '--skip-build', ...(isolated ? ['--isolated'] : [])], {
+    const child = spawn(options.hermes, ['dashboard', ...profile, '--host', '127.0.0.1', '--port', String(port), '--no-open', '--skip-build', ...(isolated ? isolatedFlag() : [])], {
       detached: true, windowsHide: true, stdio: 'ignore', env: environment,
     });
     await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
@@ -166,7 +178,7 @@ async function startDashboardIfNeeded(options) {
   }
   let child;
   if (existing !== 401 && existing !== 403) {
-    child = await start(preferred);
+    child = await start(preferred, !options.windowsDashboardProfile);
     try {
       await verify(preferred);
       reconcileDashboardPortState(options, preferred);
