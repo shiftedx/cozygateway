@@ -70,6 +70,34 @@ def scoped_home() -> Optional[str]:
     return get_hermes_home_override()
 
 
+def serves_routed_profile() -> bool:
+    """Hermes' own answer to "does this call run for a profile other than the process's own?"
+    (always on a multiplexer). A scope bound for the process's own home, as cron binds one on a
+    standalone gateway, is not routed."""
+    try:
+        from agent.secret_scope import serves_routed_profile as routed  # harness-defined identifier
+    except Exception:  # noqa: BLE001 - no harness: nothing is routed
+        return False
+    return routed()
+
+
+def owning_home() -> Optional[str]:
+    """The owning profile's home as Hermes bound it: the home override, else the home the bound
+    secret scope was built for, else (unscoped on a multiplexer) the launch profile's own home."""
+    home = scoped_home()
+    if home:
+        return home
+    try:
+        from agent.secret_scope import current_secret_scope_home  # harness-defined identifier
+        from hermes_constants import get_process_hermes_home  # harness-defined identifier
+    except Exception:  # noqa: BLE001 - no harness
+        return None
+    bound = current_secret_scope_home()
+    if bound:
+        return bound
+    return str(get_process_hermes_home()) if multiplex_active() else None
+
+
 def profile_home() -> str:
     """The owning profile's home: the bound override, else ``$HERMES_HOME`` ("" when unset)."""
     return (scoped_home() or os.getenv("HERMES_HOME") or "").strip()

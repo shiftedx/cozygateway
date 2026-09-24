@@ -227,6 +227,28 @@ class StandaloneProfileEnvTests(unittest.TestCase):
         self.assertEqual(adapter._spool_path, "/tmp/standalone-spool.sqlite")
         self.assertEqual(adapter._profile, "cleo")
 
+    @unittest.skipIf(hermes_secret_scope is None, "needs Hermes importable (run with Hermes' venv python)")
+    def test_a_cron_scope_on_a_standalone_gateway_keeps_the_standalone_token_refresh(self):
+        # Hermes cron binds the firing profile's secret scope even on a standalone gateway
+        # (cron/scheduler.py), stamped with the process's own home and no home override. That is
+        # not a routed profile, so the adapter keeps rereading $HERMES_HOME/.env for a rotated token.
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "profiles" / "cleo"
+            home.mkdir(parents=True)
+            (home / ".env").write_text("COZYGATEWAY_URL=http://standalone.invalid:5\nCOZYGATEWAY_TOKEN=v1\n")
+            with patch.dict(os.environ, {"HERMES_HOME": str(home), "COZYGATEWAY_URL": "", "COZYGATEWAY_TOKEN": ""}):
+                mapping = hermes_secret_scope.load_env_file(home / ".env")
+                token = hermes_secret_scope.set_secret_scope(mapping, profile_home=str(home))
+                try:
+                    adapter = AttachAdapter()
+                    adapter._attach_init(types.SimpleNamespace(extra={}))
+                    provider = adapter._attach_token_provider()
+                finally:
+                    hermes_secret_scope.reset_secret_scope(token)
+                self.assertEqual(adapter.token, "v1")
+                (home / ".env").write_text("COZYGATEWAY_URL=http://standalone.invalid:5\nCOZYGATEWAY_TOKEN=v2\n")
+                self.assertEqual(provider(), "v2")
+
     def test_unscoped_default_spool_is_unchanged(self):
         with patch.dict(os.environ, {"COZYGATEWAY_SPOOL_PATH": ""}):
             path = adapter_module._proactive_spool_path(types.SimpleNamespace(extra={}), None)

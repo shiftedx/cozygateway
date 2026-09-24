@@ -81,7 +81,7 @@ from .text_blocks import (
 )
 from .tool_chips import ToolChipTracker
 from .memory import MemoryConflict, MemoryError, MemoryManager
-from .profile_env import profile_env, profile_name_for_home, scope_bound, scoped_home
+from .profile_env import owning_home, profile_env, profile_name_for_home, serves_routed_profile
 
 logger = logging.getLogger(__name__)
 
@@ -167,9 +167,10 @@ def _env_int(name: str, default: int) -> int:
 class _Owner:
     """The Hermes profile an attach belongs to, captured while Hermes had it bound.
 
-    ``scoped`` is True on a multiplexed gateway serving a secondary profile: Hermes bound that
-    profile's secret scope (and ``home``) around this adapter's creation, connect or a cron send.
-    False is a standalone gateway, or a multiplexer's launch profile, whose process env IS its own.
+    ``scoped`` is Hermes' own routing answer (``serves_routed_profile``): True on any multiplexed
+    gateway, where ``home`` is the profile Hermes bound around this adapter's creation, connect or a
+    cron send (the launch profile's own home when it bound none). False on a standalone gateway, even
+    while cron binds that profile's own scope: there the process env IS the profile's.
     """
 
     scoped: bool = False
@@ -177,7 +178,7 @@ class _Owner:
 
 
 def _current_owner() -> _Owner:
-    return _Owner(scope_bound(), scoped_home())
+    return _Owner(True, owning_home()) if serves_routed_profile() else _Owner()
 
 
 @dataclass(frozen=True)
