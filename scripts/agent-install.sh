@@ -971,13 +971,13 @@ served_by_host() {
   python="$(streaming_python)" || return 0
   [ "$(hermes_config_bool "$python" "$(profile_home "$profile")/config.yaml" gateway.standalone)" != true ]
 }
-# The profile whose gateway actually carries this profile's attachment.
-lifecycle_profile() { if served_by_host "$1"; then printf '%s' "$HOST_PROFILE"; else printf '%s' "$1"; fi; }
 # Named served profiles this run gave their FIRST attach settings (a phone-created bot). Nothing in
 # the running host holds them yet, so the host is not stopped around their .env write; it picks them
 # up hot through Hermes' own control verbs instead (hot_add_to_host).
 HOT_ADD_PROFILES=()
 REHOMED_PROFILES=()
+# Served profiles whose spools the running host still held during uninstall; released together.
+HOST_HELD_SPOOLS=()
 hot_add_candidate() {
   local profile
   for profile in "${HOT_ADD_PROFILES[@]:-}"; do [ "$profile" = "$1" ] && return 0; done
@@ -3646,8 +3646,14 @@ uninstall() {
       [ "$SERVICE_PLATFORM" = Windows ] && [ "$hermes_available" = 1 ] || die "could not remove the CozyGateway spool for profile $p"
       case "$action" in
         preexisting)
+          # One multiplexed host holds every served profile's spool: restart it once, after every
+          # served profile's plugin is disabled, instead of once per profile.
+          if served_by_host "$p"; then
+            HOST_HELD_SPOOLS+=("$p")
+            continue
+          fi
           say "INFO  restarting the pre-existing Hermes gateway for profile $p to release the disabled CozyGateway spool"
-          "$HERMES_RESOLVED" -p "$(lifecycle_profile "$p")" gateway restart >/dev/null || die "could not restart the pre-existing Hermes gateway for profile $p during cleanup"
+          "$HERMES_RESOLVED" -p "$p" gateway restart >/dev/null || die "could not restart the pre-existing Hermes gateway for profile $p during cleanup"
           rm -f "$spool" "$spool-wal" "$spool-shm" || die "Hermes restarted, but the CozyGateway spool for profile $p is still in use"
           ;;
         installed|started)
@@ -3664,6 +3670,15 @@ uninstall() {
       rmdir "$home/plugin-data/cozygateway" 2>/dev/null || true
     fi
   done
+  if [ "${#HOST_HELD_SPOOLS[@]}" -gt 0 ]; then
+    say "INFO  restarting the host Hermes gateway once to release the disabled CozyGateway spools of ${HOST_HELD_SPOOLS[*]}"
+    "$HERMES_RESOLVED" -p "$HOST_PROFILE" gateway restart >/dev/null || die "could not restart the host Hermes gateway during cleanup"
+    for p in "${HOST_HELD_SPOOLS[@]}"; do
+      spool="$(profile_home "$p")/plugin-data/cozygateway/attach-v1.sqlite"
+      rm -f "$spool" "$spool-wal" "$spool-shm" || die "the host Hermes gateway restarted, but the CozyGateway spool for profile $p is still in use"
+      rmdir "$(profile_home "$p")/plugin-data/cozygateway" 2>/dev/null || true
+    done
+  fi
   remove_gateway_home; say "OK    removed only CozyGateway-owned state; Hermes profiles and Hermes services remain"
 }
 status_install() {

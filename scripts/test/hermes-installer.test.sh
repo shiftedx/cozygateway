@@ -248,6 +248,12 @@ if [ "$1" = "-p" ] && [ "$3" = "gateway" ]; then
       [ "$(state)" = running ] || exit 2
       log restart
       set_state running
+      # The restarted host no longer loads a plugin disabled before the restart; any other it reloads.
+      if [ -n "${COZYGATEWAY_TEST_HOST_SPOOL_LOCK:-}" ] && [ "$profile" = default ]; then
+        for disabled in "$COZYGATEWAY_TEST_HOST_SPOOL_LOCK".disabled-*; do
+          [ -f "$disabled" ] && : > "$COZYGATEWAY_TEST_HOST_SPOOL_LOCK.released-${disabled##*.disabled-}"
+        done
+      fi
       if [ -n "${COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER:-}" ] && [ "$profile" = "${COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE:-}" ]; then
         : > "$COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER.unlocked"
       fi
@@ -292,6 +298,7 @@ if [ "$1" = "-p" ] && [ "$3" = "plugins" ] && [ "$4" = "enable" ]; then
   exit 0
 fi
 if [ "$1" = "-p" ] && [ "$3" = "plugins" ] && [ "$4" = "disable" ]; then
+  [ -z "${COZYGATEWAY_TEST_HOST_SPOOL_LOCK:-}" ] || : > "$COZYGATEWAY_TEST_HOST_SPOOL_LOCK.disabled-$2"
   if [ -n "${COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER:-}" ] && [ "$profile" = "${COZYGATEWAY_TEST_LOCKED_SPOOL_PROFILE:-}" ]; then
     : > "$COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER"
   fi
@@ -1805,6 +1812,14 @@ cat > "$tmp/locked-spool-bin/rm" <<'LOCKED_RM'
 if [[ "$*" == *attach-v1.sqlite* ]] && [ -n "${COZYGATEWAY_TEST_LOCKED_SPOOL_RM_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$COZYGATEWAY_TEST_LOCKED_SPOOL_RM_LOG"
 fi
+# A multiplexed host holds every served profile's spool while it loads that profile's plugin.
+if [[ "$*" == *attach-v1.sqlite* ]] && [ -n "${COZYGATEWAY_TEST_HOST_SPOOL_LOCK:-}" ]; then
+  held="${!#}"; held="${held##*/profiles/}"; held="${held%%/*}"
+  if [ ! -f "$COZYGATEWAY_TEST_HOST_SPOOL_LOCK.released-$held" ]; then
+    printf 'Device or resource busy\n' >&2
+    exit 1
+  fi
+fi
 if [[ "$*" == *attach-v1.sqlite* ]] && [ -f "${COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER:?}" ] && { [ "${COZYGATEWAY_TEST_LOCKED_SPOOL_PERSISTS:-}" = 1 ] || [ ! -f "$COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER.unlocked" ]; }; then
   printf 'Device or resource busy\n' >&2
   exit 1
@@ -2055,6 +2070,35 @@ test "$(cat "$tmp/hermes/profiles/unrelated/plugin-data/unrelated/sentinel")" = 
 ! grep -q '^unrelated:' "$tmp/windows-locked-commands"
 test ! -e "$tmp/gateway-windows-locked"
 test ! -e "$tmp/hermes/profiles/locked-windows/plugin-data/cozygateway/attach-v1.sqlite"
+
+
+# On a multiplexed host ONE process holds every served profile's spool, so a Windows uninstall that
+# finds them in use restarts that host once, after the loop, and not once per profile.
+mux_windows="$tmp/hermes-mux-windows"
+mkdir -p "$tmp/gateway-mux-windows/local" "$mux_windows"
+printf 'gateway:\n  multiplex_profiles: true\n' > "$mux_windows/config.yaml"
+mkdir -p "$mux_windows/hermes-agent/venv/bin"
+cp "$tmp/hermes/hermes-agent/venv/bin/python" "$mux_windows/hermes-agent/venv/bin/python"
+for name in alpha beta; do
+  mkdir -p "$mux_windows/profiles/$name/plugins/cozygateway" "$mux_windows/profiles/$name/plugin-data/cozygateway"
+  printf 'plugins:\n  enabled:\n    - cozygateway\n' > "$mux_windows/profiles/$name/config.yaml"
+  : > "$mux_windows/profiles/$name/plugins/cozygateway/.cozygateway-installer-owned"
+  : > "$mux_windows/profiles/$name/plugin-data/cozygateway/attach-v1.sqlite"
+done
+printf 'running\n' > "$mux_windows/gateway-default.state"
+cat > "$tmp/gateway-mux-windows/local/install-state" <<MUX_WINDOWS_STATE
+profiles=alpha,beta
+hermes_root=$mux_windows
+hermes_bin=$tmp/bin/hermes
+service_alpha=preexisting
+service_beta=preexisting
+MUX_WINDOWS_STATE
+HOME="$tmp/mux-windows-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/locked-spool-bin:$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HOST_SPOOL_LOCK="$tmp/mux-windows-spools" COZYGATEWAY_TEST_LOCKED_SPOOL_MARKER="$tmp/mux-windows-unused-marker" COZYGATEWAY_TEST_HERMES_ROOT="$mux_windows" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/mux-windows-commands" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/mux-windows-native-commands" COZYGATEWAY_GIT_BASH="$(command -v bash)" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --uninstall --gateway-dir "$tmp/gateway-mux-windows" >/dev/null
+test "$(grep -c ':gateway:' "$tmp/mux-windows-commands")" = 1
+grep -q '^default:gateway:restart$' "$tmp/mux-windows-commands"
+test ! -e "$mux_windows/profiles/alpha/plugin-data/cozygateway/attach-v1.sqlite"
+test ! -e "$mux_windows/profiles/beta/plugin-data/cozygateway/attach-v1.sqlite"
+test ! -e "$mux_windows/profiles/beta/plugin-data/cozygateway"
 
 # Hermes can report a successful service uninstall while its directly spawned
 # gateway remains alive and keeps the SQLite spool locked. Recover only for the
