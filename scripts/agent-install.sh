@@ -964,6 +964,55 @@ served_by_host() {
 }
 # The profile whose gateway actually carries this profile's attachment.
 lifecycle_profile() { if served_by_host "$1"; then printf '%s' "$HOST_PROFILE"; else printf '%s' "$1"; fi; }
+# Named served profiles this run gave their FIRST attach settings (a phone-created bot). Nothing in
+# the running host holds them yet, so the host is not stopped around their .env write; it picks them
+# up hot through Hermes' own control verbs instead (hot_add_to_host).
+HOT_ADD_PROFILES=()
+hot_add_candidate() {
+  local profile
+  for profile in "${HOT_ADD_PROFILES[@]:-}"; do [ "$profile" = "$1" ] && return 0; done
+  return 1
+}
+# One Hermes control verb on the running host's socket (gateway/control_socket.py):
+# `reload-plugins <profile>` or `rescan-profiles`. Fails when nothing answered.
+host_control() {
+  local python="$HERMES_ROOT/hermes-agent/venv/bin/python"
+  [ -x "$python" ] || return 1
+  HERMES_HOME="$HERMES_ROOT" "$python" - --hermes-control "$HERMES_ROOT" "$@" <<'PY' >/dev/null 2>&1
+import sys
+from pathlib import Path
+
+root, verb = Path(sys.argv[2]), sys.argv[3]
+try:
+    from gateway import control_socket
+except Exception:
+    sys.exit(3)
+if verb == "reload-plugins":
+    answer = control_socket.reload_gateway_plugins(root, profile_home=root / "profiles" / sys.argv[4])
+    sys.exit(0 if isinstance(answer, dict) and answer.get("reloaded") else 1)
+if verb == "rescan-profiles":
+    answer = control_socket.rescan_gateway_profiles(root)
+    sys.exit(0 if isinstance(answer, dict) and answer.get("multiplex") is not False
+             and "served_profiles" in answer and not answer.get("pending") else 1)
+sys.exit(2)
+PY
+}
+# The host's 30-second reconcile rediscovers plugins only on a forced pass, and rebuilds a profile's
+# adapters only when its config.yaml or .env changed after it last looked. So: reload the profile's
+# plugins, change its .env once more, and ask for the rescan now. Prints the profiles it could not
+# hot-add, one per line; the caller restarts the host once for those.
+hot_add_to_host() {
+  local profile failed=()
+  for profile in "$@"; do
+    if host_control reload-plugins "$profile"; then
+      touch "$(profile_home "$profile")/.env"
+    else
+      failed+=("$profile")
+    fi
+  done
+  if [ "${#failed[@]}" -lt "$#" ] && ! host_control rescan-profiles; then failed=("$@"); fi
+  [ "${#failed[@]}" = 0 ] || printf '%s\n' "${failed[@]}"
+}
 
 # Profiles whose Hermes gateway must be restarted before the change takes: a
 # loaded service reads neither new plugin code nor a rewritten config.yaml.
@@ -1589,7 +1638,10 @@ write_gateway_env() {
     # the copied one belongs to the default profile. The spool path is the marker only this
     # installer writes, and it names the profile it was written for.
     token="$(env_get "$profile_env" COZYGATEWAY_TOKEN)"
-    if ! safe_secret "$token" || [ "$(env_get "$profile_env" COZYGATEWAY_SPOOL_PATH)" != "$spool_path" ]; then token="$(new_token)"; fi
+    if ! safe_secret "$token" || [ "$(env_get "$profile_env" COZYGATEWAY_SPOOL_PATH)" != "$spool_path" ]; then
+      token="$(new_token)"
+      [ "$p" = "$HOST_PROFILE" ] || ! served_by_host "$p" || HOT_ADD_PROFILES+=("$p")
+    fi
     for seen_token in "${TOKENS[@]:-}"; do [ "$token" != "$seen_token" ] || die "Hermes profiles must have distinct CozyGateway attach tokens"; done
     for seen_name in "${TOKEN_ENVS[@]:-}"; do [ "$env_name" != "$seen_name" ] || die "profile names produce the same token environment variable: $env_name"; done
     TOKENS+=("$token"); TOKEN_ENVS+=("$env_name")
@@ -1597,7 +1649,7 @@ write_gateway_env() {
     # in memory, so an edit made while it runs is undone seconds later. Stop it
     # first, write, read the file back, and start it again below. A profile whose
     # keys are already exactly right needs no edit and therefore no interruption.
-    if profile_env_needs_rewrite "$profile_env" "$token" "$spool_path"; then
+    if profile_env_needs_rewrite "$profile_env" "$token" "$spool_path" && ! hot_add_candidate "$p"; then
       stop_profile_gateway_for_env "$p"
     fi
     claim_profile_env "$profile_env"
@@ -1714,7 +1766,9 @@ ensure_hermes_gateways() {
     observed="$(profile_attach_log_origin "$(profile_home "$profile")" || true)"
     if served_by_host "$profile"; then
       host_served=1
-      if profile_changed_for "$profile"; then
+      if hot_add_candidate "$profile"; then
+        :
+      elif profile_changed_for "$profile"; then
         host_changed="$host_changed, $profile"
       elif [ -n "$observed" ] && [ "$(origin_authority "$observed")" != "$(origin_authority "$(gateway_origin)")" ]; then
         host_changed="$host_changed, $profile"
@@ -1757,8 +1811,26 @@ ensure_hermes_gateways() {
 # served profile is `hermes -p default gateway restart`. A restart reloads the attach
 # plugin and rereads every served profile's config and .env.
 ensure_host_gateway() {
-  local changed="$1"
-  case "$(gateway_state "$HOST_PROFILE")" in
+  local changed="$1" state profile hot=() failed
+  state="$(gateway_state "$HOST_PROFILE")"
+  for profile in "${HOT_ADD_PROFILES[@]:-}"; do [ -n "$profile" ] && hot+=("$profile"); done
+  # A stopped or absent host starts with every profile's current plugin and .env anyway.
+  if [ "$state" = running ] && [ "${#hot[@]}" -gt 0 ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+      say "DRY   ask the host Hermes gateway to reload plugins for ${hot[*]} and rescan its profiles"
+    else
+      failed="$(hot_add_to_host "${hot[@]}")"
+      for profile in "${hot[@]}"; do
+        case $'\n'"$failed"$'\n' in *$'\n'"$profile"$'\n'*) changed="${changed:+$changed, }$profile" ;; esac
+      done
+      if [ -z "$failed" ]; then
+        say "OK    the host Hermes gateway picked up profiles ${hot[*]} without a restart"
+      else
+        say "INFO  the host Hermes gateway did not answer its control verbs; restarting it once instead"
+      fi
+    fi
+  fi
+  case "$state" in
     running)
       if [ -n "$changed" ]; then
         run "$HERMES_BIN" -p "$HOST_PROFILE" gateway restart
