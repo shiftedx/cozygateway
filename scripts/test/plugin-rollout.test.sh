@@ -1086,6 +1086,26 @@ SH
   assert_contains "$output" 'host Hermes gateway NOT restarted'
 }
 
+
+# A profile name reaches paths, launchd labels, env keys and the box config: the provisioner accepts
+# exactly the names the watcher and the deprovisioner do, before it touches anything.
+test_provisioner_refuses_an_unsafe_profile_name() {
+  local hermes="$TMP/unsafe-hermes" bin="$TMP/unsafe-bin" output="$TMP/unsafe.out" name
+  make_fake_bin "$bin"
+  make_profile "$hermes" alpha
+  make_fake_python "$hermes" ''
+  for name in '../alpha' 'Alpha' '-alpha' 'al pha' "alpha'x"; do
+    if HOME="$TMP/unsafe-home" PATH="$bin:/usr/bin:/bin" COZY_TEST_HERMES_HOME="$hermes" \
+      COZY_TEST_LAUNCHCTL_LOG="$TMP/unsafe-launchctl" COZY_TEST_SSH_LOG="$TMP/unsafe-ssh" \
+      "$ROOT/scripts/provision-bot.sh" --no-verify --hermes-home "$hermes" --box fake -- "$name" > "$output" 2>&1; then
+      fail "provisioner accepted the unsafe profile name: $name"
+    fi
+    assert_contains "$output" 'invalid profile name'
+  done
+  [ ! -e "$TMP/unsafe-ssh" ] || fail 'the provisioner reached the box for an unsafe name'
+  [ ! -e "$hermes/profiles/alpha/plugins" ] || fail 'the provisioner touched a profile for an unsafe name'
+}
+
 test_watcher_repairs_content_drift
 test_streaming_reader_answers_without_pyyaml
 test_watcher_picks_up_a_wired_profile_that_cannot_stream
@@ -1111,4 +1131,5 @@ test_provisioner_keeps_a_standalone_profile_on_its_own_service
 test_watcher_does_not_demand_a_launchd_job_for_a_served_profile
 test_deploy_restarts_a_multiplexed_host_once
 test_deploy_leaves_the_host_alone_when_a_served_profile_is_busy
+test_provisioner_refuses_an_unsafe_profile_name
 printf 'plugin rollout: ok\n'

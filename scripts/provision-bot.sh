@@ -106,6 +106,11 @@ done
 for arg in "$@"; do PROFILES+=("$arg"); done
 
 [ "${#PROFILES[@]}" -gt 0 ] || { usage >&2; die "no profile named"; }
+# The same names the watcher and the deprovisioner accept: a profile name becomes a path, a launchd
+# label, an env key and a box config entry, so anything else is refused before any of those.
+for profile in "${PROFILES[@]}"; do
+  [[ "$profile" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || die "invalid profile name: $profile"
+done
 have python3 || die "python3 not found on PATH"
 have openssl || die "openssl not found on PATH"
 have rsync || die "rsync not found on PATH"
