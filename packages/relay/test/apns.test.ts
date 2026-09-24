@@ -1,9 +1,9 @@
 import { RelayNotifier } from "../../gateway/src/push-notifier.ts";
 import { openStorage } from "../../gateway/src/storage.ts";
 import { roomApprovalPush } from "../../gateway/src/push-crypto.ts";
-import { createServer, type ClientHttp2Session, type Http2Server } from "node:http2";
+import { createServer, type ClientHttp2Session, type Http2Server, type ServerHttp2Stream } from "node:http2";
 import { EventEmitter, once } from "node:events";
-import { generateKeyPairSync, verify as cryptoVerify } from "node:crypto";
+import { generateKeyPairSync, verify as cryptoVerify, type KeyObject } from "node:crypto";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -18,7 +18,7 @@ import { createRelayApp } from "../src/http.ts";
 import { openRelayStorage, type RelayStorage } from "../src/storage.ts";
 import type { Transport } from "../src/transports.ts";
 
-function testConfig(): { config: ApnsConfig; publicKey: ReturnType<typeof generateKeyPairSync>["publicKey"] } {
+function testConfig(): { config: ApnsConfig; publicKey: KeyObject } {
   const { privateKey, publicKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
   return {
     publicKey,
@@ -47,7 +47,7 @@ async function fakeApns(
   handler: (headers: Record<string, unknown>, body: string, stream: import("node:http2").ServerHttp2Stream) => void,
 ): Promise<string> {
   server = createServer();
-  server.on("stream", (stream, headers) => {
+  server.on("stream", (stream: ServerHttp2Stream, headers) => {
     let body = "";
     stream.setEncoding("utf8");
     stream.on("data", (d) => (body += d));
