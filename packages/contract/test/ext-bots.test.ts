@@ -48,7 +48,9 @@ import {
   BotModelProviderFieldUpdateSchema,
   BotModelProviderOAuthSessionSchema,
   BotModelProviderSetupCatalogSchema,
+  BotMcpServerDeclarationSchema,
   BotMcpServerSchema,
+  mcpServerDeclarationProblem,
   BotNewSessionResponseSchema,
   BotProfileConfigureResponseSchema,
   BotProfilePatchSchema,
@@ -636,6 +638,128 @@ describe("profile", () => {
   });
 });
 
+describe("client-declared MCP servers (capability 89)", () => {
+  const home = {
+    name: "home",
+    transport: "http" as const,
+    url: "http://homeassistant.local:8123/api/mcp",
+    headers: { Authorization: "Bearer ${COZY_MCP_HOME_TOKEN}" },
+    description: "lights and climate",
+    tools: ["GetLiveContext", "HassTurnOn"],
+    actions: { HassTurnOn: ["light"] },
+  };
+
+  it("accepts a remote server declared by name, url, tool allowlist and env-named headers", () => {
+    expect(check(BotMcpServerDeclarationSchema, home)).toBe(true);
+    expect(check(BotMcpServerDeclarationSchema, { name: "docs", transport: "http", url: "https://mcp.example.com/mcp" })).toBe(true);
+    expect(check(BotProfilePatchSchema, { declareMcpServers: [home] })).toBe(true);
+    expect(check(BotProfilePatchSchema, { removeMcpServers: ["home"] })).toBe(true);
+    expect(mcpServerDeclarationProblem({ declareMcpServers: [home], removeMcpServers: ["old"] })).toBeUndefined();
+  });
+
+  // THE LINE THIS ROW DRAWS. A declaration a chat client sends is a URL the harness dials, never a
+  // program the host starts: the object is closed, `transport` is the one literal `http`, and every
+  // field a stdio server needs is simply not a field. No shape reaches host command execution.
+  it("refuses every stdio shape: no command, args, env, cwd, and no transport but http", () => {
+    for (const extra of [
+      { command: "npx" },
+      { args: ["-y", "comfyui-mcp"] },
+      { env: { COMFYUI_URL: "${COMFYUI_URL}" } },
+      { cwd: "/tmp" },
+    ]) {
+      expect(check(BotMcpServerDeclarationSchema, { ...home, ...extra }), JSON.stringify(extra)).toBe(false);
+    }
+    for (const transport of ["stdio", "sse", "HTTP", "", undefined]) {
+      expect(check(BotMcpServerDeclarationSchema, { ...home, transport }), String(transport)).toBe(false);
+    }
+    expect(check(BotMcpServerDeclarationSchema, { name: "x", transport: "stdio", command: "sh" })).toBe(false);
+  });
+
+  // Operator-only settings stay on the harness: a client cannot mark a tool read-only (which would
+  // lift its approval), set the repair policy capability 63 keeps read-only, or tune the budgets.
+  it("refuses the harness-owned fields: mutating, repair, groups, budgets", () => {
+    for (const extra of [
+      { mutating: [] },
+      { repair: "auto_refresh" },
+      { groups: { lights: ["HassTurnOn"] } },
+      { groupsRequired: true },
+      { budgetTokens: 1 },
+      { schemaTtlSeconds: 1 },
+    ]) {
+      expect(check(BotMcpServerDeclarationSchema, { ...home, ...extra }), JSON.stringify(extra)).toBe(false);
+    }
+  });
+
+  // No secret crosses the wire. A header value is one `${COZY_MCP_*}` variable name, optionally
+  // after an auth scheme word; the value lives in the operator's environment and nowhere else. The
+  // prefix is the operator's opt-in: a variable not exported under it (a model provider's key,
+  // say) is unreachable from a phone, so a declaration cannot point one at a URL it chose.
+  it("admits a header only as a COZY_MCP_ variable name, never a literal or another variable", () => {
+    for (const value of ["${COZY_MCP_HOME_TOKEN}", "Bearer ${COZY_MCP_A}", "Basic ${COZY_MCP_B_2}", "Token ${COZY_MCP_C}"]) {
+      expect(check(BotMcpServerDeclarationSchema, { ...home, headers: { Authorization: value } }), value).toBe(true);
+    }
+    for (const value of [
+      "Bearer sk-live-abc123",
+      "${ANTHROPIC_API_KEY}",
+      "Bearer ${HOME_ASSISTANT_TOKEN}",
+      "${COZY_MCP_A}${COZY_MCP_B}",
+      "x ${COZY_MCP_A}",
+      "Bearer  ${COZY_MCP_A}",
+      "${COZY_MCP_}",
+      "${cozy_mcp_a}",
+      "",
+    ]) {
+      expect(check(BotMcpServerDeclarationSchema, { ...home, headers: { Authorization: value } }), value).toBe(false);
+    }
+    expect(check(BotMcpServerDeclarationSchema, { ...home, headers: { "Bad Header": "${COZY_MCP_A}" } })).toBe(false);
+  });
+
+  it("bounds the name to a card name and the lists to a size a phone can mean", () => {
+    for (const name of ["Home", "home.lights", "-home", "", "a".repeat(65), " home"]) {
+      expect(check(BotMcpServerDeclarationSchema, { ...home, name }), name).toBe(false);
+    }
+    expect(check(BotMcpServerDeclarationSchema, { ...home, tools: [] })).toBe(false);
+    expect(check(BotMcpServerDeclarationSchema, { ...home, tools: ["a", "a"] })).toBe(false);
+    expect(check(BotMcpServerDeclarationSchema, { ...home, actions: { HassTurnOn: [] } })).toBe(false);
+    expect(check(BotProfilePatchSchema, { declareMcpServers: [] })).toBe(false);
+    expect(check(BotProfilePatchSchema, { declareMcpServers: Array.from({ length: 17 }, (_, i) => ({ ...home, name: `s${i}` })) })).toBe(false);
+    expect(check(BotProfilePatchSchema, { removeMcpServers: ["Home"] })).toBe(false);
+  });
+
+  // What a schema cannot say, the one exported check does, so the gateway route and any client
+  // refuse the same bodies for the same reasons.
+  it("names the cross-field problems the schema cannot express", () => {
+    const problem = (patch: Parameters<typeof mcpServerDeclarationProblem>[0]) => mcpServerDeclarationProblem(patch);
+    expect(problem({ declareMcpServers: [home, home] })).toContain("more than once");
+    expect(problem({ declareMcpServers: [home], removeMcpServers: ["home"] })).toContain("both");
+    expect(problem({ declareMcpServers: [{ ...home, actions: { Other: ["x"] } }] })).toContain("not in tools");
+    const { tools: _tools, ...untooled } = home;
+    expect(problem({ declareMcpServers: [untooled] })).toContain("tools");
+    expect(problem({ declareMcpServers: [{ ...home, headers: { authorization: "${COZY_MCP_A}", Authorization: "${COZY_MCP_B}" } }] })).toContain("more than once");
+    for (const url of [
+      "http://user:pw@example.com/mcp",
+      "https://example.com/mcp?token=abc",
+      "https://example.com/mcp#frag",
+      "https://${COZY_MCP_HOST}/mcp",
+      "ftp://example.com/mcp",
+      "http://",
+    ]) {
+      expect(problem({ declareMcpServers: [{ ...home, url }] }), url).toBeDefined();
+    }
+    expect(problem({ soul: "x" })).toBeUndefined();
+  });
+
+  // The read side marks the rows a client may edit: `declaration` is present exactly on a server a
+  // chat client declared, and it is the declaration back, which by construction carries no secret.
+  it("projects a client declaration read-only on its server row, and nothing on the others", () => {
+    const row = { name: "home", installed: true, enabled: false, declaration: home };
+    expect(check(BotMcpServerSchema, row)).toBe(true);
+    expect(check(BotMcpServerSchema, { name: "github", installed: true, enabled: true })).toBe(true);
+    expect(check(BotMcpServerSchema, { ...row, declaration: { ...home, command: "npx" } })).toBe(false);
+    expect(check(BotProfilePatchSchema, { enabledMcpServers: [row] })).toBe(false);
+  });
+});
+
 describe("routines", () => {
   const routine = {
     id: "job_7f2c19",
@@ -944,7 +1068,10 @@ describe("capability advertisement", () => {
     // Capability 66 adds the typed scoped-approval block, payload-hash binding, standing once and
     // category grants, the always-require list no grant may cover, and the revocation view.
     // Capability 88 adds gateway-owned team roles and the assignment turn context.
-    expect(BOTS_CAPABILITY_VERSION).toBe(88);
+    // Capability 89 lets a chat client declare remote (http) MCP servers per bot over the
+    // `bot_config` profile write, gated on the peer's `mcp_server_declarations` attach capability.
+    // No stdio shape exists, and a header names a `COZY_MCP_*` variable, never a value.
+    expect(BOTS_CAPABILITY_VERSION).toBe(89);
   });
 
   it("versions the agent inbox on its own id, never on the bots scalar", () => {

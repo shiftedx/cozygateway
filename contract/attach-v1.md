@@ -308,6 +308,20 @@ the reconnect still asks for approval, not that repair permission was granted. U
 are validated whole, so an unknown value makes the `config_result` frame invalid and the ingress
 refuses the frame and closes the socket: the two names are the entire vocabulary.
 
+Capability 89 (`com.cozylabs.bots >= 89`): `profile.write` MAY carry `declareMcpServers` and
+`removeMcpServers`, a chat client's REMOTE MCP server declarations (`BotMcpServerDeclaration`:
+`transport` is the literal `http`, and no stdio field exists). A peer receives either field only if
+it offered the separate capability `mcp_server_declarations` in `hello`, as `memory_ownership` sits
+beside `memory_management`; the gateway refuses such a write to any other peer before the frame is
+built. A harness offers it only when its operator turned client declarations on. A header value is
+one `${COZY_MCP_<NAME>}` placeholder the peer fills from the operator's environment when the server
+starts, never a value, and the peer never resolves a placeholder outside that prefix for a client
+declaration. The peer applies removals, then declarations, then `enabledMcpServers`; a declaration
+never changes enablement; a name the client did not declare is refused by name in `ignored`; every
+tool of a client-declared server is a possible effect. A `profile.read` row MAY carry `declaration`,
+read-only, exactly on a server a client declared. The Hermes attach plugin never offers the
+capability.
+
 `status` is `ok`, `not_found`, `invalid_request`, or `unavailable`, and the four are kept apart
 because they are four different things an operator has to do: nothing, fix the id, fix the input,
 or go and look at the peer. `ok` with a body that does not match the operation is refused rather

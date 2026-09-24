@@ -1431,6 +1431,57 @@ export const BotMcpRepairPolicySchema = Type.Union([
 ]);
 export type BotMcpRepairPolicy = Static<typeof BotMcpRepairPolicySchema>;
 
+/** Capability 89. A server name is a card name on the harness: lower case, no dot (a dot separates
+ *  a group), at most 64 characters. */
+const McpServerNameSchema = Type.String({ pattern: "^[a-z0-9][a-z0-9_-]{0,63}$" });
+/** Capability 89. An MCP tool or action name as servers publish them. */
+const McpToolNameSchema = Type.String({ pattern: "^[A-Za-z0-9_./:-]{1,128}$" });
+
+/** Capability 89. ONE REMOTE MCP SERVER A CHAT CLIENT DECLARES FOR ONE BOT, carried on the
+ *  `bot_config` `profile.write` as `BotProfilePatch.declareMcpServers`.
+ *
+ *  A declaration is a URL the harness DIALS, never a program the host STARTS. The object is closed
+ *  and `transport` is the single literal `http` (Streamable HTTP, which the harness falls back to
+ *  SSE on), so `command`, `args`, `env` and `cwd`, everything a stdio server needs, is simply not a
+ *  field: no body a client can send reaches host command execution. A stdio server stays the
+ *  operator's to declare in the bot's own environment, as capability 63's policy does.
+ *
+ *  NO SECRET CROSSES THE WIRE. A header value is exactly one `${COZY_MCP_<NAME>}` placeholder,
+ *  optionally after one auth scheme word (`Bearer`, `Basic`, `Token`); the harness fills it from
+ *  the operator's environment when the server starts and at no other time, so the phone, this
+ *  gateway and every projection only ever hold the variable's NAME. The `COZY_MCP_` prefix is the
+ *  operator's opt-in: a variable not exported under it (a model provider's key, say) cannot be
+ *  named at all, so a declaration cannot point one of those at a URL of its choosing. The URL
+ *  itself carries no placeholder, no userinfo, no query and no fragment (`mcpServerDeclarationProblem`),
+ *  which keeps a credential from riding in the address.
+ *
+ *  Harness-owned settings are absent for the same reason: `mutating` (a client listing none would
+ *  lift every approval), capability 63's `repair`, `groups` and the budgets are the operator's. The
+ *  harness treats EVERY tool of a client-declared server as a possible effect, so each call asks
+ *  under the bot's guardrails, and applies its own `approve_once` repair default.
+ *
+ *  `tools` is the allowlist of tools the harness exposes (absent: every tool the server publishes,
+ *  each still asking); `actions` narrows a tool whose calls take an `action` argument, and needs
+ *  `tools` so every key it names is one the allowlist admits. */
+export const BotMcpServerDeclarationSchema = Type.Object({
+  name: McpServerNameSchema,
+  transport: Type.Literal("http"),
+  url: Type.String({ maxLength: 2048, pattern: "^https?://\\S+$" }),
+  headers: Type.Optional(Type.Record(
+    Type.String({ pattern: "^[A-Za-z0-9-]{1,64}$" }),
+    Type.String({ pattern: "^(?:(?:Bearer|Basic|Token) )?\\$\\{COZY_MCP_[A-Z0-9_]{1,64}\\}$" }),
+    { maxProperties: 8, additionalProperties: false },
+  )),
+  description: Type.Optional(Type.String({ maxLength: 200, pattern: "^[^\\u0000-\\u001f\\u007f-\\u009f]*\\S[^\\u0000-\\u001f\\u007f-\\u009f]*$" })),
+  tools: Type.Optional(Type.Array(McpToolNameSchema, { minItems: 1, maxItems: 128, uniqueItems: true })),
+  actions: Type.Optional(Type.Record(
+    McpToolNameSchema,
+    Type.Array(McpToolNameSchema, { minItems: 1, maxItems: 64, uniqueItems: true }),
+    { maxProperties: 128, additionalProperties: false },
+  )),
+}, { additionalProperties: false });
+export type BotMcpServerDeclaration = Static<typeof BotMcpServerDeclarationSchema>;
+
 /** One MCP server as the edit screen sees it: the union of the servers the profile DEFINES and the
  *  bundled catalog's menu. `installed` is true for a server the profile defines, and the catalog's
  *  own flag otherwise; `fromCatalog` marks a row the profile does not define yet, which is offered
@@ -1439,9 +1490,9 @@ export type BotMcpRepairPolicy = Static<typeof BotMcpRepairPolicySchema>;
  *
  *  `repair` (capability 63) is OPTIONAL and READ-ONLY METADATA: it is the harness's own per-server
  *  repair setting, projected onto this row so a client can say what a reconnect will cost before it
- *  costs it. It never appears on `BotProfilePatchSchema`, and the only write surface that names MCP
- *  servers, `enabledMcpServers`, is a list of NAMES, so there is no shape a client could send a
- *  policy in. Changing the setting is done on the harness. This gateway neither stores, computes,
+ *  costs it. It never appears on `BotProfilePatchSchema`: `enabledMcpServers` is a list of NAMES,
+ *  and capability 89's closed `BotMcpServerDeclaration` has no `repair` field, so there is no shape
+ *  a client could send a policy in. Changing the setting is done on the harness. This gateway neither stores, computes,
  *  writes, nor executes anything from it: it validates the closed union and relays what the peer
  *  answered on the capability-48 `bot_config` `profile.read`.
  *
@@ -1459,6 +1510,11 @@ export const BotMcpServerSchema = Type.Object({
   requires: Type.Optional(Type.Array(Type.String())),
   fromCatalog: Type.Optional(Type.Boolean()),
   repair: Type.Optional(BotMcpRepairPolicySchema),
+  /** Capability 89. READ-ONLY: present exactly on a server a chat client declared through
+   *  `declareMcpServers`, and it is that declaration back, which by construction holds no secret.
+   *  Its presence is what tells an edit screen the row is the client's to edit or remove; a row
+   *  without it (operator-declared, built-in, a catalog template) is not. */
+  declaration: Type.Optional(BotMcpServerDeclarationSchema),
 });
 export type BotMcpServer = Static<typeof BotMcpServerSchema>;
 
@@ -1806,8 +1862,59 @@ export const BotProfilePatchSchema = Type.Object({
   /** Capability 88. Replace semantics. Refused with `invalid_request` on a member, for the bot
    *  itself, and for a name that is not a bot on this gateway. */
   reports: Type.Optional(Type.Array(NameItem, { maxItems: 16 })),
+  /** Capability 89. Upserts, whole, the named remote servers (`BotMcpServerDeclaration`). */
+  declareMcpServers: Type.Optional(Type.Array(BotMcpServerDeclarationSchema, { minItems: 1, maxItems: 16 })),
+  /** Capability 89. Removes servers this lane declared, by name. */
+  removeMcpServers: Type.Optional(Type.Array(McpServerNameSchema, { minItems: 1, maxItems: 64, uniqueItems: true })),
 });
 export type BotProfilePatch = Static<typeof BotProfilePatchSchema>;
+
+/** Capability 89. What `BotProfilePatchSchema` cannot say about `declareMcpServers` and
+ *  `removeMcpServers`, as one sentence, or `undefined` when the patch is fine. The gateway answers
+ *  `400 invalid_request` with it after the schema passes; a client may run the same check first.
+ *
+ *  A name declared twice, or both declared and removed, is ambiguous about which one wins, and the
+ *  answer must not depend on a peer's iteration order. A header named twice under different cases
+ *  is the same header on the wire. `actions` needs `tools`, and names only tools in it. The URL
+ *  must parse as http or https and carry no userinfo, query, fragment or `${...}` placeholder: a
+ *  credential belongs in a `COZY_MCP_` header, never in an address a projection shows. */
+export function mcpServerDeclarationProblem(patch: BotProfilePatch): string | undefined {
+  const declared = patch.declareMcpServers ?? [];
+  const names = new Set<string>();
+  for (const server of declared) {
+    if (names.has(server.name)) return `declareMcpServers names ${server.name} more than once`;
+    names.add(server.name);
+    if (patch.removeMcpServers?.includes(server.name) === true) {
+      return `${server.name} is in both declareMcpServers and removeMcpServers`;
+    }
+    const where = `declareMcpServers ${server.name}`;
+    if (server.url.includes("${")) return `${where} url must not carry a placeholder; put credentials in headers`;
+    let url: URL;
+    try {
+      url = new URL(server.url);
+    } catch {
+      return `${where} url must be an http or https url`;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return `${where} url must be an http or https url`;
+    if (url.username !== "" || url.password !== "") return `${where} url must not carry credentials; put them in headers`;
+    if (url.search !== "" || url.hash !== "" || server.url.includes("?") || server.url.includes("#")) {
+      return `${where} url must not carry a query or fragment; put credentials in headers`;
+    }
+    const headers = new Set<string>();
+    for (const header of Object.keys(server.headers ?? {})) {
+      const lower = header.toLowerCase();
+      if (headers.has(lower)) return `${where} names header ${header} more than once`;
+      headers.add(lower);
+    }
+    if (server.actions !== undefined) {
+      if (server.tools === undefined) return `${where} actions needs tools`;
+      for (const tool of Object.keys(server.actions)) {
+        if (!server.tools.includes(tool)) return `${where} actions names ${tool}, which is not in tools`;
+      }
+    }
+  }
+  return undefined;
+}
 
 /** The gateway's per-section `applied` map, echoed VERBATIM: its keys (`soul`, `skills`,
  *  `toolsets`, `mcp_servers`, and any section a future gateway adds) and its booleans. Deliberately
@@ -3645,7 +3752,36 @@ export type BotScreenRequestCancelFrame = Static<typeof BotScreenRequestCancelFr
  * criteria and deadline, and `room` becomes optional because an assignment turn has none; `text`
  * is byte-identical with and without `context`, exactly as 47 promised. The assignment surface
  * itself is advertised on `com.cozylabs.agent-inbox` 1, never inferred from this scalar. Additive. */
-export const BOTS_CAPABILITY_VERSION = 88;
+/** Capability 89: A CHAT CLIENT DECLARES A BOT'S REMOTE MCP SERVERS. `BotProfilePatch` gains
+ * `declareMcpServers` (whole upserts of `BotMcpServerDeclaration`) and `removeMcpServers` (names),
+ * carried on the existing capability-48 `bot_config` `profile.write`; `BotMcpServer` gains the
+ * read-only `declaration` on the rows a client declared. No new route and no new operation.
+ *
+ * REMOTE ONLY. `transport` is the literal `http` and the declaration is closed, so no body reaches
+ * host command execution; a stdio server stays the operator's to declare in the bot's environment.
+ * A header value is one `${COZY_MCP_<NAME>}` variable name the harness fills from the operator's
+ * environment at start, so no secret crosses the wire and only variables the operator exported
+ * under that prefix are nameable. The URL carries no userinfo, query, fragment or placeholder.
+ * Cross-field rules live in `mcpServerDeclarationProblem`; the route answers `400` on either.
+ *
+ * GATED THREE WAYS. The route is the write-scoped paired device's (capability 72 refuses a
+ * read-scoped one `403`). The gateway forwards either field only to a peer that offered the
+ * attach-v1 capability `mcp_server_declarations`, which a harness offers only when its operator
+ * turned client declarations on; any other runtime peer answers `409 unsupported_for_runtime` and
+ * nothing is sent. A Hermes bot answers the same `409` and nothing is written: its
+ * `profiles.configure` would take a stdio definition, which this row never grants.
+ *
+ * The peer owns the semantics: removals, then declarations, then `enabledMcpServers`, so one save
+ * can declare and switch on. A declaration never changes enablement (a new server lands OFF), a
+ * name the client did not declare (operator, built-in, template) is refused by name in `ignored`,
+ * every tool of a client-declared server is a possible effect that asks, and its repair policy is
+ * the harness default `approve_once`. `applied` answers `mcp_servers_declared` and
+ * `mcp_servers_removed`.
+ *
+ * Additive: a client below 89 sends neither field and reads no `declaration`, and a peer receives
+ * either field only after negotiating `mcp_server_declarations`. A client offers the editor only on
+ * `>= 89`. */
+export const BOTS_CAPABILITY_VERSION = 89;
 
 /** Capability 82. At least one field. `title` is the friendly name; the empty string clears it. */
 export const BotIdentityPatchSchema = Type.Object({

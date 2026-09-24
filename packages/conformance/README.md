@@ -42,6 +42,13 @@ only by name. A client gates the field on `com.cozylabs.bots >= 63` and treats a
 unprojected or unknown. The gateway does not backfill it. A known CozyAgents peer may project its
 effective `approve_once` default after negotiating 63, and that setting still requires approval.
 
+`test/fixtures/bot-mcp-server-declarations-v1.json` is the client fixture for capability 89's
+client-declared remote MCP servers (`contract/ext-bots-v1.md` row 89). The write rides the
+capability-48 `bot_config` `profile.write` to a peer that negotiated `mcp_server_declarations`, so
+the portable check is the payload itself: one patch that declares, removes and enables, a profile
+read that projects the declaration back on its row, the stdio shapes, literal secrets and foreign
+variables the schema refuses, and the bodies `mcpServerDeclarationProblem` refuses after it.
+
 ## The reference Hermes/attach echo peer
 
 The suite drives a Hermes profile through an attach-v1 peer, whose observable semantics are frozen

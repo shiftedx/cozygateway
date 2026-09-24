@@ -414,6 +414,88 @@ describe("attach-v1 config lane", () => {
     quick.close();
   });
 
+  // Capability 89. A remote MCP server a chat client declares rides `profile.write` to a peer that
+  // offered `mcp_server_declarations`, byte for byte, and the peer's own `applied` and `ignored`
+  // answer comes straight back. The declaration names a variable, never a value.
+  describe("client-declared MCP servers (capability 89)", () => {
+    const home = {
+      name: "home",
+      transport: "http" as const,
+      url: "http://homeassistant.local:8123/api/mcp",
+      headers: { Authorization: "Bearer ${COZY_MCP_HOME_TOKEN}" },
+      tools: ["GetLiveContext", "HassTurnOn"],
+    };
+
+    it("forwards declarations and removals unchanged to a peer that offered mcp_server_declarations", async () => {
+      const written = {
+        name: "sage", outcome: "applied", ok: true,
+        applied: { mcp_servers_declared: true, mcp_servers_removed: true, mcp_servers: true },
+        ignored: { mcp_servers_removed: ["comfyui"] },
+        requested: ["declareMcpServers", "removeMcpServers", "enabledMcpServers"],
+      };
+      const peer = await dial({ "profile.write": written }, ["bot_config", "mcp_server_declarations"]);
+      const patch = { declareMcpServers: [home], removeMcpServers: ["comfyui"], enabledMcpServers: ["home"] };
+
+      await expect(config.configureProfile("sage", patch)).resolves.toEqual({
+        outcome: "applied", ok: true, applied: written.applied, ignored: written.ignored, requested: written.requested,
+      });
+      expect(peer.requests.map((request) => [request.operation, request.input])).toEqual([["profile.write", patch]]);
+      // Live only, exactly as every other config operation: nothing is retained on the way past.
+      expect(storage.attachCommandCursor("sage")).toBe(0);
+      expect(storage.attachEventCursor("sage")).toBe(0);
+      peer.ws.close();
+    });
+
+    // The gate. A peer that speaks `bot_config` but never offered declarations receives NOTHING
+    // carrying either field: the refusal happens before the frame is written, so a peer that does
+    // not know the fields cannot misread or half-apply them. Its other profile writes still flow.
+    it("sends a peer without mcp_server_declarations nothing, and says the runtime does not support it", async () => {
+      const peer = await dial({
+        "profile.write": { name: "sage", outcome: "applied", ok: true, applied: { soul: true }, requested: ["soul"] },
+      });
+      await expect(config.configureProfile("sage", { declareMcpServers: [home] })).rejects.toBeInstanceOf(ConfigNotNegotiated);
+      await expect(config.configureProfile("sage", { removeMcpServers: ["home"] })).rejects.toBeInstanceOf(ConfigNotNegotiated);
+      await expect(config.configureProfile("sage", { soul: "# new", declareMcpServers: [home] })).rejects.toBeInstanceOf(ConfigNotNegotiated);
+      expect(peer.requests).toEqual([]);
+
+      await expect(config.configureProfile("sage", { soul: "# new" })).resolves.toMatchObject({ ok: true });
+      expect(peer.requests.map((request) => request.input)).toEqual([{ soul: "# new" }]);
+
+      // Through the data plane the same refusal is the runtime's 409, never a 503 to retry.
+      const { plane, storage: planeStorage } = planeWith(config, { configureProfile: vi.fn() } as unknown as Partial<BotsSurface>);
+      await expect(plane.surface().configureProfile("sage", { declareMcpServers: [home] })).rejects.toBeInstanceOf(UnsupportedForRuntime);
+      expect(peer.requests).toHaveLength(1);
+      plane.close();
+      planeStorage.close();
+      peer.ws.close();
+    });
+
+    it("carries a client declaration back on its server row, read-only", async () => {
+      const row = { name: "home", installed: true, enabled: false, declaration: home };
+      const peer = await dial({ "profile.read": { ...profile, mcpServers: [row, { name: "github", installed: true, enabled: true }] } });
+      const read = await config.botProfile("sage");
+      expect(read.mcpServers).toEqual([row, { name: "github", installed: true, enabled: true }]);
+      peer.ws.close();
+    });
+
+    // A peer that projects a stdio shape as a client declaration is refused whole, the lane's
+    // convention: a client never receives a `command` in the position it renders as editable.
+    it("refuses a projected declaration that carries a command: the frame is invalid", async () => {
+      const quick = new AttachConfigSurface(ingress, 200);
+      const peer = await dial({
+        "profile.read": {
+          ...profile,
+          mcpServers: [{ name: "home", installed: true, enabled: false, declaration: { ...home, command: "npx" } }],
+        },
+      });
+      const closed = once(peer.ws, "close");
+      await expect(quick.botProfile("sage")).rejects.toBeInstanceOf(BackendUnavailable);
+      const [code] = (await closed) as [number, Buffer];
+      expect(code).toBe(1008);
+      quick.close();
+    });
+  });
+
   it("rejects per status rather than collapsing every refusal into one failure", async () => {
     const peer = await dial({ "profile.read": profile });
     await expect(config.routines("sage")).rejects.toBeInstanceOf(BackendUnavailable);

@@ -58,6 +58,12 @@ export const AttachV1CapabilitySchema = Type.Union([
    * administration merely by supporting per-chat context. */
   Type.Literal("chat_configuration"),
   Type.Literal("provider_connections"),
+  /** Capability 89 of `com.cozylabs.bots`. The peer accepts client-declared remote MCP servers
+   * (`declareMcpServers` / `removeMcpServers`) on `bot_config` `profile.write`. Negotiated apart
+   * from `bot_config` so a peer never receives a declaration it did not opt into, exactly as
+   * `memory_ownership` sits beside `memory_management`. A harness offers it only when its operator
+   * turned client declarations on. */
+  Type.Literal("mcp_server_declarations"),
   Type.Literal("bot_history"),
   /** Capability 60: durable metadata-only local search tombstone. */
   Type.Literal("session_deletion"),

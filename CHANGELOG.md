@@ -5,6 +5,16 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## Unreleased: client-declared MCP servers
+
+- A chat client can declare a bot's remote MCP servers (`com.cozylabs.bots` capability 89, #362):
+  `PATCH /bots/:name/profile` gains `declareMcpServers` and `removeMcpServers`, carried on the
+  existing `bot_config` `profile.write`, and `BotMcpServer` gains a read-only `declaration`. Remote
+  only: `transport` is `http` and no stdio field exists, so no request starts a host command. A
+  header names one `COZY_MCP_*` environment variable the harness fills at start, never a value. The
+  gateway forwards either field only to a peer that offered the new attach-v1 capability
+  `mcp_server_declarations`; any other runtime bot and every Hermes bot answer
+  `409 unsupported_for_runtime` with nothing written.
 ## Unreleased: leader assignments
 
 A bot can now lead a team. Set a bot's role to leader and name its reports from the profile

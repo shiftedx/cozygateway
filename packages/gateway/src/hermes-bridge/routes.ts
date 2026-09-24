@@ -24,6 +24,7 @@ import {
   BotModelProviderFieldUpdateSchema,
   BotModelProviderOAuthCodeSchema,
   BotProfilePatchSchema,
+  mcpServerDeclarationProblem,
   BotSpeakRequestSchema,
   BotDescribeAutoRequestSchema,
   BotDuplicateRequestSchema,
@@ -1422,15 +1423,22 @@ export function registerBotRoutes(
       parsed.guardrailLevel === undefined &&
       // Capability 88: so is a team-only patch, which touches no peer at all.
       parsed.role === undefined &&
-      parsed.reports === undefined
+      parsed.reports === undefined &&
+      parsed.declareMcpServers === undefined &&
+      parsed.removeMcpServers === undefined
     ) {
       return c.json(
         errorBody(
           "invalid_request",
-          "at least one of soul, disabledSkills, enabledSkills, enabledToolsets, enabledMcpServers, guardrailLevel, role, reports is required",
+          "at least one of soul, disabledSkills, enabledSkills, enabledToolsets, enabledMcpServers, guardrailLevel, role, reports, declareMcpServers, removeMcpServers is required",
         ),
         400,
       );
+    }
+    // Capability 89: the cross-field rules the schema cannot express, in the contract's own words.
+    const declarationProblem = mcpServerDeclarationProblem(parsed);
+    if (declarationProblem !== undefined) {
+      return c.json(errorBody("invalid_request", declarationProblem), 400);
     }
     // Capability 88. The team half is checked before anything is forwarded and stored after the
     // forward succeeds, so a refused write leaves neither half behind.

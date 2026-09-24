@@ -61,7 +61,7 @@ import type {
   ServerFrame,
 } from "cozygateway-contract";
 import type { AttachV1EventFrame } from "../adapters/attach/protocol-v1.ts";
-import { BackendUnavailable } from "../errors.ts";
+import { BackendUnavailable, UnsupportedForRuntime } from "../errors.ts";
 import type { Storage } from "../storage.ts";
 import {
   HermesRpcError,
@@ -1427,6 +1427,12 @@ export class HermesBridge implements BotControlSurface {
     patch: BotProfilePatch,
   ): Promise<ProfileConfigureResult> {
     await this.#assertBotKnown(name);
+    // Capability 89. Client-declared MCP servers are a runtime peer's, gated on its
+    // `mcp_server_declarations`. Hermes's `profiles.configure` would take a stdio definition, which
+    // that row never grants, so the WHOLE patch is refused before any section of it is written.
+    if (patch.declareMcpServers !== undefined || patch.removeMcpServers !== undefined) {
+      throw new UnsupportedForRuntime(name, "declareMcpServers", "hermes");
+    }
     return this.#chain(name, () =>
       configureBotProfile(this.#client, name, patch),
     );
