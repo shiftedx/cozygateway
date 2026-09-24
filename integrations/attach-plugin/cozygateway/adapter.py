@@ -946,6 +946,10 @@ class AttachAdapter:
         # The only window in which this adapter itself is writing a mobile-originated row. The
         # separate mirror worker skips it, then advances its durable cursor once the inject ends.
         self._desktop_mirror_injections: Set[str] = set()
+        # thread -> (turn id, inbound source) for an injected turn whose mirror baseline is owed at
+        # SETTLE time. Upstream ``handle_message`` only spawns the run, so baselining right after
+        # it returned saw none of the turn's rows and the mirror echoed them back.
+        self._mirror_settles: Dict[str, Tuple[str, Any]] = {}
         self._desktop_mirror_interval = _env_float(
             "COZYGATEWAY_DESKTOP_SESSION_SYNC_INTERVAL_SECONDS", 1.0,
         )
@@ -2228,16 +2232,51 @@ class AttachAdapter:
         # Session sync supports serialized handoff, not concurrent two-writer merges.  Keep this
         # guard across the entire injected turn and baseline before releasing it, so a poller can
         # never reflect the phone's own rows back while this lane is being written.
+        #
+        # The guard is released, and the baseline taken, when the turn SETTLES (``_cleanup_turn``
+        # on its final commit or failure, then the runner going idle), not when ``handle_message``
+        # returns: upstream only spawns the run there. Trade-off: a row an external writer (a
+        # teammate's ``message_agent`` DM) adds to this lane's session DURING the phone's turn is
+        # covered by that baseline and is not mirrored; it is still in Hermes's transcript.
         self._desktop_mirror_injections.add(turn.thread_id)
+        self._mirror_settles[turn.thread_id] = (turn.turn_id, source)
         try:
             await self.handle_message(event)  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 - best-effort failed, then clean up
             logger.debug("attach: handle_message raised", exc_info=True)
             await self._safe_failed(turn.thread_id, turn.turn_id, "turn error")
             self._cleanup_turn(turn.thread_id, turn.turn_id)
+
+    def _settle_mirror(self, chat_id: str, turn_id: str) -> None:
+        """Schedule the owed baseline for an injected turn that just settled (see ``_handle_turn``)."""
+        pending = self._mirror_settles.get(chat_id)
+        if pending is None or pending[0] != turn_id:
+            return
+        del self._mirror_settles[chat_id]
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._desktop_mirror_injections.discard(chat_id)
+            return
+        self._spawn_background(loop, self._settle_mirror_after_idle(chat_id, pending[1]))
+
+    async def _settle_mirror_after_idle(self, chat_id: str, source: Any) -> None:
+        """Baseline once the runner has finished writing the turn's rows, then release the guard."""
+        try:
+            runner = getattr(self, "gateway_runner", None)
+            session_key = self._dispatch_session_key(source)
+            is_running = getattr(runner, "_is_session_running", None)
+            # Bounded: a runner that never reports idle still releases the guard.
+            for _ in range(240):
+                if not session_key or not callable(is_running) or not is_running(session_key):
+                    break
+                await asyncio.sleep(0.25)
+            await self._baseline_mobile_mirror_link(chat_id, source)
+        except Exception:  # noqa: BLE001 - mirroring may never affect a phone turn
+            logger.debug("attach: settle baseline failed", exc_info=True)
         finally:
-            await self._baseline_mobile_mirror_link(turn.thread_id, source)
-            self._desktop_mirror_injections.discard(turn.thread_id)
+            if chat_id not in self._mirror_settles:
+                self._desktop_mirror_injections.discard(chat_id)
 
     async def _report_turn_context(self, chat_id: str, turn_id: str, session_key: str) -> None:
         """Report the runtime's current prompt occupancy after a completed injected turn.
@@ -3665,6 +3704,8 @@ class AttachAdapter:
             self._thinking.pop(turn_id, None)
         if not keep_active and self._active_turn.get(chat_id) == turn_id:
             self._active_turn.pop(chat_id, None)
+        if not keep_active:
+            self._settle_mirror(chat_id, turn_id)
 
     async def _proactive_media_send(
         self,

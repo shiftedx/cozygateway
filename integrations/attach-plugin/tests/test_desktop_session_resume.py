@@ -6,6 +6,7 @@ internal contract so an upstream refactor cannot quietly turn an exact continuat
 chat or a cross-profile switch.
 """
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -217,6 +218,15 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
         adapter.handle_message = handle_message
         return adapter, runner, store, client
 
+    async def _settle(self, adapter, thread_id, turn_id, writer=None):
+        """Finish an injected turn the way production does: the run task writes its rows, then
+        the final commit's ``_cleanup_turn`` settles it and the owed baseline runs."""
+        if writer is not None:
+            await writer
+        adapter._cleanup_turn(thread_id, turn_id)
+        for task in list(adapter._background_tasks):
+            await task
+
     def _spool(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -348,19 +358,34 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(spool.desktop_session_links()[0]["source"], "desktop")
 
+        writers = []
+        released = asyncio.Event()
+
         async def handle_message(event):
             adapter.injected.append(event)
-            store.session_db.messages.extend([
-                {"id": 41, "role": "user", "content": "from phone", "timestamp": 1},
-                {"id": 42, "role": "assistant", "content": "native reply", "timestamp": 2},
-            ])
+            # Upstream spawns the run and returns; its rows land afterwards.
+            async def run():
+                await released.wait()
+                store.session_db.messages.extend([
+                    {"id": 41, "role": "user", "content": "from phone", "timestamp": 1},
+                    {"id": 42, "role": "assistant", "content": "native reply", "timestamp": 2},
+                ])
+            writers.append(asyncio.ensure_future(run()))
 
         adapter.handle_message = handle_message
         # A plugin restart loses the in-process binding; the durable lane and link remain.
         adapter._desktop_session_bindings.clear()
         store.lookup_session_id = "bot-chat"
         await adapter._handle_turn(TurnFrame(thread_id="native:sage:1", turn_id="turn-1", text="from phone"))
-        adapter._active_turn.pop("native:sage:1", None)  # the turn sealed
+        released.set()  # the spawned run writes only after handle_message returned
+        # Still in flight: the guard holds and a poll mirrors nothing.
+        await writers[0]
+        await adapter._mirror_desktop_session_link(
+            client, spool, store.session_db, spool.desktop_session_links()[0],
+        )
+        self.assertEqual(client.mirrored, [])
+        await self._settle(adapter, "native:sage:1", "turn-1")
+        self.assertEqual(spool.desktop_session_links()[0]["lastMessageRowId"], 42)
         store.session_db.messages.extend([
             {"id": 43, "role": "user", "content": "Message from pixel: PONG?", "timestamp": 3},
             {"id": 44, "role": "assistant", "content": "PONG back to pixel", "timestamp": 4},
@@ -526,15 +551,22 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
 
         async def handle_message(event):
             adapter.injected.append(event)
-            # These are the phone request and the native assistant commit written
-            # while the injected turn is in flight.
-            store.session_db.messages.extend([
-                {"id": 41, "role": "user", "content": "from phone", "timestamp": 1},
-                {"id": 42, "role": "assistant", "content": "native reply", "timestamp": 2},
-            ])
+            # Upstream ``handle_message`` only SPAWNS the run: the phone request and the native
+            # assistant commit are written after it returns.
+            async def run():
+                await released.wait()
+                store.session_db.messages.extend([
+                    {"id": 41, "role": "user", "content": "from phone", "timestamp": 1},
+                    {"id": 42, "role": "assistant", "content": "native reply", "timestamp": 2},
+                ])
+            writers.append(asyncio.ensure_future(run()))
 
+        writers = []
+        released = asyncio.Event()
         adapter.handle_message = handle_message
         await adapter._handle_turn(TurnFrame(thread_id="native:sage:1", turn_id="turn-1", text="from phone"))
+        released.set()  # the spawned run writes only after handle_message returned
+        await self._settle(adapter, "native:sage:1", "turn-1", writers[0])
         self.assertEqual(spool.desktop_session_links()[0]["lastMessageRowId"], 42)
 
         # A later native commit used to be emitted by the desktop poller and
