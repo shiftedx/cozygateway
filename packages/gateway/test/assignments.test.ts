@@ -169,7 +169,7 @@ describe("deadline, failure, cancel, acknowledge", () => {
     expect(h.interrupts).toEqual([]);
     expect(h.storage.pendingAttachCommands("scout", 0, 10).filter((frame) => frame.command.kind === "turn")).toEqual([]);
     expect(transitions(h, view.taskId)).toEqual([
-      "null->queued task_created gateway", "queued->blocked run_timed_out gateway", "blocked->failed no_recovery_remaining gateway",
+      "null->queued task_created gateway", "queued->blocked command_discarded gateway", "blocked->failed no_recovery_remaining gateway",
     ]);
   });
 
@@ -243,6 +243,61 @@ describe("retry", () => {
 });
 
 describe("a failed assignment is over", () => {
+  it("a superseded Run's failure after a retry records nothing, and the retried Run answers", async () => {
+    const h = harness({ silent: true });
+    const view = h.room.assign("lead", request);
+    await settle();
+    const old = h.commands[0]!.turnId;
+    // The owner is lost while its Run is still open, and the person retries.
+    h.storage.tasks.atomic(() => h.storage.tasks.append(view.taskId, "test:owner", "blocked", "owner_unreachable", "gateway", h.now(), { kind: "run", id: old }));
+    expect(h.storage.tasks.command(view.taskId, "retry", { idempotencyKey: "r" }).outcome).toBe("accepted");
+    // The plugin reconnects and answers the OLD turn with unknown_turn.
+    h.event("scout", { kind: "failed", threadId: view.threadId, turnId: old, messageId: "f", message: "unknown_turn", reason: "unknown_turn" });
+    expect(h.room.view(view.taskId)?.failure).toBeUndefined();
+    const sent: string[] = [];
+    h.storage.tasks.dispatch((peer, id, command) => {
+      const queued = h.storage.enqueueTaskCommand(peer, id, command, h.now());
+      if (queued && command.kind === "turn") sent.push(command.turnId);
+      return queued;
+    });
+    expect(sent).toHaveLength(1);
+    h.event("scout", { kind: "commit", threadId: view.threadId, turnId: sent[0]!, messageId: "again", blocks: [{ type: "paragraph", text: REPLY }] });
+    expect(h.room.view(view.taskId)).toMatchObject({ state: "verifying", result: { status: "done" } });
+  });
+
+  it("closes a retry accepted just before the assignment failed, never leaving it queued", async () => {
+    const h = harness({ silent: true });
+    const view = h.room.assign("lead", { ...request, deadlineMs: 60_000 });
+    await settle();
+    h.event("scout", { kind: "interrupted", threadId: view.threadId, turnId: h.commands[0]!.turnId, messageId: "i" });
+    expect(h.storage.tasks.command(view.taskId, "retry", { idempotencyKey: "r" }).outcome).toBe("accepted");
+    h.tick(60_000);
+    h.room.reconcile();
+    h.storage.tasks.dispatch((peer, id, command) => h.storage.enqueueTaskCommand(peer, id, command, h.now()));
+    h.room.reconcile();
+    expect(h.storage.tasks.read(view.taskId)?.view.state).toBe("failed");
+    expect(transitions(h, view.taskId).slice(-3)).toEqual([
+      "blocked->queued retry_requested user", "queued->blocked command_discarded gateway", "blocked->failed no_recovery_remaining gateway",
+    ]);
+  });
+
+  it("closes a paused Task at the deadline through the gateway's timeout", async () => {
+    const h = harness({ silent: true });
+    const view = h.room.assign("lead", { ...request, deadlineMs: 60_000 });
+    await settle();
+    expect(h.storage.tasks.command(view.taskId, "pause", { idempotencyKey: "p" }).outcome).toBe("accepted");
+    h.event("scout", { kind: "interrupted", threadId: view.threadId, turnId: h.commands[0]!.turnId, messageId: "i" });
+    expect(h.storage.tasks.read(view.taskId)?.view.state).toBe("waiting_for_user_input");
+    h.tick(60_000);
+    h.room.reconcile();
+    expect(h.interrupts).toEqual([]);
+    expect(transitions(h, view.taskId).slice(-3)).toEqual([
+      "running->waiting_for_user_input user_paused gateway", "waiting_for_user_input->blocked run_timed_out gateway", "blocked->failed no_recovery_remaining gateway",
+    ]);
+    expect(h.storage.tasks.command(view.taskId, "resume", { idempotencyKey: "rs" }).outcome).toBe("conflict");
+    expect(h.room.view(view.taskId)?.state).toBe("failed");
+  });
+
   it("refuses to run a retry on a failed assignment's thread even if its Task could retry", async () => {
     const h = harness({ silent: true });
     const view = h.room.assign("lead", request);

@@ -349,7 +349,8 @@ export class Tasks {
       const view = this.#read(taskId)?.view;
       if (view === undefined) return { outcome: "conflict" };
       // A durable decision that no recovery remains is exactly a refusal to start another Run.
-      if ((action === "retry" || action === "resume") && this.#recoveryDecision?.({ taskId, bot: view.bot, runId: view.currentRun.runId })?.taskId === taskId) return { outcome: "conflict", view };
+      const decision = action === "retry" || action === "resume" ? this.#recoveryDecision?.({ taskId, bot: view.bot, runId: view.currentRun.runId }) : undefined;
+      if (decision !== undefined && decision.taskId === taskId && decision.runId === view.currentRun.runId) return { outcome: "conflict", view };
       const transition = [...this.events(taskId)].reverse().find((event) => event.from !== event.to);
       const accepted = action === "cancel" ? !TERMINAL.has(view.state) || view.state === "cancelled" : action === "scope" ? !TERMINAL.has(view.state) : action === "pause" ? ["queued", "running", "verifying", "waiting_for_approval", "waiting_for_device"].includes(view.state) : action === "resume" ? view.state === "waiting_for_user_input" && transition?.reason === "user_paused" : view.state === "blocked";
       if (!accepted || (view.pendingIntent?.command === "cancel" && action !== "cancel" && action !== "scope")) return { outcome: "conflict", view };

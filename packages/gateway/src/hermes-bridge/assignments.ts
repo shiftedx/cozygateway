@@ -313,9 +313,14 @@ export class AssignmentRooms {
       if (row.failure !== undefined) this.#storage.tasks.reconcile(this.#now());
       return true;
     }
-    // Only the Task's current Run speaks for the assignment; a stale or foreign turn does not.
-    if (this.#storage.tasks.run(agentId, event.turnId)?.taskId !== row.taskId) return true;
     const now = this.#now();
+    // Only the Task's CURRENT Run speaks for the assignment. A superseded Run (answered after a
+    // retry, say with `unknown_turn`) or a foreign turn records nothing.
+    const current = this.#storage.tasks.read(row.taskId)?.view.currentRun.runId;
+    if (this.#storage.tasks.run(agentId, event.turnId)?.taskId !== row.taskId || event.turnId !== current) {
+      if (row.failure !== undefined) this.#storage.tasks.reconcile(now);
+      return true;
+    }
     // A reply past a recorded failure (a late answer after the deadline) does not reopen the work,
     // but it may be the Run's end the failed Task was waiting for: close it now.
     if (row.failure !== undefined) {
@@ -356,18 +361,14 @@ export class AssignmentRooms {
       const task = this.#storage.tasks.read(row.taskId)?.view;
       const live = task !== undefined && !["completed", "failed", "cancelled"].includes(task.state);
       if (live && now >= row.deadlineAt && row.failure === undefined) {
-        // The deadline is hard: the gateway's own `run_timed_out` blocks the Task (never a person's
-        // cancel), and the recorded failure is the decision that no recovery remains. A turn the
-        // peer never took is withdrawn from the outbox; a running one is interrupted. The Task
-        // closes `blocked -> failed` once its Run has ended, here or on the Run's terminal event.
+        // The deadline is hard, and the recorded failure is the decision that no recovery remains.
         this.#storage.updateBotAssignment(row.taskId, { failure: "deadline", updatedAt: now });
-        const runId = task.currentRun.runId;
-        // A Task already blocked (its owner unreachable, say) keeps that reason.
-        if (task.state !== "blocked") this.#storage.tasks.nativeTerminal(task.bot, task.sessionId, runId, "timed_out", now);
-        if (!this.#storage.cancelUnackedTurn(task.bot, runId, "assignment deadline", now))
-          this.#endpoint?.sendInterrupt?.(task.bot, { threadId: task.sessionId, turnId: runId });
-        this.#storage.tasks.reconcile(now);
+        this.#block(task, now);
         this.#emit(this.#storage.botAssignment(row.taskId)!);
+      } else if (live && row.failure !== undefined && task.state !== "blocked") {
+        // Backstop: a failed assignment's Task is never left live where reconciliation cannot
+        // close it (a retry accepted just before the failure, which is then never dispatched).
+        this.#block(task, now);
       } else if (task?.state === "completed" && row.acknowledgedOutcome === undefined && row.lapseAnnouncedAt === undefined
         && now >= task.at + ASSIGNMENT_VERIFYING_AUTO_COMPLETE_MS) {
         this.#storage.updateBotAssignment(row.taskId, { lapseAnnouncedAt: now, updatedAt: now });
@@ -378,6 +379,31 @@ export class AssignmentRooms {
 
   close(): void {
     clearInterval(this.#timer);
+  }
+
+  /** Moves a failed assignment's live Task to `blocked` along the edge ADR 0004 sanctions for where
+   * it stands, so Task reconciliation closes it `blocked -> failed` (`no_recovery_remaining`) once
+   * its Run has ended. Never a person's cancel, and never through `Tasks.discarded`, which would
+   * start an automatic retry. A Task already `blocked` (its owner unreachable, say) keeps its
+   * reason. */
+  #block(task: TaskView, now: number): void {
+    const tasks = this.#storage.tasks;
+    const runId = task.currentRun.runId;
+    const ref = { kind: "run" as const, id: runId };
+    if (task.state === "queued") {
+      // Nothing ran: `command_discarded`, and a turn still in the outbox is withdrawn unsent.
+      tasks.atomic(() => tasks.append(task.taskId, `assignment:${runId}:discarded`, "blocked", "command_discarded", "gateway", now, ref));
+      this.#storage.cancelUnackedTurn(task.bot, runId, "assignment failed", now);
+    } else if (task.state !== "blocked") {
+      // The gateway's own timeout, from the running state or any wait. `nativeTerminal` is the
+      // usual door; a paused Task (its Run ended `user_paused`) needs the edge appended directly.
+      tasks.nativeTerminal(task.bot, task.sessionId, runId, "timed_out", now);
+      if (tasks.read(task.taskId)?.view.state !== "blocked")
+        tasks.atomic(() => tasks.append(task.taskId, `assignment:${runId}:deadline`, "blocked", "run_timed_out", "gateway", now, ref));
+      if (task.state !== "waiting_for_user_input" && !this.#storage.cancelUnackedTurn(task.bot, runId, "assignment deadline", now))
+        this.#endpoint?.sendInterrupt?.(task.bot, { threadId: task.sessionId, turnId: runId });
+    }
+    tasks.reconcile(now);
   }
 
   #cancelLed(leader: string): void {

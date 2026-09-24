@@ -1755,11 +1755,15 @@ projection in v1 and are acknowledged so the peer's stream keeps moving.
 A cancel asks the Task to cancel and answers the resulting state; it reads `cancelled` only once
 the Task has settled, never before (`cancelledBy` says it was asked). The deadline and a failed
 turn are never recorded on the Task as a person's cancel, and both follow the capability-64 state
-machine (ADR 0004). The deadline is hard: the gateway records `failure: "deadline"` and appends
-its own `run_timed_out`, which moves the Task `running -> blocked` (actor `gateway`); a turn the
-peer has not acknowledged is withdrawn from the outbox, and a running one is interrupted. A failed
-turn is the harness's own `run_failed`, `running -> blocked`, and its message becomes the
-assignment's `failure`. In both cases the recorded failure is the durable decision that no
+machine (ADR 0004). The deadline is hard: the gateway records `failure: "deadline"` and blocks
+the Task on the edge that fits where it stands, all with actor `gateway`: its own `run_timed_out`
+from `running`, `verifying` or any wait (a paused Task included), after which a running turn is
+interrupted; `command_discarded` from `queued`, where nothing ran, and a turn still in the outbox is
+withdrawn unsent. A failed turn is the harness's own `run_failed`, `running -> blocked`, and its
+message becomes the assignment's `failure`. Only the Task's CURRENT Run speaks for the assignment:
+a reply or failure from a Run a retry superseded records nothing. A Task left live after its
+assignment failed (a retry accepted just before, then never dispatched) is blocked the same way by
+the sweep. In both cases the recorded failure is the durable decision that no
 recovery remains (issuer `assignment`): Task reconciliation appends `blocked -> failed`
 `no_recovery_remaining` (actor `gateway`) as soon as the Run has ended, at once for a failed or
 withdrawn turn and on the interrupted Run's terminal otherwise. Until then the Task reads
