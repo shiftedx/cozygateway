@@ -387,6 +387,8 @@ type NativeRowOverlay = Pick<
 const DASHBOARD_ONLY: ReadonlySet<string> = new Set([
   "botProfile",
   "configureProfile",
+  "botPresentation",
+  "configurePresentation",
   "modelConfig",
   "configureModel",
   "modelProviders",

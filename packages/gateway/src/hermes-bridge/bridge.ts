@@ -27,6 +27,8 @@ import type {
   BotPendingApproval,
   BotProfile,
   BotProfilePatch,
+  BotPresentationPatch,
+  BotPresentationResponse,
   BotReadiness,
   BotRuntimeProjection,
   BotRuntimeRecoveryResponse,
@@ -71,6 +73,7 @@ import type {
   BotApprovalResolveOutcome,
 } from "./approvals.ts";
 import { GroupRooms, type RoomInteractionExpiry } from "./group-rooms.ts";
+import { readPresentation, writePresentation } from "./presentation.ts";
 import type { NativeGroupTurnEndpoint } from "./group-turn.ts";
 import type { ProfileChangeEvent } from "./profile-provisioner.ts";
 import type { ObservationRing } from "../observe/ring.ts";
@@ -240,6 +243,9 @@ export interface BotControlSurface {
     name: string,
     patch: BotProfilePatch,
   ): Promise<ProfileConfigureResult>;
+  /** Capability 80. Optional so a surface with no Hermes profile behind it simply lacks the route. */
+  botPresentation?(name: string): Promise<BotPresentationResponse>;
+  configurePresentation?(name: string, patch: BotPresentationPatch): Promise<BotPresentationResponse>;
   modelConfig(name: string): Promise<BotModelConfig>;
   configureModel(
     name: string,
@@ -1066,6 +1072,20 @@ export class HermesBridge implements BotControlSurface {
     return this.#chain(name, () =>
       configureBotProfile(this.#client, name, patch),
     );
+  }
+  async botPresentation(name: string): Promise<BotPresentationResponse> {
+    const read = await readPresentation(this.#client, name);
+    if (read === undefined) throw new BotNotFound(name);
+    return { name, presentation: read.presentation, revision: read.revision ?? 0 };
+  }
+  async configurePresentation(name: string, patch: BotPresentationPatch): Promise<BotPresentationResponse> {
+    // Chained per profile with every other write to it, so this gateway never races itself; the
+    // CAS inside `writePresentation` is for the OTHER clients (a desktop, another gateway).
+    const written = await this.#chain(name, () => writePresentation(this.#client, name, patch));
+    if (written === undefined) throw new BotNotFound(name);
+    // `bot_roster` carries the blob as `meta`, so every paired phone sees the write on this refresh.
+    this.refreshSoon(`bot ${name} presentation`);
+    return { name, presentation: written.presentation, revision: written.revision ?? 0 };
   }
   async modelConfig(name: string): Promise<BotModelConfig> {
     await this.#assertBotKnown(name);
