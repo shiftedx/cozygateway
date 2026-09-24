@@ -1654,6 +1654,12 @@ export function registerBotRoutes(
     return response;
   });
 
+  app.get("/bots/:name/provider-keys", requireDevice, async (c) => {
+    const resolved = canonicalName(c);
+    if ("response" in resolved) return resolved.response;
+    return profileOp(c, resolved.name, { kind: "providerKeys" });
+  });
+
   app.put("/bots/:name/provider-keys/:provider", requireDevice, async (c) => {
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;

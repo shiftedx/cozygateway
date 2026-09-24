@@ -368,40 +368,68 @@ describe("capability 82: model pin, provider keys, skills hub", () => {
     expect(h.server.callsOf("cli.exec")[0]?.params["argv"]).toEqual(["--profile", "scout", "config", "unset", "model"]);
   });
 
-  it("saves a provider key write-only and treats an absent key as already disconnected", async () => {
+  it("keeps provider keys on the bot's own profile through /api/env, write-only", async () => {
+    const env: Record<string, { provider: string; provider_label: string; is_password: boolean; is_set: boolean }> = {
+      OPENROUTER_API_KEY: { provider: "openrouter", provider_label: "OpenRouter", is_password: true, is_set: false },
+      OPENROUTER_BASE_URL: { provider: "openrouter", provider_label: "OpenRouter", is_password: false, is_set: false },
+      GOOGLE_API_KEY: { provider: "gemini", provider_label: "Google AI Studio", is_password: true, is_set: true },
+      GEMINI_API_KEY: { provider: "gemini", provider_label: "Google AI Studio", is_password: true, is_set: true },
+      SOME_TOOL_KEY: { provider: "", provider_label: "", is_password: true, is_set: true },
+    };
     const h = await setup({
-      methods: {
-        "model.save_key": () => ({ provider: { slug: "openrouter", authenticated: true } }),
-        "model.disconnect": () => {
-          throw { code: 4005, message: "no credentials found for openrouter" };
-        },
+      dashboard: (request) => {
+        if (request.path !== "/api/env") return undefined;
+        const body = request.body as Record<string, string> | undefined;
+        if (request.method === "PUT") env[body!["key"]!]!.is_set = true;
+        if (request.method === "DELETE") env[body!["key"]!]!.is_set = false;
+        return { body: request.method === "GET" ? env : { ok: true } };
       },
     });
+    const listed = await (await h.authed("/bots/scout/provider-keys")).json();
+    expect(listed).toEqual({ providers: [
+      { slug: "openrouter", name: "OpenRouter", connected: false },
+      { slug: "gemini", name: "Google AI Studio", connected: true },
+    ] });
     const saved = await h.authed("/bots/scout/provider-keys/openrouter", json("PUT", { apiKey: "sk-secret" }));
     const text = await saved.text();
     expect(text).not.toContain("sk-secret");
     expect(JSON.parse(text)).toEqual({ provider: "openrouter", connected: true });
-    expect(h.server.callsOf("model.save_key")[0]?.params).toEqual({ profile: "scout", slug: "openrouter", api_key: "sk-secret" });
-    const gone = await h.authed("/bots/scout/provider-keys/openrouter", { method: "DELETE" });
-    expect(await gone.json()).toEqual({ provider: "openrouter", connected: false });
+    const put = h.dashboardCalls.find((call) => call.method === "PUT");
+    expect(put?.query.get("profile")).toBe("scout");
+    expect(put?.body).toEqual({ key: "OPENROUTER_API_KEY", value: "sk-secret", profile: "scout" });
+    // Disconnect clears every set key of that provider, and only those.
+    expect(await (await h.authed("/bots/scout/provider-keys/gemini", { method: "DELETE" })).json())
+      .toEqual({ provider: "gemini", connected: false });
+    expect(h.dashboardCalls.filter((call) => call.method === "DELETE").map((call) => call.body)).toEqual([
+      { key: "GOOGLE_API_KEY", profile: "scout" },
+      { key: "GEMINI_API_KEY", profile: "scout" },
+    ]);
+    expect((await h.authed("/bots/scout/provider-keys/nope", json("PUT", { apiKey: "x" }))).status).toBe(400);
   });
 
-  it("searches the hub and installs into this bot", async () => {
+  it("searches the hub and installs into this bot's own profile", async () => {
     const h = await setup({
-      methods: {
-        "skills.manage": (params) => params["action"] === "search"
-          ? { results: [{ name: "pdf-tools", description: "read PDFs" }] }
-          : { installed: true, name: params["query"] },
+      dashboard: (request) => {
+        if (request.path === "/api/skills/hub/search")
+          return { body: { results: [
+            { name: "pdf", description: "read PDFs", identifier: "anthropics/skills/pdf" },
+            { name: "pdf", description: "other", identifier: "openai/skills/pdf" },
+          ], installed: { "openai/skills/pdf": "1.0" } } };
+        if (request.path === "/api/skills/hub/install") return { body: { ok: true, pid: 42, name: "install-pdf" } };
+        return undefined;
       },
     });
     const found = await h.authed("/bots/scout/skills-hub?q=pdf");
-    expect(await found.json()).toEqual({ results: [{ name: "pdf-tools", description: "read PDFs" }] });
-    const installed = await h.authed("/bots/scout/skills-hub/install", json("POST", { identifier: "pdf-tools" }));
-    expect(await installed.json()).toEqual({ installed: true, name: "pdf-tools" });
-    expect(h.server.callsOf("skills.manage").map((call) => call.params)).toEqual([
-      { profile: "scout", action: "search", query: "pdf" },
-      { profile: "scout", action: "install", query: "pdf-tools" },
-    ]);
+    expect(await found.json()).toEqual({ results: [
+      { name: "pdf", description: "read PDFs", identifier: "anthropics/skills/pdf" },
+      { name: "pdf", description: "other", identifier: "openai/skills/pdf", installed: true },
+    ] });
+    expect(h.dashboardCalls.find((call) => call.path === "/api/skills/hub/search")?.query.get("profile")).toBe("scout");
+    const installed = await h.authed("/bots/scout/skills-hub/install", json("POST", { identifier: "anthropics/skills/pdf" }));
+    expect(await installed.json()).toEqual({ started: true, identifier: "anthropics/skills/pdf" });
+    const install = h.dashboardCalls.find((call) => call.path === "/api/skills/hub/install");
+    expect(install?.body).toEqual({ identifier: "anthropics/skills/pdf", profile: "scout" });
+    expect(install?.query.get("profile")).toBe("scout");
   });
 
   it("answers 404 for a bot Hermes does not have", async () => {

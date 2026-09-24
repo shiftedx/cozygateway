@@ -11,8 +11,8 @@
 //   import              POST  /api/files/upload -> POST /api/profiles/import         (HTTP)
 //   model pin           profiles.configure {model, provider, confirm_expensive_model} (WS)
 //   model unpin         cli.exec ['--profile', name, 'config', 'unset', 'model']     (WS)
-//   provider keys       model.save_key / model.disconnect {profile, slug}            (WS)
-//   skills hub          skills.manage {profile, action: search|install}              (WS)
+//   provider keys       GET/PUT/DELETE /api/env?profile=  (see Provider keys below) (HTTP)
+//   skills hub          GET /api/skills/hub/search, POST .../install  ?profile=      (HTTP)
 //
 // The bridge owns the lifecycle around them (the per-profile chain, the roster refresh, the
 // provisioner hook, attach identity); this module owns only the wire.
@@ -349,56 +349,104 @@ export async function unpinProfileModel(client: HermesClient, name: string): Pro
 }
 
 // MARK: Provider keys
+//
+// Over the dashboard's profile-scoped `/api/env`, NOT `model.save_key`/`model.disconnect`: those
+// two RPCs have no `profile` param in the contract (a shared `/api/ws` rejects it as an extra
+// input), so on one socket they can only ever reach the launch profile. Upstream Desktop scopes
+// them with a backend per profile. `PUT`/`DELETE /api/env?profile=` run the same credential
+// lifecycle (`save_provider_env_credential` / `remove_provider_env_credential`) for the named
+// profile, which is what a phone can reach.
 
 const PROVIDER_SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/;
 
-function providerSlug(slug: string): string {
-  if (!PROVIDER_SLUG_RE.test(slug)) throw new ProfileOpInvalid("invalid provider");
-  return slug;
+interface ProviderKeyVar { key: string; provider: string; label: string; isSet: boolean }
+
+async function providerKeyVars(client: HermesClient, name: string): Promise<ProviderKeyVar[]> {
+  const env = record(await client.dashboardJson(`/api/env?profile=${encodeURIComponent(name)}`)) ?? {};
+  return Object.entries(env).flatMap(([key, raw]) => {
+    const row = record(raw);
+    const provider = text(row?.["provider"]);
+    if (provider.length === 0 || row?.["is_password"] !== true) return [];
+    return [{ key, provider, label: text(row["provider_label"]) || provider, isSet: row["is_set"] === true }];
+  });
+}
+
+/** One row per provider that takes a key, connected when any of its keys is set. */
+export async function listProviderKeys(client: HermesClient, name: string): Promise<{ providers: { slug: string; name: string; connected: boolean }[] }> {
+  const rows = new Map<string, { slug: string; name: string; connected: boolean }>();
+  for (const entry of await providerKeyVars(client, name)) {
+    const current = rows.get(entry.provider);
+    rows.set(entry.provider, { slug: entry.provider, name: current?.name ?? entry.label, connected: (current?.connected ?? false) || entry.isSet });
+  }
+  return { providers: [...rows.values()] };
 }
 
 /** The key is write-only: it goes into Hermes and nothing about it comes back or is logged. */
 export async function saveProviderKey(client: HermesClient, name: string, slug: string, apiKey: string): Promise<{ provider: string; connected: boolean }> {
+  if (!PROVIDER_SLUG_RE.test(slug)) throw new ProfileOpInvalid("invalid provider");
+  const target = (await providerKeyVars(client, name)).find((entry) => entry.provider === slug);
+  if (target === undefined) throw new ProfileOpInvalid(`${slug} does not take an API key here`);
   try {
-    await client.request("model.save_key", { profile: name, slug: providerSlug(slug), api_key: apiKey });
+    await client.dashboardJson(`/api/env?profile=${encodeURIComponent(name)}`, {
+      method: "PUT", body: { key: target.key, value: apiKey, profile: name },
+    });
   } catch (error) {
-    if (error instanceof HermesRpcError && error.code !== undefined && error.code >= 4000 && error.code < 5000)
-      throw new ProfileOpInvalid(error.message);
+    if (error instanceof HermesRpcError && error.code === 400) throw new ProfileOpInvalid(error.message);
     throw error;
   }
   return { provider: slug, connected: true };
 }
 
 export async function disconnectProvider(client: HermesClient, name: string, slug: string): Promise<{ provider: string; connected: boolean }> {
-  try {
-    await client.request("model.disconnect", { profile: name, slug: providerSlug(slug) });
-  } catch (error) {
-    // 4005: nothing was stored for it, which is the state the person asked for.
-    if (!(error instanceof HermesRpcError && error.code === 4005)) {
-      if (error instanceof HermesRpcError && error.code !== undefined && error.code >= 4000 && error.code < 5000)
-        throw new ProfileOpInvalid(error.message);
-      throw error;
+  if (!PROVIDER_SLUG_RE.test(slug)) throw new ProfileOpInvalid("invalid provider");
+  for (const entry of (await providerKeyVars(client, name)).filter((row) => row.provider === slug && row.isSet)) {
+    try {
+      await client.dashboardJson(`/api/env?profile=${encodeURIComponent(name)}`, {
+        method: "DELETE", body: { key: entry.key, profile: name },
+      });
+    } catch (error) {
+      // 404: already gone, which is the state the person asked for.
+      if (!(error instanceof HermesRpcError && error.code === 404)) throw error;
     }
   }
   return { provider: slug, connected: false };
 }
 
 // MARK: Skills Hub
+//
+// Over the dashboard's `?profile=` hub routes, NOT `skills.manage`: its in-process install writes
+// to the skills folder bound at import time, which is the launch profile's (live, 2026-09-23: an
+// install for a bot landed in the root `skills/`). `POST /api/skills/hub/install` spawns
+// `hermes -p <name> skills install`, which is how Hermes itself scopes it.
 
 export async function searchSkillsHub(client: HermesClient, name: string, query: string): Promise<BotSkillsHubSearch> {
-  const result = record(await client.request("skills.manage", {
-    profile: name, action: "search", query,
-  }, { timeoutMs: 60_000 }));
+  const result = record(await dashboardCall(client,
+    `/api/skills/hub/search?q=${encodeURIComponent(query)}&profile=${encodeURIComponent(name)}`,
+    {}, 45_000));
+  const installed = record(result?.["installed"]) ?? {};
   const rows = Array.isArray(result?.["results"]) ? (result["results"] as unknown[]) : [];
   return {
-    results: rows.map(record).filter((row) => text(row?.["name"]).length > 0)
-      .map((row) => ({ name: text(row?.["name"]), description: text(row?.["description"]) })),
+    results: rows.map(record).filter((row) => text(row?.["name"]).length > 0).map((row) => {
+      const identifier = text(row?.["identifier"]) || text(row?.["name"]);
+      return {
+        name: text(row?.["name"]),
+        description: text(row?.["description"]),
+        identifier,
+        ...(installed[identifier] !== undefined || installed[text(row?.["name"])] !== undefined ? { installed: true } : {}),
+      };
+    }),
   };
 }
 
-export async function installHubSkill(client: HermesClient, name: string, identifier: string): Promise<{ installed: boolean; name: string }> {
-  const result = record(await client.request("skills.manage", {
-    profile: name, action: "install", query: identifier,
-  }, { timeoutMs: 180_000 }));
-  return { installed: result?.["installed"] === true, name: text(result?.["name"]) || identifier };
+/** Starts the install in the background on the Hermes host; it lands on this bot's profile. */
+export async function installHubSkill(client: HermesClient, name: string, identifier: string): Promise<{ started: boolean; identifier: string }> {
+  try {
+    const result = record(await client.dashboardJson(`/api/skills/hub/install?profile=${encodeURIComponent(name)}`, {
+      method: "POST", body: { identifier, profile: name },
+    }));
+    return { started: result?.["ok"] === true, identifier };
+  } catch (error) {
+    if (error instanceof HermesRpcError && error.code === 400) throw new ProfileOpInvalid(error.message);
+    throw error;
+  }
 }

@@ -3084,7 +3084,8 @@ export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
  * /bots/:name/export` answers the profile's `.tar.gz` (credentials excluded by Hermes) and `POST
  * /bots/import?name=` creates a bot from one. `GET`/`PUT`/`DELETE /bots/:name/model-pin` reads, the
  * profile's model with the expensive-model handshake, or unpins it so the launch profile's model
- * applies. `PUT`/`DELETE /bots/:name/provider-keys/:provider` save or disconnect a provider key.
+ * applies. `GET /bots/:name/provider-keys` lists the providers that take a key, and
+ * `PUT`/`DELETE /bots/:name/provider-keys/:provider` save or disconnect one, on the bot's own profile.
  * `GET /bots/:name/skills-hub?q=` and `POST /bots/:name/skills-hub/install` search the Skills Hub
  * and install into this bot. `POST /bots` gains `cloneFrom`, `cloneAll`, `noSkills` and
  * `shareKeys`. Additive: every route is new and a client below 82 sends none of the fields. */
@@ -3154,6 +3155,9 @@ export type BotProviderKeyRequest = Static<typeof BotProviderKeyRequestSchema>;
 export const BotSkillsHubResultSchema = Type.Object({
   name: Type.String(),
   description: Type.String(),
+  /** What `install` takes; several hub sources can offer one `name`. */
+  identifier: Type.String(),
+  installed: Type.Optional(Type.Boolean()),
 });
 export const BotSkillsHubSearchSchema = Type.Object({
   results: Type.Array(BotSkillsHubResultSchema),
