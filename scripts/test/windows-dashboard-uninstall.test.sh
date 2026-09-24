@@ -57,4 +57,13 @@ expect other-port 0 'no listener is present on port 9119'
 expect listener 1 'may still be owned'
 expect error 1 'could not be inspected'
 expect none 1 'could not be inspected'
-echo 'PASS missing Dashboard owner helper fails closed when listeners cannot be inspected'
+expect listener 1 'Rerun the installer (or --runtime-only) to restore dashboard-owner.ps1'
+expect error 1 'Get-NetTCPConnection -State Listen -LocalPort 9119'
+
+# The probe can refuse, so uninstall must run it before deleting the task and Startup entry.
+uninstall_body="$(sed -n '/^uninstall() {/,/^}/p' "$repo_root/scripts/agent-install.sh" | sed -n '/hydrate_dashboard_port/,$p')"
+probe_line="$(grep -n 'DASHBOARD_OWNER_PS1" ] || stop_owned_windows_dashboard_for_uninstall' <<<"$uninstall_body" | head -1 | cut -d: -f1)"
+delete_line="$(grep -n 'schtasks.exe /Delete' <<<"$uninstall_body" | head -1 | cut -d: -f1)"
+[ -n "$probe_line" ] && [ -n "$delete_line" ] && [ "$probe_line" -lt "$delete_line" ] ||
+  { echo 'FAIL  uninstall deletes the Scheduled Task before the missing-helper Dashboard probe' >&2; exit 1; }
+echo 'PASS missing Dashboard owner helper fails closed, with recovery guidance, before the task is removed'

@@ -3495,8 +3495,8 @@ stop_owned_windows_dashboard_for_uninstall() {
     set -e
     case "$listener_code" in
       0) say "INFO  Dashboard owner helper is missing, but no listener is present on port $DASHBOARD_PORT"; return ;;
-      42) die "Dashboard owner helper is missing; refusing to remove recovery state while port $DASHBOARD_PORT may still be owned" ;;
-      *) die "Dashboard owner helper is missing and listeners on port $DASHBOARD_PORT could not be inspected; refusing to remove recovery state" ;;
+      42) die "Dashboard owner helper is missing; refusing to remove recovery state while port $DASHBOARD_PORT may still be owned. Rerun the installer (or --runtime-only) to restore dashboard-owner.ps1, then uninstall again" ;;
+      *) die "Dashboard owner helper is missing and listeners on port $DASHBOARD_PORT could not be inspected; refusing to remove recovery state. Rerun the installer (or --runtime-only) to restore dashboard-owner.ps1, then uninstall again; check the port with: Get-NetTCPConnection -State Listen -LocalPort $DASHBOARD_PORT" ;;
     esac
   fi
   local root_native hermes_native launcher_native owner_helper_native elevation_helper_native code
@@ -3651,6 +3651,9 @@ uninstall() {
   if [ "$SERVICE_PLATFORM" = Windows ]; then
     local startup_entry task_xml
     startup_entry="$(windows_startup_dir)/$WINDOWS_TASK.vbs"
+    # Without the owner helper the Dashboard step only probes and may refuse; do that before
+    # the task and Startup entry are deleted so a refusal leaves the install intact.
+    [ -f "$DASHBOARD_OWNER_PS1" ] || stop_owned_windows_dashboard_for_uninstall "$dashboard_stop_port"
     if [ "$DRY_RUN" = 1 ]; then
       say "DRY   delete Scheduled Task $WINDOWS_TASK and Startup entry $startup_entry"
     else
@@ -3664,7 +3667,7 @@ uninstall() {
       [ ! -f "$startup_entry" ] || rm -f "$startup_entry"
       stop_owned_windows_gateway 0 || true
     fi
-    stop_owned_windows_dashboard_for_uninstall "$dashboard_stop_port"
+    [ ! -f "$DASHBOARD_OWNER_PS1" ] || stop_owned_windows_dashboard_for_uninstall "$dashboard_stop_port"
     [ "$DRY_RUN" = 1 ] || remove_windows_cli_path
   elif [ "$SERVICE_PLATFORM" = Darwin ]; then
     if [ "$DRY_RUN" = 1 ]; then run launchctl bootout "gui/$(id -u)/$SERVICE_LABEL"; run rm -f "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
