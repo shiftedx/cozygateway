@@ -99,7 +99,7 @@ TERMINAL_REJECTION_MAX = 1_000_000
 TERMINAL_REJECTION_LOGS_MAX = 8
 HELLO_CAPABILITIES = (
     "draft", "media", "tools", "approvals", "clarify", "scheduled",
-    "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "delivery_receipts",
+    "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup", "memory_setup_state", "delivery_receipts",
     "delegation", "thinking", "desktop_session_sync", "bot_config", "chat_configuration", "provider_connections",
     "desktop_session_resume", "cozyapps",
     "chat_context",
@@ -950,6 +950,9 @@ class AttachV1Client:
     ) -> Optional[Dict[str, Any]]:
         """Return one live management reply without writing memory to either spool."""
         event: Dict[str, Any] = {"kind": "memory_result", "requestId": request_id, "status": status}
+        if result is not None and "setup" in result and "memory_setup_state" not in self._capabilities:
+            # A gateway that did not grant the literal validates this reply as a closed object.
+            result = {key: value for key, value in result.items() if key != "setup"}
         if result is not None: event["result"] = result
         if message: event["message"] = message[:512]
         if current is not None: event["current"] = current

@@ -54,6 +54,8 @@ class PinnedHermesMemorySetupTests(unittest.TestCase):
             assert source["status"] == "available", source
             assert source["capabilities"]["create"] is True, source
             assert source["capabilities"]["relationships"] is True, source
+            # cozychat#411: the switches are re-read from Hermes' own configuration and flag reader.
+            assert result["setup"] == {"memoryEnabled": False, "userProfileEnabled": False, "holographicEnabled": True}, result.get("setup")
             """
         )
         with tempfile.TemporaryDirectory() as home:
