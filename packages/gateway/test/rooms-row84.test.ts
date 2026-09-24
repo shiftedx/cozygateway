@@ -350,3 +350,77 @@ describe("row 84 routes", () => {
     h.storage.close();
   });
 });
+
+describe("a member renamed while its room is talking", () => {
+  const until = async (predicate: () => boolean, timeoutMs = 2_000): Promise<void> => {
+    const start = Date.now();
+    while (!predicate()) {
+      if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+  };
+
+  it("never hands the stale name a turn and seats the new name next round", async () => {
+    const h = harness({ manual: true });
+    await h.rooms.create("Crew", ["scout", "luna"]);
+    h.rooms.send("Crew", "morning everyone");
+    await until(() => h.commands.length === 1);
+    // Another member's turn is running when the rename lands.
+    const first = h.commands[0]!;
+    const renamed = first.agentId === "scout" ? "luna" : "scout";
+    h.rooms.beginMemberRename(renamed);
+    h.rooms.announceRooms(h.storage.renameBotState(renamed, "owl"));
+    h.rooms.endMemberRename(renamed);
+    const started = Date.now();
+    h.commit(first, "hello");
+    // Everyone after that passes; the owl gets its turn in the next round.
+    let answered = 1;
+    const drive = h.rooms.settled("Crew");
+    const pump = setInterval(() => {
+      while (answered < h.commands.length) h.commit(h.commands[answered++]!, "(pass)");
+    }, 1);
+    await drive;
+    clearInterval(pump);
+    // No turn for the stale name, no turn timeout, and no row written back under it.
+    expect(h.commands.some((command) => command.agentId === renamed)).toBe(false);
+    expect(h.commands.some((command) => command.agentId === "owl")).toBe(true);
+    expect(Date.now() - started).toBeLessThan(400);
+    expect(h.storage.botGroupMembers("crew").has(renamed)).toBe(false);
+    expect(h.storage.botGroup("crew")?.members).toContain("owl");
+    await h.rooms.close();
+    h.storage.close();
+  });
+
+  it("a fenced member is skipped without a turn", async () => {
+    const h = harness({ reply: () => "(pass)" });
+    await h.rooms.create("Crew", ["scout", "luna"]);
+    h.rooms.beginMemberRename("luna");
+    h.rooms.send("Crew", "anyone?");
+    await h.rooms.settled("Crew");
+    expect(h.commands.map((command) => command.agentId)).toEqual(["scout"]);
+    h.rooms.endMemberRename("luna");
+    await h.rooms.close();
+    h.storage.close();
+  });
+
+  it("a new bot given a renamed member's old name keeps its own thread ownership", async () => {
+    const h = harness({ reply: () => "(pass)" });
+    await h.rooms.create("Crew", ["scout", "luna"]);
+    const thread = h.storage.ensureBotGroupThread("crew", "scout");
+    h.storage.renameBotState("scout", "owl");
+    // A fresh bot named `scout` joins and derives the very same thread id.
+    h.storage.setBotGroupMembers("crew", ["owl", "luna", "scout"]);
+    expect(h.storage.ensureBotGroupThread("crew", "scout")).toBe(thread);
+    expect(h.storage.botGroupMemberBySession(thread, "owl")).toEqual({ key: "crew", member: "owl" });
+    expect(h.storage.botGroupMemberBySession(thread, "scout")).toEqual({ key: "crew", member: "scout" });
+    // An external commit on the new scout's thread mirrors as scout, never as owl.
+    h.rooms.handleAttachEvent("scout", {
+      kind: "event", sequence: 1, eventId: "ext-1",
+      event: { kind: "commit", threadId: thread, turnId: "t-ext", messageId: "m-ext", blocks: [{ type: "paragraph", text: "from the new scout" }] },
+    });
+    const mirrored = h.storage.botGroupLog("crew").find((row) => row.external === true);
+    expect(mirrored?.name).toBe("scout");
+    await h.rooms.close();
+    h.storage.close();
+  });
+});

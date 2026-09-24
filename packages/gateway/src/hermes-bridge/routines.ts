@@ -303,10 +303,11 @@ export function cronJobsOf(result: unknown): CronJob[] {
 /** Jobs owned by the bot profile requested from `cron.manage`: its tagged routines and its older,
  *  untagged cron jobs. A malformed or foreign tag is still somebody else's ownership claim and is
  *  therefore excluded rather than adopted as an existing cron. */
-export function selectRoutineJobs(jobs: readonly CronJob[], bot: string): CronJob[] {
+export function selectRoutineJobs(jobs: readonly CronJob[], bot: string, aliases: readonly string[] = []): CronJob[] {
   return jobs.filter((job) => {
     const owner = routineBot(job);
-    return owner === bot || (owner === null && !BOT_TAG_CLAIM_RE.test(asString(job.name) ?? ""));
+    return owner === bot || (owner !== null && aliases.includes(owner))
+      || (owner === null && !BOT_TAG_CLAIM_RE.test(asString(job.name) ?? ""));
   });
 }
 
@@ -345,10 +346,17 @@ export interface RoutineListResult {
  *  stored prompts from the dashboard (`GET /api/cron/jobs?profile=`) and unwraps the instruction
  *  the user wrote, so an editor can show and edit the whole thing. That read is best effort: when
  *  it fails the preview stays, exactly as before. */
-export async function listBotRoutines(port: HermesRoutinesPort, bot: string): Promise<RoutineListResult> {
+export async function listBotRoutines(
+  port: HermesRoutinesPort,
+  bot: string,
+  /** Names this bot was renamed from that no live bot holds now (Hermes's `previous_names`). A job
+   *  still tagged with one of them is this bot's, left behind by a rename whose retag failed or
+   *  that happened outside the gateway. */
+  aliases: readonly string[] = [],
+): Promise<RoutineListResult> {
   const result = await port.request("cron.manage", { action: "list", include_disabled: true, profile: bot });
   readCronReply("list", result);
-  const jobs = selectRoutineJobs(cronJobsOf(result), bot);
+  const jobs = selectRoutineJobs(cronJobsOf(result), bot, aliases);
   const full = await fullPrompts(port, bot, jobs.length);
   const running = asRecord(result)?.["gateway_running"];
   return {
@@ -602,12 +610,15 @@ export async function createBotRoutine(
  *  has already happened and a job left behind is still visible in Hermes's Cron view. */
 export async function retagBotRoutines(
   port: HermesRoutinesPort,
-  from: string,
+  from: readonly string[],
   to: string,
 ): Promise<{ retagged: string[]; failed: string[] }> {
   const retagged: string[] = [];
   const failed: string[] = [];
-  const jobs = (await listCronStore(port, to)).filter((job) => routineBot(job) === from);
+  const jobs = (await listCronStore(port, to)).filter((job) => {
+    const owner = routineBot(job);
+    return owner !== null && owner !== to && from.includes(owner);
+  });
   if (jobs.length === 0) return { retagged, failed };
   const call = dashboard(port, "retag");
   for (const job of jobs) {

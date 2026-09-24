@@ -335,6 +335,8 @@ export class GroupRooms {
   /** Bumped every time a room key is deleted. In memory on purpose: it only has to outlive the
    *  drives of THIS process, and a restart has no drives to disambiguate. */
   readonly #generations = new Map<string, number>();
+  /** Members whose bot is mid-rename (`beginMemberRename`), with a nesting count. */
+  readonly #renaming = new Map<string, number>();
   #closed = false;
 
   constructor(opts: GroupRoomsOptions) {
@@ -381,8 +383,8 @@ export class GroupRooms {
     const event = frame.event;
     if (event.kind !== "commit") return undefined;
     if (this.#storage.botGroupTurnForAttach(agentId, event.threadId, event.turnId) !== undefined) return undefined;
-    const owner = this.#storage.botGroupMemberBySession(event.threadId);
-    if (owner === undefined || owner.member !== agentId || this.#storage.botGroup(owner.key) === undefined) return undefined;
+    const owner = this.#storage.botGroupMemberBySession(event.threadId, agentId);
+    if (owner === undefined || this.#storage.botGroup(owner.key) === undefined) return undefined;
     return owner;
   }
 
@@ -604,6 +606,19 @@ export class GroupRooms {
     return this.#emitRoom(key, renamed ? room.name : undefined);
   }
 
+  /** Fences a member while its bot is being renamed: no room turn starts for it until
+   *  `endMemberRename`, so nothing is sent to an attach identity the rename is about to revoke and
+   *  no per-member row is written back under the old name. Counted, so overlapping calls nest. */
+  beginMemberRename(name: string): void {
+    this.#renaming.set(name, (this.#renaming.get(name) ?? 0) + 1);
+  }
+
+  endMemberRename(name: string): void {
+    const left = (this.#renaming.get(name) ?? 1) - 1;
+    if (left <= 0) this.#renaming.delete(name);
+    else this.#renaming.set(name, left);
+  }
+
   /** A member's bot was renamed and storage has already moved its membership
    *  (`Storage.renameBotState`): re-announce each changed room so clients re-seat the member. */
   announceRooms(keys: readonly string[]): void {
@@ -640,6 +655,7 @@ export class GroupRooms {
     if (room === undefined) throw new GroupNotFound(rawName.trim());
     const member = normalizeProfileName(rawMember);
     if (!room.members.includes(member)) throw new GroupInvalid(`${member} is not a member of ${room.name}`);
+    if (this.#renaming.has(member)) throw new GroupBusy(`${member} is being renamed; try again in a moment`);
     if (this.#driving(key) || this.#compressing.has(key)) {
       throw new GroupBusy("the room is still talking; stop it or wait for it to settle");
     }
@@ -951,6 +967,13 @@ export class GroupRooms {
           continue;
         }
 
+        // The responders were resolved at the top of the round. A member renamed or removed since
+        // then is not in the room any more (its successor is picked up next round), and one being
+        // renamed right now must not be handed a turn.
+        const seated = this.#storage.botGroup(key);
+        if (seated === undefined) return round;
+        if (!seated.members.includes(member.name) || this.#renaming.has(member.name)) continue;
+
         const log = threadLog();
         const mark = this.#mark(current, thread, member.name);
         const delta = deltaSince(log, mark);
@@ -1071,7 +1094,12 @@ export class GroupRooms {
   }): Promise<GroupTurnResult & { turnId?: string }> {
     const { key, groupName, member, members, delta, startEpoch, startGeneration, storedId } = args;
     if (this.#closed || this.#generation(key) !== startGeneration) return { outcome: "pass" };
-    if (this.#storage.botGroup(key) === undefined) return { outcome: "pass" };
+    const room = this.#storage.botGroup(key);
+    if (room === undefined) return { outcome: "pass" };
+    // Defense in depth for the round loop's own check: never start a turn for a member mid-rename
+    // or no longer seated.
+    if (this.#renaming.has(member.name) || !room.members.includes(member.name))
+      return { outcome: "gone" };
     const prompt = buildTurnPrompt(groupName, members, member, delta);
     const endpoint = this.#nativeTurns;
     if (endpoint === undefined) return { outcome: "failed", detail: "native attach-v1 group transport is not configured" };
