@@ -186,6 +186,32 @@ describe("capability 86 on the native data plane", () => {
     h.storage.close();
   });
 
+  it("a teammate's DM written into the bound Bot Chat shows up once as a bot_chat message", async () => {
+    const h = plane();
+    const opening = h.surface.openBotChat!("sage");
+    await vi.waitFor(() => expect(h.resumes).toHaveLength(1));
+    h.confirm();
+    await opening;
+    const threadId = h.resumes[0]!.threadId;
+    const row = (eventId: string) => ({
+      kind: "event", sequence: 10, eventId,
+      event: {
+        kind: "desktop_session_message", threadId, hermesSessionId: "bot-chat-1", desktopSessionId: "bot-chat-1",
+        source: "desktop", rowId: "44", role: "assistant", text: "PONG back to pixel", at: 1_790_222_400_000,
+      },
+    });
+    const before = h.frames.length;
+    expect(h.plane.handle("sage", row("mirror-44") as never)).toBe(true);
+    // At-least-once attach: a replay of the same Hermes row is acknowledged and not re-sent.
+    expect(h.plane.handle("sage", row("mirror-44-replay") as never)).toBe(true);
+    const chats = h.frames.slice(before).filter((frame) => frame["type"] === "bot_chat");
+    expect(chats).toHaveLength(1);
+    expect(chats[0]).toMatchObject({ bot: "sage", sessionId: threadId,
+      messages: [expect.objectContaining({ role: "assistant", text: "PONG back to pixel" })] });
+    expect(h.storage.nativeBotMessages("sage", threadId).filter((m) => m.text === "PONG back to pixel")).toHaveLength(1);
+    h.close();
+  });
+
   it("clearing a bound Bot Chat retires it in Hermes (archive + hide)", async () => {
     const h = plane();
     const opening = h.surface.openBotChat!("sage");

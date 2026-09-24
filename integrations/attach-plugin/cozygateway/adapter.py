@@ -1625,9 +1625,15 @@ class AttachAdapter:
             binding = self._desktop_session_bindings.get(thread_id)
             link = next((item for item in spool.desktop_session_links() if item["threadId"] == thread_id), None)
             link_source = str(link.get("source") or "") if link is not None else ""
-            if (binding is not None and binding[0] == session_key and link is not None
-                    and link_source in INTERACTIVE_SESSION_SOURCES
-                    and str(row.get("source") or "").strip().lower() == link_source):
+            # The bound Bot Chat needs no in-process binding: after a plugin restart the lane still
+            # runs in it (durable switch), and skipping this baseline would echo the gateway's own
+            # turn rows back through the mirror.
+            bound_bot_chat = (link is not None and link_source in INTERACTIVE_SESSION_SOURCES
+                              and await asyncio.to_thread(self._is_bound_bot_chat, db, link))
+            if (link is not None and link_source in INTERACTIVE_SESSION_SOURCES
+                    and (bound_bot_chat or (
+                        binding is not None and binding[0] == session_key
+                        and str(row.get("source") or "").strip().lower() == link_source))):
                 # Compression can rotate the active SessionEntry after adoption.  The durable
                 # link's root remains the proof; resolve it before accepting the new active tip.
                 linked_tip = await asyncio.to_thread(
@@ -1644,6 +1650,15 @@ class AttachAdapter:
                 )
         except Exception:  # noqa: BLE001 - mirroring may never affect a phone turn
             logger.debug("attach: could not baseline desktop session mirror", exc_info=True)
+
+    @staticmethod
+    def _is_bound_bot_chat(db: Any, link: Dict[str, Any]) -> bool:
+        """Whether a mirror link's adopted registry row is the profile's canonical Bot Chat."""
+        desktop_session_id = link.get("desktopSessionId")
+        if not desktop_session_id:
+            return False
+        row = db.get_session(str(desktop_session_id))
+        return isinstance(row, dict) and str(row.get("title") or "") == CANONICAL_BOT_CHAT_TITLE
 
     async def _mirror_desktop_session_link(
         self, client: Any, spool: Any, db: Any, link: Dict[str, Any], *, allow_active: bool = False,
@@ -1677,7 +1692,13 @@ class AttachAdapter:
                 if (session_source != PLATFORM_NAME or bool(session.get("hidden"))
                         or str(session.get("chat_id") or "") != thread_id):
                     return
-            elif session_source != source or not link.get("desktopSessionId"):
+            elif not link.get("desktopSessionId") or (
+                    session_source != source
+                    # Bot parity S2: the bound Bot Chat is followed WHATEVER its source. Hermes
+                    # re-stamps it ``cozygateway`` after a gateway turn, yet teammates'
+                    # ``message_agent`` DMs keep landing in it. The turn baseline already moved the
+                    # cursor past the gateway's own rows, so only external rows are mirrored.
+                    and not await asyncio.to_thread(self._is_bound_bot_chat, db, link)):
                 return
 
             after = int(link["lastMessageRowId"])
@@ -2406,7 +2427,9 @@ class AttachAdapter:
                 # This is the only intentional retarget: an explicit, idle, serialized desktop
                 # adoption. Ordinary retries use insert-only links and cannot discard an outbox tail.
                 spool.reset_desktop_session_link(
-                    thread_id=thread_id, current_hermes_session_id=target, source=raw_source,
+                    thread_id=thread_id, current_hermes_session_id=target,
+                    # A re-adopted Bot Chat keeps the interactive link shape the mirror speaks.
+                    source="desktop" if canonical_bot_chat else raw_source,
                     desktop_session_id=raw_id, last_message_row_id=baseline,
                 )
             client = self._client

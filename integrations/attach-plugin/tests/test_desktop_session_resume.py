@@ -331,6 +331,65 @@ class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.switches, [("agent:main:cozygateway:dm:native:sage:2", "desktop-raw")])
         self.assertEqual(client.confirmations, [("native:sage:2", "desktop-raw", "resume-bc")])
 
+    async def test_bound_bot_chat_mirrors_external_rows_once_and_never_echoes_gateway_turns(self):
+        # A Bot Chat adopted as desktop and since re-stamped ``cozygateway`` by gateway turns: a
+        # teammate's message_agent DM landing in it still reaches the phone, once; the gateway's
+        # own turn rows never come back as mirror rows.
+        adapter, _runner, store, client = self._adapter(
+            rows=("bot-chat",), source="cozygateway", title="Bot Chat", messages=[],
+        )
+        client.desktop_session_sync_available = True
+        spool = self._spool()
+        self.addCleanup(spool.close)
+        adapter._spool = spool
+        client.spool = spool
+        await adapter._handle_desktop_resume_command({
+            "threadId": "native:sage:1", "hermesSessionId": "bot-chat", "resumeId": "r1",
+        })
+        self.assertEqual(spool.desktop_session_links()[0]["source"], "desktop")
+
+        async def handle_message(event):
+            adapter.injected.append(event)
+            store.session_db.messages.extend([
+                {"id": 41, "role": "user", "content": "from phone", "timestamp": 1},
+                {"id": 42, "role": "assistant", "content": "native reply", "timestamp": 2},
+            ])
+
+        adapter.handle_message = handle_message
+        # A plugin restart loses the in-process binding; the durable lane and link remain.
+        adapter._desktop_session_bindings.clear()
+        store.lookup_session_id = "bot-chat"
+        await adapter._handle_turn(TurnFrame(thread_id="native:sage:1", turn_id="turn-1", text="from phone"))
+        adapter._active_turn.pop("native:sage:1", None)  # the turn sealed
+        store.session_db.messages.extend([
+            {"id": 43, "role": "user", "content": "Message from pixel: PONG?", "timestamp": 3},
+            {"id": 44, "role": "assistant", "content": "PONG back to pixel", "timestamp": 4},
+        ])
+        for _ in range(2):
+            await adapter._mirror_desktop_session_link(
+                client, spool, store.session_db, spool.desktop_session_links()[0],
+            )
+
+        self.assertEqual([event["message_row_id"] for event in client.mirrored], [43, 44])
+        self.assertEqual({event["source"] for event in client.mirrored}, {"desktop"})
+
+    async def test_a_restamped_session_that_is_not_the_bot_chat_stays_unmirrored(self):
+        adapter, _runner, store, client = self._adapter(
+            rows=("desktop-raw",), source="cozygateway", title="Scratch",
+            messages=[{"id": 5, "role": "assistant", "content": "elsewhere", "timestamp": 1}],
+        )
+        client.desktop_session_sync_available = True
+        spool = self._spool()
+        self.addCleanup(spool.close)
+        spool.upsert_desktop_session_link(
+            thread_id="native:sage:1", current_hermes_session_id="desktop-raw", source="tui",
+            desktop_session_id="desktop-raw", last_message_row_id=0,
+        )
+        await adapter._mirror_desktop_session_link(
+            client, spool, store.session_db, spool.desktop_session_links()[0],
+        )
+        self.assertEqual(client.mirrored, [])
+
     async def test_a_cozygateway_row_with_any_other_title_is_still_refused(self):
         for title in (None, "bot chat", "Bot Chat 2"):
             with self.subTest(title=title):
