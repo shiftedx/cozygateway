@@ -207,6 +207,16 @@ gateway-owned assignment rows, not a reading of Hermes session text, which is wh
 waited for. Every gateway advertises it, because the assignment store is part of every
 gateway's storage.
 
+`com.cozylabs.chat-audio` is likewise its own id. Version 1 means the chat attachment route
+accepts voice notes and relays them to the bot as audio (see
+[Attachments and media](#attachments-and-media) below). It does not mean the bot can hear them.
+Whether a bot understands a voice note depends on the bot: a CozyAgents bot transcribes one when
+its transcription is set up, and a Hermes profile does when its own speech-to-text is configured.
+It is not a `com.cozylabs.bots` row because gateways at different bots versions, CozyAgents'
+embedded gateway and this one, must each be able to advertise it without claiming the other's
+rows. This gateway advertises it wherever it serves Bot Mode. A client offers voice notes only
+when it is present.
+
 ## Resources
 
 The TypeBox schemas are normative. The names below identify complete shapes rather than maintaining
@@ -898,6 +908,34 @@ CSV, JSON, or RTF; legacy Office; OOXML; and OpenDocument files. The gateway che
 allow-listed MIME against lightweight format bytes, stores the sanitized filename as metadata, and
 serves every attachment with `Content-Disposition: attachment` and `nosniff`.
 
+`com.cozylabs.chat-audio` 1 admits a voice note on the same route, one per turn: `audio/mp4` (AAC
+`.m4a`), `audio/mpeg` (MP3), `audio/wav`, or `audio/x-wav`. It keeps the route's 20 MiB cap, not
+the 40 MiB cap assistant audio carries. A declared `audio/m4a` or `audio/x-m4a` is stored as
+`audio/mp4`, and so is a file named `*.m4a` whose part declares no type, or a type the route does
+not admit such as `application/octet-stream`. The gateway reads that from the part's own
+`Content-Type` header, because a multipart parser reports an undeclared part as `text/plain`; a
+part that does declare `text/plain` is a text document whatever its name. Parameters on a
+declared type are ignored. The bytes are
+checked with the same magic as the [canonical allowlist](#canonical-media-allowlist): an ISO BMFF
+`ftyp` box with an audio major brand for `audio/mp4`, an ID3 tag or MPEG frame sync for
+`audio/mpeg`, and `RIFF` plus `WAVE` for WAV. Refusals take the document shapes: `413` `too_large`, `400`
+`empty`, and `415` `content_type`, each under extension code `media_refused`.
+
+Every attachment on this route, document or voice note, is stored under the accepted type's
+extension, which replaces a different one: `voice.mp4` accepted as `audio/mp4` is stored as
+`voice.m4a`, and `notes.m4a` accepted as `text/plain` as `notes.txt`. A name that already ends in
+that extension, in any case, is kept. Hermes classifies an attachment by its extension before its
+type, so a mismatched name would reach it as the wrong kind of file.
+
+The gateway decides the attach-v1 media family from the accepted MIME, exactly as
+`POST /attach/v1/media/:mediaId` does: a voice note is stored as family `audio` and its transcript
+attachment carries `mediaKind: "audio"`, while every document stays family `file`. A peer learns
+the type from `GET /attach/v1/media/:mediaId`, which serves the stored `audio/*` Content-Type;
+CozyAgents takes the family from that served type. The Hermes attach plugin hands the served MIME
+and name to Hermes, which transcribes any `audio/*` attachment when its speech-to-text is
+configured. Hermes then echoes each transcript to the chat by default (`stt_echo_transcripts`);
+the plugin drops that echo on a voice-note turn rather than committing it as an extra bot message.
+
 ### Inline media ordering (capability 32)
 
 An attachment entry on `BotChatMessage.attachments` may carry an optional `position`: the index in
@@ -953,6 +991,12 @@ refused at the gateway, so a plugin that offers one is guaranteed a 415.
 
 The container MIME is what the gateway checks. Codec-level facts for MP4 (H.264 plus AAC-LC,
 `yuv420p`, fast-start) are a plugin-side probe: this layer sees a container, not a stream.
+
+`audio/mp4` additionally requires one of the audio major brands `M4A `, `M4B `, `mp42`, `isom`, or
+`iso2` in its `ftyp` box, four bytes each (the trailing space in `M4A ` and `M4B ` is part of the
+brand). QuickTime's `qt  `, still-image containers such as `heic` and `avif`, and every other brand
+are refused as `audio/mp4`. `video/mp4` keeps the broader check: any ISO BMFF brand but `qt  `.
+CozyAgents' embedded gateway applies the same list.
 
 `image/svg+xml`, `text/html`, and every other type are excluded on purpose. SVG and HTML carry
 script and external references. Excluded means refused at upload, never silently transcoded.
@@ -1058,7 +1102,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `POST /bots/:name/chat/messages` | `BotChatSendRequest` | `202 { name, sessionId, message: BotChatMessage }` | Admits a native turn or steer, then appends locally. |
 | `POST /bots/:name/chat/messages/displayed` | `BotChatDisplayedRequest` | `202 BotChatDisplayedResponse` | Capability 31. Records that this device displayed those rows. |
 | `POST /bots/:name/chat/photos` | multipart `file`, `BotChatPhotoFields` | `202 { name, sessionId, message: BotChatMessage }` | One validated image plus optional caption. |
-| `POST /bots/:name/chat/attachments` | multipart `file`, `BotChatAttachmentFields` | `202 { name, sessionId, message: BotChatMessage }` | One validated PDF, text, RTF, Office, or OpenDocument file plus optional caption. |
+| `POST /bots/:name/chat/attachments` | multipart `file`, `BotChatAttachmentFields` | `202 { name, sessionId, message: BotChatMessage }` | One validated PDF, text, RTF, Office, or OpenDocument file plus optional caption. With `com.cozylabs.chat-audio` 1, also one AAC, MP3, or WAV voice note. |
 | `POST /bots/:name/chat/stop` | — | `BotChatStopResponse` | Interrupts the current native turn; returns 409 when idle. |
 | `POST /bots/:name/chat/reset` | — | `BotChatResetResponse` | Selects a fresh native chat and emits reset. |
 | `GET /bots/:name/chat/attachments/:fileId` | optional single `Range` | attachment bytes | Gateway-owned attachment only. |

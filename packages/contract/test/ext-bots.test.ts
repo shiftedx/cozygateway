@@ -4,6 +4,8 @@ import type { BotGroup, BotGroupMessage, BotSummary, ServerFrame } from "../src/
 import {
   AGENT_INBOX_CAPABILITY_ID,
   AGENT_INBOX_CAPABILITY_VERSION,
+  CHAT_AUDIO_CAPABILITY_ID,
+  CHAT_AUDIO_CAPABILITY_VERSION,
   RunnerSchema,
   RunnerDeleteResponseSchema,
   RunnerChoiceRequiredBodySchema,
@@ -1150,6 +1152,13 @@ describe("capability advertisement", () => {
 
   it("versions the agent inbox on its own id, never on the bots scalar", () => {
     expect(AGENT_INBOX_CAPABILITY_VERSION).toBe(1);
+  });
+
+  // Its own id, not a bots row: CozyAgents' embedded gateway and this one sit at different bots
+  // versions, and each must be able to say it accepts voice notes without the other's rows.
+  it("versions chat audio on its own id, never on the bots scalar", () => {
+    expect(CHAT_AUDIO_CAPABILITY_ID).toBe("com.cozylabs.chat-audio");
+    expect(CHAT_AUDIO_CAPABILITY_VERSION).toBe(1);
   });
 
   it("accepts role and reports on the profile read and patch, bounded at 16", () => {

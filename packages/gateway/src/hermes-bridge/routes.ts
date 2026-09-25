@@ -133,7 +133,8 @@ import {
   redactHostPaths,
   type PhotoRateLimiter,
 } from "./photos.ts";
-import { FILE_MAX_BYTES, acceptFileBytes, attachmentDisposition, safeFilename } from "./documents.ts";
+import { FILE_MAX_BYTES, attachmentDisposition, declaredFilePartType, safeFilename } from "./documents.ts";
+import { acceptChatAttachmentBytes } from "./assistant-media.ts";
 import {
   RoutineDashboardUnavailable,
   RoutineNotFound,
@@ -2642,8 +2643,8 @@ export function registerBotRoutes(
   });
 
   // Capability 24: the same one-file, one-turn pipeline as photos, with a deliberately small
-  // document allow-list. Files remain gateway-owned attach-v1 media; no Hermes path or URL enters
-  // the transcript.
+  // document allow-list, plus chat-audio 1's voice notes. Files remain gateway-owned attach-v1
+  // media; no Hermes path or URL enters the transcript.
   app.post("/bots/:name/chat/attachments", requireDevice, async (c) => {
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;
@@ -2664,8 +2665,9 @@ export function registerBotRoutes(
     }
     try {
       let form: FormData;
+      let raw: Uint8Array;
       try {
-        const raw = await readCappedBody(c.req.raw.body, maxRequestBytes);
+        raw = await readCappedBody(c.req.raw.body, maxRequestBytes);
         form = await new Response(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer, { headers: { "content-type": c.req.header("content-type") ?? "" } }).formData();
       } catch {
         return c.json(errorBody("invalid_request", "the body is not a multipart/form-data upload"), 400);
@@ -2686,15 +2688,17 @@ export function registerBotRoutes(
       const filename = safeFilename(file.name);
       if (filename === undefined) return c.json(errorBody("invalid_request", "invalid attachment filename"), 400);
       const bytes = new Uint8Array(await file.arrayBuffer());
+      // chat-audio 1: an untyped part must read as undeclared, not as the parser's "text/plain".
+      const partType = declaredFilePartType(raw, c.req.header("content-type") ?? "") ?? file.type;
       let accepted;
-      try { accepted = acceptFileBytes(file.type.toLowerCase(), bytes); } catch (err) {
+      try { accepted = acceptChatAttachmentBytes(partType, filename, bytes); } catch (err) {
         const message = err instanceof Error ? err.message : "invalid file";
         const status = /size cap/.test(message) ? 413 : /no bytes/.test(message) ? 400 : 415;
         return c.json({ ...extensionErrorBody("media_refused", message), reason: status === 413 ? "too_large" : status === 400 ? "empty" : "content_type" }, status);
       }
       try {
         const sent = await chat.sendChatAttachment(name, {
-          bytes, mime: accepted.mime, name: filename,
+          bytes, mime: accepted.mime, name: accepted.name,
           text: (fields.text ?? "").trim() || "Here is an attached file.",
           ...(fields.clientId === undefined ? {} : { clientId: fields.clientId }),
         }, { deviceId: c.get("deviceId") });

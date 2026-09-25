@@ -1,4 +1,4 @@
-import { FILE_MAX_BYTES, FILE_TYPES, acceptFileBytes } from "./documents.ts";
+import { FILE_MAX_BYTES, FILE_TYPES, acceptFileBytes, withCanonicalExtension } from "./documents.ts";
 import { PhotoRefused } from "./photos.ts";
 
 export const ASSISTANT_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
@@ -45,6 +45,22 @@ function isQuickTime(bytes: Uint8Array): boolean {
   return isIsoBaseMedia(bytes) && at(bytes, 8, 0x71, 0x74, 0x20, 0x20); // QuickTime `qt  ` brand.
 }
 
+function ftypMajorBrand(bytes: Uint8Array): string | undefined {
+  if (!isIsoBaseMedia(bytes)) return undefined;
+  return String.fromCharCode(bytes[8]!, bytes[9]!, bytes[10]!, bytes[11]!);
+}
+
+/** Audio-appropriate ISO BMFF major brands, four bytes each (the trailing space in `M4A ` and
+ * `M4B ` is part of the brand). An `audio/mp4` declaration is refused for any other brand,
+ * including a still-image container that is also ISO BMFF (`heic`, `avif`) and QuickTime's `qt  `.
+ * The same list as CozyAgents' embedded gateway. */
+const AUDIO_MP4_BRANDS = new Set(["M4A ", "M4B ", "mp42", "isom", "iso2"]);
+
+function isAudioMp4(bytes: Uint8Array): boolean {
+  const brand = ftypMajorBrand(bytes);
+  return brand !== undefined && AUDIO_MP4_BRANDS.has(brand);
+}
+
 function bytesMatchMediaType(
   declared: string,
   bytes: Uint8Array,
@@ -52,7 +68,8 @@ function bytesMatchMediaType(
 ): boolean {
   if (declared.startsWith("image/")) return sniffImage(bytes) === declared;
   if (declared === "video/quicktime") return isQuickTime(bytes);
-  if (declared === "video/mp4" || declared === "audio/mp4") return isIsoBaseMedia(bytes) && !isQuickTime(bytes);
+  if (declared === "video/mp4") return isIsoBaseMedia(bytes) && !isQuickTime(bytes);
+  if (declared === "audio/mp4") return isAudioMp4(bytes);
   if (declared === "audio/mpeg") {
     return at(bytes, 0, 0x49, 0x44, 0x33) || (bytes[0] === 0xff && (bytes[1]! & 0xe0) === 0xe0);
   }
@@ -63,6 +80,35 @@ function bytesMatchMediaType(
     try { acceptFileBytes(declared, bytes); return true; } catch { return false; }
   }
   return false;
+}
+
+/** Declarations a phone uses for an AAC voice note that name the same container as `audio/mp4`. */
+const CHAT_AUDIO_ALIASES = new Map([["audio/m4a", "audio/mp4"], ["audio/x-m4a", "audio/mp4"]]);
+
+/** `com.cozylabs.chat-audio` 1: what `POST /bots/:name/chat/attachments` admits. Documents keep
+ * capability 24's rules. A voice note is one of the audio rows above, checked with the same magic,
+ * but held to the route's 20 MiB cap. A `.m4a` name stands in for a declaration the route does
+ * not admit (a missing type, `application/octet-stream`, and so on); the bytes still decide. The
+ * returned `name` carries the accepted type's extension. */
+export function acceptChatAttachmentBytes(
+  declared: string,
+  filename: string,
+  bytes: Uint8Array,
+): { mime: string; ext: string; name: string } {
+  const lowered = declared.split(";")[0]!.trim().toLowerCase();
+  let mime = CHAT_AUDIO_ALIASES.get(lowered) ?? lowered;
+  const admitted = FILE_TYPES.has(mime) || ASSISTANT_MEDIA_TYPES.get(mime)?.kind === "audio";
+  if (!admitted && /\.m4a$/i.test(filename)) mime = "audio/mp4";
+  const type = ASSISTANT_MEDIA_TYPES.get(mime);
+  if (type?.kind !== "audio") {
+    const document = acceptFileBytes(mime, bytes);
+    return { ...document, name: withCanonicalExtension(filename, document.ext) };
+  }
+  if (bytes.byteLength === 0) throw new Error("file carried no bytes");
+  if (bytes.byteLength > FILE_MAX_BYTES) throw new Error("file is over the size cap");
+  if (!bytesMatchMediaType(mime, bytes, () => undefined))
+    throw new Error("file bytes did not match the declared allowed type");
+  return { mime, ext: type.ext, name: withCanonicalExtension(filename, type.ext) };
 }
 
 /** Shared byte-side acceptance for dashboard media and attach-v1's HTTP side channel. The latter

@@ -67,6 +67,37 @@ export function safeFilename(value: string, fallback = "attachment"): string | u
   return name === "." || name === ".." ? fallback : name;
 }
 
+/** A stored name ends in the accepted type's extension. Hermes classifies an attachment by its
+ * extension before its type, so `voice.mp4` accepted as `audio/mp4` would reach it as video. */
+export function withCanonicalExtension(name: string, ext: string): string {
+  if (name.toLowerCase().endsWith(`.${ext}`)) return name;
+  const dot = name.lastIndexOf(".");
+  return `${dot > 0 ? name.slice(0, dot) : name}.${ext}`;
+}
+
+/** The Content-Type the multipart part named "file" declared itself: "" when it declared none,
+ * undefined when the part cannot be found. A parsed `File` reports an undeclared part as
+ * "text/plain", an admitted type, so only the raw part headers tell the two apart. */
+export function declaredFilePartType(body: Uint8Array, contentType: string): string | undefined {
+  const boundary = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(contentType);
+  if (boundary === null) return undefined;
+  const raw = Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+  const delimiter = `--${boundary[1] ?? boundary[2]}`;
+  for (let at = raw.indexOf(delimiter, 0, "latin1"); at >= 0;) {
+    const start = at + delimiter.length + 2; // past the CRLF that ends the delimiter line
+    const end = raw.indexOf("\r\n\r\n", start, "latin1");
+    if (end < 0) return undefined;
+    const headers = raw.subarray(start, end).toString("latin1").split("\r\n");
+    const disposition = headers.find((line) => /^content-disposition:/i.test(line)) ?? "";
+    if (/;\s*name="?file"?\s*(;|$)/i.test(disposition)) {
+      const type = headers.find((line) => /^content-type:/i.test(line));
+      return type === undefined ? "" : type.slice(type.indexOf(":") + 1).trim();
+    }
+    at = raw.indexOf(delimiter, end, "latin1");
+  }
+  return undefined;
+}
+
 export function attachmentDisposition(name: string): string {
   const safe = safeFilename(name) ?? "attachment";
   const ascii = safe.replace(/[^A-Za-z0-9._-]/g, "_") || "attachment";

@@ -3062,6 +3062,15 @@ export const HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION = 4;
  * capability 17, and it is never inferred from that scalar. */
 export const AGENT_INBOX_CAPABILITY_ID = "com.cozylabs.agent-inbox";
 export const AGENT_INBOX_CAPABILITY_VERSION = 1;
+/** Voice notes on the chat attachment route. Version 1: `POST /bots/:name/chat/attachments` also
+ * admits one `audio/mp4` (AAC `.m4a`), `audio/mpeg`, `audio/wav` or `audio/x-wav` file under the
+ * route's 20 MiB cap, and relays it to the bot as attach-v1 media of family `audio` with
+ * `mediaKind: "audio"` on the transcript row. It does not say the bot can hear it: that is the
+ * bot's own transcription, when it has one. It is its own id rather than a `com.cozylabs.bots`
+ * row because gateways at different bots versions (CozyAgents' embedded one, this one) must each
+ * be able to advertise it without claiming the other's rows. */
+export const CHAT_AUDIO_CAPABILITY_ID = "com.cozylabs.chat-audio";
+export const CHAT_AUDIO_CAPABILITY_VERSION = 1;
 /** The phone-as-node capability, advertised beside the bots one.
  *  4: device status v2 answers over an authenticated origin, under a single-use lease.
  *  5: the phone can also capture a photo or a short video, hand over a file the person picked,

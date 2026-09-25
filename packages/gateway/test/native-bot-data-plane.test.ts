@@ -401,6 +401,30 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
+  // com.cozylabs.chat-audio 1. The stored media and the transcript row call a voice note audio,
+  // never a document, so attachment history and the phone render it as one.
+  it("relays an uploaded voice note under the audio family and a document under the file family", async () => {
+    const storage = openStorage(":memory:");
+    const plane = new NativeBotDataPlane({
+      control: {} as BotsSurface, storage,
+      ingress: { sendNativeTurn: () => true } as unknown as AttachV1Ingress,
+      nativeBots: ["sage", "cleo"], chatSuggestion: "", broadcast: () => undefined, now: () => 10,
+    });
+    const voice = (await plane.surface().sendChatAttachment("sage", {
+      bytes: Uint8Array.from([0, 0, 0, 20, 0x66, 0x74, 0x79, 0x70, 0x4d, 0x34, 0x41, 0x20]),
+      mime: "audio/mp4", name: "voice.m4a", text: "Listen.",
+    })).message.attachments?.[0]!;
+    const document = (await plane.surface().sendChatAttachment("cleo", {
+      bytes: new TextEncoder().encode("%PDF-1.7\n"), mime: "application/pdf", name: "report.pdf", text: "Read.",
+    })).message.attachments?.[0]!;
+    expect(voice).toMatchObject({ mimeType: "audio/mp4", mediaKind: "audio" });
+    expect(storage.attachMediaInfo("sage", voice.fileId, 10)?.descriptor.family).toBe("audio");
+    expect(document).toMatchObject({ mimeType: "application/pdf", mediaKind: "file" });
+    expect(storage.attachMediaInfo("cleo", document.fileId, 10)?.descriptor.family).toBe("file");
+    plane.close();
+    storage.close();
+  });
+
   it("steers a follow-up into the active native turn without replacing its binding", async () => {
     const storage = openStorage(":memory:");
     const turns: Array<Record<string, unknown>> = [];

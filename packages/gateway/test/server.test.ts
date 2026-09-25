@@ -343,6 +343,8 @@ describe("GatewayInfo.capabilities wiring", () => {
       expect(health.capabilities).toMatchObject({ approvals: 1, "com.cozylabs.bots": expect.any(Number) });
       // agent-inbox 1: the assignment store is always present, so every shape advertises it.
       expect(health.capabilities?.["com.cozylabs.agent-inbox"]).toBe(1);
+      // chat-audio 1: the chat attachment route accepts voice notes wherever Bot Mode is served.
+      expect(health.capabilities?.["com.cozylabs.chat-audio"]).toBe(1);
       expect(health.botRuntimes).toEqual(["hermes"]);
     } finally {
       await gw.close();
@@ -499,6 +501,7 @@ describe("GatewayInfo.capabilities wiring", () => {
         "com.cozylabs.cozyapps": 2,
         "com.cozylabs.bots": expect.any(Number),
         "com.cozylabs.agent-inbox": 1,
+        "com.cozylabs.chat-audio": 1,
         "com.cozylabs.hermes-desktop-sessions": 4,
         "com.cozylabs.harness-settings": 1,
         "com.cozylabs.chat-configuration": 1,
