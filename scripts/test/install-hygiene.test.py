@@ -26,7 +26,7 @@ class NativeHygieneTest(unittest.TestCase):
         self.assets = self.base / "release"
         self.node = os.environ.get("COZYGATEWAY_TEST_REAL_NODE") or shutil.which("node")
         version = subprocess.check_output([self.node, "-p", "process.versions.node"], text=True)
-        self.assertEqual(version.split(".")[0], "24", "run this fixture with Node.js 24 on PATH")
+        self.assertEqual(version.split(".")[0], "26", "run this fixture with Node.js 26 on PATH")
         for path in (self.home, self.bin, self.assets, self.hermes):
             path.mkdir(parents=True)
         prompt_input = self.base / "negative-prompts"
