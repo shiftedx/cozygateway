@@ -207,6 +207,12 @@ gateway-owned assignment rows, not a reading of Hermes session text, which is wh
 waited for. Every gateway advertises it, because the assignment store is part of every
 gateway's storage.
 
+`com.cozylabs.chat-audio` is likewise its own id. Version 1 means the chat attachment route
+accepts voice notes (see [Attachments and media](#attachments-and-media) below). It is not a
+`com.cozylabs.bots` row because gateways at different bots versions, CozyAgents' embedded gateway
+and this one, must each be able to advertise it without claiming the other's rows. This gateway
+advertises it wherever it serves Bot Mode. A client offers voice notes only when it is present.
+
 ## Resources
 
 The TypeBox schemas are normative. The names below identify complete shapes rather than maintaining
@@ -898,6 +904,23 @@ CSV, JSON, or RTF; legacy Office; OOXML; and OpenDocument files. The gateway che
 allow-listed MIME against lightweight format bytes, stores the sanitized filename as metadata, and
 serves every attachment with `Content-Disposition: attachment` and `nosniff`.
 
+`com.cozylabs.chat-audio` 1 admits a voice note on the same route, one per turn: `audio/mp4` (AAC
+`.m4a`), `audio/mpeg` (MP3), `audio/wav`, or `audio/x-wav`. It keeps the route's 20 MiB cap, not
+the 40 MiB cap assistant audio carries. A declared `audio/m4a` or `audio/x-m4a` is stored as
+`audio/mp4`, and so is a file named `*.m4a` whose declared type the route does not admit (missing,
+`application/octet-stream`, and so on). Parameters on a declared type are ignored. The bytes are
+checked with the same magic as the [canonical allowlist](#canonical-media-allowlist): an ISO BMFF
+`ftyp` box that is not QuickTime for `audio/mp4`, an ID3 tag or MPEG frame sync for `audio/mpeg`,
+and `RIFF` plus `WAVE` for WAV. Refusals take the document shapes: `413` `too_large`, `400`
+`empty`, and `415` `content_type`, each under extension code `media_refused`.
+
+The gateway decides the attach-v1 media family from the accepted MIME, exactly as
+`POST /attach/v1/media/:mediaId` does: a voice note is relayed as family `audio` and its transcript
+attachment carries `mediaKind: "audio"`, while every document stays family `file`. A runtime peer
+that transcribes speech keys on that family, or on the served `audio/*` type. The Hermes attach
+plugin hands the downloaded MIME to Hermes, whose own speech-to-text takes any `audio/*`
+attachment, so a Hermes profile needs no plugin change.
+
 ### Inline media ordering (capability 32)
 
 An attachment entry on `BotChatMessage.attachments` may carry an optional `position`: the index in
@@ -1058,7 +1081,7 @@ in this table are exported from `packages/contract/src/ext-bots.ts`.
 | `POST /bots/:name/chat/messages` | `BotChatSendRequest` | `202 { name, sessionId, message: BotChatMessage }` | Admits a native turn or steer, then appends locally. |
 | `POST /bots/:name/chat/messages/displayed` | `BotChatDisplayedRequest` | `202 BotChatDisplayedResponse` | Capability 31. Records that this device displayed those rows. |
 | `POST /bots/:name/chat/photos` | multipart `file`, `BotChatPhotoFields` | `202 { name, sessionId, message: BotChatMessage }` | One validated image plus optional caption. |
-| `POST /bots/:name/chat/attachments` | multipart `file`, `BotChatAttachmentFields` | `202 { name, sessionId, message: BotChatMessage }` | One validated PDF, text, RTF, Office, or OpenDocument file plus optional caption. |
+| `POST /bots/:name/chat/attachments` | multipart `file`, `BotChatAttachmentFields` | `202 { name, sessionId, message: BotChatMessage }` | One validated PDF, text, RTF, Office, or OpenDocument file plus optional caption. With `com.cozylabs.chat-audio` 1, also one AAC, MP3, or WAV voice note. |
 | `POST /bots/:name/chat/stop` | — | `BotChatStopResponse` | Interrupts the current native turn; returns 409 when idle. |
 | `POST /bots/:name/chat/reset` | — | `BotChatResetResponse` | Selects a fresh native chat and emits reset. |
 | `GET /bots/:name/chat/attachments/:fileId` | optional single `Range` | attachment bytes | Gateway-owned attachment only. |

@@ -9,6 +9,8 @@ import {
   APPROVALS_CAPABILITY_VERSION,
   BOTS_CAPABILITY_ID,
   BOTS_CAPABILITY_VERSION,
+  CHAT_AUDIO_CAPABILITY_ID,
+  CHAT_AUDIO_CAPABILITY_VERSION,
   CHAT_CONFIGURATION_CAPABILITY_ID,
   CHAT_CONFIGURATION_CAPABILITY_VERSION,
   CHAT_CONTEXT_CAPABILITY_ID,
@@ -273,6 +275,9 @@ export function gatewayInfoForConfig(
       // Bot Mode is shared by Hermes and generic attach peers, so its coarse capability version
       // cannot select a creation runtime. `botRuntimes` is the additive deployment selector.
       [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION,
+      // Voice notes on the chat attachment route, served wherever Bot Mode is. Its own id, never a
+      // bots row, so an embedded gateway at another bots version can advertise it too.
+      [CHAT_AUDIO_CAPABILITY_ID]: CHAT_AUDIO_CAPABILITY_VERSION,
       [CHAT_CONFIGURATION_CAPABILITY_ID]: CHAT_CONFIGURATION_CAPABILITY_VERSION,
       [CHAT_CONTEXT_CAPABILITY_ID]: CHAT_CONTEXT_CAPABILITY_VERSION,
       [PROVIDER_CONNECTIONS_CAPABILITY_ID]: PROVIDER_CONNECTIONS_CAPABILITY_VERSION,

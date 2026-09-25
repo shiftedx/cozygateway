@@ -5,6 +5,19 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## Unreleased: chat voice notes
+
+- A phone can send a bot a voice note (`com.cozylabs.chat-audio` 1).
+  `POST /bots/:name/chat/attachments` now also admits one `audio/mp4` (AAC `.m4a`), `audio/mpeg`,
+  `audio/wav`, or `audio/x-wav` file under the route's 20 MiB cap, checked against the same format
+  magic as the attach media allowlist. `audio/m4a`, `audio/x-m4a`, and an `.m4a` name without an
+  admitted type are read as `audio/mp4`. The gateway relays a voice note as attach-v1 media of
+  family `audio` rather than `file`, so a runtime peer such as CozyAgents can transcribe it, and the
+  transcript row carries `mediaKind: "audio"`. Hermes profiles need no plugin change: the plugin
+  passes the audio MIME to Hermes, whose own speech-to-text takes it. The capability is its own id,
+  not a `com.cozylabs.bots` row, so CozyAgents' embedded gateway can advertise it at its own bots
+  version.
+
 ## Unreleased: client-declared MCP servers
 
 - A chat client can declare a bot's remote MCP servers (`com.cozylabs.bots` capability 89, #362):
