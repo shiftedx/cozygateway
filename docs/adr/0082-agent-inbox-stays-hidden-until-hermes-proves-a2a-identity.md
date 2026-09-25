@@ -1,5 +1,5 @@
 ---
-status: superseded by capability com.cozylabs.agent-inbox 1
+status: superseded by capability com.cozylabs.agent-inbox 1; amended by ADR 0086
 ---
 
 # ADR 0082: Agent Inbox stays hidden until Hermes proves A2A identity

@@ -999,11 +999,10 @@ CREATE TABLE IF NOT EXISTS cozy_app_dashboards (
   revision INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 ) STRICT;
--- Capability 49. A Bot the gateway itself owns, created through "POST /bots {runtime}" rather than
--- declared in the config file, so creating one needs no restart and no operator at a terminal. The
--- config-file "bots" array remains a bootstrap source and a row here wins on collision. "token" is
--- the attach credential this gateway minted for the bot: it is a secret, it is never logged, never
--- projected on any route, and never written into an operation receipt.
+-- Capability 49, retired here in 0.8.6 (ADR 0086). A CozyAgents runtime bot this gateway once
+-- created through "POST /bots {runtime}". Nothing writes a row any more, a config "bots" block is
+-- refused at load, and a row left from before is never attached. The table stays so an older
+-- database opens unchanged. "token" was the minted attach credential: never logged or projected.
 CREATE TABLE IF NOT EXISTS runtime_bots (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,

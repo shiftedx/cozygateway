@@ -1,8 +1,13 @@
 # TB1 burner test bed
 
 A disposable full-surface bed on one Mac: a CozyGateway in Docker, two burner Hermes
-agents, a burner CozyAgents runner with two runtime bots, and a CozyChat simulator.
-Everything is named `burner-` and none of it touches production.
+agents, a burner runner paired as a remote computer, and a CozyChat simulator. Everything is
+named `burner-` and none of it touches production.
+
+Since 0.8.6 CozyGateway connects Hermes (and, soon, OpenClaw) bots only
+([ADR 0086](../docs/adr/0086-cozygateway-connects-hermes-and-openclaw-only.md)). The
+`burner-ca-*` CozyAgents runtime bots named below cannot be created on this bed any more;
+CozyAgents bots belong on CozyAgents' own bundled gateway.
 
 ## What it must never touch
 
@@ -223,19 +228,9 @@ otherwise resolves `serve` as `../cli.js` relative to its own module, which does
 beside the single-file bundle, and every bot dies `readiness_failed` until the restart
 budget is exhausted.
 
-**Create the two runtime bots ONE AT A TIME**, waiting for the first to reach `ready`:
-
-```sh
-curl -X POST http://<lan-ip>:8795/bots -H "authorization: Bearer <deviceToken>" \
-  -H 'content-type: application/json' -d '{"name":"burner-ca-one","runtime":"cozyagents"}'
-```
-
-Created together, both are assigned the same readiness port (the allocator scans for a
-free port and neither has bound yet) and the second fails `child_ownership_ambiguous`.
-Recovering it is not enough: the port is re-read from the stale `bot.env`, so a genuine
-retry means deleting the bot, removing
-`<scratch>/tb1/cozyagents-home/bots/<botId>`, restarting the runner so its in-memory
-ledger drops the row, and creating again.
+**No runtime bots here.** `POST /bots {"runtime": "cozyagents"}` answers
+`503 backend_unavailable` on this gateway, and a config `bots` block is refused at load
+(ADR 0086). To test CozyAgents bots, run CozyAgents' bundled gateway and attach them there.
 
 ## CozyChat simulator
 

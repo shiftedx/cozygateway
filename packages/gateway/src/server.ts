@@ -277,7 +277,8 @@ export function gatewayInfoForConfig(
       [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION,
       // The chat attachment route accepts voice notes and relays them as audio, wherever Bot Mode
       // is served. Whether a bot understands one is up to the bot's own transcription. Its own id,
-      // never a bots row, so an embedded gateway at another bots version can advertise it too.
+      // never a bots row, so CozyAgents' bundled gateway, at another bots version, can advertise
+      // it too.
       [CHAT_AUDIO_CAPABILITY_ID]: CHAT_AUDIO_CAPABILITY_VERSION,
       [CHAT_CONFIGURATION_CAPABILITY_ID]: CHAT_CONFIGURATION_CAPABILITY_VERSION,
       [CHAT_CONTEXT_CAPABILITY_ID]: CHAT_CONTEXT_CAPABILITY_VERSION,

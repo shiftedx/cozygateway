@@ -53,7 +53,7 @@ function ftypMajorBrand(bytes: Uint8Array): string | undefined {
 /** Audio-appropriate ISO BMFF major brands, four bytes each (the trailing space in `M4A ` and
  * `M4B ` is part of the brand). An `audio/mp4` declaration is refused for any other brand,
  * including a still-image container that is also ISO BMFF (`heic`, `avif`) and QuickTime's `qt  `.
- * The same list as CozyAgents' embedded gateway. */
+ * The same list as CozyAgents' bundled gateway. */
 const AUDIO_MP4_BRANDS = new Set(["M4A ", "M4B ", "mp42", "isom", "iso2"]);
 
 function isAudioMp4(bytes: Uint8Array): boolean {

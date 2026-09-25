@@ -108,8 +108,9 @@ export interface NativeBotDataPlaneOptions {
   storage: Storage;
   ingress: AttachV1Ingress;
   nativeBots: Iterable<string>;
-  /** Config-declared bots served by a non-Hermes runtime. They have no Dashboard profile, so their
-   * roster row is built here and their Dashboard-backed surfaces refuse instead of asking. */
+  /** Bots served by a non-Hermes runtime, built here with no Dashboard profile. CozyGateway passes
+   * none since 0.8.6 (ADR 0086): CozyAgents bots attach to CozyAgents' bundled gateway, whose copy
+   * of this plane passes them. Kept so the two copies stay the same code. */
   runtimeBots?: readonly {
     id: string;
     name: string;
