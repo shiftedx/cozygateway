@@ -1801,14 +1801,28 @@ be an assignee: CozyAgents today dereferences `context.room.name` (`prompt-size.
 `runtime.ts`) and must be fixed before CozyAgents assignees ship. Its final reply is stored as `finalText`; the last line
 that starts with `Result:` (also `**Result:**` or `**Result**:`; a status word after it on the
 same line counts as the status) opens a block whose `status:` must be `done`, `partial` or `blocked`,
-whose `artifacts:` (a comma list and/or `- ` bullets) become up to 32 references, and whose other
-lines become `summary`. A reference is one token with no whitespace, once trimmed and unwrapped
-from backticks, that contains a `/` or a `.` followed by a letter or digit: a path, a file name or
-a link. An `artifacts:` line is split at commas only when every non-empty part is a reference;
-otherwise it is prose, stays whole as a `summary` line, and names no artifact. A `- ` bullet under
-it is tested on its own the same way. A reply with no valid block has no `result`: its absence is
-recorded and never invented. Drafts, tool steps, approvals and clarifications on an assignment thread have no
-projection in v1 and are acknowledged so the peer's stream keeps moving.
+whose `artifacts:` line (a comma list and/or `- ` bullets) names up to 32 references, and whose
+other lines become `summary`. A reply with no valid block has no `result`: its absence is recorded
+and never invented.
+
+The artifacts rule, which CozyAgents' bundled gateway applies too:
+
+1. Lines are read in order. A `status:`, `summary:`, `changed:` or `what changed:` line, bulleted
+   or not, is always that key. The `artifacts:` line starts a listing; each bullet (`- ` or `* `)
+   after it is listed too, until a line that is neither.
+2. The text after `artifacts:`, and each listed bullet, is split into parts. Each Markdown link
+   `[text](url)` is first replaced by its URL. The text is then split at each comma followed by
+   whitespace or ending the text, so a comma inside a URL splits nothing.
+3. Each part is trimmed and unwrapped from one pair of backticks, then judged on its own. It is a
+   reference when it has no whitespace and is a URL (`scheme://...`), or else, being neither `n/a`
+   in any case nor an email address (an `@` with no `/`), is a path (contains `/`) or a file name
+   (ends in `.` and an extension of letters and digits with at least one letter). Any other part
+   is prose and is dropped: `none`, `N/A`, `v1.2`, `kyle@example.com` and `e.g.` name nothing.
+4. The listing never reaches `summary`, so `artifacts: none` names no artifact and adds nothing.
+   References are deduplicated in order and capped at 32.
+
+Drafts, tool steps, approvals and clarifications on an assignment thread have no projection in v1
+and are acknowledged so the peer's stream keeps moving.
 
 **State** is derived on every read and never stored. First match wins:
 
