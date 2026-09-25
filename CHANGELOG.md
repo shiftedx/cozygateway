@@ -14,6 +14,10 @@ release; everything older is marked pre-release so installers resolve one "lates
   `audio/x-m4a`, and an `.m4a` name on a part that declares no type, or a type the route does not
   admit, are read as `audio/mp4`. The gateway stores a voice note as attach media of family
   `audio`, serves it as `audio/*`, and marks the transcript row `mediaKind: "audio"`.
+- `audio/mp4` now requires an audio `ftyp` major brand (`M4A `, `M4B `, `mp42`, `isom`, or `iso2`)
+  wherever the gateway sniffs it, the attach media upload route included, matching CozyAgents'
+  embedded gateway. QuickTime, `heic`, `avif`, and any other brand are refused as `audio/mp4`;
+  `video/mp4` is unchanged.
 - The capability says the gateway accepts and relays voice notes, not that a bot understands them.
   CozyAgents transcribes a voice note when its transcription is set up, taking the family from the
   served Content-Type. A Hermes profile transcribes one when its own speech-to-text is configured,

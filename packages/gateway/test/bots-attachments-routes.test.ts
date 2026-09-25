@@ -88,6 +88,18 @@ describe("capability-24 bot attachment routes", () => {
     expect(sendChatAttachment).toHaveBeenCalledWith("sage", expect.objectContaining({ mime, name }), { deviceId: "device-1" });
   });
 
+  it("accepts an iOS AVAudioRecorder AAC .m4a (major brand 'M4A ')", async () => {
+    const { app, sendChatAttachment } = fixture();
+    const recorded = Uint8Array.from([
+      0x00, 0x00, 0x00, 0x1c, 0x66, 0x74, 0x79, 0x70, 0x4d, 0x34, 0x41, 0x20, 0x00, 0x00, 0x00, 0x00,
+      0x4d, 0x34, 0x41, 0x20, 0x6d, 0x70, 0x34, 0x32, 0x69, 0x73, 0x6f, 0x6d,
+      0x00, 0x00, 0x00, 0x08, 0x66, 0x72, 0x65, 0x65,
+    ]);
+    const response = await app.request("/bots/sage/chat/attachments", { method: "POST", body: multipart("audio/mp4", recorded, "voice.m4a") });
+    expect(response.status).toBe(202);
+    expect(sendChatAttachment).toHaveBeenCalledWith("sage", expect.objectContaining({ mime: "audio/mp4", name: "voice.m4a" }), { deviceId: "device-1" });
+  });
+
   // A file part with no Content-Type of its own is "text/plain" once parsed, which the route
   // admits, so only the raw part headers can tell "declared nothing" from "declared text".
   it("reads an untyped voice.m4a part as audio/mp4", async () => {
@@ -133,6 +145,8 @@ describe("capability-24 bot attachment routes", () => {
 
   it.each([
     ["audio/mp4", "voice.m4a", ftyp("qt  ")],
+    ["audio/mp4", "voice.m4a", ftyp("heic")],
+    ["audio/mp4", "voice.m4a", ftyp("avif")],
     ["audio/wav", "voice.wav", id3],
     ["audio/mpeg", "voice.mp3", wave],
     ["audio/x-m4a", "voice.m4a", new TextEncoder().encode("not audio at all")],

@@ -45,6 +45,22 @@ function isQuickTime(bytes: Uint8Array): boolean {
   return isIsoBaseMedia(bytes) && at(bytes, 8, 0x71, 0x74, 0x20, 0x20); // QuickTime `qt  ` brand.
 }
 
+function ftypMajorBrand(bytes: Uint8Array): string | undefined {
+  if (!isIsoBaseMedia(bytes)) return undefined;
+  return String.fromCharCode(bytes[8]!, bytes[9]!, bytes[10]!, bytes[11]!);
+}
+
+/** Audio-appropriate ISO BMFF major brands, four bytes each (the trailing space in `M4A ` and
+ * `M4B ` is part of the brand). An `audio/mp4` declaration is refused for any other brand,
+ * including a still-image container that is also ISO BMFF (`heic`, `avif`) and QuickTime's `qt  `.
+ * The same list as CozyAgents' embedded gateway. */
+const AUDIO_MP4_BRANDS = new Set(["M4A ", "M4B ", "mp42", "isom", "iso2"]);
+
+function isAudioMp4(bytes: Uint8Array): boolean {
+  const brand = ftypMajorBrand(bytes);
+  return brand !== undefined && AUDIO_MP4_BRANDS.has(brand);
+}
+
 function bytesMatchMediaType(
   declared: string,
   bytes: Uint8Array,
@@ -52,7 +68,8 @@ function bytesMatchMediaType(
 ): boolean {
   if (declared.startsWith("image/")) return sniffImage(bytes) === declared;
   if (declared === "video/quicktime") return isQuickTime(bytes);
-  if (declared === "video/mp4" || declared === "audio/mp4") return isIsoBaseMedia(bytes) && !isQuickTime(bytes);
+  if (declared === "video/mp4") return isIsoBaseMedia(bytes) && !isQuickTime(bytes);
+  if (declared === "audio/mp4") return isAudioMp4(bytes);
   if (declared === "audio/mpeg") {
     return at(bytes, 0, 0x49, 0x44, 0x33) || (bytes[0] === 0xff && (bytes[1]! & 0xe0) === 0xe0);
   }

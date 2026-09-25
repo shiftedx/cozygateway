@@ -917,8 +917,8 @@ not admit such as `application/octet-stream`. The gateway reads that from the pa
 part that does declare `text/plain` is a text document whatever its name. Parameters on a
 declared type are ignored. The bytes are
 checked with the same magic as the [canonical allowlist](#canonical-media-allowlist): an ISO BMFF
-`ftyp` box that is not QuickTime for `audio/mp4`, an ID3 tag or MPEG frame sync for `audio/mpeg`,
-and `RIFF` plus `WAVE` for WAV. Refusals take the document shapes: `413` `too_large`, `400`
+`ftyp` box with an audio major brand for `audio/mp4`, an ID3 tag or MPEG frame sync for
+`audio/mpeg`, and `RIFF` plus `WAVE` for WAV. Refusals take the document shapes: `413` `too_large`, `400`
 `empty`, and `415` `content_type`, each under extension code `media_refused`.
 
 Every attachment on this route, document or voice note, is stored under the accepted type's
@@ -991,6 +991,12 @@ refused at the gateway, so a plugin that offers one is guaranteed a 415.
 
 The container MIME is what the gateway checks. Codec-level facts for MP4 (H.264 plus AAC-LC,
 `yuv420p`, fast-start) are a plugin-side probe: this layer sees a container, not a stream.
+
+`audio/mp4` additionally requires one of the audio major brands `M4A `, `M4B `, `mp42`, `isom`, or
+`iso2` in its `ftyp` box, four bytes each (the trailing space in `M4A ` and `M4B ` is part of the
+brand). QuickTime's `qt  `, still-image containers such as `heic` and `avif`, and every other brand
+are refused as `audio/mp4`. `video/mp4` keeps the broader check: any ISO BMFF brand but `qt  `.
+CozyAgents' embedded gateway applies the same list.
 
 `image/svg+xml`, `text/html`, and every other type are excluded on purpose. SVG and HTML carry
 script and external references. Excluded means refused at upload, never silently transcoded.
