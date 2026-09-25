@@ -15,8 +15,10 @@ bot-settings lane ([ADR 0086](docs/adr/0086-cozygateway-connects-hermes-and-open
   read it since 0.8.6, and each such bot was refused `1008` forever while `/health` said
   `attach.configured: 0`. Remove it; the row belongs in the config of CozyAgents' bundled gateway.
 - `com.cozylabs.agent-inbox` is not advertised, because no bot here can lead: a Hermes
-  profile has no team tools. CozyChat hides the Agent Inbox and the Team section. The assignment
-  routes stay, unadvertised, for a future Hermes or OpenClaw leader.
+  profile has no team tools. CozyChat hides the Agent Inbox and the Team section. To match, a
+  profile patch carrying `role` or `reports` is `400 invalid_request`, and no profile read or
+  roster row carries `role`. The assignment routes stay, unadvertised, for a future Hermes or
+  OpenClaw leader.
 - A `Result:` block's `artifacts:` line is split at commas only when every part is a path, file
   name or link. A prose line stays whole in `summary` and names no artifact.
 

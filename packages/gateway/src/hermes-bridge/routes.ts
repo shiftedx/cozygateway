@@ -1447,7 +1447,7 @@ export function registerBotRoutes(
     const membership = { ...(role === undefined ? {} : { role }), ...(reports === undefined ? {} : { reports }) };
     const teamRequested = (["role", "reports"] as const).filter((key) => parsed[key] !== undefined);
     if (teamRequested.length > 0) {
-      if (team === undefined) return c.json(errorBody("invalid_request", "team roles are not available on this gateway"), 400);
+      if (team === undefined) return c.json(errorBody("invalid_request", "leader teams are not available on this gateway"), 400);
       try {
         team.check(name, membership);
       } catch (err) {

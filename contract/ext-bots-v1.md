@@ -215,7 +215,10 @@ gateway-owned assignment rows, not a reading of Hermes session text, which is wh
 waited for. A gateway advertises it only when a bot on it can lead. cozygateway does not: a
 Hermes profile has no team tools, and CozyAgents bots attach to CozyAgents' bundled gateway
 (ADR 0086). Without it CozyChat hides the Agent Inbox, whose only threads are assignments, and the
-Team section. cozygateway keeps the routes below for a future Hermes or OpenClaw leader.
+Team section. So that nothing contradicts that, while agent-inbox is not advertised a profile patch
+carrying `role` or `reports` is `400 invalid_request` ("leader teams are not available on this
+gateway"), and neither the profile read nor any roster row carries `role`. cozygateway keeps the
+routes below for a future Hermes or OpenClaw leader.
 
 `com.cozylabs.chat-audio` is likewise its own id. Version 1 means the chat attachment route
 accepts voice notes and relays them to the bot as audio (see

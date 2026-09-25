@@ -72,11 +72,19 @@ it("a leader assigns to a Hermes profile over attach-v1 and acknowledges the res
     plugin.send(JSON.stringify({ kind: "hello", version: 2, instanceId: "hermes-scout", capabilities: ["draft"], resume: { eventSequence: 0, commandSequence: 0 } }));
     await until(() => pluginFrames.some((frame) => frame.kind === "hello_ack"));
 
-    // Only a leader may assign, and the team is set from the phone.
+    // Only a leader may assign. While agent-inbox is not advertised the phone cannot make one, so
+    // the leader row a future Hermes or OpenClaw leader would get is written directly here.
     const refused = await lead("/bots/lead/assignments", { to: "scout", brief: "Check CI", doneCriteria: "main is green" });
     expect(refused.status).toBe(409);
     expect(await refused.json()).toMatchObject({ reason: "not_leader" });
-    expect((await device("/bots/lead/profile", { method: "PATCH", body: JSON.stringify({ role: "leader", reports: ["scout"] }) })).status).toBe(200);
+    const teamPatch = await device("/bots/lead/profile", { method: "PATCH", body: JSON.stringify({ role: "leader", reports: ["scout"] }) });
+    expect(teamPatch.status).toBe(400);
+    expect(await teamPatch.json()).toMatchObject({ error: { code: "invalid_request", message: "leader teams are not available on this gateway" } });
+    gateway.storage.setBotTeam({ bot: "lead", role: "leader", reports: ["scout"], updatedAt: Date.now() });
+    // Nor does any roster row or profile read say `role`, so CozyChat shows no leader badge.
+    const roster = (await (await device("/bots")).json()) as { bots: Array<{ name: string; role?: string }> };
+    expect(roster.bots.find((bot) => bot.name === "lead")).not.toHaveProperty("role");
+    expect(await (await device("/bots/lead/profile")).json()).not.toHaveProperty("role");
 
     const created = await lead("/bots/lead/assignments", { to: "scout", brief: "Check CI", doneCriteria: "main is green", idempotencyKey: "ci-1" });
     expect(created.status).toBe(201);

@@ -37,9 +37,10 @@ subtree and run by the CozyAgents runner service on port 8790.
 - A config naming CozyAgents runtime bots (a `bots` block) is refused at load, by name.
   `POST /bots {runtime: "cozyagents"}` answers `503 backend_unavailable`.
 - `com.cozylabs.agent-inbox` is not advertised here, because no bot here can lead. CozyChat then
-  hides the Agent Inbox, whose only threads are assignments, and the Team section. The
-  leader-assignment routes stay, unadvertised, for a future Hermes or OpenClaw leader. This amends
-  ADR 0082's supersession note.
+  hides the Agent Inbox, whose only threads are assignments, and the Team section. To match, a
+  profile patch carrying `role` or `reports` is refused with `400`, and no profile read or roster
+  row carries `role`. The leader-assignment routes stay, unadvertised, for a future Hermes or
+  OpenClaw leader. This amends ADR 0082's supersession note.
 - Capability rows stay shared with CozyAgents' bundled gateway, so neither gateway reuses the
   other's numbers. Row 79 stays reserved for CozyAgents bot settings. Contract sections about
   `runtime: "cozyagents"` bots describe that gateway, not this one.

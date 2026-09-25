@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
 import type { MiddlewareHandler } from "hono";
-import type { ServerFrame } from "cozygateway-contract";
+import type { BotSummary, ServerFrame } from "cozygateway-contract";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2354,7 +2354,7 @@ describe("native runtime bots", () => {
     storage.close();
   });
 
-  it("carries role: leader on a runtime bot's roster row once the gateway makes it a leader", async () => {
+  it.each([true, false])("carries role: leader on roster rows only where leader teams are advertised (%s)", async (leaderTeams) => {
     const storage = openStorage(":memory:");
     storage.setBotTeam({ bot: "sage", role: "leader", reports: [], updatedAt: 7 });
     const control = {
@@ -2369,9 +2369,18 @@ describe("native runtime bots", () => {
       chatSuggestion: "",
       broadcast: () => undefined,
       now: () => 7,
+      ...(leaderTeams ? { leaderTeams } : {}),
     });
+    // A Hermes row arrives from the bridge with `role` already set from the same team table.
+    const hermesRow = { name: "lead", displayName: "Lead", role: "leader" } as unknown as BotSummary;
 
-    expect(plane.rosterBots([])).toMatchObject([{ name: "sage", role: "leader" }]);
+    const rows = plane.rosterBots([hermesRow]);
+    if (leaderTeams) {
+      expect(rows).toMatchObject([{ name: "lead", role: "leader" }, { name: "sage", role: "leader" }]);
+    } else {
+      expect(rows.map((row) => row.name)).toEqual(["lead", "sage"]);
+      for (const row of rows) expect(row).not.toHaveProperty("role");
+    }
 
     plane.close();
     storage.close();
