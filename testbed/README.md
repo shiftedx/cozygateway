@@ -229,8 +229,8 @@ beside the single-file bundle, and every bot dies `readiness_failed` until the r
 budget is exhausted.
 
 **No runtime bots here.** `POST /bots {"runtime": "cozyagents"}` answers
-`503 backend_unavailable` on this gateway, and a config `bots` block is refused at load
-(ADR 0086). To test CozyAgents bots, run CozyAgents' bundled gateway and attach them there.
+`503 backend_unavailable` on this gateway, and a config `bots` block is ignored with a
+warning (ADR 0086). To test CozyAgents bots, run CozyAgents' bundled gateway and attach them there.
 
 ## CozyChat simulator
 

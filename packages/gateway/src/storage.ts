@@ -1001,7 +1001,7 @@ CREATE TABLE IF NOT EXISTS cozy_app_dashboards (
 ) STRICT;
 -- Capability 49, retired here in 0.8.6 (ADR 0086). A CozyAgents runtime bot this gateway once
 -- created through "POST /bots {runtime}". Nothing writes a row any more, a config "bots" block is
--- refused at load, and a row left from before is never attached. The table stays so an older
+-- ignored at load, and a row left from before is never attached. The table stays so an older
 -- database opens unchanged. "token" was the minted attach credential: never logged or projected.
 CREATE TABLE IF NOT EXISTS runtime_bots (
   id TEXT PRIMARY KEY,

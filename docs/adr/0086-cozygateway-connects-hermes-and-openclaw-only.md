@@ -35,7 +35,9 @@ subtree and run by the CozyAgents runner service on port 8790.
 
 - A feature for CozyAgents bots goes to CozyAgents' bundled gateway, not here.
 - A feature here must serve Hermes or OpenClaw connectivity.
-- A config naming CozyAgents runtime bots (a `bots` block) is refused at load, by name.
+- A config naming CozyAgents runtime bots (a `bots` block) is dropped at load and named in a
+  warning when the gateway starts. Refusing it stopped an upgraded gateway from starting, and
+  `cozyagents init` had told people to add one (amended for 0.9.0).
   `POST /bots {runtime: "cozyagents"}` answers `503 backend_unavailable`.
 - `com.cozylabs.agent-inbox` is not advertised here, because no bot here can lead. CozyChat then
   hides the Agent Inbox, whose only threads are assignments, and the Team section. To match, a

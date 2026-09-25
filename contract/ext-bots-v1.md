@@ -11,7 +11,7 @@ CozyAgents' own bundled gateway
 ([ADR 0086](../docs/adr/0086-cozygateway-connects-hermes-and-openclaw-only.md)). Both gateways
 serve this extension and share its capability rows. Rows and sections about `runtime:
 "cozyagents"` bots describe CozyAgents' bundled gateway. CozyGateway hosts no runtime bots: it
-refuses a config `bots` block at load, answers `POST /bots {runtime: "cozyagents"}` with `503
+ignores a config `bots` block (with a warning at `serve`), answers `POST /bots {runtime: "cozyagents"}` with `503
 backend_unavailable`, and has no bot-settings lane.
 
 ## Ownership and boundaries

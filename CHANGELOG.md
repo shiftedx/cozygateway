@@ -5,15 +5,18 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
-## Unreleased: Hermes and OpenClaw only
+## 0.9.0 (2026-09-25): Hermes and OpenClaw only
+
+### Hermes and OpenClaw only
 
 CozyGateway connects Hermes (and, soon, OpenClaw) bots to CozyChat. CozyAgents bots use
 CozyAgents' own bundled gateway. CozyGateway hosts no CozyAgents runtime bots and has no
 bot-settings lane ([ADR 0086](docs/adr/0086-cozygateway-connects-hermes-and-openclaw-only.md)).
 
-- A config `bots` block is refused at load, by name. It named CozyAgents runtime bots, nothing had
-  read it since 0.8.6, and each such bot was refused `1008` forever while `/health` said
-  `attach.configured: 0`. Remove it; the row belongs in the config of CozyAgents' bundled gateway.
+- A config `bots` block is ignored, and `serve` names it in a warning. It named CozyAgents runtime
+  bots, nothing had read it since 0.8.6, and each such bot was refused `1008` forever while
+  `/health` said `attach.configured: 0`. The gateway still starts with one, so an upgrade does
+  not fail on it. Remove it; the row belongs in the config of CozyAgents' bundled gateway.
 - `com.cozylabs.agent-inbox` is not advertised, because no bot here can lead: a Hermes
   profile has no team tools. CozyChat hides the Agent Inbox and the Team section. To match, a
   profile patch carrying `role` or `reports` is `400 invalid_request`, and no profile read or
@@ -24,7 +27,7 @@ bot-settings lane ([ADR 0086](docs/adr/0086-cozygateway-connects-hermes-and-open
   a comma inside a URL does not split it, and prose such as `none`, `N/A`, `v1.2` or `e.g.` names
   nothing and is not added to `summary`.
 
-## Unreleased: chat voice notes
+### Chat voice notes
 
 - The chat attachment route accepts voice notes and relays them as audio
   (`com.cozylabs.chat-audio` 1). `POST /bots/:name/chat/attachments` now also admits one
@@ -48,7 +51,10 @@ bot-settings lane ([ADR 0086](docs/adr/0086-cozygateway-connects-hermes-and-open
 - The capability is its own id, not a `com.cozylabs.bots` row, so CozyAgents' bundled gateway can
   advertise it at its own bots version.
 
-## Unreleased: client-declared MCP servers
+### Client-declared MCP servers
+
+These routes serve a runtime peer that offers `mcp_server_declarations`. No bot on this gateway
+does yet: every Hermes bot answers `409 unsupported_for_runtime`.
 
 - A chat client can declare a bot's remote MCP servers (`com.cozylabs.bots` capability 89, #362):
   `PATCH /bots/:name/profile` gains `declareMcpServers` and `removeMcpServers`, carried on the
@@ -62,9 +68,13 @@ bot-settings lane ([ADR 0086](docs/adr/0086-cozygateway-connects-hermes-and-open
   `mcp_server_declarations`, and only the published patch keys ever reach a peer; any other runtime
   bot and every Hermes bot answer `409 unsupported_for_runtime` with nothing written.
 
-## Unreleased: leader assignments
+### Leader assignments
 
-A bot can now lead a team. Set a bot's role to leader and name its reports from the profile
+These routes are stored and served, but not advertised: no bot on this gateway can lead yet, so a
+`role` or `reports` patch is refused (see "Hermes and OpenClaw only" above). What follows is the
+mechanism for a future Hermes or OpenClaw leader.
+
+A bot can lead a team. Set a bot's role to leader and name its reports from the profile
 (`com.cozylabs.bots` 88); the gateway stores both itself, so a Hermes profile carries them with
 no plugin change. A leader assigns one bounded piece of work to a report with its own attach
 bearer, and the report answers it as an ordinary turn on a gateway-owned thread. Each assignment
