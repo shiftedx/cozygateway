@@ -80,12 +80,55 @@ describe("capability-24 bot attachment routes", () => {
     ["audio/m4a", "voice.m4a", "audio/mp4", ftyp("M4A ")],
     ["audio/x-m4a", "voice.m4a", "audio/mp4", ftyp("M4A ")],
     ["application/octet-stream", "voice.m4a", "audio/mp4", ftyp("M4A ")],
-    ["", "Voice.M4A", "audio/mp4", ftyp("M4A ")],
+    ["audio/x-m4a", "Voice.M4A", "audio/mp4", ftyp("M4A ")],
   ])("accepts a '%s' voice note named %s as %s", async (type, name, mime, bytes) => {
     const { app, sendChatAttachment } = fixture();
     const response = await app.request("/bots/sage/chat/attachments", { method: "POST", body: multipart(type, bytes, name) });
     expect(response.status).toBe(202);
     expect(sendChatAttachment).toHaveBeenCalledWith("sage", expect.objectContaining({ mime, name }), { deviceId: "device-1" });
+  });
+
+  // A file part with no Content-Type of its own is "text/plain" once parsed, which the route
+  // admits, so only the raw part headers can tell "declared nothing" from "declared text".
+  it("reads an untyped voice.m4a part as audio/mp4", async () => {
+    const { app, sendChatAttachment } = fixture();
+    const boundary = "cozy-untyped-part";
+    const head = new TextEncoder().encode(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="voice.m4a"\r\n\r\n`);
+    const tail = new TextEncoder().encode(`\r\n--${boundary}--\r\n`);
+    const voice = ftyp("M4A ");
+    const body = new Uint8Array(head.byteLength + voice.byteLength + tail.byteLength);
+    body.set(head);
+    body.set(voice, head.byteLength);
+    body.set(tail, head.byteLength + voice.byteLength);
+    const response = await app.request("/bots/sage/chat/attachments", {
+      method: "POST", headers: { "content-type": `multipart/form-data; boundary=${boundary}` }, body,
+    });
+    expect(response.status).toBe(202);
+    expect(sendChatAttachment).toHaveBeenCalledWith("sage", expect.objectContaining({ mime: "audio/mp4", name: "voice.m4a" }), { deviceId: "device-1" });
+  });
+
+  // Hermes classifies an attachment by its extension before its type, so the stored name must
+  // carry the canonical extension of the type the gateway accepted.
+  it.each([
+    ["audio/mp4", "voice.mp4", ftyp("M4A "), "audio/mp4", "voice.m4a"],
+    ["audio/mpeg", "memo", id3, "audio/mpeg", "memo.mp3"],
+    ["text/plain", "notes.m4a", new TextEncoder().encode("plain notes"), "text/plain", "notes.txt"],
+    ["application/pdf", "Report.PDF", new TextEncoder().encode("%PDF-1.7\n"), "application/pdf", "Report.PDF"],
+  ])("stores a %s file named %s under the accepted type's extension", async (type, name, bytes, mime, stored) => {
+    const { app, sendChatAttachment } = fixture();
+    const response = await app.request("/bots/sage/chat/attachments", { method: "POST", body: multipart(type, bytes, name) });
+    expect(response.status).toBe(202);
+    expect(sendChatAttachment).toHaveBeenCalledWith("sage", expect.objectContaining({ mime, name: stored }), { deviceId: "device-1" });
+  });
+
+  it.each([
+    ["text/plain; charset=utf-8", "notes.txt", new TextEncoder().encode("plain notes"), "text/plain"],
+    ["audio/wav; codecs=1", "voice.wav", wave, "audio/wav"],
+  ])("ignores the parameters on a declared %s", async (type, name, bytes, mime) => {
+    const { app, sendChatAttachment } = fixture();
+    const response = await app.request("/bots/sage/chat/attachments", { method: "POST", body: multipart(type, bytes, name) });
+    expect(response.status).toBe(202);
+    expect(sendChatAttachment).toHaveBeenCalledWith("sage", expect.objectContaining({ mime }), { deviceId: "device-1" });
   });
 
   it.each([

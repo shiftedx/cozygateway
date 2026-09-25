@@ -1,4 +1,4 @@
-import { FILE_MAX_BYTES, FILE_TYPES, acceptFileBytes } from "./documents.ts";
+import { FILE_MAX_BYTES, FILE_TYPES, acceptFileBytes, withCanonicalExtension } from "./documents.ts";
 import { PhotoRefused } from "./photos.ts";
 
 export const ASSISTANT_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
@@ -71,23 +71,27 @@ const CHAT_AUDIO_ALIASES = new Map([["audio/m4a", "audio/mp4"], ["audio/x-m4a", 
 /** `com.cozylabs.chat-audio` 1: what `POST /bots/:name/chat/attachments` admits. Documents keep
  * capability 24's rules. A voice note is one of the audio rows above, checked with the same magic,
  * but held to the route's 20 MiB cap. A `.m4a` name stands in for a declaration the route does
- * not admit (a missing type, `application/octet-stream`, and so on); the bytes still decide. */
+ * not admit (a missing type, `application/octet-stream`, and so on); the bytes still decide. The
+ * returned `name` carries the accepted type's extension. */
 export function acceptChatAttachmentBytes(
   declared: string,
   filename: string,
   bytes: Uint8Array,
-): { mime: string; ext: string } {
+): { mime: string; ext: string; name: string } {
   const lowered = declared.split(";")[0]!.trim().toLowerCase();
   let mime = CHAT_AUDIO_ALIASES.get(lowered) ?? lowered;
   const admitted = FILE_TYPES.has(mime) || ASSISTANT_MEDIA_TYPES.get(mime)?.kind === "audio";
   if (!admitted && /\.m4a$/i.test(filename)) mime = "audio/mp4";
   const type = ASSISTANT_MEDIA_TYPES.get(mime);
-  if (type?.kind !== "audio") return acceptFileBytes(mime, bytes);
+  if (type?.kind !== "audio") {
+    const document = acceptFileBytes(mime, bytes);
+    return { ...document, name: withCanonicalExtension(filename, document.ext) };
+  }
   if (bytes.byteLength === 0) throw new Error("file carried no bytes");
   if (bytes.byteLength > FILE_MAX_BYTES) throw new Error("file is over the size cap");
   if (!bytesMatchMediaType(mime, bytes, () => undefined))
     throw new Error("file bytes did not match the declared allowed type");
-  return { mime, ext: type.ext };
+  return { mime, ext: type.ext, name: withCanonicalExtension(filename, type.ext) };
 }
 
 /** Shared byte-side acceptance for dashboard media and attach-v1's HTTP side channel. The latter
