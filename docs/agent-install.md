@@ -37,7 +37,7 @@ service registration, plugins, environment keys, spools, and state. `--no-qr`
 never prints a pairing QR. The installer refuses to run as root.
 
 An existing install record marked `cozyagents` or `both` is preserved and the
-installer stops without changing it. Use the [CozyAgents embedded gateway](https://github.com/shiftedx/cozyagents)
+installer stops without changing it. Use the [CozyAgents bundled gateway](https://github.com/shiftedx/cozyagents)
 for that product, or install this Hermes gateway in a new gateway directory.
 
 If Node.js 24+ is unavailable, the Windows/macOS/Linux installer downloads the current

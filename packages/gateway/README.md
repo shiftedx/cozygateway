@@ -1,7 +1,8 @@
 # cozygateway
 
 A self-hosted gateway that turns your AI agent into a chat contact on your phone. It speaks
-the cozygateway wire contract v1 and connects an agent harness through attach-v1.
+the cozygateway wire contract v1 and connects Hermes (and, soon, OpenClaw) bots through attach-v1.
+CozyAgents bots use CozyAgents' own bundled gateway.
 
 Requires Node.js >= 24.
 

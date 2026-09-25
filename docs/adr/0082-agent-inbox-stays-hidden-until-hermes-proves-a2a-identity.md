@@ -32,3 +32,10 @@ bounded replay. This ADR then becomes superseded.
 `com.cozylabs.agent-inbox` 1 (leader assignments) reintroduces the inbox routes and frame without
 waiting on Hermes: its identity is gateway-owned assignment rows, each wrapping one Task, rather
 than a heuristic reading of Hermes session text.
+
+## Amended by ADR 0086
+
+CozyGateway no longer advertises `com.cozylabs.agent-inbox`: no bot on it can lead, because a
+Hermes profile has no team tools and CozyAgents bots attach to CozyAgents' bundled gateway. The
+assignment routes stay, unadvertised, for a future Hermes or OpenClaw leader. See
+[ADR 0086](0086-cozygateway-connects-hermes-and-openclaw-only.md).

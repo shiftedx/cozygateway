@@ -1,12 +1,12 @@
 # CozyGateway
 
-**Connect CozyChat to Hermes Agent from your phone while keeping the conversation on your own machine.**
+**CozyGateway connects Hermes (and, soon, OpenClaw) bots to CozyChat. CozyAgents bots use CozyAgents' own bundled gateway.**
 
-CozyGateway is the Hermes-compatible Node.js gateway for CozyChat. It implements the published [wire contract](contract/v1.md), connects Hermes profiles through the [attach-v1](contract/attach-v1.md) WebSocket data plane, and preserves the generic attach contract for compatible harness adapters. Pair a device with a short-lived code, then talk directly to your gateway—without creating an account for the gateway itself.
+CozyGateway is the Node.js gateway for CozyChat. It implements the published [wire contract](contract/v1.md), connects Hermes profiles through the [attach-v1](contract/attach-v1.md) WebSocket data plane, and keeps that attach contract generic for the planned OpenClaw adapter. Pair a device with a short-lived code, then talk directly to your gateway, without creating an account for the gateway itself. The conversation stays on your own machine.
 
 [Quick start](#quickstart) · [Documentation](#documentation) · [Releases](https://github.com/shiftedx/cozygateway/releases) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 
-[CozyChat](https://github.com/shiftedx/cozychat) is the Apple client. For CozyAgents, use its [embedded gateway](https://github.com/shiftedx/cozyagents); it is a separate product and install path.
+[CozyChat](https://github.com/shiftedx/cozychat) is the Apple client. CozyGateway hosts no CozyAgents runtime bots and has no bot-settings lane. CozyAgents bots attach to the gateway bundled with [CozyAgents](https://github.com/shiftedx/cozyagents), a separate product and install path. See [ADR 0086](docs/adr/0086-cozygateway-connects-hermes-and-openclaw-only.md).
 
 ## What it provides
 

@@ -5,6 +5,21 @@ a series are fixes to the series' own changes. Per-tag notes live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
 release; everything older is marked pre-release so installers resolve one "latest".
 
+## Unreleased: Hermes and OpenClaw only
+
+CozyGateway connects Hermes (and, soon, OpenClaw) bots to CozyChat. CozyAgents bots use
+CozyAgents' own bundled gateway. CozyGateway hosts no CozyAgents runtime bots and has no
+bot-settings lane ([ADR 0086](docs/adr/0086-cozygateway-connects-hermes-and-openclaw-only.md)).
+
+- A config `bots` block is refused at load, by name. It named CozyAgents runtime bots, nothing had
+  read it since 0.8.6, and each such bot was refused `1008` forever while `/health` said
+  `attach.configured: 0`. Remove it; the row belongs in the config of CozyAgents' bundled gateway.
+- `com.cozylabs.agent-inbox` is not advertised, because no bot here can lead: a Hermes
+  profile has no team tools. CozyChat hides the Agent Inbox and the Team section. The assignment
+  routes stay, unadvertised, for a future Hermes or OpenClaw leader.
+- A `Result:` block's `artifacts:` line is split at commas only when every part is a path, file
+  name or link. A prose line stays whole in `summary` and names no artifact.
+
 ## Unreleased: chat voice notes
 
 - The chat attachment route accepts voice notes and relays them as audio
@@ -16,7 +31,7 @@ release; everything older is marked pre-release so installers resolve one "lates
   `audio`, serves it as `audio/*`, and marks the transcript row `mediaKind: "audio"`.
 - `audio/mp4` now requires an audio `ftyp` major brand (`M4A `, `M4B `, `mp42`, `isom`, or `iso2`)
   wherever the gateway sniffs it, the attach media upload route included, matching CozyAgents'
-  embedded gateway. QuickTime, `heic`, `avif`, and any other brand are refused as `audio/mp4`;
+  bundled gateway. QuickTime, `heic`, `avif`, and any other brand are refused as `audio/mp4`;
   `video/mp4` is unchanged.
 - The capability says the gateway accepts and relays voice notes, not that a bot understands them.
   CozyAgents transcribes a voice note when its transcription is set up, taking the family from the
@@ -26,7 +41,7 @@ release; everything older is marked pre-release so installers resolve one "lates
 - Every chat attachment, document or voice note, is now stored under its accepted type's
   extension: `voice.mp4` sent as `audio/mp4` becomes `voice.m4a`, because Hermes classifies an
   attachment by its extension first.
-- The capability is its own id, not a `com.cozylabs.bots` row, so CozyAgents' embedded gateway can
+- The capability is its own id, not a `com.cozylabs.bots` row, so CozyAgents' bundled gateway can
   advertise it at its own bots version.
 
 ## Unreleased: client-declared MCP servers
@@ -51,9 +66,9 @@ no plugin change. A leader assigns one bounded piece of work to a report with it
 bearer, and the report answers it as an ordinary turn on a gateway-owned thread. Each assignment
 is one durable Task under one id, with a deadline (30 minutes by default, 4 hours at most), the
 report's parsed `Result:` block, and the leader's acknowledgement. Caps are 8 open assignments per
-leader, 1 per report, and 16 reports. The Agent Inbox returns as `com.cozylabs.agent-inbox` 1,
-backed by these assignment rows (ADR 0082 is superseded), so the phone can read every assignment
-thread. A runtime peer learns whether it leads with its own attach bearer over the new
+leader, 1 per report, and 16 reports. The assignment routes are `com.cozylabs.agent-inbox` 1,
+backed by these assignment rows (ADR 0082 is superseded). This gateway does not advertise it
+while no bot on it can lead (ADR 0086). A runtime peer learns whether it leads with its own attach bearer over the new
 `GET /bots/:name/team`, since the config lane never carries `role` or `reports`. A leader's roster
 row carries `role: "leader"` for both a Hermes profile and a runtime bot; a member's carries none.
 `team` joins the reserved room names for the same reason `assignments` did (#392): a room already
