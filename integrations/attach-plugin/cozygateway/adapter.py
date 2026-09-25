@@ -238,6 +238,8 @@ def _fresh_attach_token(fallback: str, owner: _Owner = _Owner()) -> str:
 
 
 _COMMAND_NAME = re.compile(r"^/[A-Za-z0-9_-]{1,128}$")
+# Hermes's STT transcript echo, exactly as ``_echo_stt_transcripts`` formats it.
+_TRANSCRIPT_ECHO = re.compile('\U0001F399\ufe0f "(.*)"', re.DOTALL)
 
 # A one-shot proactive sender shares its spool with the resident adapter.  Keep a
 # bounded shutdown in the foreground, but if a broken websocket watcher refuses
@@ -1065,6 +1067,8 @@ class AttachAdapter:
         # message handler returns. Attach-v1 must know those paths before its
         # terminal send seals the turn, so retain them at that boundary.
         self._turn_media: Dict[str, List[str]] = {}
+        # Voice notes an inbound turn carried, each owed at most one dropped transcript echo.
+        self._voice_note_echoes: Dict[str, int] = {}
         # Where each of those paths sat in the reply's block flow, when the draft
         # said so unambiguously: ``{turnId: (cleanedBlocks, {path: position})}``.
         # Absent (or dropped at send time) means legacy above-stack placement.
@@ -2275,6 +2279,9 @@ class AttachAdapter:
                         media_types.append(cached.media_type)
                 except Exception:  # noqa: BLE001 - one bad attachment must not drop the turn
                     logger.debug("attach: could not materialize inbound media %s", media_id, exc_info=True)
+        voice_notes = sum(1 for media_type in media_types if str(media_type).startswith("audio/"))
+        if voice_notes:
+            self._voice_note_echoes[turn.turn_id] = voice_notes
         binding = self._desktop_session_bindings.get(turn.thread_id)
         metadata: Dict[str, Any] = {"cozygateway_context_turn": True}
         if binding is not None:
@@ -3195,6 +3202,22 @@ class AttachAdapter:
         chips = tracker.chips() if tracker else []
         return chips or None
 
+    def _consume_transcript_echo(self, turn_id: str, content: str) -> bool:
+        """True for Hermes's echo of a voice-note transcript, which is then not a message.
+
+        Hermes transcribes an inbound voice note with its own STT and, by default
+        (``stt_echo_transcripts``), echoes each transcript to the chat as ``🎙️ "…"`` through this
+        surface with no reply anchor and no ``notify`` mark, so it would commit as an extra bot
+        message. The phone already shows the voice note it sent, and Hermes already hands the
+        transcript to the model. Only that exact form is dropped, and at most once per voice note
+        the turn carried; the same text on any other turn is an ordinary interim reply.
+        """
+        owed = self._voice_note_echoes.get(turn_id, 0)
+        if owed <= 0 or not _TRANSCRIPT_ECHO.fullmatch(content or ""):
+            return False
+        self._voice_note_echoes[turn_id] = owed - 1
+        return True
+
     def _caller_active_turn(self, chat_id: str) -> Optional[str]:
         """The in-flight turn on ``chat_id`` -- only when the caller belongs to it.
 
@@ -3242,6 +3265,8 @@ class AttachAdapter:
         )
         if client is None:
             return SendResult(success=False, error="attach not connected")
+        if continues and self._consume_transcript_echo(turn_id, content):
+            return SendResult(success=True)
         if isinstance(metadata, dict) and metadata.get("_interim_send") and active_turn:
             # Hermes emits error/status notices through the ordinary platform
             # send surface while the agent keeps working. Render the latest
@@ -3776,6 +3801,7 @@ class AttachAdapter:
         self._normalizers.pop(turn_id, None)
         self._content_seen.pop(turn_id, None)
         if not keep_active:
+            self._voice_note_echoes.pop(turn_id, None)
             # NOT on the interim path: resetting mid-turn would restart the preview ``seq``
             # at 1, which the gateway rightly drops as stale for the rest of the turn.
             self._thinking.pop(turn_id, None)
