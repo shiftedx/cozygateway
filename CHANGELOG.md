@@ -53,6 +53,9 @@ bot-settings lane ([ADR 0086](docs/adr/0086-cozygateway-connects-hermes-and-open
 
 ### Client-declared MCP servers
 
+These routes serve a runtime peer that offers `mcp_server_declarations`. No bot on this gateway
+does yet: every Hermes bot answers `409 unsupported_for_runtime`.
+
 - A chat client can declare a bot's remote MCP servers (`com.cozylabs.bots` capability 89, #362):
   `PATCH /bots/:name/profile` gains `declareMcpServers` and `removeMcpServers`, carried on the
   existing `bot_config` `profile.write`, and `BotMcpServer` gains a read-only `declaration`. Remote
@@ -67,7 +70,11 @@ bot-settings lane ([ADR 0086](docs/adr/0086-cozygateway-connects-hermes-and-open
 
 ### Leader assignments
 
-A bot can now lead a team. Set a bot's role to leader and name its reports from the profile
+These routes are stored and served, but not advertised: no bot on this gateway can lead yet, so a
+`role` or `reports` patch is refused (see "Hermes and OpenClaw only" above). What follows is the
+mechanism for a future Hermes or OpenClaw leader.
+
+A bot can lead a team. Set a bot's role to leader and name its reports from the profile
 (`com.cozylabs.bots` 88); the gateway stores both itself, so a Hermes profile carries them with
 no plugin change. A leader assigns one bounded piece of work to a report with its own attach
 bearer, and the report answers it as an ordinary turn on a gateway-owned thread. Each assignment
