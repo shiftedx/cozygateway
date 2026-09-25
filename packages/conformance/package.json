@@ -19,7 +19,7 @@
   },
   "dependencies": {
     "cozygateway-contract": "workspace:*",
-    "ws": "^8.18.0"
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@types/ws": "^8.5.0",
