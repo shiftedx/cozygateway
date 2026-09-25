@@ -10,7 +10,8 @@ import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-her
 /** agent-inbox 1 end to end over the real listener: a leader profile assigns work with its own
  *  attach bearer, a stock Hermes profile answers it as an ordinary attach-v1 turn over the real
  *  socket, the leader acknowledges it, and the paired phone reads the Task, the inbox and the
- *  live activity frames. */
+ *  live activity frames. The routes stay for a future Hermes or OpenClaw leader, but the gateway
+ *  does not advertise agent-inbox while no bot on it can lead (ADR 0086). */
 it("a leader assigns to a Hermes profile over attach-v1 and acknowledges the result", async () => {
   process.env["ASSIGN_DASHBOARD_TOKEN"] = "dashboard-secret";
   process.env["ASSIGN_LEAD_TOKEN"] = "lead-secret";
@@ -35,7 +36,7 @@ it("a leader assigns to a Hermes profile over attach-v1 and acknowledges the res
     const url = gateway.url;
     await until(() => gateway!.storage.botRoster().bots.some((bot) => bot.name === "lead"));
     const health = (await (await fetch(`${url}/health`)).json()) as GatewayInfo;
-    expect(health.capabilities?.["com.cozylabs.agent-inbox"]).toBe(1);
+    expect(health.capabilities?.["com.cozylabs.agent-inbox"]).toBeUndefined();
     expect(health.capabilities?.["com.cozylabs.bots"]).toBe(89);
 
     const pair = await fetch(`${url}/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ setupCode: gateway.issueSetupCode(), deviceName: "phone" }) });

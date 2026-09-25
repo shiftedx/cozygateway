@@ -311,7 +311,7 @@ export function gatewayInfoForConfig(
       ...(integrations
         ? { [INTEGRATIONS_CAPABILITY_ID]: INTEGRATIONS_CAPABILITY_VERSION }
         : {}),
-      // Leader assignments. Never inferred from the bots scalar (ADR 0082, superseded).
+      // Leader assignments. Never inferred from the bots scalar (ADR 0082, superseded; ADR 0086).
       ...(agentInbox
         ? { [AGENT_INBOX_CAPABILITY_ID]: AGENT_INBOX_CAPABILITY_VERSION }
         : {}),
@@ -489,8 +489,11 @@ export async function startGateway(
     hermesGlobalSkills !== undefined,
     maintenance !== undefined,
     integrations !== undefined,
-    // The assignment store is part of every gateway's storage.
-    true,
+    // agent-inbox is not advertised: no bot here can lead. A Hermes profile has no team tools, and
+    // CozyAgents bots attach to CozyAgents' bundled gateway (ADR 0086). Without it CozyChat hides
+    // the Agent Inbox, whose only threads are assignments, and the Team section. The routes stay
+    // for a future Hermes or OpenClaw leader, which is when this turns back on.
+    false,
   );
   // Dashboard packet D2. The observation ring: what the gateway already measures on every turn,
   // heartbeat and sweep, kept for a week instead of thrown away. OFF BY DEFAULT; constructed

@@ -204,8 +204,10 @@ and unknown server frames are ignored.
 bots version. Version 1 is leader assignments (see
 [Leader assignments](#leader-assignments-comcozylabsagent-inbox-1) below): its identity is
 gateway-owned assignment rows, not a reading of Hermes session text, which is what ADR 0082
-waited for. Every gateway advertises it, because the assignment store is part of every
-gateway's storage.
+waited for. A gateway advertises it only when a bot on it can lead. cozygateway does not: a
+Hermes profile has no team tools, and CozyAgents bots attach to CozyAgents' bundled gateway
+(ADR 0086). Without it CozyChat hides the Agent Inbox, whose only threads are assignments, and the
+Team section. cozygateway keeps the routes below for a future Hermes or OpenClaw leader.
 
 `com.cozylabs.chat-audio` is likewise its own id. Version 1 means the chat attachment route
 accepts voice notes and relays them to the bot as audio (see
