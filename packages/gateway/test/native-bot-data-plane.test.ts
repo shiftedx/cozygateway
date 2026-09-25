@@ -2330,6 +2330,29 @@ describe("native runtime bots", () => {
     storage.close();
   });
 
+  it("carries role: leader on a runtime bot's roster row once the gateway makes it a leader", async () => {
+    const storage = openStorage(":memory:");
+    storage.setBotTeam({ bot: "sage", role: "leader", reports: [], updatedAt: 7 });
+    const control = {
+      roster: () => ({ bots: [], updatedAt: 1, stale: true, hermesState: "offline" }),
+    } as unknown as BotsSurface;
+    const plane = new NativeBotDataPlane({
+      control,
+      storage,
+      ingress: { isAttached: () => false, sendNativeTurn: () => true } as unknown as AttachV1Ingress,
+      nativeBots: ["sage"],
+      runtimeBots: [sage],
+      chatSuggestion: "",
+      broadcast: () => undefined,
+      now: () => 7,
+    });
+
+    expect(plane.rosterBots([])).toMatchObject([{ name: "sage", role: "leader" }]);
+
+    plane.close();
+    storage.close();
+  });
+
   it("answers unsupported_for_runtime for Dashboard-backed surfaces on a native runtime bot", async () => {
     const storage = openStorage(":memory:");
     const botProfile = vi.fn();

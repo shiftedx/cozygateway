@@ -868,6 +868,10 @@ export class NativeBotDataPlane {
       runtime: bot.runtime,
       ...(runnerId === undefined ? {} : { runnerId }),
       ...(runnerName === undefined ? {} : { runnerName }),
+      // Capability 88, additive under agent-inbox 1: the gateway's own team row, checked the same
+      // way a Hermes profile's roster row is (roster.ts's teamRole), so a runtime bot made a
+      // leader shows the same badge.
+      ...(this.#storage.botTeam(id)?.role === "leader" ? { role: "leader" as const } : {}),
       ...this.#nativeOverlay(id),
     };
   }

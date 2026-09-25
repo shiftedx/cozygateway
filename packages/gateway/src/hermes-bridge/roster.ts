@@ -1,4 +1,4 @@
-import type { BotPreview, BotSummary } from "cozygateway-contract";
+import type { BotPreview, BotSummary, BotTeamRole } from "cozygateway-contract";
 import { asRecord, asString } from "./rpc.ts";
 import { rosterAvatar } from "./avatar.ts";
 
@@ -227,6 +227,9 @@ export interface RosterBuildOptions extends PresenceContext {
    *  that builds a roster, so `GET /bots` and the `bot_roster` frame cannot disagree about what is
    *  on it. Names are compared already-normalized (lowercase), as Hermes stores them. */
   hidden?: ReadonlySet<string>;
+  /** Capability 88, additive under agent-inbox 1. The gateway's own team row, read once per bot
+   *  built here: `undefined` (member) is the default and emits no `role` key at all. */
+  teamRole?: (name: string) => BotTeamRole | undefined;
 }
 
 /** Builds the dashboard control-plane roster. The native attach-v1 plane overlays each configured
@@ -256,6 +259,7 @@ export function buildRoster(profiles: ParsedProfile[], opts: RosterBuildOptions)
     const avatar = rosterAvatar(profile.name, profile.hasAvatar, meta, profile.metaRevision ?? 0, profile.avatarFingerprint);
     if (avatar !== undefined) summary.avatar = avatar;
     if (profile.previousNames !== undefined) summary.previousNames = [...profile.previousNames];
+    if (opts.teamRole?.(profile.name) === "leader") summary.role = "leader";
     return { summary, activityAt: botActivityAt(profile) };
   });
 

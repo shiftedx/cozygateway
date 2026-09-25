@@ -129,4 +129,19 @@ describe("assignment routes", () => {
     expect(await (await h.device(`/assignments/${second.taskId}/cancel`, post({ reason: "changed plans" }))).json()).toMatchObject({ state: "queued", cancelledBy: "user" });
     expect((await h.device("/assignments/no-such/cancel", post({}))).status).toBe(404);
   });
+
+  it("answers a bot its own team over its attach bearer, and a member with an empty team", async () => {
+    const h = await setup();
+    expect(await (await h.peer("lead", "/bots/lead/team")).json()).toEqual({ role: "leader", reports: ["scout", "sage"] });
+    expect(await (await h.peer("scout", "/bots/scout/team")).json()).toEqual({ role: "member", reports: [] });
+    const other = await h.peer("scout", "/bots/lead/team");
+    expect(other.status).toBe(403);
+    const body = await other.json() as { error: { message: string } };
+    expect(body.error.message).not.toMatch(/assignment/i);
+    expect(body.error.message).toMatch(/team/i);
+    expect((await h.device("/bots/lead/team")).status).toBe(200);
+    expect((await h.app.request("/bots/lead/team")).status).toBe(401);
+    // An unknown or revoked bearer is neither a live peer nor a paired device.
+    expect((await h.app.request("/bots/lead/team", { headers: { authorization: "Bearer tok-ghost" } })).status).toBe(401);
+  });
 });

@@ -74,6 +74,8 @@ export const RESERVED_GROUP_NAMES: ReadonlySet<string> = new Set([
   "inbox",
   // agent-inbox 1: `/bots/:name/assignments`.
   "assignments",
+  // agent-inbox 1: `/bots/:name/team`.
+  "team",
   "messages",
   "catalog",
   "focus",

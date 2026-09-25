@@ -51,6 +51,12 @@ export const BotCozyAppsReadinessSchema = Type.Object({
 }, { additionalProperties: false });
 export type BotCozyAppsReadiness = Static<typeof BotCozyAppsReadinessSchema>;
 
+/** Capability 88. A bot's place on a team. Absent means `member`: only a `leader` may assign work,
+ *  and only to a bot in its `reports`. Declared here, ahead of `BotSummarySchema`, so both it and
+ *  `BotProfile`/`BotProfilePatch` further down the file can reference it. */
+export const BotTeamRoleSchema = Type.Union([Type.Literal("leader"), Type.Literal("member")]);
+export type BotTeamRole = Static<typeof BotTeamRoleSchema>;
+
 /** One roster row. `meta` is the bot's `ui_meta["hermes-bots"]` blob verbatim (or null when the
  *  profile carries none), kept open on purpose: the desktop plugin owns that namespace and may
  *  add keys we do not model. */
@@ -112,6 +118,10 @@ export const BotSummarySchema = Type.Object({
    *  per-bot state the way upstream Desktop does. Additive under capability 82: absent when the
    *  profile has none, on a runtime bot, and on an older gateway. */
   previousNames: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }))),
+  /** Capability 88, additive under agent-inbox 1. Present and `"leader"` only when the gateway's
+   *  own team row says so; absent means member, matching `BotProfile.role`'s rule. Never
+   *  `"member"` on the wire. */
+  role: Type.Optional(BotTeamRoleSchema),
 });
 export type BotSummary = Static<typeof BotSummarySchema>;
 
@@ -1570,11 +1580,6 @@ export const GuardrailLevelSchema = Type.Union([
 export type GuardrailLevel = Static<typeof GuardrailLevelSchema>;
 
 const NameItem = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
-
-/** Capability 88. A bot's place on a team. Absent means `member`: only a `leader` may assign work,
- *  and only to a bot in its `reports`. */
-export const BotTeamRoleSchema = Type.Union([Type.Literal("leader"), Type.Literal("member")]);
-export type BotTeamRole = Static<typeof BotTeamRoleSchema>;
 
 /** `GET /bots/:name/profile`: one bot's full edit-screen state. `model.default` is the model id and
  *  keeps the gateway's own field name; both model fields are empty strings when the profile

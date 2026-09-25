@@ -10,6 +10,8 @@ import {
   AssignmentViewSchema,
   BotInboxActivityFrameSchema,
   BotInboxThreadSchema,
+  BotSummarySchema,
+  BotTeamSchema,
   ServerFrameSchema,
   check,
 } from "../src/index.ts";
@@ -51,5 +53,23 @@ describe("agent-inbox 1 assignment boundary", () => {
     expect(check(ServerFrameSchema, frame)).toBe(true);
     expect(check(BotInboxThreadSchema, { id: "assignment:t1", peers: ["lead", "scout"], startedAt: 1, lastActiveAt: 2, preview: "Check CI", messageCount: 2 })).toBe(true);
     expect(check(BotInboxThreadSchema, { id: "assignment:t1", peers: ["lead"], startedAt: 1, lastActiveAt: 2, preview: "", messageCount: 0 })).toBe(false);
+  });
+
+  it("publishes the team read: role plus at most sixteen reports", () => {
+    expect(check(BotTeamSchema, { role: "leader", reports: ["scout"] })).toBe(true);
+    expect(check(BotTeamSchema, { role: "member", reports: [] })).toBe(true);
+    expect(check(BotTeamSchema, { role: "boss", reports: [] })).toBe(false);
+    expect(check(BotTeamSchema, { role: "leader", reports: Array.from({ length: 17 }, (_, i) => `b${i}`) })).toBe(false);
+  });
+
+  it("carries an optional leader role on a roster row, closed to the two team roles", () => {
+    const row = {
+      name: "lead", displayName: "Lead", handle: "lead", description: null, hasAvatar: false,
+      group: null, pinned: false, active: false, lastActiveAt: null, chatSessionId: null,
+      preview: { kind: "empty", text: "" }, syncState: "setup_required", meta: null,
+    };
+    expect(check(BotSummarySchema, row)).toBe(true);
+    expect(check(BotSummarySchema, { ...row, role: "leader" })).toBe(true);
+    expect(check(BotSummarySchema, { ...row, role: "boss" })).toBe(false);
   });
 });

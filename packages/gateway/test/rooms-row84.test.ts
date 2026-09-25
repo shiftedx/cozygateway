@@ -7,7 +7,7 @@ import type { MiddlewareHandler } from "hono";
 import type { BotGroupStateFrame, ServerFrame } from "cozygateway-contract";
 
 import { openStorage, type Storage } from "../src/storage.ts";
-import { GroupBusy, GroupExists, GroupInvalid, GroupRooms } from "../src/hermes-bridge/group-rooms.ts";
+import { GroupBusy, GroupExists, GroupInvalid, GroupRooms, RESERVED_GROUP_NAMES } from "../src/hermes-bridge/group-rooms.ts";
 import {
   applyHoldDirective,
   classifyHoldDirective,
@@ -139,6 +139,14 @@ describe("row 84 rooms engine", () => {
     expect(luna.text).toContain("you can talk now");
     await h.rooms.close();
     h.storage.close();
+  });
+
+  it("refuses a room name that would be shadowed by a per-bot route, agent-inbox 1's team included", async () => {
+    const h = harness();
+    expect(RESERVED_GROUP_NAMES).toContain("team");
+    for (const name of RESERVED_GROUP_NAMES) {
+      await expect(h.rooms.create(name, ["scout", "luna"])).rejects.toBeInstanceOf(GroupInvalid);
+    }
   });
 
   it("refuses slash commands", async () => {

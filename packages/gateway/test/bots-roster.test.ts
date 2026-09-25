@@ -68,6 +68,17 @@ describe("Hermes roster", () => {
     expect(check(BotSummarySchema, plain)).toBe(true);
   });
 
+  it("a leader's roster row carries role: leader and a member's carries none", () => {
+    const [leader, member] = buildRoster(parseProfilesList({ profiles: [
+      profileRow({ name: "lead" }),
+      profileRow({ name: "scout" }),
+    ] }).profiles, { ...idle, teamRole: (name) => (name === "lead" ? "leader" : undefined) });
+    expect(leader).toMatchObject({ name: "lead", role: "leader" });
+    expect(member).not.toHaveProperty("role");
+    expect(check(BotSummarySchema, leader)).toBe(true);
+    expect(check(BotSummarySchema, member)).toBe(true);
+  });
+
   it("preserves compact UI metadata writes", () => {
     const meta = botMetaForWriteback({ "hermes-bots": { title: "Scout", image: "data:image/png;base64,AAAA" } }, { group: "Ops" });
     expect(meta).toEqual({ title: "Scout", group: "Ops" });
