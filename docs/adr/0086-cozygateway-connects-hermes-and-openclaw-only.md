@@ -17,8 +17,9 @@ CozyAgents users at CozyAgents' own gateway. Loose ends stayed: the config schem
 
 On 2026-09-24 the Leader bot (#471, #475) was built here by mistake. Live end-to-end tests on
 2026-09-25 found that a CozyAgents leader cannot attach to this gateway, and a Hermes profile has
-no team tools, so no bot here could lead. The Leader bot's gateway half now lives in CozyAgents'
-bundled gateway.
+no team tools, so no bot here could lead. The Leader bot's gateway half belongs in CozyAgents'
+bundled gateway, where it is being ported (see the CozyAgents ADR "CozyAgents bots attach to
+CozyAgents' own bundled gateway"). This gateway does not advertise it.
 
 ## Decision
 

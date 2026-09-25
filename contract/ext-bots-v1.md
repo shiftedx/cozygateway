@@ -1808,7 +1808,8 @@ whose `artifacts:` line (a comma list and/or `- ` bullets) names up to 32 refere
 other lines become `summary`. A reply with no valid block has no `result`: its absence is recorded
 and never invented.
 
-The artifacts rule, which CozyAgents' bundled gateway applies too:
+The artifacts rule, written here for CozyAgents' bundled gateway too, where leader assignments
+are being ported:
 
 1. Lines are read in order. A `status:`, `summary:`, `changed:` or `what changed:` line, bulleted
    or not, is always that key. The `artifacts:` line starts a listing; each bullet (`- ` or `* `)

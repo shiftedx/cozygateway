@@ -40,8 +40,9 @@ const SUMMARY_KEY = /^(?:summary|changed|what changed)\s*:\s*(.*)$/i;
 /** The artifact references in one `artifacts:` text: the text after the key, or one bullet under
  * it. Each Markdown link `[text](url)` is first replaced by its URL; the text is then split at
  * each comma followed by whitespace or ending it, so a comma inside a URL splits nothing. Each
- * part is judged on its own by `artifactReference`, and prose parts are dropped. CozyAgents'
- * bundled gateway applies the same rule (contract/ext-bots-v1.md, Leader assignments). */
+ * part is judged on its own by `artifactReference`, and prose parts are dropped. The rule is
+ * written down in contract/ext-bots-v1.md (Leader assignments) for CozyAgents' bundled gateway,
+ * where leader assignments are being ported. */
 export function artifactReferences(text: string): string[] {
   return text.replace(/\[[^\]]*\]\(([^()\s]+)\)/g, "$1").split(/,(?=\s|$)/)
     .map(artifactReference).filter((reference) => reference !== undefined);
