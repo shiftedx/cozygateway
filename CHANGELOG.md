@@ -7,16 +7,23 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## Unreleased: chat voice notes
 
-- A phone can send a bot a voice note (`com.cozylabs.chat-audio` 1).
-  `POST /bots/:name/chat/attachments` now also admits one `audio/mp4` (AAC `.m4a`), `audio/mpeg`,
-  `audio/wav`, or `audio/x-wav` file under the route's 20 MiB cap, checked against the same format
-  magic as the attach media allowlist. `audio/m4a`, `audio/x-m4a`, and an `.m4a` name without an
-  admitted type are read as `audio/mp4`. The gateway relays a voice note as attach-v1 media of
-  family `audio` rather than `file`, so a runtime peer such as CozyAgents can transcribe it, and the
-  transcript row carries `mediaKind: "audio"`. Hermes profiles need no plugin change: the plugin
-  passes the audio MIME to Hermes, whose own speech-to-text takes it. The capability is its own id,
-  not a `com.cozylabs.bots` row, so CozyAgents' embedded gateway can advertise it at its own bots
-  version.
+- The chat attachment route accepts voice notes and relays them as audio
+  (`com.cozylabs.chat-audio` 1). `POST /bots/:name/chat/attachments` now also admits one
+  `audio/mp4` (AAC `.m4a`), `audio/mpeg`, `audio/wav`, or `audio/x-wav` file under the route's
+  20 MiB cap, checked against the same format magic as the attach media allowlist. `audio/m4a`,
+  `audio/x-m4a`, and an `.m4a` name on a part that declares no type, or a type the route does not
+  admit, are read as `audio/mp4`. The gateway stores a voice note as attach media of family
+  `audio`, serves it as `audio/*`, and marks the transcript row `mediaKind: "audio"`.
+- The capability says the gateway accepts and relays voice notes, not that a bot understands them.
+  CozyAgents transcribes a voice note when its transcription is set up, taking the family from the
+  served Content-Type. A Hermes profile transcribes one when its own speech-to-text is configured,
+  and the attach plugin now drops Hermes's transcript echo on that turn instead of committing it
+  as an extra bot message.
+- Every chat attachment, document or voice note, is now stored under its accepted type's
+  extension: `voice.mp4` sent as `audio/mp4` becomes `voice.m4a`, because Hermes classifies an
+  attachment by its extension first.
+- The capability is its own id, not a `com.cozylabs.bots` row, so CozyAgents' embedded gateway can
+  advertise it at its own bots version.
 
 ## Unreleased: client-declared MCP servers
 

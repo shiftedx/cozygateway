@@ -2454,7 +2454,7 @@ export class NativeBotDataPlane {
     opts?: { deviceId?: string },
   ): Promise<{ sessionId: string; message: BotChatMessage }> {
     // chat-audio 1: the family follows the accepted MIME, exactly as the attach media upload
-    // route decides it. A runtime peer transcribes only `audio`; every other type is a document.
+    // route decides it, so the stored media and the transcript row call a voice note audio.
     const family = ASSISTANT_MEDIA_TYPES.get(file.mime)?.kind === "audio" ? "audio" : "file";
     return this.#sendAttachment(name, { ...file, family, label: "attachment", deviceId: opts?.deviceId });
   }

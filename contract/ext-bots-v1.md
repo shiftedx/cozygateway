@@ -208,10 +208,14 @@ waited for. Every gateway advertises it, because the assignment store is part of
 gateway's storage.
 
 `com.cozylabs.chat-audio` is likewise its own id. Version 1 means the chat attachment route
-accepts voice notes (see [Attachments and media](#attachments-and-media) below). It is not a
-`com.cozylabs.bots` row because gateways at different bots versions, CozyAgents' embedded gateway
-and this one, must each be able to advertise it without claiming the other's rows. This gateway
-advertises it wherever it serves Bot Mode. A client offers voice notes only when it is present.
+accepts voice notes and relays them to the bot as audio (see
+[Attachments and media](#attachments-and-media) below). It does not mean the bot can hear them.
+Whether a bot understands a voice note depends on the bot: a CozyAgents bot transcribes one when
+its transcription is set up, and a Hermes profile does when its own speech-to-text is configured.
+It is not a `com.cozylabs.bots` row because gateways at different bots versions, CozyAgents'
+embedded gateway and this one, must each be able to advertise it without claiming the other's
+rows. This gateway advertises it wherever it serves Bot Mode. A client offers voice notes only
+when it is present.
 
 ## Resources
 
@@ -907,19 +911,30 @@ serves every attachment with `Content-Disposition: attachment` and `nosniff`.
 `com.cozylabs.chat-audio` 1 admits a voice note on the same route, one per turn: `audio/mp4` (AAC
 `.m4a`), `audio/mpeg` (MP3), `audio/wav`, or `audio/x-wav`. It keeps the route's 20 MiB cap, not
 the 40 MiB cap assistant audio carries. A declared `audio/m4a` or `audio/x-m4a` is stored as
-`audio/mp4`, and so is a file named `*.m4a` whose declared type the route does not admit (missing,
-`application/octet-stream`, and so on). Parameters on a declared type are ignored. The bytes are
+`audio/mp4`, and so is a file named `*.m4a` whose part declares no type, or a type the route does
+not admit such as `application/octet-stream`. The gateway reads that from the part's own
+`Content-Type` header, because a multipart parser reports an undeclared part as `text/plain`; a
+part that does declare `text/plain` is a text document whatever its name. Parameters on a
+declared type are ignored. The bytes are
 checked with the same magic as the [canonical allowlist](#canonical-media-allowlist): an ISO BMFF
 `ftyp` box that is not QuickTime for `audio/mp4`, an ID3 tag or MPEG frame sync for `audio/mpeg`,
 and `RIFF` plus `WAVE` for WAV. Refusals take the document shapes: `413` `too_large`, `400`
 `empty`, and `415` `content_type`, each under extension code `media_refused`.
 
+Every attachment on this route, document or voice note, is stored under the accepted type's
+extension, which replaces a different one: `voice.mp4` accepted as `audio/mp4` is stored as
+`voice.m4a`, and `notes.m4a` accepted as `text/plain` as `notes.txt`. A name that already ends in
+that extension, in any case, is kept. Hermes classifies an attachment by its extension before its
+type, so a mismatched name would reach it as the wrong kind of file.
+
 The gateway decides the attach-v1 media family from the accepted MIME, exactly as
-`POST /attach/v1/media/:mediaId` does: a voice note is relayed as family `audio` and its transcript
-attachment carries `mediaKind: "audio"`, while every document stays family `file`. A runtime peer
-that transcribes speech keys on that family, or on the served `audio/*` type. The Hermes attach
-plugin hands the downloaded MIME to Hermes, whose own speech-to-text takes any `audio/*`
-attachment, so a Hermes profile needs no plugin change.
+`POST /attach/v1/media/:mediaId` does: a voice note is stored as family `audio` and its transcript
+attachment carries `mediaKind: "audio"`, while every document stays family `file`. A peer learns
+the type from `GET /attach/v1/media/:mediaId`, which serves the stored `audio/*` Content-Type;
+CozyAgents takes the family from that served type. The Hermes attach plugin hands the served MIME
+and name to Hermes, which transcribes any `audio/*` attachment when its speech-to-text is
+configured. Hermes then echoes each transcript to the chat by default (`stt_echo_transcripts`);
+the plugin drops that echo on a voice-note turn rather than committing it as an extra bot message.
 
 ### Inline media ordering (capability 32)
 

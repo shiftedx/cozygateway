@@ -401,8 +401,8 @@ describe("attach-v1 native Bot Mode plane", () => {
     storage.close();
   });
 
-  // com.cozylabs.chat-audio 1. A runtime peer transcribes only media whose family is audio, so a
-  // voice note must not be relayed under the document family.
+  // com.cozylabs.chat-audio 1. The stored media and the transcript row call a voice note audio,
+  // never a document, so attachment history and the phone render it as one.
   it("relays an uploaded voice note under the audio family and a document under the file family", async () => {
     const storage = openStorage(":memory:");
     const plane = new NativeBotDataPlane({
