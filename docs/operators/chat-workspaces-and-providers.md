@@ -32,7 +32,8 @@ creates a separate branch/checkout from the selected source branch. Neither mode
 chat's configuration or relocates the source bot. Created worktrees contain user work and are not
 automatically force-deleted when a chat is removed.
 
-For a bot's already attached CozyAgents computer, `COZYAGENTS_CHAT_COMPUTER_ID` and
+For a CozyAgents bot, which attaches to CozyAgents' bundled gateway rather than to CozyGateway
+(ADR 0086), `COZYAGENTS_CHAT_COMPUTER_ID` and
 `COZYAGENTS_CHAT_COMPUTER_NAME` name the computer. `COZYAGENTS_CHAT_PROJECTS_JSON` accepts
 `[{"id":"my-project","name":"My project","path":"/absolute/project/path"}]`; the existing bot
 workspace remains its default. The equivalent Hermes plugin variables are

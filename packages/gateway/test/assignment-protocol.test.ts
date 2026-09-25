@@ -43,12 +43,68 @@ describe("Result: block", () => {
   });
 
   it("accepts an inline comma list and bulleted keys, dedupes, and caps at 32", () => {
-    const many = Array.from({ length: 40 }, (_, i) => `f${i}`).join(", ");
-    const parsed = parseResultBlock(`Result:\n- Status: Blocked\n- what changed: nothing yet\nartifacts: a, a, ${many}`);
+    const many = Array.from({ length: 40 }, (_, i) => `f${i}.txt`).join(", ");
+    const parsed = parseResultBlock(`Result:\n- Status: Blocked\n- what changed: nothing yet\nartifacts: a.txt, a.txt, ${many}`);
     expect(parsed?.status).toBe("blocked");
     expect(parsed?.summary).toBe("nothing yet");
     expect(parsed?.artifacts).toHaveLength(32);
-    expect(parsed?.artifacts[0]).toBe("a");
+    expect(parsed?.artifacts[0]).toBe("a.txt");
+  });
+});
+
+describe("Result: artifacts are paths, file names or links, never prose", () => {
+  const artifactsOf = (block: string) => parseResultBlock(`Result: done\n${block}`)?.artifacts;
+
+  // [what the reply says after `Result: done`, the artifacts it names]
+  const table: Array<[string, string[]]> = [
+    // A path, a file name, a link, each on its own.
+    ["artifacts: src/a.ts", ["src/a.ts"]],
+    ["artifacts: notes.md", ["notes.md"]],
+    ["artifacts: https://ci/run/9", ["https://ci/run/9"]],
+    ["artifacts: `src/a.ts`, https://ci/run/9, notes.md,", ["src/a.ts", "https://ci/run/9", "notes.md"]],
+    // A Markdown link counts by its URL, and a comma inside a URL does not split it.
+    ["artifacts: [CI run](https://ci/run/9)", ["https://ci/run/9"]],
+    ["artifacts: [CI, run 9](https://ci/run/9), b.md", ["https://ci/run/9", "b.md"]],
+    ["artifacts: https://ci/runs?ids=1,2,3", ["https://ci/runs?ids=1,2,3"]],
+    ["artifacts:\n- [CI run](https://ci/run/9)\n- https://ci/runs?ids=1,2", ["https://ci/run/9", "https://ci/runs?ids=1,2"]],
+    // Placeholders, versions, addresses and abbreviations are prose.
+    ["artifacts: N/A", []],
+    ["artifacts: n/a", []],
+    ["artifacts: none", []],
+    ["artifacts: v1.2", []],
+    ["artifacts: kyle@example.com", []],
+    ["artifacts: e.g.", []],
+    ["artifacts:\n- N/A\n- none\n- v1.2\n- kyle@example.com\n- e.g.", []],
+    // Each part is judged on its own: a reference beside prose is kept.
+    ["artifacts: src/a.ts, the rest is in chat", ["src/a.ts"]],
+    // Prose on the `artifacts:` line does not cost the bullets under it.
+    ["artifacts: two files\n- a.md\n- b/c.ts", ["a.md", "b/c.ts"]],
+    ["artifacts:\n- b/c.md\n- see above\n- d.txt", ["b/c.md", "d.txt"]],
+    // The e2e reply's line, which the old parser split into two nonsense references.
+    ["- artifacts: none; the three names above with the init timestamp, with the tie caveat noted", []],
+  ];
+
+  it.each(table)("%j names %j", (block, expected) => {
+    expect(artifactsOf(block)).toEqual(expected);
+  });
+
+  it("never adds the artifacts line's own text to the summary", () => {
+    expect(parseResultBlock("Result: done\nartifacts: none")).toEqual({ status: "done", summary: "", artifacts: [] });
+    const reply = [
+      "Caveat: these timestamps are the workspace init checkpoint time.",
+      "",
+      "Result:",
+      "- status: partial",
+      "- what changed: nothing (read-only)",
+      "- artifacts: none; the three names above with the init timestamp, with the tie caveat noted",
+    ].join("\n");
+    expect(parseResultBlock(reply)).toEqual({ status: "partial", summary: "nothing (read-only)", artifacts: [] });
+  });
+
+  it("reads a key bullet after the artifacts as its key, not as an artifact", () => {
+    expect(parseResultBlock("Result:\n- status: done\n- artifacts: a.txt\n- what changed: the docs\nThen more.")).toEqual({
+      status: "done", summary: "the docs Then more.", artifacts: ["a.txt"],
+    });
   });
 });
 

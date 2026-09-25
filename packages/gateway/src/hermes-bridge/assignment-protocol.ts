@@ -37,6 +37,30 @@ const STATUSES = new Set(["done", "partial", "blocked"]);
 const RESULT_LINE = /^(?:\*\*|__)?Result(?::(?:\*\*|__)?|(?:\*\*|__):)(.*)$/;
 const SUMMARY_KEY = /^(?:summary|changed|what changed)\s*:\s*(.*)$/i;
 
+/** The artifact references in one `artifacts:` text: the text after the key, or one bullet under
+ * it. Each Markdown link `[text](url)` is first replaced by its URL; the text is then split at
+ * each comma followed by whitespace or ending it, so a comma inside a URL splits nothing. Each
+ * part is judged on its own by `artifactReference`, and prose parts are dropped. The rule is
+ * written down in contract/ext-bots-v1.md (Leader assignments) for CozyAgents' bundled gateway,
+ * where leader assignments are being ported. */
+export function artifactReferences(text: string): string[] {
+  return text.replace(/\[[^\]]*\]\(([^()\s]+)\)/g, "$1").split(/,(?=\s|$)/)
+    .map(artifactReference).filter((reference) => reference !== undefined);
+}
+
+/** One part, trimmed and unwrapped from one pair of backticks, is a reference when it has no
+ * whitespace and is: a URL (`scheme://...`); else, never `n/a` in any case, nor an email address
+ * (an `@` with no `/`); a path (a `/`); or a file name (ending in `.` and an extension of letters
+ * and digits with at least one letter). So `none`, `N/A`, `v1.2`, `kyle@example.com` and `e.g.`
+ * are prose. */
+export function artifactReference(part: string): string | undefined {
+  const token = part.trim().replace(/^`([^`]+)`$/, "$1");
+  if (token.length === 0 || /\s/.test(token)) return undefined;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(token)) return token;
+  if (/^n\/a$/i.test(token) || (token.includes("@") && !token.includes("/"))) return undefined;
+  return token.includes("/") || /\.[a-z0-9]*[a-z][a-z0-9]*$/i.test(token) ? token : undefined;
+}
+
 /** The last `Result:` block in the reply, or `undefined` when there is none or its status is not
  * one of the three words. A missing result is recorded as missing and never invented. */
 export function parseResultBlock(text: string): AssignmentResult | undefined {
@@ -59,16 +83,21 @@ export function parseResultBlock(text: string): AssignmentResult | undefined {
     const statusMatch = /^status\s*:\s*(.*)$/i.exec(content);
     const artifactsMatch = /^artifacts\s*:\s*(.*)$/i.exec(content);
     const summaryMatch = SUMMARY_KEY.exec(content);
+    // Keys first. The `artifacts:` text and each bullet under it keep only their references and
+    // never reach `summary`; any other line ends the listing.
     if (statusMatch !== null) {
       status = statusMatch[1]!.trim().toLowerCase();
       listing = false;
     } else if (artifactsMatch !== null) {
-      artifacts.push(...artifactsMatch[1]!.split(","));
+      artifacts.push(...artifactReferences(artifactsMatch[1]!));
       listing = true;
+    } else if (summaryMatch !== null) {
+      summary.push(summaryMatch[1]!);
+      listing = false;
     } else if (bullet && listing) {
-      artifacts.push(content);
+      artifacts.push(...artifactReferences(content));
     } else {
-      summary.push(summaryMatch === null ? content : summaryMatch[1]!);
+      summary.push(content);
       listing = false;
     }
   }

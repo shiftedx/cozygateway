@@ -10,7 +10,8 @@ import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-her
 /** agent-inbox 1 end to end over the real listener: a leader profile assigns work with its own
  *  attach bearer, a stock Hermes profile answers it as an ordinary attach-v1 turn over the real
  *  socket, the leader acknowledges it, and the paired phone reads the Task, the inbox and the
- *  live activity frames. */
+ *  live activity frames. The routes stay for a future Hermes or OpenClaw leader, but the gateway
+ *  does not advertise agent-inbox while no bot on it can lead (ADR 0086). */
 it("a leader assigns to a Hermes profile over attach-v1 and acknowledges the result", async () => {
   process.env["ASSIGN_DASHBOARD_TOKEN"] = "dashboard-secret";
   process.env["ASSIGN_LEAD_TOKEN"] = "lead-secret";
@@ -35,7 +36,7 @@ it("a leader assigns to a Hermes profile over attach-v1 and acknowledges the res
     const url = gateway.url;
     await until(() => gateway!.storage.botRoster().bots.some((bot) => bot.name === "lead"));
     const health = (await (await fetch(`${url}/health`)).json()) as GatewayInfo;
-    expect(health.capabilities?.["com.cozylabs.agent-inbox"]).toBe(1);
+    expect(health.capabilities?.["com.cozylabs.agent-inbox"]).toBeUndefined();
     expect(health.capabilities?.["com.cozylabs.bots"]).toBe(89);
 
     const pair = await fetch(`${url}/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ setupCode: gateway.issueSetupCode(), deviceName: "phone" }) });
@@ -71,11 +72,19 @@ it("a leader assigns to a Hermes profile over attach-v1 and acknowledges the res
     plugin.send(JSON.stringify({ kind: "hello", version: 2, instanceId: "hermes-scout", capabilities: ["draft"], resume: { eventSequence: 0, commandSequence: 0 } }));
     await until(() => pluginFrames.some((frame) => frame.kind === "hello_ack"));
 
-    // Only a leader may assign, and the team is set from the phone.
+    // Only a leader may assign. While agent-inbox is not advertised the phone cannot make one, so
+    // the leader row a future Hermes or OpenClaw leader would get is written directly here.
     const refused = await lead("/bots/lead/assignments", { to: "scout", brief: "Check CI", doneCriteria: "main is green" });
     expect(refused.status).toBe(409);
     expect(await refused.json()).toMatchObject({ reason: "not_leader" });
-    expect((await device("/bots/lead/profile", { method: "PATCH", body: JSON.stringify({ role: "leader", reports: ["scout"] }) })).status).toBe(200);
+    const teamPatch = await device("/bots/lead/profile", { method: "PATCH", body: JSON.stringify({ role: "leader", reports: ["scout"] }) });
+    expect(teamPatch.status).toBe(400);
+    expect(await teamPatch.json()).toMatchObject({ error: { code: "invalid_request", message: "leader teams are not available on this gateway" } });
+    gateway.storage.setBotTeam({ bot: "lead", role: "leader", reports: ["scout"], updatedAt: Date.now() });
+    // Nor does any roster row or profile read say `role`, so CozyChat shows no leader badge.
+    const roster = (await (await device("/bots")).json()) as { bots: Array<{ name: string; role?: string }> };
+    expect(roster.bots.find((bot) => bot.name === "lead")).not.toHaveProperty("role");
+    expect(await (await device("/bots/lead/profile")).json()).not.toHaveProperty("role");
 
     const created = await lead("/bots/lead/assignments", { to: "scout", brief: "Check CI", doneCriteria: "main is green", idempotencyKey: "ci-1" });
     expect(created.status).toBe(201);

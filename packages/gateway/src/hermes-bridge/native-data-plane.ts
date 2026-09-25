@@ -108,8 +108,9 @@ export interface NativeBotDataPlaneOptions {
   storage: Storage;
   ingress: AttachV1Ingress;
   nativeBots: Iterable<string>;
-  /** Config-declared bots served by a non-Hermes runtime. They have no Dashboard profile, so their
-   * roster row is built here and their Dashboard-backed surfaces refuse instead of asking. */
+  /** Bots served by a non-Hermes runtime, built here with no Dashboard profile. CozyGateway passes
+   * none since 0.8.6 (ADR 0086): CozyAgents bots attach to CozyAgents' bundled gateway, whose copy
+   * of this plane passes them. Kept so the two copies stay the same code. */
   runtimeBots?: readonly {
     id: string;
     name: string;
@@ -132,6 +133,10 @@ export interface NativeBotDataPlaneOptions {
    * routines over it, so those surfaces route here instead of refusing. Absent means no gateway on
    * this deployment negotiated the lane and every config surface keeps its 409. */
   botConfig?: ConfigSurface;
+  /** Whether this gateway advertises `com.cozylabs.agent-inbox`, the only case in which a roster
+   * row may carry `role`. Absent strips it, so no client shows a leader badge for a team it cannot
+   * open (ADR 0086). */
+  leaderTeams?: boolean;
   /** Session execution context is prepared before the first turn is queued. */
   chatConfiguration?: GatewayChatConfiguration;
   /** Capability 50. The attach-v1 bot-history lane. A runtime bot checkpoints its own workspace
@@ -528,6 +533,7 @@ export class NativeBotDataPlane {
   /** A model/workspace write makes the current generation historical even while it is idle. */
   readonly #chatContextInvalidatedTurns = new Map<string, string>();
   readonly #observe: ObservationRing | undefined;
+  readonly #leaderTeams: boolean;
   #staleTurnSweep: ReturnType<typeof setInterval> | undefined;
 
   constructor(opts: NativeBotDataPlaneOptions) {
@@ -540,6 +546,7 @@ export class NativeBotDataPlane {
       (opts.runtimeBots ?? []).map((bot) => [normalize(bot.id), bot]),
     );
     this.#runtimeLifecycle = opts.runtimeLifecycle;
+    this.#leaderTeams = opts.leaderTeams === true;
     this.#botConfig = opts.botConfig;
     this.#chatConfiguration = opts.chatConfiguration;
     this.#botHistory = opts.botHistory;
@@ -822,7 +829,9 @@ export class NativeBotDataPlane {
     // Appended in this function rather than in `#roster` so the `bot_roster` frame, which is
     // published through this overlay, carries exactly the rows `GET /bots` returns.
     for (const bot of this.#runtimeBots.values()) rows.push(this.#runtimeRow(bot));
-    return rows;
+    // A Hermes row's `role` comes from the bridge, a runtime row's from `#runtimeRow`; both leave
+    // here, which is the one place every roster surface passes through.
+    return this.#leaderTeams ? rows : rows.map(({ role: _role, ...row }) => row);
   }
 
   /** Everything a native row knows that the Dashboard cannot: the local conversation identity,

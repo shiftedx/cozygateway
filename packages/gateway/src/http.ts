@@ -48,6 +48,7 @@ import {
   ModelProviderOAuthCodeSchema,
   GatewayMaintenanceRestartRequestSchema,
   GatewayMaintenanceUpdateRequestSchema,
+  AGENT_INBOX_CAPABILITY_ID,
 } from "cozygateway-contract";
 
 import { Type } from "@sinclair/typebox";
@@ -1749,7 +1750,10 @@ export function createApp(deps: AppDeps): Hono<Env> {
       deps.history,
       deps.chatConfiguration,
       deps.integrations,
-      deps.assignments === undefined ? undefined : {
+      // The team fields on the profile follow the advertisement: where agent-inbox is not
+      // advertised a team patch is refused and the read carries no `role` (ADR 0086).
+      deps.assignments === undefined
+        || deps.gatewayInfo.capabilities?.[AGENT_INBOX_CAPABILITY_ID] === undefined ? undefined : {
         read: (bot) => deps.assignments!.team(bot),
         check: (bot, patch) => deps.assignments!.checkTeam(bot, patch),
         write: (bot, patch) => deps.assignments!.setTeam(bot, patch),

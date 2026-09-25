@@ -277,7 +277,8 @@ export function gatewayInfoForConfig(
       [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION,
       // The chat attachment route accepts voice notes and relays them as audio, wherever Bot Mode
       // is served. Whether a bot understands one is up to the bot's own transcription. Its own id,
-      // never a bots row, so an embedded gateway at another bots version can advertise it too.
+      // never a bots row, so CozyAgents' bundled gateway, at another bots version, can advertise
+      // it too.
       [CHAT_AUDIO_CAPABILITY_ID]: CHAT_AUDIO_CAPABILITY_VERSION,
       [CHAT_CONFIGURATION_CAPABILITY_ID]: CHAT_CONFIGURATION_CAPABILITY_VERSION,
       [CHAT_CONTEXT_CAPABILITY_ID]: CHAT_CONTEXT_CAPABILITY_VERSION,
@@ -311,7 +312,7 @@ export function gatewayInfoForConfig(
       ...(integrations
         ? { [INTEGRATIONS_CAPABILITY_ID]: INTEGRATIONS_CAPABILITY_VERSION }
         : {}),
-      // Leader assignments. Never inferred from the bots scalar (ADR 0082, superseded).
+      // Leader assignments. Never inferred from the bots scalar (ADR 0082, superseded; ADR 0086).
       ...(agentInbox
         ? { [AGENT_INBOX_CAPABILITY_ID]: AGENT_INBOX_CAPABILITY_VERSION }
         : {}),
@@ -480,6 +481,12 @@ export async function startGateway(
     () => readMaintenanceRuntimeHealth(),
     () => Date.now(),
   );
+  // agent-inbox is not advertised: no bot here can lead. A Hermes profile has no team tools, and
+  // CozyAgents bots attach to CozyAgents' bundled gateway (ADR 0086). Without it CozyChat hides
+  // the Agent Inbox, whose only threads are assignments, and the Team section, and this gateway
+  // refuses team fields on the profile and emits no `role` on a roster row. The assignment routes
+  // stay for a future Hermes or OpenClaw leader, which is when this turns back on.
+  const agentInbox = false;
   const gatewayInfo = gatewayInfoForConfig(
     config,
     gatewaySettings !== undefined,
@@ -489,8 +496,7 @@ export async function startGateway(
     hermesGlobalSkills !== undefined,
     maintenance !== undefined,
     integrations !== undefined,
-    // The assignment store is part of every gateway's storage.
-    true,
+    agentInbox,
   );
   // Dashboard packet D2. The observation ring: what the gateway already measures on every turn,
   // heartbeat and sweep, kept for a week instead of thrown away. OFF BY DEFAULT; constructed
@@ -995,6 +1001,7 @@ export async function startGateway(
   nativeBotPlane = new NativeBotDataPlane({
     control: bridge,
     storage,
+    leaderTeams: agentInbox,
     observe,
     ingress: attachV1Ingress,
     nativeBots: nativeBotIds,

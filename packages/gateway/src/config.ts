@@ -99,17 +99,6 @@ const TlsConfigSchema = Type.Object({
 });
 export type TlsConfig = Static<typeof TlsConfigSchema>;
 
-/** A Bot served by a non-Hermes runtime. It is known from config plus attach presence alone;
- *  no Hermes Dashboard is consulted for it. Token values live only in the named env var. */
-export const NativeBotConfigSchema = Type.Object({
-  id: Type.String({ minLength: 1, maxLength: 48, pattern: "^[a-z0-9][a-z0-9_-]*$" }),
-  name: Type.Optional(Type.String({ minLength: 1 })),
-  avatar: Type.Optional(Type.String({ minLength: 1 })),
-  tokenEnv: Type.String({ minLength: 1 }),
-  runtime: Type.Literal("cozyagents"),
-});
-export type NativeBotConfig = Static<typeof NativeBotConfigSchema>;
-
 const GatewayConfigSchema = Type.Object({
   name: Type.String({ minLength: 1 }),
   port: Type.Integer({ minimum: 1, maximum: 65535, default: 8787 }),
@@ -147,14 +136,10 @@ const GatewayConfigSchema = Type.Object({
    *  on exact loopback so the public proxy is the only network path into the plaintext origin. */
   publicUrl: Type.Optional(Type.String({ minLength: 1 })),
   /** Hermes runtimes. Profile ids are bare for one endpoint and namespaced for multiple.
-   *  OPTIONAL since capability 52: a CozyAgents-only gateway has no Hermes at all, and requiring
-   *  one meant such a gateway could not be configured. Absent and empty mean the same thing, no
-   *  Hermes bridge, and `/ready` then reports the bridge as `absent` rather than degraded. */
+   *  Optional: absent and empty mean the same thing, no Hermes bridge, and `/ready` then reports
+   *  the bridge as `absent` rather than degraded. Such a gateway serves no bots. */
   hermesEndpoints: Type.Optional(Type.Array(HermesEndpointConfigSchema, { maxItems: 32 })),
   tls: Type.Optional(TlsConfigSchema),
-  /** Bots served by a non-Hermes runtime, e.g. CozyAgents. Additive to hermesEndpoints' profiles;
-   *  ids share the same collision namespace (see loadConfig). */
-  bots: Type.Optional(Type.Array(NativeBotConfigSchema, { maxItems: 64 })),
   /** Dashboard packet D2. The observation ring: a seven day series and events store fed by the
    *  timing the gateway already computes on every turn, heartbeat and sweep.
    *
@@ -199,13 +184,6 @@ export function hermesEndpoints(config: GatewayConfig): ResolvedHermesEndpoint[]
 export function publicProfileId(endpoint: ResolvedHermesEndpoint, profile: string): string {
   const normalized = profile.trim().toLowerCase();
   return endpoint.namespace ? `${endpoint.id}:${normalized}` : normalized;
-}
-
-/** Bots declared under the top-level `bots` config section, with `id` normalized the same way
- *  Hermes profile ids are (see publicProfileId). The schema pattern already forbids uppercase;
- *  this is belt and braces. */
-export function nativeBots(config: GatewayConfig): NativeBotConfig[] {
-  return config.bots ?? [];
 }
 
 /** Dashboard packet D2. The observation ring's settings with the omitted case spelled out, so no
@@ -265,14 +243,20 @@ export function loadConfig(path: string): GatewayConfig {
     typeof raw === "object" && raw !== null
       ? { port: 8787, dbPath: "cozygateway.db", turnTimeoutSeconds: 0, ...raw }
       : raw;
-  // The removed single-endpoint shape is refused BY NAME rather than ignored. Since capability 52
-  // an absent `hermesEndpoints` is a valid CozyAgents-only gateway, so a config still carrying the
-  // old top-level `hermes` block would otherwise start silently with no Hermes at all, which is the
-  // one failure this check exists to prevent.
+  // Removed shapes are refused BY NAME rather than ignored. An absent `hermesEndpoints` is valid,
+  // so a config still carrying the old top-level `hermes` block would otherwise start silently
+  // with no Hermes at all.
   if (typeof withDefaults === "object" && withDefaults !== null && "hermes" in withDefaults)
     throw new ContractViolation(
       "the top-level `hermes` block was replaced by `hermesEndpoints`; move it there, or remove it for a gateway with no Hermes",
       "/hermes",
+    );
+  // A `bots` block named CozyAgents runtime bots, which this gateway stopped hosting in 0.8.6. Read
+  // by nothing, it left each such peer refused `1008` forever (ADR 0086).
+  if (typeof withDefaults === "object" && withDefaults !== null && "bots" in withDefaults)
+    throw new ContractViolation(
+      "remove the `bots` block: cozygateway connects Hermes bots and hosts no CozyAgents runtime bots; CozyAgents bots attach to CozyAgents' bundled gateway",
+      "/bots",
     );
   const config = validatePublicDeployment(assertValid(GatewayConfigSchema, withDefaults) as GatewayConfig);
   const endpointIds = new Set<string>();
@@ -293,10 +277,6 @@ export function loadConfig(path: string): GatewayConfig {
       }
       seen.add(profile);
     }
-  }
-  for (const bot of nativeBots(config)) {
-    if (seen.has(bot.id)) throw new ContractViolation(`duplicate bot id "${bot.id}"`, "/bots");
-    seen.add(bot.id);
   }
   return config;
 }

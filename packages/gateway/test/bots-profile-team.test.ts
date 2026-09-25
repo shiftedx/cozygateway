@@ -32,7 +32,7 @@ afterEach(async () => {
   for (const storage of storages.splice(0)) storage.close();
 });
 
-async function setup(opts: { configure?: () => unknown } = {}) {
+async function setup(opts: { configure?: () => unknown; agentInbox?: boolean } = {}) {
   const known = new Set(["scout", "sage"]);
   const server = await startFakeHermesServer({
     methods: {
@@ -54,7 +54,8 @@ async function setup(opts: { configure?: () => unknown } = {}) {
   rooms.push(assignments);
   const app = createApp({
     storage, config, bots: bridge, assignments,
-    gatewayInfo: { name: "g", version: "0.1.0", contract: "v1", capabilities: {} },
+    gatewayInfo: { name: "g", version: "0.1.0", contract: "v1",
+      capabilities: opts.agentInbox === false ? {} : { "com.cozylabs.agent-inbox": 1 } },
     presenceOf: () => "online", submitUserMessage: () => { throw new Error("unused"); },
     interruptThread: () => "idle", resolveApproval: () => Promise.resolve("unknown" as const),
     onDeviceRevoked: () => {}, now: () => 1_000,
@@ -72,6 +73,21 @@ async function setup(opts: { configure?: () => unknown } = {}) {
 }
 
 const patch = (body: unknown): RequestInit => ({ method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+describe("team fields where agent-inbox is not advertised", () => {
+  it("refuses a team patch with 400, writes nothing, and reads no role", async () => {
+    const h = await setup({ agentInbox: false });
+    h.storage.setBotTeam({ bot: "scout", role: "leader", reports: ["sage"], updatedAt: 1 });
+    const res = await h.authed("/bots/scout/profile", patch({ role: "member" }));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: { code: "invalid_request", message: "leader teams are not available on this gateway" } });
+    expect(h.storage.botTeam("scout")?.role).toBe("leader");
+    const read = await (await h.authed("/bots/scout/profile")).json() as Record<string, unknown>;
+    expect(read).toMatchObject({ name: "scout" });
+    expect(read).not.toHaveProperty("role");
+    expect(read).not.toHaveProperty("reports");
+  });
+});
 
 describe("team fields on the bot profile", () => {
   it("stores role and reports on the gateway, touches no peer, and merges them into the read", async () => {
