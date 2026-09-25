@@ -34,7 +34,7 @@
     "@sinclair/typebox": "^0.34.0",
     "cozygateway-contract": "workspace:*",
     "hono": "^4.13.7",
-    "ws": "^8.18.0"
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@types/ws": "^8.5.0",
