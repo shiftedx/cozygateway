@@ -61,6 +61,7 @@ import type { ObservationRing } from "../observe/ring.ts";
 import type { GatewayChatConfiguration } from "../chat-configuration.ts";
 import { CozyAgentsHarnessModelSettingsAdapter } from "../harness-settings.ts";
 import { ATTACH_MEDIA_TTL_MS } from "./photos.ts";
+import { ASSISTANT_MEDIA_TYPES } from "./assistant-media.ts";
 import type {
   BotApprovalDecision,
   BotApprovalDecisionScope,
@@ -2452,7 +2453,10 @@ export class NativeBotDataPlane {
     file: BotChatFileUpload,
     opts?: { deviceId?: string },
   ): Promise<{ sessionId: string; message: BotChatMessage }> {
-    return this.#sendAttachment(name, { ...file, family: "file", label: "attachment", deviceId: opts?.deviceId });
+    // chat-audio 1: the family follows the accepted MIME, exactly as the attach media upload
+    // route decides it. A runtime peer transcribes only `audio`; every other type is a document.
+    const family = ASSISTANT_MEDIA_TYPES.get(file.mime)?.kind === "audio" ? "audio" : "file";
+    return this.#sendAttachment(name, { ...file, family, label: "attachment", deviceId: opts?.deviceId });
   }
 
   /** One durable attachment turn, after each public route has validated its own file type. */
@@ -2462,7 +2466,7 @@ export class NativeBotDataPlane {
       bytes: Uint8Array;
       mime: string;
       name: string;
-      family: "image" | "file";
+      family: "image" | "audio" | "file";
       text: string;
       clientId?: string;
       deviceId?: string;

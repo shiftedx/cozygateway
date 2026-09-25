@@ -66,6 +66,52 @@ describe("capability-24 bot attachment routes", () => {
     expect(sendChatAttachment).not.toHaveBeenCalled();
   });
 
+  // com.cozylabs.chat-audio 1: a voice note rides the same one-file route as a document. The bytes
+  // are checked with the same magic the attach media route uses, and an m4a alias is canonical.
+  const ftyp = (brand: string) => Uint8Array.from([0, 0, 0, 20, 0x66, 0x74, 0x79, 0x70, ...[...brand].map((ch) => ch.charCodeAt(0))]);
+  const id3 = Uint8Array.from([0x49, 0x44, 0x33, 4, 0, 0]);
+  const wave = Uint8Array.from([...new TextEncoder().encode("RIFF"), 4, 0, 0, 0, ...new TextEncoder().encode("WAVE")]);
+
+  it.each([
+    ["audio/mp4", "voice.m4a", "audio/mp4", ftyp("M4A ")],
+    ["audio/mpeg", "voice.mp3", "audio/mpeg", id3],
+    ["audio/wav", "voice.wav", "audio/wav", wave],
+    ["audio/x-wav", "voice.wav", "audio/x-wav", wave],
+    ["audio/m4a", "voice.m4a", "audio/mp4", ftyp("M4A ")],
+    ["audio/x-m4a", "voice.m4a", "audio/mp4", ftyp("M4A ")],
+    ["application/octet-stream", "voice.m4a", "audio/mp4", ftyp("M4A ")],
+    ["", "Voice.M4A", "audio/mp4", ftyp("M4A ")],
+  ])("accepts a '%s' voice note named %s as %s", async (type, name, mime, bytes) => {
+    const { app, sendChatAttachment } = fixture();
+    const response = await app.request("/bots/sage/chat/attachments", { method: "POST", body: multipart(type, bytes, name) });
+    expect(response.status).toBe(202);
+    expect(sendChatAttachment).toHaveBeenCalledWith("sage", expect.objectContaining({ mime, name }), { deviceId: "device-1" });
+  });
+
+  it.each([
+    ["audio/mp4", "voice.m4a", ftyp("qt  ")],
+    ["audio/wav", "voice.wav", id3],
+    ["audio/mpeg", "voice.mp3", wave],
+    ["audio/x-m4a", "voice.m4a", new TextEncoder().encode("not audio at all")],
+    ["application/octet-stream", "voice.m4a", new TextEncoder().encode("not audio at all")],
+  ])("refuses a %s voice note named %s whose bytes contradict it", async (type, name, bytes) => {
+    const { app, sendChatAttachment } = fixture();
+    const response = await app.request("/bots/sage/chat/attachments", { method: "POST", body: multipart(type, bytes, name) });
+    expect(response.status).toBe(415);
+    expect(await response.json()).toMatchObject({ reason: "content_type" });
+    expect(sendChatAttachment).not.toHaveBeenCalled();
+  });
+
+  it("holds a voice note to the 20 MiB attachment cap, not the 40 MiB assistant audio cap", async () => {
+    const { app, sendChatAttachment } = fixture();
+    const bytes = new Uint8Array(20 * 1024 * 1024 + 1);
+    bytes.set(ftyp("M4A "));
+    const response = await app.request("/bots/sage/chat/attachments", { method: "POST", body: multipart("audio/mp4", bytes, "voice.m4a") });
+    expect(response.status).toBe(413);
+    expect(await response.json()).toMatchObject({ reason: "too_large" });
+    expect(sendChatAttachment).not.toHaveBeenCalled();
+  });
+
   it("rejects an oversized declared multipart request before parsing it", async () => {
     const { app, sendChatAttachment } = fixture();
     const response = await app.request("/bots/sage/chat/attachments", {

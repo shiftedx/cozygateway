@@ -208,6 +208,29 @@ class DispatchInjectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.media_urls, ["/cache/report.pdf"])
         self.assertEqual(event.media_types, ["application/pdf"])
 
+    async def test_turn_hands_a_voice_note_to_hermes_as_audio(self):
+        """chat-audio 1: a phone voice note is attach media of family ``audio``. The plugin keys on
+        the downloaded MIME, not the family, so Hermes' own cache classifies it as audio and its
+        runner's speech-to-text takes it (any ``audio/`` media type is a voice message there)."""
+        adapter = self._make_adapter()
+        cached = []
+
+        class Client:
+            async def download_media(self, media_id):
+                return b"\x00\x00\x00\x14ftypM4A ", "voice.m4a", "audio/mp4"
+
+        def cache_media_bytes(data, *, filename, mime_type):
+            cached.append((filename, mime_type))
+            return types.SimpleNamespace(path="/cache/voice.m4a", media_type=mime_type)
+
+        adapter._client = Client()
+        sys.modules["gateway.platforms.base"].cache_media_bytes = cache_media_bytes
+        await adapter._handle_turn(TurnFrame(thread_id="chat-1", turn_id="turn-voice", text="listen", media_ids=["media-1"]))
+        self.assertEqual(cached, [("voice.m4a", "audio/mp4")])
+        event = adapter.injected[0]
+        self.assertEqual(event.media_urls, ["/cache/voice.m4a"])
+        self.assertEqual(event.media_types, ["audio/mp4"])
+
 
 if __name__ == "__main__":
     unittest.main()

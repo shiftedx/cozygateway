@@ -133,7 +133,8 @@ import {
   redactHostPaths,
   type PhotoRateLimiter,
 } from "./photos.ts";
-import { FILE_MAX_BYTES, acceptFileBytes, attachmentDisposition, safeFilename } from "./documents.ts";
+import { FILE_MAX_BYTES, attachmentDisposition, safeFilename } from "./documents.ts";
+import { acceptChatAttachmentBytes } from "./assistant-media.ts";
 import {
   RoutineDashboardUnavailable,
   RoutineNotFound,
@@ -2642,8 +2643,8 @@ export function registerBotRoutes(
   });
 
   // Capability 24: the same one-file, one-turn pipeline as photos, with a deliberately small
-  // document allow-list. Files remain gateway-owned attach-v1 media; no Hermes path or URL enters
-  // the transcript.
+  // document allow-list, plus chat-audio 1's voice notes. Files remain gateway-owned attach-v1
+  // media; no Hermes path or URL enters the transcript.
   app.post("/bots/:name/chat/attachments", requireDevice, async (c) => {
     const resolved = canonicalName(c);
     if ("response" in resolved) return resolved.response;
@@ -2687,7 +2688,7 @@ export function registerBotRoutes(
       if (filename === undefined) return c.json(errorBody("invalid_request", "invalid attachment filename"), 400);
       const bytes = new Uint8Array(await file.arrayBuffer());
       let accepted;
-      try { accepted = acceptFileBytes(file.type.toLowerCase(), bytes); } catch (err) {
+      try { accepted = acceptChatAttachmentBytes(file.type, filename, bytes); } catch (err) {
         const message = err instanceof Error ? err.message : "invalid file";
         const status = /size cap/.test(message) ? 413 : /no bytes/.test(message) ? 400 : 415;
         return c.json({ ...extensionErrorBody("media_refused", message), reason: status === 413 ? "too_large" : status === 400 ? "empty" : "content_type" }, status);
