@@ -1788,8 +1788,12 @@ be an assignee: CozyAgents today dereferences `context.room.name` (`prompt-size.
 that starts with `Result:` (also `**Result:**` or `**Result**:`; a status word after it on the
 same line counts as the status) opens a block whose `status:` must be `done`, `partial` or `blocked`,
 whose `artifacts:` (a comma list and/or `- ` bullets) become up to 32 references, and whose other
-lines become `summary`. A reply with no valid block has no `result`: its absence is recorded and
-never invented. Drafts, tool steps, approvals and clarifications on an assignment thread have no
+lines become `summary`. A reference is one token with no whitespace, once trimmed and unwrapped
+from backticks, that contains a `/` or a `.` followed by a letter or digit: a path, a file name or
+a link. An `artifacts:` line is split at commas only when every non-empty part is a reference;
+otherwise it is prose, stays whole as a `summary` line, and names no artifact. A `- ` bullet under
+it is tested on its own the same way. A reply with no valid block has no `result`: its absence is
+recorded and never invented. Drafts, tool steps, approvals and clarifications on an assignment thread have no
 projection in v1 and are acknowledged so the peer's stream keeps moving.
 
 **State** is derived on every read and never stored. First match wins:

@@ -37,6 +37,14 @@ const STATUSES = new Set(["done", "partial", "blocked"]);
 const RESULT_LINE = /^(?:\*\*|__)?Result(?::(?:\*\*|__)?|(?:\*\*|__):)(.*)$/;
 const SUMMARY_KEY = /^(?:summary|changed|what changed)\s*:\s*(.*)$/i;
 
+/** One artifact reference, or `undefined` for prose. A reference is one token with no whitespace,
+ * once trimmed and unwrapped from backticks, that contains a `/` or a `.` followed by a letter or
+ * digit: a path, a file name or a link. The same rule serves CozyAgents' bundled gateway. */
+export function artifactReference(part: string): string | undefined {
+  const token = part.trim().replace(/^`([^`]+)`$/, "$1");
+  return !/\s/.test(token) && /\/|\.\w/.test(token) ? token : undefined;
+}
+
 /** The last `Result:` block in the reply, or `undefined` when there is none or its status is not
  * one of the three words. A missing result is recorded as missing and never invented. */
 export function parseResultBlock(text: string): AssignmentResult | undefined {
@@ -59,17 +67,22 @@ export function parseResultBlock(text: string): AssignmentResult | undefined {
     const statusMatch = /^status\s*:\s*(.*)$/i.exec(content);
     const artifactsMatch = /^artifacts\s*:\s*(.*)$/i.exec(content);
     const summaryMatch = SUMMARY_KEY.exec(content);
+    // An `artifacts:` line is split at commas only when every non-empty part is a reference;
+    // otherwise it is prose and stays whole as a summary line. A bullet under it is tested alone.
+    const parts = artifactsMatch?.[1]!.split(",").filter((part) => part.trim().length > 0);
+    const references = parts?.map(artifactReference);
+    const listed = bullet && listing ? artifactReference(content) : undefined;
     if (statusMatch !== null) {
       status = statusMatch[1]!.trim().toLowerCase();
       listing = false;
-    } else if (artifactsMatch !== null) {
-      artifacts.push(...artifactsMatch[1]!.split(","));
+    } else if (references !== undefined && references.every((reference) => reference !== undefined)) {
+      artifacts.push(...references as string[]);
       listing = true;
-    } else if (bullet && listing) {
-      artifacts.push(content);
+    } else if (listed !== undefined) {
+      artifacts.push(listed);
     } else {
       summary.push(summaryMatch === null ? content : summaryMatch[1]!);
-      listing = false;
+      listing = listing && bullet;
     }
   }
   if (status === undefined || !STATUSES.has(status)) return undefined;

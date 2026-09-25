@@ -43,12 +43,47 @@ describe("Result: block", () => {
   });
 
   it("accepts an inline comma list and bulleted keys, dedupes, and caps at 32", () => {
-    const many = Array.from({ length: 40 }, (_, i) => `f${i}`).join(", ");
-    const parsed = parseResultBlock(`Result:\n- Status: Blocked\n- what changed: nothing yet\nartifacts: a, a, ${many}`);
+    const many = Array.from({ length: 40 }, (_, i) => `f${i}.txt`).join(", ");
+    const parsed = parseResultBlock(`Result:\n- Status: Blocked\n- what changed: nothing yet\nartifacts: a.txt, a.txt, ${many}`);
     expect(parsed?.status).toBe("blocked");
     expect(parsed?.summary).toBe("nothing yet");
     expect(parsed?.artifacts).toHaveLength(32);
-    expect(parsed?.artifacts[0]).toBe("a");
+    expect(parsed?.artifacts[0]).toBe("a.txt");
+  });
+});
+
+describe("Result: artifacts are paths or links, never prose", () => {
+  it("keeps a prose artifacts line whole in the summary instead of comma-splitting it", () => {
+    // The e2e reply: the old parser split this line at its comma into two nonsense references.
+    const reply = [
+      "Caveat: these timestamps are the workspace init checkpoint time.",
+      "",
+      "Result:",
+      "- status: partial",
+      "- what changed: nothing (read-only)",
+      "- artifacts: none; the three names above with the init timestamp, with the tie caveat noted",
+      "",
+      "Deadline 9:39 AM CDT met.",
+    ].join("\n");
+    expect(parseResultBlock(reply)).toEqual({
+      status: "partial",
+      summary: "nothing (read-only) artifacts: none; the three names above with the init timestamp, with the tie caveat noted Deadline 9:39 AM CDT met.",
+      artifacts: [],
+    });
+    expect(parseResultBlock("Result: done\nartifacts: none")).toEqual({ status: "done", summary: "artifacts: none", artifacts: [] });
+  });
+
+  it("splits a line only when every part is one path, file name or link, backticks aside", () => {
+    expect(parseResultBlock("Result: done\nartifacts: `src/a.ts`, https://ci/run/9, notes.md,")?.artifacts)
+      .toEqual(["src/a.ts", "https://ci/run/9", "notes.md"]);
+    expect(parseResultBlock("Result: done\nartifacts: src/a.ts, the rest is in chat")).toEqual({
+      status: "done", summary: "artifacts: src/a.ts, the rest is in chat", artifacts: [],
+    });
+  });
+
+  it("tests each bullet under artifacts on its own", () => {
+    const parsed = parseResultBlock("Result:\n- status: done\n- artifacts: a.txt\n- what changed: the docs\nartifacts:\n- b/c.md\n- see above\n- d.txt");
+    expect(parsed).toEqual({ status: "done", summary: "the docs see above", artifacts: ["a.txt", "b/c.md", "d.txt"] });
   });
 });
 
