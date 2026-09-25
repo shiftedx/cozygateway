@@ -237,7 +237,11 @@ export function validatePublicDeployment(config: GatewayConfig): GatewayConfig {
   return url.origin === config.publicUrl ? config : { ...config, publicUrl: url.origin };
 }
 
-export function loadConfig(path: string): GatewayConfig {
+/** Said once at `serve` when a config still carries a `bots` block. */
+export const IGNORED_BOTS_BLOCK_WARNING =
+  "cozygateway: ignoring the config's `bots` block. cozygateway connects Hermes bots and hosts no CozyAgents runtime bots; CozyAgents bots attach to CozyAgents' bundled gateway. Remove the block to silence this.";
+
+export function loadConfig(path: string, warn: (message: string) => void = () => {}): GatewayConfig {
   const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
   const withDefaults =
     typeof raw === "object" && raw !== null
@@ -252,12 +256,13 @@ export function loadConfig(path: string): GatewayConfig {
       "/hermes",
     );
   // A `bots` block named CozyAgents runtime bots, which this gateway stopped hosting in 0.8.6. Read
-  // by nothing, it left each such peer refused `1008` forever (ADR 0086).
-  if (typeof withDefaults === "object" && withDefaults !== null && "bots" in withDefaults)
-    throw new ContractViolation(
-      "remove the `bots` block: cozygateway connects Hermes bots and hosts no CozyAgents runtime bots; CozyAgents bots attach to CozyAgents' bundled gateway",
-      "/bots",
-    );
+  // by nothing, it left each such peer refused `1008` forever (ADR 0086). `cozyagents init` told
+  // people to paste one here through v0.2.17, so refusing it would stop an upgraded gateway from
+  // starting at all. It is dropped and named instead.
+  if (typeof withDefaults === "object" && withDefaults !== null && "bots" in withDefaults) {
+    delete (withDefaults as Record<string, unknown>).bots;
+    warn(IGNORED_BOTS_BLOCK_WARNING);
+  }
   const config = validatePublicDeployment(assertValid(GatewayConfigSchema, withDefaults) as GatewayConfig);
   const endpointIds = new Set<string>();
   for (const endpoint of config.hermesEndpoints ?? []) {
