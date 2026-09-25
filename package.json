@@ -17,7 +17,7 @@
     "check": "pnpm build && pnpm typecheck && pnpm test"
   },
   "devDependencies": {
-    "@arethetypeswrong/cli": "^0.18.0",
+    "@arethetypeswrong/cli": "^0.18.5",
     "@types/node": "^26.5.0",
     "esbuild": "^0.25.0",
     "publint": "^0.3.24",
