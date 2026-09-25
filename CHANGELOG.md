@@ -19,8 +19,10 @@ bot-settings lane ([ADR 0086](docs/adr/0086-cozygateway-connects-hermes-and-open
   profile patch carrying `role` or `reports` is `400 invalid_request`, and no profile read or
   roster row carries `role`. The assignment routes stay, unadvertised, for a future Hermes or
   OpenClaw leader.
-- A `Result:` block's `artifacts:` line is split at commas only when every part is a path, file
-  name or link. A prose line stays whole in `summary` and names no artifact.
+- A `Result:` block's artifacts are paths, file names and links only, each part of the
+  `artifacts:` line and each bullet under it judged on its own. A Markdown link counts by its URL,
+  a comma inside a URL does not split it, and prose such as `none`, `N/A`, `v1.2` or `e.g.` names
+  nothing and is not added to `summary`.
 
 ## Unreleased: chat voice notes
 
