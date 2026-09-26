@@ -5,7 +5,8 @@
 FROM node:26-slim@sha256:ec7758ee051e457b468b32bde57b0879010b325bb9862718e9615225ce4aaae1 AS build
 ENV PNPM_HOME=/pnpm
 ENV PATH=/pnpm:$PATH
-RUN corepack enable
+# Node.js 25+ images no longer ship corepack; install the pinned packageManager pnpm instead.
+RUN npm install -g pnpm@10.30.1
 WORKDIR /repo
 COPY . .
 RUN pnpm install --frozen-lockfile
