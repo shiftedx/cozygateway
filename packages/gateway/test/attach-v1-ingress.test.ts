@@ -352,7 +352,10 @@ describe("attach-v1 ingress", () => {
     for (let sequence = 1; sequence <= 3; sequence += 1)
       countBound.ws.send(JSON.stringify({ kind: "event", sequence, eventId: `count-${sequence}`, event: { kind: "draft", threadId: "t", turnId: "u", blocks: [] } }));
     await until(() => countBound.frames.filter((frame) => frame.kind === "ack" && frame.channel === "event").length === 3);
-    expect(admitted.mock.calls.map(([, entries]) => entries.length)).toEqual([2, 1]);
+    // Where the batch timer falls decides [2, 1] or [1, 2]; the bound is that no batch exceeds 2.
+    const batches = admitted.mock.calls.map(([, entries]) => entries.length);
+    expect(Math.max(...batches)).toBeLessThanOrEqual(2);
+    expect(batches.reduce((sum, size) => sum + size, 0)).toBe(3);
     countBound.ws.close();
   });
 

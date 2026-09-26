@@ -163,7 +163,10 @@ class GatewaySequenceHoleTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(self.gateway.gaps_sent, [3])
         self.assertTrue(any("healed durable event sequence hole at 2" in line for line in logs.output))
-        self.assertEqual(spool.pending_events(10, 1_000_000), [])
+        # The client drops acknowledged rows after the gateway admits them, not in the same step.
+        await self.gateway.wait_for(
+            lambda: spool.pending_events(10, 1_000_000) == [], what="the spool to drain",
+        )
 
 
 if __name__ == "__main__":

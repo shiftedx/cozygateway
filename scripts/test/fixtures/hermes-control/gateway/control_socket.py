@@ -26,7 +26,8 @@ def _next_answer(verb, default):
 def _record(line):
     log = os.environ.get("COZY_TEST_CONTROL_LOG")
     if log:
-        with open(log, "a") as handle:
+        # The suite compares this log byte for byte; Windows text mode would write \r\n.
+        with open(log, "a", newline="\n") as handle:
             handle.write(line + "\n")
 
 
@@ -38,7 +39,14 @@ def _served(home):
 def reload_gateway_plugins(home, *, profile_home=None, timeout=30.0):
     profile_home = Path(profile_home or home)
     env = profile_home / ".env"
-    scoped = env.exists() and f"COZYGATEWAY_SPOOL_PATH={profile_home}/" in env.read_text()
+    # Match the profile's own directory, not the whole path: under Git Bash this (native Windows)
+    # Python sees profile_home as C:\...\profiles\<name>, while the .env holds /c/.../profiles/<name>.
+    spool = ""
+    if env.exists():
+        for line in env.read_text().splitlines():
+            if line.startswith("COZYGATEWAY_SPOOL_PATH="):
+                spool = line.split("=", 1)[1].replace("\\", "/")
+    scoped = f"/profiles/{profile_home.name}/" in spool
     _record(f"reload-plugins {profile_home.name} env-scoped={int(scoped)}")
     return _next_answer("reload-plugins", {"reloaded": True, "home": str(profile_home)})
 
