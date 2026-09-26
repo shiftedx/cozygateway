@@ -1093,25 +1093,31 @@ printf 'file://%s\n' "$tmp/runtime-release" > "$runtime_gateway/local/bootstrap-
 COZYGATEWAY_TEST_RUNTIME_REPAIR_LOG="$tmp/runtime-only-repair.log" "$runtime_gateway/bin/cozygateway" repair >/dev/null
 grep -Fqx -- '--runtime-only' "$tmp/runtime-only-repair.log"
 
-# An install from before the Node.js 26 floor carries a private Node.js 24. Its recorded
-# runtime-only update replaces that runtime with a checksum-verified Node.js 26 instead of refusing.
+# An install from before the Node.js 26 move carries a private Node.js 24, on a machine whose own
+# node is 24 too. Its recorded runtime-only update keeps that runtime: replacing the runtime a live
+# gateway runs from breaks on Windows and has no rollback. Nothing is downloaded.
 runtime_old_node="$runtime_gateway"
+cp "$runtime_old_node/runtime/node/bin/node" "$tmp/node26-private-before"
 cat > "$runtime_old_node/runtime/node/bin/node" <<'OLD_NODE'
 #!/usr/bin/env bash
 if [ "${1:-}" = "-p" ]; then printf '24\n'; exit 0; fi
 exec "${COZYGATEWAY_TEST_REAL_NODE:-node}" "$@"
 OLD_NODE
 chmod 700 "$runtime_old_node/runtime/node/bin/node"
-# The machine's own node is Node.js 24 too, so nothing already present qualifies.
 mkdir -p "$tmp/node24-bin"
 cp "$runtime_old_node/runtime/node/bin/node" "$tmp/node24-bin/node"
-if ! old_node_output="$(env -u COZYGATEWAY_NODE HOME="$runtime_home" PATH="$tmp/node24-bin:$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_TEST_CURL_LOG="$tmp/runtime-only-node24-curl.log" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --runtime-only --bundle "$tmp/gateway.mjs" --gateway-dir "$runtime_old_node" 2>&1)"; then
-  printf 'runtime-only repair over Node.js 24 failed:\n%s\n' "$old_node_output" >&2
+if ! old_node_output="$(env -u COZYGATEWAY_NODE HOME="$runtime_home" PATH="$tmp/node24-bin:$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE_DIST_BASE="$tmp/missing-node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --runtime-only --bundle "$tmp/gateway.mjs" --gateway-dir "$runtime_old_node" 2>&1)"; then
+  printf 'runtime-only repair over a private Node.js 24 failed:\n%s\n' "$old_node_output" >&2
   exit 1
 fi
-grep -Fq "installed checksum-verified Node.js $node_version for CozyGateway only" <<<"$old_node_output"
+grep -Fq "using existing Node.js" <<<"$old_node_output"
+! grep -Fq 'installed checksum-verified Node.js' <<<"$old_node_output"
 grep -Fq 'updated CozyGateway runtime and supervisor without changing Hermes profiles' <<<"$old_node_output"
-test "$("$runtime_old_node/runtime/node/bin/node" -p 'process.versions.node.split(".")[0]')" = 26
+test "$("$runtime_old_node/runtime/node/bin/node" -p 'process.versions.node.split(".")[0]')" = 24
+cp "$tmp/node26-private-before" "$runtime_old_node/runtime/node/bin/node"
+# A fresh install whose machine has only a system Node.js 24 gets a private Node.js 26.
+fresh_node24_output="$(HOME="$tmp/node24-fresh-home" HERMES_HOME="$tmp/missing-hermes-home" PATH="$tmp/node24-bin:$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-node24-fresh" 2>&1 || true)"
+grep -Fq 'install the current Node.js 26 release' <<<"$fresh_node24_output"
 
 # Readiness is the commit point: a failed runtime-only restart preserves the
 # prior state and never claims future repairs are narrow.

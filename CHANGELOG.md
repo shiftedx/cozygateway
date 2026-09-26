@@ -9,10 +9,11 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ### Node.js 26
 
-The installer now provisions a private Node.js 26 when the system has no Node.js 26 or newer, and
-an existing install's private Node.js 24 is replaced on its next install, update or repair,
-including a recorded runtime-only update. The Docker images build on `node:26-slim`, and the
-packages declare `engines.node >=26`.
+The installer now provisions a private Node.js 26 when the machine has no Node.js 26 or newer.
+An existing install keeps its own private Node.js 24: the bundle still targets Node.js 24, and
+replacing the runtime a live gateway runs from is unsafe on Windows and has no rollback. The
+Docker images build on `node:26-slim`, CI runs on Node.js 26, and the packages declare
+`engines.node >=26`. Node.js 26 becomes LTS in late October 2026.
 
 ### Hermes and OpenClaw only
 
