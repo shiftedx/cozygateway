@@ -1115,9 +1115,21 @@ grep -Fq "using existing Node.js" <<<"$old_node_output"
 grep -Fq 'updated CozyGateway runtime and supervisor without changing Hermes profiles' <<<"$old_node_output"
 test "$("$runtime_old_node/runtime/node/bin/node" -p 'process.versions.node.split(".")[0]')" = 24
 cp "$tmp/node26-private-before" "$runtime_old_node/runtime/node/bin/node"
+# A runtime-only install on a system Node.js 24 with no private runtime gets a private Node.js 26,
+# since nothing runs from runtime/node yet; before this it could not update at all.
+mv "$runtime_old_node/runtime/node" "$tmp/runtime-node-aside"
+if ! system24_output="$(env -u COZYGATEWAY_NODE HOME="$runtime_home" PATH="$tmp/node24-bin:$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --runtime-only --bundle "$tmp/gateway.mjs" --gateway-dir "$runtime_old_node" 2>&1)"; then
+  printf 'runtime-only repair on a system Node.js 24 failed:\n%s\n' "$system24_output" >&2
+  exit 1
+fi
+grep -Fq "installed checksum-verified Node.js $node_version for CozyGateway only" <<<"$system24_output"
+grep -Fq 'updated CozyGateway runtime and supervisor without changing Hermes profiles' <<<"$system24_output"
+test "$("$runtime_old_node/runtime/node/bin/node" -p 'process.versions.node.split(".")[0]')" = 26
+rm -rf "$runtime_old_node/runtime/node"; mv "$tmp/runtime-node-aside" "$runtime_old_node/runtime/node"
 # A fresh install whose machine has only a system Node.js 24 gets a private Node.js 26.
 fresh_node24_output="$(HOME="$tmp/node24-fresh-home" HERMES_HOME="$tmp/missing-hermes-home" PATH="$tmp/node24-bin:$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-node24-fresh" 2>&1 || true)"
 grep -Fq 'install the current Node.js 26 release' <<<"$fresh_node24_output"
+test ! -e "$tmp/gateway-node24-fresh/runtime/node"
 
 # Readiness is the commit point: a failed runtime-only restart preserves the
 # prior state and never claims future repairs are narrow.

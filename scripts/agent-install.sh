@@ -3851,8 +3851,12 @@ main() {
   if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
   preflight_service_manager
   if [ "$RUNTIME_ONLY" = 1 ]; then
-    NODE_RESOLVED="$(resolve_node)" || die "--runtime-only needs the existing Node.js runtime; reinstall normally to provision it"
-    say "OK    using existing Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
+    if NODE_RESOLVED="$(resolve_node)"; then say "OK    using existing Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
+    # An install on a system Node.js 24 predates the Node.js 26 floor. With no private runtime yet,
+    # nothing runs from runtime/node, so provisioning one there is safe and keeps it updating.
+    elif [ "$DRY_RUN" != 1 ] && [ ! -e "$GATEWAY_DIR/runtime/node" ]; then install_node_runtime
+    else die "--runtime-only needs the existing Node.js runtime; reinstall normally to provision it"
+    fi
     hydrate_listener_settings
     hydrate_dashboard_port
     validate_listener_settings
