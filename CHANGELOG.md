@@ -7,6 +7,13 @@ release; everything older is marked pre-release so installers resolve one "lates
 
 ## 0.9.0 (2026-09-25): Hermes and OpenClaw only
 
+### Node.js 26
+
+The installer now provisions a private Node.js 26 when the system has no Node.js 26 or newer, and
+an existing install's private Node.js 24 is replaced on its next install, update or repair,
+including a recorded runtime-only update. The Docker images build on `node:26-slim`, and the
+packages declare `engines.node >=26`.
+
 ### Hermes and OpenClaw only
 
 CozyGateway connects Hermes (and, soon, OpenClaw) bots to CozyChat. CozyAgents bots use

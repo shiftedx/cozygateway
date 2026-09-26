@@ -18,7 +18,7 @@ CozyGateway is the Node.js gateway for CozyChat. It implements the published [wi
 
 ## Quickstart
 
-The release bootstrap downloads one matched, checksum-verified release and installs a per-user service. It provisions a private Node.js 24 runtime when needed and sets up the matching Hermes attach plugin.
+The release bootstrap downloads one matched, checksum-verified release and installs a per-user service. It provisions a private Node.js 26 runtime when needed and sets up the matching Hermes attach plugin.
 
 ### macOS and Linux
 
@@ -112,7 +112,7 @@ CozyChat, shared model credentials, and your projects remain. See
 
 ## Develop
 
-Development requires Node.js 24+ and pnpm 10.
+Development requires Node.js 26+ and pnpm 10.
 
 ```sh
 pnpm install --frozen-lockfile
@@ -132,7 +132,7 @@ pnpm check
 
 ## Contributing, security, and license
 
-For substantial changes, open an issue before writing the implementation. Keep pull requests focused, add meaningful behavior coverage, and run `pnpm check` with Node 24 before requesting review. Contract changes require an explicit migration and conformance coverage. See [CONTRIBUTING.md](CONTRIBUTING.md).
+For substantial changes, open an issue before writing the implementation. Keep pull requests focused, add meaningful behavior coverage, and run `pnpm check` with Node 26 before requesting review. Contract changes require an explicit migration and conformance coverage. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Please report vulnerabilities privately through GitHub's security advisory flow; do not include tokens, pairing codes, keys, or conversation contents. See [SECURITY.md](SECURITY.md).
 

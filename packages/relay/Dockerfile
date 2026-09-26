@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for the cozygateway push relay. Build context is the monorepo ROOT.
 
-# Docker Hub OCI index digest for node:24-slim, verified 2026-09-04.
-FROM node:24-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS build
+# Docker Hub OCI index digest for node:26-slim, verified 2026-09-25.
+FROM node:26-slim@sha256:ec7758ee051e457b468b32bde57b0879010b325bb9862718e9615225ce4aaae1 AS build
 ENV PNPM_HOME=/pnpm
 ENV PATH=/pnpm:$PATH
 RUN corepack enable
@@ -12,7 +12,7 @@ RUN pnpm install --frozen-lockfile
 RUN pnpm build
 RUN pnpm --filter=cozygateway-relay deploy --prod --legacy /app
 
-FROM node:24-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS runtime
+FROM node:26-slim@sha256:ec7758ee051e457b468b32bde57b0879010b325bb9862718e9615225ce4aaae1 AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=build /app /app

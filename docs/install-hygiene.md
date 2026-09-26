@@ -92,7 +92,7 @@ The new staged origin records `INSTALL_HYGIENE_PROTOCOL=1`.
 
 ## Validation and Windows handoff
 
-Run the focused disposable migration fixture with Node.js 24 on PATH:
+Run the focused disposable migration fixture with Node.js 26 on PATH:
 
 ```sh
 python3 scripts/test/install-hygiene.test.py

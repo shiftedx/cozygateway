@@ -9,7 +9,7 @@
     "url": "git+https://github.com/shiftedx/cozygateway.git",
     "directory": "packages/conformance"
   },
-  "engines": { "node": ">=24" },
+  "engines": { "node": ">=26" },
   "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
   "files": ["dist"],
   "scripts": {

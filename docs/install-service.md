@@ -29,7 +29,7 @@ profiles. Unattended repair keeps the recorded Hermes profile scope and gateway
 settings. An administrator shell hands setup to the same account's normal desktop
 context before product changes.
 
-On Windows, macOS, and Linux, missing Node.js 24+ is installed as a private,
+On Windows, macOS, and Linux, missing Node.js 26+ is installed as a private,
 checksum-verified runtime under the CozyGateway home. Missing Hermes is
 installed with the verified official tagged NousResearch installer. Setup then
 runs `hermes model` interactively only when the active provider/model is

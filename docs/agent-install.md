@@ -40,8 +40,8 @@ An existing install record marked `cozyagents` or `both` is preserved and the
 installer stops without changing it. Use the [CozyAgents bundled gateway](https://github.com/shiftedx/cozyagents)
 for that product, or install this Hermes gateway in a new gateway directory.
 
-If Node.js 24+ is unavailable, the Windows/macOS/Linux installer downloads the current
-Node.js 24 archive from nodejs.org, verifies it against that release's official
+If Node.js 26+ is unavailable, the Windows/macOS/Linux installer downloads the current
+Node.js 26 archive from nodejs.org, verifies it against that release's official
 `SHASUMS256.txt`, and installs it privately under
 the CozyGateway home's `runtime/node` directory. It does not use elevation,
 replace the system Node,
