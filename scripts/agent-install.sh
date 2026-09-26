@@ -353,14 +353,13 @@ gateway_origin() {
 node_major() { "$1" -p 'process.versions.node.split(".")[0]' 2>/dev/null | tr -dc '0-9'; }
 # New installs get Node.js 26. An install's own private runtime is kept from Node.js 24 up: the
 # bundle targets node24, and replacing the runtime a live gateway runs from breaks on Windows and
-# has no rollback. A system Node must be 26 or newer, or a private Node.js 26 is provisioned.
-NODE_MAJOR=26
-NODE_PRIVATE_KEEP_MAJOR=24
+# has no rollback. A system Node must be 26 or newer, or a private Node.js 26 is provisioned. The
+# bounds are locals so tests that extract this function alone still see them.
 resolve_node() {
-  local candidate major private="$GATEWAY_DIR/runtime/node/bin/node"
+  local candidate major private="$GATEWAY_DIR/runtime/node/bin/node" floor=26 keep=24
   is_windows && private="$GATEWAY_DIR/runtime/node/node.exe"
   if [ "${COZYGATEWAY_NODE+x}" != x ] && [ -x "$private" ]; then
-    major="$(node_major "$private")"; [ "${major:-0}" -ge "$NODE_PRIVATE_KEEP_MAJOR" ] && { printf '%s' "$private"; return; }
+    major="$(node_major "$private")"; [ "${major:-0}" -ge "$keep" ] && { printf '%s' "$private"; return; }
   fi
   candidate="$NODE_BIN"
   if is_windows; then
@@ -368,7 +367,7 @@ resolve_node() {
   fi
   if case "$candidate" in */*) [ -x "$candidate" ] ;; *) have "$candidate" ;; esac; then
     major="$(node_major "$candidate")"
-    if [ "${major:-0}" -ge "$NODE_MAJOR" ]; then
+    if [ "${major:-0}" -ge "$floor" ]; then
       case "$candidate" in /*) ;; *) candidate="$(command -v "$candidate")" ;; esac
       # MSYS executes node as node.exe, but native readiness and recovery check
       # literal files. Persist the executable name shared by both shells.
