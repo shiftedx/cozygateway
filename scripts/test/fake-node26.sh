@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 if [ "${1:-}" = "-p" ]; then
-  printf '24\n'
+  printf '26\n'
   exit 0
 fi
 if [ -n "${COZYGATEWAY_TEST_DASHBOARD_HOME_LOG:-}" ] && [ "${1:-}" = - ] && [ "${5:-}" = "${COZYGATEWAY_TEST_EXPECT_DASHBOARD_LAUNCH_PORT:-9119}" ]; then

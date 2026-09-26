@@ -351,11 +351,16 @@ gateway_origin() {
 }
 
 node_major() { "$1" -p 'process.versions.node.split(".")[0]' 2>/dev/null | tr -dc '0-9'; }
+# New installs get Node.js 26. An install's own private runtime is kept from Node.js 24 up: the
+# bundle targets node24, and replacing the runtime a live gateway runs from breaks on Windows and
+# has no rollback. A system Node must be 26 or newer, or a private Node.js 26 is provisioned.
+NODE_MAJOR=26
+NODE_PRIVATE_KEEP_MAJOR=24
 resolve_node() {
   local candidate major private="$GATEWAY_DIR/runtime/node/bin/node"
   is_windows && private="$GATEWAY_DIR/runtime/node/node.exe"
   if [ "${COZYGATEWAY_NODE+x}" != x ] && [ -x "$private" ]; then
-    major="$(node_major "$private")"; [ "${major:-0}" -ge 24 ] && { printf '%s' "$private"; return; }
+    major="$(node_major "$private")"; [ "${major:-0}" -ge "$NODE_PRIVATE_KEEP_MAJOR" ] && { printf '%s' "$private"; return; }
   fi
   candidate="$NODE_BIN"
   if is_windows; then
@@ -363,7 +368,7 @@ resolve_node() {
   fi
   if case "$candidate" in */*) [ -x "$candidate" ] ;; *) have "$candidate" ;; esac; then
     major="$(node_major "$candidate")"
-    if [ "${major:-0}" -ge 24 ]; then
+    if [ "${major:-0}" -ge "$NODE_MAJOR" ]; then
       case "$candidate" in /*) ;; *) candidate="$(command -v "$candidate")" ;; esac
       # MSYS executes node as node.exe, but native readiness and recovery check
       # literal files. Persist the executable name shared by both shells.
@@ -397,9 +402,9 @@ node_archive_name() {
     *) die "private Node bootstrap is unavailable for $SERVICE_PLATFORM" ;;
   esac
   machine="$(printf '%s' "$machine" | tr '[:upper:]' '[:lower:]')"
-  case "$machine" in x86_64|amd64) arch=x64 ;; arm64|aarch64) arch=arm64 ;; *) die "Node.js 24 is unavailable for $(uname -s) $(uname -m); install Node.js 24+ and retry" ;; esac
+  case "$machine" in x86_64|amd64) arch=x64 ;; arm64|aarch64) arch=arm64 ;; *) die "Node.js 26 is unavailable for $(uname -s) $(uname -m); install Node.js 26+ and retry" ;; esac
   if [ "$os" = linux ] && have ldd && ldd --version 2>&1 | grep -qi musl; then
-    die "official Node.js binaries require glibc; install Node.js 24+ for this musl Linux system and retry"
+    die "official Node.js binaries require glibc; install Node.js 26+ for this musl Linux system and retry"
   fi
   printf 'node-%s-%s-%s.%s' "$NODE_INSTALL_VERSION" "$os" "$arch" "$extension"
 }
@@ -412,9 +417,9 @@ install_node_runtime() {
   NODE_INSTALL_VERSION="${COZYGATEWAY_NODE_VERSION:-}"
   if [ -z "$NODE_INSTALL_VERSION" ]; then
     index="$stage/index.tab"; copy_or_download "$base/index.tab" "$index"
-    NODE_INSTALL_VERSION="$(awk 'NR > 1 && $1 ~ /^v24\./ { print $1; exit }' "$index")"
+    NODE_INSTALL_VERSION="$(awk 'NR > 1 && $1 ~ /^v26\./ { print $1; exit }' "$index")"
   fi
-  case "$NODE_INSTALL_VERSION" in v24.*) ;; *) die "could not resolve a current Node.js 24 release" ;; esac
+  case "$NODE_INSTALL_VERSION" in v26.*) ;; *) die "could not resolve a current Node.js 26 release" ;; esac
   archive="$(node_archive_name)"; version_file="$base/$NODE_INSTALL_VERSION"
   copy_or_download "$version_file/SHASUMS256.txt" "$stage/SHASUMS256.txt"
   expected="$(awk -v file="$archive" '$2 == file { print $1; exit }' "$stage/SHASUMS256.txt")"
@@ -3846,8 +3851,12 @@ main() {
   if [ "$UNINSTALL" = 1 ]; then uninstall; return; fi
   preflight_service_manager
   if [ "$RUNTIME_ONLY" = 1 ]; then
-    NODE_RESOLVED="$(resolve_node)" || die "--runtime-only needs the existing Node.js 24 runtime; reinstall normally to provision it"
-    say "OK    using existing Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
+    if NODE_RESOLVED="$(resolve_node)"; then say "OK    using existing Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
+    # An install on a system Node.js 24 predates the Node.js 26 floor. With no private runtime yet,
+    # nothing runs from runtime/node, so provisioning one there is safe and keeps it updating.
+    elif [ "$DRY_RUN" != 1 ] && [ ! -e "$GATEWAY_DIR/runtime/node" ]; then install_node_runtime
+    else die "--runtime-only needs the existing Node.js runtime; reinstall normally to provision it"
+    fi
     hydrate_listener_settings
     hydrate_dashboard_port
     validate_listener_settings
@@ -3855,7 +3864,7 @@ main() {
     return
   fi
   if NODE_RESOLVED="$(resolve_node)"; then say "OK    using Node.js $("$NODE_RESOLVED" -p 'process.versions.node') at $NODE_RESOLVED"
-  elif [ "$DRY_RUN" = 1 ]; then say "DRY   install the current Node.js 24 release under $GATEWAY_DIR/runtime/node from checksum-verified nodejs.org assets"; prerequisite_missing=1
+  elif [ "$DRY_RUN" = 1 ]; then say "DRY   install the current Node.js 26 release under $GATEWAY_DIR/runtime/node from checksum-verified nodejs.org assets"; prerequisite_missing=1
   else install_node_runtime
   fi
   [ "$prerequisite_missing" = 1 ] || { hydrate_listener_settings; hydrate_dashboard_port; }

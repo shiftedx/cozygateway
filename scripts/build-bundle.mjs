@@ -44,6 +44,7 @@ const result = await build({
   bundle: true,
   platform: "node",
   format: "esm",
+  // Existing installs keep a private Node.js 24 (scripts/agent-install.sh); keep this until none do.
   target: "node24",
   outfile: "dist-bundle/cozygateway.mjs",
   // ws optionally requires these native accelerators; without them it

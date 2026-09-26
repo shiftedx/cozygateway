@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
-fake_node="$repo_root/scripts/test/fake-node24.sh"
+fake_node="$repo_root/scripts/test/fake-node26.sh"
 real_node="$(command -v node)"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-installer-test.XXXXXX")"
 tmp="$(cd -P "$tmp" && pwd)"
@@ -616,7 +616,7 @@ for platform in Darwin Linux Windows; do
   grep -Fq "gateway install --start-now --start-on-login" <<<"$output"
   grep -Fq "gateway start" <<<"$output"
   grep -Fq "gateway restart" <<<"$output"
-  grep -Fq 'using Node.js 24' <<<"$output"
+  grep -Fq 'using Node.js 26' <<<"$output"
   [ "$platform" = Windows ] || grep -Fq 'open hermes model' <<<"$output"
   test ! -e "$tmp/gateway-$platform"
 done
@@ -627,7 +627,7 @@ done
 # Missing prerequisites remain a non-mutating dry-run and describe both
 # bootstraps without attempting any download.
 missing_dry_output="$(HOME="$tmp/missing-dry-home" HERMES_HOME="$tmp/missing-hermes-home" LOCALAPPDATA="$tmp/missing-localappdata" PATH="$tmp/bin:$PATH" COZYGATEWAY_HERMES_BIN="$tmp/missing-hermes" COZYGATEWAY_NODE="$tmp/missing-node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-missing-dry")"
-grep -Fq 'install the current Node.js 24 release' <<<"$missing_dry_output"
+grep -Fq 'install the current Node.js 26 release' <<<"$missing_dry_output"
 grep -Fq 'install Hermes Agent with the verified official tagged NousResearch installer' <<<"$missing_dry_output"
 test ! -e "$tmp/gateway-missing-dry"
 if PATH="$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN=hermes COZYGATEWAY_NODE="$fake_node" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bind-host 'http://not-a-host' --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-invalid-host" >/dev/null 2>&1; then
@@ -727,7 +727,7 @@ chmod 700 "$tmp/bin/curl"
 # Official Node archives and the official Hermes installer are represented by
 # local, checksum-verified fixtures. This run starts with neither command,
 # installs both, resumes in the same process, confirms the model, and reaches QR.
-node_version=v24.99.0
+node_version=v26.99.0
 case "$(uname -m)" in x86_64|amd64) node_arch=x64 ;; arm64|aarch64) node_arch=arm64 ;; *) echo 'unsupported test architecture' >&2; exit 1 ;; esac
 node_name="node-$node_version-darwin-$node_arch"
 mkdir -p "$tmp/node-dist/$node_version" "$tmp/node-build/$node_name/bin"
@@ -960,7 +960,7 @@ if grep -Eq '^(default|ops):gateway:(restart|start|install)$' "$tmp/interrupted-
 fi
 cmp -s "$repo_root/integrations/attach-plugin/plugin.yaml" "$tmp/hermes/profiles/active/plugins/cozygateway/plugin.yaml"
 private_rerun_output="$(HOME="$tmp/darwin-home" PATH="$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_HERMES_ROOT="$tmp/hermes" COZYGATEWAY_TEST_COMMAND_LOG="$tmp/commands" COZYGATEWAY_HERMES_BIN="$tmp/darwin-home/.local/bin/hermes" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-live")"
-grep -Fq "using Node.js 24 at $tmp/gateway-live/runtime/node/bin/node" <<<"$private_rerun_output"
+grep -Fq "using Node.js 26 at $tmp/gateway-live/runtime/node/bin/node" <<<"$private_rerun_output"
 
 # A syntactically healthy endpoint with zero configured attach profiles is not
 # ready and cannot reach the pairing finale.
@@ -1092,6 +1092,44 @@ printf '%s  install.sh\n' "$runtime_repair_sha" > "$runtime_gateway/bin/cozygate
 printf 'file://%s\n' "$tmp/runtime-release" > "$runtime_gateway/local/bootstrap-source"
 COZYGATEWAY_TEST_RUNTIME_REPAIR_LOG="$tmp/runtime-only-repair.log" "$runtime_gateway/bin/cozygateway" repair >/dev/null
 grep -Fqx -- '--runtime-only' "$tmp/runtime-only-repair.log"
+
+# An install from before the Node.js 26 move carries a private Node.js 24, on a machine whose own
+# node is 24 too. Its recorded runtime-only update keeps that runtime: replacing the runtime a live
+# gateway runs from breaks on Windows and has no rollback. Nothing is downloaded.
+runtime_old_node="$runtime_gateway"
+cp "$runtime_old_node/runtime/node/bin/node" "$tmp/node26-private-before"
+cat > "$runtime_old_node/runtime/node/bin/node" <<'OLD_NODE'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-p" ]; then printf '24\n'; exit 0; fi
+exec "${COZYGATEWAY_TEST_REAL_NODE:-node}" "$@"
+OLD_NODE
+chmod 700 "$runtime_old_node/runtime/node/bin/node"
+mkdir -p "$tmp/node24-bin"
+cp "$runtime_old_node/runtime/node/bin/node" "$tmp/node24-bin/node"
+if ! old_node_output="$(env -u COZYGATEWAY_NODE HOME="$runtime_home" PATH="$tmp/node24-bin:$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE_DIST_BASE="$tmp/missing-node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --runtime-only --bundle "$tmp/gateway.mjs" --gateway-dir "$runtime_old_node" 2>&1)"; then
+  printf 'runtime-only repair over a private Node.js 24 failed:\n%s\n' "$old_node_output" >&2
+  exit 1
+fi
+grep -Fq "using existing Node.js" <<<"$old_node_output"
+! grep -Fq 'installed checksum-verified Node.js' <<<"$old_node_output"
+grep -Fq 'updated CozyGateway runtime and supervisor without changing Hermes profiles' <<<"$old_node_output"
+test "$("$runtime_old_node/runtime/node/bin/node" -p 'process.versions.node.split(".")[0]')" = 24
+cp "$tmp/node26-private-before" "$runtime_old_node/runtime/node/bin/node"
+# A runtime-only install on a system Node.js 24 with no private runtime gets a private Node.js 26,
+# since nothing runs from runtime/node yet; before this it could not update at all.
+mv "$runtime_old_node/runtime/node" "$tmp/runtime-node-aside"
+if ! system24_output="$(env -u COZYGATEWAY_NODE HOME="$runtime_home" PATH="$tmp/node24-bin:$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --runtime-only --bundle "$tmp/gateway.mjs" --gateway-dir "$runtime_old_node" 2>&1)"; then
+  printf 'runtime-only repair on a system Node.js 24 failed:\n%s\n' "$system24_output" >&2
+  exit 1
+fi
+grep -Fq "installed checksum-verified Node.js $node_version for CozyGateway only" <<<"$system24_output"
+grep -Fq 'updated CozyGateway runtime and supervisor without changing Hermes profiles' <<<"$system24_output"
+test "$("$runtime_old_node/runtime/node/bin/node" -p 'process.versions.node.split(".")[0]')" = 26
+rm -rf "$runtime_old_node/runtime/node"; mv "$tmp/runtime-node-aside" "$runtime_old_node/runtime/node"
+# A fresh install whose machine has only a system Node.js 24 gets a private Node.js 26.
+fresh_node24_output="$(HOME="$tmp/node24-fresh-home" HERMES_HOME="$tmp/missing-hermes-home" PATH="$tmp/node24-bin:$tmp/service-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_REAL_NODE="$real_node" COZYGATEWAY_NODE_VERSION="$node_version" COZYGATEWAY_NODE_DIST_BASE="$tmp/node-dist" COZYGATEWAY_SERVICE_PLATFORM=Darwin bash "$repo_root/scripts/agent-install.sh" --dry-run --bundle "$tmp/gateway.mjs" --plugin-archive "$tmp/plugin.tar.gz" --gateway-dir "$tmp/gateway-node24-fresh" 2>&1 || true)"
+grep -Fq 'install the current Node.js 26 release' <<<"$fresh_node24_output"
+test ! -e "$tmp/gateway-node24-fresh/runtime/node"
 
 # Readiness is the commit point: a failed runtime-only restart preserves the
 # prior state and never claims future repairs are narrow.
@@ -2287,8 +2325,8 @@ test -e "$locked_spool"
 test -e "$locked_install_state"
 
 # A machine with Hermes and Git Bash but no Node receives a private, checksum-
-# verified Windows Node 24 runtime and resumes installation in the same process.
-windows_node_version=v24.99.0
+# verified Windows Node 26 runtime and resumes installation in the same process.
+windows_node_version=v26.99.0
 windows_node_directory="node-$windows_node_version-win-x64"
 windows_node_archive="$windows_node_directory.zip"
 cp -R "$tmp/hermes" "$tmp/hermes-legacy"
@@ -2306,7 +2344,7 @@ grep -Fq 'installed checksum-verified Node.js' <<<"$windows_node_output"
 grep -Fq '[IO.Compression.ZipFile]::ExtractToDirectory' "$tmp/windows-node-commands"
 grep -Fq '/Run /TN CozyGateway' "$tmp/windows-node-commands"
 ! grep -Fq 'wscript ' "$tmp/windows-node-commands"
-grep -Fq "using Node.js 24 at $tmp/gateway-windows-node/runtime/node/node.exe" <<<"$(HOME="$tmp/windows-node-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-node-commands" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --status --gateway-dir "$tmp/gateway-windows-node")"
+grep -Fq "using Node.js 26 at $tmp/gateway-windows-node/runtime/node/node.exe" <<<"$(HOME="$tmp/windows-node-home" APPDATA="$tmp/windows-appdata" PATH="$tmp/windows-bin:$tmp/bin:$PATH" COZYGATEWAY_TEST_WINDOWS_LOG="$tmp/windows-node-commands" COZYGATEWAY_SERVICE_PLATFORM=Windows bash "$repo_root/scripts/agent-install.sh" --status --gateway-dir "$tmp/gateway-windows-node")"
 
 # A pre-identity state file remains removable only through the complete legacy
 # task -> VBS -> exact canonical private-Node wrapper chain.

@@ -9,7 +9,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 installer="$repo_root/scripts/agent-install.sh"
-fake_node="$repo_root/scripts/test/fake-node24.sh"
+fake_node="$repo_root/scripts/test/fake-node26.sh"
 real_node="$(command -v node)"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/cozygateway-rehome-test.XXXXXX")"
 tmp="$(cd -P "$tmp" && pwd)"
