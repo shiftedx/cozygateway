@@ -7,8 +7,7 @@ with a mismatched session token, an unrelated listener sits on the next port, an
 inherits a poisoned PSModulePath. It then checks authenticated Dashboard access, a healthy
 Gateway attach, preservation of both unrelated listeners, that uninstall stops the Gateway's
 private Dashboard even after it was orphaned from its supervisor, and that the poisoned module
-never ran elevated. It is not the 29-case native qualification matrix in
-docs/windows-qualification-2026-09-04.md; it covers this one scenario and records evidence.
+never ran elevated. It covers this one scenario and records evidence.
 
 It changes the machine. Run it only on a disposable Windows VM or test account with no
 CozyGateway or Hermes install you care about, and pass -AcknowledgeDisposableHost.

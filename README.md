@@ -1,12 +1,16 @@
 # CozyGateway
 
-**CozyGateway connects Hermes (and, soon, OpenClaw) bots to CozyChat. CozyAgents bots use CozyAgents' own bundled gateway.**
+[![CI](https://github.com/shiftedx/cozygateway/actions/workflows/ci.yml/badge.svg)](https://github.com/shiftedx/cozygateway/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/shiftedx/cozygateway)](https://github.com/shiftedx/cozygateway/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-CozyGateway is the Node.js gateway for CozyChat. It implements the published [wire contract](contract/v1.md), connects Hermes profiles through the [attach-v1](contract/attach-v1.md) WebSocket data plane, and keeps that attach contract generic for the planned OpenClaw adapter. Pair a device with a short-lived code, then talk directly to your gateway, without creating an account for the gateway itself. The conversation stays on your own machine.
+**Chat with your self-hosted AI agent from your phone.**
+
+CozyGateway is the Node.js gateway between [CozyChat](https://cozylabs.ai), the Apple client, and your [Hermes Agent](https://hermes-agent.nousresearch.com) profiles. It implements the published [wire contract](contract/v1.md) and connects Hermes over the [attach-v1](contract/attach-v1.md) WebSocket data plane, which stays generic for the planned OpenClaw adapter. Pair a device with a short-lived code and talk directly to your gateway, with no gateway account. Conversations stay on your own machine.
 
 [Quick start](#quickstart) · [Documentation](#documentation) · [Releases](https://github.com/shiftedx/cozygateway/releases) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 
-[CozyChat](https://github.com/shiftedx/cozychat) is the Apple client. CozyGateway hosts no CozyAgents runtime bots and has no bot-settings lane. CozyAgents bots attach to the gateway bundled with [CozyAgents](https://github.com/shiftedx/cozyagents), a separate product and install path. See [ADR 0086](docs/adr/0086-cozygateway-connects-hermes-and-openclaw-only.md).
+CozyAgents bots are out of scope: they attach to the gateway bundled with CozyAgents ([ADR 0086](docs/adr/0086-cozygateway-connects-hermes-and-openclaw-only.md)).
 
 ## What it provides
 
@@ -34,32 +38,15 @@ cozygateway
 
 The command shows gateway status and lets you create a fresh pairing code. Scan the QR code, or enter the code in the chat client.
 
-### Windows PowerShell
-
-The installer configures Hermes Agent and its selected profiles.
+### Windows (beta)
 
 ```powershell
 irm https://cozylabs.ai/install.ps1 | iex
 ```
 
-Use this PowerShell command on Windows; the `curl ... | bash` command above is for
-macOS/Linux. Windows PowerShell aliases `curl` to `Invoke-WebRequest`, which does
-not accept curl's flags.
+The installer configures Hermes Agent and its selected profiles, installs a verified private Git Bash if needed, and checks the running gateway and Hermes attachments before reporting success. Run the same command to update; your profiles, pairing, and model settings are kept. Then open a new terminal and run `cozygateway`.
 
-Repeat the PowerShell command to update the gateway and Hermes attachment.
-Routine updates retain your profiles, pairing, and model settings; setup asks for input only when configuration is missing. An administrator shell
-hands setup to a normal PowerShell window for the same Windows account and waits
-for its result. Setup verifies the normal desktop belongs to the same account
-and Windows session before using it to launch the installer.
-
-Setup installs a verified private Git Bash if needed and checks the running
-gateway version and configured Hermes attachments before reporting completion.
-If a component fails, rerun the same command; `cozygateway update` remains
-available for updating the gateway itself.
-
-Open a new PowerShell or Terminal window, then run `cozygateway` to check the installation or make a pairing code.
-
-The Windows installer is published and has automated coverage, but full Windows end-to-end qualification is still in progress. Use it with that limitation in mind; report results through [GitHub Issues](https://github.com/shiftedx/cozygateway/issues).
+Windows support is in beta: it has automated coverage, and full end-to-end qualification is ongoing. Please report problems through [GitHub Issues](https://github.com/shiftedx/cozygateway/issues).
 
 For installation details, profile selection, service registration, and prerequisites, see [Install as a service](docs/install-service.md).
 

@@ -1,9 +1,8 @@
 # Changelog
 
 CozyGateway is pre-1.0. Each minor series below groups the tags that shipped it; patch tags within
-a series are fixes to the series' own changes. Per-tag notes live on the
-[releases page](https://github.com/shiftedx/cozygateway/releases). Only the newest tag is a full
-release; everything older is marked pre-release so installers resolve one "latest".
+a series are fixes to the series' own changes. Release notes for each published version live on the
+[releases page](https://github.com/shiftedx/cozygateway/releases).
 
 ## 0.9.0 (2026-09-25): Hermes and OpenClaw only
 

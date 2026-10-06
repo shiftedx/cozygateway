@@ -3799,7 +3799,7 @@ refuse_legacy_cozyagents_state() {
   harness="$(sed -n 's/^harness=//p' "$STATE_FILE" | tail -1)"
   case "$harness" in
     cozyagents|both)
-      die "this install state belongs to the retired CozyAgents gateway; it was left unchanged. Use https://github.com/shiftedx/cozyagents for its embedded gateway, or install Hermes CozyGateway in a new --gateway-dir"
+      die "this install state belongs to the retired CozyAgents gateway; it was left unchanged. Use https://cozylabs.ai for its embedded gateway, or install Hermes CozyGateway in a new --gateway-dir"
       ;;
   esac
 }

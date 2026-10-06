@@ -2411,7 +2411,7 @@ $alreadyConfigured = Test-Path -LiteralPath $configPath -PathType Leaf
 if (Test-Path -LiteralPath $statePath -PathType Leaf) {
     $legacyHarness = ((Get-Content -LiteralPath $statePath | Where-Object { $_ -like 'harness=*' } | Select-Object -Last 1) -replace '^harness=', '').Trim()
     if ($legacyHarness -in @('cozyagents', 'both')) {
-        Fail 'this install state belongs to the retired CozyAgents gateway; it was left unchanged. Use https://github.com/shiftedx/cozyagents for its embedded gateway, or install Hermes CozyGateway in a new COZYGATEWAY_HOME.'
+        Fail 'this install state belongs to the retired CozyAgents gateway; it was left unchanged. Use https://cozylabs.ai for its embedded gateway, or install Hermes CozyGateway in a new COZYGATEWAY_HOME.'
     }
 }
 
