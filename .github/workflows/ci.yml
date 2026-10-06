@@ -29,6 +29,9 @@ jobs:
       - run: pnpm test
       - run: pnpm audit --prod --audit-level moderate
       - run: pnpm test:installer
+      - run: python3 -m unittest discover -s integrations/attach-plugin/tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/integrations/attach-plugin
       - run: pnpm --filter cozygateway-contract lint:package
 
   docker:
@@ -79,7 +82,7 @@ jobs:
         shell: bash
       - run: bash scripts/test/hermes-installer.test.sh
         shell: bash
-      - run: python -m unittest discover -s integrations/attach-plugin/tests
+      - run: python -m unittest discover -s integrations/attach-plugin/tests -p test_spool_v1.py
         env:
           PYTHONPATH: ${{ github.workspace }}/integrations/attach-plugin
 
