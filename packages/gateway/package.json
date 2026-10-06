@@ -1,6 +1,6 @@
 {
   "name": "cozygateway",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Self-hosted gateway that turns your AI agent into a chat contact on your phone. Speaks the cozygateway wire contract; drives backends through adapters.",
   "type": "module",
   "license": "MIT",
@@ -30,14 +30,14 @@
     "build": "node ../../scripts/build-observe-assets.mjs && tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "@hono/node-server": "^2.1.1",
-    "@sinclair/typebox": "^0.34.0",
+    "@hono/node-server": "^2.1.3",
+    "@sinclair/typebox": "^0.34.52",
     "cozygateway-contract": "workspace:*",
     "hono": "^4.13.7",
-    "ws": "^8.18.0"
+    "ws": "^8.22.0"
   },
   "devDependencies": {
-    "@types/ws": "^8.5.0",
+    "@types/ws": "^8.18.2",
     "cozygateway-relay": "workspace:*"
   }
 }

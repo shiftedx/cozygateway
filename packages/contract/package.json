@@ -28,6 +28,6 @@
     "lint:package": "publint && attw --pack . --profile esm-only"
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.34.0"
+    "@sinclair/typebox": "^0.34.52"
   }
 }

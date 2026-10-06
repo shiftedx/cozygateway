@@ -4,6 +4,16 @@ CozyGateway is pre-1.0. Each minor series below groups the tags that shipped it;
 a series are fixes to the series' own changes. Release notes for each published version live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases).
 
+## 0.9.1 (2026-10-05): maintenance
+
+A maintenance release with no behavior changes. Update with `cozygateway repair`; profiles,
+pairing, and model settings are kept.
+
+- Dependencies: esbuild 0.28, ws 8.22, @hono/node-server 2.1.3, @sinclair/typebox 0.34.52, and
+  source-map-js 1.2.2, which clears GHSA-68fv-2mgg-jv7q in the development toolchain.
+- Installer messages for a retired CozyAgents install now point to cozylabs.ai.
+- CI now runs the full attach-plugin test suite on Linux.
+
 ## 0.9.0 (2026-09-25): Hermes and OpenClaw only
 
 ### Node.js 26
