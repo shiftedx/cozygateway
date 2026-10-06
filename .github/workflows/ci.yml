@@ -29,7 +29,11 @@ jobs:
       - run: pnpm test
       - run: pnpm audit --prod --audit-level moderate
       - run: pnpm test:installer
-      - run: python3 -m unittest discover -s integrations/attach-plugin/tests
+      # The plugin runs inside Hermes' venv, which provides websockets.
+      - run: |
+          python3 -m venv /tmp/attach-venv
+          /tmp/attach-venv/bin/pip install --quiet websockets==15.0.1
+          /tmp/attach-venv/bin/python -m unittest discover -s integrations/attach-plugin/tests
         env:
           PYTHONPATH: ${{ github.workspace }}/integrations/attach-plugin
       - run: pnpm --filter cozygateway-contract lint:package
