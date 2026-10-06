@@ -99,3 +99,19 @@ jobs:
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
       - name: scan complete repository history
         run: /tmp/gitleaks git --log-opts='--all' --redact --gitleaks-ignore-path=.gitleaksignore
+      # See AGENTS.md. PRIVATE_PATTERNS (one extended regex per line) lives in repository secrets
+      # so the list itself stays private; only file names are printed, never matching lines.
+      - name: block agent work product and private identifiers
+        env:
+          PRIVATE_PATTERNS: ${{ secrets.PRIVATE_PATTERNS }}
+        run: |
+          set -eu
+          if git ls-files | grep -E '^(\.superpowers|\.claude|\.codex|\.cursor|docs/(plans|handoffs|superpowers|evidence))/|\.patch$'; then
+            echo "::error::agent work product is tracked; see AGENTS.md"; exit 1
+          fi
+          if [ -n "$PRIVATE_PATTERNS" ]; then
+            printf '%s\n' "$PRIVATE_PATTERNS" > /tmp/private-patterns
+            if git grep -lIE -f /tmp/private-patterns; then
+              echo "::error::private identifier in the files above; see AGENTS.md"; exit 1
+            fi
+          fi
