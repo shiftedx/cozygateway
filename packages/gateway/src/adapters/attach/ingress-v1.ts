@@ -1,0 +1,1379 @@
+import { randomUUID } from "node:crypto";
+import type { TSchema } from "@sinclair/typebox";
+import type { IncomingMessage } from "node:http";
+import type { Duplex } from "node:stream";
+
+import { check, ContractViolation, assertValid, BOTS_CAPABILITY_ID, BOTS_CAPABILITY_VERSION, CHAT_CONTEXT_CAPABILITY_ID, CHAT_CONTEXT_CAPABILITY_VERSION, type AttachHealthSummary } from "cozygateway-contract";
+import { WebSocket, WebSocketServer } from "ws";
+
+import type { NativeInteractionResolutionRequest, Storage } from "../../storage.ts";
+import type {
+  AttachInterruptFrame,
+  AttachSteerFrame,
+  AttachTurnFrame,
+  TurnEndpoint,
+} from "./adapter.ts";
+import {
+  AttachV1AckSchema,
+  AttachV1ClientFrameSchema,
+  AttachV1ChatContextFrameSchema,
+  AttachV1EventFrameSchema,
+  AttachV1GapSchema,
+  AttachV1HeartbeatSchema,
+  AttachV1HelloSchema,
+  AttachV1ObservationSnapshotSchema,
+  sanitizeActiveTurns,
+  sanitizeTurnHealth,
+  AttachV1ConfigResultSchema,
+  AttachV1HistoryResultSchema,
+  AttachV1MemoryResultSchema,
+  AttachV1MobileCancelSchema,
+  AttachV1MobileRequestSchema,
+  mobileRequestRefusal,
+  AttachV1MobileResultSchema,
+  type AttachV1Capability,
+  type AttachV1ClientFrame,
+  type AttachV1ChatContextFrame,
+  type AttachV1Command,
+  type AttachV1DiscardReason,
+  type AttachV1EventFrame,
+  type AttachV1MobileCancel,
+  type AttachV1MobileRequest,
+  type AttachV1MobileResultInput,
+  type AttachV1ConfigRequest,
+  type AttachV1ConfigResult,
+  type AttachV1HistoryRequest,
+  type AttachV1HistoryResult,
+  type AttachV1MemoryRequest,
+  type AttachV1MemoryResult,
+  type AttachV1ServerFrame,
+  type AttachV1SlashCommand,
+  type AttachV1Telemetry,
+  type AttachV1TurnHealth,
+  type AttachV1TurnContext,
+} from "./protocol-v1.ts";
+import { resolveAttachBearer } from "./token-auth.ts";
+import { emitTrace, traceId, type TraceLog } from "../../trace.ts";
+import {
+  PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES,
+  PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS,
+  PendingWebsocketLimiter,
+} from "../../websocket-limits.ts";
+import { monotonicNow, type ObservationRing } from "../../observe/ring.ts";
+
+export const ATTACH_V1_MAX_IN_FLIGHT_EVENTS = 64;
+export const ATTACH_V1_MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024;
+const ATTACH_V1_EVENT_ADMISSION_BATCH = 32;
+const ATTACH_V1_EVENT_BATCH_KINDS = new Set<AttachV1EventFrame["event"]["kind"]>(["draft", "tool", "thinking"]);
+export const ATTACH_V1_HEARTBEAT_INTERVAL_MS = 15_000;
+export const ATTACH_V1_HEARTBEAT_TIMEOUT_MS = 45_000;
+/** Every capability the gateway will negotiate. `satisfies` proves each entry is a real
+ *  capability; it does NOT prove the list is complete, so adding one to the schema and forgetting
+ *  it here type-checks cleanly and silently refuses the surface at negotiation. A test compares
+ *  this list against the schema for exactly that reason. */
+export const ATTACH_V1_CAPABILITIES = ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location", "mobile_media", "mobile_notifications", "memory_management", "memory_setup_state", "memory_setup", "memory_ownership", "delivery_receipts", "delegation", "thinking", "desktop_session_resume", "desktop_session_sync", "cozyapps", "cozyapps_dashboard", "bot_config", "chat_configuration", "provider_connections", "mcp_server_declarations", "bot_history", "session_deletion", "observation_snapshot", "chat_context"] as const satisfies readonly AttachV1Capability[];
+
+/** Why a memory request did or did not reach the attached plugin. */
+export type MemorySendOutcome = "sent" | "unknown_bot" | "not_attached" | "capability_not_negotiated";
+/** The same four answers for the bot-config lane. It is its own alias rather than a shared one
+ *  because the two lanes are negotiated separately: a peer can serve memory and not config. */
+export type ConfigSendOutcome = MemorySendOutcome;
+/** And again for the bot-history lane, negotiated separately from both: a peer can serve config
+ *  and hold no checkpointed workspace at all. */
+export type HistorySendOutcome = MemorySendOutcome;
+
+export interface AttachV1Events {
+  onObservationSnapshot?(agentId: string, payload: unknown, bytes: number): "stored" | "refused" | "too_large" | "disabled";
+  /** Current prompt occupancy is latest-only and never enters the durable event spool. */
+  onChatContext?(agentId: string, frame: AttachV1ChatContextFrame): void;
+  /** True only after the event was durably projected into its owning app/transcript state. */
+  onEvent(agentId: string, frame: AttachV1EventFrame): boolean;
+  /** Authorization/canonical-target check performed before inbox admission. */
+  canAcceptEvent?(agentId: string, frame: AttachV1EventFrame): boolean;
+  /** Capability 69. `activeTurns` is what the peer declared it still carries at hello: an empty
+   * array is the declaration "none", and `undefined` is a peer that cannot declare. */
+  onHello?(agentId: string, activeTurns?: readonly string[]): void;
+  /** Capability 78. Called on every authenticated heartbeat, including an absent or unusable
+   * optional health declaration, so the native owner can apply its soft timeout independently of
+   * peer reporting. Returned ids are confirmed delivery faults for this callback's state. */
+  onTurnHealth?(agentId: string, reports: readonly AttachV1TurnHealth[] | undefined): readonly string[];
+  onTaskTurnQueued?(agentId: string, command: Extract<AttachV1Command, { kind: "turn" }>): void;
+  /** Dashboard packet D2. The turn command frame HAS BEEN WRITTEN TO THE PEER'S SOCKET, which is the
+   * moment section 10 calls dispatch and the zero of `ttft_ms` and `turn_ms`. Distinct from
+   * `onTaskTurnQueued`, which fires when a durable task command is queued, and distinct from
+   * admission, which is only the gateway's own durable write: a turn for an unattached peer sits in
+   * the outbox until it returns, and timing a model from there would chart the gateway's waiting. */
+  onTurnDispatched?(agentId: string, turnId: string): void;
+  onPresence(agentId: string, state: "online" | "degraded" | "absent"): void;
+  /** The peer took a command off the wire. Transport-only proof: it says the command reached the
+   * process that will run it, never that the work happened. Capability row 67 uses it to move a
+   * CozyApp action receipt to the public `running`, for a v1 peer too. */
+  onCommandDelivered?(agentId: string, commandId: string): void;
+  onMobileRequest?(agentId: string, frame: AttachV1MobileRequest): void;
+  /** Capability 70. Refuse ONE request the gateway will not route, without touching the socket. */
+  onMobileRequestRefused?(agentId: string, requestId: string): void;
+  onMobileCancel?(agentId: string, frame: AttachV1MobileCancel): void;
+  onMemoryResult?(agentId: string, frame: AttachV1MemoryResult): void;
+  onConfigResult?(agentId: string, frame: AttachV1ConfigResult): void;
+  onHistoryResult?(agentId: string, frame: AttachV1HistoryResult): void;
+  /** A scheduled delivery that will never reach a transcript. The ingress emits the plugin-facing
+   * receipt itself; this is the app-facing half, raised so the layer that owns a bot's canonical
+   * chat can say so to the user instead of leaving a cron report silently missing. */
+  onScheduledDeliveryFailed?(
+    agentId: string,
+    failure: {
+      deliveryId: string;
+      messageId: string;
+      stage: "authorization" | "projection";
+      reason: string;
+      at: number;
+    },
+  ): void;
+}
+
+interface BufferedEvent {
+  frame: AttachV1EventFrame;
+  receivedAt: number;
+  bytes: number;
+}
+
+interface Connection {
+  socket: WebSocket;
+  hello: boolean;
+  instanceId?: string;
+  commandCursor: number;
+  lastSeenAt: number;
+  heartbeatDegraded: boolean;
+  /** Confirmed delivery faults from the last turn-health callback. Separate from transport state. */
+  deliveryFaults: Set<string>;
+  degraded: boolean;
+  telemetry?: { eventOutboxDepth: number; lastAckProgressAt: number };
+  maxInFlightEvents: number;
+  maxInFlightBytes: number;
+  sendCursor: number;
+  sentCommands: Map<number, { commandId: string; bytes: number }>;
+  sentCommandBytes: number;
+  capabilities: Set<AttachV1Capability>;
+  events: BufferedEvent[];
+  eventBytes: number;
+  eventFlush?: ReturnType<typeof setTimeout>;
+}
+
+/** Storage-backed attach-v1 ingress. Socket loss changes availability but never deletes commands
+ * or fails turns: a reconnect resumes the durable outbox and plugin event stream by cursor. */
+export class AttachV1Ingress implements TurnEndpoint {
+  readonly #tokens: Map<string, string>;
+  readonly #storage: Storage;
+  readonly #events: AttachV1Events;
+  readonly #current = new Map<string, Connection>();
+  /** Last authenticated catalog per profile. It deliberately survives a socket drop: command
+   * discovery remains useful while the phone is offline, just as Telegram keeps its bot menu. */
+  readonly #commandCatalogs = new Map<string, readonly AttachV1SlashCommand[]>();
+  readonly #negotiated = new Set<string>();
+  readonly #wss: WebSocketServer;
+  readonly #heartbeatIntervalMs: number;
+  readonly #heartbeatTimeoutMs: number;
+  readonly #heartbeat: ReturnType<typeof setInterval>;
+  readonly #observe: ObservationRing | undefined;
+  readonly #now: () => number;
+  readonly #allowedCapabilities: ReadonlyMap<string, ReadonlySet<AttachV1Capability>>;
+  readonly #projectionRetryMs: number;
+  readonly #projectionMaxAttempts: number;
+  readonly #projectionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly #projectionYields = new Map<string, ReturnType<typeof setImmediate>>();
+  readonly #projectionMarkers = new Map<string, { eventIds: readonly string[]; attempts: number }>();
+  readonly #trace: TraceLog | undefined;
+  readonly #log: (line: string) => void;
+  readonly #pendingConnections: PendingWebsocketLimiter;
+  #lastHeartbeatAt: number | null = null;
+  #lastTickAt = monotonicNow();
+
+  constructor(deps: {
+    tokens: Map<string, string>;
+    storage: Storage;
+    events: AttachV1Events;
+    heartbeatIntervalMs?: number;
+    heartbeatTimeoutMs?: number;
+    /** Dashboard packet D2. The heartbeat this ingress already runs is a request with exactly one
+     *  acknowledgement, which makes it the gateway-to-peer round trip section 10 asks for. Absent
+     *  means the observation ring is off and the heartbeat is byte identical to its pre-D2 self. */
+    observe?: ObservationRing;
+    now?: () => number;
+    allowedCapabilities?: ReadonlyMap<string, ReadonlySet<AttachV1Capability>>;
+    projectionRetryMs?: number;
+    projectionMaxAttempts?: number;
+    trace?: TraceLog;
+    /** Operator-visible channel for refusals. Tracing is optional and often off; a peer that is
+     *  being refused must still say so somewhere an operator reads by default. */
+    log?: (line: string) => void;
+    /** Test seam; production keeps a bounded pool until attach-v1 hello completes. */
+    maxPendingConnections?: number;
+  }) {
+    this.#tokens = deps.tokens;
+    this.#storage = deps.storage;
+    this.#events = deps.events;
+    this.#observe = deps.observe?.enabled === true ? deps.observe : undefined;
+    this.#heartbeatIntervalMs = deps.heartbeatIntervalMs ?? ATTACH_V1_HEARTBEAT_INTERVAL_MS;
+    this.#heartbeatTimeoutMs = deps.heartbeatTimeoutMs ?? ATTACH_V1_HEARTBEAT_TIMEOUT_MS;
+    this.#now = deps.now ?? (() => Date.now());
+    this.#allowedCapabilities = deps.allowedCapabilities ?? new Map();
+    this.#projectionRetryMs = deps.projectionRetryMs ?? 250;
+    this.#projectionMaxAttempts = deps.projectionMaxAttempts ?? 8;
+    this.#trace = deps.trace;
+    this.#log = deps.log ?? ((line) => console.warn(line));
+    this.#pendingConnections = new PendingWebsocketLimiter(deps.maxPendingConnections ?? PUBLIC_WEBSOCKET_MAX_PENDING_CONNECTIONS);
+    this.#wss = new WebSocketServer({ noServer: true, maxPayload: PUBLIC_WEBSOCKET_MAX_PAYLOAD_BYTES, allowSynchronousEvents: false });
+    this.#wss.on("error", () => {});
+    this.#wss.on("connection", (socket: WebSocket, req: IncomingMessage, releasePending: () => void) => this.#onConnection(socket, req, releasePending));
+    this.#heartbeat = setInterval(() => this.#tick(), this.#heartbeatIntervalMs);
+    this.#heartbeat.unref();
+  }
+
+  handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
+    const releasePending = this.#pendingConnections.reserve(socket);
+    if (releasePending === undefined) return;
+    try {
+      this.#wss.handleUpgrade(req, socket, head, (ws) => this.#wss.emit("connection", ws, req, releasePending));
+    } catch {
+      releasePending();
+      socket.destroy();
+    }
+  }
+
+  #agentFor(req: IncomingMessage): string | undefined {
+    return resolveAttachBearer(this.#tokens, req.headers.authorization);
+  }
+
+  #onConnection(socket: WebSocket, req: IncomingMessage, releasePending?: () => void): void {
+    socket.once("close", () => releasePending?.());
+    socket.on("error", () => {
+      releasePending?.();
+      socket.terminate();
+    });
+    const agentId = this.#agentFor(req);
+    if (agentId === undefined) {
+      socket.close(1008, "unauthorized");
+      return;
+    }
+    const connection: Connection = {
+      socket, hello: false, commandCursor: 0, lastSeenAt: this.#now(), degraded: false,
+      heartbeatDegraded: false,
+      deliveryFaults: new Set(),
+      maxInFlightEvents: ATTACH_V1_MAX_IN_FLIGHT_EVENTS,
+      maxInFlightBytes: ATTACH_V1_MAX_IN_FLIGHT_BYTES,
+      sendCursor: 0,
+      sentCommands: new Map(),
+      sentCommandBytes: 0,
+      capabilities: new Set(),
+      events: [],
+      eventBytes: 0,
+    };
+    const helloTimer = setTimeout(() => {
+      if (!connection.hello) socket.close(1002, "attach-v1 hello required");
+    }, 5_000);
+    helloTimer.unref();
+
+    socket.on("message", (data) => {
+      // Includes sockets accepted before deletion that have not sent hello yet: those are not
+      // in #current, but must never recreate their stream/catalog once the credential is revoked.
+      if (this.#agentFor(req) !== agentId) {
+        this.#discardEventQueue(connection);
+        socket.close(1008, "identity revoked");
+        return;
+      }
+      // A replaced socket may still deliver already-buffered frames before close completes.
+      if (connection.hello && this.#current.get(agentId) !== connection) {
+        this.#discardEventQueue(connection);
+        return;
+      }
+      const receivedAt = this.#now();
+      connection.lastSeenAt = receivedAt;
+      connection.heartbeatDegraded = false;
+      let decoded: unknown;
+      try { decoded = JSON.parse(String(data)); } catch {
+        this.#refuse(agentId, socket, "unparseable", "frame is not JSON");
+        return;
+      }
+      // There is one hello shape. A peer built against an older one used to negotiate a reduced
+      // capability set and look healthy for hours; name the version it sent and close instead.
+      const helloVersion = helloVersionOf(decoded);
+      if (helloVersion !== undefined) {
+        this.#refuse(agentId, socket, "hello", `unsupported hello version ${helloVersion}, this gateway speaks hello version 2 only`);
+        return;
+      }
+      // Capability 70. `targetDeviceId` is not on this wire, and a peer that still sends it is
+      // told so PER REQUEST rather than by losing its socket: see `mobileRequestRefusal`. The
+      // request gets the row's own typed refusal, the connection and everything queued on it
+      // survive, and the peer's next valid frame is handled normally.
+      const removedField = mobileRequestRefusal(decoded);
+      if (removedField !== undefined) {
+        emitTrace(this.#trace, "attach_frame_field_removed", {
+          kind: "mobile_request", field: removedField.field,
+        });
+        this.#events.onMobileRequestRefused?.(agentId, removedField.requestId);
+        return;
+      }
+      if (!check(AttachV1ClientFrameSchema, decoded)) {
+        // A dropped frame used to be invisible on both ends: the peer waits forever for a reply
+        // that will never come, and no log says why. Name the offending field and close, so a
+        // contract skew is a loud, bounded refusal instead of a hang.
+        this.#refuse(agentId, socket, frameKind(decoded), schemaReason(decoded));
+        return;
+      }
+      const frame = decoded as AttachV1ClientFrame;
+      if (!connection.hello) {
+        if (frame.kind !== "hello") {
+          socket.close(1002, "attach-v1 hello required");
+          return;
+        }
+        clearTimeout(helloTimer);
+        const previous = this.#current.get(agentId);
+        if (previous !== undefined && previous.socket !== socket) {
+          this.#discardEventQueue(previous);
+          previous.socket.close(4000, "superseded");
+        }
+        const resumedEventsThrough = frame.resume?.eventSequence ?? 0;
+        const resumedCommandsThrough = frame.resume?.commandSequence ?? 0;
+        if (!this.#storage.reconcileAttachResume(agentId, resumedEventsThrough, resumedCommandsThrough, this.#now())) {
+          socket.close(1008, "invalid command resume cursor");
+          return;
+        }
+        connection.hello = true;
+        releasePending?.();
+        this.#negotiated.add(agentId);
+        connection.instanceId = frame.instanceId;
+        connection.commandCursor = this.#storage.attachCommandCursor(agentId);
+        connection.sendCursor = connection.commandCursor;
+        const offered = new Set(frame.capabilities);
+        connection.capabilities = new Set(this.#allowed(agentId).filter((capability) => offered.has(capability)));
+        this.#storage.setAttachSessionDeletionCapability(
+          agentId,
+          connection.capabilities.has("session_deletion"),
+          receivedAt,
+        );
+        if ("telemetry" in frame && frame.telemetry !== undefined)
+          connection.telemetry = this.#recordTelemetry(agentId, frame.telemetry, receivedAt);
+        if (frame.commands !== undefined) {
+          this.#commandCatalogs.set(agentId, [...frame.commands]);
+          this.#storage.tasks.declareSlashCommands(agentId, frame.commands.map((command) => command.name));
+        }
+        connection.maxInFlightEvents = Math.min(frame.limits?.maxInFlightEvents ?? ATTACH_V1_MAX_IN_FLIGHT_EVENTS, ATTACH_V1_MAX_IN_FLIGHT_EVENTS);
+        connection.maxInFlightBytes = Math.min(frame.limits?.maxInFlightBytes ?? ATTACH_V1_MAX_IN_FLIGHT_BYTES, ATTACH_V1_MAX_IN_FLIGHT_BYTES);
+        this.#current.set(agentId, connection);
+        this.#traceAttach("attach_hello", agentId, {
+          commandCursor: connection.commandCursor,
+          eventCursor: this.#storage.attachEventCursor(agentId),
+          helloVersion: frame.version,
+          capabilities: [...connection.capabilities].join(","),
+        });
+        // What a peer negotiated decides which surfaces work for the rest of the connection's
+        // life, and nothing else on the gateway reports it. A plugin that quietly handshakes as
+        // an older version leaves this one line as the evidence.
+        this.#log(`attach-v1: profile "${agentId}" negotiated hello v${frame.version} with capabilities [${[...connection.capabilities].join(", ")}]`);
+        this.#send(connection, {
+          kind: "hello_ack", version: 2, agentId,
+          capabilities: [...connection.capabilities],
+          resume: { eventSequence: this.#storage.attachEventCursor(agentId), commandSequence: this.#storage.attachCommandCursor(agentId) },
+          limits: { maxInFlightEvents: connection.maxInFlightEvents, maxInFlightBytes: connection.maxInFlightBytes },
+          heartbeatIntervalMs: this.#heartbeatIntervalMs,
+          extensions: {
+            [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION,
+            [CHAT_CONTEXT_CAPABILITY_ID]: CHAT_CONTEXT_CAPABILITY_VERSION,
+          },
+        });
+        this.#presence(agentId, "online");
+        this.#storage.tasks.hello(agentId, receivedAt);
+        this.flushTaskCommands();
+        this.#refreshDegraded(agentId, connection);
+        this.#flush(agentId, connection.commandCursor);
+        // Capability 69. Reconciliation runs LAST, after the durable outbox has been handed to
+        // the peer. A command still sitting in the outbox is one the peer has never seen, so it
+        // could not have declared it; reconciling before the flush would read "not declared" as
+        // "lost" and fail a message that is about to be delivered.
+        const activeTurns = sanitizeActiveTurns(frame.activeTurns);
+        if (frame.activeTurns !== undefined && activeTurns === undefined)
+          this.#log(`attach-v1: profile "${agentId}" sent an unusable activeTurns declaration on hello; treating it as undeclared`);
+        this.#events.onHello?.(agentId, activeTurns);
+        // A prior marker write can fail after admission. Replaying after the canonical session is
+        // ready makes reconnect recovery independent of a later new event.
+        this.#projectPending(agentId);
+        this.flushTaskCommands();
+        return;
+      }
+      if (frame.kind === "hello") return;
+      // An inbound control frame can change turn/session state. It therefore cannot overtake a
+      // buffered event on the same socket; this drain is bounded by the per-connection FIFO.
+      if (frame.kind !== "event" && !this.#drainEventQueue(agentId, connection, req)) return;
+      if (frame.kind === "heartbeat") {
+        // Gateway is the sole heartbeat initiator. The inbound frame is its one acknowledgement,
+        // not a request for another response; echoing it makes two healthy peers amplify heartbeats.
+        this.#lastHeartbeatAt = receivedAt;
+        // Dashboard packet D2, design section 10. This frame is the peer's sole acknowledgement of
+        // the heartbeat the tick below sent, so the pair is a round trip and nothing else has to be
+        // added to the wire to measure it. Timed on the gateway's monotonic clock at both ends; the
+        // peer's own `sentAt` echo is never subtracted, because that would cross two machines'
+        // clocks and section 11 forbids exactly that.
+        this.#observe?.peerHeartbeatAcked(agentId);
+        if (frame.telemetry !== undefined)
+          connection.telemetry = this.#recordTelemetry(agentId, frame.telemetry, receivedAt);
+        const reports = sanitizeTurnHealth(frame.turnHealth);
+        if (frame.turnHealth !== undefined && reports === undefined)
+          this.#log(`attach-v1: profile "${agentId}" sent unusable turn health; treating it as unknown`);
+        const confirmedFaults = new Set(this.#events.onTurnHealth?.(agentId, reports) ?? []);
+        let newFaults = 0;
+        for (const turnId of confirmedFaults) {
+          if (!connection.deliveryFaults.has(turnId)) newFaults += 1;
+        }
+        // The callback is authoritative for this heartbeat only. A later clean callback clears
+        // the marker; socket traffic itself never does, because transport recovery is not proof
+        // that the prior interim delivery was restored.
+        connection.deliveryFaults = confirmedFaults;
+        if (newFaults > 0)
+          this.#log(`attach-v1: profile "${agentId}" confirmed ${newFaults} new turn-delivery fault${newFaults === 1 ? "" : "s"}`);
+        this.#refreshDegraded(agentId, connection);
+        return;
+      }
+      if (frame.kind === "observation_snapshot") {
+        if (!connection.capabilities.has("observation_snapshot")) {
+          socket.close(1008, "attach-v1 capability not negotiated: observation_snapshot");
+          return;
+        }
+        const outcome = this.#events.onObservationSnapshot?.(agentId, frame.payload, Buffer.byteLength(String(data)));
+        if (outcome === "refused" || outcome === "too_large")
+          this.#log(`attach-v1: observation_snapshot dropped (${outcome})`);
+        return;
+      }
+      if (frame.kind === "chat_context") {
+        if (!connection.capabilities.has("chat_context")) {
+          socket.close(1008, "attach-v1 capability not negotiated: chat_context");
+          return;
+        }
+        this.#events.onChatContext?.(agentId, frame);
+        return;
+      }
+      if (frame.kind === "mobile_request") {
+        const required = frame.command === "location.current" ? "mobile_location"
+          : frame.command === "camera.capture" || frame.command === "file.pick" ? "mobile_media"
+          : frame.command === "notification.present" ? "mobile_notifications" : "mobile_node";
+        if (!connection.capabilities.has(required)) {
+          socket.close(1008, `attach-v1 capability not negotiated: ${required}`);
+          return;
+        }
+        this.#events.onMobileRequest?.(agentId, frame);
+        return;
+      }
+      if (frame.kind === "mobile_cancel") {
+        if (!connection.capabilities.has("mobile_node")) {
+          socket.close(1008, "attach-v1 capability not negotiated: mobile_node");
+          return;
+        }
+        this.#events.onMobileCancel?.(agentId, frame);
+        return;
+      }
+      if (frame.kind === "memory_result") {
+        if (!connection.capabilities.has("memory_management")) {
+          socket.close(1008, "attach-v1 capability not negotiated: memory_management");
+          return;
+        }
+        this.#events.onMemoryResult?.(agentId, frame);
+        return;
+      }
+      if (frame.kind === "config_result") {
+        if (!connection.capabilities.has("bot_config") && !connection.capabilities.has("chat_configuration") && !connection.capabilities.has("provider_connections")) {
+          socket.close(1008, "attach-v1 capability not negotiated: config lane");
+          return;
+        }
+        this.#events.onConfigResult?.(agentId, frame);
+        return;
+      }
+      if (frame.kind === "history_result") {
+        if (!connection.capabilities.has("bot_history")) {
+          socket.close(1008, "attach-v1 capability not negotiated: bot_history");
+          return;
+        }
+        this.#events.onHistoryResult?.(agentId, frame);
+        return;
+      }
+      if (frame.kind === "ack") {
+        const sent = connection.sentCommands.get(frame.sequence);
+        if (frame.channel === "command" && sent?.commandId === frame.id && this.#storage.ackAttachCommand(agentId, frame.sequence, frame.id, this.#now())) {
+          connection.sentCommands.delete(frame.sequence);
+          connection.sentCommandBytes -= sent.bytes;
+          connection.commandCursor = this.#storage.attachCommandCursor(agentId);
+          this.flushTaskCommands();
+          this.#events.onCommandDelivered?.(agentId, sent.commandId);
+          this.#traceAttach("attach_command_ack", agentId, { commandCursor: connection.commandCursor });
+          this.#flush(agentId, connection.commandCursor);
+        }
+        return;
+      }
+      if (frame.kind === "gap") {
+        if (frame.channel === "command") {
+          connection.sentCommands.clear();
+          connection.sentCommandBytes = 0;
+          connection.sendCursor = frame.requestedAfter;
+          this.#flush(agentId, frame.requestedAfter);
+        }
+        return;
+      }
+      const queued = { frame, receivedAt, bytes: Buffer.byteLength(String(data)) };
+      if (ATTACH_V1_EVENT_BATCH_KINDS.has(frame.event.kind)) {
+        this.#queueEvent(agentId, connection, req, queued);
+        return;
+      }
+      // A terminal, delivery, or other side-effecting event remains a wire-order boundary. Its
+      // preceding ephemeral prefix is durably admitted and projected before this one proceeds.
+      if (!this.#drainEventQueue(agentId, connection, req)) return;
+      this.#admitEvents(agentId, connection, req, [queued]);
+    });
+
+    socket.on("close", (code) => {
+      clearTimeout(helloTimer);
+      releasePending?.();
+      this.#discardEventQueue(connection);
+      if (this.#current.get(agentId) === connection) {
+        this.#current.delete(agentId);
+        this.#presence(agentId, "absent");
+      }
+      // Dashboard packet D2. Drop any outstanding heartbeat stamp with the socket that sent it. An
+      // ack arriving on the NEXT connection would otherwise be differenced against this one's send
+      // and record the whole disconnect as a peer round trip, which is a one-way silence reported
+      // as a measurement.
+      this.#observe?.peerForgotten(agentId);
+      this.#traceAttach("attach_close", agentId, { code, commandCursor: connection.commandCursor });
+    });
+  }
+
+  #connectionIsCurrent(agentId: string, connection: Connection, req: IncomingMessage): boolean {
+    return this.#agentFor(req) === agentId
+      && this.#current.get(agentId) === connection
+      && connection.hello
+      && connection.socket.readyState === WebSocket.OPEN;
+  }
+
+  #discardEventQueue(connection: Connection): void {
+    if (connection.eventFlush !== undefined) clearTimeout(connection.eventFlush);
+    connection.eventFlush = undefined;
+    connection.events = [];
+    connection.eventBytes = 0;
+  }
+
+  #queueEvent(agentId: string, connection: Connection, req: IncomingMessage, event: BufferedEvent): void {
+    if (!this.#connectionIsCurrent(agentId, connection, req)) {
+      this.#discardEventQueue(connection);
+      return;
+    }
+    const countLimit = Math.max(1, Math.min(ATTACH_V1_EVENT_ADMISSION_BATCH, connection.maxInFlightEvents));
+    const byteLimit = Math.max(1, connection.maxInFlightBytes);
+    if ((connection.events.length >= countLimit || (connection.events.length > 0 && connection.eventBytes + event.bytes > byteLimit))
+      && !this.#drainEventQueue(agentId, connection, req)) return;
+    if (!this.#connectionIsCurrent(agentId, connection, req)) return;
+    connection.events.push(event);
+    connection.eventBytes += event.bytes;
+    if (connection.eventFlush === undefined) {
+      const flush = setTimeout(() => {
+        connection.eventFlush = undefined;
+        this.#drainEventQueue(agentId, connection, req);
+      }, 0);
+      flush.unref();
+      connection.eventFlush = flush;
+    } else connection.eventFlush.refresh();
+  }
+
+  /** Drains at most the connection's bounded FIFO before a later wire frame observes state. */
+  #drainEventQueue(agentId: string, connection: Connection, req: IncomingMessage): boolean {
+    if (!this.#connectionIsCurrent(agentId, connection, req)) {
+      this.#discardEventQueue(connection);
+      return false;
+    }
+    if (connection.eventFlush !== undefined) clearTimeout(connection.eventFlush);
+    connection.eventFlush = undefined;
+    return connection.events.length === 0 || this.#admitQueuedEvents(agentId, connection, req);
+  }
+
+  #admitQueuedEvents(agentId: string, connection: Connection, req: IncomingMessage): boolean {
+    const entries = connection.events;
+    connection.events = [];
+    connection.eventBytes = 0;
+    return this.#admitEvents(agentId, connection, req, entries);
+  }
+
+  #admitEvents(agentId: string, connection: Connection, req: IncomingMessage, entries: readonly BufferedEvent[]): boolean {
+    if (!this.#connectionIsCurrent(agentId, connection, req)) {
+      this.#discardEventQueue(connection);
+      return false;
+    }
+    const admissions = (() => {
+      try {
+        return this.#storage.acceptAttachEvents(agentId, entries.map((entry) => {
+          const missingCapability = eventCapabilities(entry.frame).find((capability) => !connection.capabilities.has(capability));
+          const discardReason: AttachV1DiscardReason | undefined = missingCapability !== undefined
+            ? "capability_not_negotiated"
+            : this.#events.canAcceptEvent?.(agentId, entry.frame) === false
+              ? "unauthorized_target"
+              : undefined;
+          return { frame: entry.frame, receivedAt: entry.receivedAt, ...(discardReason === undefined ? {} : { discardReason }) };
+        }));
+      } catch (error) {
+        this.#log(`attach-v1: event admission for profile "${agentId}" failed (${error instanceof Error ? error.message : String(error)})`);
+        this.#discardEventQueue(connection);
+        connection.socket.close(1011, "event admission failed");
+        return undefined;
+      }
+    })();
+    if (admissions === undefined) return false;
+    const accepted = admissions.some((admission) => admission.status === "accepted" || admission.status === "duplicate");
+    // The durable batch is already committed. Projection stays outside it, but runs before the
+    // corresponding ACKs just as the former one-frame path did.
+    if (accepted) {
+      this.#projectPending(agentId);
+      this.flushTaskCommands();
+    }
+    for (let index = 0; index < admissions.length; index += 1) {
+      const admission = admissions[index]!;
+      const entry = entries[index]!;
+      if (admission.status === "gap") {
+        this.#send(connection, {
+          kind: "gap", channel: "event", requestedAfter: admission.expectedSequence - 1,
+          earliestAvailable: admission.expectedSequence, latestAvailable: this.#storage.attachEventCursor(agentId),
+        });
+        continue;
+      }
+      if (admission.status === "conflict") {
+        this.#discardEventQueue(connection);
+        connection.socket.close(1008, "event sequence conflict");
+        return false;
+      }
+      if (admission.status === "discarded" && entry.frame.event.kind === "scheduled") {
+        this.#deliveryFailed(agentId, {
+          deliveryId: entry.frame.event.deliveryId,
+          messageId: entry.frame.event.messageId,
+          stage: "authorization",
+          reason: admission.reason,
+        });
+      }
+      this.#traceAttach("attach_event", agentId, { eventCursor: admission.acknowledgedSequence, outcome: admission.status });
+      this.#send(connection, {
+        kind: "ack", channel: "event", sequence: admission.acknowledgedSequence,
+        id: entry.frame.eventId, ...(admission.status === "duplicate" ? { duplicate: true } : {}),
+        ...(admission.status === "discarded" ? { discarded: true as const, reason: admission.reason } : {}),
+      });
+    }
+    // A gap/conflict ends the storage prefix. Buffered later frames have no durable receipt, so
+    // discard them for peer replay instead of trying to invent a new ordering after the repair.
+    if (admissions.length < entries.length || admissions.some((admission) => admission.status === "gap")) {
+      this.#discardEventQueue(connection);
+      return false;
+    }
+    return true;
+  }
+
+  #send(connection: Connection, frame: AttachV1ServerFrame): boolean {
+    if (connection.socket.readyState !== WebSocket.OPEN) return false;
+    const encoded = JSON.stringify(frame);
+    if (connection.socket.bufferedAmount + Buffer.byteLength(encoded) > connection.maxInFlightBytes) return false;
+    connection.socket.send(encoded);
+    return true;
+  }
+
+  #flush(agentId: string, afterSequence: number): void {
+    const connection = this.#current.get(agentId);
+    if (connection === undefined || !connection.hello) return;
+    const countCapacity = connection.maxInFlightEvents - connection.sentCommands.size;
+    if (countCapacity <= 0) return;
+    const frames = this.#storage.pendingAttachCommands(agentId, Math.max(afterSequence, connection.sendCursor), countCapacity);
+    for (const queued of frames) {
+      let frame = queued;
+      const missing = commandCapabilities(frame.command).find((capability) => !connection.capabilities.has(capability));
+      if (missing !== undefined) {
+        // Unlike ordinary optional commands, a committed deletion must stay durable until its
+        // capable receiver ACKs it. A temporarily older reconnect gets no unknown frame and must
+        // not turn the privacy tombstone into a semantic no-op for a later capable reconnect.
+        if (frame.command.kind === "session_deleted") break;
+        const cancelled = this.#storage.discardAttachCommandAndReopenNativeInteraction(
+          agentId,
+          frame.sequence,
+          frame.commandId,
+          `capability not negotiated: ${missing}`,
+          this.#now(),
+        );
+        if (cancelled === undefined) break;
+        frame = cancelled;
+        this.#presence(agentId, "degraded");
+      }
+      const bytes = Buffer.byteLength(JSON.stringify(frame));
+      if (connection.sentCommandBytes + bytes > connection.maxInFlightBytes) break;
+      if (!this.#send(connection, frame)) break;
+      if (frame.command.kind === "turn") this.#events.onTurnDispatched?.(agentId, frame.command.turnId);
+      connection.sentCommands.set(frame.sequence, { commandId: frame.commandId, bytes });
+      connection.sentCommandBytes += bytes;
+      connection.sendCursor = frame.sequence;
+    }
+  }
+
+  flushTaskCommands(): void {
+    this.#storage.tasks.dispatch((peer, id, command) => {
+      if (!this.canQueue(peer) || !commandCapabilities(command).every((capability) => this.#allowed(peer).includes(capability))) return false;
+      const connection = this.#current.get(peer);
+      if (connection?.hello === true && !commandCapabilities(command).every((capability) => connection.capabilities.has(capability))) return false;
+      if (!this.#storage.enqueueTaskCommand(peer, id, command, this.#now())) return false;
+      if (command.kind === "turn") this.#events.onTaskTurnQueued?.(peer, command);
+      this.#flush(peer, connection?.commandCursor ?? 0);
+      return true;
+    });
+  }
+
+  #enqueue(agentId: string, command: AttachV1Command, commandId: string = randomUUID()): boolean {
+    const requiredCapabilities = commandCapabilities(command);
+    if (!requiredCapabilities.every((capability) => this.#allowed(agentId).includes(capability))) return false;
+    const connection = this.#current.get(agentId);
+    if (connection?.hello === true && !requiredCapabilities.every((capability) => connection.capabilities.has(capability))) return false;
+    this.#storage.enqueueAttachCommand(agentId, commandId, command, this.#now());
+    // Always start at the receiver's ACK cursor. Starting at the newly appended sequence would
+    // bypass older unacked rows and defeat maxInFlightEvents under a fast producer.
+    this.#flush(agentId, this.#current.get(agentId)?.commandCursor ?? 0);
+    return true;
+  }
+
+  /** v1 accepts a turn while absent because the command is durably queued. */
+  canQueue(agentId: string): boolean { return [...this.#tokens.values()].includes(agentId); }
+  hasNegotiated(agentId: string): boolean {
+    return this.#negotiated.has(agentId) || this.#storage.attachEventCursor(agentId) > 0;
+  }
+  isAttached(agentId: string): boolean {
+    const current = this.#current.get(agentId);
+    return current?.hello === true && current.socket.readyState === WebSocket.OPEN && !current.degraded;
+  }
+  /** Bounded liveness counts for one harness; never exposes its identities. */
+  connectionHealth(agentIds: ReadonlySet<string> = new Set(this.#tokens.values())) {
+    let online = 0;
+    let degraded = 0;
+    let deliveryDegraded = 0;
+    const now = this.#now();
+    for (const [agentId, connection] of this.#current) {
+      if (!agentIds.has(agentId)) continue;
+      if (!connection.hello || connection.socket.readyState !== WebSocket.OPEN) continue;
+      if (connection.deliveryFaults.size > 0) deliveryDegraded += 1;
+      if (connection.degraded || this.#pluginBacklogStalled(connection, now)) degraded += 1;
+      else online += 1;
+    }
+    return {
+      configured: agentIds.size,
+      online,
+      degraded,
+      absent: Math.max(0, agentIds.size - online - degraded),
+      ...(deliveryDegraded === 0 ? {} : { deliveryDegraded }),
+    };
+  }
+  peerHealth(agentId: string) {
+    const connection = this.#current.get(agentId);
+    return { ...this.connectionHealth(new Set([agentId])), ...this.#storage.attachPeerHealth(agentId),
+      lastContactAt: connection?.lastSeenAt ?? null };
+  }
+  health(): AttachHealthSummary {
+    const durable = this.#storage.attachHealth();
+    return {
+      ...this.connectionHealth(),
+      lastHeartbeatAt: this.#lastHeartbeatAt,
+      ...durable,
+    };
+  }
+  sendTurn(agentId: string, frame: AttachTurnFrame): boolean {
+    return this.#enqueue(agentId, { kind: "turn", threadId: frame.threadId, turnId: frame.turnId, messageId: `${frame.turnId}:user`, text: frame.text });
+  }
+  sendSteer(agentId: string, frame: AttachSteerFrame): boolean {
+    return this.#enqueue(agentId, { kind: "steer", threadId: frame.threadId, turnId: frame.turnId, messageId: randomUUID(), text: frame.text });
+  }
+  sendInterrupt(agentId: string, frame: AttachInterruptFrame): boolean {
+    return this.#enqueue(agentId, { kind: "interrupt", threadId: frame.threadId, turnId: frame.turnId });
+  }
+  sendApprovalResolution(agentId: string, input: { threadId: string; turnId: string; approvalId: string; decision: "approve" | "deny" }, commandId?: string): boolean {
+    return this.#enqueue(agentId, { kind: "resolve_approval", ...input }, commandId);
+  }
+
+  /** Atomically marks the native interaction requested and appends its stable command. The ACK
+   * only means the plugin journal accepted it; callers await the later terminal attach event. */
+  requestNativeApprovalResolution(
+    agentId: string,
+    input: { threadId: string; turnId: string; approvalId: string; decision: "approve" | "deny" },
+    sourceBot = agentId,
+    /** Capability 66. Set only when a person is countermanding a decision the GATEWAY admitted off
+     *  a standing grant. The replacement command carries its own id, because the outbox holds one
+     *  command per id per peer and the original is already in it. */
+    opts?: { override?: boolean },
+  ): NativeInteractionResolutionRequest | { outcome: "unsupported" } {
+    const requestedAt = this.#now();
+    const expired = this.#storage.expireNativeInteractionIfDue(sourceBot, "approval", input.approvalId, requestedAt);
+    if (expired !== undefined) return { outcome: "expired", ...expired };
+    if (!this.#canResolve(agentId, "approvals")) return { outcome: "unsupported" };
+    const result = this.#storage.requestNativeInteractionResolution({
+      bot: sourceBot,
+      outboxAgentId: agentId,
+      kind: "approval",
+      interactionId: input.approvalId,
+      decision: input.decision,
+      commandId: opts?.override === true
+        ? `approval:${agentId}:${input.approvalId}:${input.decision}`
+        : `approval:${agentId}:${input.approvalId}`,
+      command: { kind: "resolve_approval", ...input },
+      requestedAt,
+      ...(opts?.override === true ? { override: true } : {}),
+    });
+    if (result.outcome === "requested" || result.outcome === "already_requested")
+      this.#flush(agentId, this.#current.get(agentId)?.commandCursor ?? 0);
+    return result;
+  }
+
+  sendNativeTurn(agentId: string, input: { threadId: string; turnId: string; messageId: string; text: string; mediaIds?: string[]; context?: AttachV1TurnContext }): boolean {
+    return this.#enqueue(agentId, { kind: "turn", ...input });
+  }
+
+  sendNativeSteer(agentId: string, input: { threadId: string; turnId: string; messageId: string; text: string }): boolean {
+    return this.#enqueue(agentId, { kind: "steer", ...input });
+  }
+
+  sendNativeInterrupt(agentId: string, input: { threadId: string; turnId: string }): boolean {
+    return this.#enqueue(agentId, { kind: "interrupt", ...input });
+  }
+  /** The saved values ride along only for a peer that negotiated `cozyapps_dashboard`. A peer at
+   *  cozyapps 1 gets the pre-2 command with no new member on it, which is what the live Hermes
+   *  bots receive: they do not change, and the action still runs. */
+  sendCozyAppAction(agentId: string, input: { appId: string; actionId: string; actionRequestId: string; values?: ReadonlyArray<{ valueId: string; type: "string" | "number" | "boolean" | "date" | "selection"; value: string | number | boolean; revision: number }> | undefined }): boolean {
+    const { values, ...action } = input;
+    const dashboard = this.#current.get(agentId)?.capabilities.has("cozyapps_dashboard") === true
+      && this.#allowed(agentId).includes("cozyapps_dashboard");
+    return this.#enqueue(
+      agentId,
+      { kind: "cozyapp_action", ...action, ...(dashboard && values !== undefined && values.length > 0 ? { values: [...values] } : {}) },
+      `cozyapp-action:${input.actionRequestId}`,
+    );
+  }
+
+  /** Enqueue an explicit desktop adoption. The idempotency key is the gateway-owned resume id;
+   * command ACK is transport-only, while the later `desktop_session_resumed` event is the sole
+   * proof that the plugin switched the exact profile-local Hermes context. */
+  sendNativeDesktopResume(agentId: string, input: {
+    threadId: string; hermesSessionId: string; resumeId: string;
+  }): boolean {
+    return this.#enqueue(
+      agentId,
+      { kind: "desktop_session_resume", ...input },
+      `desktop-resume:${agentId}:${input.resumeId}`,
+    );
+  }
+
+  /** Capability 60's deletion is committed with the SQLite outbox, so this only wakes its normal
+   * ordered replay loop after that transaction succeeds. A disconnected or older peer receives
+   * no unknown command. */
+  canSendSessionDeletion(agentId: string): boolean {
+    return this.#allowed(agentId).includes("session_deletion")
+      && this.#storage.hasAttachSessionDeletionCapability(agentId);
+  }
+
+  flushQueuedCommands(agentId: string): void {
+    this.#flush(agentId, this.#current.get(agentId)?.commandCursor ?? 0);
+  }
+
+  sendClarifyResolution(agentId: string, input: { threadId: string; turnId: string; clarifyId: string; optionId: string }, commandId?: string): boolean {
+    return this.#enqueue(agentId, { kind: "resolve_clarify", ...input }, commandId);
+  }
+
+  /** Raw memory is a live request/reply lane and is never written to Gateway storage.
+   *
+   *  The three ways this lane can be closed are operationally different -- an unconfigured bot, a
+   *  disconnected plugin, and a plugin that connected but never offered `memory_management` all
+   *  need different fixes -- so the caller gets the reason rather than a bare `false`. Collapsing
+   *  them into one 503 is what made a stale plugin indistinguishable from an offline one. */
+  sendMemoryRequest(agentId: string, input: AttachV1MemoryRequest): MemorySendOutcome {
+    if (![...this.#tokens.values()].includes(agentId)) return "unknown_bot";
+    const connection = this.#current.get(agentId);
+    if (connection?.hello !== true || connection.socket.readyState !== WebSocket.OPEN) return "not_attached";
+    if (!connection.capabilities.has("memory_management")) return "capability_not_negotiated";
+    if (input.operation === "setup" && !connection.capabilities.has("memory_setup")) return "capability_not_negotiated";
+    if (input.operation === "create" && input.input.owner !== undefined && !connection.capabilities.has("memory_ownership")) return "capability_not_negotiated";
+    return this.#send(connection, input) ? "sent" : "not_attached";
+  }
+
+  /** The bot-config lane, live request/reply exactly as memory is: never a durable command, never
+   *  a Gateway row. The caller gets the same four-way reason rather than a bare `false`, because a
+   *  peer that connected without `bot_config` is a 409 (this runtime does not serve config) while a
+   *  peer that is simply offline is a 503, and one sentence for both is what the memory lane had to
+   *  go back and fix. */
+  sendConfigRequest(agentId: string, input: AttachV1ConfigRequest): ConfigSendOutcome {
+    if (![...this.#tokens.values()].includes(agentId)) return "unknown_bot";
+    const connection = this.#current.get(agentId);
+    if (connection?.hello !== true || connection.socket.readyState !== WebSocket.OPEN) return "not_attached";
+    const capability = input.operation.startsWith("chat.") ? "chat_configuration"
+      : input.operation.startsWith("providers.connections.") ? "provider_connections" : "bot_config";
+    if (!connection.capabilities.has(capability)) return "capability_not_negotiated";
+    // Capability 89. A profile write that declares or removes an MCP server reaches only a peer that
+    // opted into `mcp_server_declarations`; refused before the frame exists, so a peer that does
+    // not know the fields never sees them and cannot apply the rest of the patch without them.
+    if (input.operation === "profile.write"
+      && (input.input.declareMcpServers !== undefined || input.input.removeMcpServers !== undefined)
+      && !connection.capabilities.has("mcp_server_declarations")) return "capability_not_negotiated";
+    return this.#send(connection, input) ? "sent" : "not_attached";
+  }
+
+  /** The bot-history lane, live request/reply exactly as config is: never a durable command, never
+   *  a Gateway row, and never a checkpoint this gateway stores a copy of. The peer owns the
+   *  repository; this only carries the question and the answer. */
+  sendHistoryRequest(agentId: string, input: AttachV1HistoryRequest): HistorySendOutcome {
+    if (![...this.#tokens.values()].includes(agentId)) return "unknown_bot";
+    const connection = this.#current.get(agentId);
+    if (connection?.hello !== true || connection.socket.readyState !== WebSocket.OPEN) return "not_attached";
+    if (!connection.capabilities.has("bot_history")) return "capability_not_negotiated";
+    return this.#send(connection, input) ? "sent" : "not_attached";
+  }
+
+  requestNativeClarifyResolution(
+    agentId: string,
+    input: { threadId: string; turnId: string; clarifyId: string; optionId: string },
+    sourceBot = agentId,
+  ): NativeInteractionResolutionRequest | { outcome: "unsupported" } {
+    const requestedAt = this.#now();
+    const expired = this.#storage.expireNativeInteractionIfDue(sourceBot, "clarify", input.clarifyId, requestedAt);
+    if (expired !== undefined) return { outcome: "expired", ...expired };
+    if (!this.#canResolve(agentId, "clarify")) return { outcome: "unsupported" };
+    const result = this.#storage.requestNativeInteractionResolution({
+      bot: sourceBot,
+      outboxAgentId: agentId,
+      kind: "clarify",
+      interactionId: input.clarifyId,
+      decision: "select",
+      optionId: input.optionId,
+      commandId: `clarify:${agentId}:${input.clarifyId}`,
+      command: { kind: "resolve_clarify", ...input },
+      requestedAt,
+    });
+    if (result.outcome === "requested" || result.outcome === "already_requested")
+      this.#flush(agentId, this.#current.get(agentId)?.commandCursor ?? 0);
+    return result;
+  }
+
+  sendMobileResult(agentId: string, frame: AttachV1MobileResultInput): boolean {
+    const connection = this.#current.get(agentId);
+    const detailed = { kind: "mobile_result" as const, ...frame };
+    if (!check(AttachV1MobileResultSchema, detailed)) return false;
+    const outbound = detailed as AttachV1ServerFrame;
+    const required = "result" in frame && isLocationResult(frame.result) ? "mobile_location"
+      : "result" in frame && isMediaResult(frame.result) ? "mobile_media"
+      : "result" in frame && isNotificationResult(frame.result) ? "mobile_notifications" : "mobile_node";
+    if (connection === undefined || !connection.hello || !connection.capabilities.has(required)) return false;
+    return this.#send(connection, outbound);
+  }
+
+  /** Durably queues one delivery receipt. `false` means the receipt was not queued at all, which
+   * is deliberate and never fatal: a receipt is gateway-to-plugin bookkeeping, so a plugin that
+   * never negotiated `delivery_receipts` simply does not hear about it rather than having its
+   * outbox filled with commands it would only discard. A receipt queued while the plugin is away
+   * follows the ordinary durable path and, if that plugin comes back without the capability, the
+   * existing tombstone converts it to a `discard`. */
+  sendDeliveryReceipt(
+    agentId: string,
+    input: {
+      deliveryId: string;
+      messageId: string;
+      state: "displayed" | "failed";
+      at?: number;
+      stage?: "authorization" | "projection";
+      reason?: string;
+    },
+  ): boolean {
+    const { at, stage, reason, ...rest } = input;
+    return this.#enqueue(
+      agentId,
+      {
+        kind: "delivery_receipt", ...rest, at: at ?? this.#now(),
+        ...(stage === undefined ? {} : { stage }),
+        ...(reason === undefined ? {} : { reason: reason.slice(0, 256) }),
+      },
+      `rcpt:${input.deliveryId}:${input.state}`,
+    );
+  }
+
+  #deliveryFailed(
+    agentId: string,
+    failure: { deliveryId: string; messageId: string; stage: "authorization" | "projection"; reason: string },
+  ): void {
+    const at = this.#now();
+    const reason = failure.reason.slice(0, 256);
+    this.sendDeliveryReceipt(agentId, { ...failure, reason, state: "failed", at });
+    this.#events.onScheduledDeliveryFailed?.(agentId, { ...failure, reason, at });
+  }
+
+  replayUnapplied(agentId: string): void {
+    this.#projectPending(agentId);
+  }
+
+  /** Explicit operator/control-plane release for the first projection dead letter. It does not
+   * skip the failed event: the event is retried first, preserving stream order. */
+  releaseProjectionDeadLetter(agentId: string, eventId: string): boolean {
+    if (!this.#storage.releaseAttachProjectionDeadLetter(agentId, eventId)) return false;
+    this.#projectPending(agentId);
+    return true;
+  }
+
+  negotiatedCapabilities(agentId: string): ReadonlySet<AttachV1Capability> {
+    return this.#current.get(agentId)?.capabilities ?? new Set();
+  }
+
+  commandCatalog(agentId: string): readonly AttachV1SlashCommand[] {
+    return this.#commandCatalogs.get(agentId) ?? [];
+  }
+
+  #canResolve(agentId: string, capability: "approvals" | "clarify"): boolean {
+    if (!this.#allowed(agentId).includes(capability)) return false;
+    const connection = this.#current.get(agentId);
+    return connection?.hello !== true || connection.capabilities.has(capability);
+  }
+
+  #recordTelemetry(
+    agentId: string,
+    telemetry: AttachV1Telemetry,
+    receivedAt: number,
+  ): { eventOutboxDepth: number; lastAckProgressAt: number } {
+    return this.#storage.recordAttachTelemetry(agentId, telemetry, receivedAt);
+  }
+
+  #pluginBacklogStalled(connection: Connection, now: number): boolean {
+    return connection.telemetry !== undefined
+      && connection.telemetry.eventOutboxDepth > 0
+      && now - connection.telemetry.lastAckProgressAt >= 30_000;
+  }
+
+  #refreshDegraded(agentId: string, connection: Connection): void {
+    if (this.#current.get(agentId) !== connection) return;
+    const degraded = connection.heartbeatDegraded || this.#pluginBacklogStalled(connection, this.#now());
+    if (connection.degraded === degraded) return;
+    connection.degraded = degraded;
+    this.#presence(agentId, degraded ? "degraded" : "online");
+  }
+
+  #allowed(agentId: string): AttachV1Capability[] {
+    const configured = this.#allowedCapabilities.get(agentId);
+    return configured === undefined
+      ? [...ATTACH_V1_CAPABILITIES]
+      : ATTACH_V1_CAPABILITIES.filter((capability) => configured.has(capability));
+  }
+
+  #projectPending(agentId: string): void {
+    // New later events must not accelerate an earlier event through its retry budget. The one
+    // active timer is the ordering barrier for this identity until it fires or the event applies.
+    const yieldTimer = this.#projectionYields.get(agentId);
+    if (yieldTimer !== undefined) {
+      clearImmediate(yieldTimer);
+      this.#projectionYields.delete(agentId);
+    }
+    if (this.#projectionTimers.has(agentId)) return;
+    if (!this.#finishProjectionMarkers(agentId)) return;
+    const frames = this.#storage.unappliedAttachEvents(agentId, ATTACH_V1_EVENT_ADMISSION_BATCH);
+    const applied: string[] = [];
+    const commitAppliedPrefix = (): boolean => {
+      if (applied.length === 0) return true;
+      if (!this.#markProjected(agentId, applied)) return false;
+      applied.length = 0;
+      return true;
+    };
+    for (const frame of frames) {
+      // Durable callbacks may have side effects. Commit their preceding ephemeral prefix first so
+      // a marker failure cannot leave a successful callback ahead of an unmarked draft/tool run.
+      if (!ATTACH_V1_EVENT_BATCH_KINDS.has(frame.event.kind) && !commitAppliedPrefix()) return;
+      let projected = false;
+      let error = "projection declined event";
+      try {
+        projected = this.#events.onEvent(agentId, frame);
+      } catch (err) {
+        error = err instanceof Error ? err.message : "projection threw";
+      }
+      if (projected) {
+        if (ATTACH_V1_EVENT_BATCH_KINDS.has(frame.event.kind)) {
+          applied.push(frame.eventId);
+        } else {
+          if (!this.#markProjected(agentId, [frame.eventId])) return;
+        }
+        continue;
+      }
+      // Persist every successful prefix before recording this failure. A callback never shares a
+      // transaction with another callback, and a retry sees exactly the remaining head.
+      if (!commitAppliedPrefix()) return;
+      // A draft or tool frame is ephemeral rendering state: superseded in seconds and worthless
+      // once its turn ends. It gets the same bounded retries, but exhaustion SKIPS it (stamped
+      // applied, said out loud) instead of dead-lettering: in production two declined drafts
+      // dead-lettered and head-of-line blocked their bots for hours (issue #193), a price no
+      // draft is worth. Durable facts (commits, terminals, scheduled deliveries, interactions)
+      // keep the dead letter, because silently skipping one of those would lose user data.
+      const ephemeral = frame.event.kind === "draft" || frame.event.kind === "tool" || frame.event.kind === "delegation" || frame.event.kind === "thinking";
+      const failure = this.#storage.recordAttachProjectionFailure(agentId, frame.eventId, error, this.#now(), ephemeral ? Number.MAX_SAFE_INTEGER : this.#projectionMaxAttempts);
+      // A projection failure used to be invisible until the post-mortem DB read. Say it on the
+      // operator channel at the first attempt and at the dead letter (issue #193): the dead
+      // letter blocks every later event for this identity, which is exactly the kind of fact an
+      // operator must not learn from a silent phone.
+      if (failure.attempts === 1)
+        this.#log(`attach-v1: projecting ${frame.event.kind} event ${frame.sequence} for profile "${agentId}" failed (${error}); retrying`);
+      if (ephemeral && failure.attempts >= this.#projectionMaxAttempts) {
+        if (!this.#markProjected(agentId, [frame.eventId])) return;
+        this.#log(`attach-v1: skipped undeliverable ${frame.event.kind} event ${frame.sequence} for profile "${agentId}" after ${failure.attempts} attempts (${error}); ephemeral events never dead-letter the stream`);
+        continue;
+      }
+      if (failure.deadLettered) {
+        this.#log(`attach-v1: event ${frame.sequence} for profile "${agentId}" dead-lettered after ${failure.attempts} projection attempts (${error}); later events for this profile are blocked until it is released`);
+        if (frame.event.kind === "scheduled") {
+          this.#deliveryFailed(agentId, {
+            deliveryId: frame.event.deliveryId,
+            messageId: frame.event.messageId,
+            stage: "projection",
+            reason: error,
+          });
+        }
+        this.#presence(agentId, "degraded");
+        this.#traceAttach("attach_projection", agentId, { outcome: "dead_letter" });
+        // Dashboard packet D2. A dead letter is one of the state changes section 3 names as worth a
+        // marker. The sequence number is the reference; the event that failed and the error text
+        // are not, because either could carry a person's words.
+        this.#observe?.deadLetter(agentId, null, { sequence: frame.sequence, attempts: failure.attempts });
+        return;
+      }
+      const delay = Math.min(this.#projectionRetryMs * 2 ** Math.max(0, failure.attempts - 1), 30_000);
+      const timer = setTimeout(() => {
+        this.#projectionTimers.delete(agentId);
+        this.#projectPending(agentId);
+        this.flushTaskCommands();
+      }, delay);
+      timer.unref();
+      this.#projectionTimers.set(agentId, timer);
+      break;
+    }
+    if (!commitAppliedPrefix()) return;
+    if (frames.length === ATTACH_V1_EVENT_ADMISSION_BATCH && !this.#projectionTimers.has(agentId)
+      && this.#storage.unappliedAttachEvents(agentId, 1).length > 0) {
+      const timer = setImmediate(() => {
+        this.#projectionYields.delete(agentId);
+        this.#projectPending(agentId);
+        this.flushTaskCommands();
+      });
+      timer.unref();
+      this.#projectionYields.set(agentId, timer);
+    }
+  }
+
+  #markProjected(agentId: string, eventIds: readonly string[]): boolean {
+    this.#projectionMarkers.set(agentId, { eventIds: [...eventIds], attempts: 0 });
+    return this.#finishProjectionMarkers(agentId);
+  }
+
+  #finishProjectionMarkers(agentId: string): boolean {
+    const pending = this.#projectionMarkers.get(agentId);
+    if (pending === undefined) return true;
+    try {
+      this.#storage.markAttachEventsApplied(agentId, pending.eventIds, this.#now());
+    } catch (error) {
+      this.#retryProjectionMarker(agentId, pending, error);
+      return false;
+    }
+    this.#projectionMarkers.delete(agentId);
+    for (const eventId of pending.eventIds) this.#traceAttach("attach_projection", agentId, { outcome: "applied" });
+    return true;
+  }
+
+  #retryProjectionMarker(agentId: string, pending: { eventIds: readonly string[]; attempts: number }, error: unknown): void {
+    const attempts = pending.attempts + 1;
+    this.#projectionMarkers.set(agentId, { ...pending, attempts });
+    const reason = error instanceof Error ? error.message : String(error);
+    if (attempts >= this.#projectionMaxAttempts) {
+      this.#log(`attach-v1: marking projected events for profile "${agentId}" failed ${attempts} times (${reason}); closing its connection for durable replay`);
+      this.#current.get(agentId)?.socket.close(1011, "projection state update failed");
+      return;
+    }
+    this.#log(`attach-v1: marking projected events for profile "${agentId}" failed (${reason}); retrying`);
+    const delay = Math.min(this.#projectionRetryMs * 2 ** Math.max(0, attempts - 1), 30_000);
+    const timer = setTimeout(() => {
+      this.#projectionTimers.delete(agentId);
+      this.#projectPending(agentId);
+      this.flushTaskCommands();
+    }, delay);
+    timer.unref();
+    this.#projectionTimers.set(agentId, timer);
+  }
+
+  #tick(): void {
+    this.#storage.tasks.reconcile(this.#now());
+    this.flushTaskCommands();
+    const tickAt = monotonicNow();
+    const tickDelayMs = Math.max(0, tickAt - this.#lastTickAt - this.#heartbeatIntervalMs);
+    this.#lastTickAt = tickAt;
+    // Reuse the heartbeat cadence: no extra watchdog timer or per-event metric writes.
+    if (tickDelayMs >= this.#heartbeatIntervalMs)
+      emitTrace(this.#trace, "attach_heartbeat_tick_delayed", { tickDelayMs: Math.round(tickDelayMs) });
+    const now = this.#now();
+    for (const [agentId, connection] of this.#current) {
+      const age = now - connection.lastSeenAt;
+      if (age >= this.#heartbeatTimeoutMs) {
+        this.#traceAttach("attach_heartbeat_timeout", agentId, {
+          silenceMs: age, timeoutMs: this.#heartbeatTimeoutMs, tickDelayMs: Math.round(tickDelayMs),
+        });
+        connection.socket.terminate();
+      } else {
+        connection.heartbeatDegraded = age >= this.#heartbeatIntervalMs * 2;
+        this.#refreshDegraded(agentId, connection);
+        this.#observe?.peerHeartbeatSent(agentId);
+        this.#send(connection, { kind: "heartbeat", sentAt: now });
+      }
+    }
+  }
+
+  #presence(agentId: string, state: "online" | "degraded" | "absent"): void {
+    this.#storage.tasks.presence(agentId, state !== "absent", this.#now());
+    this.#events.onPresence(agentId, state);
+    this.#traceAttach("attach_presence", agentId, { state });
+  }
+
+  /** Refuses one frame out loud. The reason is derived from the schema, never from payload
+   *  content, so nothing a peer sent can be echoed into a log line. */
+  #refuse(agentId: string, socket: WebSocket, kind: string, reason: string): void {
+    const bounded = reason.slice(0, 160);
+    this.#log(`attach-v1: refused ${kind} frame from profile "${agentId}": ${bounded}`);
+    this.#traceAttach("attach_frame_refused", agentId, { frameKind: kind, reason: bounded });
+    socket.close(1008, `attach-v1 invalid ${kind} frame`.slice(0, 120));
+  }
+
+  #traceAttach(event: string, agentId: string, fields: Record<string, number | string> = {}): void {
+    if (this.#trace === undefined) return;
+    try {
+      const queue = this.#storage.attachQueueHealth(agentId, this.#now());
+      emitTrace(this.#trace, event, { profile: traceId(agentId), queueDepth: queue.depth, oldestQueueAgeMs: queue.oldestAgeMs, ...fields });
+    } catch {
+      emitTrace(this.#trace, event, { profile: traceId(agentId), ...fields });
+    }
+  }
+
+  /** Ends a deleted bot's live attach lane. The caller removes the token map entry
+   *  (`revokeAttachTokens`); this drops the open socket and the per-profile runtime state so a
+   *  connection authenticated before the revocation cannot keep flowing. Durable journal rows are
+   *  the storage purge's business, not this method's. */
+  disconnectAgent(agentId: string): void {
+    const timer = this.#projectionTimers.get(agentId);
+    if (timer !== undefined) clearTimeout(timer);
+    this.#projectionTimers.delete(agentId);
+    const yieldTimer = this.#projectionYields.get(agentId);
+    if (yieldTimer !== undefined) clearImmediate(yieldTimer);
+    this.#projectionYields.delete(agentId);
+    this.#projectionMarkers.delete(agentId);
+    const connection = this.#current.get(agentId);
+    if (connection !== undefined) {
+      this.#discardEventQueue(connection);
+      connection.socket.close(1008, "identity revoked");
+      this.#current.delete(agentId);
+    }
+    this.#commandCatalogs.delete(agentId);
+    this.#negotiated.delete(agentId);
+  }
+
+  close(): void {
+    clearInterval(this.#heartbeat);
+    for (const timer of this.#projectionTimers.values()) clearTimeout(timer);
+    this.#projectionTimers.clear();
+    for (const timer of this.#projectionYields.values()) clearImmediate(timer);
+    this.#projectionYields.clear();
+    this.#projectionMarkers.clear();
+    for (const connection of this.#current.values()) {
+      this.#discardEventQueue(connection);
+      connection.socket.close(1001, "server shutdown");
+    }
+    this.#current.clear();
+    this.#wss.close();
+  }
+}
+
+/** The peer's claimed frame kind, constrained to the known set. An unknown or absent kind is
+ *  reported as "unknown" rather than echoed, so the log line stays bounded and content-free. */
+const KNOWN_FRAME_KINDS = new Set(["hello", "event", "ack", "gap", "heartbeat", "mobile_request", "mobile_cancel", "memory_result", "config_result", "history_result", "observation_snapshot", "chat_context"]);
+function frameKind(decoded: unknown): string {
+  const kind = typeof decoded === "object" && decoded !== null ? (decoded as { kind?: unknown }).kind : undefined;
+  return typeof kind === "string" && KNOWN_FRAME_KINDS.has(kind) ? kind : "unknown";
+}
+
+/** The one member schema a frame CLAIMED to be, so the violation names a field instead of the
+ *  whole union. Validating a bad frame against the union only ever answers "expected union value"
+ *  at the root, which is exactly as useless as the silent drop it replaced. */
+const KIND_SCHEMAS: Record<string, TSchema> = {
+  hello: AttachV1HelloSchema,
+  observation_snapshot: AttachV1ObservationSnapshotSchema,
+  chat_context: AttachV1ChatContextFrameSchema,
+  event: AttachV1EventFrameSchema,
+  ack: AttachV1AckSchema,
+  gap: AttachV1GapSchema,
+  heartbeat: AttachV1HeartbeatSchema,
+  mobile_request: AttachV1MobileRequestSchema,
+  mobile_cancel: AttachV1MobileCancelSchema,
+  memory_result: AttachV1MemoryResultSchema,
+  config_result: AttachV1ConfigResultSchema,
+  history_result: AttachV1HistoryResultSchema,
+};
+
+/** The first schema violation, as "<message> at <json pointer>". TypeBox's message text and the
+ *  pointer are both schema-derived, so no payload value reaches the log. */
+function schemaReason(decoded: unknown): string {
+  const schema = KIND_SCHEMAS[frameKind(decoded)] ?? AttachV1ClientFrameSchema;
+  try {
+    assertValid(schema, decoded);
+  } catch (err) {
+    if (err instanceof ContractViolation) return err.message;
+  }
+  return "failed schema validation";
+}
+
+/** The version a hello frame claimed, when it is anything other than the one supported version.
+ *  `undefined` means "not a mis-versioned hello", so an ordinary frame takes the normal path. The
+ *  value is rendered bounded and only when it is a finite number, so no payload prose reaches a log. */
+function helloVersionOf(decoded: unknown): string | undefined {
+  if (typeof decoded !== "object" || decoded === null) return undefined;
+  const record = decoded as { kind?: unknown; version?: unknown };
+  if (record.kind !== "hello" || record.version === 2) return undefined;
+  return typeof record.version === "number" && Number.isFinite(record.version)
+    ? String(record.version).slice(0, 16)
+    : "unknown";
+}
+
+function isLocationResult(value: unknown): value is { latitude: number; longitude: number } {
+  return typeof value === "object" && value !== null && "latitude" in value && "longitude" in value;
+}
+function isMediaResult(value: unknown): value is { mediaId: string } {
+  return typeof value === "object" && value !== null && "mediaId" in value;
+}
+function isNotificationResult(value: unknown): value is { action: string } {
+  return typeof value === "object" && value !== null && "action" in value;
+}
+
+function eventCapabilities(frame: AttachV1EventFrame): AttachV1Capability[] {
+  switch (frame.event.kind) {
+    case "media": return ["media"];
+    case "tool": return ["tools"];
+    case "delegation": return ["delegation"];
+    case "thinking": return ["thinking"];
+    case "approval": return ["approvals"];
+    case "clarify": return ["clarify"];
+    case "scheduled": return ["scheduled", ...(frame.event.mediaIds?.length ? ["media" as const] : [])];
+    case "presence": return [];
+    case "desktop_session_message": return ["desktop_session_sync"];
+    case "desktop_session_resumed": return ["desktop_session_resume"];
+    case "cozyapp_upsert": return ["cozyapps"];
+    case "cozyapp_action_status": return ["cozyapps"];
+    case "cozyapp_dashboard_upsert": return ["cozyapps", "cozyapps_dashboard"];
+    case "cozyapp_action_receipt": return ["cozyapps", "cozyapps_dashboard"];
+    case "commit": return ["draft", ...(frame.event.mediaIds?.length ? ["media" as const] : [])];
+    default: return ["draft"];
+  }
+}
+
+function commandCapabilities(command: AttachV1Command): AttachV1Capability[] {
+  if (command.kind === "discard") return [];
+  if (command.kind === "delivery_receipt") return ["delivery_receipts"];
+  if (command.kind === "resolve_approval") return ["approvals"];
+  if (command.kind === "resolve_clarify") return ["clarify"];
+  if (command.kind === "desktop_session_resume") return ["desktop_session_resume"];
+  if (command.kind === "session_deleted") return ["session_deletion"];
+  if (command.kind === "cozyapp_action") return command.values === undefined ? ["cozyapps"] : ["cozyapps", "cozyapps_dashboard"];
+  if (command.kind === "turn" && (command.mediaIds?.length ?? 0) > 0) return ["draft", "media"];
+  return ["draft"];
+}

@@ -1,0 +1,101 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 26
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # build first: workspace packages resolve cozygateway-contract through its
+      # exports map, which points at dist/, so a fresh checkout needs the build
+      # before typecheck or test can resolve the package
+      - run: pnpm build
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm audit --prod --audit-level moderate
+      - run: pnpm test:installer
+      - run: pnpm --filter cozygateway-contract lint:package
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 26
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: bash scripts/docker-smoke.sh
+
+  windows-installer:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with: { node-version: 26, cache: pnpm }
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with: { python-version: "3.11" }
+      - run: pnpm install --frozen-lockfile
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap.test.ps1
+      - run: node --test scripts/test/windows-hidden-supervisor.test.mjs
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-launcher-stop.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-fresh-prerequisites.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-installer-session.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap-durability.test.ps1
+      # Also runs under pwsh 7 in test:installer; here it runs on Windows PowerShell 5.1,
+      # which is the shell the interrupted-install lock actually wedged.
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/bootstrap-lock-units.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-download-retry.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-harness-update.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-setup-flow.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-git-bootstrap.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-gateway-health.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-gateway-recovery.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/bootstrap-transaction.test.ps1
+      - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-dashboard-owner.test.ps1
+      - run: bash scripts/test/windows-state-identity.test.sh
+        shell: bash
+      - run: bash scripts/test/hermes-installer.test.sh
+        shell: bash
+      - run: python -m unittest discover -s integrations/attach-plugin/tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/integrations/attach-plugin
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: install pinned gitleaks
+        run: |
+          set -eu
+          curl --fail --location --silent --show-error --output /tmp/gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tar.gz' | sha256sum --check --status
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+      - name: scan complete repository history
+        run: /tmp/gitleaks git --log-opts='--all' --redact --gitleaks-ignore-path=.gitleaksignore

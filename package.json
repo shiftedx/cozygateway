@@ -1,0 +1,27 @@
+{
+  "name": "cozygateway-monorepo",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=26"
+  },
+  "packageManager": "pnpm@10.30.1",
+  "scripts": {
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "build": "pnpm -r build",
+    "bundle": "node scripts/build-bundle.mjs",
+    "test:installer": "python3 scripts/test/uninstall.test.py && bash scripts/test/powershell-lock-units.sh && bash scripts/test/windows-dashboard-uninstall.test.sh && bash scripts/test/windows-dashboard-fallback-owner.test.sh && bash scripts/test/bootstrap-transaction.test.sh && bash scripts/test/bootstrap-runtime-rollback.test.sh && bash scripts/test/attach-health-diagnosis.test.sh && bash scripts/test/hermes-installer.test.sh && bash scripts/test/bot-provisioner-installer.test.sh && bash scripts/test/plugin-rollout.test.sh && bash scripts/test/hermes-host.test.sh && bash scripts/test/installer-rehome.test.sh && python3 scripts/test/install-hygiene.test.py",
+    "test:installer:windows": "node --test scripts/test/windows-hidden-supervisor.test.mjs && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-launcher-stop.test.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-installer-session.test.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap-durability.test.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-download-retry.test.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-harness-update.test.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-setup-flow.test.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-git-bootstrap.test.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-gateway-health.test.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-gateway-recovery.test.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-fresh-prerequisites.test.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap-path-isolation.test.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap.test.ps1",
+    "check": "pnpm build && pnpm typecheck && pnpm test"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.0",
+    "@types/node": "^26.5.0",
+    "esbuild": "^0.25.0",
+    "publint": "^0.3.24",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  }
+}

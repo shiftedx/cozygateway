@@ -1,0 +1,38 @@
+# TLS option B: the gateway terminates TLS itself, with a cert/key pair you supply.
+#
+# This is an OVERLAY, not a replacement:
+#
+#   cp .env.example .env        # set COZY_TLS_CERT_HOST_PATH and COZY_TLS_KEY_HOST_PATH
+#   docker compose -f docker-compose.yml -f docker-compose.tls-native.yml up -d
+#
+# A deployment that never names this file is byte-for-byte the plain-HTTP deployment it always was:
+# with COZY_TLS_CERT_FILE and COZY_TLS_KEY_FILE unset, the gateway serves plain HTTP exactly as
+# before. Set only one of the two and it refuses to start rather than quietly serving plaintext on
+# a port you believed was encrypted.
+#
+# Pick this over the Caddy sidecar when you already have a certificate you must use (a corporate
+# CA, an mTLS-adjacent policy, a cert issued by something else on the box), or when one container
+# is one container too many. Pick the sidecar when you want issuance and renewal handled for you.
+
+services:
+  gateway:
+    environment:
+      # Paths INSIDE the container. The key material rides the mount below, never the config file.
+      COZY_TLS_CERT_FILE: "/certs/cert.pem"
+      COZY_TLS_KEY_FILE: "/certs/key.pem"
+    volumes:
+      - "${COZY_TLS_CERT_HOST_PATH:?set COZY_TLS_CERT_HOST_PATH in .env}:/certs/cert.pem:ro"
+      - "${COZY_TLS_KEY_HOST_PATH:?set COZY_TLS_KEY_HOST_PATH in .env}:/certs/key.pem:ro"
+    healthcheck:
+      # The default file's healthcheck dials http://127.0.0.1; once the listener is TLS it has to
+      # dial https, and it has to accept the gateway's own certificate. This is a loopback liveness
+      # probe inside the container, not a trust boundary: it is asking "is my own listener up", and
+      # the answer must not depend on whether the container's CA bundle happens to know the
+      # operator's cert. Nothing about the DEVICE's verification is relaxed by this.
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "process.env.NODE_TLS_REJECT_UNAUTHORIZED='0';fetch('https://127.0.0.1:'+(process.env.COZYGATEWAY_PORT||8787)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]

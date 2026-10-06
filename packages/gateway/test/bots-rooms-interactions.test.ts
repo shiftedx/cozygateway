@@ -1,0 +1,914 @@
+import { roomApprovalPush } from "../src/push-crypto.ts";
+import { createServer, type Server } from "node:http";
+import { once } from "node:events";
+
+import { Hono } from "hono";
+import type { MiddlewareHandler } from "hono";
+import { WebSocket } from "ws";
+import { afterEach, describe, expect, it } from "vitest";
+import type {
+  BotApprovalPendingFrame,
+  BotClarifyPendingFrame,
+  BotGroupStateFrame,
+  BotSummary,
+  BotToolActivityFrame,
+  ServerFrame,
+} from "cozygateway-contract";
+
+import { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
+import type { AttachV1ServerFrame } from "../src/adapters/attach/protocol-v1.ts";
+import { HermesBridge, type BotsSurface } from "../src/hermes-bridge/bridge.ts";
+import { NativeBotDataPlane } from "../src/hermes-bridge/native-data-plane.ts";
+import { registerBotRoutes } from "../src/hermes-bridge/routes.ts";
+import { createHermesClient, type HermesClient } from "../src/hermes-bridge/client.ts";
+import { openStorage, type Storage } from "../src/storage.ts";
+import { startFakeHermesServer, type FakeHermesServer } from "./support/fake-hermes-server.ts";
+
+/** Capability 51: a room member turn can ASK.
+ *
+ *  Below 51 a room acknowledged and dropped every approval, clarify and tool event on a member
+ *  turn, which is why a runtime peer had to run room turns with read-only tools: a bot that cannot
+ *  ask for permission must never need it. These tests pin the facts that lift that rule.
+ *
+ *  The load-bearing design choice is that a room interaction is stored as an ORDINARY interaction
+ *  row -- same table, keyed by the member bot and the attach id -- with the gateway-owned member
+ *  thread as its session. So nothing about the inbox, the deadline wheel, the resolve routes, or
+ *  the `resolve_approval` command had to learn what a room is, and these tests assert exactly that
+ *  by resolving a room interaction through the unchanged 1:1 route and watching the unchanged
+ *  command reach the peer that raised it. */
+
+const NOW = 1_800_000_000_000;
+
+const servers: FakeHermesServer[] = [];
+const bridges: HermesBridge[] = [];
+const storages: Storage[] = [];
+const closers: Array<() => Promise<void> | void> = [];
+
+afterEach(async () => {
+  for (const close of closers.splice(0)) await close();
+  for (const bridge of bridges.splice(0)) await bridge.close();
+  for (const server of servers.splice(0)) await server.close();
+  for (const storage of storages.splice(0)) storage.close();
+});
+
+async function until(predicate: () => boolean, timeoutMs = 4_000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/** The Hermes profiles this gateway serves. Runtime bots are deliberately absent from every one of
+ *  these lists: a runtime bot never appears in `profiles.list`. */
+const scoutRow = { name: "scout", description: "watches CI", has_avatar: false };
+const lunaRow = { name: "luna", description: "reads the docs", has_avatar: false };
+
+/** The roster row a runtime bot gets, in the shape `NativeBotDataPlane.rosterBots` appends. */
+function runtimeRow(name: string): BotSummary {
+  return {
+    name,
+    displayName: name[0]!.toUpperCase() + name.slice(1),
+    handle: name,
+    description: null,
+    hasAvatar: false,
+    group: null,
+    pinned: false,
+    active: true,
+    meta: null,
+    runtime: "cozyagents",
+    chatSessionId: null,
+    lastActiveAt: null,
+    preview: { kind: "empty", text: "No conversations yet, say hi" },
+    syncState: "ready",
+  };
+}
+
+interface Harness {
+  bridge: HermesBridge;
+  storage: Storage;
+  client: HermesClient;
+  /** Every attach turn command the rooms handed to the transport, in dispatch order. */
+  commands: Array<{ agentId: string; threadId: string; turnId: string }>;
+  frames: ServerFrame[];
+  pushedApprovals: Array<{ kind: string; room?: string }>;
+  /** Pushes one attach event at the room, answering whether the room accepted it. A `false` here
+   *  is a DEAD LETTER: the ingress would retry it and then block the member's whole stream. */
+  push: (agentId: string, event: Record<string, unknown>) => boolean;
+  /** The bots routes, mounted over the native plane's surface: the real 1:1 resolve routes. */
+  app: Hono<{ Variables: { deviceId: string } }>;
+  /** What each runtime peer's own attach socket received, by bot name. */
+  received: Map<string, AttachV1ServerFrame[]>;
+  /** One peer's `resolve_*` commands, in arrival order. */
+  resolutions: (bot: string) => Array<Record<string, unknown>>;
+}
+
+/** The whole gateway both halves of this feature need: rooms that HOLD a member turn (nothing
+ *  settles until a test says so, which is the only way to observe a turn blocked on a human), the
+ *  native data plane that owns the interaction inbox and the resolve routes, and one real attach
+ *  socket per runtime bot. All three read the same storage, which is the point. */
+async function setup(
+  opts: { runtimeBots?: readonly string[]; hermesProfiles?: readonly unknown[] } = {},
+): Promise<Harness> {
+  const runtimeBots = opts.runtimeBots ?? ["sage"];
+  const profiles = opts.hermesProfiles ?? [scoutRow];
+  const server = await startFakeHermesServer({
+    methods: { "profiles.list": () => ({ profiles, bot_mode_protocol: true }) },
+  });
+  servers.push(server);
+  const storage = openStorage(":memory:");
+  storages.push(storage);
+
+  const ingress = new AttachV1Ingress({
+    tokens: new Map(runtimeBots.map((bot) => [`secret:${bot}`, bot])),
+    storage,
+    events: { onEvent: () => true, onPresence: () => {} },
+    now: () => NOW,
+  });
+  const attachServer: Server = createServer();
+  attachServer.on("upgrade", (req, socket, head) => ingress.handleUpgrade(req, socket, head));
+  await new Promise<void>((resolve) => attachServer.listen(0, "127.0.0.1", resolve));
+  const address = attachServer.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+
+  // ONE broadcast sink for both halves, exactly as `server.ts` wires it: the plane and the rooms
+  // publish to the same hub, so a terminal frame the plane emits for a room interaction lands on
+  // the same wire the room's own frames do.
+  const frames: ServerFrame[] = [];
+  const pushedApprovals: Array<{ kind: string; room?: string }> = [];
+
+  const received = new Map<string, AttachV1ServerFrame[]>();
+  const sockets: WebSocket[] = [];
+  for (const bot of runtimeBots) {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, {
+      headers: { authorization: `Bearer secret:${bot}` },
+    });
+    const inbox: AttachV1ServerFrame[] = [];
+    received.set(bot, inbox);
+    sockets.push(ws);
+    ws.on("message", (data) => inbox.push(JSON.parse(String(data)) as AttachV1ServerFrame));
+    await once(ws, "open");
+    ws.send(JSON.stringify({
+      kind: "hello", version: 2, instanceId: `peer:${bot}`,
+      capabilities: ["draft", "tools", "approvals", "clarify"],
+      resume: { eventSequence: 0, commandSequence: 0 },
+    }));
+    await until(() => inbox.some((frame) => frame.kind === "hello_ack"));
+  }
+
+  const plane = new NativeBotDataPlane({
+    control: {} as BotsSurface,
+    storage,
+    ingress,
+    nativeBots: runtimeBots,
+    chatSuggestion: "",
+    broadcast: (frame) => frames.push(frame),
+    onApproval: event => pushedApprovals.push({ kind: event.outcome === undefined ? "approval_pending" : "approval_resolved", ...(event.room === undefined ? {} : { room: event.room }) }),
+    now: () => NOW,
+    log: () => {},
+  });
+
+  const client = createHermesClient({
+    url: server.url,
+    auth: { mode: "token", token: "T" },
+    reconnect: { minMs: 15, maxMs: 60 },
+  });
+  const runtime = new Set(runtimeBots);
+  const bridge = new HermesBridge({
+    client,
+    storage,
+    broadcast: (frame) => {
+      frames.push(frame);
+      const push = roomApprovalPush(frame);
+      if (push !== undefined) pushedApprovals.push({ kind: push.kind, room: "room" in frame ? String(frame.room) : undefined });
+    },
+    now: () => NOW,
+    logSink: () => {},
+    runtimeBotNames: () => runtime,
+  });
+  bridges.push(bridge);
+  bridge.setRosterOverlay((bots) => [...bots, ...runtimeBots.map(runtimeRow)]);
+  // Production wiring, exactly as `server.ts` does it once the plane exists.
+  bridge.setGroupInteractionExpiry(plane.groupInteractions());
+
+  const commands: Harness["commands"] = [];
+  let sequence = 0;
+  bridge.setGroupNativeTurns({
+    canQueue: () => true,
+    sendNativeTurn: (agentId, command) => {
+      commands.push({ agentId, threadId: command.threadId, turnId: command.turnId });
+      return true;
+    },
+  });
+  bridge.start();
+  await until(() => client.state() === "online");
+
+  const app = new Hono<{ Variables: { deviceId: string } }>();
+  const requireDevice: MiddlewareHandler<{ Variables: { deviceId: string } }> = async (c, next) => {
+    c.set("deviceId", "device-1");
+    await next();
+  };
+  registerBotRoutes(app, requireDevice, plane.surface());
+
+  closers.push(async () => {
+    for (const ws of sockets) ws.close();
+    plane.close();
+    ingress.close();
+    await new Promise<void>((resolve) => attachServer.close(() => resolve()));
+  });
+
+  return {
+    bridge,
+    storage,
+    client,
+    commands,
+    frames,
+    pushedApprovals,
+    app,
+    received,
+    resolutions: (bot) =>
+      (received.get(bot) ?? [])
+        .filter((frame) => frame.kind === "command" && frame.command.kind.startsWith("resolve_"))
+        .map((frame) => (frame as { command: Record<string, unknown> }).command),
+    push: (agentId, event) => {
+      sequence += 1;
+      return bridge.handleGroupAttachEvent(agentId, {
+        kind: "event",
+        sequence,
+        eventId: `event-${sequence}`,
+        event: event as never,
+      });
+    },
+  };
+}
+
+/** Drives a room to the point where its first member holds an open turn. */
+async function blockedTurn(h: Harness, members: string[]): Promise<{ agentId: string; threadId: string; turnId: string }> {
+  await h.bridge.createGroup("Launch", members);
+  h.bridge.sendGroupMessage("Launch", `ship it ${members.map((name) => `@${name}`).join(" ")}`);
+  await until(() => h.commands.length > 0);
+  return h.commands[0]!;
+}
+
+describe("capability 51: approvals and clarifications on a room turn", () => {
+  it("lands a runtime member's room approval in the inbox and resolves it through the unchanged route", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    expect(turn.agentId).toBe("sage");
+    expect(turn.threadId).toBe("group:launch:sage");
+
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-1", callId: "call-1", name: "terminal:rm", status: "pending",
+    })).toBe(true);
+
+    // The inbox is the 1:1 inbox: one row, keyed by the member bot and the attach approval id,
+    // carrying the room facts a client needs to render the card above the right transcript.
+    expect(h.storage.pendingNativeApprovals(["sage"], 100)).toEqual([{
+      bot: "sage",
+      sessionId: "group:launch:sage",
+      turnId: turn.turnId,
+      toolCallId: "approval-1",
+      ruleName: "terminal:rm",
+      createdAt: NOW,
+      room: "Launch",
+    }]);
+
+    const pending = h.frames.find((frame) => frame.type === "bot_approval_pending") as BotApprovalPendingFrame;
+    expect(pending).toMatchObject({
+      bot: "sage", sessionId: "group:launch:sage", turnId: turn.turnId,
+      toolCallId: "approval-1", name: "terminal:rm", room: "Launch", cause: { kind: "user", seq: 1 },
+    });
+
+    expect(h.storage.botGroupLog("launch").some(row => row.turnId === turn.turnId)).toBe(false);
+
+    // The room advertises what it is blocked on, so the rooms list can badge without joining the
+    // inbox to a room itself -- and the badge frame reports the round the drive is ACTUALLY on.
+    const blocked = [{ member: "sage", kind: "approval", id: "approval-1", turnId: turn.turnId, cause: { kind: "user", seq: 1 } }];
+    expect(h.bridge.groups()[0]?.pendingInteractions).toEqual(blocked);
+    const state = [...h.frames].reverse().find((frame) => frame.type === "bot_group_state") as BotGroupStateFrame;
+    expect(state).toMatchObject({ state: "running", round: 0, pendingInteractions: blocked });
+
+    // The existing 1:1 route resolves it, unchanged, and the peer gets the command it always got.
+    const response = await h.app.request("/bots/sage/approvals/approval-1/approve", { method: "POST" });
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({ status: "requested" });
+
+    await until(() => h.resolutions("sage").length > 0);
+    expect(h.resolutions("sage")).toEqual([{
+      kind: "resolve_approval",
+      threadId: "group:launch:sage",
+      turnId: turn.turnId,
+      approvalId: "approval-1",
+      decision: "approve",
+    }]);
+  });
+
+  it("capability 56: carries a sanitized approval detail on a room turn, and omits it when absent", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+
+    // With detail: sanitized and carried on both the live frame and the durable row, so a room
+    // card reads exactly like a 1:1 card would.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-detail", callId: "call-1", name: "my_browser_open", status: "pending",
+      // \u0000 (NUL, C0), \u0007 (BEL, C0), \u200b (zero-width space, Unicode Format/Cf).
+      detail: "Would drive Chrome\u0000 (Work\u200bprofile)\u0007.",
+    })).toBe(true);
+
+    const pendingWithDetail = h.frames.find(
+      (frame) => frame.type === "bot_approval_pending" && (frame as BotApprovalPendingFrame).toolCallId === "approval-detail",
+    ) as BotApprovalPendingFrame;
+    expect(pendingWithDetail).toMatchObject({
+      bot: "sage", room: "Launch", name: "my_browser_open", detail: "Would drive Chrome (Workprofile).",
+    });
+    expect(h.storage.nativeInteraction("sage", "approval", "approval-detail")?.payload).toMatchObject({
+      name: "my_browser_open",
+      detail: "Would drive Chrome (Workprofile).",
+      room: { name: "Launch" },
+    });
+
+    // Without detail: byte-identical to today, on both surfaces.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-no-detail", callId: "call-2", name: "terminal:rm", status: "pending",
+    })).toBe(true);
+    const pendingNoDetail = h.frames.find(
+      (frame) => frame.type === "bot_approval_pending" && (frame as BotApprovalPendingFrame).toolCallId === "approval-no-detail",
+    ) as BotApprovalPendingFrame;
+    expect(pendingNoDetail).not.toHaveProperty("detail");
+    expect(h.storage.nativeInteraction("sage", "approval", "approval-no-detail")?.payload).not.toHaveProperty("detail");
+  });
+
+  it("capability 62: carries a validated repair block on a room turn, drops an invalid one, and omits it when absent", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    const repair = {
+      kind: "mcp_reconnect", server: "github", impact: ["github_search_issues"], scope: "server",
+      fingerprint: { previous: "sha256:1f3a", current: "sha256:9c0e" }, reason: "stale_tool", policy: "approve_once",
+    };
+    const pendingFrame = (toolCallId: string): BotApprovalPendingFrame => h.frames.find(
+      (frame) => frame.type === "bot_approval_pending" && (frame as BotApprovalPendingFrame).toolCallId === toolCallId,
+    ) as BotApprovalPendingFrame;
+    const payload = (toolCallId: string) =>
+      h.storage.nativeInteraction("sage", "approval", toolCallId)?.payload as { repair?: unknown } | undefined;
+    const inboxRow = (toolCallId: string) =>
+      h.storage.pendingNativeApprovals(["sage"], 100).find((row) => row.toolCallId === toolCallId);
+
+    // Valid: the block the 1:1 lane would carry rides the room frame, the durable row, and the
+    // inbox row byte for byte, beside the room name.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-repair", callId: "call-1", name: "mcp_reconnect", status: "pending", repair,
+    })).toBe(true);
+    expect(pendingFrame("approval-repair")).toMatchObject({ bot: "sage", room: "Launch", name: "mcp_reconnect" });
+    expect(JSON.stringify(pendingFrame("approval-repair").repair)).toBe(JSON.stringify(repair));
+    expect(JSON.stringify(payload("approval-repair")?.repair)).toBe(JSON.stringify(repair));
+    expect(inboxRow("approval-repair")).toMatchObject({ room: "Launch" });
+    expect(JSON.stringify(inboxRow("approval-repair")?.repair)).toBe(JSON.stringify(repair));
+
+    // Invalid: dropped, the approval kept, on every surface.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-repair-bad", callId: "call-2", name: "mcp_reconnect", status: "pending",
+      repair: { ...repair, kind: "restart" },
+    })).toBe(true);
+    expect(pendingFrame("approval-repair-bad")).toMatchObject({ bot: "sage", room: "Launch" });
+    expect(pendingFrame("approval-repair-bad")).not.toHaveProperty("repair");
+    expect(payload("approval-repair-bad")).not.toHaveProperty("repair");
+    expect(inboxRow("approval-repair-bad")).not.toHaveProperty("repair");
+
+    // Absent: byte identical to a pre-62 room approval.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-plain", callId: "call-3", name: "terminal:rm", status: "pending",
+    })).toBe(true);
+    expect(pendingFrame("approval-plain")).not.toHaveProperty("repair");
+    expect(payload("approval-plain")).not.toHaveProperty("repair");
+  });
+
+  it("capability 66: a room member's approval carries its scope block like a 1:1 approval, and is answerable with the same scoped decision body", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    const scope = {
+      kind: "scoped_approval",
+      action: "workspace.write",
+      category: "other",
+      system: "workspace",
+      resource: "repo/notes.md",
+      change: "append one line to notes.md",
+      effects: ["one file changes on disk"],
+      reason: "guardrail",
+      payloadHash: "a".repeat(64),
+      expiresAt: NOW + 600_000,
+      retry: "idempotent",
+      requested: "once",
+    };
+    const pendingFrame = (toolCallId: string): BotApprovalPendingFrame => h.frames.find(
+      (frame) => frame.type === "bot_approval_pending" && (frame as BotApprovalPendingFrame).toolCallId === toolCallId,
+    ) as BotApprovalPendingFrame;
+    const payload = (toolCallId: string) =>
+      h.storage.nativeInteraction("sage", "approval", toolCallId)?.payload as { scope?: unknown } | undefined;
+    const inboxRow = (toolCallId: string) =>
+      h.storage.pendingNativeApprovals(["sage"], 100).find((row) => row.toolCallId === toolCallId);
+
+    // Valid: byte for byte on the live frame, the durable row and the inbox row, beside the room
+    // name, exactly as row 66 already promises for a 1:1 ask.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-scope", callId: "call-1", name: "workspace_write", status: "pending", scope,
+    })).toBe(true);
+    expect(pendingFrame("approval-scope")).toMatchObject({ bot: "sage", room: "Launch", name: "workspace_write" });
+    expect(JSON.stringify(pendingFrame("approval-scope").scope)).toBe(JSON.stringify(scope));
+    expect(JSON.stringify(payload("approval-scope")?.scope)).toBe(JSON.stringify(scope));
+    expect(inboxRow("approval-scope")).toMatchObject({ room: "Launch" });
+    expect(JSON.stringify(inboxRow("approval-scope")?.scope)).toBe(JSON.stringify(scope));
+
+    // Invalid: dropped, the approval kept, on every surface. Dropping fails closed, so the room
+    // ask is answerable but can leave no standing grant behind.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-scope-bad", callId: "call-2", name: "workspace_write", status: "pending",
+      scope: { ...scope, category: "vandalism" },
+    })).toBe(true);
+    expect(pendingFrame("approval-scope-bad")).toMatchObject({ bot: "sage", room: "Launch" });
+    expect(pendingFrame("approval-scope-bad")).not.toHaveProperty("scope");
+    expect(payload("approval-scope-bad")).not.toHaveProperty("scope");
+    expect(inboxRow("approval-scope-bad")).not.toHaveProperty("scope");
+
+    // Absent: byte identical to a pre-66 room approval. This is every Hermes-raised room approval
+    // that does not classify its call, and it must keep rendering the plain card.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-plain-scope", callId: "call-3", name: "terminal:rm", status: "pending",
+    })).toBe(true);
+    expect(pendingFrame("approval-plain-scope")).not.toHaveProperty("scope");
+    expect(payload("approval-plain-scope")).not.toHaveProperty("scope");
+
+    // The scoped decision body reaches a ROOM approval through the unchanged 1:1 route, and the
+    // standing grant it leaves is visible in the revocation view and endable there.
+    const approved = await h.app.request("/bots/sage/approvals/approval-scope/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: "category", expiresAt: NOW + 3_600_000 }),
+    });
+    expect(approved.status).toBe(202);
+    const grantsRead = await h.app.request("/bots/sage/approvals/grants");
+    expect(grantsRead.status).toBe(200);
+    const { grants } = await grantsRead.json() as { grants: Array<{ grantId: string; scope: string; resource: string }> };
+    expect(grants).toHaveLength(1);
+    expect(grants[0]).toMatchObject({ scope: "category", resource: "repo/notes.md" });
+    const revoked = await h.app.request(`/bots/sage/approvals/grants/${grants[0]!.grantId}`, { method: "DELETE" });
+    expect(revoked.status).toBe(200);
+    expect(((await (await h.app.request("/bots/sage/approvals/grants")).json()) as { grants: unknown[] }).grants)
+      .toHaveLength(0);
+  });
+
+  it("capability 66: an unclassified room ask declares no category, so no category grant covers it", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    // What a Hermes ask the plugin could not place looks like on this wire: a rule name, the
+    // capability-56 sentence, and NO block. The plugin answers no block rather than declaring
+    // `other`, because `other` is the one category a standing category grant can cover.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-unplaced", callId: "call-1", name: "terminal:rmdir", status: "pending",
+      detail: "Would remove the empty build directory.",
+    })).toBe(true);
+    const raised = h.frames.find(
+      (frame) => frame.type === "bot_approval_pending"
+        && (frame as BotApprovalPendingFrame).toolCallId === "approval-unplaced",
+    ) as BotApprovalPendingFrame;
+    expect(raised).toMatchObject({ bot: "sage", room: "Launch" });
+    expect(raised).not.toHaveProperty("scope");
+
+    const refused = await h.app.request("/bots/sage/approvals/approval-unplaced/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: "category", expiresAt: NOW + 3_600_000 }),
+    });
+    expect(refused.status).toBe(409);
+    expect((await refused.json() as { error: { code: string } }).error.code)
+      .toBe("approval_category_undeclared");
+    expect(((await (await h.app.request("/bots/sage/approvals/grants")).json()) as { grants: unknown[] }).grants)
+      .toHaveLength(0);
+
+    // One decision at a time IS on offer, and it is the derived binding that carries it.
+    const once = await h.app.request("/bots/sage/approvals/approval-unplaced/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: "once" }),
+    });
+    expect(once.status).toBe(202);
+  });
+
+  it("capability 66: a resource that is only the tool carries no category grant, only a once grant", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    // What every Hermes ask the plugin CAN classify looks like: it named the operation, because a
+    // pattern key is an operation, and it could not name the object, because that lives in the
+    // call's arguments and row 66 forbids one on this wire. `resourceKind: "action"` says exactly
+    // that, and a category grant over it would cover every file that tool can reach.
+    const toolResource = {
+      kind: "scoped_approval", action: "fs:write_file", category: "other",
+      system: "fs", resource: "write_file", resourceKind: "action",
+      change: "Run fs:write_file on write_file in fs.", effects: [],
+      reason: "peer_policy", payloadHash: "d".repeat(64), expiresAt: NOW + 600_000,
+      retry: "idempotent", requested: "once",
+    } as const;
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-tool", callId: "call-1", name: "fs:write_file",
+      status: "pending", scope: toolResource,
+    })).toBe(true);
+    // Carried byte for byte, `resourceKind` included: the card has to be able to say what it is.
+    const raised = h.frames.find(
+      (frame) => frame.type === "bot_approval_pending"
+        && (frame as BotApprovalPendingFrame).toolCallId === "approval-tool",
+    ) as BotApprovalPendingFrame;
+    expect(JSON.stringify(raised.scope)).toBe(JSON.stringify(toolResource));
+
+    const refused = await h.app.request("/bots/sage/approvals/approval-tool/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: "category", expiresAt: NOW + 3_600_000 }),
+    });
+    expect(refused.status).toBe(409);
+    expect((await refused.json() as { error: { code: string } }).error.code)
+      .toBe("approval_category_undeclared");
+    expect(((await (await h.app.request("/bots/sage/approvals/grants")).json()) as { grants: unknown[] }).grants)
+      .toHaveLength(0);
+
+    // One decision at a time IS the offer, and it is bound to the payload hash, so it covers one
+    // repetition of the exact ask this person read and nothing else.
+    const once = await h.app.request("/bots/sage/approvals/approval-tool/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: "once" }),
+    });
+    expect(once.status).toBe(202);
+    const { grants } = await (await h.app.request("/bots/sage/approvals/grants")).json() as
+      { grants: Array<{ scope: string }> };
+    expect(grants).toHaveLength(1);
+    expect(grants[0]).toMatchObject({ scope: "once" });
+  });
+
+  it("capability 66: no category grant made against a real object ever covers a tool-only ask", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    // Planted as if another peer, one that CAN name an object, had made it over the same action and
+    // the same string. The consult must refuse it too, or the decision-side refusal would only move
+    // the coverage rather than end it.
+    h.storage.recordApprovalGrant({
+      bot: "sage", grantId: "grant:sage:object", scope: "category", deviceId: "device-1",
+      sessionId: turn.threadId, turnId: null, approvalId: "approval-object",
+      action: "fs:write_file", category: "other", system: "fs",
+      resource: "write_file", payloadHash: null,
+      expiresAt: NOW + 3_600_000, createdAt: NOW,
+    });
+
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-tool", callId: "call-1", name: "fs:write_file",
+      status: "pending",
+      scope: {
+        kind: "scoped_approval", action: "fs:write_file", category: "other",
+        system: "fs", resource: "write_file", resourceKind: "action",
+        change: "Run fs:write_file on write_file in fs.", effects: [],
+        reason: "peer_policy", payloadHash: "d".repeat(64), expiresAt: NOW + 600_000,
+        retry: "idempotent", requested: "once",
+      },
+    })).toBe(true);
+
+    const raised = h.frames.find(
+      (frame) => frame.type === "bot_approval_pending"
+        && (frame as BotApprovalPendingFrame).toolCallId === "approval-tool",
+    ) as BotApprovalPendingFrame;
+    expect(raised).not.toHaveProperty("grantId");
+    expect(h.resolutions("sage")).toEqual([]);
+  });
+
+  it("capability 66: a standing grant covers a later room ask exactly as it covers a 1:1 ask", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    const base = {
+      kind: "scoped_approval", action: "workspace.write", category: "other",
+      system: "workspace", resource: "repo/notes.md", effects: [], reason: "guardrail",
+      expiresAt: NOW + 600_000, retry: "idempotent", requested: "category",
+    } as const;
+    const pendingFrame = (toolCallId: string): BotApprovalPendingFrame => h.frames.find(
+      (frame) => frame.type === "bot_approval_pending" && (frame as BotApprovalPendingFrame).toolCallId === toolCallId,
+    ) as BotApprovalPendingFrame;
+
+    // One decision, one standing category policy.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-first", callId: "call-1", name: "workspace_write", status: "pending",
+      scope: { ...base, change: "append one line to notes.md", payloadHash: "a".repeat(64) },
+    })).toBe(true);
+    const approved = await h.app.request("/bots/sage/approvals/approval-first/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: "category", expiresAt: NOW + 3_600_000 }),
+    });
+    expect(approved.status).toBe(202);
+
+    // A LATER room ask of the same action on the same resource is covered by it. The card is still
+    // raised, it names the grant, and the gateway settles it through the ordinary relay, which is
+    // the whole of the 1:1 behavior and must not differ here.
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-second", callId: "call-2", name: "workspace_write", status: "pending",
+      scope: { ...base, change: "append two lines to notes.md", payloadHash: "b".repeat(64) },
+    })).toBe(true);
+
+    const covered = pendingFrame("approval-second");
+    expect(covered).toMatchObject({ bot: "sage", room: "Launch" });
+    expect(covered.grantId).toBeDefined();
+    // On the durable record too, so the rebroadcast and a cold inbox read say who answered.
+    expect(h.storage.nativeInteraction("sage", "approval", "approval-second")?.payload)
+      .toMatchObject({ grantId: covered.grantId });
+    expect(h.storage.pendingNativeApprovals(["sage"], 100)
+      .find((row) => row.toolCallId === "approval-second")?.grantId).toBe(covered.grantId);
+    // And the peer got the same `resolve_approval` a tapped card sends: relayed, never executed.
+    await until(() => h.resolutions("sage").some((command) => command.approvalId === "approval-second"));
+    expect(h.resolutions("sage").find((command) => command.approvalId === "approval-second"))
+      .toEqual({
+        kind: "resolve_approval", threadId: "group:launch:sage", turnId: turn.turnId,
+        approvalId: "approval-second", decision: "approve",
+      });
+  });
+
+  it("capability 66: no standing grant covers an always-require room ask", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    // Planted directly, because the routes refuse to make one over this category at all. The floor
+    // is that the CONSULT never reads one either, whatever route put it there.
+    h.storage.recordApprovalGrant({
+      bot: "sage", grantId: "grant:sage:planted", scope: "category", deviceId: "device-1",
+      sessionId: turn.threadId, turnId: turn.turnId, approvalId: "approval-planted",
+      action: "payments.send",
+      category: "money_movement", system: "banking", resource: "invoice/8821",
+      payloadHash: null, expiresAt: NOW + 3_600_000, createdAt: NOW,
+    });
+
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-money", callId: "call-1", name: "pay_invoice", status: "pending",
+      scope: {
+        kind: "scoped_approval", action: "payments.send", category: "money_movement",
+        system: "banking", resource: "invoice/8821", change: "send 40 dollars to the vendor",
+        effects: [], reason: "always_require", payloadHash: "c".repeat(64),
+        expiresAt: NOW + 600_000, retry: "idempotent", requested: "once",
+      },
+    })).toBe(true);
+
+    const raised = h.frames.find(
+      (frame) => frame.type === "bot_approval_pending"
+        && (frame as BotApprovalPendingFrame).toolCallId === "approval-money",
+    ) as BotApprovalPendingFrame;
+    expect(raised).not.toHaveProperty("grantId");
+    expect(h.resolutions("sage")).toEqual([]);
+  });
+
+  it("capability 66: the always-require floor holds for a room approval too", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    expect(h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-money", callId: "call-1", name: "pay_invoice", status: "pending",
+      scope: {
+        kind: "scoped_approval", action: "payments.send", category: "money_movement",
+        system: "banking", resource: "invoice/8821", change: "send 40 dollars to the vendor",
+        effects: [], reason: "always_require", payloadHash: "c".repeat(64),
+        expiresAt: NOW + 600_000, retry: "not_idempotent", requested: "once",
+      },
+    })).toBe(true);
+
+    const refused = await h.app.request("/bots/sage/approvals/approval-money/approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant: "category", expiresAt: NOW + 3_600_000 }),
+    });
+    expect(refused.status).toBe(409);
+    expect((await refused.json() as { error: { code: string } }).error.code).toBe("approval_category_forbidden");
+    expect(((await (await h.app.request("/bots/sage/approvals/grants")).json()) as { grants: unknown[] }).grants)
+      .toHaveLength(0);
+  });
+
+  it("lands a runtime member's room clarification in the inbox and resolves it through the unchanged route", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+
+    expect(h.push("sage", {
+      kind: "clarify", threadId: turn.threadId, turnId: turn.turnId, clarifyId: "clarify-1",
+      prompt: "Which environment?",
+      options: [{ id: "staging", label: "Staging" }, { id: "prod", label: "Production" }],
+      status: "pending",
+    })).toBe(true);
+
+    expect(h.storage.pendingNativeClarifications(["sage"], 100)).toEqual([{
+      bot: "sage",
+      sessionId: "group:launch:sage",
+      turnId: turn.turnId,
+      clarifyId: "clarify-1",
+      prompt: "Which environment?",
+      options: [{ id: "staging", label: "Staging" }, { id: "prod", label: "Production" }],
+      expiresAt: NOW + 600000,
+      room: "Launch",
+    }]);
+    const pending = h.frames.find((frame) => frame.type === "bot_clarify_pending") as BotClarifyPendingFrame;
+    expect(pending).toMatchObject({
+      bot: "sage", sessionId: "group:launch:sage", turnId: turn.turnId,
+      clarifyId: "clarify-1", room: "Launch",
+    });
+    expect(h.bridge.groups()[0]?.pendingInteractions).toEqual([
+      { member: "sage", kind: "clarify", id: "clarify-1", turnId: turn.turnId },
+    ]);
+
+    const response = await h.app.request("/bots/sage/clarifications/clarify-1", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ optionId: "staging" }),
+    });
+    expect(response.status).toBe(202);
+
+    await until(() => h.resolutions("sage").length > 0);
+    expect(h.resolutions("sage")).toEqual([{
+      kind: "resolve_clarify",
+      threadId: "group:launch:sage",
+      turnId: turn.turnId,
+      clarifyId: "clarify-1",
+      optionId: "staging",
+    }]);
+  });
+
+  it("routes each of two runtime members' room approvals back to the peer that raised it", async () => {
+    const h = await setup({ runtimeBots: ["sage", "nova"] });
+    const first = await blockedTurn(h, ["sage", "nova"]);
+
+    h.push(first.agentId, {
+      kind: "approval", threadId: first.threadId, turnId: first.turnId,
+      approvalId: "approval-first", callId: "call-1", name: "terminal:rm", status: "pending",
+    });
+    expect(h.bridge.groups()[0]?.pendingInteractions).toEqual([
+      { member: first.agentId, kind: "approval", id: "approval-first", turnId: first.turnId, cause: { kind: "user", seq: 1 } },
+    ]);
+    expect(await (await h.app.request(`/bots/${first.agentId}/approvals/approval-first/approve`, { method: "POST" })).json())
+      .toEqual({ status: "requested" });
+    await until(() => h.resolutions(first.agentId).length > 0);
+
+    // Member turns are SERIAL in a room, so the second member is asked only once the first settles.
+    h.push(first.agentId, {
+      kind: "commit", threadId: first.threadId, turnId: first.turnId, messageId: "m-1",
+      blocks: [{ type: "paragraph", text: "done my half" }],
+    });
+    await until(() => h.commands.some((command) => command.agentId !== first.agentId));
+    const second = h.commands.find((command) => command.agentId !== first.agentId)!;
+
+    h.push(second.agentId, {
+      kind: "approval", threadId: second.threadId, turnId: second.turnId,
+      approvalId: "approval-second", callId: "call-2", name: "workspace:write", status: "pending",
+    });
+    expect(h.storage.pendingNativeApprovals([second.agentId], 100)).toMatchObject([
+      { bot: second.agentId, sessionId: second.threadId, toolCallId: "approval-second", room: "Launch" },
+    ]);
+    expect(h.bridge.groups()[0]?.pendingInteractions).toEqual([
+      { member: second.agentId, kind: "approval", id: "approval-second", turnId: second.turnId, cause: { kind: "member", seq: 2 } },
+    ]);
+    expect(await (await h.app.request(`/bots/${second.agentId}/approvals/approval-second/deny`, { method: "POST" })).json())
+      .toEqual({ status: "requested" });
+    await until(() => h.resolutions(second.agentId).length > 0);
+
+    // Each peer got its OWN decision on its OWN member thread, and neither saw the other's. The
+    // routes never learned about rooms; the durable row's `bot` did all the addressing.
+    expect(h.resolutions(first.agentId)).toEqual([{
+      kind: "resolve_approval", threadId: first.threadId, turnId: first.turnId,
+      approvalId: "approval-first", decision: "approve",
+    }]);
+    expect(h.resolutions(second.agentId)).toEqual([{
+      kind: "resolve_approval", threadId: second.threadId, turnId: second.turnId,
+      approvalId: "approval-second", decision: "deny",
+    }]);
+    expect(first.threadId).not.toBe(second.threadId);
+  });
+
+  it("projects a room turn's tool steps as an ephemeral activity card and never dead-letters one", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+
+    expect(h.push("sage", {
+      kind: "tool", threadId: turn.threadId, turnId: turn.turnId, callId: "call-1",
+      name: "read_file", status: "running", detail: "reading the plan",
+    })).toBe(true);
+    expect(h.push("sage", {
+      kind: "tool", threadId: turn.threadId, turnId: turn.turnId, callId: "call-1",
+      name: "read_file", status: "ok",
+    })).toBe(true);
+
+    const activity = h.frames.filter((frame) => frame.type === "bot_tool_activity") as BotToolActivityFrame[];
+    expect(activity).toHaveLength(2);
+    expect(activity[0]).toMatchObject({
+      bot: "sage", sessionId: "group:launch:sage", turnId: turn.turnId, room: "Launch", seq: 1,
+    });
+    // Name and status only. The plugin sent a `detail` and the room does not carry it: a room is a
+    // place several bots and a human read each other's activity, so this projection stays at the
+    // narrowest thing that is still useful. Arguments and results were never on this wire.
+    expect(activity[0]?.steps).toEqual([
+      { stepId: "call-1", seq: 1, name: "read_file", status: "running", startedAt: NOW },
+    ]);
+    expect(activity[1]?.steps).toEqual([
+      { stepId: "call-1", seq: 1, name: "read_file", status: "ok", startedAt: NOW, endedAt: NOW },
+    ]);
+
+    // EPHEMERAL: the room transcript gains nothing and no step is persisted anywhere.
+    expect(h.storage.botChatToolSteps("group:launch:sage", 0)).toEqual([]);
+
+    // The turn settles and the gateway closes the card it opened.
+    expect(h.push("sage", {
+      kind: "commit", threadId: turn.threadId, turnId: turn.turnId, messageId: "m-1",
+      blocks: [{ type: "paragraph", text: "read it, shipping" }],
+    })).toBe(true);
+    await until(() => h.frames.some((frame) => frame.type === "bot_tool_activity" && frame.done === true));
+
+    // A replayed tool event for the settled turn is still ACKNOWLEDGED: an at-least-once stream
+    // must never be blocked behind rendering state (issue #193).
+    expect(h.push("sage", {
+      kind: "tool", threadId: turn.threadId, turnId: turn.turnId, callId: "call-1",
+      name: "read_file", status: "ok",
+    })).toBe(true);
+    expect(h.storage.attachProjectionDeadLetters()).toEqual([]);
+  });
+
+  it("expires a room clarification on its own deadline, without waiting for the turn to seal", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+
+    h.push("sage", {
+      kind: "clarify", threadId: turn.threadId, turnId: turn.turnId, clarifyId: "clarify-1",
+      prompt: "Which environment?", options: [{ id: "staging", label: "Staging" }],
+      status: "pending", expiresAt: NOW + 20,
+    });
+    expect(h.storage.pendingNativeClarifications(["sage"], 100)).toHaveLength(1);
+
+    // The room borrows the 1:1 lane's deadline wheel, so the card dies on its own clock. The
+    // member turn is still wide open throughout: nothing here waits on a settlement.
+    await until(() => h.frames.some((frame) =>
+      frame.type === "bot_clarify_resolved" && frame.outcome === "expired" && frame.room === "Launch",
+    ));
+    expect(h.storage.pendingNativeClarifications(["sage"], 100)).toEqual([]);
+    expect(h.commands).toHaveLength(1);
+    expect(h.storage.botGroupTurn("launch", turn.turnId)?.state).toBe("pending");
+  });
+
+  it("expires a room interaction its member turn left behind", async () => {
+    const h = await setup();
+    const turn = await blockedTurn(h, ["sage", "scout"]);
+    h.push("sage", {
+      kind: "approval", threadId: turn.threadId, turnId: turn.turnId,
+      approvalId: "approval-1", callId: "call-1", name: "terminal:rm", status: "pending",
+    });
+    expect(h.storage.pendingNativeApprovals(["sage"], 100)).toHaveLength(1);
+
+    // The member answered without waiting. A card the user could still tap would resolve into a
+    // turn that is over, so the gateway closes it through the native plane's own rule.
+    h.push("sage", {
+      kind: "commit", threadId: turn.threadId, turnId: turn.turnId, messageId: "m-1",
+      blocks: [{ type: "paragraph", text: "never mind" }],
+    });
+    expect(h.storage.pendingNativeApprovals(["sage"], 100)).toEqual([]);
+    expect(h.frames.some((frame) =>
+      frame.type === "bot_approval_resolved" && frame.outcome === "expired" && frame.room === "Launch",
+    )).toBe(true);
+    expect(h.pushedApprovals).toEqual([
+      { kind: "approval_pending", room: "Launch" },
+      { kind: "approval_resolved", room: "Launch" },
+    ]);
+    expect(h.bridge.groups()[0]?.pendingInteractions).toBeUndefined();
+  });
+
+  it("leaves a Hermes member's room turn exactly as it was", async () => {
+    // No runtime members at all: `scout` and `luna` are Hermes profiles, and the Hermes plugin has
+    // never been asked to raise an approval inside a room. Its events stay acknowledged and
+    // unprojected.
+    const h = await setup({ runtimeBots: [], hermesProfiles: [scoutRow, lunaRow] });
+    const turn = await blockedTurn(h, ["scout", "luna"]);
+
+    for (const event of [
+      { kind: "approval", threadId: turn.threadId, turnId: turn.turnId, approvalId: "a-1", callId: "c-1", name: "terminal:rm", status: "pending" },
+      { kind: "clarify", threadId: turn.threadId, turnId: turn.turnId, clarifyId: "cl-1", prompt: "Which?", options: [{ id: "a", label: "A" }], status: "pending" },
+      { kind: "tool", threadId: turn.threadId, turnId: turn.turnId, callId: "c-1", name: "read_file", status: "running" },
+    ]) {
+      // Acknowledged, exactly as before: a dropped projection must never dead-letter the stream.
+      expect(h.push(turn.agentId, event)).toBe(true);
+    }
+
+    expect(h.storage.pendingNativeApprovals([turn.agentId], 100)).toEqual([]);
+    expect(h.storage.pendingNativeClarifications([turn.agentId], 100)).toEqual([]);
+    expect(h.frames.some((frame) =>
+      frame.type === "bot_approval_pending" || frame.type === "bot_clarify_pending" || frame.type === "bot_tool_activity",
+    )).toBe(false);
+    expect(h.bridge.groups()[0]?.pendingInteractions).toBeUndefined();
+  });
+});

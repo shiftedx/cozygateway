@@ -1,0 +1,818 @@
+import { createServer, type Server } from "node:http";
+import { once } from "node:events";
+
+import { WebSocket } from "ws";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { BotModelConfig, BotProfile, BotRoutine } from "cozygateway-contract";
+
+import { AttachV1Ingress } from "../src/adapters/attach/ingress-v1.ts";
+import type { AttachV1ConfigRequest, AttachV1ServerFrame } from "../src/adapters/attach/protocol-v1.ts";
+import {
+  AttachConfigSurface,
+  ConfigInvalidRequest,
+  ConfigNotFound,
+  ConfigNotNegotiated,
+  createConfigRateLimiter,
+  type ConfigSurface,
+} from "../src/hermes-bridge/bot-config.ts";
+import { NativeBotDataPlane } from "../src/hermes-bridge/native-data-plane.ts";
+import { BotNotFound } from "../src/hermes-bridge/crud.ts";
+import { RoutineNotFound } from "../src/hermes-bridge/routines.ts";
+import { BackendUnavailable, UnsupportedForRuntime } from "../src/errors.ts";
+import { openStorage, type Storage } from "../src/storage.ts";
+import { createApp } from "../src/http.ts";
+import { SETUP_CODE_TTL_MS, newSetupCode } from "../src/auth.ts";
+import { testHermes } from "./support/test-config.ts";
+import type { BotsSurface } from "../src/hermes-bridge/bridge.ts";
+
+const profile: BotProfile = {
+  name: "sage",
+  description: "",
+  soul: "# Sage",
+  skills: [],
+  toolsets: [],
+  toolsetsPinned: false,
+  mcpServers: [],
+  model: { provider: "anthropic", default: "opus" },
+  runtimeInert: [],
+};
+
+const modelConfig: BotModelConfig = {
+  model: "opus",
+  effort: "high",
+  catalog: [],
+  efforts: ["low", "high"],
+};
+
+const routine: BotRoutine = {
+  id: "job-1",
+  title: "Morning brief",
+  schedule: { raw: "0 9 * * *", human: "Daily" },
+  enabled: true,
+  lastRun: null,
+  nextRun: null,
+};
+
+const sage = { id: "sage", name: "Sage", avatar: null, runtime: "cozyagents" } as const;
+
+function planeWith(botConfig: ConfigSurface | undefined, control: Partial<BotsSurface>) {
+  const storage = openStorage(":memory:");
+  const plane = new NativeBotDataPlane({
+    control: control as BotsSurface,
+    storage,
+    ingress: {} as never,
+    nativeBots: ["sage"],
+    runtimeBots: [sage],
+    chatSuggestion: "",
+    broadcast: () => undefined,
+    ...(botConfig === undefined ? {} : { botConfig }),
+  });
+  return { plane, storage };
+}
+
+describe("attach-v1 config lane", () => {
+  let server: Server;
+  let port: number;
+  let storage: Storage;
+  let ingress: AttachV1Ingress;
+  let config: AttachConfigSurface;
+
+  beforeEach(async () => {
+    storage = openStorage(":memory:");
+    ingress = new AttachV1Ingress({
+      tokens: new Map([["secret", "sage"]]),
+      storage,
+      events: {
+        onEvent: () => true,
+        onPresence: () => undefined,
+        onConfigResult: (agentId, frame) => {
+          config.handle(agentId, frame);
+        },
+      },
+    });
+    config = new AttachConfigSurface(ingress);
+    server = createServer();
+    server.on("upgrade", (req, socket, head) => ingress.handleUpgrade(req, socket, head));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    port = typeof address === "object" && address !== null ? address.port : 0;
+  });
+
+  afterEach(async () => {
+    config.close();
+    ingress.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    storage.close();
+  });
+
+  /** A peer that answers every `config_request` with the reply the table names for its operation. */
+  async function dial(
+    replies: Partial<Record<AttachV1ConfigRequest["operation"], unknown>>,
+    capabilities: string[] = ["bot_config"],
+  ): Promise<{ ws: WebSocket; requests: AttachV1ConfigRequest[] }> {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/attach/v1`, {
+      headers: { authorization: "Bearer secret" },
+    });
+    const requests: AttachV1ConfigRequest[] = [];
+    let acked = false;
+    ws.on("message", (data) => {
+      const frame = JSON.parse(String(data)) as AttachV1ServerFrame;
+      if (frame.kind === "hello_ack") { acked = true; return; }
+      if (frame.kind !== "config_request") return;
+      requests.push(frame);
+      const result = replies[frame.operation];
+      ws.send(JSON.stringify(
+        result === undefined
+          ? { kind: "config_result", requestId: frame.requestId, status: "not_found", message: "no such thing" }
+          : { kind: "config_result", requestId: frame.requestId, status: "ok", result },
+      ));
+    });
+    await once(ws, "open");
+    ws.send(JSON.stringify({
+      kind: "hello", version: 2, instanceId: "peer", capabilities,
+      resume: { eventSequence: 0, commandSequence: 0 },
+    }));
+    await until(() => acked);
+    return { ws, requests };
+  }
+
+  it("round-trips every config operation through an attached peer", async () => {
+    const peer = await dial({
+      "profile.read": profile,
+      "profile.write": { name: "sage", outcome: "applied", ok: true, applied: { soul: true }, requested: ["soul"] },
+      "model.read": modelConfig,
+      "model.write": modelConfig,
+      "routines.list": { name: "sage", routines: [routine], updatedAt: 5 },
+      "routines.create": { name: "sage", routine },
+      "routines.update": { name: "sage", routine, replacedId: "job-0" },
+      "routines.delete": { ok: true },
+      "routines.run": { ok: true },
+    });
+
+    await expect(config.botProfile("sage")).resolves.toEqual(profile);
+    await expect(config.configureProfile("sage", { soul: "# new" })).resolves.toEqual({
+      outcome: "applied", ok: true, applied: { soul: true }, requested: ["soul"],
+    });
+    await expect(config.modelConfig("sage")).resolves.toEqual(modelConfig);
+    await expect(config.configureModel("sage", { model: "opus" })).resolves.toEqual(modelConfig);
+    await expect(config.routines("sage")).resolves.toEqual({ name: "sage", routines: [routine], updatedAt: 5 });
+    await expect(config.createRoutine("sage", { title: "t", schedule: "30m", prompt: "p" })).resolves.toEqual({ routine });
+    await expect(config.patchRoutine("sage", "job-0", { enabled: false })).resolves.toEqual({ routine, replacedId: "job-0" });
+    await expect(config.deleteRoutine("sage", "job-1")).resolves.toBeUndefined();
+    await expect(config.runRoutine("sage", "job-1")).resolves.toBeUndefined();
+
+    expect(peer.requests.map((request) => request.operation)).toEqual([
+      "profile.read", "profile.write", "model.read", "model.write",
+      "routines.list", "routines.create", "routines.update", "routines.delete", "routines.run",
+    ]);
+    // The lane is live only: nothing it carried becomes a durable command or event.
+    expect(storage.attachCommandCursor("sage")).toBe(0);
+    expect(storage.attachEventCursor("sage")).toBe(0);
+    peer.ws.close();
+  });
+
+  it("carries subagent model reads, selection, and reset over the runtime config lane", async () => {
+    const configured = { ...modelConfig, subagentModel: "provider:child" };
+    const peer = await dial({ "model.read": configured, "model.write": configured });
+    await expect(config.modelConfig("sage")).resolves.toEqual(configured);
+    await expect(config.configureModel("sage", { subagentModel: "provider:child" })).resolves.toEqual(configured);
+    await config.configureModel("sage", { subagentModel: null });
+    expect(peer.requests.filter((request) => request.operation === "model.write").map((request) => request.input)).toEqual([
+      { subagentModel: "provider:child" }, { subagentModel: null },
+    ]);
+    peer.ws.close();
+  });
+
+  it("carries vision model reads, selection, and reset over the runtime config lane", async () => {
+    const configured = { ...modelConfig, visionModel: "provider:vision" };
+    const peer = await dial({ "model.read": configured, "model.write": configured });
+    await expect(config.modelConfig("sage")).resolves.toEqual(configured);
+    await expect(config.configureModel("sage", { visionModel: "provider:vision" })).resolves.toEqual(configured);
+    await config.configureModel("sage", { visionModel: null });
+    expect(peer.requests.filter((request) => request.operation === "model.write").map((request) => request.input)).toEqual([
+      { visionModel: "provider:vision" }, { visionModel: null },
+    ]);
+    peer.ws.close();
+  });
+
+  it("uses the independently negotiated chat configuration capability", async () => {
+    const configuration = { sessionId: "session-1", workspace: null, model: null };
+    const peer = await dial({
+      "chat.configuration.read": {
+        computer: { id: "computer-1", name: "Runner", isAvailable: true },
+        configuration: null,
+      },
+      "chat.configuration.prepare": { configuration },
+      "chat.projects": { projects: [] },
+      "chat.branches": { branches: [] },
+    }, ["chat_configuration"]);
+
+    await expect(config.readChatConfiguration("sage", "session-1")).resolves.toMatchObject({
+      computer: { id: "computer-1" }, configuration: null,
+    });
+    await expect(config.prepareChatConfiguration("sage", configuration)).resolves.toEqual({ configuration });
+    await expect(config.chatProjects("sage", "computer-1")).resolves.toEqual({ projects: [] });
+    await expect(config.chatBranches("sage", "computer-1", "project-1")).resolves.toEqual({ branches: [] });
+    expect(peer.requests.map((request) => request.operation)).toEqual([
+      "chat.configuration.read", "chat.configuration.prepare", "chat.projects", "chat.branches",
+    ]);
+    peer.ws.close();
+  });
+
+  it("accepts a runtime peer's providers rows and projects them as the bot's provider catalog", async () => {
+    // The shape CozyAgents sends from its `model.read`: BotModelProviderSchema fields plus the extras
+    // (`id`, `models`, `manualModels`) its launcher reads, which the schema tolerates.
+    const withProviders = {
+      ...modelConfig,
+      catalog: [
+        { id: "anthropic:opus", displayName: "Opus", unauthenticated: true },
+        { id: "custom-1:private-model", displayName: "Private: private-model" },
+      ],
+      providers: [
+        { id: "anthropic", slug: "anthropic", name: "anthropic", authenticated: false, modelCount: 1 },
+        {
+          id: "custom-1", slug: "custom-1", name: "Private", authenticated: true, modelCount: 1,
+          baseUrl: "https://models.example.test/v1", models: ["private-model"], manualModels: ["private-model"],
+        },
+      ],
+    };
+    const peer = await dial({ "model.read": withProviders });
+    await expect(config.modelConfig("sage")).resolves.toEqual(withProviders);
+    const { plane, storage: planeStorage } = planeWith(config, { modelProviders: vi.fn() } as Partial<BotsSurface>);
+    await expect(plane.surface().modelProviders("sage")).resolves.toMatchObject({
+      providers: [{ slug: "anthropic", name: "anthropic", authenticated: false, models: ["opus"], modelCount: 1, methods: [] }],
+    });
+    plane.close();
+    planeStorage.close();
+    peer.ws.close();
+  });
+
+  it("refuses a providers row that carries only `id`: the frame is invalid and the read is a 503", async () => {
+    // The pre-P3b CozyAgents shape. On the wire the ingress refuses the whole `config_result`
+    // frame (the `result` union has no member for that row) and closes the peer's socket, so the
+    // read never reaches `validResult` and ends as unavailable at the lane timeout. Pinned so
+    // neither side can drift back without a red test.
+    const quick = new AttachConfigSurface(ingress, 200);
+    const peer = await dial({ "model.read": { ...modelConfig, providers: [{ id: "anthropic" }] } });
+    const closed = once(peer.ws, "close");
+    const pending = quick.modelConfig("sage");
+    await expect(pending).rejects.toBeInstanceOf(BackendUnavailable);
+    await expect(pending).rejects.toThrow("bot config reply timed out");
+    const [code, reason] = (await closed) as [number, Buffer];
+    expect(code).toBe(1008);
+    expect(String(reason)).toBe("attach-v1 invalid config_result frame");
+    quick.close();
+  });
+
+  it("preserves a peer's additive row-local ignored details on profile writes", async () => {
+    const peer = await dial({
+      "profile.write": {
+        name: "sage",
+        outcome: "applied",
+        ok: true,
+        applied: { skills_enabled: true },
+        ignored: { skills_enabled: ["missing-skill"] },
+        requested: ["enabledSkills"],
+      },
+    });
+
+    await expect(config.configureProfile("sage", { enabledSkills: ["missing-skill"] })).resolves.toEqual({
+      outcome: "applied",
+      ok: true,
+      applied: { skills_enabled: true },
+      ignored: { skills_enabled: ["missing-skill"] },
+      requested: ["enabledSkills"],
+    });
+    expect(peer.requests[0]?.input).toEqual({ enabledSkills: ["missing-skill"] });
+    peer.ws.close();
+  });
+
+  // Capability 57: this gateway does not interpret guardrailLevel, it relays it. A patch carrying
+  // the field is forwarded to the peer byte-for-byte, and a peer's read carrying it comes straight
+  // back, for each of the four names.
+  it("round-trips guardrailLevel through the peer unchanged, for each of the four names", async () => {
+    for (const guardrailLevel of ["locked", "guided", "balanced", "autonomous"] as const) {
+      const peer = await dial({
+        "profile.read": { ...profile, guardrailLevel },
+        "profile.write": { name: "sage", outcome: "applied", ok: true, applied: { guardrails: true }, requested: ["guardrailLevel"] },
+      });
+
+      await expect(config.botProfile("sage")).resolves.toMatchObject({ guardrailLevel });
+      await expect(config.configureProfile("sage", { guardrailLevel })).resolves.toEqual({
+        outcome: "applied", ok: true, applied: { guardrails: true }, requested: ["guardrailLevel"],
+      });
+
+      expect(peer.requests.map((request) => request.input)).toEqual([
+        {},
+        { guardrailLevel },
+      ]);
+      peer.ws.close();
+    }
+  });
+
+  // Absent stays absent: a peer that answers no guardrailLevel at all (a pre-57 peer) is not
+  // backfilled with one, and a patch that does not mention it carries no such key on the wire.
+  it("leaves guardrailLevel absent on the wire when the caller does not mention it", async () => {
+    const peer = await dial({
+      "profile.read": profile,
+      "profile.write": { name: "sage", outcome: "applied", ok: true, applied: { soul: true }, requested: ["soul"] },
+    });
+    const read = await config.botProfile("sage");
+    expect("guardrailLevel" in read).toBe(false);
+    await config.configureProfile("sage", { soul: "# new" });
+    expect(peer.requests[1]?.input).toEqual({ soul: "# new" });
+    peer.ws.close();
+  });
+
+  // Capability 58: this gateway relays guardrailCeiling on a read exactly as it relays
+  // guardrailLevel, but the field never appears on a write, because it is read-only.
+  it("round-trips guardrailCeiling through the peer's profile.read unchanged, for each of the four names", async () => {
+    for (const guardrailCeiling of ["locked", "guided", "balanced", "autonomous"] as const) {
+      const peer = await dial({ "profile.read": { ...profile, guardrailCeiling } });
+      await expect(config.botProfile("sage")).resolves.toMatchObject({ guardrailCeiling });
+      expect(peer.requests.map((request) => request.input)).toEqual([{}]);
+      peer.ws.close();
+    }
+  });
+
+  // Absent stays absent: a peer that answers no guardrailCeiling at all (a pre-58 peer, or a peer
+  // that has not set one) is not backfilled with one.
+  it("leaves guardrailCeiling absent on the wire when the peer does not answer one", async () => {
+    const peer = await dial({ "profile.read": profile });
+    const read = await config.botProfile("sage");
+    expect("guardrailCeiling" in read).toBe(false);
+    peer.ws.close();
+  });
+
+  // Capability 63: the per-server MCP repair policy is the HARNESS's setting, projected read-only
+  // onto the profile row. Real socket, real ingress, real config surface, real data plane: what the
+  // peer put on `profile.read` is what the bot's profile surface answers, for each of the two names.
+  it("carries the per-server MCP repair policy from the peer's profile.read through to the bot profile surface, for both names", async () => {
+    for (const repair of ["approve_once", "auto_refresh"] as const) {
+      const row = { name: "github", installed: true, enabled: true, repair };
+      const peer = await dial({ "profile.read": { ...profile, mcpServers: [row] } });
+      const { plane, storage: planeStorage } = planeWith(config, { botProfile: vi.fn() } as unknown as Partial<BotsSurface>);
+
+      await expect(plane.surface().botProfile("sage")).resolves.toEqual({
+        ...profile,
+        mcpServers: [row],
+      });
+      // A read, never a write: the request that carried it named no policy at all.
+      expect(peer.requests.map((request) => request.input)).toEqual([{}]);
+
+      plane.close();
+      planeStorage.close();
+      peer.ws.close();
+    }
+  });
+
+  // The gateway preserves a missing key. Hermes-shaped and old-peer rows omit it, as does a peer
+  // that does not project a policy. A known CozyAgents peer can instead project its effective
+  // `approve_once` default after negotiating 63, which still requires approval.
+  it("leaves the repair policy absent on a server the peer answered without one", async () => {
+    const peer = await dial({
+      "profile.read": { ...profile, mcpServers: [{ name: "github", installed: true, enabled: true }] },
+    });
+    const read = await config.botProfile("sage");
+    expect(read.mcpServers[0] && "repair" in read.mcpServers[0]).toBe(false);
+    peer.ws.close();
+  });
+
+  // The lane retains NOTHING: there is no stored copy to go stale and no rebroadcast to replay.
+  // A second read after the peer changed its own setting answers the peer's current value, and the
+  // policy never becomes a durable command or event on the way past.
+  it("re-reads the repair policy from the peer instead of keeping a copy of it", async () => {
+    const server = (repair: string) => ({ name: "github", installed: true, enabled: true, repair });
+    const first = await dial({ "profile.read": { ...profile, mcpServers: [server("approve_once")] } });
+    await expect(config.botProfile("sage")).resolves.toMatchObject({ mcpServers: [server("approve_once")] });
+    first.ws.close();
+    await until(() => first.ws.readyState === first.ws.CLOSED);
+
+    const second = await dial({ "profile.read": { ...profile, mcpServers: [server("auto_refresh")] } });
+    await expect(config.botProfile("sage")).resolves.toMatchObject({ mcpServers: [server("auto_refresh")] });
+    expect(storage.attachCommandCursor("sage")).toBe(0);
+    expect(storage.attachEventCursor("sage")).toBe(0);
+    second.ws.close();
+  });
+
+  // An unknown policy follows the lane's existing convention exactly as the pre-P3b providers row
+  // does: the `config_result` frame is invalid, the ingress refuses it and closes the peer's socket,
+  // and the read ends unavailable at the lane timeout. Fail closed, never an unvalidated string
+  // handed to a client that would render it as a permission.
+  it("refuses an unknown repair policy: the frame is invalid and the read is unavailable", async () => {
+    const quick = new AttachConfigSurface(ingress, 200);
+    const peer = await dial({
+      "profile.read": {
+        ...profile,
+        mcpServers: [{ name: "github", installed: true, enabled: true, repair: "auto_reconnect" }],
+      },
+    });
+    const closed = once(peer.ws, "close");
+    const pending = quick.botProfile("sage");
+    await expect(pending).rejects.toBeInstanceOf(BackendUnavailable);
+    await expect(pending).rejects.toThrow("bot config reply timed out");
+    const [code, reason] = (await closed) as [number, Buffer];
+    expect(code).toBe(1008);
+    expect(String(reason)).toBe("attach-v1 invalid config_result frame");
+    quick.close();
+  });
+
+  // Capability 89. A remote MCP server a chat client declares rides `profile.write` to a peer that
+  // offered `mcp_server_declarations`, byte for byte, and the peer's own `applied` and `ignored`
+  // answer comes straight back. The declaration names a variable, never a value.
+  describe("client-declared MCP servers (capability 89)", () => {
+    const home = {
+      name: "home",
+      transport: "http" as const,
+      url: "https://ha.example.com/api/mcp",
+      headers: { Authorization: "Bearer ${COZY_MCP_HOME_TOKEN}" },
+      tools: ["GetLiveContext", "HassTurnOn"],
+    };
+
+    it("forwards declarations and removals unchanged to a peer that offered mcp_server_declarations", async () => {
+      const written = {
+        name: "sage", outcome: "applied", ok: true,
+        applied: { mcp_servers_declared: true, mcp_servers_removed: true, mcp_servers: true },
+        ignored: { mcp_servers_removed: ["comfyui"] },
+        requested: ["declareMcpServers", "removeMcpServers", "enabledMcpServers"],
+      };
+      const peer = await dial({ "profile.write": written }, ["bot_config", "mcp_server_declarations"]);
+      const patch = { declareMcpServers: [home], removeMcpServers: ["comfyui"], enabledMcpServers: ["home"] };
+
+      await expect(config.configureProfile("sage", patch)).resolves.toEqual({
+        outcome: "applied", ok: true, applied: written.applied, ignored: written.ignored, requested: written.requested,
+      });
+      expect(peer.requests.map((request) => [request.operation, request.input])).toEqual([["profile.write", patch]]);
+      // Live only, exactly as every other config operation: nothing is retained on the way past.
+      expect(storage.attachCommandCursor("sage")).toBe(0);
+      expect(storage.attachEventCursor("sage")).toBe(0);
+      peer.ws.close();
+    });
+
+    // The gate. A peer that speaks `bot_config` but never offered declarations receives NOTHING
+    // carrying either field: the refusal happens before the frame is written, so a peer that does
+    // not know the fields cannot misread or half-apply them. Its other profile writes still flow.
+    it("sends a peer without mcp_server_declarations nothing, and says the runtime does not support it", async () => {
+      const peer = await dial({
+        "profile.write": { name: "sage", outcome: "applied", ok: true, applied: { soul: true }, requested: ["soul"] },
+      });
+      await expect(config.configureProfile("sage", { declareMcpServers: [home] })).rejects.toBeInstanceOf(ConfigNotNegotiated);
+      await expect(config.configureProfile("sage", { removeMcpServers: ["home"] })).rejects.toBeInstanceOf(ConfigNotNegotiated);
+      await expect(config.configureProfile("sage", { soul: "# new", declareMcpServers: [home] })).rejects.toBeInstanceOf(ConfigNotNegotiated);
+      expect(peer.requests).toEqual([]);
+
+      await expect(config.configureProfile("sage", { soul: "# new" })).resolves.toMatchObject({ ok: true });
+      expect(peer.requests.map((request) => request.input)).toEqual([{ soul: "# new" }]);
+
+      // Through the data plane the same refusal is the runtime's 409, never a 503 to retry.
+      const { plane, storage: planeStorage } = planeWith(config, { configureProfile: vi.fn() } as unknown as Partial<BotsSurface>);
+      await expect(plane.surface().configureProfile("sage", { declareMcpServers: [home] })).rejects.toBeInstanceOf(UnsupportedForRuntime);
+      expect(peer.requests).toHaveLength(1);
+      plane.close();
+      planeStorage.close();
+      peer.ws.close();
+    });
+
+    // The patch schema is open, as every object on the contract is, so an unmodeled key passes the
+    // boundary. It must still never reach a peer: the lane input is rebuilt from the published keys,
+    // for a peer with the declaration capability and one without it alike.
+    it("never forwards an unknown patch key to the peer, whatever the peer negotiated", async () => {
+      const smuggled = {
+        soul: "# new",
+        mcpServers: { evil: { command: "sh", args: ["-c", "id"] } },
+        DeclareMcpServers: [{ name: "evil", transport: "stdio", command: "sh" }],
+        enabled_mcp_servers: ["evil"],
+      };
+      for (const capabilities of [["bot_config"], ["bot_config", "mcp_server_declarations"]]) {
+        const peer = await dial({
+          "profile.write": { name: "sage", outcome: "applied", ok: true, applied: { soul: true }, requested: ["soul"] },
+        }, capabilities);
+        await config.configureProfile("sage", smuggled as never);
+        expect(peer.requests.map((request) => request.input), capabilities.join()).toEqual([{ soul: "# new" }]);
+        peer.ws.close();
+        await until(() => peer.ws.readyState === peer.ws.CLOSED);
+      }
+    });
+
+    // Capability 88's `role` and `reports` are published patch keys but GATEWAY-OWNED: the route
+    // strips them before forwarding, and the lane refuses to carry them even if a caller did not.
+    it("never forwards the gateway-owned team fields to a peer", async () => {
+      const peer = await dial({
+        "profile.write": { name: "sage", outcome: "applied", ok: true, applied: { soul: true }, requested: ["soul"] },
+      }, ["bot_config", "mcp_server_declarations"]);
+      await config.configureProfile("sage", { soul: "# new", role: "leader", reports: ["scout"] });
+      expect(peer.requests.map((request) => request.input)).toEqual([{ soul: "# new" }]);
+      peer.ws.close();
+    });
+
+    // The whole HTTP route over a real attached runtime peer: the ordinary PATCH a phone sends.
+    describe("through PATCH /bots/:name/profile", () => {
+      async function appFor() {
+        const { plane, storage: planeStorage } = planeWith(config, { configureProfile: vi.fn() } as unknown as Partial<BotsSurface>);
+        const appStorage = openStorage(":memory:");
+        const app = createApp({
+          storage: appStorage,
+          config: { name: "g", port: 8787, dbPath: ":memory:", turnTimeoutSeconds: 0, hermesEndpoints: [{ id: "default", ...testHermes() }] },
+          bots: plane.surface(),
+          gatewayInfo: { name: "g", version: "0.1.0", contract: "v1", capabilities: { "com.cozylabs.bots": 89 } },
+          presenceOf: () => "online",
+          submitUserMessage: () => { throw new Error("unused"); },
+          interruptThread: () => "idle",
+          resolveApproval: () => Promise.resolve("unknown" as const),
+          onDeviceRevoked: () => {},
+          now: () => 1_000,
+        });
+        const pair = async (kind?: "observer") => {
+          const code = newSetupCode();
+          appStorage.createSetupCode(code, 1_000 + SETUP_CODE_TTL_MS, kind ?? "device");
+          const res = await app.request("/pair", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ setupCode: code, deviceName: kind ?? "phone", ...(kind === undefined ? {} : { kind }) }),
+          });
+          return ((await res.json()) as { deviceToken: string }).deviceToken;
+        };
+        const [phone, observer] = [await pair(), await pair("observer")];
+        const send = (token: string, body: unknown) => app.request("/bots/sage/profile", {
+          method: "PATCH",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify(body),
+        });
+        const close = () => { plane.close(); planeStorage.close(); appStorage.close(); };
+        return { phone, observer, send, close };
+      }
+      const written = { name: "sage", outcome: "applied", ok: true, applied: { mcp_servers_declared: true }, requested: ["declareMcpServers"] };
+
+      it("409s a runtime bot whose peer never offered mcp_server_declarations, sending it nothing", async () => {
+        const peer = await dial({ "profile.write": written });
+        const route = await appFor();
+        const res = await route.send(route.phone, { declareMcpServers: [home] });
+        expect(res.status).toBe(409);
+        expect(await res.json()).toMatchObject({ error: { code: "unsupported_for_runtime" }, runtime: "cozyagents" });
+        expect(peer.requests).toEqual([]);
+        route.close();
+        peer.ws.close();
+      });
+
+      it("forwards to a peer that offered it, and only the published keys", async () => {
+        const peer = await dial({ "profile.write": written }, ["bot_config", "mcp_server_declarations"]);
+        const route = await appFor();
+        const res = await route.send(route.phone, { declareMcpServers: [home], mcpServers: { evil: { command: "sh" } } });
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual(written);
+        expect(peer.requests.map((request) => request.input)).toEqual([{ declareMcpServers: [home] }]);
+        route.close();
+        peer.ws.close();
+      });
+
+      it("403s a read-scoped observer device before anything is parsed or sent", async () => {
+        const peer = await dial({ "profile.write": written }, ["bot_config", "mcp_server_declarations"]);
+        const route = await appFor();
+        const res = await route.send(route.observer, { declareMcpServers: [home] });
+        expect(res.status).toBe(403);
+        expect(await res.json()).toMatchObject({ error: { code: "scope_read_only" } });
+        expect(peer.requests).toEqual([]);
+        route.close();
+        peer.ws.close();
+      });
+
+      it("400s a loopback or metadata url before the peer is asked", async () => {
+        const peer = await dial({ "profile.write": written }, ["bot_config", "mcp_server_declarations"]);
+        const route = await appFor();
+        for (const url of ["http://127.0.0.1:8123/mcp", "http://169.254.169.254/latest", "http://[::1]/mcp", "http://localhost/mcp"]) {
+          const res = await route.send(route.phone, { declareMcpServers: [{ ...home, url }] });
+          expect(res.status, url).toBe(400);
+          expect(await res.json()).toMatchObject({ error: { code: "invalid_request" } });
+        }
+        expect(peer.requests).toEqual([]);
+        route.close();
+        peer.ws.close();
+      });
+    });
+
+    it("carries a client declaration back on its server row, read-only", async () => {
+      const row = { name: "home", installed: true, enabled: false, declaration: home };
+      const peer = await dial({ "profile.read": { ...profile, mcpServers: [row, { name: "github", installed: true, enabled: true }] } });
+      const read = await config.botProfile("sage");
+      expect(read.mcpServers).toEqual([row, { name: "github", installed: true, enabled: true }]);
+      peer.ws.close();
+    });
+
+    // A peer that projects a stdio shape as a client declaration is refused whole, the lane's
+    // convention: a client never receives a `command` in the position it renders as editable.
+    it("refuses a projected declaration that carries a command: the frame is invalid", async () => {
+      const quick = new AttachConfigSurface(ingress, 200);
+      const peer = await dial({
+        "profile.read": {
+          ...profile,
+          mcpServers: [{ name: "home", installed: true, enabled: false, declaration: { ...home, command: "npx" } }],
+        },
+      });
+      const closed = once(peer.ws, "close");
+      await expect(quick.botProfile("sage")).rejects.toBeInstanceOf(BackendUnavailable);
+      const [code] = (await closed) as [number, Buffer];
+      expect(code).toBe(1008);
+      quick.close();
+    });
+  });
+
+  it("rejects per status rather than collapsing every refusal into one failure", async () => {
+    const peer = await dial({ "profile.read": profile });
+    await expect(config.routines("sage")).rejects.toBeInstanceOf(BackendUnavailable);
+    await expect(config.deleteRoutine("sage", "job-9")).rejects.toBeInstanceOf(RoutineNotFound);
+    peer.ws.close();
+  });
+
+  // The bot is on the roster and its chat lane works, so "nothing is stored here" cannot be told
+  // as "this bot is unreachable": that is a retry a client would offer forever.
+  it("separates an empty profile from an offline peer", async () => {
+    const sent: AttachV1ConfigRequest[] = [];
+    const surface = new AttachConfigSurface({
+      sendConfigRequest: (_agent, request) => { sent.push(request); return "sent" as const; },
+    });
+    const pending = surface.botProfile("sage");
+    surface.handle("sage", { kind: "config_result", requestId: sent[0]!.requestId, status: "not_found" });
+    // `BotNotFound` is the class the bots routes answer 404 `not_found` on.
+    await expect(pending).rejects.toBeInstanceOf(ConfigNotFound);
+    await expect(pending).rejects.toBeInstanceOf(BotNotFound);
+    await expect(pending).rejects.toThrow('bot "sage" has no stored profile');
+    surface.close();
+  });
+
+  it("separates an empty model config from an offline peer", async () => {
+    const sent: AttachV1ConfigRequest[] = [];
+    const surface = new AttachConfigSurface({
+      sendConfigRequest: (_agent, request) => { sent.push(request); return "sent" as const; },
+    });
+    const pending = surface.modelConfig("sage");
+    surface.handle("sage", { kind: "config_result", requestId: sent[0]!.requestId, status: "not_found" });
+    await expect(pending).rejects.toBeInstanceOf(ConfigNotFound);
+    await expect(pending).rejects.toThrow('bot "sage" has no stored model config');
+    surface.close();
+  });
+
+  // A write, a list, and a create have no "nothing stored" answer to give: the peer failing one of
+  // those is a backend failure, and a 404 there would tell a client the bot went away.
+  it("keeps a refused write and a refused list on backend_unavailable", async () => {
+    const sent: AttachV1ConfigRequest[] = [];
+    const surface = new AttachConfigSurface({
+      sendConfigRequest: (_agent, request) => { sent.push(request); return "sent" as const; },
+    });
+    const write = surface.configureProfile("sage", { soul: "# new" });
+    surface.handle("sage", { kind: "config_result", requestId: sent[0]!.requestId, status: "not_found" });
+    await expect(write).rejects.toBeInstanceOf(BackendUnavailable);
+    const list = surface.routines("sage");
+    surface.handle("sage", { kind: "config_result", requestId: sent[1]!.requestId, status: "not_found" });
+    await expect(list).rejects.toBeInstanceOf(BackendUnavailable);
+    surface.close();
+  });
+
+  it("reports a refused write as invalid input in the peer's own words", async () => {
+    const sent: AttachV1ConfigRequest[] = [];
+    const surface = new AttachConfigSurface({
+      sendConfigRequest: (_agent, request) => { sent.push(request); return "sent" as const; },
+    });
+    const pending = surface.createRoutine("sage", { title: "t", schedule: "nonsense", prompt: "p" });
+    surface.handle("sage", {
+      kind: "config_result", requestId: sent[0]!.requestId, status: "invalid_request",
+      message: "schedule \"nonsense\" is not a schedule this runtime can keep",
+    });
+    await expect(pending).rejects.toBeInstanceOf(ConfigInvalidRequest);
+    await expect(pending).rejects.toThrow("is not a schedule this runtime can keep");
+    surface.close();
+  });
+
+  it("maps a silent peer to unavailable instead of waiting forever", async () => {
+    const surface = new AttachConfigSurface({ sendConfigRequest: () => "sent" }, 1);
+    await expect(surface.botProfile("sage")).rejects.toThrow("bot config reply timed out");
+    surface.close();
+  });
+
+  it("separates a peer that never negotiated bot_config from one that is offline", async () => {
+    const notNegotiated = new AttachConfigSurface({ sendConfigRequest: () => "capability_not_negotiated" });
+    await expect(notNegotiated.botProfile("sage")).rejects.toBeInstanceOf(ConfigNotNegotiated);
+    const offline = new AttachConfigSurface({ sendConfigRequest: () => "not_attached" });
+    await expect(offline.botProfile("sage")).rejects.toBeInstanceOf(BackendUnavailable);
+    notNegotiated.close();
+    offline.close();
+  });
+
+  it("spends a bounded budget so a looping client is stopped at the gateway", async () => {
+    let now = 0;
+    const surface = new AttachConfigSurface(
+      { sendConfigRequest: () => "sent" },
+      12_000,
+      undefined,
+      { rateLimiter: createConfigRateLimiter({ capacity: 1, refillMs: 1_000 }), now: () => now },
+    );
+    void surface.botProfile("sage").catch(() => undefined);
+    await expect(surface.botProfile("sage")).rejects.toThrow("too many bot config requests");
+    now = 1_000;
+    void surface.botProfile("sage").catch(() => undefined);
+    surface.close();
+  });
+
+  it("drops a reply for a request another profile made", async () => {
+    const sent: AttachV1ConfigRequest[] = [];
+    const surface = new AttachConfigSurface({
+      sendConfigRequest: (_agent, request) => { sent.push(request); return "sent" as const; },
+    });
+    const pending = surface.botProfile("sage");
+    const frame = { kind: "config_result" as const, requestId: sent[0]!.requestId, status: "ok" as const, result: profile };
+    expect(surface.handle("cleo", frame)).toBe(false);
+    expect(surface.handle("sage", frame)).toBe(true);
+    await expect(pending).resolves.toEqual(profile);
+    expect(surface.handle("sage", frame)).toBe(false);
+    surface.close();
+  });
+
+  it("refuses a reply whose shape does not answer the operation that was asked", async () => {
+    const sent: AttachV1ConfigRequest[] = [];
+    const surface = new AttachConfigSurface({
+      sendConfigRequest: (_agent, request) => { sent.push(request); return "sent" as const; },
+    });
+    const pending = surface.modelConfig("sage");
+    expect(surface.handle("sage", {
+      kind: "config_result", requestId: sent[0]!.requestId, status: "ok", result: profile,
+    })).toBe(true);
+    await expect(pending).rejects.toThrow("bot config returned an invalid reply");
+    surface.close();
+  });
+});
+
+describe("native runtime bot config routing", () => {
+  it("routes the Dashboard-backed config surfaces to the peer for a runtime bot", async () => {
+    const botProfile = vi.fn();
+    const routines = vi.fn();
+    const surface = {
+      botProfile: vi.fn(async () => profile),
+      routines: vi.fn(async () => ({ name: "sage", routines: [routine], updatedAt: 5 })),
+      configureProfile: vi.fn(),
+      modelConfig: vi.fn(),
+      configureModel: vi.fn(),
+      createRoutine: vi.fn(),
+      patchRoutine: vi.fn(),
+      deleteRoutine: vi.fn(),
+      runRoutine: vi.fn(),
+    };
+    const { plane, storage } = planeWith(surface as unknown as ConfigSurface, { botProfile, routines } as unknown as Partial<BotsSurface>);
+
+    await expect(plane.surface().botProfile("SAGE")).resolves.toEqual(profile);
+    await expect(plane.surface().routines("sage")).resolves.toMatchObject({ routines: [routine] });
+    expect(surface.botProfile).toHaveBeenCalledWith("sage");
+    expect(botProfile).not.toHaveBeenCalled();
+    expect(routines).not.toHaveBeenCalled();
+
+    plane.close();
+    storage.close();
+  });
+
+  it("exposes runtime provider catalogs while retaining unsupported delete and desktop transcripts", async () => {
+    const surface = { botProfile: vi.fn(async () => profile), modelConfig: vi.fn(async () => modelConfig) };
+    const { plane, storage } = planeWith(surface as unknown as ConfigSurface, {
+      deleteBot: vi.fn(), modelProviders: vi.fn(), desktopSessionTranscript: vi.fn(),
+    } as Partial<BotsSurface>);
+
+    await expect(plane.surface().deleteBot("sage")).rejects.toBeInstanceOf(UnsupportedForRuntime);
+    await expect(plane.surface().modelProviders("sage")).resolves.toMatchObject({ providers: expect.any(Array) });
+    await expect(plane.surface().desktopSessionTranscript("sage", "x")).rejects.toMatchObject({
+      feature: "desktopSessionTranscript",
+    });
+
+    plane.close();
+    storage.close();
+  });
+
+  it("still answers 409 when the peer never negotiated bot_config", async () => {
+    const surface = {
+      botProfile: vi.fn(async () => {
+        throw new ConfigNotNegotiated("sage");
+      }),
+    };
+    const { plane, storage } = planeWith(surface as unknown as ConfigSurface, { botProfile: vi.fn() } as unknown as Partial<BotsSurface>);
+
+    await expect(plane.surface().botProfile("sage")).rejects.toBeInstanceOf(UnsupportedForRuntime);
+    await expect(plane.surface().botProfile("sage")).rejects.toMatchObject({
+      feature: "botProfile", runtime: "cozyagents",
+    });
+
+    plane.close();
+    storage.close();
+  });
+
+  it("keeps the 409 for every config surface when no config lane is wired at all", async () => {
+    const { plane, storage } = planeWith(undefined, { botProfile: vi.fn(), routines: vi.fn() } as Partial<BotsSurface>);
+    await expect(plane.surface().botProfile("sage")).rejects.toBeInstanceOf(UnsupportedForRuntime);
+    await expect(plane.surface().routines("sage")).rejects.toBeInstanceOf(UnsupportedForRuntime);
+    plane.close();
+    storage.close();
+  });
+});
+
+async function until(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) throw new Error("timeout");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}

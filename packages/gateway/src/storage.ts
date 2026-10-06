@@ -1,0 +1,7204 @@
+import { Artifacts } from "./artifacts.ts";
+import { ObserveStore } from "./observe/store.ts";
+import { Tasks } from "./tasks.ts";
+import { deriveAssignmentState, frozenOnDelete } from "./assignment-state.ts";
+import { CachedDatabaseSync } from "./sqlite.ts";
+import type { DatabaseSync } from "node:sqlite";
+import { createHash, randomUUID } from "node:crypto";
+
+import {
+  MOBILE_REQUEST_STATES,
+  MOBILE_REQUEST_TERMINAL_STATES,
+} from "cozygateway-contract";
+import type {
+  AssignmentResult,
+  AssignmentState,
+  AttachmentBlock,
+  BotChatAttachment,
+  DeviceKind,
+  DeviceScope,
+  BotChatMessage,
+  BotMessageReaction,
+  BotMobileReceipt,
+  BotComposerDraft,
+  BotMobilePreferredDevice,
+  BotMobileRequest,
+  MobileRequestState,
+  BotApprovalRepair,
+  BotApprovalGrant,
+  BotApprovalScope,
+  BotGroupPendingInteraction,
+  BotInteractionSettlement,
+  BotPendingClarification,
+  BotSummary,
+  BotProfilePatch,
+  ChatModelSelection,
+  ChatWorkspaceSelection,
+  Message,
+  MessageRole,
+  RichBlock,
+  CozyAppTree,
+  CozyAppActionReceipt,
+  CozyAppDashboard,
+  CozyAppData,
+  CozyAppDocument,
+  CozyAppValue,
+  CozyAppValueLiteral,
+  CozyAppValueType,
+  GatewayMaintenanceAction,
+  GatewayMaintenanceNextAction,
+  GatewayMaintenanceOperation,
+  GatewayMaintenanceOperationStatus,
+  GatewayMaintenanceStep,
+  GatewayMaintenanceVersions,
+} from "cozygateway-contract";
+import {
+  COZYAPP_DASHBOARD_OWNER,
+  COZYAPP_MAX_VALUES,
+  cozyAppReceiptStatus,
+  cozyAppValueOfType,
+} from "cozygateway-contract";
+import type {
+  AttachV1Command,
+  AttachV1CommandFrame,
+  AttachV1DiscardReason,
+  AttachV1EventFrame,
+  AttachV1MediaDescriptor,
+  AttachV1Telemetry,
+} from "./adapters/attach/protocol-v1.ts";
+
+export type AttachEventAdmission =
+  | { status: "accepted" | "duplicate" | "ignored_terminal" | "ignored_delivery"; acknowledgedSequence: number }
+  | { status: "discarded"; acknowledgedSequence: number; reason: AttachV1DiscardReason }
+  | { status: "gap"; expectedSequence: number; receivedSequence: number }
+  | { status: "conflict"; acknowledgedSequence: number };
+
+/** Result of atomically recording a device decision and enqueueing its attach command. This is
+ * deliberately internal: only the bot plane derives the outward REST/frame state. */
+export type NativeInteractionResolutionRequest =
+  | {
+      outcome: "requested" | "already_requested" | "resolution_pending";
+      sessionId: string;
+      turnId: string;
+      fresh: boolean;
+    }
+  | { outcome: "expired"; sessionId: string; turnId: string }
+  | { outcome: "unknown" | "not_pending" };
+
+/** Capability 60's single authoritative deletion boundary.  A caller gets no partial success:
+ * the transcript is gone exactly when the replay-safe local-index tombstone is durable. */
+export type NativeSessionDeletion =
+  | { outcome: "deleted"; deletedAt: number; sessionSha: string }
+  | { outcome: "not_found" | "foreign" | "current" | "active" };
+
+export type NativeChatConfigurationUpdate =
+  | { outcome: "updated"; workspace: ChatWorkspaceSelection | null; model: ChatModelSelection | null }
+  | { outcome: "stale_session" | "workspace_locked" | "turn_active" | "not_found" };
+
+/** One immutable assignment of a local Bot Chat session to a concrete execution peer. The
+ * transport credential is gateway-private and never appears in an app or attach event payload. */
+export interface ChatExecutionRow {
+  executionId: string;
+  bot: string;
+  sessionId: string;
+  runnerId: string;
+  token: string;
+  operationId: string;
+  workspace: ChatWorkspaceSelection;
+  model?: ChatModelSelection | null;
+  sourceProfile?: BotProfilePatch;
+  launchModel?: { provider?: string; endpoint?: string; id: string };
+  harness?: "cozyagents" | "hermes";
+  stage: "starting" | "ready" | "deleted" | "failed";
+  createdAt: number;
+}
+
+/** A profile this gateway just created whose attach/blank-slate seed was interrupted.  This is
+ * deliberately not a general work queue: it holds only the caller's original tool selection so
+ * the bridge can finish the one idempotent profile write after a transient Hermes failure. */
+export interface PendingHermesProfileSeedRow {
+  profile: string;
+  selection: { toolsets?: readonly string[]; mcpServers?: readonly string[] };
+  attempts: number;
+  nextAttemptAt: number;
+  /** False for a clone, a duplicate or an import: the seed must not blank the skills it brought.
+   *  Absent reads as true, which is every row written before capability 82. */
+  blankSlate?: boolean;
+}
+
+/** Terminal receipts are reconnect aids, not permanent interaction history. Pending rows are
+ * never pruned; retain only the newest bounded terminal proof per profile. */
+const NATIVE_INTERACTION_SETTLEMENT_LIMIT = 100;
+
+/** Physical library identity: bots may reuse friendly logical ids without taking each other's app.
+ * Both hashes are deterministic, and the bounded readable middle keeps diagnostics useful. */
+export function cozyAppPhysicalId(creatorBot: string, logicalId: string): string {
+  const digest = (value: string, length: number) => createHash("sha256").update(value).digest("hex").slice(0, length);
+  const prefix = `app_${digest(creatorBot, 12)}_`;
+  // An action prompt may hand the bot its physical id; keep that update idempotent instead of
+  // nesting a namespace on every refresh. A different creator's prefix never passes this check.
+  if (logicalId.startsWith(prefix)) return logicalId;
+  return `${prefix}${logicalId.slice(0, 102)}_${digest(logicalId, 8)}`;
+}
+
+/** How long a SETTLED lifecycle record is kept. Documented in contract/ext-bots-v1.md row 68. */
+const MOBILE_REQUEST_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+/** Capability 71. An abandoned composer must not hold a person's words forever. */
+const COMPOSER_DRAFT_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+/** Completed tool detail expires after a week; compact summaries expire after two weeks. */
+export const BOT_CHAT_TOOL_DETAIL_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+export const BOT_CHAT_TOOL_SUMMARY_RETENTION_MS = 14 * 24 * 60 * 60 * 1_000;
+const BOT_CHAT_TOOL_DETAIL_COMPACTION_BATCH = 256;
+const ATTACH_PAYLOAD_RETENTION_MS = 14 * 24 * 60 * 60 * 1_000;
+const ATTACH_PAYLOAD_COMPACTION_BATCH = 256;
+const ATTACH_PAYLOAD_COMPACTION_MAX_BYTES = 4 * 1024 * 1024;
+const ATTACH_PAYLOAD_COMPACTION_FIELDS = {
+  draft: ["$.event.blocks", "$.event.replace"],
+  thinking: ["$.event.text", "$.event.seq", "$.event.lastActiveAt"],
+  tool: ["$.event.callId", "$.event.name", "$.event.status", "$.event.role", "$.event.detail"],
+  commit: ["$.event.blocks", "$.event.mediaPositions"],
+  scheduled: ["$.event.blocks", "$.event.mediaPositions"],
+  failed: ["$.event.message", "$.event.reason"],
+  delegation: ["$.event.index", "$.event.label", "$.event.aliasId", "$.event.currentTool", "$.event.apiCalls", "$.event.toolCount", "$.event.costUsd", "$.event.costStatus", "$.event.schemaValidation", "$.event.durationMs", "$.event.lastActiveAt"],
+  media: ["$.event.media"],
+  desktop_session_message: ["$.event.text"],
+  cozyapp_upsert: ["$.event.name", "$.event.tree"],
+  cozyapp_dashboard_upsert: ["$.event.documentVersion", "$.event.document", "$.event.data"],
+  cozyapp_action_receipt: ["$.event.data"],
+} as const;
+type AttachPayloadCompactionKind = keyof typeof ATTACH_PAYLOAD_COMPACTION_FIELDS;
+const ATTACH_PAYLOAD_COMPACTION_CANDIDATE = Object.entries(ATTACH_PAYLOAD_COMPACTION_FIELDS)
+  .map(([kind, fields]) => `(json_extract(frame_json, '$.event.kind') = '${kind}' AND (${fields.map((field) => `json_type(frame_json, '${field}') IS NOT NULL`).join(" OR ")}))`)
+  .join(" OR ");
+const MOBILE_REQUEST_TERMINAL_PLACEHOLDERS = MOBILE_REQUEST_TERMINAL_STATES.map(() => "?").join(", ");
+
+const BOT_MOBILE_REQUEST_SELECT = `
+  SELECT request_id AS requestId, bot, session_id AS sessionId, turn_id AS turnId,
+         device_id AS deviceId, command, purpose, state,
+         requested_at AS requestedAt, updated_at AS updatedAt, expires_at AS expiresAt
+  FROM bot_mobile_requests`;
+
+function mobileRequestRow(row: Omit<BotMobileRequest, "deviceId"> & { deviceId: string | null }): BotMobileRequest {
+  const { deviceId, ...rest } = row;
+  return deviceId === null ? rest : { ...rest, deviceId };
+}
+
+/** Lifecycle order. A step that does not move a request forward is dropped rather than applied,
+ *  so a late `routed` cannot un-execute a request and a replay cannot rewind one. */
+function isTerminalMobileRequestState(state: string): boolean {
+  return (MOBILE_REQUEST_TERMINAL_STATES as readonly string[]).includes(state);
+}
+
+function mobileRequestRank(state: MobileRequestState): number {
+  return isTerminalMobileRequestState(state) ? MOBILE_REQUEST_STATES.length : MOBILE_REQUEST_STATES.indexOf(state);
+}
+
+const BOT_MOBILE_RECEIPT_COLUMNS = `
+  request_id TEXT PRIMARY KEY,
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  command TEXT NOT NULL CHECK (command IN (
+    'device.status', 'location.current', 'camera.capture', 'file.pick', 'notification.present'
+  )),
+  shared_description TEXT NOT NULL CHECK (shared_description IN (
+    'Device status', 'Approximate location', 'Camera photo', 'Camera video',
+    'Selected photo', 'Selected file', 'Notification action'
+  )),
+  purpose TEXT NOT NULL,
+  shared_at INTEGER NOT NULL
+`;
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS devices (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL,
+  last_seen_at INTEGER,
+  -- Capability 72. No CHECK on either column ON PURPOSE, and the migration that adds them to an
+  -- existing database therefore produces the SAME schema rather than a weaker one: SQLite cannot
+  -- add a CHECK by ALTER TABLE, and rebuilding this table is not an option because two tables
+  -- reference devices(id) ON DELETE CASCADE, so a drop-and-rename would take their rows with it.
+  -- The constraint lives in the type system instead (StoredDeviceKind and DeviceScope), which is
+  -- the same choice setup_codes.kind already makes.
+  kind TEXT NOT NULL DEFAULT 'device',
+  scope TEXT NOT NULL DEFAULT 'write',
+  edge_rtt_ms INTEGER,
+  edge_colo TEXT
+) STRICT;
+CREATE TABLE IF NOT EXISTS setup_codes (
+  code TEXT PRIMARY KEY,
+  expires_at INTEGER NOT NULL,
+  used_at INTEGER,
+  kind TEXT
+) STRICT;
+CREATE TABLE IF NOT EXISTS runners (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  platform TEXT,
+  version TEXT,
+  backends TEXT,
+  is_default INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_seen_at INTEGER,
+  display_name TEXT
+) STRICT;
+-- A deletion fence survives stale bootstrap config and is cleared only by an explicit create.
+CREATE TABLE IF NOT EXISTS deleted_bots (
+  bot TEXT PRIMARY KEY, deleted_at INTEGER NOT NULL
+) STRICT;
+-- A name can be explicitly recreated, but the old attach credential must never authenticate
+-- again. Store only its fingerprint and canonical owner; restoreBot never clears this ledger.
+CREATE TABLE IF NOT EXISTS revoked_attach_credentials (
+  token_sha256 TEXT PRIMARY KEY,
+  bot TEXT NOT NULL,
+  revoked_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS agents (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  avatar TEXT,
+  backend TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS threads (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  title TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_message_at INTEGER,
+  archived_at INTEGER
+) STRICT;
+CREATE TABLE IF NOT EXISTS messages (
+  thread_id TEXT NOT NULL REFERENCES threads(id),
+  seq INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  blocks_json TEXT NOT NULL,
+  turn_id TEXT,
+  marker TEXT,
+  delivery TEXT,
+  external_id TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (thread_id, seq)
+) STRICT, WITHOUT ROWID;
+CREATE UNIQUE INDEX IF NOT EXISTS messages_external_id
+  ON messages (thread_id, external_id) WHERE external_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS push_registrations (
+  device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+  push_id TEXT NOT NULL,
+  relay_url TEXT NOT NULL,
+  push_key TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS live_activity_registrations (
+  device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  activity_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  bot TEXT NOT NULL,
+  push_id TEXT NOT NULL,
+  event_sequence INTEGER NOT NULL DEFAULT 0,
+  last_timestamp INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (device_id, activity_id)
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS live_activity_device_conversation
+  ON live_activity_registrations (device_id, conversation_id);
+CREATE TABLE IF NOT EXISTS live_activity_relay_deletion_outbox (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  push_id TEXT NOT NULL UNIQUE,
+  queued_at INTEGER NOT NULL
+) STRICT;
+-- Successful global skill mutations are retained for retry safety. The Hermes configs remain the
+-- source of truth; this is only the 24-hour request-id receipt the control plane needs.
+CREATE TABLE IF NOT EXISTS hermes_global_skill_requests (
+  request_id TEXT PRIMARY KEY,
+  result_json TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+) STRICT;
+-- Privileged host-maintenance requests use the paired device's request id as a durable 24-hour
+-- idempotency key. The response is intentionally only a receipt: no command, host path, or
+-- installer state ever crosses this boundary.
+CREATE TABLE IF NOT EXISTS gateway_maintenance_operations (
+  operation_id TEXT PRIMARY KEY,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  fingerprint TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('restart','update')),
+  step TEXT NOT NULL CHECK (step IN ('agents','gateway','postflight')),
+  status TEXT NOT NULL CHECK (status IN ('pending','running','succeeded','rolled_back','failed')),
+  prior_versions_json TEXT NOT NULL,
+  resulting_versions_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  failure_code TEXT,
+  message TEXT,
+  next_action TEXT NOT NULL CHECK (next_action IN ('wait','retry_update','run_repair','confirm_hermes_repair','use_hermes_repair'))
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS gateway_maintenance_one_active
+ON gateway_maintenance_operations ((1))
+WHERE status IN ('pending','running');
+-- Hermes Dashboard control-plane roster cache. Bot Mode conversations live in native attach-v1
+-- tables below.
+CREATE TABLE IF NOT EXISTS bot_roster (
+  name TEXT PRIMARY KEY,
+  summary_json TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
+-- A phone-created profile is not eligible for native provisioning until its idempotent
+-- blank-slate/attach-plugin seed has succeeded.  Retain just that intent across a gateway
+-- restart; credentials and arbitrary profile configuration remain Hermes-owned.
+CREATE TABLE IF NOT EXISTS pending_hermes_profile_seeds (
+  profile TEXT PRIMARY KEY,
+  selection_json TEXT NOT NULL,
+  attempts INTEGER NOT NULL CHECK (attempts >= 1),
+  next_attempt_at INTEGER NOT NULL,
+  blank_slate INTEGER NOT NULL DEFAULT 1
+) STRICT;
+-- Tool steps a bot's turn ran (contract/ext-bots-v1.md, capability 12). A CACHE of nothing: hermes
+-- keeps its tool lifecycle on a live event stream and replays none of it, so if these rows are not
+-- written here the activity exists for exactly as long as a socket stayed open, and the collapsed
+-- "what did it do" strip under a reply in history has nothing to expand.
+--
+-- Deliberately NOT keyed to a transcript row. A step belongs to a TURN, and the gateway cannot say
+-- which assistant row a turn produced without guessing (see the note on BotTurnToolSteps in
+-- ext-bots.ts). What it can say honestly is WHEN, so started_at is the join a client uses to
+-- place a turn's strip against the message timestamps it already has.
+--
+-- The name column is the only text here, and it is a tool identifier: never an argument, a command
+-- or a path. Nothing else from the hermes tool events is stored, for the same reason nothing else is
+-- broadcast: this table would otherwise become the durable copy of exactly the free text the wire
+-- refuses to carry.
+CREATE TABLE IF NOT EXISTS bot_chat_tool_steps (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  step_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  detail TEXT,
+  error_text TEXT,
+  PRIMARY KEY (bot, turn_id, step_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_chat_tool_steps_session
+  ON bot_chat_tool_steps (session_id, started_at);
+-- Hard deletion uses the same terminal proof but includes already-compacted summaries, so it
+-- needs a time-ordered candidate index separate from the detail-only partial index.
+CREATE INDEX IF NOT EXISTS bot_chat_tool_steps_terminal_retention
+  ON bot_chat_tool_steps (ended_at, bot, turn_id, step_id);
+-- A protected or orphaned historical row must not make every retention pass walk the same
+-- lifetime prefix. Each bounded pass resumes from its source index's ordered key.
+CREATE TABLE IF NOT EXISTS storage_retention_cursors (
+  pass TEXT PRIMARY KEY CHECK (pass IN ('delete', 'compact', 'attach_payload')),
+  at INTEGER NOT NULL,
+  key_1 TEXT NOT NULL,
+  key_2 TEXT NOT NULL,
+  key_3 TEXT NOT NULL
+) STRICT, WITHOUT ROWID;
+-- Capability 34 delegation children. Same shape of honesty as bot_chat_tool_steps: a child
+-- belongs to a TURN's batch, keyed by (batch, child) where child_id is the Hermes child session
+-- id that joins the spawn and finish legs of one delegation, and the only text here is the
+-- bounded display text the wire already carries (a truncated task label, a tool name) -- never
+-- a child transcript, summary, or path.
+CREATE TABLE IF NOT EXISTS bot_chat_delegations (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  batch_id TEXT NOT NULL,
+  child_id TEXT NOT NULL,
+  child_index INTEGER NOT NULL,
+  batch_count INTEGER NOT NULL,
+  alias_id TEXT,
+  label TEXT,
+  status TEXT NOT NULL,
+  current_tool TEXT,
+  api_calls INTEGER,
+  tool_count INTEGER,
+  cost_usd REAL CHECK (cost_usd IS NULL OR (cost_usd >= 0 AND cost_usd <= 1000000)),
+  cost_status TEXT CHECK (cost_status IN ('estimated', 'reported', 'unknown')),
+  schema_valid INTEGER CHECK (schema_valid IN (0, 1)),
+  schema_retries INTEGER CHECK (schema_retries BETWEEN 0 AND 1),
+  duration_ms INTEGER CHECK (duration_ms BETWEEN 0 AND 2147483647),
+  last_active_at INTEGER NOT NULL,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  PRIMARY KEY (bot, turn_id, batch_id, child_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_chat_delegations_session
+  ON bot_chat_delegations (session_id, started_at);
+-- Capability 18 routine model/effort selections. Hermes' surveyed cron RPC cannot persist or
+-- apply the pair to one run, so these are deliberately gateway-owned inert contract metadata.
+-- JSON preserves the difference between an omitted field and an explicit null (follow profile).
+CREATE TABLE IF NOT EXISTS bot_routine_overrides (
+  bot TEXT NOT NULL,
+  routine_id TEXT NOT NULL,
+  overrides_json TEXT NOT NULL,
+  PRIMARY KEY (bot, routine_id)
+) STRICT, WITHOUT ROWID;
+-- Group chat rooms. Unlike the three tables above these are NOT a cache: this gateway hosts the
+-- rooms (spec section 4), so the room, its transcript, each member's watermark and the epoch are
+-- the source of truth and must survive a restart. Only the "a round loop is running right now"
+-- flag is runtime state, and it is deliberately absent here: a process that died mid-round left no
+-- loop behind, so a restored room is settled until the user speaks again.
+--
+-- The key column is the lowercased room name (rooms are addressed case-insensitively and cannot
+-- collide on case); the name column is what the user typed and what renders. Both child tables
+-- cascade off the room, so DELETE /bots/groups/:name leaves nothing behind.
+CREATE TABLE IF NOT EXISTS bot_groups (
+  key TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  members_json TEXT NOT NULL,
+  -- F8b. NULL is a room written before ownership persistence. Federation derives and backfills it
+  -- once; new federated rooms write their host in the same create transaction as their membership.
+  owning_host TEXT,
+  created_at INTEGER NOT NULL,
+  epoch INTEGER NOT NULL,
+  needs_you INTEGER NOT NULL,
+  next_seq INTEGER NOT NULL
+) STRICT;
+-- Deleted rooms retain their owner while bot_group_turns retains late-event tombstones. There is
+-- no turn-pruning job today, so this table deliberately has none either.
+CREATE TABLE IF NOT EXISTS bot_group_owner_tombstones (
+  group_key TEXT PRIMARY KEY,
+  owning_host TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS bot_group_log (
+  group_key TEXT NOT NULL REFERENCES bot_groups(key) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  from_kind TEXT NOT NULL,
+  from_name TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  text TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  client_id TEXT,
+  -- Capability 47 provenance. Every column is nullable because a room that predates 47 has rows
+  -- with none of it, and an absent id is the honest answer for those rows.
+  message_id TEXT,
+  turn_id TEXT,
+  epoch INTEGER,
+  cause_kind TEXT,
+  cause_seq INTEGER,
+  attach_thread_id TEXT,
+  attach_turn_id TEXT,
+  PRIMARY KEY (group_key, seq)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS bot_group_members (
+  group_key TEXT NOT NULL REFERENCES bot_groups(key) ON DELETE CASCADE,
+  member TEXT NOT NULL,
+  watermark INTEGER NOT NULL,
+  session_id TEXT,
+  PRIMARY KEY (group_key, member)
+) STRICT, WITHOUT ROWID;
+-- A group turn is a durable hand-off to an attach-v1 profile.  It records the one member turn a
+-- serial room may have outstanding, so a restart can authenticate its eventual event and resume
+-- the room without consulting the Dashboard chat plane.
+CREATE TABLE IF NOT EXISTS bot_group_turns (
+  -- Intentionally no FK: a late terminal event after DELETE must still be acknowledged rather
+  -- than poison the profile's ordered inbox. The row is a harmless ownership tombstone then.
+  group_key TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  member TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  epoch INTEGER NOT NULL,
+  watermark INTEGER NOT NULL,
+  -- Capability 47. What the member was answering, recorded when the turn was HANDED OVER rather
+  -- than derived at settlement: by the time a reply lands the room may have moved on, and the
+  -- causation a reader wants is the one that was true when the member was asked.
+  cause_kind TEXT,
+  cause_seq INTEGER,
+  state TEXT NOT NULL,
+  text TEXT,
+  detail TEXT,
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  consumed_at INTEGER,
+  PRIMARY KEY (group_key, turn_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_group_turns_target ON bot_group_turns(agent_id, thread_id, turn_id);
+-- Capability 88. Gateway-owned team role. Hermes has no field for it and the gateway is what
+-- enforces it, so the gateway owns it.
+CREATE TABLE IF NOT EXISTS bot_team (
+  bot TEXT PRIMARY KEY,
+  role TEXT NOT NULL CHECK (role IN ('leader', 'member')),
+  reports_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
+-- agent-inbox 1. One assignment wraps one capability-64 Task and shares its id. The thread
+-- (assignment:<task_id>) is gateway-owned, which is what lets Tasks.admit find the assignee and
+-- the Task id when the turn is enqueued in the same transaction. The state is derived, never stored.
+CREATE TABLE IF NOT EXISTS bot_assignments (
+  task_id TEXT PRIMARY KEY,
+  leader TEXT NOT NULL,
+  assignee TEXT NOT NULL,
+  thread_id TEXT NOT NULL UNIQUE,
+  brief TEXT NOT NULL,
+  done_criteria TEXT NOT NULL,
+  output_format TEXT,
+  deadline_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  idempotency_key TEXT,
+  result_json TEXT,
+  final_text TEXT,
+  final_at INTEGER,
+  final_turn_id TEXT,
+  failure TEXT,
+  cancelled_by TEXT CHECK (cancelled_by IN ('leader', 'user')),
+  acknowledged_at INTEGER,
+  acknowledged_outcome TEXT CHECK (acknowledged_outcome IN ('completed', 'failed')),
+  -- The 24 h verifying window's lapse was announced (once, across restarts).
+  lapse_announced_at INTEGER,
+  -- A deleted party loses the row; a later bot of the same name never inherits it. The surviving
+  -- party keeps reading it, with the state it had when its Task went away frozen here.
+  leader_deleted_at INTEGER,
+  assignee_deleted_at INTEGER,
+  frozen_state TEXT
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS bot_assignments_idempotency ON bot_assignments(leader, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS bot_assignments_leader ON bot_assignments(leader, created_at);
+CREATE INDEX IF NOT EXISTS bot_assignments_assignee ON bot_assignments(assignee, created_at);
+-- attach-v1 is an at-least-once transport. Both journals are gateway-owned durability boundaries:
+-- commands survive until the plugin ACKs them, and events are ACKed only after the inbox commit.
+CREATE TABLE IF NOT EXISTS attach_streams (
+  agent_id TEXT PRIMARY KEY,
+  next_command_sequence INTEGER NOT NULL DEFAULT 1,
+  last_event_sequence INTEGER NOT NULL DEFAULT 0,
+  plugin_event_outbox_depth INTEGER,
+  plugin_oldest_event_age_ms INTEGER,
+  plugin_event_ack_cursor INTEGER,
+  plugin_last_ack_progress_at INTEGER,
+  plugin_command_inbox_depth INTEGER,
+  -- Capability 60: last positively negotiated receiver support survives an outage/restart.
+  session_deletion_capability INTEGER,
+  updated_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS attach_command_outbox (
+  agent_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  command_id TEXT NOT NULL,
+  command_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  acked_at INTEGER,
+  cancelled_at INTEGER,
+  cancel_reason TEXT,
+  PRIMARY KEY (agent_id, sequence),
+  UNIQUE (agent_id, command_id)
+) STRICT, WITHOUT ROWID;
+-- A turn can emit many progress events after later commands have been queued. Looking it up by
+-- decoding every newer command blocks the gateway's event loop; the journal stores only gateway
+-- JSON, and the valid-row predicate keeps a manually corrupted legacy row out of this index.
+CREATE INDEX IF NOT EXISTS attach_command_outbox_turn_lookup
+  ON attach_command_outbox (
+    agent_id,
+    json_extract(command_json, '$.kind'),
+    json_extract(command_json, '$.turnId'),
+    sequence DESC
+  )
+  WHERE cancelled_at IS NULL AND json_valid(command_json);
+CREATE TABLE IF NOT EXISTS attach_event_inbox (
+  agent_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  event_id TEXT NOT NULL,
+  frame_json TEXT NOT NULL,
+  received_at INTEGER NOT NULL,
+  disposition TEXT NOT NULL,
+  applied_at INTEGER,
+  projection_attempts INTEGER NOT NULL DEFAULT 0,
+  projection_error TEXT,
+  dead_lettered_at INTEGER,
+  PRIMARY KEY (agent_id, sequence),
+  UNIQUE (agent_id, event_id)
+) STRICT, WITHOUT ROWID;
+-- Projection only needs accepted rows that have not been applied or dead-lettered. The primary
+-- key is ordered by sequence, so without this partial index every new event walks the peer's full
+-- acknowledged history before reaching its one unapplied tail row.
+CREATE INDEX IF NOT EXISTS attach_event_inbox_unapplied
+  ON attach_event_inbox (agent_id, sequence)
+  WHERE disposition = 'accepted' AND applied_at IS NULL AND dead_lettered_at IS NULL;
+-- The ordered projection barrier asks for the earliest accepted dead letter independently of
+-- whether it was applied later. Keep that lookup off the full inbox too.
+CREATE INDEX IF NOT EXISTS attach_event_inbox_dead_letter_barrier
+  ON attach_event_inbox (agent_id, sequence)
+  WHERE disposition = 'accepted' AND dead_lettered_at IS NOT NULL;
+-- Global health needs only the newest durable ingress timestamp, not a scan of every tombstone.
+CREATE INDEX IF NOT EXISTS attach_event_inbox_received_at_desc
+  ON attach_event_inbox (received_at DESC);
+-- Historical attach rows retain their cursor and dedupe tombstone, but not their duplicate raw
+-- payload after the durable projection and retention window. This partial index finds only rows
+-- with a field the compactor can remove, rather than walking an agent's whole journal each pass.
+CREATE INDEX IF NOT EXISTS attach_event_inbox_payload_compaction
+  ON attach_event_inbox (applied_at, agent_id, sequence)
+  WHERE disposition = 'accepted' AND applied_at IS NOT NULL AND dead_lettered_at IS NULL
+    AND json_valid(frame_json) AND (${ATTACH_PAYLOAD_COMPACTION_CANDIDATE});
+CREATE TABLE IF NOT EXISTS attach_turn_terminals (
+  agent_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  terminal_kind TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  received_at INTEGER NOT NULL,
+  PRIMARY KEY (agent_id, turn_id)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS attach_media (
+  agent_id TEXT NOT NULL,
+  media_id TEXT NOT NULL,
+  descriptor_json TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  bytes BLOB NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER,
+  PRIMARY KEY (agent_id, media_id)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS attach_scheduled_deliveries (
+  agent_id TEXT NOT NULL,
+  delivery_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  projected_at INTEGER,
+  PRIMARY KEY (agent_id, delivery_id),
+  UNIQUE (agent_id, message_id),
+  UNIQUE (agent_id, event_id)
+) STRICT, WITHOUT ROWID;
+-- App-facing Bot Mode projection for profiles whose chat plane is attach-v1. Dashboard JSON-RPC
+-- remains management-only for these profiles; the transcript therefore has to be gateway-owned.
+CREATE TABLE IF NOT EXISTS bot_native_chats (
+  bot TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  -- Deprecated by issue #191: never read or written, and cleared to NULL at open. It stays only so
+  -- a rolled-back gateway (whose SQL still names it) can boot on this database; drop it in a later
+  -- release once no supported rollback target reads it.
+  active_turn_id TEXT,
+  updated_at INTEGER NOT NULL
+) STRICT;
+-- bot_native_chats is deliberately only the active-session pointer. A bot can have more than
+-- one local attach conversation, so the durable session rows live separately rather than being
+-- overwritten by reset/new-session actions. The session row's active_turn_id is the only copy of
+-- a native turn; the selected chat's turn is derived by joining this pointer to it.
+CREATE TABLE IF NOT EXISTS bot_native_sessions (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  active_turn_id TEXT,
+  PRIMARY KEY (bot, session_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_native_sessions_recent
+  ON bot_native_sessions (bot, updated_at DESC, created_at DESC);
+-- Per-session choices deliberately live beside the gateway-owned native sessions rather than on a
+-- bot/runtime row: changing one chat must never relocate or alter another chat.
+CREATE TABLE IF NOT EXISTS bot_chat_configurations (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  workspace_json TEXT,
+  model_json TEXT,
+  workspace_locked INTEGER NOT NULL CHECK (workspace_locked IN (0, 1)),
+  explicitly_configured INTEGER NOT NULL DEFAULT 0 CHECK (explicitly_configured IN (0, 1)),
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bot, session_id)
+) STRICT, WITHOUT ROWID;
+-- Written only after an executing adapter reports workspace preparation succeeded. New sessions
+-- copy this safe preference; merely selecting a workspace must not overwrite it.
+CREATE TABLE IF NOT EXISTS bot_chat_workspace_defaults (
+  bot TEXT PRIMARY KEY,
+  workspace_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
+-- A chat may be prepared more than once before its first accepted turn. Keep each immutable
+-- execution identity for audit/retry, while readers select the newest non-deleted assignment.
+CREATE TABLE IF NOT EXISTS chat_executions (
+  execution_id TEXT PRIMARY KEY,
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  runner_id TEXT NOT NULL,
+  token TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  workspace_json TEXT NOT NULL,
+  model_json TEXT,
+  source_profile_json TEXT,
+  launch_model_json TEXT,
+  harness TEXT NOT NULL DEFAULT 'cozyagents',
+  stage TEXT NOT NULL CHECK (stage IN ('starting', 'ready', 'deleted', 'failed')),
+  created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS chat_executions_session_recent
+  ON chat_executions (bot, session_id, created_at DESC, execution_id DESC);
+-- A separately source-qualified, explicitly adopted Hermes desktop session. The raw Hermes id is
+-- never substituted for its local session id: this row is the only durable bridge between the two
+-- namespaces, and remains pending until the plugin positively confirms switch_session().
+CREATE TABLE IF NOT EXISTS bot_desktop_resume_bindings (
+  bot TEXT NOT NULL,
+  hermes_session_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  resume_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'resumed')),
+  created_at INTEGER NOT NULL,
+  confirmed_at INTEGER,
+  PRIMARY KEY (bot, hermes_session_id),
+  UNIQUE (bot, session_id),
+  UNIQUE (bot, resume_id)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS bot_native_messages (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  message_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  text TEXT NOT NULL,
+  at INTEGER,
+  client_id TEXT,
+  attachments_json TEXT,
+  marker TEXT,
+  -- Capability 47 provenance, nullable for every row written before it.
+  turn_id TEXT,
+  author_bot TEXT,
+  in_reply_to_id TEXT,
+  PRIMARY KEY (bot, session_id, seq),
+  UNIQUE (bot, message_id)
+) STRICT, WITHOUT ROWID;
+-- Capability 86. Each bot's canonical Hermes "Bot Chat" registry id, durable so a restarted gateway
+-- still archives it on "Clear chat" and never lets a newer desktop session displace it.
+CREATE TABLE IF NOT EXISTS bot_canonical_chats (
+  bot TEXT PRIMARY KEY,
+  hermes_session_id TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+-- Capability 86. Tapback reactions: at most one per author per message (Hermes's own rule).
+CREATE TABLE IF NOT EXISTS bot_message_reactions (
+  bot TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  author TEXT NOT NULL,
+  emoji TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  PRIMARY KEY (bot, message_id, author)
+) STRICT, WITHOUT ROWID;
+-- Proof a HUMAN saw a row, which no other durable record in this gateway carries: a transcript row
+-- proves only that the gateway holds the message, and push is fire-and-forget. First write wins and
+-- rows are never deleted, so a receipt outlives the session selection that produced it.
+CREATE TABLE IF NOT EXISTS bot_message_receipts (
+  bot TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  displayed_at INTEGER NOT NULL,
+  device_id TEXT NOT NULL,
+  -- Dashboard packet D2, design section 11 ("Perceived by the person"). What the person actually
+  -- waited, from send tapped to first delta rendered, measured on the PHONE's own clock, plus the
+  -- network path the phone was on. Both are null for every receipt from a client that does not
+  -- report them, which is every client below capability 73 and any client that chooses not to.
+  -- They are stored beside the receipt rather than only folded into the ring so a receipt read
+  -- back later still says what it was, and they are never mixed into a gateway-measured hop.
+  felt_latency_ms INTEGER,
+  network_path TEXT,
+  vpn INTEGER,
+  edge_rtt_ms INTEGER,
+  edge_colo TEXT,
+  PRIMARY KEY (bot, message_id)
+) STRICT, WITHOUT ROWID;
+-- Capability 39 phone-sharing receipts. The request id is the idempotency key; the remaining
+-- columns are chat-visible metadata. Device identity, lease, and shared result are never stored.
+CREATE TABLE IF NOT EXISTS bot_mobile_receipts (
+${BOT_MOBILE_RECEIPT_COLUMNS}
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_mobile_receipts_session
+  ON bot_mobile_receipts (bot, session_id, shared_at, request_id);
+-- Capability 68 phone capability request lifecycle. One row per request, bound to the profile,
+-- the conversation, the turn and the ONE paired device it was issued for; the paired device is
+-- this gateway's user identity. The lease, the phone's answer, and anything the phone measured
+-- are not here, exactly as they are not on a receipt.
+CREATE TABLE IF NOT EXISTS bot_mobile_requests (
+  request_id TEXT PRIMARY KEY,
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  device_id TEXT,
+  command TEXT NOT NULL CHECK (command IN (
+    'device.status', 'location.current', 'camera.capture', 'file.pick', 'notification.present'
+  )),
+  purpose TEXT NOT NULL,
+  state TEXT NOT NULL,
+  requested_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_mobile_requests_session
+  ON bot_mobile_requests (bot, session_id, requested_at, request_id);
+-- Capability 70 the phone this conversation's capability requests should go to. One row per
+-- profile and conversation; the device id is checked against the paired devices on the way in, so
+-- a stored choice always names a device this gateway knows. Read only at admission.
+CREATE TABLE IF NOT EXISTS bot_mobile_preferred_devices (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bot, session_id)
+) STRICT, WITHOUT ROWID;
+-- Capability 71 one composer draft per profile and conversation, belonging to the PERSON and not
+-- to any one of their phones, which is why there is no device column here at all. Only the newest
+-- text is kept: no history, no per-device copy, no merge.
+CREATE TABLE IF NOT EXISTS bot_composer_drafts (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bot, session_id)
+) STRICT, WITHOUT ROWID;
+-- Binds one committed TURN reply that carried attachments to the delivery id its plugin already
+-- keyed the media lifecycle under (turn:<turnId>). Scheduled deliveries have
+-- attach_scheduled_deliveries for this; a turn had nothing, which is why turn media could never
+-- move past 'journaled' no matter how many phones displayed it. First write wins, and the row
+-- outlives the session selection so a receipt arriving days later still finds its delivery.
+CREATE TABLE IF NOT EXISTS bot_turn_media_deliveries (
+  bot TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  delivery_id TEXT NOT NULL,
+  PRIMARY KEY (bot, message_id)
+) STRICT, WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS bot_native_interactions (
+  bot TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('approval', 'clarify')),
+  interaction_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  selected_option_id TEXT,
+  expires_at INTEGER,
+  resolution_command_id TEXT,
+  resolution_requested_at INTEGER,
+  requested_decision TEXT,
+  requested_option_id TEXT,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (bot, kind, interaction_id)
+) STRICT, WITHOUT ROWID;
+-- Capability 66. One standing approval a person left behind, and the ONLY thing a later invocation
+-- is consulted against. It is a policy record, never a stored payload: payload_hash is a digest,
+-- and no argument, command, or secret value is here to replay. A 'once' row covers exactly one
+-- payload on one task; a 'category' row covers any payload of one action on one resource until it
+-- expires or is revoked. expires_at is absolute and never extended, so an expired grant is dead
+-- whatever its scope says, and revoked_at takes a grant out of every consult immediately.
+CREATE TABLE IF NOT EXISTS bot_approval_grants (
+  bot TEXT NOT NULL,
+  grant_id TEXT NOT NULL,
+  scope TEXT NOT NULL CHECK (scope IN ('once', 'category')),
+  -- The device that decided, kept for the decision log and never put on the wire.
+  device_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT,
+  approval_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  category TEXT NOT NULL,
+  system TEXT NOT NULL,
+  resource TEXT NOT NULL,
+  payload_hash TEXT,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  revoked_at INTEGER,
+  -- A 'once' grant covers exactly one later ask: claiming it stamps this column in the same
+  -- transaction that returns it, so the ask after that asks a person again. NULL on a 'category'
+  -- grant, which is bounded by its expiry and by revocation instead.
+  used_at INTEGER,
+  PRIMARY KEY (bot, grant_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_approval_grants_target
+  ON bot_approval_grants (bot, session_id, action, system, resource);
+-- Gateway-originated terminal truth complements attach's terminal journal: the wall-clock bound
+-- can settle a durable queued turn before any plugin event exists.
+CREATE TABLE IF NOT EXISTS bot_native_turn_terminals (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  cause TEXT,
+  completed_at INTEGER NOT NULL,
+  PRIMARY KEY (bot, turn_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_native_turn_terminals_session
+  ON bot_native_turn_terminals (bot, session_id, completed_at DESC);
+CREATE INDEX IF NOT EXISTS bot_native_turn_terminals_completed_at_desc
+  ON bot_native_turn_terminals (completed_at DESC);
+-- Capability 69. A steer's words, kept from the moment the steer is dispatched until something
+-- proves they were heard: a frame from the peer on that turn, a rescued reply in that session, a
+-- promotion into a new durable turn, or a visible failed-delivery row. DURABLE, because the whole
+-- point is that a gateway restart between the steer and the seal must not drop what a person said.
+CREATE TABLE IF NOT EXISTS bot_native_pending_steers (
+  bot TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  media_ids_json TEXT,
+  context_json TEXT,
+  origin_device TEXT,
+  created_at INTEGER NOT NULL,
+  settled_at INTEGER,
+  PRIMARY KEY (bot, message_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS bot_native_pending_steers_open
+  ON bot_native_pending_steers (bot, session_id, turn_id, created_at);
+-- CozyApps are gateway-owned user library records. The tree is validated before every write;
+-- SQLite only owns durable identity, revision, and bot cleanup.
+CREATE TABLE IF NOT EXISTS cozy_apps (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  creator_bot TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  tree_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS cozy_apps_creator_bot ON cozy_apps (creator_bot, updated_at DESC);
+CREATE TABLE IF NOT EXISTS cozy_app_actions (
+  id TEXT PRIMARY KEY,
+  app_id TEXT NOT NULL REFERENCES cozy_apps(id) ON DELETE CASCADE,
+  creator_bot TEXT NOT NULL,
+  action_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL CHECK (status IN ('requested', 'delivered', 'completed', 'failed')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS cozy_app_actions_creator_bot ON cozy_app_actions (creator_bot, updated_at DESC);
+-- Capability row 67, com.cozylabs.cozyapps 2. One saved editable input value, keyed by app and
+-- value id, with its OWN revision independent of the app tree's. It is written by the user action
+-- and by nothing else: no attach frame reaches this table. The idempotency key stored here is the
+-- last key that wrote this row, so a retried tap replays its own result instead of writing twice.
+CREATE TABLE IF NOT EXISTS cozy_app_values (
+  app_id TEXT NOT NULL REFERENCES cozy_apps(id) ON DELETE CASCADE,
+  value_id TEXT NOT NULL,
+  type TEXT NOT NULL CHECK (type IN ('string', 'number', 'boolean', 'date', 'selection')),
+  -- A product field value, stored as its JSON literal. Never a nested object: the write path
+  -- refuses anything the declared type does not admit.
+  value_json TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  -- The key alone is a latch, not idempotency. This is a digest of the exact write the key stood
+  -- for: value id, the revision the writer observed, the declared type and the value. A repeat of
+  -- the key with a different write is a conflict rather than a silent replay of the old value.
+  request_hash TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (app_id, value_id)
+) STRICT, WITHOUT ROWID;
+-- The small versioned envelope. The gateway validates the document's structure and bounds before
+-- this row is written and never interprets it. The data column is the source-attributed snapshot and
+-- is only ever written by the creator bot over attach.
+CREATE TABLE IF NOT EXISTS cozy_app_dashboards (
+  app_id TEXT PRIMARY KEY REFERENCES cozy_apps(id) ON DELETE CASCADE,
+  owner TEXT NOT NULL,
+  creator_bot TEXT NOT NULL,
+  document_version INTEGER NOT NULL,
+  document_json TEXT NOT NULL,
+  data_json TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+) STRICT;
+-- Capability 49, retired here in 0.8.6 (ADR 0086). A CozyAgents runtime bot this gateway once
+-- created through "POST /bots {runtime}". Nothing writes a row any more, a config "bots" block is
+-- ignored at load, and a row left from before is never attached. The table stays so an older
+-- database opens unchanged. "token" was the minted attach credential: never logged or projected.
+CREATE TABLE IF NOT EXISTS runtime_bots (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  avatar TEXT,
+  token TEXT NOT NULL UNIQUE,
+  runtime TEXT NOT NULL CHECK (runtime IN ('cozyagents')),
+  spec_generation INTEGER NOT NULL CHECK (spec_generation >= 1),
+  created_at INTEGER NOT NULL,
+  -- Capability 54. Which paired runner runs this bot. Nullable and deliberately unconstrained by a
+  -- foreign key: a row written before 54 names nobody, and revoking a computer must leave the bots
+  -- that ran on it standing rather than cascade them away.
+  runner_id TEXT
+) STRICT;
+-- Capability 49. The durable lifecycle operations a CozyRunner reconciles, keyed by "operation_id"
+-- (ADR 0002). "stage" starts at "waiting_for_runner" and only ever moves under a runner receipt, so
+-- a gateway with no runner connected keeps an honest projection instead of inventing progress.
+-- "payload_json" carries the runtime spec MINUS the attach token, which is read from "runtime_bots"
+-- at send time so no secret is ever at rest in an operations row.
+CREATE TABLE IF NOT EXISTS runner_operations (
+  operation_id TEXT PRIMARY KEY,
+  bot TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('create_runtime', 'delete_runtime')),
+  spec_generation INTEGER NOT NULL CHECK (spec_generation >= 1),
+  payload_json TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  code TEXT,
+  observed_generation INTEGER,
+  last_contact_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  sent_at INTEGER,
+  -- Capability 54. Which runner this operation belongs to, so a create, a delete and a later
+  -- upgrade for one bot all reach one machine. Null is a row written before 54: it goes to the
+  -- account default rather than to whichever socket happened to be attached.
+  runner_id TEXT
+) STRICT;
+CREATE INDEX IF NOT EXISTS runner_operations_bot ON runner_operations (bot, created_at DESC);
+-- The observation ring (dashboard packet D2). Two capped tables holding what the gateway already
+-- measures once per turn, per heartbeat and per sweep and used to throw away. Written only when
+-- config observability.enabled is on, trimmed to observability.retentionDays by the nightly
+-- maintenance pass, and governed by one rule enforced in observe/store.ts rather than at the call
+-- sites: no message text, no transcript, no url, path, query or body, no token. Tool names, reason
+-- codes, hashes, counts and durations only, the same rule the guardrail audit log follows.
+--
+-- The series column carries its qualifier inline (device_rtt_ms|tunnel) because the row shape is four
+-- columns by design and a fifth label column would invite free text into exactly the place the
+-- privacy rule is hardest to police. Both qualifiers are closed enums.
+CREATE TABLE IF NOT EXISTS observe_series (
+  series TEXT NOT NULL,
+  -- The subject of the sample: a bot id, a device id, an agent id, or null for a gateway-wide one.
+  bot TEXT,
+  at INTEGER NOT NULL,
+  value REAL NOT NULL
+) STRICT;
+-- D3 reads one series for one subject over a 1h, 24h or 7d window, and this is that scan.
+CREATE INDEX IF NOT EXISTS observe_series_window ON observe_series (series, bot, at);
+-- The trim deletes by age across every series, which the index above cannot serve.
+CREATE INDEX IF NOT EXISTS observe_series_age ON observe_series (at);
+CREATE TABLE IF NOT EXISTS observe_events (
+  at INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  bot TEXT,
+  -- An id and only an id: a turn id, a grant id, a device id. Never a path or a name a person typed.
+  ref TEXT,
+  detail_json TEXT
+) STRICT;
+CREATE INDEX IF NOT EXISTS observe_events_window ON observe_events (kind, at);
+CREATE INDEX IF NOT EXISTS observe_events_age ON observe_events (at);
+-- This gateway's identity key. Every id in the ring is stored as a keyed hash rather than raw, so
+-- there is no string a caller can invent that lands in the bot or ref column, only a hash of one.
+-- Per gateway and durable: a bot hashes the same across restarts, so a chart survives one, and
+-- differently on somebody else's gateway, so two exports cannot be joined by guessing a name.
+CREATE TABLE IF NOT EXISTS observe_identity (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  key TEXT NOT NULL
+) STRICT;
+`;
+
+/** Capability 52. Which credential a setup code may mint. A code written before 52 has no kind
+ *  stored and reads as a device code. Capability 72 adds `observer`, a code that mints a device
+ *  token whose scope is `read`. */
+export type SetupCodeKind = "device" | "runner" | "observer";
+
+/** Capability 72. The kinds this table can hold, which is `DeviceKind` minus `runner`: runners
+ *  live in their own table, so widening this to the wire type would let `createDevice` be called
+ *  with a kind the devices table has no meaning for. */
+export type StoredDeviceKind = Exclude<DeviceKind, "runner">;
+
+const DEVICE_COLUMNS =
+  "id, name, created_at AS createdAt, last_seen_at AS lastSeenAt, kind, scope";
+
+const RUNNER_COLUMNS =
+  "id, name, platform, version, backends, is_default AS isDefault, created_at AS createdAt,"
+  + " last_seen_at AS lastSeenAt, display_name AS displayName";
+
+export interface DeviceRow {
+  id: string;
+  name: string;
+  createdAt: number;
+  lastSeenAt: number | null;
+  /** Capability 72. `observer` is a browser paired to watch and nothing else. A row written
+   *  before 72 reads as `device`, which is what every device paired before 72 was. This is
+   *  narrower than the wire's `DeviceKind`: a runner is never a row in this table. */
+  kind: StoredDeviceKind;
+  /** Capability 72. `write` for every device paired before 72, so no shipped credential is ever
+   *  silently downgraded by the migration that added this column. */
+  scope: DeviceScope;
+}
+/** Capability 52. One paired computer that runs bots. `platform`, `version` and `backends` are
+ *  what that runner last reported on its `hello`, so they are null or empty until it has connected
+ *  once: the gateway records what it was told and invents nothing. */
+export interface RunnerRow {
+  id: string;
+  /** What the runner itself reported on its last `hello` (or the name it was paired with, absent
+   *  a hello). Capability 55: this is no longer necessarily the name a client renders -- see
+   *  `displayName`. */
+  name: string;
+  platform: string | null;
+  version: string | null;
+  backends: readonly string[];
+  isDefault: boolean;
+  createdAt: number;
+  lastSeenAt: number | null;
+  /** Capability 55. The name a person set with `PATCH /runners/:id {name}`, null when nobody has.
+   *  It wins over `name` on the wire and survives whatever the runner reports next. */
+  displayName: string | null;
+}
+interface RunnerDbRow {
+  id: string;
+  name: string;
+  platform: string | null;
+  version: string | null;
+  backends: string | null;
+  isDefault: number;
+  createdAt: number;
+  lastSeenAt: number | null;
+  displayName: string | null;
+}
+function runnerRow(row: RunnerDbRow): RunnerRow {
+  let backends: string[] = [];
+  if (row.backends !== null) {
+    try {
+      const parsed: unknown = JSON.parse(row.backends);
+      if (Array.isArray(parsed)) backends = parsed.filter((item): item is string => typeof item === "string");
+    } catch {
+      backends = [];
+    }
+  }
+  return {
+    id: row.id,
+    name: row.name,
+    platform: row.platform,
+    version: row.version,
+    backends,
+    isDefault: row.isDefault === 1,
+    createdAt: row.createdAt,
+    lastSeenAt: row.lastSeenAt,
+    displayName: row.displayName,
+  };
+}
+export interface AgentRow {
+  id: string;
+  name: string;
+  avatar: string | null;
+  backend: string;
+}
+export interface ThreadRow {
+  id: string;
+  agentId: string;
+  title: string;
+  createdAt: number;
+  lastMessageAt: number | null;
+  archivedAt: number | null;
+}
+export interface PushRegistrationRow {
+  deviceId: string;
+  pushId: string;
+  relayUrl: string;
+  pushKey: string;
+}
+export interface LiveActivityRegistrationRow {
+  deviceId: string;
+  activityId: string;
+  runId: string;
+  conversationId: string;
+  bot: string;
+  pushId: string;
+  eventSequence: number;
+  lastTimestamp: number;
+  createdAt: number;
+}
+
+/** Capability 49. A Bot this gateway owns outright: created over `POST /bots`, served by a
+ *  CozyAgents peer, and stored here rather than in the config file so no restart is needed. */
+export interface RuntimeBotRow {
+  id: string;
+  name: string;
+  avatar: string | null;
+  /** The attach credential the gateway minted. A secret: never logged, never on a wire but the
+   *  runner command that has to inject it into the container. */
+  token: string;
+  runtime: "cozyagents";
+  specGeneration: number;
+  createdAt: number;
+  /** Capability 54. The paired runner this bot was placed on, or null for a bot created before 54
+   *  and for a config-declared one. Never backfilled: the gateway never knew it. */
+  runnerId: string | null;
+}
+
+/** What a create hands `insertRuntimeBot`. `runnerId` is optional so a caller with no roster (the
+ *  legacy shared credential, and every pre-54 test) writes the same row it always did. */
+export type RuntimeBotInsert = Omit<RuntimeBotRow, "runnerId"> & { runnerId?: string | null };
+
+export type RunnerOperationKind = "create_runtime" | "delete_runtime";
+
+/** The provisioning progression, in order. Only these stages are ordered against each other:
+ *  everything else a runner can receipt is a transition out of the progression rather than a step
+ *  along it, so it is always allowed to land. */
+const RUNNER_PROGRESSION: readonly string[] = [
+  "waiting_for_runner",
+  "waiting_for_capacity",
+  "pulling_image",
+  "creating",
+  "starting",
+  "ready",
+];
+
+/** Whether `next` would walk the recorded stage backwards along the provisioning progression. */
+export function regressesRunnerStage(current: string, next: string): boolean {
+  const from = RUNNER_PROGRESSION.indexOf(current);
+  const to = RUNNER_PROGRESSION.indexOf(next);
+  if (from === -1 || to === -1) return false;
+  return to < from;
+}
+
+/** One durable lifecycle operation plus the latest receipt a runner sent for it. */
+export interface RunnerOperationRow {
+  operationId: string;
+  bot: string;
+  kind: RunnerOperationKind;
+  specGeneration: number;
+  payload: Record<string, unknown>;
+  stage: string;
+  code: string | null;
+  observedGeneration: number | null;
+  lastContactAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+  sentAt: number | null;
+  /** Capability 54. The runner this operation is queued for, or null for a row written before 54,
+   *  which the lane hands to the account default. */
+  runnerId: string | null;
+}
+
+export interface BotRoutineOverrides {
+  model?: string | null;
+  effort?: string | null;
+}
+
+export interface NativeBotAttachmentHistoryItem {
+  bot: string;
+  sessionId: string;
+  messageId: string;
+  caption: string;
+  at: number | null;
+  attachment: AttachmentBlock;
+}
+
+/** A group room as it sits on disk. `epoch` and `needsYou` are live protocol state, not metadata:
+ *  the epoch supersedes in-flight rounds and `needsYou` is the escalation badge. */
+export interface BotGroupRow {
+  key: string;
+  name: string;
+  members: string[];
+  owningHost?: string;
+  createdAt: number;
+  epoch: number;
+  needsYou: boolean;
+  nextSeq: number;
+  /** Row 84 room state: per-thread marks, holds, held replay, picture, holdDetection. */
+  meta: BotGroupMeta;
+}
+
+/** Row 84. `marks` is thread -> member -> seq; `held` is member -> remembered seqs to replay. */
+export interface BotGroupMeta {
+  marks?: Record<string, Record<string, number>>;
+  holds?: Record<string, { at: number; seq?: number; thread?: string; noted?: boolean }>;
+  held?: Record<string, number[]>;
+  holdDetection?: boolean;
+  picture?: string;
+  /** Threads queued behind the live drive, so a restart still drives them. */
+  queue?: string[];
+}
+
+/** One transcript entry. `kind` is `user` for the human and `member` for a bot; `name` is the bot's
+ *  profile name (or the human's label) and `displayName` is what renders. */
+export interface BotGroupLogRow {
+  seq: number;
+  kind: "user" | "member";
+  name: string;
+  displayName: string;
+  text: string;
+  at: number;
+  clientId?: string;
+  /** Capability 47 provenance, absent on every row written before it. `messageId` is the row's own
+   *  durable id; the rest name the member turn that produced it and what that turn was answering. */
+  messageId?: string;
+  turnId?: string;
+  epoch?: number;
+  cause?: BotGroupCause;
+  attachTurn?: { threadId: string; turnId: string };
+  /** Row 84. The thread this entry belongs to; absent on legacy rows. */
+  threadId?: string;
+  /** Row 84. Mirrored from the member's own thread outside a room turn. */
+  external?: boolean;
+}
+
+/** The highest room seq a member had been shown when its turn started, and whose message that was.
+ *  Recorded on the turn row at hand-off and copied onto the reply it produces. */
+export interface BotGroupCause {
+  kind: "user" | "member";
+  seq: number;
+}
+
+/** Durable ownership and settlement of one attach-v1 member turn. `pending` is the only state a
+ * room may wait for; completed rows remain so at-least-once event replays stay authorized. */
+export interface BotGroupTurnRow {
+  key: string;
+  turnId: string;
+  member: string;
+  agentId: string;
+  threadId: string;
+  messageId: string;
+  epoch: number;
+  watermark: number;
+  /** Capability 47. Absent on a turn row written before it. */
+  cause?: BotGroupCause;
+  state: "pending" | "commit" | "failed" | "cancelled" | "interrupted" | "timeout";
+  text?: string;
+  detail?: string;
+  createdAt: number;
+  completedAt?: number;
+  consumedAt?: number;
+}
+
+/** Capability 88. A bot's team role; a bot with no row is a member with no reports. */
+export interface BotTeamRow {
+  bot: string;
+  role: "leader" | "member";
+  reports: string[];
+  updatedAt: number;
+}
+
+/** agent-inbox 1. The assignment's own facts beside the Task it wraps; `taskId` is that Task's id. */
+export interface BotAssignmentRow {
+  taskId: string;
+  leader: string;
+  assignee: string;
+  threadId: string;
+  brief: string;
+  doneCriteria: string;
+  outputFormat?: string;
+  deadlineAt: number;
+  createdAt: number;
+  updatedAt: number;
+  idempotencyKey?: string;
+  resultJson?: string;
+  finalText?: string;
+  finalAt?: number;
+  finalTurnId?: string;
+  failure?: string;
+  cancelledBy?: "leader" | "user";
+  acknowledgedAt?: number;
+  acknowledgedOutcome?: "completed" | "failed";
+  lapseAnnouncedAt?: number;
+  leaderDeletedAt?: number;
+  assigneeDeletedAt?: number;
+  frozenState?: AssignmentState;
+}
+export type BotAssignmentPatch = Partial<Pick<BotAssignmentRow, "resultJson" | "finalText" | "finalAt" | "finalTurnId" | "failure" | "cancelledBy" | "acknowledgedAt" | "acknowledgedOutcome" | "lapseAnnouncedAt" | "frozenState">> & { updatedAt: number };
+
+const BOT_ASSIGNMENT_SELECT = `SELECT task_id AS taskId, leader, assignee, thread_id AS threadId, brief,
+  done_criteria AS doneCriteria, output_format AS outputFormat, deadline_at AS deadlineAt,
+  created_at AS createdAt, updated_at AS updatedAt, idempotency_key AS idempotencyKey,
+  result_json AS resultJson, final_text AS finalText, final_at AS finalAt, final_turn_id AS finalTurnId,
+  failure, cancelled_by AS cancelledBy, acknowledged_at AS acknowledgedAt,
+  acknowledged_outcome AS acknowledgedOutcome, lapse_announced_at AS lapseAnnouncedAt,
+  leader_deleted_at AS leaderDeletedAt, assignee_deleted_at AS assigneeDeletedAt,
+  frozen_state AS frozenState FROM bot_assignments`;
+const BOT_ASSIGNMENT_COLUMNS: Record<keyof BotAssignmentPatch, string> = {
+  resultJson: "result_json", finalText: "final_text", finalAt: "final_at", finalTurnId: "final_turn_id",
+  failure: "failure", cancelledBy: "cancelled_by", acknowledgedAt: "acknowledged_at",
+  acknowledgedOutcome: "acknowledged_outcome", lapseAnnouncedAt: "lapse_announced_at",
+  frozenState: "frozen_state", updatedAt: "updated_at",
+};
+
+/** Optional columns become absent keys, never `null`. */
+function toBotAssignmentRow(row: Record<string, unknown>): BotAssignmentRow {
+  return Object.fromEntries(Object.entries(row).filter(([, value]) => value !== null)) as unknown as BotAssignmentRow;
+}
+
+/** Gateway-owned truth for an admitted scheduled delivery. `journaled` remains plugin-local and
+ * push remains deliberately absent: its fire-and-forget path cannot prove human visibility. */
+export interface AttachScheduledDeliveryReceipt {
+  deliveryId: string;
+  messageId: string;
+  target:
+    | { kind: "thread"; threadId: string }
+    | { kind: "canonical_home"; sessionId: string };
+  state: "admitted" | "projected" | "blocked";
+  admittedAt: number;
+  projectedAt?: number;
+  attempts?: number;
+  deadLetteredAt?: number;
+  /** Capability 31. When a paired device reported the projected row on screen. */
+  displayedAt?: number;
+  /** Present together only when the admitted scheduled event expected media. These are a bounded
+   * read-back of its requested IDs and the committed native row's actual attachment IDs. */
+  expectedMediaIds?: string[];
+  committedMediaIds?: string[];
+  /** True only when projection is durable and the committed native attachment IDs exactly match
+   * the expected IDs in order. Display and media upload are deliberately not substitutes. */
+  mediaVerified?: boolean;
+  /** The one terminal fact about this occurrence, once it has one. `state` above stays the
+   * projection-pipeline position it has always been, so an existing reader is untouched. */
+  terminal?: {
+    state: "displayed" | "failed";
+    stage?: "authorization" | "projection";
+    reason?: string;
+    at: number;
+  };
+}
+
+interface BotGroupDbRow {
+  key: string;
+  name: string;
+  membersJson: string;
+  owningHost: string | null;
+  createdAt: number;
+  epoch: number;
+  needsYou: number;
+  nextSeq: number;
+  metaJson: string | null;
+}
+
+function toBotGroupRow(row: BotGroupDbRow): BotGroupRow {
+  const parsed: unknown = JSON.parse(row.membersJson);
+  return {
+    key: row.key,
+    name: row.name,
+    members: Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [],
+    ...(row.owningHost === null ? {} : { owningHost: row.owningHost }),
+    createdAt: row.createdAt,
+    epoch: row.epoch,
+    needsYou: row.needsYou === 1,
+    nextSeq: row.nextSeq,
+    meta: parseGroupMeta(row.metaJson),
+  };
+}
+
+function parseGroupMeta(raw: string | null): BotGroupMeta {
+  if (raw === null) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as BotGroupMeta : {};
+  } catch {
+    return {};
+  }
+}
+
+function toBotGroupTurnRow(row: Record<string, unknown>): BotGroupTurnRow {
+  const state = row["state"];
+  if (state !== "pending" && state !== "commit" && state !== "failed" && state !== "cancelled" && state !== "interrupted" && state !== "timeout") {
+    throw new Error("invalid stored group turn state");
+  }
+  const optional = (key: "text" | "detail" | "completedAt" | "consumedAt"): string | number | undefined =>
+    row[key] === null || row[key] === undefined ? undefined : row[key] as string | number;
+  return {
+    key: String(row["key"]), turnId: String(row["turnId"]), member: String(row["member"]),
+    agentId: String(row["agentId"]), threadId: String(row["threadId"]), messageId: String(row["messageId"]),
+    epoch: Number(row["epoch"]), watermark: Number(row["watermark"]),
+    ...(row["causeKind"] === "user" || row["causeKind"] === "member"
+      ? { cause: { kind: row["causeKind"], seq: Number(row["causeSeq"]) } }
+      : {}),
+    state,
+    ...(typeof optional("text") === "string" ? { text: optional("text") as string } : {}),
+    ...(typeof optional("detail") === "string" ? { detail: optional("detail") as string } : {}),
+    createdAt: Number(row["createdAt"]),
+    ...(typeof optional("completedAt") === "number" ? { completedAt: optional("completedAt") as number } : {}),
+    ...(typeof optional("consumedAt") === "number" ? { consumedAt: optional("consumedAt") as number } : {}),
+  };
+}
+
+interface MessageDbRow {
+  threadId: string;
+  seq: number;
+  role: string;
+  blocksJson: string;
+  turnId: string | null;
+  marker: string | null;
+  delivery: string | null;
+  createdAt: number;
+}
+
+function toMessage(row: MessageDbRow): Message {
+  const message: Message = {
+    threadId: row.threadId,
+    seq: row.seq,
+    role: row.role as MessageRole,
+    blocks: JSON.parse(row.blocksJson) as RichBlock[],
+    createdAt: row.createdAt,
+  };
+  if (row.turnId !== null) message.turnId = row.turnId;
+  if (row.marker === "turn.failed" || row.marker === "turn.interrupted") message.marker = row.marker;
+  if (row.delivery === "turn" || row.delivery === "steer") message.delivery = row.delivery;
+  return message;
+}
+
+interface GatewayMaintenanceDbRow {
+  operationId: string;
+  idempotencyKey: string;
+  fingerprint: string;
+  action: string;
+  step: string;
+  status: string;
+  priorVersionsJson: string;
+  resultingVersionsJson: string;
+  createdAt: number;
+  updatedAt: number;
+  completedAt: number | null;
+  failureCode: string | null;
+  message: string | null;
+  nextAction: string;
+}
+
+function gatewayMaintenanceOperation(row: GatewayMaintenanceDbRow): GatewayMaintenanceOperation {
+  return {
+    operationId: row.operationId,
+    idempotencyKey: row.idempotencyKey,
+    action: row.action as GatewayMaintenanceAction,
+    step: row.step as GatewayMaintenanceStep,
+    status: row.status as GatewayMaintenanceOperationStatus,
+    priorVersions: JSON.parse(row.priorVersionsJson) as GatewayMaintenanceVersions,
+    resultingVersions: JSON.parse(row.resultingVersionsJson) as Partial<GatewayMaintenanceVersions>,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    ...(row.completedAt === null ? {} : { completedAt: row.completedAt }),
+    ...(row.failureCode === null ? {} : { failureCode: row.failureCode }),
+    ...(row.message === null ? {} : { message: row.message }),
+    nextAction: row.nextAction as GatewayMaintenanceNextAction,
+  };
+}
+
+const GATEWAY_MAINTENANCE_SELECT = `
+  SELECT operation_id AS operationId, idempotency_key AS idempotencyKey, fingerprint,
+    action, step, status, prior_versions_json AS priorVersionsJson,
+    resulting_versions_json AS resultingVersionsJson, created_at AS createdAt,
+    updated_at AS updatedAt, completed_at AS completedAt, failure_code AS failureCode,
+    message, next_action AS nextAction
+  FROM gateway_maintenance_operations`;
+
+export class GatewayMaintenanceOperationConflict extends Error {
+  readonly code: "stale_version" | "operation_in_progress";
+
+  constructor(code: GatewayMaintenanceOperationConflict["code"]) {
+    super(code);
+    this.name = "GatewayMaintenanceOperationConflict";
+    this.code = code;
+  }
+}
+
+/** Capability 66. The one bounded window both the revocation view and the consult read. A grant
+ *  outside it is invisible to a person, so it must be unable to decide anything: keeping the two
+ *  reads on one bound is what makes "every grant that can auto-approve is revocable" true. */
+const APPROVAL_GRANT_WINDOW = 100;
+/** The live-grant predicate, parameterised by `bot` then `now`. Revoked, spent and expired grants
+ *  are all dead, and dead grants are never listed and never consulted. */
+const LIVE_APPROVAL_GRANT =
+  "bot = ? AND revoked_at IS NULL AND used_at IS NULL AND expires_at > ?";
+
+export class Storage {
+  readonly #db: DatabaseSync;
+  readonly tasks: Tasks;
+  readonly artifacts: Artifacts;
+  /** Dashboard packet D2's observation ring. A namespace rather than methods on Storage because
+   *  it is a self-contained store with its own privacy rule, and that rule is easier to trust
+   *  when the only way to write a row is through the one class that enforces it. */
+  readonly observe: ObserveStore;
+
+  constructor(db: DatabaseSync) {
+    this.#db = db;
+    this.observe = new ObserveStore(db);
+    this.tasks = new Tasks(db);
+    this.tasks.expireInteractions((bot, kind, id, at) => { this.expireNativeInteractionIfDue(bot, kind, id, at); });
+    // Capability 65 is the canonical producer capability 64 left absent by default. Only explicit
+    // source-bound declarations and their real commitment status cross this join; no attachment,
+    // file id or delivery is ever read as commitment evidence.
+    this.artifacts = new Artifacts(db);
+    this.tasks.artifactReferences((source) => this.artifacts.taskReferences(source));
+    // The Task id is minted gateway-side and no attach-v1 frame carries it to a peer, so the
+    // gateway resolves the owning Task from the Run identity capability 64 already established.
+    this.artifacts.taskJoin((peer, runId) => this.tasks.taskOfRun(peer, runId));
+    this.artifacts.onIdentityReplaced((retired, surviving) => { this.tasks.artifactIdentityReplaced(retired, surviving); });
+    this.artifacts.onCommitment((taskId, runId, at) => { this.tasks.artifactsSettled(taskId, runId, at); });
+    // Upgrade recovery uses an acknowledged delete as its authority, never a missing config row.
+    for (const row of db.prepare("SELECT DISTINCT bot FROM runner_operations WHERE kind = 'delete_runtime' AND stage = 'deleted'").all() as { bot: string }[])
+      this.#pruneCompletedRuntimeCreates(row.bot);
+  }
+
+  /** Explicit deletion is the one authority that removes a retained original. The bytes go through
+   * the existing unreferenced-media rule, so an object still reachable as a durable attachment
+   * stays reachable and only the Artifact stops offering it. */
+  deleteArtifact(artifactId: string, at: number): "deleted" | "absent" {
+    const forgotten = this.artifacts.forget(artifactId, at);
+    if (forgotten.media !== undefined) this.deleteUnreferencedAttachMedia(forgotten.media.agentId, forgotten.media.mediaId);
+    return forgotten.outcome;
+  }
+
+  createSetupCode(code: string, expiresAt: number, kind: SetupCodeKind = "device"): void {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      // Pairing is an explicit, single-current-invitation flow. Minting a replacement revokes
+      // every older unredeemed code so repeated CLI calls cannot accumulate parallel credentials.
+      this.#db.prepare("DELETE FROM setup_codes").run();
+      this.#db
+        .prepare("INSERT INTO setup_codes (code, expires_at, kind) VALUES (?, ?, ?)")
+        .run(code, expiresAt, kind);
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /** Capability 52: a code carries the kind of credential it may mint. A row written before 52 has
+   *  a NULL kind and is a device code, which is what every code minted before 52 was. A code
+   *  presented for the wrong kind is `invalid`, the same answer an expired or unknown code gets, so
+   *  the two are indistinguishable from outside. */
+  consumeSetupCode(code: string, now: number, kind: SetupCodeKind = "device"): "ok" | "invalid" {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db.prepare("DELETE FROM setup_codes WHERE used_at IS NOT NULL OR expires_at < ?").run(now);
+      // Delete-to-consume is atomic and leaves no used credential residue behind.
+      const result = this.#db
+        .prepare(
+          "DELETE FROM setup_codes WHERE code = ? AND used_at IS NULL AND expires_at >= ?"
+            + " AND COALESCE(kind, 'device') = ?",
+        )
+        .run(code, now, kind);
+      this.#db.exec("COMMIT");
+      return result.changes === 1 ? "ok" : "invalid";
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /** Capability 72. `kind` and `scope` default to the pre-72 answer, so every existing caller
+   *  mints exactly the write-scoped device it minted before. */
+  createDevice(device: {
+    id: string;
+    name: string;
+    tokenHash: string;
+    createdAt: number;
+    kind?: StoredDeviceKind;
+    scope?: DeviceScope;
+  }): void {
+    this.#db
+      .prepare(
+        "INSERT INTO devices (id, name, token_hash, created_at, kind, scope) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        device.id,
+        device.name,
+        device.tokenHash,
+        device.createdAt,
+        device.kind ?? "device",
+        device.scope ?? "write",
+      );
+  }
+
+  /** Capability 72. Lets a test compare a freshly created devices table against one an in-place
+   *  migration produced, so the two schemas cannot silently drift apart. */
+  devicesTableInfoForTesting(): Array<{ name: string; type: string; notnull: number; dflt_value: unknown }> {
+    return (
+      this.#db.prepare("PRAGMA table_info(devices)").all() as unknown as Array<{
+        name: string; type: string; notnull: number; dflt_value: unknown;
+      }>
+    ).map((column) => ({
+      name: column.name, type: column.type, notnull: column.notnull, dflt_value: column.dflt_value,
+    }));
+  }
+
+  /** Capability 72. Writes a scope string the type system would never allow, so a test can prove
+   *  the scope check is fail-closed: a row a newer gateway wrote, read back by an older one that
+   *  has never heard of that scope, must be refused rather than waved through. Unreachable through
+   *  any ordinary code path, which is why it exists only here. */
+  setDeviceScopeForTesting(id: string, scope: string): void {
+    this.#db.prepare("UPDATE devices SET scope = ? WHERE id = ?").run(scope, id);
+  }
+
+  deviceByTokenHash(tokenHash: string): DeviceRow | undefined {
+    return this.#db
+      .prepare(`SELECT ${DEVICE_COLUMNS} FROM devices WHERE token_hash = ?`)
+      .get(tokenHash) as DeviceRow | undefined;
+  }
+
+  listDevices(): DeviceRow[] {
+    return this.#db
+      .prepare(`SELECT ${DEVICE_COLUMNS} FROM devices ORDER BY created_at`)
+      .all() as unknown as DeviceRow[];
+  }
+
+  deleteDevice(id: string): boolean {
+    // Capability 70. A routing choice naming a device nobody is paired to any more is dead weight:
+    // the read already hides it behind its join, and leaving the row would mean the database
+    // disagreed with every answer the gateway gives about it.
+    this.#db.prepare("DELETE FROM bot_mobile_preferred_devices WHERE device_id = ?").run(id);
+    return this.#db.prepare("DELETE FROM devices WHERE id = ?").run(id).changes === 1;
+  }
+
+  touchDevice(id: string, at: number): void {
+    this.#db.prepare("UPDATE devices SET last_seen_at = ? WHERE id = ?").run(at, id);
+  }
+
+  /** Records exactly what the app reported on its authenticated websocket auth frame. */
+  recordDeviceEdgeProbe(id: string, edgeRttMs?: number, edgeColo?: string): void {
+    if (edgeRttMs === undefined && edgeColo === undefined) return;
+    this.#db.prepare(
+      "UPDATE devices SET edge_rtt_ms = COALESCE(?, edge_rtt_ms), edge_colo = COALESCE(?, edge_colo) WHERE id = ?",
+    ).run(edgeRttMs ?? null, edgeColo ?? null, id);
+  }
+
+  /** Capability 52. A paired runner's row. The token is stored as a hash, exactly as a device
+   *  token is, so a database read never yields a usable credential. */
+  createRunner(runner: {
+    id: string;
+    name: string;
+    tokenHash: string;
+    createdAt: number;
+    isDefault: boolean;
+  }): void {
+    this.#db
+      .prepare(
+        "INSERT INTO runners (id, name, token_hash, is_default, created_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(runner.id, runner.name, runner.tokenHash, runner.isDefault ? 1 : 0, runner.createdAt);
+  }
+
+  runnerByTokenHash(tokenHash: string): RunnerRow | undefined {
+    const row = this.#db
+      .prepare(`SELECT ${RUNNER_COLUMNS} FROM runners WHERE token_hash = ?`)
+      .get(tokenHash) as RunnerDbRow | undefined;
+    return row === undefined ? undefined : runnerRow(row);
+  }
+
+  runner(id: string): RunnerRow | undefined {
+    const row = this.#db
+      .prepare(`SELECT ${RUNNER_COLUMNS} FROM runners WHERE id = ?`)
+      .get(id) as RunnerDbRow | undefined;
+    return row === undefined ? undefined : runnerRow(row);
+  }
+
+  listRunners(): RunnerRow[] {
+    return (
+      this.#db.prepare(`SELECT ${RUNNER_COLUMNS} FROM runners ORDER BY created_at`).all() as unknown as RunnerDbRow[]
+    ).map(runnerRow);
+  }
+
+  countRunners(): number {
+    const row = this.#db.prepare("SELECT COUNT(*) AS count FROM runners").get() as { count: number };
+    return row.count;
+  }
+
+  deleteRunner(id: string): boolean {
+    return this.#db.prepare("DELETE FROM runners WHERE id = ?").run(id).changes === 1;
+  }
+
+  /** Moves the account default. One transaction, because a moment with two defaults would send an
+   *  unaddressed operation to two machines. */
+  setDefaultRunner(id: string): boolean {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const moved = this.#db.prepare("UPDATE runners SET is_default = 1 WHERE id = ?").run(id).changes === 1;
+      if (moved) this.#db.prepare("UPDATE runners SET is_default = 0 WHERE id <> ?").run(id);
+      this.#db.exec("COMMIT");
+      return moved;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  touchRunner(id: string, at: number): void {
+    this.#db.prepare("UPDATE runners SET last_seen_at = ? WHERE id = ?").run(at, id);
+  }
+
+  /** Capability 55. Sets or clears the person-set display name. `null` clears it, returning the
+   *  row to whatever the runner itself reports; it never touches the `name` column, which stays
+   *  hello's to write. */
+  setRunnerDisplayName(id: string, displayName: string | null): boolean {
+    return this.#db.prepare("UPDATE runners SET display_name = ? WHERE id = ?").run(displayName, id).changes === 1;
+  }
+
+  /** What the runner reported about itself on its `hello`. Every field is optional on the wire, so
+   *  an older runner simply leaves the columns as they were. */
+  observeRunner(
+    id: string,
+    seen: { name?: string; platform?: string; version?: string; backends?: readonly string[] },
+  ): void {
+    this.#db
+      .prepare(
+        "UPDATE runners SET name = COALESCE(?, name), platform = COALESCE(?, platform),"
+          + " version = COALESCE(?, version), backends = COALESCE(?, backends) WHERE id = ?",
+      )
+      .run(
+        seen.name ?? null,
+        seen.platform ?? null,
+        seen.version ?? null,
+        seen.backends === undefined ? null : JSON.stringify([...seen.backends]),
+        id,
+      );
+  }
+
+  hermesGlobalSkillRequest(requestId: string, now: number): unknown | undefined {
+    this.#db.prepare("DELETE FROM hermes_global_skill_requests WHERE expires_at < ?").run(now);
+    const row = this.#db.prepare(
+      "SELECT result_json AS resultJson FROM hermes_global_skill_requests WHERE request_id = ? AND expires_at >= ?",
+    ).get(requestId, now) as { resultJson: string } | undefined;
+    if (row === undefined) return undefined;
+    try { return JSON.parse(row.resultJson) as unknown; } catch { return undefined; }
+  }
+
+  rememberHermesGlobalSkillRequest(requestId: string, result: unknown, expiresAt: number): void {
+    this.#db.prepare(
+      `INSERT INTO hermes_global_skill_requests (request_id, result_json, expires_at)
+       VALUES (?, ?, ?) ON CONFLICT(request_id) DO NOTHING`,
+    ).run(requestId, JSON.stringify(result), expiresAt);
+  }
+
+  createGatewayMaintenanceOperation(input: {
+    operationId: string;
+    idempotencyKey: string;
+    fingerprint: string;
+    action: GatewayMaintenanceAction;
+    step: GatewayMaintenanceStep;
+    priorVersions: GatewayMaintenanceVersions;
+    now: number;
+  }): GatewayMaintenanceOperation {
+    try {
+      this.#db.prepare(
+        `INSERT INTO gateway_maintenance_operations (
+          operation_id, idempotency_key, fingerprint, action, step, status,
+          prior_versions_json, resulting_versions_json, created_at, updated_at, next_action
+        ) VALUES (?, ?, ?, ?, ?, 'pending', ?, '{}', ?, ?, 'wait')`,
+      ).run(
+        input.operationId,
+        input.idempotencyKey,
+        input.fingerprint,
+        input.action,
+        input.step,
+        JSON.stringify(input.priorVersions),
+        input.now,
+        input.now,
+      );
+    } catch (error) {
+      const retried = this.gatewayMaintenanceOperationByKey(input.idempotencyKey);
+      if (retried !== undefined) {
+        if (retried.fingerprint !== input.fingerprint)
+          throw new GatewayMaintenanceOperationConflict("stale_version");
+        const { fingerprint: _fingerprint, ...operation } = retried;
+        return operation;
+      }
+      if (this.activeGatewayMaintenanceOperation() !== undefined)
+        throw new GatewayMaintenanceOperationConflict("operation_in_progress");
+      throw error;
+    }
+    return this.gatewayMaintenanceOperation(input.operationId)!;
+  }
+
+  gatewayMaintenanceOperation(operationId: string): GatewayMaintenanceOperation | undefined {
+    const row = this.#db.prepare(`${GATEWAY_MAINTENANCE_SELECT} WHERE operation_id = ?`)
+      .get(operationId) as GatewayMaintenanceDbRow | undefined;
+    return row === undefined ? undefined : gatewayMaintenanceOperation(row);
+  }
+
+  gatewayMaintenanceOperationByKey(
+    idempotencyKey: string,
+  ): (GatewayMaintenanceOperation & { fingerprint: string }) | undefined {
+    const row = this.#db.prepare(`${GATEWAY_MAINTENANCE_SELECT} WHERE idempotency_key = ?`)
+      .get(idempotencyKey) as GatewayMaintenanceDbRow | undefined;
+    return row === undefined ? undefined : { ...gatewayMaintenanceOperation(row), fingerprint: row.fingerprint };
+  }
+
+  activeGatewayMaintenanceOperation(): GatewayMaintenanceOperation | undefined {
+    const row = this.#db.prepare(
+      `${GATEWAY_MAINTENANCE_SELECT} WHERE status IN ('pending','running') ORDER BY created_at LIMIT 1`,
+    ).get() as GatewayMaintenanceDbRow | undefined;
+    return row === undefined ? undefined : gatewayMaintenanceOperation(row);
+  }
+
+  advanceGatewayMaintenanceOperation(input: {
+    operationId: string;
+    from: { status: GatewayMaintenanceOperationStatus; step: GatewayMaintenanceStep };
+    to: {
+      status: GatewayMaintenanceOperationStatus;
+      step: GatewayMaintenanceStep;
+      resultingVersions?: Partial<GatewayMaintenanceVersions>;
+      completedAt?: number;
+      failureCode?: string;
+      message?: string;
+      nextAction: GatewayMaintenanceNextAction;
+    };
+    now: number;
+  }): boolean {
+    const current = this.gatewayMaintenanceOperation(input.operationId);
+    if (current === undefined) return false;
+    const result = this.#db.prepare(
+      `UPDATE gateway_maintenance_operations SET
+        status = ?, step = ?, resulting_versions_json = ?, updated_at = ?, completed_at = ?,
+        failure_code = ?, message = ?, next_action = ?
+       WHERE operation_id = ? AND status = ? AND step = ?`,
+    ).run(
+      input.to.status,
+      input.to.step,
+      JSON.stringify(input.to.resultingVersions ?? current.resultingVersions),
+      input.now,
+      input.to.completedAt ?? null,
+      input.to.failureCode ?? null,
+      input.to.message ?? null,
+      input.to.nextAction,
+      input.operationId,
+      input.from.status,
+      input.from.step,
+    );
+    if (result.changes === 1 && !["pending", "running"].includes(input.to.status))
+      this.pruneGatewayMaintenanceOperations();
+    return result.changes === 1;
+  }
+
+  pruneGatewayMaintenanceOperations(keep = 100): void {
+    this.#db.prepare(
+      `DELETE FROM gateway_maintenance_operations WHERE operation_id IN (
+        SELECT operation_id FROM gateway_maintenance_operations
+        WHERE status NOT IN ('pending','running')
+        ORDER BY updated_at DESC, operation_id DESC LIMIT -1 OFFSET ?
+      )`,
+    ).run(keep);
+  }
+
+  isBotDeleted(bot: string): boolean {
+    return this.#db.prepare("SELECT 1 FROM deleted_bots WHERE bot = ?").get(bot) !== undefined;
+  }
+
+  /** Revocation precedes any in-memory identity removal. Commit the bot and execution
+   * credentials together so a restart cannot resurrect a partially revoked incarnation. */
+  revokeAttachCredentials(bot: string, tokens: readonly string[], at: number): void {
+    if (tokens.length === 0) return;
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const insert = this.#db.prepare("INSERT OR IGNORE INTO revoked_attach_credentials (token_sha256, bot, revoked_at) VALUES (?, ?, ?)");
+      for (const token of tokens) insert.run(createHash("sha256").update(token).digest("hex"), bot, at);
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  isAttachCredentialRevoked(token: string): boolean {
+    return this.#db.prepare("SELECT 1 FROM revoked_attach_credentials WHERE token_sha256 = ?")
+      .get(createHash("sha256").update(token).digest("hex")) !== undefined;
+  }
+
+  /** Only the successful explicit-create path may reauthorize this name. */
+  restoreBot(bot: string): void {
+    this.#db.prepare("DELETE FROM deleted_bots WHERE bot = ?").run(bot);
+  }
+
+  upsertAgent(agent: AgentRow): void {
+    if (this.isBotDeleted(agent.id)) return;
+    this.#db
+      .prepare(
+        `INSERT INTO agents (id, name, avatar, backend) VALUES (?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET name = excluded.name, avatar = excluded.avatar, backend = excluded.backend`,
+      )
+      .run(agent.id, agent.name, agent.avatar, agent.backend);
+  }
+
+  listAgents(): AgentRow[] {
+    return this.#db
+      .prepare("SELECT id, name, avatar, backend FROM agents ORDER BY id")
+      .all() as unknown as AgentRow[];
+  }
+
+  agentById(id: string): AgentRow | undefined {
+    return this.#db.prepare("SELECT id, name, avatar, backend FROM agents WHERE id = ?").get(id) as
+      | AgentRow
+      | undefined;
+  }
+
+  createThread(thread: { id: string; agentId: string; title: string; createdAt: number }): void {
+    this.#db
+      .prepare("INSERT INTO threads (id, agent_id, title, created_at) VALUES (?, ?, ?, ?)")
+      .run(thread.id, thread.agentId, thread.title, thread.createdAt);
+  }
+
+  listThreads(): ThreadRow[] {
+    return this.#db
+      .prepare(
+        `SELECT id, agent_id AS agentId, title, created_at AS createdAt,
+                last_message_at AS lastMessageAt, archived_at AS archivedAt
+         FROM threads WHERE archived_at IS NULL
+         ORDER BY last_message_at IS NULL, last_message_at DESC, created_at DESC`,
+      )
+      .all() as unknown as ThreadRow[];
+  }
+
+  threadById(id: string): ThreadRow | undefined {
+    return this.#db
+      .prepare(
+        `SELECT id, agent_id AS agentId, title, created_at AS createdAt,
+                last_message_at AS lastMessageAt, archived_at AS archivedAt
+         FROM threads WHERE id = ?`,
+      )
+      .get(id) as ThreadRow | undefined;
+  }
+
+  renameThread(id: string, title: string): boolean {
+    return this.#db.prepare("UPDATE threads SET title = ? WHERE id = ?").run(title, id).changes === 1;
+  }
+
+  archiveThread(id: string): boolean {
+    return (
+      this.#db
+        .prepare("UPDATE threads SET archived_at = ? WHERE id = ? AND archived_at IS NULL")
+        .run(Date.now(), id).changes === 1
+    );
+  }
+
+  appendMessage(
+    threadId: string,
+    entry: {
+      role: MessageRole;
+      blocks: RichBlock[];
+      turnId?: string;
+      marker?: "turn.failed" | "turn.interrupted";
+      delivery?: "turn" | "steer";
+      /** Stable attach-v1 message id. Replays return the existing row without appending. */
+      externalId?: string;
+    },
+    createdAt: number,
+  ): Message {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      if (entry.externalId !== undefined) {
+        const prior = this.#db
+          .prepare(
+            `SELECT thread_id AS threadId, seq, role, blocks_json AS blocksJson, turn_id AS turnId,
+                    marker, delivery, created_at AS createdAt
+             FROM messages WHERE thread_id = ? AND external_id = ?`,
+          )
+          .get(threadId, entry.externalId) as MessageDbRow | undefined;
+        if (prior !== undefined) {
+          this.#db.exec("COMMIT");
+          return toMessage(prior);
+        }
+      }
+      const row = this.#db
+        .prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM messages WHERE thread_id = ?")
+        .get(threadId) as { next: number };
+      this.#db
+        .prepare(
+          `INSERT INTO messages (thread_id, seq, role, blocks_json, turn_id, marker, delivery, external_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          threadId,
+          row.next,
+          entry.role,
+          JSON.stringify(entry.blocks),
+          entry.turnId ?? null,
+          entry.marker ?? null,
+          entry.delivery ?? null,
+          entry.externalId ?? null,
+          createdAt,
+        );
+      this.#db.prepare("UPDATE threads SET last_message_at = ? WHERE id = ?").run(createdAt, threadId);
+      this.#db.exec("COMMIT");
+      const message: Message = {
+        threadId,
+        seq: row.next,
+        role: entry.role,
+        blocks: entry.blocks,
+        createdAt,
+      };
+      if (entry.turnId !== undefined) message.turnId = entry.turnId;
+      if (entry.marker !== undefined) message.marker = entry.marker;
+      if (entry.delivery !== undefined) message.delivery = entry.delivery;
+      return message;
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  messagesSince(threadId: string, sinceSeq: number): Message[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT thread_id AS threadId, seq, role, blocks_json AS blocksJson, turn_id AS turnId,
+                marker, delivery, created_at AS createdAt
+         FROM messages WHERE thread_id = ? AND seq > ? ORDER BY seq`,
+      )
+      .all(threadId, sinceSeq) as unknown as MessageDbRow[];
+    return rows.map(toMessage);
+  }
+
+  messageByExternalId(threadId: string, externalId: string): Message | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT thread_id AS threadId, seq, role, blocks_json AS blocksJson, turn_id AS turnId,
+                marker, delivery, created_at AS createdAt
+         FROM messages WHERE thread_id = ? AND external_id = ?`,
+      )
+      .get(threadId, externalId) as MessageDbRow | undefined;
+    return row === undefined ? undefined : toMessage(row);
+  }
+
+  messagesBefore(threadId: string, before: number | null, limit: number): Message[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT thread_id AS threadId, seq, role, blocks_json AS blocksJson, turn_id AS turnId,
+                marker, delivery, created_at AS createdAt
+         FROM messages WHERE thread_id = ? AND seq < ?
+         ORDER BY seq DESC LIMIT ?`,
+      )
+      .all(threadId, before ?? Number.MAX_SAFE_INTEGER, limit) as unknown as MessageDbRow[];
+    return rows.reverse().map(toMessage);
+  }
+
+  savePushRegistration(deviceId: string, reg: { pushId: string; relayUrl: string; pushKey: string }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO push_registrations (device_id, push_id, relay_url, push_key) VALUES (?, ?, ?, ?)
+         ON CONFLICT(device_id) DO UPDATE SET push_id = excluded.push_id,
+           relay_url = excluded.relay_url, push_key = excluded.push_key`,
+      )
+      .run(deviceId, reg.pushId, reg.relayUrl, reg.pushKey);
+  }
+
+  pushRegistrations(): PushRegistrationRow[] {
+    return this.#db
+      .prepare(
+        `SELECT device_id AS deviceId, push_id AS pushId, relay_url AS relayUrl, push_key AS pushKey
+         FROM push_registrations ORDER BY device_id`,
+      )
+      .all() as unknown as PushRegistrationRow[];
+  }
+
+  deletePushRegistration(deviceId: string): void {
+    this.#db.prepare("DELETE FROM push_registrations WHERE device_id = ?").run(deviceId);
+  }
+
+  /** Stores the one ActivityKit card owned by this device conversation and durably queues the
+   * superseded relay push ids it returns. The replacement, queueing, and stale-row removal are one
+   * transaction so a turn can never observe both the superseded card and its replacement. */
+  saveLiveActivityRegistration(
+    row: Omit<LiveActivityRegistrationRow, "eventSequence" | "lastTimestamp">,
+  ): string[] {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const previous = this.#db.prepare(
+        `SELECT push_id AS pushId FROM live_activity_registrations
+         WHERE device_id = ? AND (conversation_id = ? OR activity_id = ?)`,
+      ).all(row.deviceId, row.conversationId, row.activityId) as Array<{ pushId: string }>;
+      const superseded = [...new Set(
+        previous.map(({ pushId }) => pushId).filter((pushId) => pushId !== row.pushId),
+      )];
+      const enqueue = this.#db.prepare(
+        `INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+         VALUES (?, ?)`,
+      );
+      for (const pushId of superseded) enqueue.run(pushId, row.createdAt);
+      this.#db.prepare(
+        `DELETE FROM live_activity_registrations
+         WHERE device_id = ? AND conversation_id = ? AND activity_id <> ?`,
+      ).run(row.deviceId, row.conversationId, row.activityId);
+      this.#db.prepare(
+        `INSERT INTO live_activity_registrations
+         (device_id, activity_id, run_id, conversation_id, bot, push_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(device_id, activity_id) DO UPDATE SET
+           run_id = excluded.run_id, conversation_id = excluded.conversation_id,
+           bot = excluded.bot, push_id = excluded.push_id, created_at = excluded.created_at`,
+      ).run(row.deviceId, row.activityId, row.runId, row.conversationId, row.bot, row.pushId, row.createdAt);
+      this.#db.exec("COMMIT");
+      return superseded;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  liveActivityRegistration(deviceId: string, activityId: string): LiveActivityRegistrationRow | undefined {
+    return this.#db.prepare(
+      `SELECT device_id AS deviceId, activity_id AS activityId, run_id AS runId,
+       conversation_id AS conversationId, bot, push_id AS pushId,
+       event_sequence AS eventSequence, last_timestamp AS lastTimestamp, created_at AS createdAt
+       FROM live_activity_registrations WHERE device_id = ? AND activity_id = ?`,
+    ).get(deviceId, activityId) as unknown as LiveActivityRegistrationRow | undefined;
+  }
+
+  liveActivityRegistrations(bot?: string): LiveActivityRegistrationRow[] {
+    const sql = `SELECT device_id AS deviceId, activity_id AS activityId, run_id AS runId,
+      conversation_id AS conversationId, bot, push_id AS pushId,
+      event_sequence AS eventSequence, last_timestamp AS lastTimestamp, created_at AS createdAt
+      FROM live_activity_registrations`;
+    return (bot === undefined
+      ? this.#db.prepare(`${sql} ORDER BY created_at`).all()
+      : this.#db.prepare(`${sql} WHERE bot = ? ORDER BY created_at`).all(bot)) as unknown as LiveActivityRegistrationRow[];
+  }
+
+  advanceLiveActivity(deviceId: string, activityId: string, timestamp: number): number {
+    this.#db.prepare(
+      `UPDATE live_activity_registrations SET event_sequence = event_sequence + 1,
+       last_timestamp = ? WHERE device_id = ? AND activity_id = ?`,
+    ).run(timestamp, deviceId, activityId);
+    return this.liveActivityRegistration(deviceId, activityId)?.eventSequence ?? 0;
+  }
+
+  /** Atomically queues and removes the current row. `expectedPushId` makes asynchronous relay
+   * responses compare-and-delete, so an old response cannot remove a rotated registration. */
+  deleteLiveActivityRegistration(
+    deviceId: string,
+    activityId: string,
+    options: { expectedPushId?: string; queuedAt?: number } = {},
+  ): LiveActivityRegistrationRow | undefined {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.liveActivityRegistration(deviceId, activityId);
+      if (row !== undefined
+        && (options.expectedPushId === undefined || row.pushId === options.expectedPushId)) {
+        this.#db.prepare(
+          `INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+           VALUES (?, ?)`,
+        ).run(row.pushId, options.queuedAt ?? Date.now());
+        this.#db.prepare(
+          "DELETE FROM live_activity_registrations WHERE device_id = ? AND activity_id = ?",
+        ).run(deviceId, activityId);
+      } else if (row !== undefined) {
+        this.#db.exec("COMMIT");
+        return undefined;
+      }
+      this.#db.exec("COMMIT");
+      return row;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /** A relay can finish creating a push id after its local conversation was deleted. */
+  queueLiveActivityRelayDeletion(pushId: string, queuedAt: number): void {
+    this.#db.prepare(
+      `INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+       VALUES (?, ?)`,
+    ).run(pushId, queuedAt);
+  }
+
+  liveActivityRelayDeletions(limit: number): string[] {
+    return (this.#db.prepare(
+      `SELECT push_id AS pushId FROM live_activity_relay_deletion_outbox
+       ORDER BY queued_at, push_id LIMIT ?`,
+    ).all(Math.max(0, limit)) as Array<{ pushId: string }>).map(({ pushId }) => pushId);
+  }
+
+  liveActivityRelayDeletionHighWater(): number | undefined {
+    const row = this.#db.prepare(
+      "SELECT MAX(sequence) AS sequence FROM live_activity_relay_deletion_outbox",
+    ).get() as { sequence: number | null };
+    return row.sequence ?? undefined;
+  }
+
+  liveActivityRelayDeletionPage(
+    afterSequence: number,
+    throughSequence: number,
+    limit: number,
+  ): Array<{ pushId: string; sequence: number }> {
+    return this.#db.prepare(
+      `SELECT push_id AS pushId, sequence FROM live_activity_relay_deletion_outbox
+       WHERE sequence > ? AND sequence <= ? ORDER BY sequence LIMIT ?`,
+    ).all(afterSequence, throughSequence, Math.max(0, limit)) as Array<{
+      pushId: string;
+      sequence: number;
+    }>;
+  }
+
+  completeLiveActivityRelayDeletion(pushId: string): boolean {
+    return this.#db.prepare(
+      "DELETE FROM live_activity_relay_deletion_outbox WHERE push_id = ?",
+    ).run(pushId).changes === 1;
+  }
+
+  /** Replaces the whole cached roster in one transaction, preserving build order. */
+  replaceBotRoster(bots: Array<{ name: string; summary: BotSummary }>, updatedAt: number): void {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db.prepare("DELETE FROM bot_roster").run();
+      const insert = this.#db.prepare(
+        "INSERT INTO bot_roster (name, summary_json, position, updated_at) VALUES (?, ?, ?, ?)",
+      );
+      bots.filter((bot) => !this.isBotDeleted(bot.name)).forEach((bot, index) => {
+        insert.run(bot.name, JSON.stringify(bot.summary), index, updatedAt);
+      });
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  /** The cached roster in build order, plus the stamp of the refresh that produced it (null when
+   *  no refresh has ever landed). */
+  botRoster(): { bots: BotSummary[]; updatedAt: number | null } {
+    const rows = this.#db
+      .prepare("SELECT summary_json AS summaryJson, updated_at AS updatedAt FROM bot_roster ORDER BY position")
+      .all() as unknown as Array<{ summaryJson: string; updatedAt: number }>;
+    return {
+      bots: rows.map((row) => JSON.parse(row.summaryJson) as BotSummary),
+      updatedAt: rows.length === 0 ? null : rows[0]!.updatedAt,
+    };
+  }
+
+  /** Records the one seed pass that a successfully-created Hermes profile still needs.  The
+   * profile name is the identity: a retry may update its delay but can never replace the original
+   * user selection with a later unrelated request. */
+  savePendingHermesProfileSeed(row: PendingHermesProfileSeedRow): void {
+    this.#db.prepare(
+      `INSERT INTO pending_hermes_profile_seeds
+         (profile, selection_json, attempts, next_attempt_at, blank_slate)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(profile) DO UPDATE SET
+         attempts = excluded.attempts,
+         next_attempt_at = excluded.next_attempt_at`,
+    ).run(
+      row.profile,
+      JSON.stringify(row.selection),
+      row.attempts,
+      row.nextAttemptAt,
+      row.blankSlate === false ? 0 : 1,
+    );
+  }
+
+  pendingHermesProfileSeeds(): PendingHermesProfileSeedRow[] {
+    const rows = this.#db.prepare(
+      `SELECT profile, selection_json AS selectionJson, attempts, next_attempt_at AS nextAttemptAt,
+              blank_slate AS blankSlate
+       FROM pending_hermes_profile_seeds ORDER BY next_attempt_at, profile`,
+    ).all() as unknown as Array<{
+      profile: string;
+      selectionJson: string;
+      attempts: number;
+      nextAttemptAt: number;
+      blankSlate: number;
+    }>;
+    return rows.flatMap((row) => {
+      try {
+        const parsed: unknown = JSON.parse(row.selectionJson);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          this.removePendingHermesProfileSeed(row.profile);
+          return [];
+        }
+        const value = parsed as Record<string, unknown>;
+        const names = (field: "toolsets" | "mcpServers"): string[] | undefined => {
+          const raw = value[field];
+          return Array.isArray(raw) && raw.every((name) => typeof name === "string")
+            ? [...raw] as string[]
+            : undefined;
+        };
+        const toolsets = names("toolsets");
+        const mcpServers = names("mcpServers");
+        return [{
+          profile: row.profile,
+          selection: {
+            ...(toolsets === undefined ? {} : { toolsets }),
+            ...(mcpServers === undefined ? {} : { mcpServers }),
+          },
+          attempts: row.attempts,
+          nextAttemptAt: row.nextAttemptAt,
+          ...(row.blankSlate === 0 ? { blankSlate: false } : {}),
+        }];
+      } catch {
+        // Corrupt durable intent must not turn into a seed with an invented selection.  Removing
+        // the row is safer than retrying a profile after the user may have edited it manually.
+        this.removePendingHermesProfileSeed(row.profile);
+        return [];
+      }
+    });
+  }
+
+  removePendingHermesProfileSeed(profile: string): boolean {
+    return this.#db.prepare(
+      "DELETE FROM pending_hermes_profile_seeds WHERE profile = ?",
+    ).run(profile).changes === 1;
+  }
+
+  /** Writes one tool step, or updates the one already there (capability 12). Upsert rather than
+   *  insert-then-update because a step is written twice by design -- once when it starts and once
+   *  when it ends -- and the end write must not depend on the start write having happened: an event
+   *  stream this gateway attached to mid-turn delivers an end with no start, and a step recorded
+   *  only at its end is still a true thing that happened.
+   *
+   *  `seq` and `started_at` are pinned by the FIRST write and never moved, so a step keeps the
+   *  position it was first seen in. Status and `ended_at` are the only columns a later write owns. */
+  upsertBotChatToolStep(step: {
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    stepId: string;
+    seq: number;
+    name: string;
+    status: string;
+    startedAt: number;
+    endedAt: number | undefined;
+    detail?: string | undefined;
+    errorText?: string | undefined;
+  }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO bot_chat_tool_steps
+           (bot, session_id, turn_id, step_id, seq, name, status, started_at, ended_at, detail, error_text)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(bot, turn_id, step_id) DO UPDATE SET
+           status = excluded.status,
+           ended_at = COALESCE(excluded.ended_at, bot_chat_tool_steps.ended_at),
+           detail = COALESCE(excluded.detail, bot_chat_tool_steps.detail),
+           error_text = COALESCE(excluded.error_text, bot_chat_tool_steps.error_text),
+           name = CASE WHEN bot_chat_tool_steps.name = '' THEN excluded.name ELSE bot_chat_tool_steps.name END`,
+      )
+      .run(
+        step.bot,
+        step.sessionId,
+        step.turnId,
+        step.stepId,
+        step.seq,
+        step.name,
+        step.status,
+        step.startedAt,
+        step.endedAt ?? null,
+        step.detail ?? null,
+        step.errorText ?? null,
+      );
+  }
+
+  /** Every tool step recorded for one chat, oldest turn first and in-turn order within it. The
+   *  caller groups them; this returns rows because the grouping belongs to the surface that knows
+   *  the frame shape, not to the table. */
+  botChatToolSteps(
+    sessionId: string,
+    notBefore: number,
+  ): Array<{
+    turnId: string;
+    stepId: string;
+    seq: number;
+    name: string;
+    status: string;
+    startedAt: number;
+    endedAt: number | null;
+    detail: string | null;
+    errorText: string | null;
+  }> {
+    return this.#db
+      .prepare(
+        `SELECT turn_id AS turnId, step_id AS stepId, seq, name, status,
+                started_at AS startedAt, ended_at AS endedAt, detail, error_text AS errorText
+         FROM bot_chat_tool_steps
+         WHERE session_id = ? AND started_at >= ?
+         ORDER BY started_at, seq, step_id`,
+      )
+      .all(sessionId, notBefore) as unknown as Array<{
+      turnId: string;
+      stepId: string;
+      seq: number;
+      name: string;
+      status: string;
+      startedAt: number;
+      endedAt: number | null;
+      detail: string | null;
+      errorText: string | null;
+    }>;
+  }
+
+  /** Drops every tool step belonging to one bot. Called wherever a bot's chat stops being the thing
+   *  those steps described: a reset, a delete, a re-pin. */
+  deleteBotChatToolSteps(bot: string): void {
+    this.#db.prepare("DELETE FROM bot_chat_tool_steps WHERE bot = ?").run(bot);
+  }
+
+  listCozyApps(): Array<{ id: string; name: string; creatorBot: string; revision: number; createdAt: number; updatedAt: number }> {
+    return this.#db.prepare(`SELECT id, name, creator_bot AS creatorBot, revision, created_at AS createdAt, updated_at AS updatedAt FROM cozy_apps ORDER BY updated_at DESC, id`).all() as unknown as Array<{ id: string; name: string; creatorBot: string; revision: number; createdAt: number; updatedAt: number }>;
+  }
+
+  cozyApp(id: string): { id: string; name: string; creatorBot: string; revision: number; tree: CozyAppTree; createdAt: number; updatedAt: number } | undefined {
+    const row = this.#db.prepare(`SELECT id, name, creator_bot AS creatorBot, revision, tree_json AS treeJson, created_at AS createdAt, updated_at AS updatedAt FROM cozy_apps WHERE id = ?`).get(id) as { id: string; name: string; creatorBot: string; revision: number; treeJson: string; createdAt: number; updatedAt: number } | undefined;
+    if (row === undefined) return undefined;
+    const { treeJson, ...app } = row;
+    return { ...app, tree: JSON.parse(treeJson) as CozyAppTree };
+  }
+
+  cozyAppsSnapshot(): { apps: Array<{ id: string; name: string; creatorBot: string; revision: number; tree: CozyAppTree; createdAt: number; updatedAt: number }>; actions: Array<{ id: string; appId: string; creatorBot: string; actionId: string; status: "requested" | "delivered" | "completed" | "failed"; createdAt: number; updatedAt: number }> } {
+    return { apps: this.listCozyApps().map((summary) => this.cozyApp(summary.id)!), actions: this.#db.prepare("SELECT id, app_id AS appId, creator_bot AS creatorBot, action_id AS actionId, status, created_at AS createdAt, updated_at AS updatedAt FROM cozy_app_actions ORDER BY updated_at DESC LIMIT 1000").all() as unknown as Array<{ id: string; appId: string; creatorBot: string; actionId: string; status: "requested" | "delivered" | "completed" | "failed"; createdAt: number; updatedAt: number }> };
+  }
+
+  upsertCozyApp(app: { id: string; name: string; creatorBot: string; tree: CozyAppTree; now: number }): { revision: number; createdAt: number } {
+    const existing = this.#db.prepare("SELECT creator_bot AS creatorBot, revision, created_at AS createdAt FROM cozy_apps WHERE id = ?").get(app.id) as { creatorBot: string; revision: number; createdAt: number } | undefined;
+    if (existing !== undefined && existing.creatorBot !== app.creatorBot) throw new Error("cozy app creator is immutable");
+    const revision = (existing?.revision ?? 0) + 1;
+    this.#db.prepare(`INSERT INTO cozy_apps (id, name, creator_bot, revision, tree_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, tree_json = excluded.tree_json, updated_at = excluded.updated_at`).run(app.id, app.name, app.creatorBot, revision, JSON.stringify(app.tree), existing?.createdAt ?? app.now, app.now);
+    return { revision, createdAt: existing?.createdAt ?? app.now };
+  }
+
+  renameCozyApp(id: string, name: string, now: number): boolean {
+    return this.#db.prepare("UPDATE cozy_apps SET name = ?, revision = revision + 1, updated_at = ? WHERE id = ?").run(name, now, id).changes === 1;
+  }
+
+  replaceCozyAppTree(id: string, expectedRevision: number, tree: CozyAppTree, now: number): "updated" | "conflict" | "not_found" {
+    const row = this.#db.prepare("SELECT revision FROM cozy_apps WHERE id = ?").get(id) as { revision: number } | undefined;
+    if (row === undefined) return "not_found";
+    if (row.revision !== expectedRevision) return "conflict";
+    return this.#db.prepare("UPDATE cozy_apps SET tree_json = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?").run(JSON.stringify(tree), now, id, expectedRevision).changes === 1 ? "updated" : "conflict";
+  }
+
+  deleteCozyApp(id: string): boolean { return this.#db.prepare("DELETE FROM cozy_apps WHERE id = ?").run(id).changes === 1; }
+
+  /** Capability row 67 adds the OPTIONAL binding: which app revision and which saved value
+   *  revisions the person's tap was made against. The returned action is the unchanged v1 payload,
+   *  because the shipped client decoder refuses an unknown key on it. */
+  createCozyAppAction(input: { id: string; appId: string; creatorBot: string; actionId: string; idempotencyKey: string; now: number; appRevision?: number | undefined; valueRevisions?: ReadonlyArray<{ valueId: string; revision: number }> | undefined }): { action: { id: string; appId: string; creatorBot: string; actionId: string; status: string; createdAt: number; updatedAt: number }; fresh: boolean } {
+    const scopedKey = `${input.appId}:${input.idempotencyKey}`;
+    const existing = this.#db.prepare("SELECT id, app_id AS appId, creator_bot AS creatorBot, action_id AS actionId, status, created_at AS createdAt, updated_at AS updatedAt FROM cozy_app_actions WHERE idempotency_key = ?").get(scopedKey) as { id: string; appId: string; creatorBot: string; actionId: string; status: string; createdAt: number; updatedAt: number } | undefined;
+    if (existing !== undefined) {
+      if (existing.actionId !== input.actionId) throw new Error("idempotency key is already used for another action");
+      return { action: existing, fresh: false };
+    }
+    this.#db.prepare("INSERT INTO cozy_app_actions (id, app_id, creator_bot, action_id, idempotency_key, status, created_at, updated_at, app_revision, value_revisions_json) VALUES (?, ?, ?, ?, ?, 'requested', ?, ?, ?, ?)").run(input.id, input.appId, input.creatorBot, input.actionId, scopedKey, input.now, input.now, input.appRevision ?? null, input.valueRevisions === undefined ? null : JSON.stringify(input.valueRevisions));
+    return { action: { id: input.id, appId: input.appId, creatorBot: input.creatorBot, actionId: input.actionId, status: "requested", createdAt: input.now, updatedAt: input.now }, fresh: true };
+  }
+
+  /** The command reached the peer that will run it, which is the public receipt's `running`. It is
+   *  the ONLY thing the gateway can say on its own: HTTP acceptance is `queued`, and the terminal
+   *  is the peer's own event. A settled action is never reopened. Scoped by the owning bot, as
+   *  every other action mutation is, so one attached bot cannot move another bot's action. */
+  markCozyAppActionDelivered(id: string, creatorBot: string, now: number): boolean {
+    return this.#db.prepare("UPDATE cozy_app_actions SET status = 'delivered', updated_at = ? WHERE id = ? AND creator_bot = ? AND status = 'requested'").run(now, id, creatorBot).changes === 1;
+  }
+
+  /** `data` is the bot's source-attributed snapshot and arrives only on the peer's own terminal
+   *  event. No HTTP path and no model output writes it. */
+  settleCozyAppAction(input: { id: string; appId: string; creatorBot: string; actionId: string; status: "completed" | "failed"; now: number; data?: CozyAppData | undefined }): boolean {
+    return this.#db.prepare("UPDATE cozy_app_actions SET status = ?, updated_at = ?, data_json = COALESCE(?, data_json) WHERE id = ? AND app_id = ? AND creator_bot = ? AND action_id = ? AND status IN ('requested', 'delivered')").run(input.status, input.now, input.data === undefined ? null : JSON.stringify(input.data), input.id, input.appId, input.creatorBot, input.actionId).changes === 1;
+  }
+
+  /** The durable receipts for one app, newest first, in the plan's four public names. The internal
+   *  `requested`/`delivered` states are mapped rather than duplicated in a parallel table. */
+  cozyAppReceipts(appId: string): CozyAppActionReceipt[] {
+    const rows = this.#db.prepare(`SELECT id, app_id AS appId, creator_bot AS creatorBot, action_id AS actionId, status,
+             app_revision AS appRevision, value_revisions_json AS valueRevisionsJson, data_json AS dataJson,
+             created_at AS createdAt, updated_at AS updatedAt
+      FROM cozy_app_actions WHERE app_id = ? ORDER BY updated_at DESC, id LIMIT 1000`).all(appId) as unknown as Array<{ id: string; appId: string; creatorBot: string; actionId: string; status: "requested" | "delivered" | "completed" | "failed"; appRevision: number | null; valueRevisionsJson: string | null; dataJson: string | null; createdAt: number; updatedAt: number }>;
+    return rows.map((row) => ({
+      id: row.id, appId: row.appId, creatorBot: row.creatorBot, actionId: row.actionId,
+      status: cozyAppReceiptStatus(row.status),
+      ...(row.appRevision === null ? {} : { appRevision: row.appRevision }),
+      ...(row.valueRevisionsJson === null ? {} : { valueRevisions: JSON.parse(row.valueRevisionsJson) as Array<{ valueId: string; revision: number }> }),
+      ...(row.dataJson === null ? {} : { data: JSON.parse(row.dataJson) as CozyAppData }),
+      createdAt: row.createdAt, updatedAt: row.updatedAt,
+    }));
+  }
+
+  cozyAppValues(appId: string): CozyAppValue[] {
+    return (this.#db.prepare("SELECT app_id AS appId, value_id AS valueId, type, value_json AS valueJson, revision, updated_at AS updatedAt FROM cozy_app_values WHERE app_id = ? ORDER BY value_id").all(appId) as unknown as Array<{ appId: string; valueId: string; type: CozyAppValueType; valueJson: string; revision: number; updatedAt: number }>)
+      .map((row) => ({ appId: row.appId, valueId: row.valueId, type: row.type, value: JSON.parse(row.valueJson) as CozyAppValueLiteral, revision: row.revision, updatedAt: row.updatedAt }));
+  }
+
+  /** The saved editable input. Written by the user action and by nothing else: no attach frame
+   *  reaches this table. The observed revision is the whole conflict check, and the idempotency
+   *  key makes a retried tap replay its own result rather than write a second time. */
+  writeCozyAppValue(input: { appId: string; valueId: string; type: CozyAppValueType; value: CozyAppValueLiteral; expectedRevision: number; idempotencyKey: string; now: number }): { outcome: "written" | "replayed" | "conflict" | "invalid_type" | "limit_exceeded" | "not_found"; value?: CozyAppValue } {
+    if (!cozyAppValueOfType(input.type, input.value)) return { outcome: "invalid_type" };
+    if (this.#db.prepare("SELECT 1 FROM cozy_apps WHERE id = ?").get(input.appId) === undefined) return { outcome: "not_found" };
+    // The key stands for ONE write, not for a value id: same key, different write is a conflict.
+    const requestHash = createHash("sha256")
+      .update(JSON.stringify([input.valueId, input.expectedRevision, input.type, input.value]))
+      .digest("hex");
+    const read = (): CozyAppValue | undefined => this.cozyAppValues(input.appId).find((entry) => entry.valueId === input.valueId);
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = read();
+      if (current !== undefined) {
+        const stored = this.#db.prepare("SELECT idempotency_key AS key, request_hash AS hash FROM cozy_app_values WHERE app_id = ? AND value_id = ?").get(input.appId, input.valueId) as { key: string; hash: string } | undefined;
+        if (stored?.key === input.idempotencyKey) {
+          this.#db.exec("COMMIT");
+          return stored.hash === requestHash ? { outcome: "replayed", value: current } : { outcome: "conflict", value: current };
+        }
+        if (current.revision !== input.expectedRevision) { this.#db.exec("COMMIT"); return { outcome: "conflict", value: current }; }
+      } else {
+        if (input.expectedRevision !== 0) { this.#db.exec("COMMIT"); return { outcome: "conflict" }; }
+        // Capability row 67. The ceiling is on how many values one app holds, so editing an
+        // existing value at the ceiling still works; only a NEW one past it is refused. The cap is
+        // enforced here because the action command carries these values on a bounded array.
+        const held = Number((this.#db.prepare("SELECT COUNT(*) AS held FROM cozy_app_values WHERE app_id = ?").get(input.appId) as { held: number }).held);
+        if (held >= COZYAPP_MAX_VALUES) { this.#db.exec("COMMIT"); return { outcome: "limit_exceeded" }; }
+      }
+      const revision = (current?.revision ?? 0) + 1;
+      this.#db.prepare(`INSERT INTO cozy_app_values (app_id, value_id, type, value_json, revision, idempotency_key, request_hash, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(app_id, value_id) DO UPDATE SET type = excluded.type, value_json = excluded.value_json, revision = excluded.revision, idempotency_key = excluded.idempotency_key, request_hash = excluded.request_hash, updated_at = excluded.updated_at`)
+        .run(input.appId, input.valueId, input.type, JSON.stringify(input.value), revision, input.idempotencyKey, requestHash, input.now);
+      this.#db.exec("COMMIT");
+      return { outcome: "written", value: { appId: input.appId, valueId: input.valueId, type: input.type, value: input.value, revision, updatedAt: input.now } };
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  cozyAppDashboard(appId: string): CozyAppDashboard | undefined {
+    const row = this.#db.prepare("SELECT app_id AS id, owner, creator_bot AS creatorBot, document_version AS documentVersion, document_json AS documentJson, data_json AS dataJson, revision, updated_at AS updatedAt FROM cozy_app_dashboards WHERE app_id = ?").get(appId) as { id: string; owner: string; creatorBot: string; documentVersion: number; documentJson: string; dataJson: string; revision: number; updatedAt: number } | undefined;
+    if (row === undefined) return undefined;
+    const { documentJson, dataJson, ...rest } = row;
+    return { ...rest, document: JSON.parse(documentJson) as CozyAppDocument, data: JSON.parse(dataJson) as CozyAppData };
+  }
+
+  /** The envelope's revision is its own, independent of the app tree's. `creatorBot` is pinned by
+   *  the first write and a different bot is refused, so a plugin writes only its own app's record.
+   *  `data` is the bot's source-attributed snapshot: the user regeneration path never sends one,
+   *  and omitting it keeps whatever the bot last observed. */
+  writeCozyAppDashboard(input: { appId: string; creatorBot: string; documentVersion: number; document: CozyAppDocument; expectedRevision: number; now: number; data?: CozyAppData | undefined }): { outcome: "written" | "conflict" | "forbidden" | "not_found"; dashboard?: CozyAppDashboard } {
+    const app = this.#db.prepare("SELECT creator_bot AS creatorBot FROM cozy_apps WHERE id = ?").get(input.appId) as { creatorBot: string } | undefined;
+    if (app === undefined) return { outcome: "not_found" };
+    if (app.creatorBot !== input.creatorBot) return { outcome: "forbidden" };
+    const current = this.cozyAppDashboard(input.appId);
+    if ((current?.revision ?? 0) !== input.expectedRevision) return { outcome: "conflict", ...(current === undefined ? {} : { dashboard: current }) };
+    const revision = (current?.revision ?? 0) + 1;
+    const data = input.data ?? current?.data ?? {};
+    this.#db.prepare(`INSERT INTO cozy_app_dashboards (app_id, owner, creator_bot, document_version, document_json, data_json, revision, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(app_id) DO UPDATE SET document_version = excluded.document_version, document_json = excluded.document_json, data_json = excluded.data_json, revision = excluded.revision, updated_at = excluded.updated_at`)
+      .run(input.appId, COZYAPP_DASHBOARD_OWNER, input.creatorBot, input.documentVersion, JSON.stringify(input.document), JSON.stringify(data), revision, input.now);
+    return { outcome: "written", dashboard: this.cozyAppDashboard(input.appId)! };
+  }
+
+  /** In one bounded pass, hard-deletes terminal summaries older than fourteen days, then converts
+   * up to the remaining capacity of seven-day-old terminal diagnostics into summaries. A terminal
+   * receipt and an ended step are both required, so active or unresolved work is never touched.
+   * Messages, media, approvals, and attach journals are deliberately outside this operation. */
+  compactBotChatToolDetails(now: number): { compacted: number; deleted: number } {
+    const detailCutoff = now - BOT_CHAT_TOOL_DETAIL_RETENTION_MS;
+    const summaryCutoff = now - BOT_CHAT_TOOL_SUMMARY_RETENTION_MS;
+    type Cursor = { endedAt: number; bot: string; turnId: string; stepId: string };
+    type Candidate = Cursor;
+    const cursor = this.#db.prepare(
+      `SELECT at AS endedAt, key_1 AS bot, key_2 AS turnId, key_3 AS stepId
+       FROM storage_retention_cursors WHERE pass = ?`,
+    );
+    const saveCursor = this.#db.prepare(
+      `INSERT INTO storage_retention_cursors (pass, at, key_1, key_2, key_3)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(pass) DO UPDATE SET at = excluded.at, key_1 = excluded.key_1,
+         key_2 = excluded.key_2, key_3 = excluded.key_3`,
+    );
+    const clearCursor = this.#db.prepare(
+      "DELETE FROM storage_retention_cursors WHERE pass = ?",
+    );
+    const scan = (pass: "delete" | "compact", index: string, cutoff: number, limit: number, extraPredicate = ""): Candidate[] => {
+      if (limit === 0) return [];
+      const after = cursor.get(pass) as Cursor | undefined;
+      const afterClause = after === undefined ? "" : " AND (ended_at, bot, turn_id, step_id) > (?, ?, ?, ?)";
+      const rows = this.#db.prepare(
+        `SELECT ended_at AS endedAt, bot, turn_id AS turnId, step_id AS stepId
+         FROM bot_chat_tool_steps INDEXED BY ${index}
+         WHERE ended_at < ?${extraPredicate}${afterClause}
+         ORDER BY ended_at, bot, turn_id, step_id
+         LIMIT ?`,
+      ).all(
+        cutoff,
+        ...(after === undefined ? [] : [after.endedAt, after.bot, after.turnId, after.stepId]),
+        limit,
+      ) as Candidate[];
+      if (rows.length === 0) {
+        clearCursor.run(pass);
+      } else {
+        const tail = rows.at(-1)!;
+        saveCursor.run(pass, tail.endedAt, tail.bot, tail.turnId, tail.stepId);
+      }
+      return rows;
+    };
+    const settled = this.#db.prepare(
+      `SELECT 1
+       FROM bot_chat_tool_steps AS step
+       JOIN bot_native_turn_terminals AS terminal
+         ON terminal.bot = step.bot AND terminal.session_id = step.session_id
+           AND terminal.turn_id = step.turn_id
+       WHERE step.bot = ? AND step.turn_id = ? AND step.step_id = ?
+         AND step.ended_at IS NOT NULL AND step.status <> 'running'
+         AND terminal.completed_at < ?
+         AND NOT EXISTS (
+           SELECT 1 FROM bot_native_sessions AS active
+           WHERE active.bot = step.bot AND active.session_id = step.session_id
+             AND active.active_turn_id = step.turn_id
+         )`,
+    );
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const deleteRow = this.#db.prepare(
+        "DELETE FROM bot_chat_tool_steps WHERE bot = ? AND turn_id = ? AND step_id = ?",
+      );
+      let deleted = 0;
+      for (const row of scan("delete", "bot_chat_tool_steps_terminal_retention", summaryCutoff, BOT_CHAT_TOOL_DETAIL_COMPACTION_BATCH)) {
+        if (settled.get(row.bot, row.turnId, row.stepId, summaryCutoff) !== undefined)
+          deleted += Number(deleteRow.run(row.bot, row.turnId, row.stepId).changes);
+      }
+      const detailCapacity = BOT_CHAT_TOOL_DETAIL_COMPACTION_BATCH - deleted;
+      const compactRow = this.#db.prepare(
+        `UPDATE bot_chat_tool_steps SET detail = NULL, error_text = NULL
+         WHERE bot = ? AND turn_id = ? AND step_id = ?
+           AND (detail IS NOT NULL OR error_text IS NOT NULL)`,
+      );
+      let compacted = 0;
+      for (const row of scan(
+        "compact", "bot_chat_tool_steps_detail_compaction", detailCutoff, detailCapacity,
+        " AND (detail IS NOT NULL OR error_text IS NOT NULL)",
+      )) {
+        if (settled.get(row.bot, row.turnId, row.stepId, detailCutoff) !== undefined)
+          compacted += Number(compactRow.run(row.bot, row.turnId, row.stepId).changes);
+      }
+      this.#db.exec("COMMIT");
+      return { compacted, deleted };
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /** Upserts one delegation child by (bot, turn, batch, child). `child_index` and `started_at`
+   *  are pinned by the FIRST write; a later write owns status/current_tool/last_active_at/
+   *  ended_at, `batch_count` only grows, and `label` keeps its first non-null value (a finish
+   *  leg without a label must not erase the spawn leg's). */
+  upsertBotChatDelegation(child: {
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    batchId: string;
+    /** Batch-level canonical Hermes alias; keep-first, a null never erases a stored one. */
+    aliasId?: string | undefined;
+    childId: string;
+    index: number;
+    count: number;
+    status: string;
+    lastActiveAt: number;
+    startedAt: number;
+    endedAt: number | undefined;
+    label?: string | undefined;
+    currentTool?: string | undefined;
+    apiCalls?: number | undefined;
+    toolCount?: number | undefined;
+    costUsd?: number | undefined;
+    costStatus?: "estimated" | "reported" | "unknown" | undefined;
+    schemaValidation?: { valid: boolean; retries?: number | undefined } | undefined;
+    durationMs?: number | undefined;
+  }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO bot_chat_delegations
+           (bot, session_id, turn_id, batch_id, alias_id, child_id, child_index, batch_count,
+            label, status, current_tool, api_calls, tool_count, cost_usd, cost_status,
+            schema_valid, schema_retries, duration_ms, last_active_at, started_at, ended_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(bot, turn_id, batch_id, child_id) DO UPDATE SET
+           batch_count = MAX(bot_chat_delegations.batch_count, excluded.batch_count),
+           alias_id = COALESCE(bot_chat_delegations.alias_id, excluded.alias_id),
+           label = COALESCE(bot_chat_delegations.label, excluded.label),
+           status = excluded.status,
+           current_tool = excluded.current_tool,
+           api_calls = COALESCE(excluded.api_calls, bot_chat_delegations.api_calls),
+           tool_count = COALESCE(excluded.tool_count, bot_chat_delegations.tool_count),
+           cost_usd = COALESCE(excluded.cost_usd, bot_chat_delegations.cost_usd),
+           cost_status = COALESCE(excluded.cost_status, bot_chat_delegations.cost_status),
+           schema_valid = COALESCE(excluded.schema_valid, bot_chat_delegations.schema_valid),
+           schema_retries = COALESCE(excluded.schema_retries, bot_chat_delegations.schema_retries),
+           duration_ms = COALESCE(excluded.duration_ms, bot_chat_delegations.duration_ms),
+           last_active_at = excluded.last_active_at,
+           ended_at = COALESCE(excluded.ended_at, bot_chat_delegations.ended_at)`,
+      )
+      .run(
+        child.bot,
+        child.sessionId,
+        child.turnId,
+        child.batchId,
+        child.aliasId ?? null,
+        child.childId,
+        child.index,
+        child.count,
+        child.label ?? null,
+        child.status,
+        child.currentTool ?? null,
+        child.apiCalls ?? null,
+        child.toolCount ?? null,
+        child.costUsd ?? null,
+        child.costStatus ?? null,
+        child.schemaValidation === undefined ? null : (child.schemaValidation.valid ? 1 : 0),
+        child.schemaValidation?.retries ?? null,
+        child.durationMs ?? null,
+        child.lastActiveAt,
+        child.startedAt,
+        child.endedAt ?? null,
+      );
+  }
+
+  /** Every delegation child recorded for one chat, oldest first and in-batch order within. */
+  botChatDelegations(
+    sessionId: string,
+    notBefore: number,
+  ): Array<{
+    turnId: string;
+    batchId: string;
+    aliasId: string | null;
+    childId: string;
+    index: number;
+    count: number;
+    label: string | null;
+    status: string;
+    currentTool: string | null;
+    apiCalls: number | null;
+    toolCount: number | null;
+    costUsd: number | null;
+    costStatus: "estimated" | "reported" | "unknown" | null;
+    schemaValid: number | null;
+    schemaRetries: number | null;
+    durationMs: number | null;
+    lastActiveAt: number;
+    startedAt: number;
+    endedAt: number | null;
+  }> {
+    return this.#db
+      .prepare(
+        `SELECT turn_id AS turnId, batch_id AS batchId, alias_id AS aliasId,
+                child_id AS childId,
+                child_index AS "index", batch_count AS count, label, status,
+                current_tool AS currentTool, api_calls AS apiCalls, tool_count AS toolCount,
+                cost_usd AS costUsd, cost_status AS costStatus, schema_valid AS schemaValid,
+                schema_retries AS schemaRetries, duration_ms AS durationMs,
+                last_active_at AS lastActiveAt, started_at AS startedAt, ended_at AS endedAt
+         FROM bot_chat_delegations
+         WHERE session_id = ? AND started_at >= ?
+         ORDER BY started_at, child_index, child_id`,
+      )
+      .all(sessionId, notBefore) as unknown as Array<{
+      turnId: string;
+      batchId: string;
+      aliasId: string | null;
+      childId: string;
+      index: number;
+      count: number;
+      label: string | null;
+      status: string;
+      currentTool: string | null;
+      apiCalls: number | null;
+      toolCount: number | null;
+      costUsd: number | null;
+      costStatus: "estimated" | "reported" | "unknown" | null;
+      schemaValid: number | null;
+      schemaRetries: number | null;
+      durationMs: number | null;
+      lastActiveAt: number;
+      startedAt: number;
+      endedAt: number | null;
+    }>;
+  }
+
+  botRoutineOverrides(bot: string, routineId: string): BotRoutineOverrides | undefined {
+    const row = this.#db
+      .prepare("SELECT overrides_json AS overridesJson FROM bot_routine_overrides WHERE bot = ? AND routine_id = ?")
+      .get(bot, routineId) as { overridesJson: string } | undefined;
+    if (row === undefined) return undefined;
+    const parsed: unknown = JSON.parse(row.overridesJson);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const record = parsed as Record<string, unknown>;
+    return {
+      ...(typeof record["model"] === "string" || record["model"] === null
+        ? { model: record["model"] as string | null }
+        : {}),
+      ...(typeof record["effort"] === "string" || record["effort"] === null
+        ? { effort: record["effort"] as string | null }
+        : {}),
+    };
+  }
+
+  setBotRoutineOverrides(bot: string, routineId: string, overrides: BotRoutineOverrides): void {
+    if (overrides.model === undefined && overrides.effort === undefined) {
+      this.deleteBotRoutineOverrides(bot, routineId);
+      return;
+    }
+    this.#db
+      .prepare(
+        `INSERT INTO bot_routine_overrides (bot, routine_id, overrides_json) VALUES (?, ?, ?)
+         ON CONFLICT(bot, routine_id) DO UPDATE SET overrides_json = excluded.overrides_json`,
+      )
+      .run(bot, routineId, JSON.stringify(overrides));
+  }
+
+  deleteBotRoutineOverrides(bot: string, routineId: string): void {
+    this.#db.prepare("DELETE FROM bot_routine_overrides WHERE bot = ? AND routine_id = ?").run(bot, routineId);
+  }
+
+  // --- Group chat rooms (contract/ext-bots-v1.md section 4, groups). ------------------------------
+
+  /** Creates a room. Returns false when one already exists under the same case-insensitive key,
+   *  which the route answers as a 409 rather than silently adopting a different membership. */
+  createBotGroup(room: { key: string; name: string; members: string[]; owningHost?: string; createdAt: number }): boolean {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.#db.prepare("SELECT key FROM bot_groups WHERE key = ?").get(room.key);
+      if (existing !== undefined) {
+        this.#db.exec("ROLLBACK");
+        return false;
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO bot_groups (key, name, members_json, owning_host, created_at, epoch, needs_you, next_seq)
+           VALUES (?, ?, ?, ?, ?, 0, 0, 1)`,
+        )
+        .run(room.key, room.name, JSON.stringify(room.members), room.owningHost ?? null, room.createdAt);
+      const member = this.#db.prepare(
+        "INSERT INTO bot_group_members (group_key, member, watermark, session_id) VALUES (?, ?, 0, ?)",
+      );
+      for (const name of room.members) member.run(room.key, name, `group:${room.key}:${name}`);
+      this.#db.exec("COMMIT");
+      return true;
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  botGroups(): BotGroupRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT key, name, members_json AS membersJson, owning_host AS owningHost, created_at AS createdAt, epoch,
+                needs_you AS needsYou, next_seq AS nextSeq, meta_json AS metaJson
+         FROM bot_groups ORDER BY created_at, key`,
+      )
+      .all() as unknown as BotGroupDbRow[];
+    return rows.map(toBotGroupRow);
+  }
+
+  botGroup(key: string): BotGroupRow | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT key, name, members_json AS membersJson, owning_host AS owningHost, created_at AS createdAt, epoch,
+                needs_you AS needsYou, next_seq AS nextSeq, meta_json AS metaJson
+         FROM bot_groups WHERE key = ?`,
+      )
+      .get(key) as BotGroupDbRow | undefined;
+    return row === undefined ? undefined : toBotGroupRow(row);
+  }
+
+  /** Drops a room and, by cascade, its transcript and its per-member state. */
+  deleteBotGroup(key: string): boolean {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      // Preserve attach-event authorization after delete/recreate, but make it impossible for an
+      // old pending command to block the new room under the same case-insensitive key.
+      this.#db.prepare(
+        "UPDATE bot_group_turns SET state = 'cancelled', detail = 'group deleted', completed_at = COALESCE(completed_at, 0) WHERE group_key = ? AND state = 'pending'",
+      ).run(key);
+      // `bot_group_turns` intentionally outlives the room for late attach terminals. Its owner
+      // must outlive the row on the same lifecycle; there is no turn pruning today, so this
+      // tombstone has no invented pruning policy either.
+      this.#db.prepare(
+        "INSERT OR REPLACE INTO bot_group_owner_tombstones (group_key, owning_host) SELECT key, owning_host FROM bot_groups WHERE key = ? AND owning_host IS NOT NULL AND EXISTS (SELECT 1 FROM bot_group_turns WHERE group_key = ?)",
+      ).run(key, key);
+      const deleted = this.#db.prepare("DELETE FROM bot_groups WHERE key = ?").run(key).changes === 1;
+      this.#db.exec("COMMIT");
+      return deleted;
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  /** The live row wins over a deleted-room tombstone when the same name is recreated. */
+  botGroupOwner(key: string): string | undefined {
+    const live = this.#db.prepare("SELECT owning_host AS owningHost FROM bot_groups WHERE key = ?").get(key) as { owningHost: string | null } | undefined;
+    if (live !== undefined) return live.owningHost ?? undefined;
+    const tombstone = this.#db.prepare("SELECT owning_host AS owningHost FROM bot_group_owner_tombstones WHERE group_key = ?").get(key) as { owningHost: string } | undefined;
+    return tombstone?.owningHost;
+  }
+
+  /** Legacy rooms have immutable membership but no owner. Set it once after the deterministic
+   * federation derivation; a concurrent or newer write never changes it. */
+  backfillBotGroupOwner(key: string, owningHost: string): void {
+    this.#db.prepare("UPDATE bot_groups SET owning_host = ? WHERE key = ? AND owning_host IS NULL").run(owningHost, key);
+  }
+
+  /** Appends one entry and hands back the room-local `seq` it was given. The counter lives on the
+   *  room rather than being derived from `MAX(seq)`, so a trim that drops the head can never hand a
+   *  later entry a seq the room has already used. */
+  appendBotGroupMessage(key: string, entry: Omit<BotGroupLogRow, "seq">): BotGroupLogRow {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#db.prepare("SELECT next_seq AS nextSeq FROM bot_groups WHERE key = ?").get(key) as
+        | { nextSeq: number }
+        | undefined;
+      if (row === undefined) throw new Error(`no group room "${key}"`);
+      const seq = row.nextSeq;
+      this.#db
+        .prepare(
+          `INSERT INTO bot_group_log (group_key, seq, from_kind, from_name, display_name, text, at, client_id,
+             message_id, turn_id, epoch, cause_kind, cause_seq, attach_thread_id, attach_turn_id, thread_id, external)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(key, seq, entry.kind, entry.name, entry.displayName, entry.text, entry.at, entry.clientId ?? null,
+          entry.messageId ?? null, entry.turnId ?? null, entry.epoch ?? null,
+          entry.cause?.kind ?? null, entry.cause?.seq ?? null,
+          entry.attachTurn?.threadId ?? null, entry.attachTurn?.turnId ?? null,
+          entry.threadId ?? null, entry.external === true ? 1 : null);
+      this.#db.prepare("UPDATE bot_groups SET next_seq = ? WHERE key = ?").run(seq + 1, key);
+      this.#db.exec("COMMIT");
+      return { ...entry, seq };
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  botGroupLog(key: string): BotGroupLogRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT seq, from_kind AS kind, from_name AS name, display_name AS displayName, text, at,
+                client_id AS clientId, message_id AS messageId, turn_id AS turnId, epoch,
+                cause_kind AS causeKind, cause_seq AS causeSeq,
+                attach_thread_id AS attachThreadId, attach_turn_id AS attachTurnId,
+                thread_id AS threadId, external
+         FROM bot_group_log WHERE group_key = ? ORDER BY seq`,
+      )
+      .all(key) as unknown as Array<Omit<BotGroupLogRow, "external" | "threadId"> & {
+        clientId: string | null; messageId: string | null; turnId: string | null; epoch: number | null;
+        causeKind: string | null; causeSeq: number | null;
+        attachThreadId: string | null; attachTurnId: string | null;
+        threadId: string | null; external: number | null;
+      }>;
+    return rows.map((row) => {
+      const entry: BotGroupLogRow = {
+        seq: row.seq,
+        kind: row.kind,
+        name: row.name,
+        displayName: row.displayName,
+        text: row.text,
+        at: row.at,
+      };
+      if (row.clientId !== null) entry.clientId = row.clientId;
+      if (row.messageId !== null) entry.messageId = row.messageId;
+      if (row.turnId !== null) entry.turnId = row.turnId;
+      if (row.epoch !== null) entry.epoch = row.epoch;
+      if ((row.causeKind === "user" || row.causeKind === "member") && row.causeSeq !== null)
+        entry.cause = { kind: row.causeKind, seq: row.causeSeq };
+      if (row.attachThreadId !== null && row.attachTurnId !== null)
+        entry.attachTurn = { threadId: row.attachThreadId, turnId: row.attachTurnId };
+      if (row.threadId !== null) entry.threadId = row.threadId;
+      if (row.external === 1) entry.external = true;
+      return entry;
+    });
+  }
+
+  /** Keeps the newest `limit` entries, dropping from the head (the desktop's own retention rule).
+   *  Watermarks are seqs, not indices, so nothing else has to move. */
+  trimBotGroupLog(key: string, limit: number): void {
+    this.#db
+      .prepare(
+        `DELETE FROM bot_group_log WHERE group_key = ? AND seq NOT IN
+           (SELECT seq FROM bot_group_log WHERE group_key = ? ORDER BY seq DESC LIMIT ?)`,
+      )
+      .run(key, key, limit);
+  }
+
+  /** Per-member watermark (highest seq the member has been shown) and room session id. Members are
+   *  rowed at create; a member row missing here means the room predates it, which reads as a fresh
+   *  member that has seen nothing. */
+  botGroupMembers(key: string): Map<string, { watermark: number; sessionId: string | null }> {
+    const rows = this.#db
+      .prepare("SELECT member, watermark, session_id AS sessionId FROM bot_group_members WHERE group_key = ?")
+      .all(key) as unknown as Array<{ member: string; watermark: number; sessionId: string | null }>;
+    return new Map(rows.map((row) => [row.member, { watermark: row.watermark, sessionId: row.sessionId }]));
+  }
+
+  setBotGroupWatermark(key: string, member: string, watermark: number): void {
+    this.#db
+      .prepare(
+        `INSERT INTO bot_group_members (group_key, member, watermark, session_id) VALUES (?, ?, ?, NULL)
+         ON CONFLICT(group_key, member) DO UPDATE SET watermark = excluded.watermark`,
+      )
+      .run(key, member, watermark);
+  }
+
+  setBotGroupSession(key: string, member: string, sessionId: string): void {
+    this.#db
+      .prepare(
+        `INSERT INTO bot_group_members (group_key, member, watermark, session_id) VALUES (?, ?, 0, ?)
+         ON CONFLICT(group_key, member) DO UPDATE SET session_id = excluded.session_id`,
+      )
+      .run(key, member, sessionId);
+  }
+
+  /** Bumps and returns the room's epoch. The bump is what supersedes a round loop still running from
+   *  the previous user message, so it has to be atomic with respect to concurrent sends. */
+  bumpBotGroupEpoch(key: string): number {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#db.prepare("SELECT epoch FROM bot_groups WHERE key = ?").get(key) as
+        | { epoch: number }
+        | undefined;
+      if (row === undefined) throw new Error(`no group room "${key}"`);
+      const epoch = row.epoch + 1;
+      this.#db.prepare("UPDATE bot_groups SET epoch = ? WHERE key = ?").run(epoch, key);
+      this.#db.exec("COMMIT");
+      return epoch;
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  setBotGroupNeedsYou(key: string, needsYou: boolean): void {
+    this.#db.prepare("UPDATE bot_groups SET needs_you = ? WHERE key = ?").run(needsYou ? 1 : 0, key);
+  }
+
+  // --- Row 84: room settings. The key is the room's stable identity; the name is only its label. ---
+
+  /** The key of the live room DISPLAYED under this case-insensitive name, if any. */
+  botGroupKeyByName(name: string): string | undefined {
+    // Folded in JavaScript, like every room key: SQLite's lower() folds ASCII only.
+    const wanted = name.trim().toLowerCase();
+    const rows = this.#db.prepare("SELECT key, name FROM bot_groups").all() as unknown as Array<{ key: string; name: string }>;
+    return rows.find((row) => row.name.toLowerCase() === wanted)?.key;
+  }
+
+  setBotGroupMeta(key: string, meta: BotGroupMeta): void {
+    this.#db.prepare("UPDATE bot_groups SET meta_json = ? WHERE key = ?").run(JSON.stringify(meta), key);
+  }
+
+  renameBotGroup(key: string, name: string): void {
+    this.#db.prepare("UPDATE bot_groups SET name = ? WHERE key = ?").run(name, key);
+  }
+
+  /** A bot's profile was renamed (row 82, or outside the gateway and re-linked through Hermes's
+   *  `previous_names`). Moves, in ONE transaction, the bot-keyed state that belongs to the bot
+   *  rather than to one conversation:
+   *
+   *  - room membership: `members_json`, the per-member row (watermark and attach thread, whose
+   *    Hermes session lives in the profile directory and so moved with it), and the member-keyed
+   *    room meta (`marks`, `holds`, `held`). The transcript's author names stay as written;
+   *  - the canonical Bot Chat binding (`bot_canonical_chats`): the Hermes session moved with the
+   *    profile directory, so the binding still names it;
+   *  - routine overrides (`bot_routine_overrides`): keyed by cron job id, and the jobs moved too.
+   *
+   *  The 1:1 transcript and everything hanging off it (reactions, receipts, drafts, grants) stay
+   *  with the old name, per row 82's review: the provisioner enrols the new name afresh.
+   *
+   *  Settled group-turn rows keep the old agent id on purpose: they authorize late events from
+   *  the old attach identity.
+   *
+   *  `prefer` settles a collision with state already under `to`. A gateway rename passes `from`:
+   *  `to` was free a moment ago, so anything under it is a stale leftover (a deleted bot of that
+   *  name a room still lists) and the live bot's state wins. The `previous_names` re-link passes
+   *  `to`: there `to` is a live bot, and a stale name it once had never overwrites its own state;
+   *  the stale rows are dropped instead. Returns the keys of the rooms that changed. */
+  renameBotState(from: string, to: string, prefer: "from" | "to" = "from"): string[] {
+    if (from === to) return [];
+    const renameKeys = <T>(record: Record<string, T> | undefined): Record<string, T> | undefined => {
+      if (record === undefined || !(from in record)) return record;
+      const next: Record<string, T> = {};
+      for (const [key, value] of Object.entries(record)) if (key !== from) next[key] = value;
+      if (prefer === "from" || !(to in record)) next[to] = record[from]!;
+      return next;
+    };
+    const changed: string[] = [];
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const room of this.botGroups()) {
+        // A member removed earlier leaves its row behind (harmless), so the list is the test.
+        if (!room.members.includes(from)) continue;
+        const members: string[] = [];
+        for (const member of room.members) {
+          const next = member === from ? to : member;
+          if (!members.includes(next)) members.push(next);
+        }
+        const meta: BotGroupMeta = { ...room.meta };
+        const holds = renameKeys(meta.holds);
+        if (holds !== undefined) meta.holds = holds;
+        const held = renameKeys(meta.held);
+        if (held !== undefined) meta.held = held;
+        if (meta.marks !== undefined) {
+          meta.marks = Object.fromEntries(
+            Object.entries(meta.marks).map(([thread, byMember]) => [thread, renameKeys(byMember) ?? byMember]),
+          );
+        }
+        this.#db.prepare("UPDATE bot_groups SET members_json = ?, meta_json = ? WHERE key = ?")
+          .run(JSON.stringify(members), JSON.stringify(meta), room.key);
+        // The per-member row (watermark and attach thread) follows the same preference.
+        const rowOf = (member: string): boolean =>
+          this.#db.prepare("SELECT 1 FROM bot_group_members WHERE group_key = ? AND member = ?").get(room.key, member) !== undefined;
+        if (rowOf(from)) {
+          if (prefer === "to" && rowOf(to)) {
+            this.#db.prepare("DELETE FROM bot_group_members WHERE group_key = ? AND member = ?").run(room.key, from);
+          } else {
+            this.#db.prepare("DELETE FROM bot_group_members WHERE group_key = ? AND member = ?").run(room.key, to);
+            this.#db.prepare("UPDATE bot_group_members SET member = ? WHERE group_key = ? AND member = ?")
+              .run(to, room.key, from);
+          }
+        }
+        changed.push(room.key);
+      }
+      const conflict = prefer === "from" ? "REPLACE" : "IGNORE";
+      this.#db.prepare(
+        `INSERT OR ${conflict} INTO bot_canonical_chats (bot, hermes_session_id, updated_at)
+         SELECT ?, hermes_session_id, updated_at FROM bot_canonical_chats WHERE bot = ?`,
+      ).run(to, from);
+      this.#db.prepare("DELETE FROM bot_canonical_chats WHERE bot = ?").run(from);
+      this.#db.prepare(`UPDATE OR ${conflict} bot_routine_overrides SET bot = ? WHERE bot = ?`).run(to, from);
+      this.#db.prepare("DELETE FROM bot_routine_overrides WHERE bot = ?").run(from);
+      this.#renameTeam(from, to, conflict);
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+    return changed;
+  }
+
+  /** New members get their deterministic thread; a removed member's row stays (harmless). */
+  setBotGroupMembers(key: string, members: string[]): void {
+    this.#db.prepare("UPDATE bot_groups SET members_json = ? WHERE key = ?").run(JSON.stringify(members), key);
+    for (const member of members) this.ensureBotGroupThread(key, member);
+  }
+
+  /** The room and member whose gateway-owned attach thread this is. */
+  botGroupMemberBySession(sessionId: string, member: string): { key: string; member: string } | undefined {
+    // By member too: a renamed member keeps its thread id (`group:<key>:<old name>`), so a new bot
+    // later given the old name in the same room derives the very same id.
+    return this.#db.prepare(
+      "SELECT group_key AS key, member FROM bot_group_members WHERE session_id = ? AND member = ? LIMIT 1",
+    ).get(sessionId, member) as { key: string; member: string } | undefined;
+  }
+
+  /** Stop: every pending turn of the room is cancelled, the same shape `deleteBotGroup` uses. */
+  cancelPendingBotGroupTurns(key: string, detail: string, completedAt: number): BotGroupTurnRow[] {
+    const pending = this.pendingBotGroupTurns().filter((turn) => turn.key === key);
+    this.#db.prepare(
+      "UPDATE bot_group_turns SET state = 'cancelled', detail = ?, completed_at = ? WHERE group_key = ? AND state = 'pending'",
+    ).run(detail, completedAt, key);
+    return pending;
+  }
+
+  /** Returns the gateway-owned attach thread for this member.  Older rooms gain the deterministic
+   * binding lazily, which is safe because it is scoped by the room key and never derived from a
+   * Dashboard session. */
+  ensureBotGroupThread(key: string, member: string): string {
+    const existing = this.#db.prepare(
+      "SELECT session_id AS sessionId FROM bot_group_members WHERE group_key = ? AND member = ?",
+    ).get(key, member) as { sessionId: string | null } | undefined;
+    if (existing?.sessionId !== null && existing?.sessionId !== undefined) return existing.sessionId;
+    const threadId = `group:${key}:${member}`;
+    this.#db.prepare(
+      `INSERT INTO bot_group_members (group_key, member, watermark, session_id) VALUES (?, ?, 0, ?)
+       ON CONFLICT(group_key, member) DO UPDATE SET session_id = excluded.session_id`,
+    ).run(key, member, threadId);
+    return threadId;
+  }
+
+  beginBotGroupTurn(turn: Omit<BotGroupTurnRow, "state" | "createdAt" | "completedAt" | "consumedAt" | "text" | "detail"> & { createdAt: number }): boolean {
+    this.#db.exec("SAVEPOINT group_turn");
+    try {
+      const active = this.#db.prepare(
+        "SELECT 1 FROM bot_group_turns WHERE group_key = ? AND state = 'pending' LIMIT 1",
+      ).get(turn.key);
+      if (active !== undefined) {
+        this.#db.exec("RELEASE group_turn");
+        return false;
+      }
+      this.#db.prepare(
+        `INSERT INTO bot_group_turns
+           (group_key, turn_id, member, agent_id, thread_id, message_id, epoch, watermark,
+            cause_kind, cause_seq, state, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      ).run(turn.key, turn.turnId, turn.member, turn.agentId, turn.threadId, turn.messageId, turn.epoch, turn.watermark,
+        turn.cause?.kind ?? null, turn.cause?.seq ?? null, turn.createdAt);
+      this.#db.exec("RELEASE group_turn");
+      return true;
+    } catch (err) {
+      this.#db.exec("ROLLBACK TO group_turn; RELEASE group_turn");
+      throw err;
+    }
+  }
+
+  botGroupTurnForAttach(agentId: string, threadId: string, turnId: string): BotGroupTurnRow | undefined {
+    const row = this.#db.prepare(
+      `SELECT group_key AS key, turn_id AS turnId, member, agent_id AS agentId, thread_id AS threadId,
+              message_id AS messageId, epoch, watermark, cause_kind AS causeKind, cause_seq AS causeSeq,
+              state, text, detail, created_at AS createdAt,
+              completed_at AS completedAt, consumed_at AS consumedAt
+       FROM bot_group_turns WHERE agent_id = ? AND thread_id = ? AND turn_id = ?`,
+    ).get(agentId, threadId, turnId) as Record<string, unknown> | undefined;
+    return row === undefined ? undefined : toBotGroupTurnRow(row);
+  }
+
+  completeBotGroupTurn(agentId: string, threadId: string, turnId: string, state: Exclude<BotGroupTurnRow["state"], "pending" | "timeout">, text: string | undefined, detail: string | undefined, completedAt: number): BotGroupTurnRow | undefined {
+    const prior = this.botGroupTurnForAttach(agentId, threadId, turnId);
+    if (prior === undefined) return undefined;
+    if (prior.state === "pending") {
+      this.#db.prepare(
+        `UPDATE bot_group_turns SET state = ?, text = ?, detail = ?, completed_at = ?
+         WHERE group_key = ? AND turn_id = ? AND state = 'pending'`,
+      ).run(state, text ?? null, detail ?? null, completedAt, prior.key, prior.turnId);
+    }
+    return this.botGroupTurnForAttach(agentId, threadId, turnId);
+  }
+
+  timeoutBotGroupTurn(key: string, turnId: string, detail: string, completedAt: number): void {
+    this.tasks.atomic(() => {
+      const changed = this.#db.prepare(
+        `UPDATE bot_group_turns SET state = 'timeout', detail = ?, completed_at = ?
+         WHERE group_key = ? AND turn_id = ? AND state = 'pending'`,
+      ).run(detail, completedAt, key, turnId).changes === 1;
+      const turn = changed ? this.botGroupTurn(key, turnId) : undefined;
+      if (turn !== undefined) this.tasks.nativeTerminal(turn.member, turn.threadId, turnId, "timed_out", completedAt);
+    });
+  }
+
+  botGroupTurn(key: string, turnId: string): BotGroupTurnRow | undefined {
+    const row = this.#db.prepare(
+      `SELECT group_key AS key, turn_id AS turnId, member, agent_id AS agentId, thread_id AS threadId,
+              message_id AS messageId, epoch, watermark, cause_kind AS causeKind, cause_seq AS causeSeq,
+              state, text, detail, created_at AS createdAt,
+              completed_at AS completedAt, consumed_at AS consumedAt
+       FROM bot_group_turns WHERE group_key = ? AND turn_id = ?`,
+    ).get(key, turnId) as Record<string, unknown> | undefined;
+    return row === undefined ? undefined : toBotGroupTurnRow(row);
+  }
+
+  /** Atomically assigns a completed settlement to one orchestrator. */
+  consumeBotGroupTurn(key: string, turnId: string, consumedAt: number): BotGroupTurnRow | undefined {
+    const row = this.botGroupTurn(key, turnId);
+    if (row === undefined || row.state === "pending" || row.consumedAt !== undefined) return undefined;
+    const changed = this.#db.prepare(
+      "UPDATE bot_group_turns SET consumed_at = ? WHERE group_key = ? AND turn_id = ? AND consumed_at IS NULL",
+    ).run(consumedAt, key, turnId).changes;
+    return changed === 1 ? { ...row, consumedAt } : undefined;
+  }
+
+  pendingBotGroupTurns(): BotGroupTurnRow[] {
+    const rows = this.#db.prepare(
+      `SELECT group_key AS key, turn_id AS turnId, member, agent_id AS agentId, thread_id AS threadId,
+              message_id AS messageId, epoch, watermark, cause_kind AS causeKind, cause_seq AS causeSeq,
+              state, text, detail, created_at AS createdAt,
+              completed_at AS completedAt, consumed_at AS consumedAt
+       FROM bot_group_turns WHERE state = 'pending'`,
+    ).all() as Record<string, unknown>[];
+    return rows.map(toBotGroupTurnRow);
+  }
+
+  /** Capability 88. A team role and every mention in another leader's `reports` follow the renamed
+   *  bot, as do both sides of its live assignments, so the old name keeps no authority a later bot
+   *  of that name could pick up. Called inside `renameBotState`'s transaction. */
+  #renameTeam(from: string, to: string, conflict: "REPLACE" | "IGNORE"): void {
+    this.#db.prepare(`UPDATE OR ${conflict} bot_team SET bot = ? WHERE bot = ?`).run(to, from);
+    this.#db.prepare("DELETE FROM bot_team WHERE bot = ?").run(from);
+    const rows = this.#db.prepare(`SELECT DISTINCT team.bot AS bot, team.reports_json AS reports FROM bot_team AS team, json_each(team.reports_json) AS report
+      WHERE report.value = ?`).all(from) as { bot: string; reports: string }[];
+    for (const row of rows) {
+      const reports = [...new Set((JSON.parse(row.reports) as string[]).map((name) => name === from ? to : name))].filter((name) => name !== row.bot);
+      this.#db.prepare("UPDATE bot_team SET reports_json = ? WHERE bot = ?").run(JSON.stringify(reports), row.bot);
+    }
+    // An idempotency key is scoped to one leader. Where both names used the same key, the moved
+    // row gives its key up rather than collide: its Task already exists and needs no replay.
+    this.#db.prepare(`UPDATE bot_assignments SET idempotency_key = NULL WHERE leader = ? AND idempotency_key IN
+      (SELECT idempotency_key FROM bot_assignments WHERE leader = ? AND idempotency_key IS NOT NULL)`).run(from, to);
+    this.#db.prepare("UPDATE bot_assignments SET leader = ? WHERE leader = ? AND leader_deleted_at IS NULL").run(to, from);
+    this.#db.prepare("UPDATE bot_assignments SET assignee = ? WHERE assignee = ? AND assignee_deleted_at IS NULL").run(to, from);
+  }
+
+  /** Capability 88. Only the assignee runs on its assignment thread, and never once the assignment
+   *  has failed: that Task is terminal and the leader assigns again. */
+  #assignmentRunnable(threadId: string, peer: string): boolean {
+    const row = this.botAssignmentByThread(threadId);
+    return row !== undefined && row.assignee === peer && row.assigneeDeletedAt === undefined && row.failure === undefined;
+  }
+
+  botTeam(bot: string): BotTeamRow | undefined {
+    const row = this.#db.prepare("SELECT bot, role, reports_json AS reports, updated_at AS updatedAt FROM bot_team WHERE bot = ?")
+      .get(bot) as { bot: string; role: BotTeamRow["role"]; reports: string; updatedAt: number } | undefined;
+    return row === undefined ? undefined : { ...row, reports: JSON.parse(row.reports) as string[] };
+  }
+
+  setBotTeam(row: BotTeamRow): void {
+    this.#db.prepare(`INSERT INTO bot_team (bot, role, reports_json, updated_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(bot) DO UPDATE SET role = excluded.role, reports_json = excluded.reports_json, updated_at = excluded.updated_at`)
+      .run(row.bot, row.role, JSON.stringify(row.reports), row.updatedAt);
+  }
+
+  /** The leaders whose `reports` name this bot. */
+  botTeamLeadersOf(report: string): string[] {
+    return (this.#db.prepare(`SELECT DISTINCT team.bot AS bot FROM bot_team AS team, json_each(team.reports_json) AS report
+      WHERE team.role = 'leader' AND report.value = ? ORDER BY team.bot`).all(report) as { bot: string }[]).map((row) => row.bot);
+  }
+
+  /** Every bot name the team and assignment rows hold, for the `previous_names` re-link. */
+  botTeamNames(): string[] {
+    return (this.#db.prepare(`SELECT bot AS name FROM bot_team
+      UNION SELECT report.value FROM bot_team, json_each(bot_team.reports_json) AS report
+      UNION SELECT leader FROM bot_assignments WHERE leader_deleted_at IS NULL
+      UNION SELECT assignee FROM bot_assignments WHERE assignee_deleted_at IS NULL`).all() as { name: string }[]).map((row) => row.name);
+  }
+
+  createBotAssignment(row: Omit<BotAssignmentRow, "updatedAt" | "resultJson" | "finalText" | "finalAt" | "finalTurnId" | "failure" | "cancelledBy" | "acknowledgedAt" | "acknowledgedOutcome">): void {
+    this.#db.prepare(`INSERT INTO bot_assignments (task_id, leader, assignee, thread_id, brief, done_criteria,
+        output_format, deadline_at, created_at, updated_at, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(row.taskId, row.leader, row.assignee, row.threadId, row.brief, row.doneCriteria, row.outputFormat ?? null,
+        row.deadlineAt, row.createdAt, row.createdAt, row.idempotencyKey ?? null);
+  }
+
+  botAssignment(taskId: string): BotAssignmentRow | undefined {
+    const row = this.#db.prepare(`${BOT_ASSIGNMENT_SELECT} WHERE task_id = ?`).get(taskId) as Record<string, unknown> | undefined;
+    return row === undefined ? undefined : toBotAssignmentRow(row);
+  }
+
+  botAssignmentByThread(threadId: string): BotAssignmentRow | undefined {
+    const row = this.#db.prepare(`${BOT_ASSIGNMENT_SELECT} WHERE thread_id = ?`).get(threadId) as Record<string, unknown> | undefined;
+    return row === undefined ? undefined : toBotAssignmentRow(row);
+  }
+
+  botAssignmentByKey(leader: string, idempotencyKey: string): BotAssignmentRow | undefined {
+    const row = this.#db.prepare(`${BOT_ASSIGNMENT_SELECT} WHERE leader = ? AND idempotency_key = ? AND leader_deleted_at IS NULL`).get(leader, idempotencyKey) as Record<string, unknown> | undefined;
+    return row === undefined ? undefined : toBotAssignmentRow(row);
+  }
+
+  /** Newest first. `participant` matches either side. A party that was deleted no longer matches
+   *  its own name, so a later bot of that name sees none of it. */
+  botAssignments(filter: { leader?: string; assignee?: string; participant?: string; createdSince?: number } = {}): BotAssignmentRow[] {
+    const where: string[] = [];
+    const params: Array<string | number> = [];
+    if (filter.createdSince !== undefined) { where.push("created_at >= ?"); params.push(filter.createdSince); }
+    if (filter.leader !== undefined) { where.push("leader = ? AND leader_deleted_at IS NULL"); params.push(filter.leader); }
+    if (filter.assignee !== undefined) { where.push("assignee = ? AND assignee_deleted_at IS NULL"); params.push(filter.assignee); }
+    if (filter.participant !== undefined) {
+      where.push("((leader = ? AND leader_deleted_at IS NULL) OR (assignee = ? AND assignee_deleted_at IS NULL))");
+      params.push(filter.participant, filter.participant);
+    }
+    const rows = this.#db.prepare(`${BOT_ASSIGNMENT_SELECT}${where.length === 0 ? "" : ` WHERE ${where.join(" AND ")}`}
+      ORDER BY created_at DESC, rowid DESC`).all(...params) as Record<string, unknown>[];
+    return rows.map(toBotAssignmentRow);
+  }
+
+  updateBotAssignment(taskId: string, patch: BotAssignmentPatch): void {
+    const entries = Object.entries(patch).filter(([, value]) => value !== undefined) as [keyof BotAssignmentPatch, string | number][];
+    this.#db.prepare(`UPDATE bot_assignments SET ${entries.map(([key]) => `${BOT_ASSIGNMENT_COLUMNS[key]} = ?`).join(", ")} WHERE task_id = ?`)
+      .run(...entries.map(([, value]) => value), taskId);
+  }
+
+  /** Durably queues one gateway→plugin command. Reusing commandId is idempotent and returns the
+   * original frame, which lets a caller safely retry after an ambiguous local failure. */
+  enqueueAttachCommand(
+    agentId: string,
+    commandId: string,
+    command: AttachV1Command,
+    createdAt: number,
+  ): AttachV1CommandFrame {
+    this.#db.exec("SAVEPOINT attach_enqueue");
+    try {
+      const prior = this.#db
+        .prepare(
+          `SELECT sequence, command_json AS commandJson FROM attach_command_outbox
+           WHERE agent_id = ? AND command_id = ?`,
+        )
+        .get(agentId, commandId) as { sequence: number; commandJson: string } | undefined;
+      if (prior !== undefined) {
+        this.#db.exec("RELEASE attach_enqueue");
+        return { kind: "command", sequence: prior.sequence, commandId, command: JSON.parse(prior.commandJson) as AttachV1Command };
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO attach_streams (agent_id, next_command_sequence, last_event_sequence, updated_at)
+           VALUES (?, 1, 0, ?) ON CONFLICT(agent_id) DO NOTHING`,
+        )
+        .run(agentId, createdAt);
+      const stream = this.#db
+        .prepare("SELECT next_command_sequence AS sequence FROM attach_streams WHERE agent_id = ?")
+        .get(agentId) as { sequence: number };
+      this.#db
+        .prepare(
+          `INSERT INTO attach_command_outbox
+             (agent_id, sequence, command_id, command_json, created_at, acked_at)
+           VALUES (?, ?, ?, ?, ?, NULL)`,
+        )
+        .run(agentId, stream.sequence, commandId, JSON.stringify(command), createdAt);
+      this.#db
+        .prepare("UPDATE attach_streams SET next_command_sequence = ?, updated_at = ? WHERE agent_id = ?")
+        .run(stream.sequence + 1, createdAt, agentId);
+      this.tasks.admit(agentId, command, createdAt);
+      this.#db.exec("RELEASE attach_enqueue");
+      return { kind: "command", sequence: stream.sequence, commandId, command };
+    } catch (err) {
+      this.#db.exec("ROLLBACK TO attach_enqueue; RELEASE attach_enqueue");
+      throw err;
+    }
+  }
+
+  enqueueTaskCommand(peer: string, commandId: string, command: AttachV1Command, at: number): boolean {
+    return this.tasks.atomic(() => {
+      if (command.kind === "turn") {
+        const run = this.tasks.run(peer, command.turnId);
+        const view = run === undefined ? undefined : this.tasks.read(run.taskId)?.view;
+        if (run === undefined || view === undefined || view.state !== "queued" || view.currentRun.runId !== command.turnId || view.pendingIntent?.command === "pause" || view.pendingIntent?.command === "cancel") return false;
+        if (view.room !== undefined) {
+          const previous = run.predecessorRunId === null ? undefined : this.botGroupTurnForAttach(peer, command.threadId, run.predecessorRunId);
+          const room = this.botGroup(view.room);
+          if (previous === undefined || room === undefined || !room.members.includes(view.bot)) return false;
+          if (this.botGroupTurnForAttach(peer, command.threadId, command.turnId) === undefined && !this.beginBotGroupTurn({ key: room.key, turnId: command.turnId, member: view.bot, agentId: peer, threadId: command.threadId, messageId: command.messageId, epoch: room.epoch, watermark: previous.watermark, ...(previous.cause === undefined ? {} : { cause: previous.cause }), createdAt: at })) return false;
+        } else if (this.nativeBotHasSession(view.bot, command.threadId)) {
+          const state = this.nativeChatConfiguration(view.bot, command.threadId);
+          if (state?.activeTurnId !== undefined && state.activeTurnId !== command.turnId) return false;
+          this.setNativeBotTurn(view.bot, command.threadId, command.turnId, at);
+          this.appendNativeBotMessage({ bot: view.bot, sessionId: command.threadId, messageId: command.messageId, role: "user", text: command.text, turnId: command.turnId, at });
+        // Capability 88: an assignment thread is gateway-owned too, and only its assignee may run on it.
+        } else if (this.threadById(command.threadId)?.agentId !== peer && !this.#assignmentRunnable(command.threadId, peer)) return false;
+      }
+      this.enqueueAttachCommand(peer, commandId, command, at);
+      return true;
+    });
+  }
+
+  pendingAttachCommands(agentId: string, afterSequence: number, limit: number): AttachV1CommandFrame[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT sequence, command_id AS commandId, command_json AS commandJson,
+                cancelled_at AS cancelledAt, cancel_reason AS cancelReason
+         FROM attach_command_outbox
+         WHERE agent_id = ? AND sequence > ? AND acked_at IS NULL
+         ORDER BY sequence LIMIT ?`,
+      )
+      .all(agentId, afterSequence, limit) as unknown as Array<{ sequence: number; commandId: string; commandJson: string; cancelledAt: number | null; cancelReason: string | null }>;
+    return rows.map((row) => ({
+      kind: "command",
+      sequence: row.sequence,
+      commandId: row.commandId,
+      command: row.cancelledAt === null
+        ? JSON.parse(row.commandJson) as AttachV1Command
+        : (() => {
+            const stored = JSON.parse(row.commandJson) as AttachV1Command;
+            return stored.kind === "discard" ? stored : {
+            kind: "discard" as const,
+            originalKind: stored.kind as Exclude<AttachV1Command["kind"], "discard">,
+            reason: row.cancelReason ?? "capability no longer negotiated",
+          };
+          })(),
+    }));
+  }
+
+  /** Capability 88. Cancels a turn command the peer has not acknowledged, through the same path a
+   *  Task cancel uses, so a peer that never took it never runs it. False when it was already taken. */
+  cancelUnackedTurn(agentId: string, turnId: string, reason: string, cancelledAt: number): boolean {
+    const row = this.#db.prepare(`SELECT sequence, command_id AS commandId FROM attach_command_outbox WHERE agent_id = ?
+      AND json_extract(command_json, '$.kind') = 'turn' AND json_extract(command_json, '$.turnId') = ?
+      AND acked_at IS NULL AND cancelled_at IS NULL`).get(agentId, turnId) as { sequence: number; commandId: string } | undefined;
+    if (row === undefined) return false;
+    this.cancelAttachCommand(agentId, row.sequence, row.commandId, reason, cancelledAt);
+    return true;
+  }
+
+  cancelAttachCommand(agentId: string, sequence: number, commandId: string, reason: string, cancelledAt: number): AttachV1CommandFrame | undefined {
+    return this.tasks.atomic(() => {
+    const prior = this.#db.prepare("SELECT command_json AS json FROM attach_command_outbox WHERE agent_id = ? AND sequence = ? AND command_id = ? AND acked_at IS NULL AND cancelled_at IS NULL").get(agentId, sequence, commandId) as { json: string } | undefined;
+    this.#db
+      .prepare(
+        `UPDATE attach_command_outbox
+         SET cancelled_at = COALESCE(cancelled_at, ?), cancel_reason = COALESCE(cancel_reason, ?)
+         WHERE agent_id = ? AND sequence = ? AND command_id = ? AND acked_at IS NULL`,
+      )
+      .run(cancelledAt, reason.slice(0, 512), agentId, sequence, commandId);
+    if (prior !== undefined) this.tasks.discarded(agentId, JSON.parse(prior.json) as AttachV1Command, cancelledAt);
+    return this.pendingAttachCommands(agentId, sequence - 1, 1)[0];
+    });
+  }
+
+  /** An unsupported negotiated capability turns a queued native resolution into a transport
+   * discard. Clear only its matching pending marker in the same transaction, so the card is
+   * actionable again instead of claiming a request Hermes can no longer receive. */
+  discardAttachCommandAndReopenNativeInteraction(
+    agentId: string,
+    sequence: number,
+    commandId: string,
+    reason: string,
+    cancelledAt: number,
+  ): AttachV1CommandFrame | undefined {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db
+        .prepare(
+          `UPDATE attach_command_outbox
+           SET cancelled_at = COALESCE(cancelled_at, ?), cancel_reason = COALESCE(cancel_reason, ?)
+           WHERE agent_id = ? AND sequence = ? AND command_id = ? AND acked_at IS NULL`,
+        )
+        .run(cancelledAt, reason.slice(0, 512), agentId, sequence, commandId);
+      this.#db
+        .prepare(
+          `UPDATE bot_native_interactions
+           SET resolution_command_id = NULL, resolution_requested_at = NULL,
+               requested_decision = NULL, requested_option_id = NULL
+           WHERE bot = ? AND resolution_command_id = ? AND status = 'pending'`,
+        )
+        .run(agentId, commandId);
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+    return this.pendingAttachCommands(agentId, sequence - 1, 1)[0];
+  }
+
+  attachCommandCancellation(agentId: string, sequence: number): { reason: string; cancelledAt: number } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT cancel_reason AS reason, cancelled_at AS cancelledAt
+         FROM attach_command_outbox WHERE agent_id = ? AND sequence = ? AND cancelled_at IS NOT NULL`,
+      )
+      .get(agentId, sequence) as { reason: string; cancelledAt: number } | undefined;
+    return row;
+  }
+
+  setAttachSessionDeletionCapability(agentId: string, supported: boolean, now: number): void {
+    this.#db.prepare(
+      `INSERT INTO attach_streams (agent_id, next_command_sequence, last_event_sequence, session_deletion_capability, updated_at)
+       VALUES (?, 1, 0, ?, ?)
+       ON CONFLICT(agent_id) DO UPDATE SET session_deletion_capability = excluded.session_deletion_capability, updated_at = excluded.updated_at`,
+    ).run(agentId, supported ? 1 : 0, now);
+  }
+
+  hasAttachSessionDeletionCapability(agentId: string): boolean {
+    return (this.#db.prepare("SELECT session_deletion_capability AS supported FROM attach_streams WHERE agent_id = ?")
+      .get(agentId) as { supported: number | null } | undefined)?.supported === 1;
+  }
+
+  ackAttachCommand(agentId: string, sequence: number, commandId: string, ackedAt: number): boolean {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#db.prepare("SELECT command_json AS json, cancelled_at AS cancelledAt FROM attach_command_outbox WHERE agent_id = ? AND sequence = ? AND command_id = ?").get(agentId, sequence, commandId) as { json: string; cancelledAt: number | null } | undefined;
+      const changed = this.#db.prepare("UPDATE attach_command_outbox SET acked_at = COALESCE(acked_at, ?) WHERE agent_id = ? AND sequence = ? AND command_id = ?").run(ackedAt, agentId, sequence, commandId).changes === 1;
+      if (row !== undefined && row.cancelledAt === null) this.tasks.acknowledged(agentId, JSON.parse(row.json) as AttachV1Command, ackedAt);
+      this.#db.exec("COMMIT");
+      return changed;
+    } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+  }
+
+  /** Reconciles a plugin's durable cursors after an ACK was lost or the gateway was reprovisioned.
+   * A stream absent from this gateway can safely begin at the authenticated plugin's durable
+   * cursors: there are no local commands or events to skip. Once a stream exists, refusing command
+   * cursors beyond the issued tail still prevents a corrupt peer from skipping future rows. */
+  reconcileAttachResume(
+    agentId: string,
+    eventThrough: number,
+    commandThrough: number,
+    reconciledAt: number,
+  ): boolean {
+    if (eventThrough < 0 || commandThrough < 0) return false;
+    const stream = this.#db
+      .prepare("SELECT 1 AS present FROM attach_streams WHERE agent_id = ?")
+      .get(agentId) as { present: number } | undefined;
+    if (stream === undefined) {
+      const command = this.#db
+        .prepare("SELECT 1 AS present FROM attach_command_outbox WHERE agent_id = ? LIMIT 1")
+        .get(agentId) as { present: number } | undefined;
+      if (command !== undefined) return false;
+      this.#db
+        .prepare(
+          `INSERT INTO attach_streams
+             (agent_id, next_command_sequence, last_event_sequence, updated_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(agentId, commandThrough + 1, eventThrough, reconciledAt);
+      return true;
+    }
+    const row = this.#db
+      .prepare(
+        `SELECT COALESCE(
+           MAX(sequence),
+           (SELECT next_command_sequence - 1 FROM attach_streams WHERE agent_id = ?),
+           0
+         ) AS sequence
+         FROM attach_command_outbox WHERE agent_id = ?`,
+      )
+      .get(agentId, agentId) as { sequence: number };
+    if (commandThrough > row.sequence) return false;
+    return this.tasks.atomic(() => {
+      const admitted = this.#db.prepare("SELECT command_json AS json FROM attach_command_outbox WHERE agent_id = ? AND sequence <= ? AND acked_at IS NULL AND cancelled_at IS NULL ORDER BY sequence").all(agentId, commandThrough) as unknown as { json: string }[];
+      this.#db.prepare("UPDATE attach_command_outbox SET acked_at = COALESCE(acked_at, ?) WHERE agent_id = ? AND sequence <= ?").run(reconciledAt, agentId, commandThrough);
+      for (const command of admitted) this.tasks.acknowledged(agentId, JSON.parse(command.json) as AttachV1Command, reconciledAt);
+      return true;
+    });
+  }
+
+  attachCommandCursor(agentId: string): number {
+    const row = this.#db
+      .prepare(
+        `SELECT COALESCE(
+           MIN(CASE WHEN acked_at IS NULL THEN sequence END) - 1,
+           MAX(sequence),
+           (SELECT next_command_sequence - 1 FROM attach_streams WHERE agent_id = ?),
+           0
+         ) AS sequence
+         FROM attach_command_outbox WHERE agent_id = ?`,
+      )
+      .get(agentId, agentId) as { sequence: number };
+    return row.sequence;
+  }
+
+  attachEventCursor(agentId: string): number {
+    const row = this.#db
+      .prepare("SELECT last_event_sequence AS sequence FROM attach_streams WHERE agent_id = ?")
+      .get(agentId) as { sequence: number } | undefined;
+    return row?.sequence ?? 0;
+  }
+
+  /** Durable attach-v1 observability with no frame payloads or identity details. */
+  attachHealth(): {
+    lastEventAt: number | null;
+    lastTerminalAt: number | null;
+    queueDepth: number;
+    deadLetters: number;
+    pluginOutboxDepth: number;
+    pluginOldestEventAgeMs: number;
+    pluginLastAckProgressAt: number | null;
+    pluginCommandInboxDepth: number;
+  } {
+    return this.#db.prepare(
+      `SELECT
+         (SELECT received_at FROM attach_event_inbox
+          INDEXED BY attach_event_inbox_received_at_desc
+          ORDER BY received_at DESC LIMIT 1) AS lastEventAt,
+         (SELECT MAX(at) FROM (
+            SELECT received_at AS at FROM (
+              SELECT received_at FROM attach_turn_terminals
+              INDEXED BY attach_turn_terminals_received_at_desc
+              WHERE received_at IS NOT NULL
+              ORDER BY received_at DESC LIMIT 1
+            )
+            UNION ALL SELECT completed_at AS at FROM (
+              SELECT completed_at FROM bot_native_turn_terminals
+              INDEXED BY bot_native_turn_terminals_completed_at_desc
+              ORDER BY completed_at DESC LIMIT 1
+            )
+         )) AS lastTerminalAt,
+         (SELECT COUNT(*) FROM attach_command_outbox WHERE acked_at IS NULL) AS queueDepth,
+         (SELECT COUNT(*) FROM attach_event_inbox
+          WHERE disposition = 'accepted' AND dead_lettered_at IS NOT NULL) AS deadLetters,
+         (SELECT COALESCE(SUM(plugin_event_outbox_depth), 0) FROM attach_streams) AS pluginOutboxDepth,
+         (SELECT COALESCE(MAX(plugin_oldest_event_age_ms), 0) FROM attach_streams) AS pluginOldestEventAgeMs,
+         (SELECT MAX(plugin_last_ack_progress_at) FROM attach_streams) AS pluginLastAckProgressAt,
+         (SELECT COALESCE(SUM(plugin_command_inbox_depth), 0) FROM attach_streams) AS pluginCommandInboxDepth`,
+    ).get() as {
+      lastEventAt: number | null;
+      lastTerminalAt: number | null;
+      queueDepth: number;
+      deadLetters: number;
+      pluginOutboxDepth: number;
+      pluginOldestEventAgeMs: number;
+      pluginLastAckProgressAt: number | null;
+      pluginCommandInboxDepth: number;
+    };
+  }
+
+  /** One attach peer's durable counters. Missing plugin telemetry remains unknown. */
+  attachPeerHealth(agentId: string) {
+    return this.#db.prepare(`SELECT
+      (SELECT COUNT(*) FROM attach_command_outbox WHERE agent_id = ? AND acked_at IS NULL) AS queueDepth,
+      (SELECT COUNT(*) FROM attach_event_inbox INDEXED BY attach_event_inbox_dead_letter_barrier
+       WHERE agent_id = ? AND disposition = 'accepted' AND dead_lettered_at IS NOT NULL) AS deadLetters,
+      (SELECT plugin_event_outbox_depth FROM attach_streams WHERE agent_id = ?) AS pluginOutboxDepth,
+      (SELECT plugin_oldest_event_age_ms FROM attach_streams WHERE agent_id = ?) AS pluginOldestEventAgeMs,
+      (SELECT plugin_last_ack_progress_at FROM attach_streams WHERE agent_id = ?) AS pluginLastAckProgressAt,
+      (SELECT plugin_event_ack_cursor FROM attach_streams WHERE agent_id = ?) AS pluginAckCursor,
+      (SELECT plugin_command_inbox_depth FROM attach_streams WHERE agent_id = ?) AS pluginCommandInboxDepth`)
+      .get(agentId, agentId, agentId, agentId, agentId, agentId, agentId) as {
+        queueDepth: number; deadLetters: number; pluginOutboxDepth: number | null;
+        pluginOldestEventAgeMs: number | null; pluginLastAckProgressAt: number | null; pluginAckCursor: number | null; pluginCommandInboxDepth: number | null;
+      };
+  }
+
+  /** Persist only bounded spool counters from an authenticated control frame. The gateway owns
+   * progress time: a plugin-reported clock can be skewed, while a higher durable cursor is proof. */
+  recordAttachTelemetry(agentId: string, telemetry: AttachV1Telemetry, receivedAt: number): {
+    eventOutboxDepth: number;
+    lastAckProgressAt: number;
+  } {
+    this.#db
+      .prepare(
+        `INSERT INTO attach_streams
+           (agent_id, next_command_sequence, last_event_sequence, plugin_event_outbox_depth,
+            plugin_oldest_event_age_ms, plugin_event_ack_cursor, plugin_last_ack_progress_at,
+            plugin_command_inbox_depth, updated_at)
+         VALUES (?, 1, 0, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(agent_id) DO UPDATE SET
+           plugin_event_outbox_depth = excluded.plugin_event_outbox_depth,
+           plugin_oldest_event_age_ms = excluded.plugin_oldest_event_age_ms,
+           plugin_last_ack_progress_at = CASE
+             WHEN attach_streams.plugin_event_ack_cursor IS NULL
+               OR attach_streams.plugin_last_ack_progress_at IS NULL
+               OR (COALESCE(attach_streams.plugin_event_outbox_depth, 0) = 0
+                   AND excluded.plugin_event_outbox_depth > 0)
+               OR excluded.plugin_event_ack_cursor > attach_streams.plugin_event_ack_cursor
+             THEN excluded.plugin_last_ack_progress_at
+             ELSE attach_streams.plugin_last_ack_progress_at
+           END,
+           plugin_event_ack_cursor = excluded.plugin_event_ack_cursor,
+           plugin_command_inbox_depth = excluded.plugin_command_inbox_depth,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        agentId, telemetry.eventOutboxDepth, telemetry.oldestEventAgeMs, telemetry.eventAckCursor,
+        receivedAt, telemetry.commandInboxDepth, receivedAt,
+      );
+    const row = this.#db
+      .prepare(
+        `SELECT plugin_event_outbox_depth AS eventOutboxDepth,
+                plugin_last_ack_progress_at AS lastAckProgressAt
+         FROM attach_streams WHERE agent_id = ?`,
+      )
+      .get(agentId) as { eventOutboxDepth: number; lastAckProgressAt: number | null };
+    return { eventOutboxDepth: row.eventOutboxDepth, lastAckProgressAt: row.lastAckProgressAt ?? receivedAt };
+  }
+
+  attachQueueHealth(agentId: string, now: number): { depth: number; oldestAgeMs: number } {
+    const row = this.#db.prepare(
+      `SELECT COUNT(*) AS depth, MIN(created_at) AS oldestAt
+       FROM attach_command_outbox WHERE agent_id = ? AND acked_at IS NULL`,
+    ).get(agentId) as { depth: number; oldestAt: number | null };
+    return { depth: row.depth, oldestAgeMs: row.oldestAt === null ? 0 : Math.max(0, now - row.oldestAt) };
+  }
+
+  /** Inbox admission is the ACK boundary. Sequence must be contiguous; duplicates by eventId are
+   * harmless; and a terminal transition seals its turn so late turn events are journaled/ACKed but
+   * never applied. Delegation lifecycle is the one exception: async children can settle after their
+   * parent turn seals, and the data plane applies those updates idempotently. */
+  acceptAttachEvent(
+    agentId: string,
+    frame: AttachV1EventFrame,
+    receivedAt: number,
+    discardReason?: AttachV1DiscardReason,
+  ): AttachEventAdmission {
+    return this.acceptAttachEvents(agentId, [{ frame, receivedAt, ...(discardReason === undefined ? {} : { discardReason }) }])[0]!;
+  }
+
+  /** Admits a contiguous prefix in one durable commit. A gap or conflict ends the prefix, so no
+   * later frame is accepted beyond the result the peer must repair. */
+  acceptAttachEvents(
+    agentId: string,
+    entries: readonly { frame: AttachV1EventFrame; receivedAt: number; discardReason?: AttachV1DiscardReason }[],
+  ): AttachEventAdmission[] {
+    if (entries.length === 0) return [];
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const outcomes: AttachEventAdmission[] = [];
+      for (const entry of entries) {
+        const outcome = this.#acceptAttachEvent(agentId, entry.frame, entry.receivedAt, entry.discardReason);
+        outcomes.push(outcome);
+        if (outcome.status === "gap" || outcome.status === "conflict") break;
+      }
+      this.#db.exec("COMMIT");
+      return outcomes;
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  #acceptAttachEvent(
+    agentId: string,
+    frame: AttachV1EventFrame,
+    receivedAt: number,
+    discardReason?: AttachV1DiscardReason,
+  ): AttachEventAdmission {
+    const duplicate = this.#db
+      .prepare("SELECT sequence FROM attach_event_inbox WHERE agent_id = ? AND event_id = ?")
+      .get(agentId, frame.eventId) as { sequence: number } | undefined;
+    if (duplicate !== undefined)
+      return duplicate.sequence === frame.sequence
+        ? { status: "duplicate", acknowledgedSequence: duplicate.sequence }
+        : { status: "conflict", acknowledgedSequence: duplicate.sequence };
+    this.#db
+      .prepare(
+        `INSERT INTO attach_streams (agent_id, next_command_sequence, last_event_sequence, updated_at)
+         VALUES (?, 1, 0, ?) ON CONFLICT(agent_id) DO NOTHING`,
+      )
+      .run(agentId, receivedAt);
+    const stream = this.#db
+      .prepare("SELECT last_event_sequence AS sequence FROM attach_streams WHERE agent_id = ?")
+      .get(agentId) as { sequence: number };
+    if (frame.sequence !== stream.sequence + 1)
+      return frame.sequence <= stream.sequence
+        ? { status: "conflict", acknowledgedSequence: stream.sequence }
+        : { status: "gap", expectedSequence: stream.sequence + 1, receivedSequence: frame.sequence };
+    const quarantine = (reason: AttachV1DiscardReason): AttachEventAdmission => {
+      this.#db
+        .prepare(
+          `INSERT INTO attach_event_inbox
+             (agent_id, sequence, event_id, frame_json, received_at, disposition,
+              projection_error, applied_at, dead_lettered_at)
+           VALUES (?, ?, ?, ?, ?, 'discarded', ?, ?, ?)`,
+        )
+        .run(
+          agentId, frame.sequence, frame.eventId, JSON.stringify(frame), receivedAt,
+          reason, receivedAt, receivedAt,
+        );
+      this.#db
+        .prepare("UPDATE attach_streams SET last_event_sequence = ?, updated_at = ? WHERE agent_id = ?")
+        .run(frame.sequence, receivedAt, agentId);
+      return { status: "discarded", acknowledgedSequence: frame.sequence, reason };
+    };
+    if (discardReason !== undefined) return quarantine(discardReason);
+    const event = frame.event;
+    const turnId = "turnId" in event ? event.turnId : undefined;
+    const terminal = (event.kind === "commit" && event.continues !== true) || event.kind === "failed" || event.kind === "cancelled" || event.kind === "interrupted";
+    const sealed = turnId === undefined
+      ? undefined
+      : (this.#db.prepare("SELECT event_id AS eventId FROM attach_turn_terminals WHERE agent_id = ? AND turn_id = ?").get(agentId, turnId) as { eventId: string } | undefined);
+    let disposition: "accepted" | "ignored_terminal" | "ignored_delivery" =
+      sealed === undefined || event.kind === "delegation" ? "accepted" : "ignored_terminal";
+    if (event.kind === "scheduled") {
+      const prior = this.#db
+        .prepare(
+          `SELECT delivery.thread_id AS threadId, delivery.message_id AS messageId,
+                  inbox.frame_json AS frameJson
+           FROM attach_scheduled_deliveries AS delivery
+           JOIN attach_event_inbox AS inbox
+             ON inbox.agent_id = delivery.agent_id AND inbox.event_id = delivery.event_id
+           WHERE delivery.agent_id = ? AND delivery.delivery_id = ?`,
+        )
+        .get(agentId, event.deliveryId) as { threadId: string; messageId: string; frameJson: string } | undefined;
+      if (prior !== undefined) {
+        const first = JSON.parse(prior.frameJson) as AttachV1EventFrame;
+        const firstScheduled = first.event.kind === "scheduled" ? first.event : undefined;
+        const sameTarget = firstScheduled !== undefined
+          && ("target" in firstScheduled) === ("target" in event)
+          && ("target" in event || ("threadId" in firstScheduled && firstScheduled.threadId === event.threadId));
+        if (prior.messageId !== event.messageId || !sameTarget)
+          return { status: "conflict", acknowledgedSequence: stream.sequence };
+        disposition = "ignored_delivery";
+      } else {
+        // `agentId` is the authenticated attach identity. Check the active native-session
+        // pointer while this same IMMEDIATE transaction holds admission, not only in ingress:
+        // a /new selection between a precheck and this write must not deliver to the old chat.
+        if (!("target" in event)) {
+          const selected = this.#db
+            .prepare("SELECT session_id AS sessionId FROM bot_native_chats WHERE bot = ?")
+            .get(agentId) as { sessionId: string } | undefined;
+          // Core threads share this attach identity but are authorized by the server's core
+          // thread lookup. Only a known native-session id is constrained by this local pointer.
+          if (
+            selected !== undefined &&
+            selected.sessionId !== event.threadId &&
+            this.nativeBotHasSession(agentId, event.threadId)
+          ) return quarantine("unauthorized_target");
+        }
+        // This is inside the admission transaction, so /new cannot race a semantic home event
+        // between its selection and its durable delivery binding.
+        const threadId = "target" in event
+          ? this.nativeBotChat(agentId, receivedAt).sessionId
+          : event.threadId;
+        this.#db
+          .prepare(
+            `INSERT INTO attach_scheduled_deliveries
+               (agent_id, delivery_id, thread_id, message_id, event_id, projected_at)
+             VALUES (?, ?, ?, ?, ?, NULL)`,
+          )
+          .run(agentId, event.deliveryId, threadId, event.messageId, frame.eventId);
+      }
+    }
+    this.#db
+      .prepare(
+        `INSERT INTO attach_event_inbox
+           (agent_id, sequence, event_id, frame_json, received_at, disposition, applied_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL)`,
+      )
+      .run(agentId, frame.sequence, frame.eventId, JSON.stringify(frame), receivedAt, disposition);
+    if (terminal && sealed === undefined) {
+      this.#db
+        .prepare(
+          `INSERT INTO attach_turn_terminals
+             (agent_id, turn_id, event_id, terminal_kind, message_id, sequence, received_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(agentId, event.turnId, frame.eventId, event.kind, event.messageId, frame.sequence, receivedAt);
+    }
+    this.#db
+      .prepare("UPDATE attach_streams SET last_event_sequence = ?, updated_at = ? WHERE agent_id = ?")
+      .run(frame.sequence, receivedAt, agentId);
+    if (disposition === "accepted") this.tasks.event(agentId, frame, receivedAt);
+    return { status: disposition, acknowledgedSequence: frame.sequence };
+  }
+
+  markAttachEventApplied(agentId: string, eventId: string, appliedAt: number): void {
+    this.markAttachEventsApplied(agentId, [eventId], appliedAt);
+  }
+
+  markAttachEventsApplied(agentId: string, eventIds: readonly string[], appliedAt: number): void {
+    if (eventIds.length === 0) return;
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const markInbox = this.#db.prepare("UPDATE attach_event_inbox SET applied_at = ? WHERE agent_id = ? AND event_id = ?");
+      const markDelivery = this.#db.prepare("UPDATE attach_scheduled_deliveries SET projected_at = COALESCE(projected_at, ?) WHERE agent_id = ? AND event_id = ?");
+      for (const eventId of eventIds) {
+        markInbox.run(appliedAt, agentId, eventId);
+        markDelivery.run(appliedAt, agentId, eventId);
+      }
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  /** Reclaims copied attach transport payloads after their projected facts have aged out of the
+   * diagnostic window. Rows themselves remain as sequence/event-id tombstones. A bounded pass
+   * reads at most 256 source keys before proving terminal/active safety, then permits at most 4 MiB
+   * of selected source JSON (or one larger valid row) before rewriting its removable fields. */
+  compactAttachPayloads(now: number): number {
+    const cutoff = now - ATTACH_PAYLOAD_RETENTION_MS;
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      type Cursor = { appliedAt: number; agentId: string; sequence: number };
+      type Source = Cursor & { eventId: string };
+      const cursor = this.#db.prepare(
+        `SELECT at AS appliedAt, key_1 AS agentId, CAST(key_2 AS INTEGER) AS sequence
+         FROM storage_retention_cursors WHERE pass = 'attach_payload'`,
+      ).get() as Cursor | undefined;
+      const after = cursor === undefined ? "" : " AND (applied_at, agent_id, sequence) > (?, ?, CAST(? AS INTEGER))";
+      const source = this.#db.prepare(
+        `SELECT applied_at AS appliedAt, agent_id AS agentId, sequence, event_id AS eventId
+         FROM attach_event_inbox INDEXED BY attach_event_inbox_payload_compaction
+         WHERE disposition = 'accepted' AND applied_at < ? AND dead_lettered_at IS NULL
+           AND json_valid(frame_json) AND (${ATTACH_PAYLOAD_COMPACTION_CANDIDATE})${after}
+         ORDER BY applied_at, agent_id, sequence
+         LIMIT ?`,
+      ).all(
+        cutoff,
+        ...(cursor === undefined ? [] : [cursor.appliedAt, cursor.agentId, String(cursor.sequence)]),
+        ATTACH_PAYLOAD_COMPACTION_BATCH,
+      ) as Source[];
+      if (source.length === 0) {
+        this.#db.prepare("DELETE FROM storage_retention_cursors WHERE pass = 'attach_payload'").run();
+      }
+      const eligible = this.#db.prepare(
+        `SELECT json_extract(frame_json, '$.event.kind') AS kind,
+                length(CAST(frame_json AS BLOB)) AS bytes
+           FROM attach_event_inbox
+          WHERE agent_id = ? AND event_id = ?
+            AND disposition = 'accepted' AND applied_at < ? AND dead_lettered_at IS NULL
+            AND json_valid(frame_json) AND (${ATTACH_PAYLOAD_COMPACTION_CANDIDATE})
+            AND (
+              json_type(frame_json, '$.event.turnId') IS NULL
+              OR (
+                EXISTS (
+                  SELECT 1 FROM attach_turn_terminals AS terminal
+                   WHERE terminal.agent_id = attach_event_inbox.agent_id
+                     AND terminal.turn_id = json_extract(attach_event_inbox.frame_json, '$.event.turnId')
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM bot_native_sessions AS active
+                   WHERE active.bot = attach_event_inbox.agent_id
+                     AND active.active_turn_id = json_extract(attach_event_inbox.frame_json, '$.event.turnId')
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM chat_executions AS execution
+                  JOIN bot_native_sessions AS active
+                    ON active.bot = execution.bot AND active.session_id = execution.session_id
+                   WHERE execution.execution_id = attach_event_inbox.agent_id
+                     AND active.active_turn_id = json_extract(attach_event_inbox.frame_json, '$.event.turnId')
+                )
+              )
+            )`,
+      );
+      let compacted = 0;
+      let selectedBytes = 0;
+      let inspected: Source | undefined;
+      const updates = new Map<AttachPayloadCompactionKind, ReturnType<DatabaseSync["prepare"]>>();
+      for (const row of source) {
+        const candidate = eligible.get(row.agentId, row.eventId, cutoff) as {
+          kind: string; bytes: number;
+        } | undefined;
+        if (candidate === undefined) {
+          inspected = row;
+          continue;
+        }
+        if (selectedBytes > 0 && selectedBytes + candidate.bytes > ATTACH_PAYLOAD_COMPACTION_MAX_BYTES) break;
+        const kind = candidate.kind as AttachPayloadCompactionKind;
+        const fields = ATTACH_PAYLOAD_COMPACTION_FIELDS[kind];
+        let update = updates.get(kind);
+        if (update === undefined) {
+          update = this.#db.prepare(
+            `UPDATE attach_event_inbox SET frame_json = json_remove(frame_json, ${fields.map((field) => `'${field}'`).join(", ")}) WHERE agent_id = ? AND event_id = ?`,
+          );
+          updates.set(kind, update);
+        }
+        compacted += Number(update.run(row.agentId, row.eventId).changes);
+        selectedBytes += candidate.bytes;
+        inspected = row;
+      }
+      if (inspected !== undefined) {
+        this.#db.prepare(
+          `INSERT INTO storage_retention_cursors (pass, at, key_1, key_2, key_3)
+           VALUES ('attach_payload', ?, ?, ?, '')
+           ON CONFLICT(pass) DO UPDATE SET at = excluded.at, key_1 = excluded.key_1,
+             key_2 = excluded.key_2, key_3 = excluded.key_3`,
+        ).run(inspected.appliedAt, inspected.agentId, String(inspected.sequence));
+      }
+      this.#db.exec("COMMIT");
+      return compacted;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  recordAttachProjectionFailure(agentId: string, eventId: string, error: string, failedAt: number, maxAttempts: number): { attempts: number; deadLettered: boolean } {
+    this.#db
+      .prepare(
+        `UPDATE attach_event_inbox
+         SET projection_attempts = projection_attempts + 1,
+             projection_error = ?,
+             dead_lettered_at = CASE WHEN projection_attempts + 1 >= ? THEN COALESCE(dead_lettered_at, ?) ELSE dead_lettered_at END
+         WHERE agent_id = ? AND event_id = ? AND applied_at IS NULL`,
+      )
+      .run(error.slice(0, 512), maxAttempts, failedAt, agentId, eventId);
+    const row = this.#db
+      .prepare(
+        `SELECT projection_attempts AS attempts, dead_lettered_at AS deadLetteredAt
+         FROM attach_event_inbox WHERE agent_id = ? AND event_id = ?`,
+      )
+      .get(agentId, eventId) as { attempts: number; deadLetteredAt: number | null };
+    return { attempts: row.attempts, deadLettered: row.deadLetteredAt !== null };
+  }
+
+  attachProjectionFailure(agentId: string, eventId: string): { attempts: number; error?: string; deadLetteredAt?: number } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT projection_attempts AS attempts, projection_error AS error, dead_lettered_at AS deadLetteredAt
+         FROM attach_event_inbox WHERE agent_id = ? AND event_id = ?`,
+      )
+      .get(agentId, eventId) as { attempts: number; error: string | null; deadLetteredAt: number | null } | undefined;
+    if (row === undefined) return undefined;
+    return { attempts: row.attempts, ...(row.error === null ? {} : { error: row.error }), ...(row.deadLetteredAt === null ? {} : { deadLetteredAt: row.deadLetteredAt }) };
+  }
+
+  releaseAttachProjectionDeadLetter(agentId: string, eventId: string): boolean {
+    const earliest = this.#db
+      .prepare(
+        `SELECT event_id AS eventId FROM attach_event_inbox
+         INDEXED BY attach_event_inbox_dead_letter_barrier
+         WHERE agent_id = ? AND disposition = 'accepted' AND dead_lettered_at IS NOT NULL
+         ORDER BY sequence LIMIT 1`,
+      )
+      .get(agentId) as { eventId: string } | undefined;
+    if (earliest?.eventId !== eventId) return false;
+    return this.#db
+      .prepare(
+        `UPDATE attach_event_inbox
+         SET projection_attempts = 0, projection_error = NULL, dead_lettered_at = NULL
+         WHERE agent_id = ? AND event_id = ? AND disposition = 'accepted' AND applied_at IS NULL`,
+      )
+      .run(agentId, eventId).changes === 1;
+  }
+
+  unappliedAttachEvents(agentId: string, limit = 256): AttachV1EventFrame[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT frame_json AS frameJson FROM attach_event_inbox
+         INDEXED BY attach_event_inbox_unapplied
+         WHERE agent_id = ? AND disposition = 'accepted' AND applied_at IS NULL
+           AND dead_lettered_at IS NULL
+           AND sequence < COALESCE(
+             (SELECT MIN(blocked.sequence) FROM attach_event_inbox AS blocked
+              INDEXED BY attach_event_inbox_dead_letter_barrier
+              WHERE blocked.agent_id = ? AND blocked.disposition = 'accepted'
+                AND blocked.dead_lettered_at IS NOT NULL),
+             9223372036854775807
+           )
+         ORDER BY sequence LIMIT ?`,
+      )
+      .all(agentId, agentId, limit) as unknown as Array<{ frameJson: string }>;
+    return rows.map((row) => JSON.parse(row.frameJson) as AttachV1EventFrame);
+  }
+
+  /** Operator surface (issue #193): the projection dead letters currently blocking streams. */
+  attachProjectionDeadLetters(): Array<{
+    agentId: string; sequence: number; eventId: string; kind: string;
+    attempts: number; error: string | null; deadLetteredAt: number; receivedAt: number;
+  }> {
+    return this.#db
+      .prepare(
+        `SELECT agent_id AS agentId, sequence, event_id AS eventId,
+                json_extract(frame_json, '$.event.kind') AS kind,
+                projection_attempts AS attempts, projection_error AS error,
+                dead_lettered_at AS deadLetteredAt, received_at AS receivedAt
+         FROM attach_event_inbox
+         WHERE disposition = 'accepted' AND dead_lettered_at IS NOT NULL AND applied_at IS NULL
+         ORDER BY agent_id, sequence`,
+      )
+      .all() as unknown as Array<{
+        agentId: string; sequence: number; eventId: string; kind: string;
+        attempts: number; error: string | null; deadLetteredAt: number; receivedAt: number;
+      }>;
+  }
+
+  attachTurnCommand(agentId: string, turnId: string): { threadId: string; messageId: string } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT command_json AS commandJson FROM attach_command_outbox
+         INDEXED BY attach_command_outbox_turn_lookup
+         WHERE agent_id = ? AND cancelled_at IS NULL AND json_valid(command_json)
+           AND json_extract(command_json, '$.kind') = 'turn'
+           AND json_extract(command_json, '$.turnId') = ?
+         ORDER BY sequence DESC LIMIT 1`,
+      )
+      .get(agentId, turnId) as { commandJson: string } | undefined;
+    if (row === undefined) return undefined;
+    const command = JSON.parse(row.commandJson) as Extract<AttachV1Command, { kind: "turn" }>;
+    return { threadId: command.threadId, messageId: command.messageId };
+  }
+
+  /** Applied evidence for a reported sealed interim commit. The `(agent_id, event_id)` lookup is
+   * exact and indexed; matching the embedded turn id prevents a peer from using another turn's
+   * event as terminal proof. Health reports alone never mutate terminal state. */
+  attachTurnSealEvidence(agentId: string, turnId: string, eventId: string): {
+    kind: string;
+    continues?: boolean;
+    disposition: string;
+  } | undefined {
+    const row = this.#db.prepare(
+      `SELECT json_extract(frame_json, '$.event.kind') AS kind,
+              json_extract(frame_json, '$.event.continues') AS continues,
+              disposition
+         FROM attach_event_inbox
+        WHERE agent_id = ? AND event_id = ? AND applied_at IS NOT NULL
+          AND json_extract(frame_json, '$.event.turnId') = ?`,
+    ).get(agentId, eventId, turnId) as { kind: string | null; continues: number | null; disposition: string } | undefined;
+    if (row?.kind === null || row === undefined) return undefined;
+    return {
+      kind: row.kind,
+      ...(row.continues === null ? {} : { continues: row.continues === 1 }),
+      disposition: row.disposition,
+    };
+  }
+
+  /** Durable delivery evidence for one native turn. ACK proves the plugin accepted the command;
+   * absent ACK keeps the user-visible state queued without inventing a timeout. */
+  nativeBotTurnDelivery(agentId: string, turnId: string): {
+    sequence: number;
+    commandId: string;
+    queuedAt: number;
+    acknowledgedAt: number | null;
+  } | undefined {
+    return this.#db
+      .prepare(
+        `SELECT sequence, command_id AS commandId, created_at AS queuedAt, acked_at AS acknowledgedAt
+         FROM attach_command_outbox
+         WHERE agent_id = ? AND cancelled_at IS NULL
+           AND json_extract(command_json, '$.kind') = 'turn'
+           AND json_extract(command_json, '$.turnId') = ?
+         ORDER BY sequence DESC LIMIT 1`,
+      )
+      .get(agentId, turnId) as {
+      sequence: number;
+      commandId: string;
+      queuedAt: number;
+      acknowledgedAt: number | null;
+    } | undefined;
+  }
+
+  recordNativeBotTerminal(input: {
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    status: "completed" | "failed" | "interrupted" | "timed_out";
+    cause?: "cancelled" | "verification_unavailable";
+    completedAt: number;
+  }): void {
+    this.tasks.atomic(() => {
+    this.#db
+      .prepare(
+        `INSERT INTO bot_native_turn_terminals
+           (bot, session_id, turn_id, status, cause, completed_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(bot, turn_id) DO NOTHING`,
+      )
+      .run(
+        input.bot,
+        input.sessionId,
+        input.turnId,
+        input.status,
+        input.cause ?? null,
+        input.completedAt,
+      );
+    this.tasks.nativeTerminal(input.bot, input.sessionId, input.turnId, input.status, input.completedAt, input.cause);
+    });
+  }
+
+  nativeBotTurnTerminal(bot: string, sessionId: string, turnId: string): {
+    status: "completed" | "failed" | "interrupted" | "timed_out";
+    cause?: "cancelled" | "verification_unavailable";
+  } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT status, cause FROM bot_native_turn_terminals
+         WHERE bot = ? AND session_id = ? AND turn_id = ?`,
+      )
+      .get(bot, sessionId, turnId) as {
+        status: "completed" | "failed" | "interrupted" | "timed_out";
+        cause: "cancelled" | "verification_unavailable" | null;
+      } | undefined;
+    return row === undefined
+      ? undefined
+      : { status: row.status, ...(row.cause === null ? {} : { cause: row.cause }) };
+  }
+
+  /** Last durable terminal for a native session, including a gateway deadline before any plugin
+   * event exists. */
+  nativeBotLastTerminal(agentId: string, sessionId: string): {
+    status: "completed" | "failed" | "interrupted" | "timed_out";
+    cause?: "cancelled" | "verification_unavailable";
+  } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT status, cause FROM bot_native_turn_terminals
+         WHERE bot = ? AND session_id = ? ORDER BY completed_at DESC LIMIT 1`,
+      )
+      .get(agentId, sessionId) as {
+      status: "completed" | "failed" | "interrupted" | "timed_out";
+      cause: "cancelled" | "verification_unavailable" | null;
+    } | undefined;
+    return row === undefined
+      ? undefined
+      : {
+          status: row.status,
+          ...(row.cause === null ? {} : { cause: row.cause }),
+        };
+  }
+
+  attachScheduledDelivery(agentId: string, deliveryId: string): { threadId: string; messageId: string; projectedAt: number | null } | undefined {
+    return this.#db
+      .prepare(
+        `SELECT thread_id AS threadId, message_id AS messageId, projected_at AS projectedAt
+         FROM attach_scheduled_deliveries WHERE agent_id = ? AND delivery_id = ?`,
+      )
+      .get(agentId, deliveryId) as { threadId: string; messageId: string; projectedAt: number | null } | undefined;
+  }
+
+  /** Binds a committed turn reply's message to the delivery id its plugin keyed the attachments
+   * under. Only called for a reply that actually carries attachments: a text-only turn has no
+   * media lifecycle to close, so binding it would only put a receipt on the wire that nothing
+   * reads. First write wins, matching the receipt itself. */
+  bindTurnMediaDelivery(bot: string, messageId: string, deliveryId: string): void {
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO bot_turn_media_deliveries (bot, message_id, delivery_id)
+         VALUES (?, ?, ?)`,
+      )
+      .run(bot, messageId, deliveryId);
+  }
+
+  /** Records that a device put these bot rows on screen. First write wins: a later report for an
+   * id that already has a receipt changes nothing, and an id naming no durable row is ignored
+   * rather than refused, so a device replaying an offline queue never gets stuck on a batch it
+   * cannot repair.
+   *
+   * The delivery join belongs here, in the same transaction as the write, so a caller cannot see
+   * a receipt without also seeing the delivery binding it just closed. Both kinds of delivery are
+   * joined: a scheduled occurrence, and a turn reply that carried media. Emitting the attach
+   * command is deliberately NOT this layer's job. */
+  recordBotMessageDisplayed(
+    bot: string,
+    messageIds: readonly string[],
+    deviceId: string,
+    at: number,
+    /** Capability 73. What the person waited and which network they were on, both measured on the
+     * phone. Stored on the receipt rather than only folded into the observation ring so a receipt
+     * read back later still says what it was, and never mixed into a gateway-measured hop. */
+    perceived?: { feltLatencyMs?: number; networkPath?: string; vpn?: boolean; edgeRttMs?: number; edgeColo?: string },
+  ): { recorded: number; deliveries: Array<{ deliveryId: string; messageId: string }> } {
+    const insert = this.#db.prepare(
+      `INSERT OR IGNORE INTO bot_message_receipts (bot, message_id, displayed_at, device_id, felt_latency_ms, network_path, vpn, edge_rtt_ms, edge_colo)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE EXISTS (SELECT 1 FROM bot_native_messages WHERE bot = ? AND message_id = ?)`,
+    );
+    const feltLatencyMs = perceived?.feltLatencyMs ?? null;
+    const networkPath = perceived?.networkPath ?? null;
+    const vpn = perceived?.vpn === undefined ? null : perceived.vpn ? 1 : 0;
+    const edgeRttMs = perceived?.edgeRttMs ?? null;
+    const edgeColo = perceived?.edgeColo ?? null;
+    const binding = this.#db.prepare(
+      `SELECT delivery_id AS deliveryId FROM attach_scheduled_deliveries
+       WHERE agent_id = ? AND message_id = ?`,
+    );
+    const turnBinding = this.#db.prepare(
+      `SELECT delivery_id AS deliveryId FROM bot_turn_media_deliveries
+       WHERE bot = ? AND message_id = ?`,
+    );
+    const deliveries: Array<{ deliveryId: string; messageId: string }> = [];
+    const displayed: string[] = [];
+    let recorded = 0;
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const messageId of new Set(messageIds)) {
+        if (insert.run(bot, messageId, at, deviceId, feltLatencyMs, networkPath, vpn, edgeRttMs, edgeColo, bot, messageId).changes !== 1) continue;
+        recorded += 1;
+        displayed.push(messageId);
+        const bound = (binding.get(bot, messageId) ?? turnBinding.get(bot, messageId)) as
+          { deliveryId: string } | undefined;
+        if (bound !== undefined) deliveries.push({ deliveryId: bound.deliveryId, messageId });
+      }
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+    // Capability 65. The device reported these rows on screen, which is receipt for any Artifact
+    // the gateway derived from their attachments. It stays outside the receipt transaction: an
+    // acknowledgement that could not be written must never lose the receipt that earned it.
+    for (const messageId of displayed) this.artifacts.acknowledgeMessage(bot, messageId, at);
+    return { recorded, deliveries };
+  }
+
+  botMessageReceipt(bot: string, messageId: string): {
+    displayedAt: number; deviceId: string; feltLatencyMs: number | null; networkPath: string | null;
+    vpn: boolean | null; edgeRttMs: number | null; edgeColo: string | null;
+  } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT displayed_at AS displayedAt, device_id AS deviceId,
+                felt_latency_ms AS feltLatencyMs, network_path AS networkPath,
+                vpn, edge_rtt_ms AS edgeRttMs, edge_colo AS edgeColo
+         FROM bot_message_receipts WHERE bot = ? AND message_id = ?`,
+      )
+      .get(bot, messageId) as {
+        displayedAt: number; deviceId: string; feltLatencyMs: number | null; networkPath: string | null;
+        vpn: number | null; edgeRttMs: number | null; edgeColo: string | null;
+      } | undefined;
+    return row === undefined ? undefined : { ...row, vpn: row.vpn === null ? null : row.vpn === 1 };
+  }
+
+  /** Read the admitted event's existing durable records; it intentionally performs no projection
+   * or mutation, so an agent can distinguish pending admission from a visible transcript row. */
+  attachScheduledDeliveryReceipt(agentId: string, deliveryId: string): AttachScheduledDeliveryReceipt | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT delivery.thread_id AS threadId, delivery.message_id AS messageId,
+                inbox.frame_json AS frameJson, inbox.received_at AS admittedAt,
+                inbox.applied_at AS projectedAt, inbox.projection_attempts AS attempts,
+                inbox.dead_lettered_at AS deadLetteredAt, inbox.disposition AS disposition,
+                inbox.projection_error AS projectionError,
+                receipt.displayed_at AS displayedAt,
+                message.attachments_json AS attachmentsJson
+         FROM attach_scheduled_deliveries AS delivery
+         JOIN attach_event_inbox AS inbox
+           ON inbox.agent_id = delivery.agent_id AND inbox.event_id = delivery.event_id
+         LEFT JOIN bot_message_receipts AS receipt
+           ON receipt.bot = delivery.agent_id AND receipt.message_id = delivery.message_id
+         LEFT JOIN bot_native_messages AS message
+           ON message.bot = delivery.agent_id AND message.message_id = delivery.message_id
+         WHERE delivery.agent_id = ? AND delivery.delivery_id = ?`,
+      )
+      .get(agentId, deliveryId) as {
+        threadId: string; messageId: string; frameJson: string; admittedAt: number;
+        projectedAt: number | null; attempts: number; deadLetteredAt: number | null;
+        disposition: string; projectionError: string | null; displayedAt: number | null;
+        attachmentsJson: string | null;
+      } | undefined;
+    if (row === undefined) return undefined;
+    const frame = JSON.parse(row.frameJson) as AttachV1EventFrame;
+    const semanticHome = frame.event.kind === "scheduled" && "target" in frame.event;
+    const target = semanticHome
+      ? { kind: "canonical_home" as const, sessionId: row.threadId }
+      : { kind: "thread" as const, threadId: row.threadId };
+    // One terminal fact, and displayed outranks failed: a row a human read is delivered no matter
+    // what the pipeline had to survive to put it there.
+    const reason = row.projectionError === null ? undefined : row.projectionError.slice(0, 256);
+    const terminal: AttachScheduledDeliveryReceipt["terminal"] =
+      row.displayedAt !== null
+        ? { state: "displayed", at: row.displayedAt }
+        : row.disposition === "discarded"
+          ? { state: "failed", stage: "authorization", ...(reason === undefined ? {} : { reason }), at: row.admittedAt }
+          : row.deadLetteredAt !== null
+            ? { state: "failed", stage: "projection", ...(reason === undefined ? {} : { reason }), at: row.deadLetteredAt }
+            : undefined;
+    const extras = {
+      ...(row.displayedAt === null ? {} : { displayedAt: row.displayedAt }),
+      ...(terminal === undefined ? {} : { terminal }),
+    };
+    const expectedMediaIds = frame.event.kind === "scheduled" && frame.event.mediaIds?.length
+      ? frame.event.mediaIds.slice(0, 16)
+      : undefined;
+    const committedMediaIds = row.projectedAt === null || row.attachmentsJson === null
+      ? []
+      : (JSON.parse(row.attachmentsJson) as BotChatAttachment[])
+        .flatMap((attachment) => typeof attachment.fileId === "string" ? [attachment.fileId] : []);
+    const media = expectedMediaIds === undefined
+      ? {}
+      : {
+        expectedMediaIds,
+        committedMediaIds,
+        mediaVerified: row.projectedAt !== null
+          && expectedMediaIds.length === committedMediaIds.length
+          && expectedMediaIds.every((mediaId, index) => mediaId === committedMediaIds[index]),
+      };
+    if (row.projectedAt !== null) {
+      return {
+        deliveryId, messageId: row.messageId, target,
+        state: "projected", admittedAt: row.admittedAt, projectedAt: row.projectedAt, ...extras, ...media,
+      };
+    }
+    if (row.deadLetteredAt !== null) {
+      return {
+        deliveryId, messageId: row.messageId, target,
+        state: "blocked", admittedAt: row.admittedAt, attempts: row.attempts,
+        deadLetteredAt: row.deadLetteredAt, ...extras, ...media,
+      };
+    }
+    return {
+      deliveryId, messageId: row.messageId, target,
+      state: "admitted", admittedAt: row.admittedAt, ...extras, ...media,
+    };
+  }
+
+  saveAttachMedia(
+    agentId: string,
+    descriptor: AttachV1MediaDescriptor,
+    bytes: Uint8Array,
+    createdAt: number,
+  ): boolean {
+    const descriptorJson = JSON.stringify(descriptor);
+    try {
+      this.#db
+        .prepare(
+          `INSERT INTO attach_media
+             (agent_id, media_id, descriptor_json, mime, size, sha256, bytes, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          agentId,
+          descriptor.mediaId,
+          descriptorJson,
+          descriptor.mimeType,
+          bytes.byteLength,
+          descriptor.sha256,
+          bytes,
+          createdAt,
+          descriptor.expiresAt ?? null,
+        );
+      return true;
+    } catch {
+      const existing = this.#db
+        .prepare(
+          `SELECT descriptor_json AS descriptorJson FROM attach_media
+           WHERE agent_id = ? AND media_id = ?`,
+        )
+        .get(agentId, descriptor.mediaId) as { descriptorJson: string } | undefined;
+      if (existing?.descriptorJson === descriptorJson) return false;
+      throw new Error("attach media id already exists");
+    }
+  }
+
+  /** Roll back one just-created attach row when its command could not be admitted. */
+  deleteAttachMedia(agentId: string, mediaId: string): void {
+    this.#db
+      .prepare("DELETE FROM attach_media WHERE agent_id = ? AND media_id = ?")
+      .run(agentId, mediaId);
+  }
+
+  /** Reclaim only rows whose producer explicitly gave them a retention deadline. Attach-plugin
+   * descriptors without `expiresAt` remain under the plugin's existing retention policy. */
+  pruneExpiredAttachMedia(now: number): number {
+    return Number(
+      this.#db
+        .prepare(
+          `DELETE FROM attach_media WHERE expires_at IS NOT NULL AND expires_at <= ?
+             AND NOT EXISTS (SELECT 1 FROM artifacts
+               WHERE artifacts.created_by = attach_media.agent_id AND artifacts.media_id = attach_media.media_id)`,
+        )
+        .run(now)
+        .changes,
+    );
+  }
+
+  /** Delete only media that cannot yet be reached from any durable attach event or native
+   * transcript. This is the rollback half of an atomic producer occurrence; a referenced object
+   * is deliberately retained rather than turning a successfully committed attachment into a 404. */
+  deleteUnreferencedAttachMedia(agentId: string, mediaId: string): "deleted" | "absent" | "referenced" {
+    const exists = this.#db
+      .prepare("SELECT 1 FROM attach_media WHERE agent_id = ? AND media_id = ?")
+      .get(agentId, mediaId) !== undefined;
+    if (!exists) return "absent";
+    const referenced = this.#db
+      .prepare(
+        `SELECT 1
+           WHERE EXISTS (
+             SELECT 1 FROM attach_event_inbox AS inbox, json_each(inbox.frame_json, '$.event.mediaIds') AS media
+             WHERE inbox.agent_id = ? AND media.value = ?
+           )
+           OR EXISTS (
+             SELECT 1 FROM bot_native_messages AS message, json_each(message.attachments_json) AS attachment
+             WHERE message.bot = ? AND json_extract(attachment.value, '$.fileId') = ?
+           )
+           OR EXISTS (
+             SELECT 1 FROM artifacts WHERE created_by = ? AND media_id = ?
+           )`,
+      )
+      .get(agentId, mediaId, agentId, mediaId, agentId, mediaId) !== undefined;
+    if (referenced) return "referenced";
+    this.#db
+      .prepare("DELETE FROM attach_media WHERE agent_id = ? AND media_id = ?")
+      .run(agentId, mediaId);
+    return "deleted";
+  }
+
+  attachMediaInfo(
+    agentId: string,
+    mediaId: string,
+    now: number,
+  ): { descriptor: AttachV1MediaDescriptor; mime: string; size: number; sha256: string } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT descriptor_json AS descriptorJson, mime, size, sha256 FROM attach_media
+         WHERE agent_id = ? AND media_id = ? AND (expires_at IS NULL OR expires_at > ?)`,
+      )
+      .get(agentId, mediaId, now) as { descriptorJson: string; mime: string; size: number; sha256: string } | undefined;
+    return row === undefined ? undefined : { descriptor: JSON.parse(row.descriptorJson) as AttachV1MediaDescriptor, mime: row.mime, size: row.size, sha256: row.sha256 };
+  }
+
+  attachMediaSlice(agentId: string, mediaId: string, start: number, length: number, now: number): Uint8Array | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT substr(bytes, ?, ?) AS bytes FROM attach_media
+         WHERE agent_id = ? AND media_id = ? AND (expires_at IS NULL OR expires_at > ?)`,
+      )
+      .get(start + 1, length, agentId, mediaId, now) as { bytes: Uint8Array } | undefined;
+    return row?.bytes;
+  }
+
+  /** Return the selected local conversation, creating the first empty conversation on demand. */
+  nativeBotChat(bot: string, now: number): { sessionId: string; created: boolean; activeTurnId?: string } {
+    const selected = this.#db
+      .prepare(
+        `SELECT chat.session_id AS sessionId, chat.updated_at AS updatedAt,
+                session.session_id IS NOT NULL AS hasSession, session.active_turn_id AS activeTurnId
+         FROM bot_native_chats AS chat
+         LEFT JOIN bot_native_sessions AS session ON session.bot = chat.bot AND session.session_id = chat.session_id
+         WHERE chat.bot = ?`,
+      )
+      .get(bot) as { sessionId: string; updatedAt: number; hasSession: number; activeTurnId: string | null } | undefined;
+    if (selected === undefined) {
+      const sessionId = this.#insertNativeBotSession(bot, now);
+      this.#db.prepare("INSERT INTO bot_native_chats (bot, session_id, updated_at) VALUES (?, ?, ?)").run(bot, sessionId, now);
+      return { sessionId, created: true };
+    }
+    if (selected.hasSession === 0) {
+      // A manually damaged pointer names no session row. The open-time migration already restored
+      // every legacy companion row with its turn, so the only honest repair left is an idle row.
+      this.#db
+        .prepare("INSERT OR IGNORE INTO bot_native_sessions (bot, session_id, created_at, updated_at, active_turn_id) VALUES (?, ?, ?, ?, NULL)")
+        .run(bot, selected.sessionId, selected.updatedAt, selected.updatedAt);
+    }
+    return { sessionId: selected.sessionId, created: false, ...(selected.activeTurnId === null ? {} : { activeTurnId: selected.activeTurnId }) };
+  }
+
+  /** Mint and select a fresh empty local conversation. `reset` and `new session` intentionally
+   * share this primitive: the wire distinguishes them by frame type, not by storage semantics. */
+  resetNativeBotChat(bot: string, now: number): string {
+    const sessionId = this.#insertNativeBotSession(bot, now);
+    this.#db
+      .prepare(
+        `INSERT INTO bot_native_chats (bot, session_id, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(bot) DO UPDATE SET session_id = excluded.session_id, updated_at = excluded.updated_at`,
+      )
+      .run(bot, sessionId, now);
+    return sessionId;
+  }
+
+  /** The session-scoped configuration is intentionally read without creating a chat pointer. */
+  nativeChatConfiguration(bot: string, sessionId: string): {
+    workspace: ChatWorkspaceSelection | null;
+    model: ChatModelSelection | null;
+    workspaceLocked: boolean;
+    explicitlyConfigured: boolean;
+    activeTurnId?: string;
+  } | undefined {
+    const session = this.#db.prepare(
+      "SELECT active_turn_id AS activeTurnId FROM bot_native_sessions WHERE bot = ? AND session_id = ?",
+    ).get(bot, sessionId) as { activeTurnId: string | null } | undefined;
+    if (session === undefined) return undefined;
+    const row = this.#db.prepare(
+      `SELECT workspace_json AS workspaceJson, model_json AS modelJson, workspace_locked AS workspaceLocked,
+              explicitly_configured AS explicitlyConfigured
+       FROM bot_chat_configurations WHERE bot = ? AND session_id = ?`,
+    ).get(bot, sessionId) as {
+      workspaceJson: string | null; modelJson: string | null; workspaceLocked: number; explicitlyConfigured: number;
+    } | undefined;
+    return {
+      workspace: row?.workspaceJson === null || row?.workspaceJson === undefined
+        ? null : JSON.parse(row.workspaceJson) as ChatWorkspaceSelection,
+      model: row?.modelJson === null || row?.modelJson === undefined
+        ? null : JSON.parse(row.modelJson) as ChatModelSelection,
+      workspaceLocked: row?.workspaceLocked === 1,
+      explicitlyConfigured: row?.explicitlyConfigured === 1,
+      ...(session.activeTurnId === null ? {} : { activeTurnId: session.activeTurnId }),
+    };
+  }
+
+  nativeChatWorkspaceDefault(bot: string): ChatWorkspaceSelection | null {
+    const row = this.#db.prepare(
+      "SELECT workspace_json AS workspaceJson FROM bot_chat_workspace_defaults WHERE bot = ?",
+    ).get(bot) as { workspaceJson: string } | undefined;
+    return row === undefined ? null : JSON.parse(row.workspaceJson) as ChatWorkspaceSelection;
+  }
+
+  /** Newest live assignment for this exact local session. Historical deleted assignments remain
+   * addressable by execution id so retry/replacement cannot silently retarget a past turn. */
+  chatExecution(bot: string, sessionId: string): ChatExecutionRow | undefined {
+    const row = this.#db.prepare(
+      `SELECT execution_id AS executionId, bot, session_id AS sessionId, runner_id AS runnerId,
+              token, operation_id AS operationId, workspace_json AS workspaceJson, stage,
+              model_json AS modelJson, source_profile_json AS sourceProfileJson,
+              launch_model_json AS launchModelJson, harness, created_at AS createdAt
+       FROM chat_executions
+       WHERE bot = ? AND session_id = ? AND stage != 'deleted'
+       ORDER BY created_at DESC, execution_id DESC LIMIT 1`,
+    ).get(bot, sessionId) as ChatExecutionDbRow | undefined;
+    return row === undefined ? undefined : chatExecution(row);
+  }
+
+  chatExecutionById(executionId: string): ChatExecutionRow | undefined {
+    const row = this.#db.prepare(
+      `SELECT execution_id AS executionId, bot, session_id AS sessionId, runner_id AS runnerId,
+              token, operation_id AS operationId, workspace_json AS workspaceJson, stage,
+              model_json AS modelJson, source_profile_json AS sourceProfileJson,
+              launch_model_json AS launchModelJson, harness, created_at AS createdAt
+       FROM chat_executions WHERE execution_id = ?`,
+    ).get(executionId) as ChatExecutionDbRow | undefined;
+    return row === undefined ? undefined : chatExecution(row);
+  }
+
+  chatExecutions(): ChatExecutionRow[] {
+    return (this.#db.prepare(
+      `SELECT execution_id AS executionId, bot, session_id AS sessionId, runner_id AS runnerId,
+              token, operation_id AS operationId, workspace_json AS workspaceJson, stage,
+              model_json AS modelJson, source_profile_json AS sourceProfileJson,
+              launch_model_json AS launchModelJson, harness, created_at AS createdAt FROM chat_executions ORDER BY created_at, execution_id`,
+    ).all() as unknown as ChatExecutionDbRow[]).map(chatExecution);
+  }
+
+  /** Execution identity, placement, token, operation and workspace never mutate in place. */
+  saveChatExecution(row: ChatExecutionRow): void {
+    this.#db.prepare(
+      `INSERT OR IGNORE INTO chat_executions
+         (execution_id, bot, session_id, runner_id, token, operation_id, workspace_json,
+          model_json, source_profile_json, launch_model_json, harness, stage, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(row.executionId, row.bot, row.sessionId, row.runnerId, row.token, row.operationId,
+      JSON.stringify(row.workspace), row.model === undefined ? null : JSON.stringify(row.model),
+      row.sourceProfile === undefined ? null : JSON.stringify(row.sourceProfile),
+      row.launchModel === undefined ? null : JSON.stringify(row.launchModel), row.harness ?? "cozyagents", row.stage, row.createdAt);
+  }
+
+  /** Only an authenticated matching runner delete receipt releases this durable cleanup row. */
+  completeChatExecutionDeletion(executionId: string): void {
+    this.#db.prepare("DELETE FROM chat_executions WHERE execution_id = ? AND stage = 'deleted'").run(executionId);
+  }
+
+  setChatExecutionStage(executionId: string, stage: ChatExecutionRow["stage"]): void {
+    this.#db.prepare("UPDATE chat_executions SET stage = ? WHERE execution_id = ?").run(stage, executionId);
+  }
+
+  /** Atomically guard the selected session and its current turn before accepting a patch. */
+  updateNativeChatConfiguration(input: {
+    bot: string;
+    sessionId: string;
+    workspace?: ChatWorkspaceSelection | null;
+    model?: ChatModelSelection | null;
+    now: number;
+  }): NativeChatConfigurationUpdate {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const selected = this.#db.prepare(
+        "SELECT session_id AS sessionId FROM bot_native_chats WHERE bot = ?",
+      ).get(input.bot) as { sessionId: string } | undefined;
+      if (selected === undefined) { this.#db.exec("COMMIT"); return { outcome: "not_found" }; }
+      if (selected.sessionId !== input.sessionId) { this.#db.exec("COMMIT"); return { outcome: "stale_session" }; }
+      const current = this.nativeChatConfiguration(input.bot, input.sessionId);
+      if (current === undefined) { this.#db.exec("COMMIT"); return { outcome: "not_found" }; }
+      if (input.workspace !== undefined && current.workspaceLocked) {
+        const same = JSON.stringify(input.workspace) === JSON.stringify(current.workspace);
+        if (!same) { this.#db.exec("COMMIT"); return { outcome: "workspace_locked" }; }
+      }
+      if (input.model !== undefined && current.activeTurnId !== undefined) {
+        this.#db.exec("COMMIT");
+        return { outcome: "turn_active" };
+      }
+      const workspace = input.workspace === undefined ? current.workspace : input.workspace;
+      const model = input.model === undefined ? current.model : input.model;
+      this.#db.prepare(
+        `INSERT INTO bot_chat_configurations
+           (bot, session_id, workspace_json, model_json, workspace_locked, explicitly_configured, updated_at)
+         VALUES (?, ?, ?, ?, ?, 1, ?)
+         ON CONFLICT(bot, session_id) DO UPDATE SET workspace_json = excluded.workspace_json,
+           model_json = excluded.model_json, explicitly_configured = 1, updated_at = excluded.updated_at`,
+      ).run(
+        input.bot, input.sessionId,
+        workspace === null ? null : JSON.stringify(workspace),
+        model === null ? null : JSON.stringify(model),
+        current.workspaceLocked ? 1 : 0, input.now,
+      );
+      this.#db.exec("COMMIT");
+      return { outcome: "updated", workspace, model };
+    } catch (error) {
+      try { this.#db.exec("ROLLBACK"); } catch { /* transaction already closed */ }
+      throw error;
+    }
+  }
+
+  /** Called by the turn admission owner, after the user turn is durably accepted. */
+  lockNativeChatWorkspace(bot: string, sessionId: string, now: number): boolean {
+    const session = this.#db.prepare(
+      "SELECT 1 AS found FROM bot_native_sessions WHERE bot = ? AND session_id = ?",
+    ).get(bot, sessionId) as { found: number } | undefined;
+    if (session === undefined) return false;
+    this.#db.prepare(
+      `INSERT INTO bot_chat_configurations
+         (bot, session_id, workspace_json, model_json, workspace_locked, updated_at)
+       VALUES (?, ?, NULL, NULL, 1, ?)
+       ON CONFLICT(bot, session_id) DO UPDATE SET workspace_locked = 1, updated_at = excluded.updated_at`,
+    ).run(bot, sessionId, now);
+    return true;
+  }
+
+  /** Only a successful adapter preparation becomes the bot's next-new-chat default. */
+  setNativeChatWorkspaceDefault(bot: string, workspace: ChatWorkspaceSelection, now: number): void {
+    this.#db.prepare(
+      `INSERT INTO bot_chat_workspace_defaults (bot, workspace_json, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(bot) DO UPDATE SET workspace_json = excluded.workspace_json, updated_at = excluded.updated_at`,
+    ).run(bot, JSON.stringify(workspace), now);
+  }
+
+  /** Stage an explicit Hermes desktop adoption. This does NOT select the local chat: selection
+   * follows only the plugin's source/profile-checked confirmation event. A previously confirmed
+   * binding is deliberately re-staged with a fresh proof nonce: the plugin's raw-session mapping
+   * is process-local, so a later explicit adoption cannot trust an old confirmation after that
+   * plugin reconnects or restarts. */
+  stageNativeDesktopResume(bot: string, hermesSessionId: string, now: number): {
+    sessionId: string; resumeId: string; status: "pending" | "resumed";
+  } {
+    const prior = this.#db.prepare(
+      `SELECT session_id AS sessionId, resume_id AS resumeId, status
+       FROM bot_desktop_resume_bindings WHERE bot = ? AND hermes_session_id = ?`,
+    ).get(bot, hermesSessionId) as {
+      sessionId: string; resumeId: string; status: "pending" | "resumed";
+    } | undefined;
+    if (prior !== undefined) {
+      // Keep an in-flight proof stable so a retry observes the same command, but never treat a
+      // persisted positive proof as evidence about the currently attached plugin process.
+      if (prior.status === "pending") return prior;
+      const resumeId = randomUUID();
+      this.#db.prepare(
+        `UPDATE bot_desktop_resume_bindings
+         SET resume_id = ?, status = 'pending', confirmed_at = NULL
+         WHERE bot = ? AND hermes_session_id = ? AND session_id = ? AND status = 'resumed'`,
+      ).run(resumeId, bot, hermesSessionId, prior.sessionId);
+      return { sessionId: prior.sessionId, resumeId, status: "pending" };
+    }
+    const sessionId = this.#insertNativeBotSession(bot, now);
+    const resumeId = randomUUID();
+    this.#db.prepare(
+      `INSERT INTO bot_desktop_resume_bindings
+       (bot, hermes_session_id, session_id, resume_id, status, created_at, confirmed_at)
+       VALUES (?, ?, ?, ?, 'pending', ?, NULL)`,
+    ).run(bot, hermesSessionId, sessionId, resumeId, now);
+    return { sessionId, resumeId, status: "pending" };
+  }
+
+  /** Confirm an exact plugin-side switch. The full triple makes stale/replayed confirmations
+   * harmless and prevents a raw Hermes id from being rebound to a different local session. */
+  confirmNativeDesktopResume(input: {
+    bot: string; hermesSessionId: string; sessionId: string; resumeId: string; now: number;
+  }): { previousSessionId: string; selectionChanged: boolean } | undefined {
+    const row = this.#db.prepare(
+      `SELECT status FROM bot_desktop_resume_bindings
+       WHERE bot = ? AND hermes_session_id = ? AND session_id = ? AND resume_id = ?`,
+    ).get(input.bot, input.hermesSessionId, input.sessionId, input.resumeId) as {
+      status: "pending" | "resumed";
+    } | undefined;
+    if (row === undefined) return undefined;
+    const current = this.nativeBotChat(input.bot, input.now);
+    if (row.status === "resumed") {
+      return { previousSessionId: current.sessionId, selectionChanged: false };
+    }
+    if (current.activeTurnId !== undefined) return undefined;
+    this.#db.prepare(
+      `UPDATE bot_desktop_resume_bindings SET status = 'resumed', confirmed_at = ?
+       WHERE bot = ? AND hermes_session_id = ? AND session_id = ? AND resume_id = ? AND status = 'pending'`,
+    ).run(input.now, input.bot, input.hermesSessionId, input.sessionId, input.resumeId);
+    this.#db.prepare(
+      `INSERT INTO bot_native_chats (bot, session_id, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(bot) DO UPDATE SET session_id = excluded.session_id, updated_at = excluded.updated_at`,
+    ).run(input.bot, input.sessionId, input.now);
+    return {
+      previousSessionId: current.sessionId,
+      selectionChanged: current.sessionId !== input.sessionId,
+    };
+  }
+
+  nativeDesktopResumeAt(bot: string, hermesSessionId: string): number | undefined {
+    return (this.#db.prepare(
+      `SELECT confirmed_at AS confirmedAt FROM bot_desktop_resume_bindings
+       WHERE bot = ? AND hermes_session_id = ? AND status = 'resumed'`,
+    ).get(bot, hermesSessionId) as { confirmedAt: number | null } | undefined)?.confirmedAt ?? undefined;
+  }
+
+  /** Reverse the private Hermes-to-gateway bridge for the selected chat. This exposes neither id
+   * on a wire; it lets the gateway prove that its current local pin already represents the newest
+   * source-qualified interactive session and avoid a redundant adoption event. */
+  nativeDesktopResumeBinding(bot: string, sessionId: string): {
+    hermesSessionId: string; status: "pending" | "resumed";
+  } | undefined {
+    return this.#db.prepare(
+      `SELECT hermes_session_id AS hermesSessionId, status
+       FROM bot_desktop_resume_bindings WHERE bot = ? AND session_id = ?`,
+    ).get(bot, sessionId) as {
+      hermesSessionId: string; status: "pending" | "resumed";
+    } | undefined;
+  }
+
+  /** Real conversational activity for cross-surface recency. A freshly-created empty gateway
+   * placeholder has no activity and must not outrank an existing Desktop/TUI/CLI conversation just
+   * because the placeholder was allocated a few milliseconds later. */
+  nativeBotSessionActivityAt(bot: string, sessionId: string): number | undefined {
+    return (this.#db.prepare(
+      `SELECT MAX(at) AS activityAt FROM bot_native_messages
+       WHERE bot = ? AND session_id = ?`,
+    ).get(bot, sessionId) as { activityAt: number | null }).activityAt ?? undefined;
+  }
+
+  /** A sync row from a TUI-origin lane is accepted only after this exact, durable adoption proof.
+   * It deliberately does not consult the active-session pointer: mirroring history must never
+   * select a chat or disturb an in-flight turn. */
+  hasConfirmedNativeDesktopResume(bot: string, hermesSessionId: string, sessionId: string): boolean {
+    return this.#db.prepare(
+      `SELECT 1 AS found FROM bot_desktop_resume_bindings
+       WHERE bot = ? AND hermes_session_id = ? AND session_id = ? AND status = 'resumed'`,
+    ).get(bot, hermesSessionId, sessionId) !== undefined;
+  }
+
+  nativeBotSessions(bot: string, limit: number): Array<{
+    id: string; startedAt: number; lastActiveAt: number; title?: string; preview?: string;
+  }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT session_id AS id, created_at AS startedAt, updated_at AS lastActiveAt
+         FROM bot_native_sessions WHERE bot = ?
+         ORDER BY updated_at DESC, created_at DESC, session_id DESC LIMIT ?`,
+      )
+      .all(bot, limit) as unknown as Array<{ id: string; startedAt: number; lastActiveAt: number }>;
+    const latestMessage = this.#db.prepare(
+      `SELECT text FROM bot_native_messages
+       WHERE bot = ? AND session_id = ? AND trim(text) <> ''
+       ORDER BY seq DESC LIMIT 1`,
+    );
+    return rows.map((row) => {
+      const preview = (latestMessage.get(bot, row.id) as { text: string } | undefined)?.text.trim();
+      return { ...row, title: "Bot Chat", ...(preview === undefined || preview.length === 0 ? {} : { preview }) };
+    });
+  }
+
+  nativeBotSessionOwner(sessionId: string): string | undefined {
+    return (this.#db
+      .prepare("SELECT bot FROM bot_native_sessions WHERE session_id = ? LIMIT 1")
+      .get(sessionId) as { bot: string } | undefined)?.bot;
+  }
+
+  nativeBotHasSession(bot: string, sessionId: string): boolean {
+    return this.#db
+      .prepare("SELECT 1 AS found FROM bot_native_sessions WHERE bot = ? AND session_id = ?")
+      .get(bot, sessionId) !== undefined;
+  }
+
+  selectNativeBotSession(bot: string, sessionId: string, now: number): boolean {
+    if (!this.nativeBotHasSession(bot, sessionId)) return false;
+    this.#db.prepare("UPDATE bot_native_chats SET session_id = ?, updated_at = ? WHERE bot = ?").run(sessionId, now, bot);
+    return true;
+  }
+
+  /** Delete one inactive, non-selected direct conversation and atomically append its Capability
+   * 60 receiver tombstone. `sessionId` never leaves the durable Gateway/peer boundary unhashed. */
+  deleteNativeBotSession(input: { bot: string; sessionId: string; deletedAt: number; enqueue: boolean; outboxAgentId?: string }): NativeSessionDeletion {
+    const outboxAgentId = input.outboxAgentId ?? input.bot;
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const any = this.#db.prepare("SELECT bot, active_turn_id AS activeTurnId FROM bot_native_sessions WHERE session_id = ? LIMIT 1")
+        .get(input.sessionId) as { bot: string; activeTurnId: string | null } | undefined;
+      if (any === undefined) { this.#db.exec("COMMIT"); return { outcome: "not_found" }; }
+      if (any.bot !== input.bot) { this.#db.exec("COMMIT"); return { outcome: "foreign" }; }
+      const selected = this.#db.prepare("SELECT session_id AS sessionId FROM bot_native_chats WHERE bot = ?")
+        .get(input.bot) as { sessionId: string } | undefined;
+      if (selected?.sessionId === input.sessionId) { this.#db.exec("COMMIT"); return { outcome: "current" }; }
+      if (any.activeTurnId !== null) { this.#db.exec("COMMIT"); return { outcome: "active" }; }
+
+      this.#db.prepare(`DELETE FROM bot_message_receipts WHERE bot = ? AND message_id IN
+        (SELECT message_id FROM bot_native_messages WHERE bot = ? AND session_id = ?)`)
+        .run(input.bot, input.bot, input.sessionId);
+      // Capability 86: a deleted conversation's Tapbacks go with it.
+      this.#db.prepare(`DELETE FROM bot_message_reactions WHERE bot = ? AND message_id IN
+        (SELECT message_id FROM bot_native_messages WHERE bot = ? AND session_id = ?)`)
+        .run(input.bot, input.bot, input.sessionId);
+      this.#db.prepare(`DELETE FROM bot_turn_media_deliveries WHERE bot = ? AND message_id IN
+        (SELECT message_id FROM bot_native_messages WHERE bot = ? AND session_id = ?)`)
+        .run(input.bot, input.bot, input.sessionId);
+      // Preserve sequence/dedupe state but erase direct-session transport payloads. Cancelled
+      // commands replay only as the ordinary payload-free discard command.
+      const commandRows = this.#db.prepare(
+        `SELECT sequence, command_json AS commandJson FROM attach_command_outbox
+         WHERE agent_id = ? AND json_extract(command_json, '$.threadId') = ?`,
+      ).all(outboxAgentId, input.sessionId) as Array<{ sequence: number; commandJson: string }>;
+      for (const row of commandRows) {
+        const original = JSON.parse(row.commandJson) as AttachV1Command;
+        this.#db.prepare(
+          `UPDATE attach_command_outbox SET command_json = ?, cancelled_at = COALESCE(cancelled_at, ?),
+           cancel_reason = COALESCE(cancel_reason, 'session deleted') WHERE agent_id = ? AND sequence = ?`,
+        ).run(JSON.stringify({ kind: "discard", originalKind: original.kind, reason: "session deleted" }), input.deletedAt, outboxAgentId, row.sequence);
+      }
+      // Canonical-home scheduled events deliberately carry no threadId. Their admission-time
+      // delivery binding is the canonical session association, so collect it before removing
+      // that mapping or redacting the inbox payload.
+      const scheduledRows = this.#db.prepare(
+        `SELECT inbox.sequence, inbox.event_id AS eventId, inbox.frame_json AS frameJson
+         FROM attach_scheduled_deliveries AS delivery
+         JOIN attach_event_inbox AS inbox
+           ON inbox.agent_id = delivery.agent_id AND inbox.event_id = delivery.event_id
+         WHERE delivery.agent_id = ? AND delivery.thread_id = ?`,
+      ).all(outboxAgentId, input.sessionId) as Array<{ sequence: number; eventId: string; frameJson: string }>;
+      const scheduledMediaIds = new Set<string>();
+      for (const row of scheduledRows) {
+        const frame = JSON.parse(row.frameJson) as AttachV1EventFrame;
+        if (frame.event.kind === "scheduled") for (const mediaId of frame.event.mediaIds ?? []) scheduledMediaIds.add(mediaId);
+      }
+      const directEventRows = this.#db.prepare(
+        `SELECT sequence, event_id AS eventId FROM attach_event_inbox
+         WHERE agent_id = ? AND json_extract(frame_json, '$.event.threadId') = ?`,
+      ).all(outboxAgentId, input.sessionId) as Array<{ sequence: number; eventId: string }>;
+      const eventRows = new Map<number, { eventId: string }>([
+        ...directEventRows.map((row) => [row.sequence, { eventId: row.eventId }] as const),
+        ...scheduledRows.map((row) => [row.sequence, { eventId: row.eventId }] as const),
+      ]);
+      for (const [sequence, row] of eventRows) {
+        this.#db.prepare(
+          `UPDATE attach_event_inbox SET frame_json = ?, disposition = 'discarded', applied_at = COALESCE(applied_at, ?),
+           projection_error = COALESCE(projection_error, 'session deleted'), dead_lettered_at = COALESCE(dead_lettered_at, ?)
+           WHERE agent_id = ? AND sequence = ?`,
+        ).run(JSON.stringify({ kind: "event", sequence, eventId: row.eventId, event: { kind: "presence", state: "absent" } }), input.deletedAt, input.deletedAt, outboxAgentId, sequence);
+      }
+      this.#db.prepare("DELETE FROM attach_scheduled_deliveries WHERE agent_id = ? AND thread_id = ?")
+        .run(outboxAgentId, input.sessionId);
+      this.#db.prepare(
+        `DELETE FROM attach_media WHERE agent_id = ? AND media_id IN (
+           SELECT json_extract(attachment.value, '$.fileId') FROM bot_native_messages AS message,
+             json_each(message.attachments_json) AS attachment
+           WHERE message.bot = ? AND message.session_id = ?
+         ) AND NOT EXISTS (
+           SELECT 1 FROM bot_native_messages AS message, json_each(message.attachments_json) AS attachment
+           WHERE message.bot = ? AND message.session_id <> ?
+             AND json_extract(attachment.value, '$.fileId') = attach_media.media_id
+         ) AND NOT EXISTS (
+           SELECT 1 FROM attach_event_inbox AS inbox, json_each(inbox.frame_json, '$.event.mediaIds') AS media
+           WHERE inbox.agent_id = ? AND media.value = attach_media.media_id
+         ) AND NOT EXISTS (
+           SELECT 1 FROM artifacts WHERE artifacts.created_by = attach_media.agent_id
+             AND artifacts.media_id = attach_media.media_id
+         )`,
+      ).run(outboxAgentId, input.bot, input.sessionId, input.bot, input.sessionId, outboxAgentId);
+      const deleteUnreferencedMedia = this.#db.prepare(
+        `DELETE FROM attach_media WHERE agent_id = ? AND media_id = ? AND NOT EXISTS (
+           SELECT 1 FROM bot_native_messages AS message, json_each(message.attachments_json) AS attachment
+           WHERE message.bot = ? AND message.session_id <> ?
+             AND json_extract(attachment.value, '$.fileId') = attach_media.media_id
+         ) AND NOT EXISTS (
+           SELECT 1 FROM attach_event_inbox AS inbox, json_each(inbox.frame_json, '$.event.mediaIds') AS media
+           WHERE inbox.agent_id = ? AND media.value = attach_media.media_id
+         ) AND NOT EXISTS (
+           SELECT 1 FROM artifacts WHERE artifacts.created_by = attach_media.agent_id
+             AND artifacts.media_id = attach_media.media_id
+         )`,
+      );
+      for (const mediaId of scheduledMediaIds)
+        deleteUnreferencedMedia.run(outboxAgentId, mediaId, input.bot, input.sessionId, outboxAgentId);
+      for (const table of ["bot_native_messages", "bot_chat_tool_steps", "bot_chat_delegations", "bot_mobile_receipts", "bot_mobile_requests", "bot_native_interactions", "bot_approval_grants", "bot_native_turn_terminals", "bot_desktop_resume_bindings", "bot_chat_configurations", "bot_mobile_preferred_devices", "bot_composer_drafts"]) {
+        this.#db.prepare(`DELETE FROM ${table} WHERE bot = ? AND session_id = ?`).run(input.bot, input.sessionId);
+      }
+      this.#db.prepare("DELETE FROM bot_native_sessions WHERE bot = ? AND session_id = ?").run(input.bot, input.sessionId);
+      const sessionSha = createHash("sha256").update(input.sessionId).digest("hex");
+      if (input.enqueue) {
+        const commandId = `session-deleted:${input.bot}:${sessionSha}`;
+        const prior = this.#db.prepare("SELECT 1 AS found FROM attach_command_outbox WHERE agent_id = ? AND command_id = ?")
+          .get(outboxAgentId, commandId) as { found: number } | undefined;
+        if (prior === undefined) {
+          this.#db.prepare("INSERT INTO attach_streams (agent_id, next_command_sequence, last_event_sequence, updated_at) VALUES (?, 1, 0, ?) ON CONFLICT(agent_id) DO NOTHING")
+            .run(outboxAgentId, input.deletedAt);
+          const row = this.#db.prepare("SELECT next_command_sequence AS sequence FROM attach_streams WHERE agent_id = ?").get(outboxAgentId) as { sequence: number };
+          const command: AttachV1Command = {
+            kind: "session_deleted", sessionSha,
+            deletion: { id: commandId, revision: row.sequence, at: input.deletedAt },
+          };
+          this.#db.prepare("INSERT INTO attach_command_outbox (agent_id, sequence, command_id, command_json, created_at, acked_at) VALUES (?, ?, ?, ?, ?, NULL)")
+            .run(outboxAgentId, row.sequence, commandId, JSON.stringify(command), input.deletedAt);
+          this.#db.prepare("UPDATE attach_streams SET next_command_sequence = ?, updated_at = ? WHERE agent_id = ?")
+            .run(row.sequence + 1, input.deletedAt, outboxAgentId);
+        }
+      }
+      this.#db.exec("COMMIT");
+      return { outcome: "deleted", deletedAt: input.deletedAt, sessionSha };
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  setNativeBotTurn(bot: string, sessionId: string, turnId: string | undefined, now: number): void {
+    this.#db
+      .prepare("UPDATE bot_native_sessions SET active_turn_id = ?, updated_at = ? WHERE bot = ? AND session_id = ?")
+      .run(turnId ?? null, now, bot, sessionId);
+  }
+
+  /** Capability 69. Every nonterminal native turn this profile is still carrying, across all of
+   * its local sessions and not just the canonical chat, so hello reconciliation can answer the
+   * only question that matters at a re-attach: what does this gateway think is running? */
+  nativeBotActiveTurns(bot: string): { sessionId: string; turnId: string }[] {
+    return this.#db
+      .prepare(
+        `SELECT session_id AS sessionId, active_turn_id AS turnId FROM bot_native_sessions
+         WHERE bot = ? AND active_turn_id IS NOT NULL`,
+      )
+      .all(bot) as unknown as { sessionId: string; turnId: string }[];
+  }
+
+  /** Capability 69. Remember one steer's words until something proves they were heard. Ordered by
+   * arrival, so several steers on one dead turn are promoted in the order the person sent them
+   * rather than the last one silently replacing the rest. */
+  recordPendingNativeSteer(input: {
+    bot: string; sessionId: string; turnId: string; messageId: string; text: string;
+    mediaIds?: readonly string[]; context?: unknown; originDevice?: string; at: number;
+  }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO bot_native_pending_steers
+           (bot, session_id, turn_id, message_id, text, media_ids_json, context_json, origin_device, created_at, settled_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(bot, message_id) DO NOTHING`,
+      )
+      .run(
+        input.bot, input.sessionId, input.turnId, input.messageId, input.text,
+        input.mediaIds === undefined || input.mediaIds.length === 0 ? null : JSON.stringify([...input.mediaIds]),
+        input.context === undefined ? null : JSON.stringify(input.context),
+        input.originDevice ?? null,
+        input.at,
+      );
+  }
+
+  /** Move one still-open steer onto the turn that now carries it. Promotion re-dispatches the
+   * steers that followed the promoted one onto the new turn, and they stay open there. */
+  movePendingNativeSteer(bot: string, messageId: string, turnId: string): void {
+    this.#db
+      .prepare("UPDATE bot_native_pending_steers SET turn_id = ? WHERE bot = ? AND message_id = ? AND settled_at IS NULL")
+      .run(turnId, bot, messageId);
+  }
+
+  /** Settle exactly one steer, by the message id that identifies the person's words. */
+  settlePendingNativeSteer(bot: string, messageId: string, at: number): void {
+    this.#db
+      .prepare("UPDATE bot_native_pending_steers SET settled_at = ? WHERE bot = ? AND message_id = ? AND settled_at IS NULL")
+      .run(at, bot, messageId);
+  }
+
+  /** Unsettled steers, oldest first. `turnId` narrows to one turn; omitting it asks the whole
+   * conversation, which is what a rescued reply settles. */
+  pendingNativeSteers(bot: string, sessionId: string, turnId?: string): {
+    turnId: string; messageId: string; text: string; mediaIds?: string[]; context?: unknown; originDevice?: string;
+  }[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT turn_id AS turnId, message_id AS messageId, text, media_ids_json AS mediaIdsJson,
+                context_json AS contextJson, origin_device AS originDevice
+         FROM bot_native_pending_steers
+         WHERE bot = ? AND session_id = ? AND settled_at IS NULL AND (? IS NULL OR turn_id = ?)
+         ORDER BY created_at, message_id`,
+      )
+      .all(bot, sessionId, turnId ?? null, turnId ?? null) as unknown as {
+        turnId: string; messageId: string; text: string; mediaIdsJson: string | null;
+        contextJson: string | null; originDevice: string | null;
+      }[];
+    return rows.map((row) => ({
+      turnId: row.turnId,
+      messageId: row.messageId,
+      text: row.text,
+      ...(row.mediaIdsJson === null ? {} : { mediaIds: JSON.parse(row.mediaIdsJson) as string[] }),
+      ...(row.contextJson === null ? {} : { context: JSON.parse(row.contextJson) as unknown }),
+      ...(row.originDevice === null ? {} : { originDevice: row.originDevice }),
+    }));
+  }
+
+  /** Settle every open steer for one turn, or for the whole conversation when `turnId` is
+   * omitted. Settling is idempotent and never deletes: the row is the record that the words were
+   * accounted for. */
+  settlePendingNativeSteers(bot: string, sessionId: string, turnId: string | undefined, at: number): void {
+    this.#db
+      .prepare(
+        `UPDATE bot_native_pending_steers SET settled_at = ?
+         WHERE bot = ? AND session_id = ? AND settled_at IS NULL AND (? IS NULL OR turn_id = ?)`,
+      )
+      .run(at, bot, sessionId, turnId ?? null, turnId ?? null);
+  }
+
+  /** Capability 69. The outbox row for one steer command, so a promotion can cancel a steer the
+   * peer never took off the wire instead of letting it arrive after the promoted turn. */
+  attachSteerDelivery(agentId: string, messageId: string): {
+    sequence: number; commandId: string; acknowledgedAt: number | null;
+  } | undefined {
+    return this.#db
+      .prepare(
+        `SELECT sequence, command_id AS commandId, acked_at AS acknowledgedAt
+         FROM attach_command_outbox
+         WHERE agent_id = ? AND cancelled_at IS NULL
+           AND json_extract(command_json, '$.kind') = 'steer'
+           AND json_extract(command_json, '$.messageId') = ?
+         ORDER BY sequence DESC LIMIT 1`,
+      )
+      .get(agentId, messageId) as { sequence: number; commandId: string; acknowledgedAt: number | null } | undefined;
+  }
+
+  /** Capability 69. Move one user row onto the turn that will actually answer it. The only caller
+   * is steer promotion: the person's message was committed against a turn the peer had already
+   * lost, and the promoted turn is the one that answers it, so the causation link
+   * (`BotChatMessage.inReplyToId`) has to follow rather than dangle on a dead id. */
+  rebindNativeBotMessageTurn(bot: string, sessionId: string, messageId: string, turnId: string): void {
+    this.#db
+      .prepare("UPDATE bot_native_messages SET turn_id = ? WHERE bot = ? AND session_id = ? AND message_id = ?")
+      .run(turnId, bot, sessionId, messageId);
+  }
+
+  clearNativeBotTurn(bot: string, sessionId: string, turnId: string, now: number): boolean {
+    const cleared = this.#db
+      .prepare(
+        "UPDATE bot_native_sessions SET active_turn_id = NULL, updated_at = ? WHERE bot = ? AND session_id = ? AND active_turn_id = ?",
+      )
+      .run(now, bot, sessionId, turnId);
+    return cleared.changes > 0;
+  }
+
+  appendNativeBotMessage(input: {
+    bot: string;
+    sessionId: string;
+    messageId: string;
+    role: string;
+    text: string;
+    at: number;
+    clientId?: string;
+    /** Capability 32: an entry MAY carry a `position` saying where in the block flow it renders. */
+    attachments?: BotChatAttachment[];
+    /** Capability 31: labels a gateway-authored row that is not conversation. */
+    marker?: string;
+    /** Capability 47: the attach turn this row belongs to, the bot that authored it, and the user
+     *  row it answers. Absent where the fact does not exist, never invented. */
+    turnId?: string;
+    authorBot?: string;
+    inReplyToId?: string;
+  }): BotChatMessage {
+    const prior = this.#db
+      .prepare(
+        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson, marker,
+                turn_id AS turnId, author_bot AS authorBot, in_reply_to_id AS inReplyToId
+         FROM bot_native_messages WHERE bot = ? AND message_id = ?`,
+      )
+      .get(input.bot, input.messageId) as NativeBotMessageDbRow | undefined;
+    if (prior !== undefined) return nativeBotMessage(prior);
+    const next = this.#db
+      .prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM bot_native_messages WHERE bot = ? AND session_id = ?")
+      .get(input.bot, input.sessionId) as { seq: number };
+    this.#db
+      .prepare(
+        `INSERT INTO bot_native_messages
+           (bot, session_id, seq, message_id, role, text, at, client_id, attachments_json, marker,
+            turn_id, author_bot, in_reply_to_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.bot,
+        input.sessionId,
+        next.seq,
+        input.messageId,
+        input.role,
+        input.text,
+        input.at,
+        input.clientId ?? null,
+        input.attachments === undefined ? null : JSON.stringify(input.attachments),
+        input.marker ?? null,
+        input.turnId ?? null,
+        input.authorBot ?? null,
+        input.inReplyToId ?? null,
+      );
+    this.#db
+      .prepare("UPDATE bot_native_sessions SET updated_at = MAX(updated_at, ?) WHERE bot = ? AND session_id = ?")
+      .run(input.at, input.bot, input.sessionId);
+    this.#db
+      .prepare("UPDATE bot_native_chats SET updated_at = MAX(updated_at, ?) WHERE bot = ? AND session_id = ?")
+      .run(input.at, input.bot, input.sessionId);
+    return { id: input.messageId, role: input.role, text: input.text, at: input.at, ...(input.clientId === undefined ? {} : { clientId: input.clientId }), ...(input.attachments === undefined ? {} : { attachments: input.attachments }), ...(input.marker === undefined ? {} : { marker: input.marker }), ...(input.turnId === undefined ? {} : { turnId: input.turnId }), ...(input.authorBot === undefined ? {} : { authorBot: input.authorBot }), ...(input.inReplyToId === undefined ? {} : { inReplyToId: input.inReplyToId }) };
+  }
+
+  /** The user row that opened one native turn, if the turn was opened by a user message at all.
+   *  It is the causation link `BotChatMessage.inReplyToId` carries, read at commit time from the
+   *  row the send itself stamped rather than guessed from transcript adjacency: a scheduled
+   *  delivery or an interim reply can sit between a question and its answer. */
+  nativeBotTurnUserMessageId(bot: string, sessionId: string, turnId: string): string | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT message_id AS id FROM bot_native_messages
+         WHERE bot = ? AND session_id = ? AND turn_id = ? AND role = 'user' ORDER BY seq LIMIT 1`,
+      )
+      .get(bot, sessionId, turnId) as { id: string } | undefined;
+    return row?.id;
+  }
+
+  nativeBotMessages(bot: string, sessionId: string): BotChatMessage[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson, marker,
+                turn_id AS turnId, author_bot AS authorBot, in_reply_to_id AS inReplyToId
+         FROM bot_native_messages WHERE bot = ? AND session_id = ? ORDER BY seq`,
+      )
+      .all(bot, sessionId) as unknown as NativeBotMessageDbRow[];
+    const reactions = this.#reactionsBySession(bot, sessionId);
+    return rows.map((row) => withReactions(nativeBotMessage(row), reactions.get(row.id)));
+  }
+
+  /** Capability 86. Every reacted row of one session, by message id, in author order. */
+  #reactionsBySession(bot: string, sessionId: string): Map<string, BotMessageReaction[]> {
+    const rows = this.#db.prepare(
+      `SELECT r.message_id AS messageId, r.author, r.emoji, r.at FROM bot_message_reactions r
+       JOIN bot_native_messages m ON m.bot = r.bot AND m.message_id = r.message_id
+       WHERE r.bot = ? AND m.session_id = ? ORDER BY r.at`,
+    ).all(bot, sessionId) as Array<{ messageId: string; author: string; emoji: string; at: number }>;
+    const out = new Map<string, BotMessageReaction[]>();
+    for (const row of rows) {
+      const list = out.get(row.messageId) ?? [];
+      list.push(reactionRow(row));
+      out.set(row.messageId, list);
+    }
+    return out;
+  }
+
+  botMessageReactions(bot: string, messageId: string): BotMessageReaction[] {
+    return (this.#db.prepare(
+      `SELECT author, emoji, at FROM bot_message_reactions WHERE bot = ? AND message_id = ? ORDER BY at`,
+    ).all(bot, messageId) as Array<{ author: string; emoji: string; at: number }>).map(reactionRow);
+  }
+
+  /** Capability 86, Tapback semantics (`tui_gateway` `message.react`): one reaction per author, the
+   *  same emoji again retracts it, null clears. Undefined when the message is not this bot's. */
+  setBotMessageReaction(input: {
+    bot: string; messageId: string; author: "user" | "agent"; emoji: string | null; now: number;
+  }): { sessionId: string; reactions: BotMessageReaction[] } | undefined {
+    const owner = this.#db.prepare(
+      "SELECT session_id AS sessionId FROM bot_native_messages WHERE bot = ? AND message_id = ?",
+    ).get(input.bot, input.messageId) as { sessionId: string } | undefined;
+    if (owner === undefined) return undefined;
+    const mine = this.#db.prepare(
+      "SELECT emoji FROM bot_message_reactions WHERE bot = ? AND message_id = ? AND author = ?",
+    ).get(input.bot, input.messageId, input.author) as { emoji: string } | undefined;
+    if (input.emoji === null || mine?.emoji === input.emoji) {
+      this.#db.prepare("DELETE FROM bot_message_reactions WHERE bot = ? AND message_id = ? AND author = ?")
+        .run(input.bot, input.messageId, input.author);
+    } else {
+      this.#db.prepare(
+        `INSERT INTO bot_message_reactions (bot, message_id, author, emoji, at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(bot, message_id, author) DO UPDATE SET emoji = excluded.emoji, at = excluded.at`,
+      ).run(input.bot, input.messageId, input.author, input.emoji, input.now);
+    }
+    return { sessionId: owner.sessionId, reactions: this.botMessageReactions(input.bot, input.messageId) };
+  }
+
+  canonicalBotChat(bot: string): string | undefined {
+    return (this.#db.prepare("SELECT hermes_session_id AS id FROM bot_canonical_chats WHERE bot = ?")
+      .get(bot) as { id: string } | undefined)?.id;
+  }
+
+  setCanonicalBotChat(bot: string, hermesSessionId: string | null, now: number): void {
+    if (hermesSessionId === null) {
+      this.#db.prepare("DELETE FROM bot_canonical_chats WHERE bot = ?").run(bot);
+      return;
+    }
+    this.#db.prepare(
+      `INSERT INTO bot_canonical_chats (bot, hermes_session_id, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(bot) DO UPDATE SET hermes_session_id = excluded.hermes_session_id, updated_at = excluded.updated_at`,
+    ).run(bot, hermesSessionId, now);
+  }
+
+  canonicalBotChats(): Array<{ bot: string; hermesSessionId: string }> {
+    return this.#db.prepare("SELECT bot, hermes_session_id AS hermesSessionId FROM bot_canonical_chats")
+      .all() as Array<{ bot: string; hermesSessionId: string }>;
+  }
+
+  /** Capability 86: the bot's profile model changed, so every per-chat override of this bot yields
+   *  to it again (upstream: a chat's pick sticks "until you change the Bot's profile model"). The
+   *  row stays explicitly configured, so the next turn's preparation clears the harness override. */
+  clearNativeChatModels(bot: string, now: number): number {
+    return Number(this.#db.prepare(
+      `UPDATE bot_chat_configurations SET model_json = NULL, updated_at = ?
+       WHERE bot = ? AND model_json IS NOT NULL`,
+    ).run(now, bot).changes);
+  }
+
+  /** First write wins on requestId. Only metadata is accepted by this API. */
+  recordBotMobileReceipt(input: {
+    requestId: string;
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    command: BotMobileReceipt["command"];
+    sharedDescription: BotMobileReceipt["sharedDescription"];
+    purpose: string;
+    sharedAt: number;
+  }): BotMobileReceipt | undefined {
+    const written = this.#db
+      .prepare(
+        `INSERT INTO bot_mobile_receipts
+           (request_id, bot, session_id, turn_id, command, shared_description, purpose, shared_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(request_id) DO NOTHING`,
+      )
+      .run(
+        input.requestId,
+        input.bot,
+        input.sessionId,
+        input.turnId,
+        input.command,
+        input.sharedDescription,
+        input.purpose,
+        input.sharedAt,
+      );
+    if (written.changes !== 1) return undefined;
+    return input;
+  }
+
+  /** Capability 68. The typed lifecycle of one request. First write wins on the binding, the state
+   *  only ever moves FORWARD, and the first terminal state is sealed: a later answer for a request
+   *  that already expired, was cancelled, or was refused cannot rewrite the outcome a person was
+   *  already told. */
+  recordBotMobileRequest(input: {
+    requestId: string;
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    deviceId?: string;
+    command: BotMobileRequest["command"];
+    purpose: string;
+    state: MobileRequestState;
+    at: number;
+    expiresAt: number;
+  }): BotMobileRequest | undefined {
+    this.#sweepMobileRequests(input.at);
+    const existing = this.#db
+      .prepare("SELECT state, bot, session_id AS sessionId FROM bot_mobile_requests WHERE request_id = ?")
+      .get(input.requestId) as { state: MobileRequestState; bot: string; sessionId: string } | undefined;
+    if (existing === undefined) {
+      this.#db
+        .prepare(
+          `INSERT INTO bot_mobile_requests
+             (request_id, bot, session_id, turn_id, device_id, command, purpose, state, requested_at, updated_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.requestId, input.bot, input.sessionId, input.turnId, input.deviceId ?? null,
+          input.command, input.purpose, input.state, input.at, input.at, input.expiresAt,
+        );
+      return this.#mobileRequest(input.requestId);
+    }
+    // A record belongs to the conversation and profile that opened it. A later step naming a
+    // different one is a binding violation, not an update.
+    if (existing.bot !== input.bot || existing.sessionId !== input.sessionId) return undefined;
+    if (isTerminalMobileRequestState(existing.state)) return undefined;
+    if (mobileRequestRank(input.state) <= mobileRequestRank(existing.state)) return undefined;
+    this.#db
+      .prepare("UPDATE bot_mobile_requests SET state = ?, updated_at = ? WHERE request_id = ?")
+      .run(input.state, input.at, input.requestId);
+    return this.#mobileRequest(input.requestId);
+  }
+
+  #mobileRequest(requestId: string): BotMobileRequest | undefined {
+    const row = this.#db
+      .prepare(`${BOT_MOBILE_REQUEST_SELECT} WHERE request_id = ?`)
+      .get(requestId) as (Omit<BotMobileRequest, "deviceId"> & { deviceId: string | null }) | undefined;
+    return row === undefined ? undefined : mobileRequestRow(row);
+  }
+
+  /** The reconciliation read a resuming app makes: bounded, live requests first and then the newest
+   *  settled ones. A request that has NOT settled is what the app came to reconcile, so it is never
+   *  crowded out of the window by finished history however long the conversation has been running.
+   *  Scoped to the profile and conversation the request was issued in: another conversation's
+   *  request is absent, not hidden. */
+  nativeBotMobileRequests(bot: string, sessionId: string, limit = 100): BotMobileRequest[] {
+    const rows = this.#db
+      .prepare(
+        `${BOT_MOBILE_REQUEST_SELECT} WHERE bot = ? AND session_id = ?
+         ORDER BY (state IN (${MOBILE_REQUEST_TERMINAL_PLACEHOLDERS})) ASC, requested_at DESC, request_id DESC
+         LIMIT ?`,
+      )
+      .all(bot, sessionId, ...MOBILE_REQUEST_TERMINAL_STATES, limit) as unknown as (Omit<BotMobileRequest, "deviceId"> & { deviceId: string | null })[];
+    return rows.map(mobileRequestRow);
+  }
+
+  /** Settled records are history and stop being useful to reconcile against. Sweeping them on the
+   *  next write keeps the table bounded without a timer; a request nobody settled is never swept,
+   *  because its outcome is still owed to a person. */
+  #sweepMobileRequests(now: number): void {
+    this.#db
+      .prepare(
+        `DELETE FROM bot_mobile_requests
+         WHERE updated_at < ? AND state IN (${MOBILE_REQUEST_TERMINAL_PLACEHOLDERS})`,
+      )
+      .run(now - MOBILE_REQUEST_RETENTION_MS, ...MOBILE_REQUEST_TERMINAL_STATES);
+  }
+
+  /** Capability 70. The device this conversation's capability requests should go to. The write
+   *  REFUSES an id that names no paired device rather than storing a choice that would resolve to
+   *  nothing at admission time; `null` is the clear. A paired device is this gateway's only user
+   *  identity, so checking pairing here is also the whole authorization check. */
+  setBotMobilePreferredDevice(
+    bot: string, sessionId: string, deviceId: string | null, at: number,
+  ): "ok" | "unknown_device" {
+    if (deviceId === null) {
+      this.#db
+        .prepare("DELETE FROM bot_mobile_preferred_devices WHERE bot = ? AND session_id = ?")
+        .run(bot, sessionId);
+      return "ok";
+    }
+    const paired = this.#db
+      .prepare("SELECT id FROM devices WHERE id = ?")
+      .get(deviceId) as { id: string } | undefined;
+    if (paired === undefined) return "unknown_device";
+    this.#db
+      .prepare(
+        `INSERT INTO bot_mobile_preferred_devices (bot, session_id, device_id, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (bot, session_id) DO UPDATE SET device_id = excluded.device_id,
+           updated_at = excluded.updated_at`,
+      )
+      .run(bot, sessionId, deviceId, at);
+    return "ok";
+  }
+
+  /** A choice whose device has since been unpaired reads as no choice at all, so admission falls
+   *  through to the pre-70 rule instead of resolving to a device that cannot answer. */
+  botMobilePreferredDevice(bot: string, sessionId: string): BotMobilePreferredDevice {
+    const row = this.#db
+      .prepare(
+        `SELECT p.device_id AS deviceId, p.updated_at AS updatedAt, d.name AS deviceName
+         FROM bot_mobile_preferred_devices p
+         JOIN devices d ON d.id = p.device_id
+         WHERE p.bot = ? AND p.session_id = ?`,
+      )
+      .get(bot, sessionId) as { deviceId: string; updatedAt: number; deviceName: string } | undefined;
+    if (row === undefined) return { sessionId };
+    return { sessionId, deviceId: row.deviceId, deviceName: row.deviceName, updatedAt: row.updatedAt };
+  }
+
+  /** Capability 71. Last write wins, and the empty string is the CLEAR a send writes immediately.
+   *  `changed` is false when the text is the one already stored, so a device replaying what it
+   *  already had cannot wake every other paired device with a notification. */
+  setBotComposerDraft(
+    bot: string, sessionId: string, text: string, at: number,
+  ): { draft: BotComposerDraft; changed: boolean } {
+    this.#sweepComposerDrafts(at);
+    const existing = this.#db
+      .prepare("SELECT text, updated_at AS updatedAt FROM bot_composer_drafts WHERE bot = ? AND session_id = ?")
+      .get(bot, sessionId) as { text: string; updatedAt: number } | undefined;
+    // `updatedAt` IS THE VERSION a client compares two drafts by, so it must move FORWARD on every
+    // stored change even when the clock repeats a millisecond or steps backwards. Two writes
+    // sharing a version would make "which of these is newer" unanswerable at exactly the moment it
+    // matters: a send's clear racing the keystroke before it.
+    const updatedAt = existing === undefined ? at : Math.max(at, existing.updatedAt + 1);
+    this.#db
+      .prepare(
+        `INSERT INTO bot_composer_drafts (bot, session_id, text, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (bot, session_id) DO UPDATE SET text = excluded.text,
+           updated_at = excluded.updated_at`,
+      )
+      .run(bot, sessionId, text, updatedAt);
+    return { draft: { sessionId, text, updatedAt }, changed: existing?.text !== text };
+  }
+
+  /** Pass `now` to sweep on the way in. A read is the second guard on retention, for a gateway
+   *  that sits between two maintenance passes; omitting it reads without sweeping. */
+  botComposerDraft(bot: string, sessionId: string, now?: number): BotComposerDraft {
+    if (now !== undefined) this.#sweepComposerDrafts(now);
+    const row = this.#db
+      .prepare("SELECT text, updated_at AS updatedAt FROM bot_composer_drafts WHERE bot = ? AND session_id = ?")
+      .get(bot, sessionId) as { text: string; updatedAt: number } | undefined;
+    return row === undefined
+      ? { sessionId, text: "", updatedAt: 0 }
+      : { sessionId, text: row.text, updatedAt: row.updatedAt };
+  }
+
+  /** The retention pass's own entry point. Sweeping only on the next write meant one abandoned
+   *  draft on a gateway where nobody ever typed again was kept for as long as the gateway ran,
+   *  which is not what row 71 promises: the periodic sweep is what makes "forgotten after thirty
+   *  days" true on an idle gateway, and the write and the read are the two cheap guards beside it. */
+  pruneExpiredComposerDrafts(now: number): void {
+    this.#sweepComposerDrafts(now);
+  }
+
+  #sweepComposerDrafts(now: number): void {
+    this.#db
+      .prepare("DELETE FROM bot_composer_drafts WHERE updated_at < ?")
+      .run(now - COMPOSER_DRAFT_RETENTION_MS);
+  }
+
+  /** Test-only view of the stored preference rows, so a test can prove an unpaired device's row is
+   *  GONE rather than merely hidden behind the read's join. */
+  mobilePreferredDeviceRowsForTesting(bot: string): { sessionId: string; deviceId: string }[] {
+    return this.#db
+      .prepare("SELECT session_id AS sessionId, device_id AS deviceId FROM bot_mobile_preferred_devices WHERE bot = ? ORDER BY session_id")
+      .all(bot) as unknown as { sessionId: string; deviceId: string }[];
+  }
+
+  nativeBotMobileReceipts(bot: string, sessionId: string): BotMobileReceipt[] {
+    return this.#db
+      .prepare(
+        `SELECT request_id AS requestId, bot, session_id AS sessionId,
+                turn_id AS turnId, command, shared_description AS sharedDescription, purpose, shared_at AS sharedAt
+         FROM bot_mobile_receipts
+         WHERE bot = ? AND session_id = ?
+         ORDER BY shared_at, request_id`,
+      )
+      .all(bot, sessionId) as unknown as BotMobileReceipt[];
+  }
+
+  /** Agent-sent artifacts across configured profiles and every durable session. Filtering stays in
+   * SQLite so a phone asking for one page never makes the gateway hydrate an unbounded transcript. */
+  nativeBotAttachmentHistory(input: {
+    bots: readonly string[];
+    query?: string;
+    kind?: "image" | "video" | "audio" | "file";
+    bot?: string;
+    since?: number;
+    offset: number;
+    limit: number;
+  }): NativeBotAttachmentHistoryItem[] {
+    if (input.bots.length === 0) return [];
+    const botPlaceholders = input.bots.map(() => "?").join(", ");
+    const kind = `COALESCE(json_extract(artifact.value, '$.mediaKind'), CASE
+      WHEN lower(json_extract(artifact.value, '$.mimeType')) LIKE 'image/%' THEN 'image'
+      WHEN lower(json_extract(artifact.value, '$.mimeType')) LIKE 'video/%' THEN 'video'
+      WHEN lower(json_extract(artifact.value, '$.mimeType')) LIKE 'audio/%' THEN 'audio'
+      ELSE 'file' END)`;
+    const clauses = [
+      "message.role = 'assistant'",
+      "message.attachments_json IS NOT NULL",
+      `message.bot IN (${botPlaceholders})`,
+    ];
+    const args: Array<string | number> = [...input.bots];
+    if (input.bot !== undefined) { clauses.push("message.bot = ?"); args.push(input.bot); }
+    if (input.kind !== undefined) { clauses.push(`${kind} = ?`); args.push(input.kind); }
+    if (input.since !== undefined) { clauses.push("COALESCE(message.at, 0) >= ?"); args.push(input.since); }
+    const query = input.query?.trim().toLowerCase();
+    if (query) {
+      clauses.push(`instr(lower(message.bot || ' ' || message.text || ' ' ||
+        json_extract(artifact.value, '$.name') || ' ' ||
+        json_extract(artifact.value, '$.mimeType')), ?) > 0`);
+      args.push(query);
+    }
+    const rows = this.#db.prepare(
+      `SELECT message.bot, message.session_id AS sessionId,
+              message.message_id AS messageId, message.text AS caption, message.at,
+              artifact.value AS attachmentJson
+       FROM bot_native_messages AS message, json_each(message.attachments_json) AS artifact
+       WHERE ${clauses.join(" AND ")}
+       ORDER BY COALESCE(message.at, 0) DESC, message.message_id DESC,
+                json_extract(artifact.value, '$.fileId') DESC
+       LIMIT ? OFFSET ?`,
+    ).all(...args, input.limit, input.offset) as unknown as Array<{
+      bot: string; sessionId: string; messageId: string; caption: string;
+      at: number | null; attachmentJson: string;
+    }>;
+    return rows.map((row) => ({
+      bot: row.bot,
+      sessionId: row.sessionId,
+      messageId: row.messageId,
+      caption: row.caption,
+      at: row.at,
+      attachment: JSON.parse(row.attachmentJson) as AttachmentBlock,
+    }));
+  }
+
+  nativeBotMessage(bot: string, messageId: string): BotChatMessage | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT message_id AS id, role, text, at, client_id AS clientId, attachments_json AS attachmentsJson, marker,
+                turn_id AS turnId, author_bot AS authorBot, in_reply_to_id AS inReplyToId
+         FROM bot_native_messages WHERE bot = ? AND message_id = ?`,
+      )
+      .get(bot, messageId) as NativeBotMessageDbRow | undefined;
+    return row === undefined ? undefined
+      : withReactions(nativeBotMessage(row), this.botMessageReactions(bot, messageId));
+  }
+
+  #insertNativeBotSession(bot: string, now: number): string {
+    if (this.isBotDeleted(bot)) throw new Error(`bot "${bot}" was deleted`);
+    const sessionId = `native:${bot}:${randomUUID()}`;
+    this.#db
+      .prepare("INSERT INTO bot_native_sessions (bot, session_id, created_at, updated_at, active_turn_id) VALUES (?, ?, ?, ?, NULL)")
+      .run(bot, sessionId, now, now);
+    const workspace = this.nativeChatWorkspaceDefault(bot);
+    if (workspace !== null) {
+      this.#db.prepare(
+        `INSERT INTO bot_chat_configurations
+           (bot, session_id, workspace_json, model_json, workspace_locked, updated_at)
+         VALUES (?, ?, ?, NULL, 0, ?)`,
+      ).run(bot, sessionId, JSON.stringify(workspace), now);
+    }
+    return sessionId;
+  }
+
+  recordNativeInteraction(input: {
+    bot: string;
+    kind: "approval" | "clarify";
+    interactionId: string;
+    sessionId: string;
+    turnId: string;
+    payload: unknown;
+    status: string;
+    selectedOptionId?: string;
+    expiresAt?: number;
+    updatedAt: number;
+  }): "inserted" | "updated" | "duplicate" | "conflict" {
+    return this.tasks.atomic(() => {
+    const prior = this.nativeInteraction(input.bot, input.kind, input.interactionId);
+    if (prior === undefined) {
+      this.#db
+        .prepare(
+          `INSERT INTO bot_native_interactions
+             (bot, kind, interaction_id, session_id, turn_id, payload_json, status,
+              selected_option_id, expires_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(input.bot, input.kind, input.interactionId, input.sessionId, input.turnId, JSON.stringify(input.payload), input.status, input.selectedOptionId ?? null, input.expiresAt ?? input.updatedAt + 600_000, input.updatedAt);
+      if (input.status !== "pending") this.#trimTerminalNativeInteractions(input.bot);
+      this.tasks.interaction(input.bot, input.kind, input.interactionId);
+      return "inserted";
+    }
+    if (prior.status !== "pending") return "duplicate";
+    if (input.status === "pending") return "duplicate";
+    if (prior.sessionId !== input.sessionId || prior.turnId !== input.turnId)
+      return "conflict";
+    this.#db
+      .prepare(
+        `UPDATE bot_native_interactions SET status = ?, selected_option_id = ?, updated_at = ?
+         WHERE bot = ? AND kind = ? AND interaction_id = ? AND status = 'pending'`,
+      )
+      .run(input.status, input.selectedOptionId ?? null, input.updatedAt, input.bot, input.kind, input.interactionId);
+    this.#trimTerminalNativeInteractions(input.bot);
+    this.tasks.interaction(input.bot, input.kind, input.interactionId);
+    return "updated";
+    });
+  }
+
+  resolveNativeInteraction(
+    bot: string,
+    kind: "approval" | "clarify",
+    interactionId: string,
+    status: string,
+    updatedAt: number,
+    selectedOptionId?: string,
+  ): boolean {
+    return this.tasks.atomic(() => {
+    const resolved = this.#db
+      .prepare(
+        `UPDATE bot_native_interactions SET status = ?, selected_option_id = ?, updated_at = ?
+         WHERE bot = ? AND kind = ? AND interaction_id = ? AND status = 'pending'`,
+      )
+      .run(status, selectedOptionId ?? null, updatedAt, bot, kind, interactionId).changes === 1;
+    if (resolved) { this.#trimTerminalNativeInteractions(bot); this.tasks.interaction(bot, kind, interactionId); }
+    return resolved;
+    });
+  }
+
+  nativeInteraction(
+    bot: string,
+    kind: "approval" | "clarify",
+    interactionId: string,
+  ): { sessionId: string; turnId: string; payload: unknown; status: string; selectedOptionId: string | null; expiresAt: number | null; resolutionCommandId: string | null; resolutionRequestedAt: number | null; requestedDecision: string | null; requestedOptionId: string | null; updatedAt: number } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT session_id AS sessionId, turn_id AS turnId, payload_json AS payloadJson, status,
+                selected_option_id AS selectedOptionId, expires_at AS expiresAt,
+                resolution_command_id AS resolutionCommandId,
+                resolution_requested_at AS resolutionRequestedAt,
+                requested_decision AS requestedDecision,
+                requested_option_id AS requestedOptionId,
+                updated_at AS updatedAt
+         FROM bot_native_interactions WHERE bot = ? AND kind = ? AND interaction_id = ?`,
+      )
+      .get(bot, kind, interactionId) as { sessionId: string; turnId: string; payloadJson: string; status: string; selectedOptionId: string | null; expiresAt: number | null; resolutionCommandId: string | null; resolutionRequestedAt: number | null; requestedDecision: string | null; requestedOptionId: string | null; updatedAt: number } | undefined;
+    return row === undefined ? undefined : { ...row, payload: JSON.parse(row.payloadJson) as unknown };
+  }
+
+  /** The decision marker and command outbox append are one transaction. A restart can therefore
+   * never present a decision as submitted without retaining the exact command for replay. */
+  requestNativeInteractionResolution(input: {
+    bot: string;
+    /** The authenticated peer that receives the durable command. It can be a session execution
+     * identity while `bot` remains the source bot that owns the interaction record. */
+    outboxAgentId?: string;
+    kind: "approval" | "clarify";
+    interactionId: string;
+    decision: string;
+    optionId?: string;
+    commandId: string;
+    command: AttachV1Command;
+    requestedAt: number;
+    /** Capability 66. Replace a resolution the GATEWAY itself admitted off a standing grant. A
+     * person countermanding their own policy on one ask must not be told a different decision is
+     * already awaiting confirmation, when the decision awaiting confirmation is the one the
+     * gateway made for them. Only ever set for that case: a second HUMAN decision still conflicts.
+     * The first TERMINAL is still immutable, because this replaces a requested marker, never a
+     * settled outcome, and the peer's terminal remains the only proof either way. */
+    override?: boolean;
+  }): NativeInteractionResolutionRequest {
+    const outboxAgentId = input.outboxAgentId ?? input.bot;
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#db
+        .prepare(
+          `SELECT session_id AS sessionId, turn_id AS turnId, status, expires_at AS expiresAt,
+                  resolution_command_id AS resolutionCommandId,
+                  requested_decision AS requestedDecision,
+                  requested_option_id AS requestedOptionId
+           FROM bot_native_interactions
+           WHERE bot = ? AND kind = ? AND interaction_id = ?`,
+        )
+        .get(input.bot, input.kind, input.interactionId) as {
+        sessionId: string;
+        turnId: string;
+        status: string;
+        expiresAt: number | null;
+        resolutionCommandId: string | null;
+        requestedDecision: string | null;
+        requestedOptionId: string | null;
+      } | undefined;
+      if (row === undefined) {
+        this.#db.exec("COMMIT");
+        return { outcome: "unknown" };
+      }
+      if (row.status !== "pending") {
+        this.#db.exec("COMMIT");
+        return { outcome: row.status === "expired" ? "expired" : "not_pending", ...(row.status === "expired" ? { sessionId: row.sessionId, turnId: row.turnId } : {}) } as NativeInteractionResolutionRequest;
+      }
+      if (row.expiresAt !== null && row.expiresAt <= input.requestedAt) {
+        this.#db
+          .prepare(
+            `UPDATE bot_native_interactions SET status = 'expired', updated_at = ?
+             WHERE bot = ? AND kind = ? AND interaction_id = ? AND status = 'pending'
+               AND expires_at IS NOT NULL AND expires_at <= ?`,
+          )
+          .run(input.requestedAt, input.bot, input.kind, input.interactionId, input.requestedAt);
+        this.#trimTerminalNativeInteractions(input.bot);
+        this.tasks.interaction(input.bot, input.kind, input.interactionId);
+        this.#db.exec("COMMIT");
+        return { outcome: "expired", sessionId: row.sessionId, turnId: row.turnId };
+      }
+      if (row.resolutionCommandId !== null) {
+        const same = row.requestedDecision === input.decision && row.requestedOptionId === (input.optionId ?? null);
+        if (same || input.override !== true) {
+          this.#db.exec("COMMIT");
+          return {
+            outcome: same ? "already_requested" : "resolution_pending",
+            sessionId: row.sessionId,
+            turnId: row.turnId,
+            fresh: false,
+          };
+        }
+        // Falls through: the replacement command is appended and the marker rewritten below.
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO attach_streams (agent_id, next_command_sequence, last_event_sequence, updated_at)
+           VALUES (?, 1, 0, ?) ON CONFLICT(agent_id) DO NOTHING`,
+        )
+        .run(outboxAgentId, input.requestedAt);
+      const stream = this.#db
+        .prepare("SELECT next_command_sequence AS sequence FROM attach_streams WHERE agent_id = ?")
+        .get(outboxAgentId) as { sequence: number };
+      this.#db
+        .prepare(
+          `INSERT INTO attach_command_outbox
+             (agent_id, sequence, command_id, command_json, created_at, acked_at)
+           VALUES (?, ?, ?, ?, ?, NULL)`,
+        )
+        .run(outboxAgentId, stream.sequence, input.commandId, JSON.stringify(input.command), input.requestedAt);
+      this.#db
+        .prepare("UPDATE attach_streams SET next_command_sequence = ?, updated_at = ? WHERE agent_id = ?")
+        .run(stream.sequence + 1, input.requestedAt, outboxAgentId);
+      const marked = this.#db
+        .prepare(
+          `UPDATE bot_native_interactions
+           SET resolution_command_id = ?, resolution_requested_at = ?, requested_decision = ?,
+               requested_option_id = ?
+           WHERE bot = ? AND kind = ? AND interaction_id = ? AND status = 'pending'
+             AND (resolution_command_id IS NULL OR ? = 1)`,
+        )
+        .run(
+          input.commandId,
+          input.requestedAt,
+          input.decision,
+          input.optionId ?? null,
+          input.bot,
+          input.kind,
+          input.interactionId,
+          input.override === true ? 1 : 0,
+        ).changes;
+      if (marked !== 1) throw new Error("native interaction changed during resolution request");
+      this.#db.exec("COMMIT");
+      return { outcome: "requested", sessionId: row.sessionId, turnId: row.turnId, fresh: true };
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  pendingNativeInteractions(bot?: string): Array<{
+    bot: string; kind: "approval" | "clarify"; interactionId: string; sessionId: string; turnId: string;
+    payload: unknown; expiresAt: number | null; updatedAt: number;
+  }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT bot, kind, interaction_id AS interactionId, session_id AS sessionId, turn_id AS turnId,
+                payload_json AS payloadJson, expires_at AS expiresAt, updated_at AS updatedAt
+         FROM bot_native_interactions WHERE status = 'pending' AND (? IS NULL OR bot = ?)
+         ORDER BY updated_at, interaction_id`,
+      )
+      .all(bot ?? null, bot ?? null) as unknown as Array<{ bot: string; kind: "approval" | "clarify"; interactionId: string; sessionId: string; turnId: string; payloadJson: string; expiresAt: number | null; updatedAt: number }>;
+    return rows.map(({ payloadJson, ...row }) => ({ ...row, payload: JSON.parse(payloadJson) as unknown }));
+  }
+
+  /** Bounded current-state projection for the mobile approval inbox. `updated_at` is the pending
+   * record's creation time: records are inserted pending once and only transition to a terminal
+   * status afterwards, at which point this query excludes them. Keep the payload JSON in SQLite;
+   * this read selects only the already-safe rule display name and can never surface tool args. */
+  pendingNativeApprovals(bots: readonly string[], limit: number): Array<{
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    toolCallId: string;
+    ruleName: string;
+    createdAt: number;
+    resolutionRequestedAt?: number;
+    room?: string;
+    repair?: BotApprovalRepair;
+    scope?: BotApprovalScope;
+    grantId?: string;
+  }> {
+    if (bots.length === 0) return [];
+    const placeholders = bots.map(() => "?").join(", ");
+    const rows = this.#db
+      .prepare(
+        `SELECT bot, session_id AS sessionId, turn_id AS turnId,
+                interaction_id AS toolCallId,
+                json_extract(payload_json, '$.name') AS ruleName,
+                json_extract(payload_json, '$.room.name') AS room,
+                json_extract(payload_json, '$.repair') AS repairJson,
+                json_extract(payload_json, '$.scope') AS scopeJson,
+                json_extract(payload_json, '$.grantId') AS grantId,
+                updated_at AS createdAt,
+                resolution_requested_at AS resolutionRequestedAt
+         FROM bot_native_interactions
+         WHERE kind = 'approval' AND status = 'pending' AND bot IN (${placeholders})
+         ORDER BY updated_at, interaction_id
+         LIMIT ?`,
+      )
+      .all(...bots, limit) as unknown as Array<{
+        bot: string;
+        sessionId: string;
+        turnId: string;
+        toolCallId: string;
+        ruleName: string;
+        room: string | null;
+        repairJson: string | null;
+        scopeJson: string | null;
+        grantId: string | null;
+        createdAt: number;
+        resolutionRequestedAt: number | null;
+      }>;
+    return rows.map(({ resolutionRequestedAt, room, repairJson, scopeJson, grantId, ...row }) => ({
+      ...row,
+      ...(resolutionRequestedAt === null ? {} : { resolutionRequestedAt }),
+      // Capability 51. A room approval is the same durable row with the room name recorded beside
+      // the rule name, so one inbox answers for both lanes and a 1:1 row is byte-identical.
+      ...(room === null ? {} : { room }),
+      // Capability 62. The repair block was validated on ingest and stored as sent, so the inbox
+      // row carries the same object the live frame did; absent for every other approval.
+      ...(repairJson === null ? {} : { repair: JSON.parse(repairJson) as BotApprovalRepair }),
+      // Capability 66. Same discipline for the scoped-approval block: validated on ingest, stored
+      // as sent, so a cold inbox read renders the card the live frame did.
+      ...(scopeJson === null ? {} : { scope: JSON.parse(scopeJson) as BotApprovalScope }),
+      // Capability 66. The standing grant that settled this ask, persisted on the record, so an
+      // inbox opened cold says why a card the person never tapped is already resolving.
+      ...(grantId === null ? {} : { grantId }),
+    }));
+  }
+
+  /** Capability 66. Name, on the durable record, the standing grant that is settling this ask. It
+   * is written after the record exists because the consult needs the record's own binding first,
+   * and it is written ONLY while the ask is still pending, so it can never annotate a settled one.
+   * Every later surface (the rebroadcast, the inbox) reads it from here rather than from a frame
+   * that has already gone. */
+  attachInteractionGrant(bot: string, interactionId: string, grantId: string): void {
+    this.#db
+      .prepare(
+        `UPDATE bot_native_interactions
+         SET payload_json = json_set(payload_json, '$.grantId', ?)
+         WHERE bot = ? AND kind = 'approval' AND interaction_id = ? AND status = 'pending'`,
+      )
+      .run(grantId, bot, interactionId);
+  }
+
+  /** Capability 66. Record the standing approval one decision left behind. `grantId` is derived
+   * from the approval it came from, so a retried decision writes the same row rather than a second
+   * grant: first write wins and the returned flag says whether this call created it. */
+  recordApprovalGrant(input: {
+    bot: string;
+    grantId: string;
+    scope: "once" | "category";
+    deviceId: string;
+    sessionId: string;
+    turnId: string | null;
+    approvalId: string;
+    action: string;
+    category: string;
+    system: string;
+    resource: string;
+    payloadHash: string | null;
+    expiresAt: number;
+    createdAt: number;
+  }): boolean {
+    return this.#db
+      .prepare(
+        `INSERT INTO bot_approval_grants
+           (bot, grant_id, scope, device_id, session_id, turn_id, approval_id, action, category,
+            system, resource, payload_hash, expires_at, created_at, revoked_at, used_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+         ON CONFLICT(bot, grant_id) DO NOTHING`,
+      )
+      .run(
+        input.bot, input.grantId, input.scope, input.deviceId, input.sessionId, input.turnId,
+        input.approvalId, input.action, input.category, input.system, input.resource,
+        input.payloadHash, input.expiresAt, input.createdAt,
+      ).changes === 1;
+  }
+
+  /** Capability 66. The revocation view: the standing grants for one bot that are live, newest
+   * first. The deciding device, the approval it came from, and a `once` grant's payload hash stay
+   * in the store; what a person needs to revoke one is what leaves it.
+   *
+   * This is the SAME bounded window the consult reads (`APPROVAL_GRANT_WINDOW`), which is the
+   * point: a grant that has fallen out of the list has fallen out of the consult too, so nothing
+   * can decide invisibly. Newest first, because an older grant is the one a person is likelier to
+   * have forgotten and the one this bound drops. */
+  approvalGrants(bot: string, now: number): BotApprovalGrant[] {
+    return this.#db
+      .prepare(
+        `SELECT grant_id AS grantId, scope, action, category, system, resource,
+                session_id AS sessionId, expires_at AS expiresAt, created_at AS createdAt
+         FROM bot_approval_grants
+         WHERE ${LIVE_APPROVAL_GRANT}
+         ORDER BY created_at DESC, grant_id DESC
+         LIMIT ${APPROVAL_GRANT_WINDOW}`,
+      )
+      .all(bot, now) as unknown as BotApprovalGrant[];
+  }
+
+  /** Capability 66. Revocation is immediate: the row stays for the decision log and leaves every
+   * consult in the same transaction that marks it. */
+  revokeApprovalGrant(bot: string, grantId: string, now: number): boolean {
+    return this.#db
+      .prepare(
+        `UPDATE bot_approval_grants SET revoked_at = ?
+         WHERE bot = ? AND grant_id = ? AND revoked_at IS NULL`,
+      )
+      .run(now, bot, grantId).changes === 1;
+  }
+
+  /** Capability 66. The consult, and for a `once` grant the claim: does a standing grant already
+   * cover this exact proposal, and if it is a single-use one, spend it now? Every binding field
+   * must match, the grant must be live and inside the visible window, and a `once` grant
+   * additionally demands the same task and the same payload hash. The caller never asks for an
+   * always-require category, and `allowOnce` is false unless the peer called the retry idempotent,
+   * so a mutation is never automatically replayed.
+   *
+   * The read and the spend are ONE transaction: two asks arriving together cannot both claim the
+   * same single-use grant. Returns the grant id, which is what the decision log, the pending frame
+   * and the durable record name. */
+  claimApprovalGrant(input: {
+    bot: string;
+    sessionId: string;
+    turnId: string;
+    action: string;
+    category: string;
+    system: string;
+    resource: string;
+    payloadHash: string;
+    allowOnce: boolean;
+    /** Capability 66. False for a binding DERIVED from a plain approval: a plain ask declares no
+     * category, so nothing can say it is not a destructive or a publishing one, and a standing
+     * category policy must never answer for an action nobody classified. Only a person's own
+     * single-use grant covers one. */
+    allowCategory: boolean;
+    now: number;
+  }): string | undefined {
+    return this.tasks.atomic(() => {
+      const row = this.#db
+        .prepare(
+          `SELECT grant_id AS grantId, scope FROM bot_approval_grants
+           WHERE ${LIVE_APPROVAL_GRANT}
+             AND session_id = ? AND action = ? AND category = ? AND system = ? AND resource = ?
+             AND ((? = 1 AND scope = 'category')
+                  OR (? = 1 AND scope = 'once' AND turn_id = ? AND payload_hash = ?))
+             AND grant_id IN (
+               SELECT grant_id FROM bot_approval_grants
+               WHERE ${LIVE_APPROVAL_GRANT}
+               ORDER BY created_at DESC, grant_id DESC
+               LIMIT ${APPROVAL_GRANT_WINDOW}
+             )
+           ORDER BY expires_at DESC, grant_id
+           LIMIT 1`,
+        )
+        .get(
+          input.bot, input.now, input.sessionId, input.action, input.category, input.system,
+          input.resource, input.allowCategory ? 1 : 0, input.allowOnce ? 1 : 0, input.turnId,
+          input.payloadHash, input.bot, input.now,
+        ) as { grantId: string; scope: string } | undefined;
+      if (row === undefined) return undefined;
+      if (row.scope === "once")
+        this.#db
+          .prepare(
+            `UPDATE bot_approval_grants SET used_at = ?
+             WHERE bot = ? AND grant_id = ? AND used_at IS NULL`,
+          )
+          .run(input.now, input.bot, row.grantId);
+      return row.grantId;
+    });
+  }
+
+  /** Capability 51. What a room's members are currently blocked on, read off the same durable
+   * interaction table the 1:1 inbox reads. Room membership lives in the payload rather than in a
+   * new column on purpose: the row is byte-for-byte the row a 1:1 chat writes, so every existing
+   * resolve, expiry and retention path applies to it unchanged.
+   *
+   * A POINTER projection only: the member, the kind, the resolution id, and the room turn. No
+   * rule name, prompt or option list, because the room surface is not where a card is rendered. */
+  botGroupPendingInteractions(key: string): BotGroupPendingInteraction[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT bot AS member, kind, interaction_id AS id, turn_id AS turnId
+         FROM bot_native_interactions
+         WHERE status = 'pending' AND json_extract(payload_json, '$.room.key') = ?
+         ORDER BY updated_at, interaction_id
+         LIMIT 32`,
+      )
+      .all(key) as unknown as BotGroupPendingInteraction[];
+    return rows.map(row => {
+      const turn = this.botGroupTurn(key, row.turnId);
+      return row.kind === "approval" && turn?.member === row.member && turn.cause !== undefined ? { ...row, cause: turn.cause } : row;
+    });
+  }
+
+  /** Bounded display-safe clarification recovery. The original payload remains private in the
+   * durable interaction row; this projects only the already-rendered prompt/options. */
+  pendingNativeClarifications(
+    bots: readonly string[],
+    limit: number,
+  ): BotPendingClarification[] {
+    if (bots.length === 0) return [];
+    const placeholders = bots.map(() => "?").join(", ");
+    const rows = this.#db
+      .prepare(
+        `SELECT bot, session_id AS sessionId, turn_id AS turnId,
+                interaction_id AS clarifyId, payload_json AS payloadJson,
+                expires_at AS expiresAt, resolution_requested_at AS resolutionRequestedAt
+         FROM bot_native_interactions
+         WHERE kind = 'clarify' AND status = 'pending' AND bot IN (${placeholders})
+         ORDER BY updated_at, interaction_id
+         LIMIT ?`,
+      )
+      .all(...bots, limit) as unknown as Array<{
+        bot: string;
+        sessionId: string;
+        turnId: string;
+        clarifyId: string;
+        payloadJson: string;
+        expiresAt: number | null;
+        resolutionRequestedAt: number | null;
+      }>;
+    return rows.map(({ payloadJson, expiresAt, resolutionRequestedAt, ...row }) => {
+      const payload = JSON.parse(payloadJson) as { prompt?: unknown; options?: unknown; room?: { name?: unknown } };
+      const room = typeof payload.room?.name === "string" ? payload.room.name : undefined;
+      return {
+        ...row,
+        prompt: typeof payload.prompt === "string" ? payload.prompt : "",
+        options: Array.isArray(payload.options) ? payload.options as BotPendingClarification["options"] : [],
+        ...(expiresAt === null ? {} : { expiresAt }),
+        ...(resolutionRequestedAt === null ? {} : { resolutionRequestedAt }),
+        // Capability 51, as on the approval inbox.
+        ...(room === undefined ? {} : { room }),
+      };
+    });
+  }
+
+  /** Terminal interaction proof is durable but bounded. This recovery read includes neither
+   * command ids/decisions nor raw approval or model payloads. */
+  terminalNativeSettlements(
+    bots: readonly string[],
+  ): BotInteractionSettlement[] {
+    if (bots.length === 0) return [];
+    // Existing deployments predate the retention bound. Normalize their retained history when it
+    // is first read, so an upgrade cannot leave an indefinitely growing terminal table until the
+    // next incoming Hermes event happens to settle.
+    for (const bot of bots) this.#trimTerminalNativeInteractions(bot);
+    const placeholders = bots.map(() => "?").join(", ");
+    const rows = this.#db
+      .prepare(
+        `SELECT bot, kind, interaction_id AS interactionId, session_id AS sessionId,
+                turn_id AS turnId, status AS outcome, selected_option_id AS selectedOptionId,
+                updated_at AS settledAt
+         FROM bot_native_interactions
+         WHERE status <> 'pending' AND bot IN (${placeholders})
+         ORDER BY updated_at DESC, kind, interaction_id`,
+      )
+      .all(...bots) as unknown as Array<{
+        bot: string;
+        kind: "approval" | "clarify";
+        interactionId: string;
+        sessionId: string;
+        turnId: string;
+        outcome: BotInteractionSettlement["outcome"];
+        selectedOptionId: string | null;
+        settledAt: number;
+      }>;
+    return rows.map(({ selectedOptionId, ...row }) => ({
+      ...row,
+      ...(selectedOptionId === null ? {} : { selectedOptionId }),
+    }));
+  }
+
+  /** Atomically transition one stale approval before a user can act on it. The conditional update
+   * is authoritative, so a timer or another device winning the race cannot expire a settled row. */
+  expireNativeApprovalIfDue(
+    bot: string,
+    interactionId: string,
+    now: number,
+  ): { sessionId: string; turnId: string } | undefined {
+    return this.expireNativeInteractionIfDue(bot, "approval", interactionId, now);
+  }
+
+  /** A requested decision remains pending until Hermes proves a terminal result. The deadline is
+   * still authoritative during that interval, so it must be checked in the same synchronous path
+   * used by the action route, not only by a background timer. */
+  expireNativeInteractionIfDue(
+    bot: string,
+    kind: "approval" | "clarify",
+    interactionId: string,
+    now: number,
+  ): { sessionId: string; turnId: string } | undefined {
+    return this.tasks.atomic(() => {
+    const row = this.#db
+      .prepare(
+        `SELECT session_id AS sessionId, turn_id AS turnId
+         FROM bot_native_interactions
+         WHERE bot = ? AND kind = ? AND interaction_id = ?
+           AND status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?`,
+      )
+      .get(bot, kind, interactionId, now) as { sessionId: string; turnId: string } | undefined;
+    if (row === undefined) return undefined;
+    const changed = this.#db
+      .prepare(
+        `UPDATE bot_native_interactions SET status = 'expired', updated_at = ?
+         WHERE bot = ? AND kind = ? AND interaction_id = ?
+           AND status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?`,
+      )
+      .run(now, bot, kind, interactionId, now).changes === 1;
+    if (changed) { this.#trimTerminalNativeInteractions(bot); this.tasks.interaction(bot, kind, interactionId); }
+    return changed ? row : undefined;
+    });
+  }
+
+  /** Due active-profile approval ids. Callers settle each through the conditional method above,
+   * retaining exactly-one terminal event semantics while completing the check synchronously. */
+  dueNativeApprovalIds(bots: readonly string[], now: number): Array<{ bot: string; interactionId: string }> {
+    if (bots.length === 0) return [];
+    const placeholders = bots.map(() => "?").join(", ");
+    return this.#db
+      .prepare(
+        `SELECT bot, interaction_id AS interactionId FROM bot_native_interactions
+         WHERE kind = 'approval' AND status = 'pending' AND expires_at IS NOT NULL
+           AND expires_at <= ? AND bot IN (${placeholders})
+         ORDER BY expires_at, interaction_id`,
+      )
+      .all(now, ...bots) as unknown as Array<{ bot: string; interactionId: string }>;
+  }
+
+  #trimTerminalNativeInteractions(bot: string): void {
+    this.#db
+      .prepare(
+        `DELETE FROM bot_native_interactions
+         WHERE bot = ? AND status <> 'pending'
+           AND (kind, interaction_id) IN (
+             SELECT kind, interaction_id FROM bot_native_interactions
+             WHERE bot = ? AND status <> 'pending'
+             ORDER BY updated_at DESC, kind, interaction_id
+             LIMIT -1 OFFSET ?
+           )`,
+      )
+      .run(bot, bot, NATIVE_INTERACTION_SETTLEMENT_LIMIT);
+  }
+
+  /** The bot's live native turn, if any, read WITHOUT the create-if-missing side effect of
+   *  `nativeBotChat`. Deletion asks this question about a bot it is about to remove, so writing a
+   *  fresh chat row for it here would be self-defeating. */
+  nativeBotActiveTurn(bot: string): { sessionId: string; turnId: string } | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT chat.session_id AS sessionId, session.active_turn_id AS turnId
+         FROM bot_native_chats AS chat
+         JOIN bot_native_sessions AS session ON session.bot = chat.bot AND session.session_id = chat.session_id
+         WHERE chat.bot = ?`,
+      )
+      .get(bot) as unknown as { sessionId: string; turnId: string | null } | undefined;
+    if (row === undefined || row.turnId === null) return undefined;
+    return { sessionId: row.sessionId, turnId: row.turnId };
+  }
+
+  /** Removes every durable row this gateway holds for one bot, in one transaction: the roster
+   *  cache row, the native chat plane (active pointer, sessions, transcript, receipts, turn media
+   *  bindings, interactions, terminals), tool steps and delegations, routine overrides, the attach
+   *  journals (stream cursors, command outbox, event inbox, turn terminals, media blobs, scheduled
+   *  deliveries), the bot's group-turn tombstones, its Live Activity registrations, and its half
+   *  of the core thread surface (messages, threads, the agent row). Group rooms and their
+   *  membership are deliberately NOT touched: a room is a user-owned resource that may name a
+   *  deleted member, and
+   *  the room surface already renders a missing member honestly.
+   *
+   *  Returns the deleted row count per area (zero-row areas omitted), so the delete route reports
+   *  what it actually removed rather than asserting it. Keys are the stable identifiers
+   *  `BotDeleteResponse.purged` carries on the wire. */
+  purgeBot(
+    bot: string,
+    runtimeDelete?: Parameters<Storage["enqueueRunnerOperation"]>[0],
+  ): Record<string, number> {
+    if (runtimeDelete !== undefined && (runtimeDelete.bot !== bot || runtimeDelete.kind !== "delete_runtime"))
+      throw new Error("a bot purge can only enqueue that bot's runtime deletion");
+    const areas: ReadonlyArray<readonly [area: string, table: string, column: string]> = [
+      ["roster", "bot_roster", "name"],
+      ["toolSteps", "bot_chat_tool_steps", "bot"],
+      ["delegations", "bot_chat_delegations", "bot"],
+      ["routineOverrides", "bot_routine_overrides", "bot"],
+      ["chatPointer", "bot_native_chats", "bot"],
+      ["chatConfiguration", "bot_chat_configurations", "bot"],
+      ["chatWorkspaceDefault", "bot_chat_workspace_defaults", "bot"],
+      ["desktopResumeBindings", "bot_desktop_resume_bindings", "bot"],
+      ["pendingProfileSeeds", "pending_hermes_profile_seeds", "profile"],
+      ["slashCatalogs", "task_slash_catalogs", "peer"],
+      ["sessions", "bot_native_sessions", "bot"],
+      ["messages", "bot_native_messages", "bot"],
+      ["receipts", "bot_message_receipts", "bot"],
+      // Capability 86.
+      ["reactions", "bot_message_reactions", "bot"],
+      ["canonicalBotChat", "bot_canonical_chats", "bot"],
+      ["mobileReceipts", "bot_mobile_receipts", "bot"],
+      // Capability 68. A lifecycle record names a device, a turn and the purpose a person was
+      // shown. Deleting the bot takes them with it rather than leaving them keyed to an identity
+      // that no longer exists.
+      ["mobileRequests", "bot_mobile_requests", "bot"],
+      // Capabilities 70 and 71. A preferred device and a draft are both keyed to this bot's
+      // conversation; deleting the bot takes them rather than leaving a person's own words and
+      // their routing choice pointing at an identity that is gone.
+      ["mobilePreferredDevices", "bot_mobile_preferred_devices", "bot"],
+      ["composerDrafts", "bot_composer_drafts", "bot"],
+      ["turnMediaDeliveries", "bot_turn_media_deliveries", "bot"],
+      ["interactions", "bot_native_interactions", "bot"],
+      // Capability 66. A standing approval belongs to the bot it was made for: deleting the bot
+      // takes its grants with it rather than leaving policy pointing at an identity that is gone.
+      ["approvalGrants", "bot_approval_grants", "bot"],
+      ["turnTerminals", "bot_native_turn_terminals", "bot"],
+      // Capability 69. A pending steer holds a person's own words against a conversation with
+      // this bot. Deleting the bot takes them with it rather than leaving text keyed to an
+      // identity that no longer exists and a promotion that can never run.
+      ["pendingSteers", "bot_native_pending_steers", "bot"],
+      ["attachStream", "attach_streams", "agent_id"],
+      ["attachCommands", "attach_command_outbox", "agent_id"],
+      ["attachEvents", "attach_event_inbox", "agent_id"],
+      ["attachTurnTerminals", "attach_turn_terminals", "agent_id"],
+      ["scheduledDeliveries", "attach_scheduled_deliveries", "agent_id"],
+      ["groupTurns", "bot_group_turns", "agent_id"],
+      ["liveActivities", "live_activity_registrations", "bot"],
+      ["cozyApps", "cozy_apps", "creator_bot"],
+      ["cozyAppActions", "cozy_app_actions", "creator_bot"],
+      // Capability 49. The gateway-owned runtime row goes with everything else the bot owned; its
+      // operations are deliberately NOT purged, because the `delete_runtime` this delete enqueues
+      // is the record of the cleanup a runner still owes.
+      ["runtimeBot", "runtime_bots", "id"],
+      // Capability 88. The deleted bot's own team row. Its assignments are handled below.
+      ["team", "bot_team", "bot"],
+    ];
+    const purged: Record<string, number> = {};
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db.prepare("INSERT OR IGNORE INTO deleted_bots (bot, deleted_at) VALUES (?, ?)").run(bot, Date.now());
+      // Queue host cleanup in the same commit as forgetting the runtime and its credential.
+      if (runtimeDelete !== undefined) this.enqueueRunnerOperation(runtimeDelete);
+      const retiredCreates = this.#pruneCompletedRuntimeCreates(bot);
+      if (retiredCreates > 0) purged["runtimeCreateOperations"] = retiredCreates;
+      // These execution rows ARE the retryable delete outbox. Keep them until their runner
+      // acknowledges deletion; dropping them here would strand a process on an offline computer.
+      this.#db.prepare("UPDATE chat_executions SET stage = 'deleted' WHERE bot = ?").run(bot);
+      // An execution is a separate attach peer, with its own cursors and media. Its id is
+      // resolved from this bot's execution rows, never guessed from a prefix or a session id.
+      for (const table of ["attach_streams", "attach_command_outbox", "attach_event_inbox",
+        "attach_turn_terminals", "attach_scheduled_deliveries"]) {
+        const count = Number(this.#db.prepare(`DELETE FROM ${table}
+          WHERE agent_id IN (SELECT execution_id FROM chat_executions WHERE bot = ?)`).run(bot).changes);
+        if (count > 0) purged[`execution_${table}`] = count;
+      }
+      const catalogs = Number(this.#db.prepare(`DELETE FROM task_slash_catalogs
+        WHERE peer IN (SELECT execution_id FROM chat_executions WHERE bot = ?)`).run(bot).changes);
+      if (catalogs > 0) purged["executionSlashCatalogs"] = catalogs;
+      // Capability 88. No later bot of this name inherits a place on anyone's team or any
+      // assignment. The surviving party keeps the row: an assignee still reads the work it did for
+      // a deleted leader, and a leader reads a deleted assignee's work frozen at the state it had,
+      // derived here while its Task (purged just below) can still say it.
+      const teams = this.#db.prepare(`SELECT DISTINCT team.bot AS bot, team.reports_json AS reports FROM bot_team AS team, json_each(team.reports_json) AS report
+        WHERE report.value = ?`).all(bot) as { bot: string; reports: string }[];
+      for (const row of teams)
+        this.#db.prepare("UPDATE bot_team SET reports_json = ? WHERE bot = ?").run(JSON.stringify((JSON.parse(row.reports) as string[]).filter((name) => name !== bot)), row.bot);
+      if (teams.length > 0) purged["teamReports"] = teams.length;
+      const now = Date.now();
+      let answered = 0;
+      for (const row of this.botAssignments({ assignee: bot })) {
+        const task = this.tasks.read(row.taskId)?.view;
+        const result = row.resultJson === undefined ? undefined : (JSON.parse(row.resultJson) as { status: AssignmentResult["status"] }).status;
+        const frozen = row.frozenState ?? frozenOnDelete(deriveAssignmentState({
+          deadlineAt: row.deadlineAt,
+          ...(row.acknowledgedOutcome === undefined ? {} : { acknowledgedOutcome: row.acknowledgedOutcome }),
+          ...(row.cancelledBy === undefined ? {} : { cancelledBy: row.cancelledBy }),
+          ...(row.failure === undefined ? {} : { failure: row.failure }),
+          ...(result === undefined ? {} : { resultStatus: result }),
+          ...(task === undefined ? {} : { taskState: task.state, taskAt: task.at }),
+        }, now), result);
+        this.#db.prepare(`UPDATE bot_assignments SET assignee_deleted_at = ?, updated_at = ?, frozen_state = ?,
+            failure = CASE WHEN ? = 'cancelled' THEN COALESCE(failure, 'assignee deleted') ELSE failure END
+          WHERE task_id = ?`).run(now, now, frozen, frozen, row.taskId);
+        answered += 1;
+      }
+      if (answered > 0) purged["assignmentsAnswered"] = answered;
+      // A tombstoned row gives its idempotency key up, so a later bot of this name can use it.
+      const led = Number(this.#db.prepare(`UPDATE bot_assignments SET leader_deleted_at = ?, updated_at = ?, idempotency_key = NULL
+        WHERE leader = ? AND leader_deleted_at IS NULL`).run(now, now, bot).changes);
+      if (led > 0) purged["assignmentsLed"] = led;
+      // Private Task history belongs to the deleted bot. Room Tasks belong to the shared room;
+      // ownerDeleted already settled those and the room's history remains readable.
+      for (const [area, count] of Object.entries(this.tasks.purgeBot(bot))) if (count > 0) purged[area] = count;
+      // Earlier native-history builds used this migration ledger. It is an explicitly known
+      // legacy table, not an invitation to sweep arbitrary tables by a matching identifier.
+      if (this.#db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bot_native_history_migrations'").get()) {
+        const changes = Number(this.#db.prepare("DELETE FROM bot_native_history_migrations WHERE bot = ?").run(bot).changes);
+        if (changes > 0) purged["nativeHistoryMigrations"] = changes;
+      }
+      this.#db.prepare(`INSERT OR IGNORE INTO live_activity_relay_deletion_outbox (push_id, queued_at)
+        SELECT push_id, ? FROM live_activity_registrations WHERE bot = ?`).run(Date.now(), bot);
+      // Private Artifacts and deliveries follow their owner; room Artifacts retain their
+      // records and referenced media as part of the shared room history.
+      // Deliveries first: they reference the record they belong to.
+      for (const [area, statement] of [
+        ["artifactDeliveries", "DELETE FROM artifact_deliveries WHERE artifact_id IN (SELECT artifact_id FROM artifacts WHERE bot = ? AND room IS NULL)"],
+        ["artifacts", "DELETE FROM artifacts WHERE bot = ? AND room IS NULL"],
+      ] as const) {
+        const changes = Number(this.#db.prepare(statement).run(bot).changes);
+        if (changes > 0) purged[area] = changes;
+      }
+      const media = Number(this.#db.prepare(`DELETE FROM attach_media
+        WHERE (agent_id = ? OR agent_id IN (SELECT execution_id FROM chat_executions WHERE bot = ?))
+          AND NOT EXISTS (SELECT 1 FROM artifacts WHERE room IS NOT NULL
+            AND created_by = attach_media.agent_id AND media_id = attach_media.media_id)`).run(bot, bot).changes);
+      if (media > 0) purged["attachMedia"] = media;
+      for (const [area, table, column] of areas) {
+        const changes = Number(
+          this.#db.prepare(`DELETE FROM ${table} WHERE ${column} = ?`).run(bot).changes,
+        );
+        if (changes > 0) purged[area] = changes;
+      }
+      // The core thread surface is a parent/child chain rather than a flat `WHERE bot = ?`, and
+      // `PRAGMA foreign_keys` is ON, so it goes child-first inside this same transaction. The
+      // deletion fence keeps a stale config from reconstructing the `agents` row at the next boot.
+      const core: ReadonlyArray<readonly [area: string, sql: string]> = [
+        [
+          "coreMessages",
+          "DELETE FROM messages WHERE thread_id IN (SELECT id FROM threads WHERE agent_id = ?)",
+        ],
+        ["coreThreads", "DELETE FROM threads WHERE agent_id = ?"],
+        ["agentRow", "DELETE FROM agents WHERE id = ?"],
+      ];
+      for (const [area, sql] of core) {
+        const changes = Number(this.#db.prepare(sql).run(bot).changes);
+        if (changes > 0) purged[area] = changes;
+      }
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+    return purged;
+  }
+
+  // ---- Capability 49: gateway-owned runtime bots and their runner operations ----
+
+  /** Writes a runtime bot row. Throws when the id or the token is already held, so a create can
+   *  never silently take over an existing identity. */
+  insertRuntimeBot(row: RuntimeBotInsert): void {
+    this.#db
+      .prepare(
+        `INSERT INTO runtime_bots (id, name, avatar, token, runtime, spec_generation, created_at, runner_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        row.id, row.name, row.avatar, row.token, row.runtime, row.specGeneration, row.createdAt,
+        row.runnerId ?? null,
+      );
+  }
+
+  runtimeBots(): RuntimeBotRow[] {
+    return (
+      this.#db
+        .prepare(
+          `SELECT id, name, avatar, token, runtime, spec_generation, created_at, runner_id
+           FROM runtime_bots ORDER BY created_at ASC`,
+        )
+        .all() as unknown as Array<{
+        id: string; name: string; avatar: string | null; token: string;
+        runtime: string; spec_generation: number; created_at: number; runner_id: string | null;
+      }>
+    ).map((row) => ({
+      id: row.id,
+      name: row.name,
+      avatar: row.avatar,
+      token: row.token,
+      runtime: "cozyagents" as const,
+      specGeneration: row.spec_generation,
+      createdAt: row.created_at,
+      runnerId: row.runner_id,
+    }));
+  }
+
+  /** Primary-key lookup. Every route that touches a runtime bot calls this, so it reads the one
+   *  row by id rather than scanning the table. */
+  runtimeBot(id: string): RuntimeBotRow | undefined {
+    const row = this.#db
+      .prepare(
+        `SELECT id, name, avatar, token, runtime, spec_generation, created_at, runner_id
+         FROM runtime_bots WHERE id = ?`,
+      )
+      .get(id) as unknown as
+      | {
+          id: string; name: string; avatar: string | null; token: string; runtime: string;
+          spec_generation: number; created_at: number; runner_id: string | null;
+        }
+      | undefined;
+    return row === undefined
+      ? undefined
+      : {
+          id: row.id,
+          name: row.name,
+          avatar: row.avatar,
+          token: row.token,
+          runtime: "cozyagents",
+          specGeneration: row.spec_generation,
+          createdAt: row.created_at,
+          runnerId: row.runner_id,
+        };
+  }
+
+  /** Capability 54. How many runtime bots this gateway placed on one computer, which is what the
+   *  roster screen shows and what a revoke warns about. */
+  countRuntimeBotsForRunner(runnerId: string): number {
+    const row = this.#db
+      .prepare("SELECT COUNT(*) AS count FROM runtime_bots WHERE runner_id = ?")
+      .get(runnerId) as { count: number };
+    return row.count;
+  }
+
+  /** Durably accepts a lifecycle operation. It waits in `waiting_for_runner` whether or not a
+   *  runner is connected right now: the send is a separate, retryable act. */
+  enqueueRunnerOperation(op: {
+    operationId: string;
+    bot: string;
+    kind: RunnerOperationKind;
+    specGeneration: number;
+    payload: Record<string, unknown>;
+    at: number;
+    /** Capability 54. Which runner this operation belongs to. Absent leaves it unaddressed, which
+     *  is exactly what a pre-54 row is. */
+    runnerId?: string | null;
+  }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO runner_operations
+           (operation_id, bot, kind, spec_generation, payload_json, stage, created_at, updated_at, runner_id)
+         VALUES (?, ?, ?, ?, ?, 'waiting_for_runner', ?, ?, ?)`,
+      )
+      .run(
+        op.operationId, op.bot, op.kind, op.specGeneration, JSON.stringify(op.payload), op.at, op.at,
+        op.runnerId ?? null,
+      );
+  }
+
+  /** Operations no runner has been handed yet, oldest first. A reconnecting runner is sent exactly
+   *  these, which is what makes a create accepted while offline reconcile later.
+   *
+   *  Capability 54: `target` narrows the queue to one computer. `runnerId` takes the rows that name
+   *  it, and `includeUnassigned` adds the rows that name nobody, which the lane sets only for the
+   *  runner an unaddressed row honestly belongs to. Called with nothing it is the whole queue, the
+   *  pre-54 behaviour a single-tenant caller still gets. */
+  unsentRunnerOperations(
+    target?: { runnerId: string; includeUnassigned?: boolean },
+  ): RunnerOperationRow[] {
+    if (target === undefined) {
+      return this.#runnerOperations(
+        "SELECT * FROM runner_operations WHERE sent_at IS NULL ORDER BY created_at ASC, operation_id ASC",
+      );
+    }
+    const where =
+      target.includeUnassigned === true
+        ? "(runner_id = ? OR runner_id IS NULL)"
+        : "runner_id = ?";
+    return this.#runnerOperations(
+      `SELECT * FROM runner_operations WHERE sent_at IS NULL AND ${where}`
+        + " ORDER BY created_at ASC, operation_id ASC",
+      target.runnerId,
+    );
+  }
+
+  runnerOperation(operationId: string): RunnerOperationRow | undefined {
+    return this.#runnerOperations(
+      "SELECT * FROM runner_operations WHERE operation_id = ?",
+      operationId,
+    )[0];
+  }
+
+  /** The operation whose stage a bot's runtime projection reports: the most recently accepted
+   * row. `rowid` is the durable acceptance order; wall-clock values are display/audit facts and
+   * may move backwards after a host clock correction. */
+  latestRunnerOperationForBot(bot: string): RunnerOperationRow | undefined {
+    return this.#runnerOperations(
+      "SELECT * FROM runner_operations WHERE bot = ? ORDER BY rowid DESC LIMIT 1",
+      bot,
+    )[0];
+  }
+
+  /** Reopens exactly the current terminal create operation for a gateway-owned runtime bot.
+   *
+   * The INSERT reads `payload_json` directly from the prior row rather than round-tripping its
+   * parsed object through a caller. That keeps the original durable spec byte-for-byte intact and
+   * makes `operationId` the only new command identity. The `latest` predicate is the idempotency
+   * fence: once one caller inserts its fresh row, a replay (or a concurrent caller) affects zero
+   * rows because the source is no longer this bot's current operation. */
+  recoverFailedRuntimeCreate(input: {
+    operationId: string;
+    sourceOperationId: string;
+    bot: string;
+    at: number;
+  }): RunnerOperationRow | undefined {
+    const result = this.#db
+      .prepare(
+        `INSERT INTO runner_operations
+           (operation_id, bot, kind, spec_generation, payload_json, stage, created_at, updated_at, runner_id)
+         SELECT ?, bot, kind, spec_generation, payload_json, 'waiting_for_runner', ?, ?, runner_id
+         FROM runner_operations
+         WHERE operation_id = ? AND bot = ? AND kind = 'create_runtime' AND stage = 'needs_attention'
+           AND operation_id = (
+             SELECT operation_id FROM runner_operations
+             WHERE bot = ? ORDER BY rowid DESC LIMIT 1
+           )`,
+      )
+      .run(
+        input.operationId,
+        input.at,
+        input.at,
+        input.sourceOperationId,
+        input.bot,
+        input.bot,
+      );
+    return result.changes === 1 ? this.runnerOperation(input.operationId) : undefined;
+  }
+
+  markRunnerOperationSent(operationId: string, at: number): void {
+    this.#db
+      .prepare("UPDATE runner_operations SET sent_at = ?, updated_at = ? WHERE operation_id = ?")
+      .run(at, at, operationId);
+  }
+
+  /** A runner that connects (or reconnects) is handed every operation still waiting on its first
+   *  receipt again. An operation a runner has already receipted is NOT resent: retry from the last
+   *  verified stage is the runner's own job (ADR 0002), and resending would repeat a mutation.
+   *
+   *  Capability 54: `target` narrows the reset to the reconnecting runner's own rows, exactly as
+   *  `unsentRunnerOperations` narrows the queue. Without it, one machine coming back would rewind
+   *  and resend the work every OTHER machine already has in flight, which is churn caused by a
+   *  computer that has nothing to do with those bots. */
+  resetUnreceiptedRunnerOperationSends(
+    target?: { runnerId: string; includeUnassigned?: boolean },
+  ): void {
+    const base = "UPDATE runner_operations SET sent_at = NULL WHERE sent_at IS NOT NULL AND stage = 'waiting_for_runner'";
+    if (target === undefined) {
+      this.#db.prepare(base).run();
+      return;
+    }
+    const scope =
+      target.includeUnassigned === true
+        ? " AND (runner_id = ? OR runner_id IS NULL)"
+        : " AND runner_id = ?";
+    this.#db.prepare(base + scope).run(target.runnerId);
+  }
+
+  /** Capability 54. Re-addresses one runner's not-yet-sent operations, which is what a revoke does
+   *  with the work that machine will never authenticate to collect: to the account default when
+   *  there is one, and to nobody when there is not, which is the same unaddressed state a pre-54
+   *  row holds and is dispatched to whichever runner becomes the default later. Returns how many
+   *  moved. An operation already SENT is left alone: the runner may well have applied it, and
+   *  handing that same mutation to a second machine is the one thing the single-writer rule
+   *  exists to prevent. */
+  readdressUnsentRunnerOperations(from: string, to: string | null): number {
+    return Number(
+      this.#db
+        .prepare("UPDATE runner_operations SET runner_id = ? WHERE runner_id = ? AND sent_at IS NULL")
+        .run(to, from).changes,
+    );
+  }
+
+  /** Records one immutable stage receipt onto its operation.
+   *
+   *  Three guards, each of which exists because a runner is a separate process that can retry,
+   *  reconnect, and deliver out of order:
+   *
+   *  - A receipt for an operation this gateway never issued, or for a different bot than the one
+   *    the operation names, is `unknown` and changes nothing. The gateway is the lifecycle
+   *    authority; a runner cannot invent state for a bot it was not asked about.
+   *  - A receipt that would move the stage BACKWARDS along the provisioning progression (a
+   *    `creating` arriving after `ready`) is `stale`: the contact is recorded, the stage is not.
+   *    Stages outside that progression (`needs_attention`, `deleting`, `stopped`, ...) are real
+   *    lifecycle transitions and always apply.
+   *  - `observed_generation` advances only on `ready`. An in-progress stage says what is being
+   *    attempted, never what is running. */
+  recordRunnerReceipt(receipt: {
+    operationId: string;
+    botId: string;
+    specGeneration: number;
+    stage: string;
+    at: number;
+    code?: string;
+  }): "recorded" | "stale" | "unknown" {
+    const current = this.runnerOperation(receipt.operationId);
+    if (current === undefined || current.bot !== receipt.botId) return "unknown";
+    if (regressesRunnerStage(current.stage, receipt.stage)) {
+      this.#db
+        .prepare("UPDATE runner_operations SET last_contact_at = ?, updated_at = ? WHERE operation_id = ?")
+        .run(receipt.at, receipt.at, receipt.operationId);
+      return "stale";
+    }
+    this.#db
+      .prepare(
+        `UPDATE runner_operations
+           SET stage = ?, code = ?, observed_generation = ?, last_contact_at = ?, updated_at = ?
+         WHERE operation_id = ?`,
+      )
+      .run(
+        receipt.stage,
+        receipt.code ?? null,
+        receipt.stage === "ready" ? receipt.specGeneration : current.observedGeneration,
+        receipt.at,
+        receipt.at,
+        receipt.operationId,
+      );
+    if (current.kind === "delete_runtime" && receipt.stage === "deleted") {
+      // Preserve the delete receipt itself as the runner replay/idempotency fence. A later bot
+      // with this name can already exist, so only creates older than an acknowledged delete go.
+      this.#pruneCompletedRuntimeCreates(current.bot);
+    }
+    return "recorded";
+  }
+
+  #pruneCompletedRuntimeCreates(bot: string): number {
+    return Number(this.#db.prepare(`DELETE FROM runner_operations AS creation
+      WHERE creation.bot = ? AND creation.kind = 'create_runtime'
+        AND EXISTS (SELECT 1 FROM runner_operations AS deletion
+          WHERE deletion.bot = creation.bot AND deletion.kind = 'delete_runtime'
+            AND deletion.stage = 'deleted' AND deletion.rowid > creation.rowid)`).run(bot).changes);
+  }
+
+  #runnerOperations(sql: string, ...params: string[]): RunnerOperationRow[] {
+    return (
+      this.#db.prepare(sql).all(...params) as unknown as Array<{
+        operation_id: string; bot: string; kind: string; spec_generation: number;
+        payload_json: string; stage: string; code: string | null;
+        observed_generation: number | null; last_contact_at: number | null;
+        created_at: number; updated_at: number; sent_at: number | null;
+        runner_id: string | null;
+      }>
+    ).map((row) => ({
+      operationId: row.operation_id,
+      bot: row.bot,
+      kind: row.kind as RunnerOperationKind,
+      specGeneration: row.spec_generation,
+      payload: JSON.parse(row.payload_json) as Record<string, unknown>,
+      stage: row.stage,
+      code: row.code,
+      observedGeneration: row.observed_generation,
+      lastContactAt: row.last_contact_at,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      sentAt: row.sent_at,
+      runnerId: row.runner_id,
+    }));
+  }
+
+  close(): void {
+    this.#db.close();
+  }
+}
+
+interface NativeBotMessageDbRow {
+  id: string;
+  role: string;
+  text: string;
+  at: number | null;
+  clientId: string | null;
+  attachmentsJson: string | null;
+  marker: string | null;
+  turnId: string | null;
+  authorBot: string | null;
+  inReplyToId: string | null;
+}
+
+interface ChatExecutionDbRow {
+  executionId: string;
+  bot: string;
+  sessionId: string;
+  runnerId: string;
+  token: string;
+  operationId: string;
+  workspaceJson: string;
+  modelJson: string | null;
+  sourceProfileJson: string | null;
+  launchModelJson: string | null;
+  harness: "cozyagents" | "hermes";
+  stage: ChatExecutionRow["stage"];
+  createdAt: number;
+}
+
+function chatExecution(row: ChatExecutionDbRow): ChatExecutionRow {
+  return {
+    executionId: row.executionId, bot: row.bot, sessionId: row.sessionId, runnerId: row.runnerId,
+    token: row.token, operationId: row.operationId,
+    workspace: JSON.parse(row.workspaceJson) as ChatWorkspaceSelection,
+    ...(row.modelJson === null ? {} : { model: JSON.parse(row.modelJson) as ChatModelSelection | null }),
+    ...(row.sourceProfileJson === null ? {} : { sourceProfile: JSON.parse(row.sourceProfileJson) as BotProfilePatch }),
+    ...(row.launchModelJson === null ? {} : { launchModel: JSON.parse(row.launchModelJson) as { provider?: string; endpoint?: string; id: string } }),
+    harness: row.harness, stage: row.stage, createdAt: row.createdAt,
+  };
+}
+
+function reactionRow(row: { author: string; emoji: string; at: number }): BotMessageReaction {
+  // Hermes stamps reactions in SECONDS; this table stores the gateway's milliseconds.
+  return { emoji: row.emoji, author: row.author === "agent" ? "agent" : "user", at: row.at / 1000 };
+}
+
+function withReactions(message: BotChatMessage, reactions: BotMessageReaction[] | undefined): BotChatMessage {
+  return reactions === undefined || reactions.length === 0 ? message : { ...message, reactions };
+}
+
+function nativeBotMessage(row: NativeBotMessageDbRow): BotChatMessage {
+  return {
+    id: row.id,
+    role: row.role,
+    text: row.text,
+    at: row.at,
+    ...(row.clientId === null ? {} : { clientId: row.clientId }),
+    ...(row.attachmentsJson === null ? {} : { attachments: JSON.parse(row.attachmentsJson) as BotChatAttachment[] }),
+    ...(row.marker === null ? {} : { marker: row.marker }),
+    ...(row.turnId === null ? {} : { turnId: row.turnId }),
+    ...(row.authorBot === null ? {} : { authorBot: row.authorBot }),
+    ...(row.inReplyToId === null ? {} : { inReplyToId: row.inReplyToId }),
+  };
+}
+
+export function openStorage(dbPath: string): Storage {
+  const db = new CachedDatabaseSync(dbPath);
+  db.exec("PRAGMA journal_mode = WAL");
+  // The attach ACK boundary is a durable SQLite commit, not merely a WAL append.
+  db.exec("PRAGMA synchronous = FULL");
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec(SCHEMA);
+  // Issue #191. bot_native_chats once carried its own copy of the selected session's turn beside
+  // the per-session truth in bot_native_sessions. Before retiring that copy, restore any missing
+  // companion session row from the pointer (a pre-session-table database or a damaged pointer), so
+  // its in-flight turn survives; where both rows exist the session value already won every read
+  // and is kept. The column is cleared, not dropped: every earlier migration is additive so that a
+  // rolled-back release still boots here. Nothing writes the copy any more, so once cleared this
+  // is one cheap probe of a one-row-per-bot table. A second process that reaches this point while
+  // another holds the migration lock waits briefly for it, then re-probes and finds the work done.
+  const legacyChatTurn = db.prepare("SELECT 1 FROM bot_native_chats WHERE active_turn_id IS NOT NULL LIMIT 1");
+  if (legacyChatTurn.get() !== undefined) {
+    db.exec("PRAGMA busy_timeout = 5000");
+    try {
+      db.exec("BEGIN IMMEDIATE");
+    } finally {
+      db.exec("PRAGMA busy_timeout = 0");
+    }
+    try {
+      if (legacyChatTurn.get() !== undefined) {
+        db.exec(`INSERT OR IGNORE INTO bot_native_sessions (bot, session_id, created_at, updated_at, active_turn_id)
+          SELECT bot, session_id, updated_at, updated_at, active_turn_id FROM bot_native_chats`);
+        db.exec("UPDATE bot_native_chats SET active_turn_id = NULL WHERE active_turn_id IS NOT NULL");
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  // The original tool table predates detail/error_text. Migrate before creating their index.
+  const toolColumns = new Set(
+    (db.prepare("PRAGMA table_info(bot_chat_tool_steps)").all() as Array<{ name: string }>).map(row => row.name),
+  );
+  for (const column of ["detail", "error_text"])
+    if (!toolColumns.has(column)) db.exec(`ALTER TABLE bot_chat_tool_steps ADD COLUMN ${column} TEXT`);
+  // Capability 88. Columns added to bot_assignments during its own review, before any release.
+  const assignmentColumns = new Set(
+    (db.prepare("PRAGMA table_info(bot_assignments)").all() as Array<{ name: string }>).map(row => row.name),
+  );
+  for (const [column, type] of [["lapse_announced_at", "INTEGER"], ["leader_deleted_at", "INTEGER"], ["assignee_deleted_at", "INTEGER"], ["frozen_state", "TEXT"]] as const)
+    if (!assignmentColumns.has(column)) db.exec(`ALTER TABLE bot_assignments ADD COLUMN ${column} ${type}`);
+  db.exec(`CREATE INDEX IF NOT EXISTS bot_chat_tool_steps_detail_compaction
+    ON bot_chat_tool_steps (ended_at, bot, turn_id, step_id)
+    WHERE detail IS NOT NULL OR error_text IS NOT NULL`);
+  // Terminal receipts originally joined back to the inbox for their timestamp. Copy that durable
+  // fact once onto older receipts before creating the ordered endpoint index used by health.
+  const attachTerminalColumns = new Set(
+    (db.prepare("PRAGMA table_info(attach_turn_terminals)").all() as Array<{ name: string }>).map(row => row.name),
+  );
+  if (!attachTerminalColumns.has("received_at"))
+    db.exec("ALTER TABLE attach_turn_terminals ADD COLUMN received_at INTEGER");
+  db.exec(`UPDATE attach_turn_terminals AS terminal
+    SET received_at = (
+      SELECT inbox.received_at FROM attach_event_inbox AS inbox
+      WHERE inbox.agent_id = terminal.agent_id AND inbox.event_id = terminal.event_id
+    )
+    WHERE received_at IS NULL`);
+  db.exec(`CREATE INDEX IF NOT EXISTS attach_turn_terminals_received_at_desc
+    ON attach_turn_terminals (received_at DESC)`);
+  // Setup codes are short-lived invitations, not durable sessions. Old builds retained expired
+  // and consumed rows forever; prune that residue while keeping a live invitation across restart.
+  db.prepare("DELETE FROM setup_codes WHERE used_at IS NOT NULL OR expires_at < ?").run(Date.now());
+  // CREATE TABLE IF NOT EXISTS does not add delegation-enrichment columns to an existing database.
+  // Migrate additively in place; each nullable column preserves the distinction between an older
+  // unavailable result and an explicit `schema_valid = 0` verdict.
+  // Capability 52. An existing database's `setup_codes` predates the kind column; adding it
+  // nullable keeps every live invitation valid and reads it back as the device code it was.
+  // Capability 54. An existing database's runtime bots and operations predate the runner column;
+  // adding it nullable is the whole migration. Nothing is backfilled: an operation written before
+  // 54 belongs to the account default, and inventing a runner id for it would be a guess this
+  // gateway cannot make honestly. Idempotent, so a restarted container runs it harmlessly again.
+  // Dashboard packet D2. An existing database's receipts predate the app-reported perceived
+  // latency and network path. Both are added nullable and nothing is backfilled: a receipt written
+  // before capability 73 carries no measurement, and inventing one would be a guess.
+  {
+    const columns = new Set(
+      (db.prepare("PRAGMA table_info(bot_message_receipts)").all() as unknown as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!columns.has("felt_latency_ms")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN felt_latency_ms INTEGER");
+    if (!columns.has("network_path")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN network_path TEXT");
+    if (!columns.has("vpn")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN vpn INTEGER");
+    if (!columns.has("edge_rtt_ms")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN edge_rtt_ms INTEGER");
+    if (!columns.has("edge_colo")) db.exec("ALTER TABLE bot_message_receipts ADD COLUMN edge_colo TEXT");
+  }
+  // Capability 82: a cloned, duplicated or imported profile's deferred seed must not blank the
+  // skills it brought. Rows written before it are fresh creates, so the default is 1.
+  {
+    const columns = new Set(
+      (db.prepare("PRAGMA table_info(pending_hermes_profile_seeds)").all() as unknown as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!columns.has("blank_slate"))
+      db.exec("ALTER TABLE pending_hermes_profile_seeds ADD COLUMN blank_slate INTEGER NOT NULL DEFAULT 1");
+  }
+  for (const table of ["runtime_bots", "runner_operations"]) {
+    const columns = new Set(
+      (db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!columns.has("runner_id")) db.exec(`ALTER TABLE ${table} ADD COLUMN runner_id TEXT`);
+  }
+  // Created here rather than in SCHEMA, because on an existing database the column it indexes does
+  // not exist until the line above has run.
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS runner_operations_unsent ON runner_operations (sent_at, runner_id, created_at)",
+  );
+  const setupCodeColumns = new Set(
+    (db.prepare("PRAGMA table_info(setup_codes)").all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!setupCodeColumns.has("kind")) db.exec("ALTER TABLE setup_codes ADD COLUMN kind TEXT");
+  // Capability 72. A database whose devices table predates the observer gets both columns with
+  // the pre-72 answer baked in, so every device already paired stays a write-scoped device and no
+  // shipped credential is silently downgraded to read-only.
+  const deviceColumns = new Set(
+    (db.prepare("PRAGMA table_info(devices)").all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!deviceColumns.has("kind"))
+    db.exec("ALTER TABLE devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'device'");
+  if (!deviceColumns.has("scope"))
+    db.exec("ALTER TABLE devices ADD COLUMN scope TEXT NOT NULL DEFAULT 'write'");
+  if (!deviceColumns.has("edge_rtt_ms")) db.exec("ALTER TABLE devices ADD COLUMN edge_rtt_ms INTEGER");
+  if (!deviceColumns.has("edge_colo")) db.exec("ALTER TABLE devices ADD COLUMN edge_colo TEXT");
+  const attachStreamColumns = new Set(
+    (db.prepare("PRAGMA table_info(attach_streams)").all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!attachStreamColumns.has("session_deletion_capability"))
+    db.exec("ALTER TABLE attach_streams ADD COLUMN session_deletion_capability INTEGER");
+  const chatConfigurationColumns = new Set(
+    (db.prepare("PRAGMA table_info(bot_chat_configurations)").all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!chatConfigurationColumns.has("explicitly_configured"))
+    db.exec("ALTER TABLE bot_chat_configurations ADD COLUMN explicitly_configured INTEGER NOT NULL DEFAULT 0");
+  // Chat execution rows carry only restart metadata.  The token remains in the gateway database;
+  // model endpoint/provider fields are metadata-only and no credential is ever duplicated here.
+  const chatExecutionColumns = new Set(
+    (db.prepare("PRAGMA table_info(chat_executions)").all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  for (const [name, sql] of [
+    ["model_json", "ALTER TABLE chat_executions ADD COLUMN model_json TEXT"],
+    ["source_profile_json", "ALTER TABLE chat_executions ADD COLUMN source_profile_json TEXT"],
+    ["launch_model_json", "ALTER TABLE chat_executions ADD COLUMN launch_model_json TEXT"],
+    ["harness", "ALTER TABLE chat_executions ADD COLUMN harness TEXT NOT NULL DEFAULT 'cozyagents'"],
+  ] as const)
+    if (!chatExecutionColumns.has(name)) db.exec(sql);
+  // Capability 55. An existing database's `runners` predates the person-set display name; adding
+  // it nullable is the whole migration. Nothing is backfilled: every existing row reopens with no
+  // display name, which is exactly "nobody has renamed this yet" -- the honest state. Idempotent,
+  // so a restarted container runs it harmlessly again.
+  const runnerColumns = new Set(
+    (db.prepare("PRAGMA table_info(runners)").all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  if (!runnerColumns.has("display_name")) db.exec("ALTER TABLE runners ADD COLUMN display_name TEXT");
+  const delegationColumns = new Set(
+    (db.prepare("PRAGMA table_info(bot_chat_delegations)").all() as unknown as Array<{ name: string }>)
+      .map((column) => column.name),
+  );
+  const delegationAdditions = [
+    ["cost_usd", "ALTER TABLE bot_chat_delegations ADD COLUMN cost_usd REAL CHECK (cost_usd IS NULL OR (cost_usd >= 0 AND cost_usd <= 1000000))"],
+    ["cost_status", "ALTER TABLE bot_chat_delegations ADD COLUMN cost_status TEXT CHECK (cost_status IN ('estimated', 'reported', 'unknown'))"],
+    ["schema_valid", "ALTER TABLE bot_chat_delegations ADD COLUMN schema_valid INTEGER CHECK (schema_valid IN (0, 1))"],
+    ["schema_retries", "ALTER TABLE bot_chat_delegations ADD COLUMN schema_retries INTEGER CHECK (schema_retries BETWEEN 0 AND 1)"],
+    ["duration_ms", "ALTER TABLE bot_chat_delegations ADD COLUMN duration_ms INTEGER CHECK (duration_ms BETWEEN 0 AND 2147483647)"],
+  ] as const;
+  for (const [name, sql] of delegationAdditions)
+    if (!delegationColumns.has(name)) db.exec(sql);
+  // Capability 47 provenance, migrated the same additive way and for the same reason: an existing
+  // database keeps its rows, and every one of them reads back with the new ids simply absent.
+  // Backfilling them is impossible and would be a lie: the gateway threw those values away.
+  for (const [table, additions] of [
+    ["bot_group_log", [
+      ["message_id", "ALTER TABLE bot_group_log ADD COLUMN message_id TEXT"],
+      ["turn_id", "ALTER TABLE bot_group_log ADD COLUMN turn_id TEXT"],
+      ["epoch", "ALTER TABLE bot_group_log ADD COLUMN epoch INTEGER"],
+      ["cause_kind", "ALTER TABLE bot_group_log ADD COLUMN cause_kind TEXT"],
+      ["cause_seq", "ALTER TABLE bot_group_log ADD COLUMN cause_seq INTEGER"],
+      ["attach_thread_id", "ALTER TABLE bot_group_log ADD COLUMN attach_thread_id TEXT"],
+      ["attach_turn_id", "ALTER TABLE bot_group_log ADD COLUMN attach_turn_id TEXT"],
+      ["thread_id", "ALTER TABLE bot_group_log ADD COLUMN thread_id TEXT"],
+      ["external", "ALTER TABLE bot_group_log ADD COLUMN external INTEGER"],
+    ]],
+    ["bot_group_turns", [
+      ["cause_kind", "ALTER TABLE bot_group_turns ADD COLUMN cause_kind TEXT"],
+      ["cause_seq", "ALTER TABLE bot_group_turns ADD COLUMN cause_seq INTEGER"],
+    ]],
+    // F8b. Membership is immutable, so a federated reader can derive this once for a room written
+    // before this column and persist it. A NULL must remain NULL until that reader has evidence.
+    ["bot_groups", [
+      ["owning_host", "ALTER TABLE bot_groups ADD COLUMN owning_host TEXT"],
+      // Row 84 room state (marks, holds, picture). NULL reads as an empty object.
+      ["meta_json", "ALTER TABLE bot_groups ADD COLUMN meta_json TEXT"],
+    ]],
+    ["bot_native_messages", [
+      ["turn_id", "ALTER TABLE bot_native_messages ADD COLUMN turn_id TEXT"],
+      ["author_bot", "ALTER TABLE bot_native_messages ADD COLUMN author_bot TEXT"],
+      ["in_reply_to_id", "ALTER TABLE bot_native_messages ADD COLUMN in_reply_to_id TEXT"],
+    ]],
+    // Capability row 67. The receipt binding and the bot's source snapshot hang off the action
+    // row that already exists, so a v1 action written before this row keeps every column it had
+    // and reads back as a `queued` receipt carrying no binding, which is exactly what it was.
+    ["cozy_app_actions", [
+      ["app_revision", "ALTER TABLE cozy_app_actions ADD COLUMN app_revision INTEGER"],
+      ["value_revisions_json", "ALTER TABLE cozy_app_actions ADD COLUMN value_revisions_json TEXT"],
+      ["data_json", "ALTER TABLE cozy_app_actions ADD COLUMN data_json TEXT"],
+    ]],
+  ] as ReadonlyArray<readonly [string, ReadonlyArray<readonly [string, string]>]>) {
+    const present = new Set(
+      (db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    for (const [name, sql] of additions) if (!present.has(name)) db.exec(sql);
+  }
+  // Early desktop-sync builds reflected a gateway-authored row back through attach as
+  // `desktop:cozygateway:*`, then stored that echo alongside the original direct transcript
+  // row. Repair only a provable pair: same bot, local session, role, exact text, and a one-second
+  // timestamp window. An unmatched echo remains recoverable history, and no direct source row is
+  // ever touched. Deleting rows leaves valid per-session seq ordering; SQLite does not require
+  // resequencing the remaining primary-key values.
+  db.prepare(`
+    DELETE FROM bot_native_messages
+    WHERE message_id LIKE 'desktop:cozygateway:%'
+      AND at IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM bot_native_messages AS direct
+        WHERE direct.bot = bot_native_messages.bot
+          AND direct.session_id = bot_native_messages.session_id
+          AND direct.role = bot_native_messages.role
+          AND direct.text = bot_native_messages.text
+          AND direct.message_id NOT LIKE 'desktop:cozygateway:%'
+          AND direct.at IS NOT NULL
+          AND ABS(direct.at - bot_native_messages.at) <= 1000
+      )
+  `).run();
+  // A process can disappear after a tool starts but before its terminal event is persisted. Only
+  // the selected active turn can still receive that event after restart; close every older step so
+  // history never presents stale work as currently running.
+  db.prepare(`
+    UPDATE bot_chat_tool_steps
+    SET status = 'interrupted', ended_at = ?
+    WHERE ended_at IS NULL AND NOT EXISTS (
+      SELECT 1 FROM bot_native_chats AS chat
+      JOIN bot_native_sessions AS session ON session.bot = chat.bot AND session.session_id = chat.session_id
+      WHERE chat.bot = bot_chat_tool_steps.bot
+        AND chat.session_id = bot_chat_tool_steps.session_id
+        AND session.active_turn_id = bot_chat_tool_steps.turn_id
+    )
+  `).run(Date.now());
+  // Restart truth for delegation children: only the selected active turn can still receive a
+  // finish leg after restart, so every other still-live child settles as `unknown` -- NEVER
+  // `failed`. Hermes explicitly cannot prove what external side effects an in-flight child had,
+  // and a late finish leg replayed through the spool is still free to overwrite `unknown` with
+  // the real outcome.
+  db.prepare(`
+    UPDATE bot_chat_delegations
+    SET status = 'unknown', ended_at = ?
+    WHERE status IN ('queued', 'starting', 'running', 'stalling') AND NOT EXISTS (
+      SELECT 1 FROM bot_native_chats AS chat
+      JOIN bot_native_sessions AS session ON session.bot = chat.bot AND session.session_id = chat.session_id
+      WHERE chat.bot = bot_chat_delegations.bot
+        AND chat.session_id = bot_chat_delegations.session_id
+        AND session.active_turn_id = bot_chat_delegations.turn_id
+    )
+  `).run(Date.now());
+  return new Storage(db);
+}

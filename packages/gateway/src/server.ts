@@ -1,0 +1,1393 @@
+import type { Server } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+
+import { serve } from "@hono/node-server";
+import {
+  AGENT_INBOX_CAPABILITY_ID,
+  AGENT_INBOX_CAPABILITY_VERSION,
+  APPROVALS_CAPABILITY_ID,
+  APPROVALS_CAPABILITY_VERSION,
+  BOTS_CAPABILITY_ID,
+  BOTS_CAPABILITY_VERSION,
+  CHAT_AUDIO_CAPABILITY_ID,
+  CHAT_AUDIO_CAPABILITY_VERSION,
+  CHAT_CONFIGURATION_CAPABILITY_ID,
+  CHAT_CONFIGURATION_CAPABILITY_VERSION,
+  CHAT_CONTEXT_CAPABILITY_ID,
+  CHAT_CONTEXT_CAPABILITY_VERSION,
+  PROVIDER_CONNECTIONS_CAPABILITY_ID,
+  PROVIDER_CONNECTIONS_CAPABILITY_VERSION,
+  HERMES_DESKTOP_SESSIONS_CAPABILITY_ID,
+  HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION,
+  HERMES_SESSION_MANAGEMENT_CAPABILITY_ID,
+  MOBILE_NODE_CAPABILITY_ID,
+  MOBILE_NODE_CAPABILITY_VERSION,
+  GATEWAY_MANAGEMENT_CAPABILITY_ID,
+  GATEWAY_MANAGEMENT_CAPABILITY_VERSION,
+  GATEWAY_MAINTENANCE_CAPABILITY_ID,
+  GATEWAY_MAINTENANCE_CAPABILITY_VERSION,
+  HARNESS_SETTINGS_CAPABILITY_ID,
+  HARNESS_SETTINGS_CAPABILITY_VERSION,
+  HARNESS_WORKSPACE_CAPABILITY_ID,
+  HARNESS_WORKSPACE_CAPABILITY_VERSION,
+  HARNESS_UPDATE_CAPABILITY_ID,
+  HARNESS_UPDATE_CAPABILITY_VERSION,
+  INTEGRATIONS_CAPABILITY_ID,
+  INTEGRATIONS_CAPABILITY_VERSION,
+  COZYAPPS_CAPABILITY_ID,
+  COZYAPPS_CAPABILITY_VERSION,
+  assertValidCozyAppTree,
+  assertValidCozyAppDocument,
+  assertValidCozyAppData,
+  type GatewayInfo,
+  type ServerFrame,
+} from "cozygateway-contract";
+
+import { DEFAULT_ARTIFACT_STORE_BYTES } from "./artifacts.ts";
+import { hermesEndpoints, observability, publicProfileId, validatePublicDeployment, type GatewayConfig } from "./config.ts";
+import { ObservationRing } from "./observe/ring.ts";
+import { TunnelSelfProbe, TUNNEL_PROBE_INTERVAL_MS } from "./observe/self-probe.ts";
+import { publicHostOf } from "./observe/origin.ts";
+import { fileGatewaySettings, type GatewaySettingsStore } from "./gateway-settings.ts";
+import { createInstallerProvisioner, type ProfileChangeEvent, type ProfileProvisioner } from "./hermes-bridge/profile-provisioner.ts";
+import {
+  discoverGatewayMaintenance,
+  type GatewayMaintenanceRuntimeHealth,
+} from "./gateway-maintenance.ts";
+import { cozyAppPhysicalId, openStorage, type Storage } from "./storage.ts";
+import {
+  ATTACH_V1_CAPABILITIES,
+  AttachV1Ingress,
+} from "./adapters/attach/ingress-v1.ts";
+import type { AttachV1Capability, AttachV1EventFrame } from "./adapters/attach/protocol-v1.ts";
+import { AttachNativeSink } from "./adapters/attach/native-sink.ts";
+import {
+  AttachRouter,
+  collectAttachTokens,
+  createAttachAdapter,
+  type TurnEndpoint,
+} from "./adapters/attach/adapter.ts";
+import { revokeAttachTokens } from "./adapters/attach/token-auth.ts";
+import { createApp } from "./http.ts";
+import { listenerOrigin } from "./configure.ts";
+import { primaryLanAddress } from "./lan.ts";
+import { RunnerLane } from "./runner/lane.ts";
+import { RunnerChatExecutionDriver } from "./runner/chat-executions.ts";
+import { LEGACY_RUNNER_ID, LEGACY_RUNNER_NAME, RunnerRoster, effectiveRunnerName } from "./runner/roster.ts";
+import type { PairingAttemptLimiter } from "./pairing-admission.ts";
+import { WsHub } from "./ws-hub.ts";
+import { MobileNodeBroker } from "./mobile-node.ts";
+import { TurnRunner } from "./turns.ts";
+import { RelayNotifier, taskCompletionPayload, type ChatMessagePushEvent } from "./push-notifier.ts";
+import { LiveActivityNotifier } from "./live-activity-notifier.ts";
+import { roomApprovalPush, type ApprovalPushPayload } from "./push-crypto.ts";
+import { SETUP_CODE_TTL_MS, hashToken, newSetupCode } from "./auth.ts";
+import { BotScreenSurface } from "./hermes-bridge/bot-screen.ts";
+import {
+  createUpgradeDispatcher,
+  type UpgradeHandler,
+} from "./upgrade-dispatcher.ts";
+import { createHermesClient } from "./hermes-bridge/client.ts";
+import { DEFAULT_CHAT_SUGGESTION, parseHermesOptions } from "./hermes-bridge/config.ts";
+import { HermesBridge, type BotsSurface } from "./hermes-bridge/bridge.ts";
+import { HermesDashboardIntegrations } from "./hermes-bridge/integrations.ts";
+import { FederatedBotControlSurface, endpointStorage } from "./hermes-bridge/federation.ts";
+import { GatewayRoomHost, type RoomHost } from "./hermes-bridge/group-rooms.ts";
+import { AssignmentRooms } from "./hermes-bridge/assignments.ts";
+import { NativeBotDataPlane } from "./hermes-bridge/native-data-plane.ts";
+import { AttachChatConfigurationDriver, AttachConfigSurface } from "./hermes-bridge/bot-config.ts";
+import { GatewayChatConfiguration } from "./chat-configuration.ts";
+import { GatewayProviderConnections } from "./provider-connections.ts";
+import { AttachHistorySurface } from "./hermes-bridge/bot-history.ts";
+import { AttachMemorySurface } from "./hermes-bridge/memory.ts";
+import { PHOTO_SWEEP_MS } from "./hermes-bridge/photos.ts";
+
+/** Dashboard packet D2. How often the gateway-wide depths are sampled, and how often the seven day
+ *  ring is trimmed. A minute is fine enough to see a queue build and coarse enough that a week of
+ *  it is a few thousand rows per series rather than a few million. */
+const OBSERVE_SWEEP_MS = 60_000;
+const OBSERVE_TRIM_MS = 3_600_000;
+import { resolveTlsMaterial } from "./tls.ts";
+import type { TraceLog } from "./trace.ts";
+import { GatewayHarnessSettings, HermesHarnessModelSettingsAdapter } from "./harness-settings.ts";
+import { GatewayHarnessWorkspace, discoverHermesWorkspace } from "./hermes-bridge/workspace.ts";
+import { GatewayHarnessUpdates, discoverHermesUpdates } from "./hermes-bridge/update.ts";
+import {
+  discoverHermesSessionManagement,
+  GatewayHermesSessionManagement,
+} from "./hermes-bridge/session-management.ts";
+import {
+  GatewayHermesGlobalSkills,
+  HERMES_GLOBAL_SKILLS_CAPABILITY_ID,
+  HERMES_GLOBAL_SKILLS_CAPABILITY_VERSION,
+} from "./hermes-bridge/global-skills.ts";
+
+export const GATEWAY_VERSION = "0.9.0";
+export const PUSH_PROXY_CAPABILITY_ID = "com.cozylabs.push-proxy";
+export const PUSH_PROXY_CAPABILITY_VERSION = 1;
+export const RUNNERS_CAPABILITY_ID = "com.cozylabs.runners";
+export const RUNNERS_CAPABILITY_VERSION = 1;
+
+/** Seconds from the config file in the units the data plane takes. An omitted knob stays omitted,
+ *  so the plane keeps ownership of its own defaults instead of having them restated here. */
+function millis(seconds: number | undefined): number | undefined {
+  return seconds === undefined ? undefined : seconds * 1000;
+}
+
+/** Last stop of the attach apply chain. An event no projection claims is either transiently
+ *  unappliable (declining is right: the ingress retries it and eventually dead-letters) or
+ *  PERMANENTLY orphaned: the durable binding it was authorized against -- its turn command or
+ *  its scheduled delivery target -- is gone or points elsewhere, so no retry can ever apply it.
+ *  Declining those bricked whole agents in production (issue #193): one orphan dead-letters,
+ *  and every later journaled event for that identity is acknowledged on the wire yet never
+ *  applied. An orphan is a fact about the past, not future work: acknowledge it out loud and
+ *  let the stream move. */
+function acknowledgeOrphanedAttachEvent(
+  storage: Storage,
+  agentId: string,
+  frame: AttachV1EventFrame,
+): boolean {
+  const event = frame.event;
+  const acknowledge = (reason: string): true => {
+    console.warn(
+      `attach-v1: acknowledged orphaned ${event.kind} event for profile "${agentId}": ${reason}`,
+    );
+    return true;
+  };
+  if (event.kind === "scheduled") {
+    const delivery = storage.attachScheduledDelivery(agentId, event.deliveryId);
+    if (delivery === undefined || delivery.messageId !== event.messageId)
+      return acknowledge("no durable delivery binding");
+    if (
+      storage.threadById(delivery.threadId) === undefined &&
+      !storage.nativeBotHasSession(agentId, delivery.threadId)
+    )
+      return acknowledge("the delivery target no longer exists");
+    return false;
+  }
+  if ("turnId" in event) {
+    const command = storage.attachTurnCommand(agentId, event.turnId);
+    if (command === undefined) return acknowledge("no durable turn command");
+    if ("threadId" in event && command.threadId !== event.threadId)
+      return acknowledge("the turn command is bound to another thread");
+    if (
+      "threadId" in event &&
+      storage.threadById(event.threadId) === undefined &&
+      !storage.nativeBotHasSession(agentId, event.threadId)
+    )
+      return acknowledge("the turn's thread no longer exists");
+  }
+  return false;
+}
+
+function allowedAttachMedia(config: GatewayConfig, agentId: string): boolean {
+  return hermesEndpoints(config).some((endpoint) =>
+    Object.keys(endpoint.config.profiles).some((profile) => publicProfileId(endpoint, profile) === agentId));
+}
+
+export interface RunningGateway {
+  url: string;
+  port: number;
+  storage: Storage;
+  /** The registered HTTP route manifest, exposed for black-box conformance walks. */
+  routes(): readonly { method: string; path: string }[];
+  /** The production observation writers this gateway registered at startup. */
+  observations: { ring: ObservationRing };
+  issueSetupCode(): string;
+  close(): Promise<void>;
+}
+
+export interface StartGatewayOptions {
+  /** Writable source JSON path. Enables authenticated device management and atomic persistence. */
+  configPath?: string;
+  /** Overrides the push notifier's fire-and-forget failure log sink. Not part of
+   *  `GatewayConfig` (which is JSON-schema-validated and loadable from disk) since a log
+   *  function isn't serializable; this is a programmatic-only seam. Defaults to the
+   *  notifier's own stderr writer, so production behavior is unchanged when omitted. Exists
+   *  for hosts (e.g. the conformance suite's reference gateway) that intentionally register
+   *  an unroutable relay and want to observe or silence the resulting failure log instead of
+   *  it reaching real stderr (design decision, issue #10). */
+  notifierLog?: (message: string) => void;
+  /** Overrides the sink for the approval audit line the runner writes on every resolved approval
+   *  (issue #19). Defaults to stderr, like the other two. The line names the thread, turn,
+   *  toolCallId, outcome, and deciding device, and never the approval's argument summary. Exists
+   *  so a test can read the audit trail without scraping real stderr. */
+  approvalLog?: (message: string) => void;
+  /** JSON-line, privacy-safe transport transition diagnostics. */
+  traceLog?: TraceLog;
+  /** Test-only `/pair` admission seam. The production path always uses the default bucket built
+   *  from its wall clock; a long-running black-box harness may supply a virtual-clock bucket. */
+  pairingAdmission?: PairingAttemptLimiter;
+  /** What moves a phone-created Hermes profile past `setup_required`. Omitted, and with
+   *  `configPath` set, the gateway builds `createInstallerProvisioner` from the installer state
+   *  beside the config, which reruns the shipped installer unattended after a Hermes profile is
+   *  created or deleted (and stays off when that state says this is not such an install). A host
+   *  or test may hand in its own; `null` turns it off outright. */
+  profileProvisioner?: ProfileProvisioner | null;
+}
+
+/** The assembly seam between Hermes' settled-chat event and the relay notifier. Kept pure so the
+ *  live hub snapshot, rather than a startup-time set, is pinned by a unit test. */
+export function createChatMessagePushHandler(
+  notifier: Pick<RelayNotifier, "notifyChatMessage">,
+  connectedDeviceIds: () => ReadonlySet<string>,
+  liveActivityDeviceIds: (
+    event: ChatMessagePushEvent,
+  ) => ReadonlySet<string> = () => new Set(),
+): (event: ChatMessagePushEvent) => void {
+  return (event) =>
+    notifier.notifyChatMessage(
+      event,
+      new Set([...connectedDeviceIds(), ...liveActivityDeviceIds(event)]),
+    );
+}
+
+/** One shared immutable GatewayInfo for health, pairing, and the ready frame. */
+export function gatewayInfoForConfig(
+  config: GatewayConfig,
+  management = false,
+  harnessWorkspace = false,
+  harnessUpdates = false,
+  hermesSessionManagementVersion?: number,
+  hermesGlobalSkills = false,
+  maintenance = false,
+  integrations = false,
+  agentInbox = false,
+): GatewayInfo {
+  const configuredCapabilities = Object.fromEntries(
+    Object.entries(config.capabilities ?? {})
+      .filter(([id]) => id !== HARNESS_UPDATE_CAPABILITY_ID
+        && id !== GATEWAY_MANAGEMENT_CAPABILITY_ID
+        && id !== HERMES_SESSION_MANAGEMENT_CAPABILITY_ID
+        && id !== HERMES_GLOBAL_SKILLS_CAPABILITY_ID
+        && id !== GATEWAY_MAINTENANCE_CAPABILITY_ID
+        && id !== INTEGRATIONS_CAPABILITY_ID),
+  );
+  return {
+    name: config.name,
+    version: GATEWAY_VERSION,
+    contract: "v1",
+    capabilities: {
+      ...configuredCapabilities,
+      [APPROVALS_CAPABILITY_ID]: APPROVALS_CAPABILITY_VERSION,
+      [COZYAPPS_CAPABILITY_ID]: COZYAPPS_CAPABILITY_VERSION,
+      ...(management ? { [GATEWAY_MANAGEMENT_CAPABILITY_ID]: GATEWAY_MANAGEMENT_CAPABILITY_VERSION } : {}),
+      // Bot Mode is shared by Hermes and generic attach peers, so its coarse capability version
+      // cannot select a creation runtime. `botRuntimes` is the additive deployment selector.
+      [BOTS_CAPABILITY_ID]: BOTS_CAPABILITY_VERSION,
+      // The chat attachment route accepts voice notes and relays them as audio, wherever Bot Mode
+      // is served. Whether a bot understands one is up to the bot's own transcription. Its own id,
+      // never a bots row, so CozyAgents' bundled gateway, at another bots version, can advertise
+      // it too.
+      [CHAT_AUDIO_CAPABILITY_ID]: CHAT_AUDIO_CAPABILITY_VERSION,
+      [CHAT_CONFIGURATION_CAPABILITY_ID]: CHAT_CONFIGURATION_CAPABILITY_VERSION,
+      [CHAT_CONTEXT_CAPABILITY_ID]: CHAT_CONTEXT_CAPABILITY_VERSION,
+      [PROVIDER_CONNECTIONS_CAPABILITY_ID]: PROVIDER_CONNECTIONS_CAPABILITY_VERSION,
+      [HARNESS_SETTINGS_CAPABILITY_ID]: HARNESS_SETTINGS_CAPABILITY_VERSION,
+      [RUNNERS_CAPABILITY_ID]: RUNNERS_CAPABILITY_VERSION,
+      ...(hermesEndpoints(config).length === 0
+        ? {}
+        : {
+            [HERMES_DESKTOP_SESSIONS_CAPABILITY_ID]: HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION,
+            [MOBILE_NODE_CAPABILITY_ID]: MOBILE_NODE_CAPABILITY_VERSION,
+          }),
+      ...(config.pushRelayUrl === undefined
+        ? {}
+        : { [PUSH_PROXY_CAPABILITY_ID]: PUSH_PROXY_CAPABILITY_VERSION }),
+      ...(harnessWorkspace
+        ? { [HARNESS_WORKSPACE_CAPABILITY_ID]: HARNESS_WORKSPACE_CAPABILITY_VERSION }
+        : {}),
+      ...(harnessUpdates
+        ? { [HARNESS_UPDATE_CAPABILITY_ID]: HARNESS_UPDATE_CAPABILITY_VERSION }
+        : {}),
+      ...(hermesSessionManagementVersion === undefined
+        ? {}
+        : { [HERMES_SESSION_MANAGEMENT_CAPABILITY_ID]: hermesSessionManagementVersion }),
+      ...(hermesGlobalSkills
+        ? { [HERMES_GLOBAL_SKILLS_CAPABILITY_ID]: HERMES_GLOBAL_SKILLS_CAPABILITY_VERSION }
+        : {}),
+      ...(maintenance
+        ? { [GATEWAY_MAINTENANCE_CAPABILITY_ID]: GATEWAY_MAINTENANCE_CAPABILITY_VERSION }
+        : {}),
+      ...(integrations
+        ? { [INTEGRATIONS_CAPABILITY_ID]: INTEGRATIONS_CAPABILITY_VERSION }
+        : {}),
+      // Leader assignments. Never inferred from the bots scalar (ADR 0082, superseded; ADR 0086).
+      ...(agentInbox
+        ? { [AGENT_INBOX_CAPABILITY_ID]: AGENT_INBOX_CAPABILITY_VERSION }
+        : {}),
+    },
+    botRuntimes: hermesEndpoints(config).length === 0 ? [] : ["hermes"],
+  };
+}
+
+export function maintenanceRuntimeHealth(input: {
+  attach?: { configured: number; online: number };
+  deadLetters?: number;
+}): GatewayMaintenanceRuntimeHealth {
+  return {
+    harness: "hermes",
+    ...(input.attach === undefined ? {} : {
+      attach: { ...input.attach, deadLetters: input.deadLetters ?? 0 },
+    }),
+  };
+}
+
+export async function startGateway(
+  config: GatewayConfig,
+  options: StartGatewayOptions = {},
+): Promise<RunningGateway> {
+  // Validate the public posture before TLS files, storage, bridges, or the listener can produce a
+  // side effect. Programmatic hosts do not necessarily pass through loadConfig(), so startup owns
+  // this last fail-closed check too.
+  config = validatePublicDeployment(config);
+  // Transition records deliberately have a useful production default. They remain injectable so
+  // embedded hosts and tests can collect them without intercepting stderr.
+  const traceLog = options.traceLog ?? ((line: string) => process.stderr.write(`${line}\n`));
+  // Phone-created bot provisioning. Only a native install has the installer state this reads;
+  // every other host (docker, conformance, tests) resolves to undefined and the hook stays absent.
+  const profileProvisioner: ProfileProvisioner | undefined = options.profileProvisioner === null
+    ? undefined
+    : options.profileProvisioner
+      ?? (options.configPath === undefined
+        ? undefined
+        : createInstallerProvisioner({
+            configPath: options.configPath,
+            log: (line) => process.stderr.write(`[provisioner] ${line}\n`),
+          }));
+  let gatewaySettings: GatewaySettingsStore | undefined;
+  if (options.configPath !== undefined) {
+    try {
+      gatewaySettings = fileGatewaySettings(options.configPath);
+    } catch (error) {
+      const code = typeof error === "object" && error !== null && "code" in error
+        ? String(error.code)
+        : "invalid-source-config";
+      traceLog(JSON.stringify({
+        component: "gateway-settings",
+        event: "persistence-unavailable",
+        configPath: options.configPath,
+        code,
+      }));
+    }
+  }
+  // First thing, before the database is opened or a single socket is dialed: if the operator asked
+  // for TLS, prove the pair is usable. Absent config resolves to undefined and every line below
+  // behaves exactly as it did before TLS existed. Present-but-broken throws here, so the failure is
+  // a refusal to start rather than a plaintext listener on a port believed to be encrypted.
+  const tls = resolveTlsMaterial(config.tls);
+  const scheme = tls === undefined ? "http" : "https";
+  const storage = openStorage(config.dbPath);
+  storage.pruneExpiredAttachMedia(Date.now());
+  storage.pruneExpiredComposerDrafts(Date.now());
+  // Host provisioning may complete after a restart. A confirmed deletion remains authoritative
+  // while that stale config and its old credential still exist on disk.
+  const endpoints = hermesEndpoints(config).map((endpoint) => ({ ...endpoint, config: {
+    ...endpoint.config,
+    profiles: Object.fromEntries(Object.entries(endpoint.config.profiles)
+      .filter(([rawId]) => !storage.isBotDeleted(publicProfileId(endpoint, rawId)))),
+  } }));
+  const profileEntries = endpoints.flatMap((endpoint) => Object.entries(endpoint.config.profiles).map(
+    ([rawId, profile]) => [publicProfileId(endpoint, rawId), profile] as const,
+  ));
+  for (const [id, profile] of profileEntries) {
+    storage.upsertAgent({
+      id,
+      name: profile.name ?? id,
+      avatar: profile.avatar ?? null,
+      backend: "attach",
+    });
+  }
+  const hermesProfileIds = new Set(profileEntries.map(([id]) => id));
+  const runnerRoster = new RunnerRoster({ storage, now: () => Date.now() });
+  const runnerToken = process.env["COZYGATEWAY_RUNNER_TOKEN"];
+  const legacyRunnerConfigured = runnerToken !== undefined && runnerToken.length > 0;
+  const runnerName = (id: string): string | undefined => {
+    const row = runnerRoster.get(id);
+    return row === undefined ? (id === LEGACY_RUNNER_ID && legacyRunnerConfigured ? LEGACY_RUNNER_NAME : undefined) : effectiveRunnerName(row);
+  };
+  // capabilities is always present, empty when unconfigured, so the shape is uniform across
+  // /health, the pair response, and the ready frame (contract v1.md section 5). Absence is a
+  // valid wire shape too (older gateways), but this implementation always advertises the field.
+  //
+  // Built-in optional surfaces advertise vendor capability ids only when their backing config is
+  // present. Each integer version advances independently of the frozen contract literal.
+  const parsedEndpoints = endpoints.map((endpoint) => ({ endpoint, options: parseHermesOptions(endpoint.config, process.env) }));
+  // Capability 52. A gateway with no Hermes endpoint has no endpoint options to read, so the one
+  // setting the native plane borrows from them falls back to the same default `parseHermesOptions`
+  // would have produced. Nothing else below reads this object.
+  const chatSuggestion = parsedEndpoints[0]?.options.chatSuggestion ?? DEFAULT_CHAT_SUGGESTION;
+  const clientMembers = parsedEndpoints.map(({ endpoint, options: memberOptions }) => ({
+    endpoint,
+    options: memberOptions,
+    client: createHermesClient({ url: memberOptions.url, auth: memberOptions.auth }),
+  }));
+  // The global-skills discovery needs the same authenticated profile catalogue as its mutation.
+  // Start the transport now; HermesBridge.start() below is idempotent and still owns all bridge
+  // subscriptions and roster work after the listener is ready.
+  for (const member of clientMembers) member.client.start();
+  const candidateGlobalSkills = clientMembers.length === 0
+    ? undefined
+    : new GatewayHermesGlobalSkills(
+      clientMembers.flatMap(({ endpoint, client }) => Object.keys(endpoint.config.profiles).map((profile) => ({
+        id: publicProfileId(endpoint, profile), profile, client,
+      }))),
+      storage,
+    );
+  // The integrations surface has one gateway-managed source profile. A federated gateway has no
+  // unambiguous launch profile for a global setup route, and an unset bridge profile is explicitly
+  // not guessed from a phone request, so neither shape advertises this capability.
+  const candidateIntegrations = clientMembers.length === 1
+    && clientMembers[0]!.options.bridgeProfile !== undefined
+    ? new HermesDashboardIntegrations({
+      client: clientMembers[0]!.client,
+      sourceProfile: clientMembers[0]!.options.bridgeProfile,
+      now: () => Date.now(),
+    })
+    : undefined;
+  const harnessModelAdapters = clientMembers.map(
+    ({ endpoint, client }) => new HermesHarnessModelSettingsAdapter(endpoint, client),
+  );
+  // Optional Hermes surfaces are evidence-gated, not configuration-gated. A missing,
+  // malformed, or unreachable pinned response yields no adapter and no advertised route.
+  const [workspaceResults, updateResults, sessionResults, hermesGlobalSkills, integrations] = await Promise.all([
+    Promise.all(clientMembers.map(({ client }, index) =>
+      discoverHermesWorkspace(client, harnessModelAdapters[index]!.descriptor()))),
+    Promise.all(clientMembers.map(({ client }, index) =>
+      discoverHermesUpdates(client, harnessModelAdapters[index]!.descriptor()))),
+    Promise.all(clientMembers.map(({ client }, index) =>
+      discoverHermesSessionManagement(client, harnessModelAdapters[index]!.descriptor()))),
+    candidateGlobalSkills === undefined
+      ? Promise.resolve(undefined)
+      : candidateGlobalSkills.probe().then(() => candidateGlobalSkills).catch(() => undefined),
+    candidateIntegrations === undefined
+      ? Promise.resolve(undefined)
+      : candidateIntegrations.probe().then((available) => available ? candidateIntegrations : undefined),
+  ]);
+  const discoveredWorkspaceAdapters = workspaceResults.filter((adapter) => adapter !== undefined);
+  const discoveredSessionAdapters = sessionResults.filter((adapter) => adapter !== undefined);
+  const hermesSessions = new GatewayHermesSessionManagement(discoveredSessionAdapters);
+  const harnessWorkspace = new GatewayHarnessWorkspace(discoveredWorkspaceAdapters);
+  const harnessUpdates = new GatewayHarnessUpdates(
+    updateResults.filter((adapter) => adapter !== undefined),
+  );
+  let readMaintenanceRuntimeHealth: () => GatewayMaintenanceRuntimeHealth = () => ({
+    harness: "hermes" as const,
+  });
+  const maintenance = await discoverGatewayMaintenance(
+    process.env,
+    storage,
+    GATEWAY_VERSION,
+    () => readMaintenanceRuntimeHealth(),
+    () => Date.now(),
+  );
+  // agent-inbox is not advertised: no bot here can lead. A Hermes profile has no team tools, and
+  // CozyAgents bots attach to CozyAgents' bundled gateway (ADR 0086). Without it CozyChat hides
+  // the Agent Inbox, whose only threads are assignments, and the Team section, and this gateway
+  // refuses team fields on the profile and emits no `role` on a roster row. The assignment routes
+  // stay for a future Hermes or OpenClaw leader, which is when this turns back on.
+  const agentInbox = false;
+  const gatewayInfo = gatewayInfoForConfig(
+    config,
+    gatewaySettings !== undefined,
+    harnessWorkspace.available,
+    harnessUpdates.available,
+    hermesSessions.capabilityVersion,
+    hermesGlobalSkills !== undefined,
+    maintenance !== undefined,
+    integrations !== undefined,
+    agentInbox,
+  );
+  // Dashboard packet D2. The observation ring: what the gateway already measures on every turn,
+  // heartbeat and sweep, kept for a week instead of thrown away. OFF BY DEFAULT; constructed
+  // either way so every hook below takes the same shape, and inert when disabled.
+  const observeOptions = observability(config);
+  const observe = new ObservationRing({ store: storage.observe, options: observeOptions });
+  const observePublicHost = publicHostOf(config.publicUrl);
+  let mobileNode: MobileNodeBroker | undefined;
+  const hub = new WsHub({
+    storage, gatewayInfo, now: () => Date.now(), trace: traceLog,
+    observe,
+    ...(observePublicHost === undefined ? {} : { publicHost: observePublicHost }),
+    onMobileResult: (deviceId, frame) => mobileNode?.result(deviceId, frame),
+    onMobileProgress: (deviceId, frame) => mobileNode?.progress(deviceId, frame),
+    onDeviceDisconnect: (deviceId) => mobileNode?.disconnectDevice(deviceId),
+    onMobileAvailable: (deviceId) => mobileNode?.reconnectDevice(deviceId),
+  });
+
+  // Dial-out JSON-RPC client to the Hermes gateway plus the cache/refresh/focus machinery on top
+  // of it. Credential resolution already happened above, before the port is bound, so a
+  // misconfigured bridge fails startup instead of half-starting.
+  // The push notifier is built further down (it needs the hub's presence check, which needs the
+  // hub), but the bridge above it has to be able to raise a group escalation. This indirection is
+  // the whole of the coupling: unset until the notifier exists, which is before the listener is
+  // bound and therefore before any room can run a round.
+  let raisePush: (event: {
+    threadId: string;
+    agentName: string;
+    preview: string;
+  }) => void = () => {};
+  // Same indirection, for the bots bridge's approval lifecycle (issue #19 bridge lane): the
+  // notifier does not exist yet, and no approval can be raised before the listener is bound.
+  let raiseApprovalPush: (payload: ApprovalPushPayload) => void = () => {};
+  let raiseChatMessagePush: (event: ChatMessagePushEvent) => void = () => {};
+  // Same indirection again, for capability 37's delete. The runtime attach identity (token map,
+  // live socket, capability grant, adapter) is built below the bridge, so the bridge reaches it
+  // through this hole rather than the construction order being rearranged around one route.
+  // Until it is filled no bot can be deleted, because the listener is not bound yet.
+  let killAttachIdentity: (name: string) => boolean = () => false;
+  let raiseLiveActivityFrame: (frame: ServerFrame) => void = () => {};
+
+  let federation: FederatedBotControlSurface | undefined;
+  const bridgeMembers = clientMembers.map(({ endpoint, options: memberOptions, client }) => {
+    const memberStorage = endpoint.namespace ? endpointStorage(storage, endpoint.id!) : storage;
+    const member = new HermesBridge({
+    client,
+    storage: memberStorage,
+    observe,
+    broadcast: (frame) => {
+      if (endpoint.namespace && (frame.type === "bot_roster" || frame.type === "bot_presence")) {
+        federation?.publish();
+      } else if (endpoint.namespace && frame.type === "bot_routines") {
+        const namespaced = { ...frame, bot: publicProfileId(endpoint, frame.bot) };
+        hub.broadcast(namespaced);
+        raiseLiveActivityFrame(namespaced);
+      } else {
+        hub.broadcast(frame);
+        raiseLiveActivityFrame(frame);
+        const roomPush = roomApprovalPush(frame);
+        if (roomPush !== undefined) raiseApprovalPush(roomPush);
+      }
+    },
+    now: () => Date.now(),
+    hiddenProfiles: memberOptions.hiddenProfiles,
+    ...(memberOptions.bridgeProfile === undefined
+      ? {}
+      : { bridgeProfile: memberOptions.bridgeProfile }),
+    seedBlankSlateBots: memberOptions.seedBlankSlateBots,
+    blankSlateSkillsOn: memberOptions.blankSlateSkillsOn,
+    revokeAttachIdentity: (name) => killAttachIdentity(publicProfileId(endpoint, name)),
+    // Only the shape the installer writes, one un-namespaced Hermes endpoint, is one the installer
+    // can reprovision; a federated member's profiles live on some other box's Hermes.
+    ...(profileProvisioner !== undefined && clientMembers.length === 1 && endpoint.namespace === false
+      ? { onProfileChange: (event: ProfileChangeEvent) => profileProvisioner.provision(event) }
+      : {}),
+    runtimeBotNames: () => new Set(),
+    // F8. A room hosted by this endpoint on a federated gateway is created, addressed and answered
+    // in public `<endpoint>:<profile>` names, because the attach identity a member turn is
+    // dispatched to IS the public name. The prefix is what lets the endpoint's own membership and
+    // roster lookups find the profile behind one. Absent on the un-namespaced endpoint, where the
+    // two names are the same string and nothing changes.
+    ...(endpoint.namespace ? { roomMemberNamespace: endpoint.id! } : {}),
+    // Spec section 4's `@user` escalation. The room's own state and frame already went out; this
+    // is the leg that reaches a backgrounded phone. The thread id is namespaced `group:<name>`
+    // rather than borrowed from a chat thread, so a client that does not know about rooms yet
+    // cannot mistake it for one of its threads. Client-side handling of that id is the documented
+    // follow-up (contract, "needs you").
+    onGroupEscalation: (event) => {
+      raisePush({
+        threadId: `group:${event.group}`,
+        agentName: event.displayName,
+        preview: event.text,
+      });
+    },
+    });
+    return { endpoint, client, bridge: member };
+  });
+  // Capability 85, bot screen. One courier over every endpoint's existing `/api/ws` client: the
+  // screen's RPCs ride the same authenticated link, and the RFB splice dials `/api/display/ws`
+  // beside it on a ticket Hermes mints over that link.
+  const botScreen = clientMembers.length === 0
+    ? undefined
+    : new BotScreenSurface({
+        endpoints: clientMembers.map(({ endpoint, options: memberOptions, client }) => ({
+          client,
+          apiWsUrl: memberOptions.url,
+          ...(endpoint.namespace ? { namespace: endpoint.id! } : {}),
+        })),
+        broadcast: (frame) => hub.broadcast(frame),
+        sendToDevice: (deviceId, frame) => hub.sendFrameToDevice(deviceId, frame),
+        deviceForToken: (token) => storage.deviceByTokenHash(hashToken(token))?.id,
+      });
+  // Capability 46 and 52, findings V1-F1 (R1) and F8. The gateway's OWN room host, built for every
+  // shape that goes through the federated control surface: no Hermes endpoint at all, or two or
+  // more, or one namespaced endpoint. A room is a gateway-owned attach-v1 conversation, so it owns
+  // the same rooms a bridge would, answering membership from the gateway's own runtime bots. It
+  // holds the rooms that resolve to NO endpoint (every member a runtime bot); a room whose members
+  // all live on one endpoint is hosted by that endpoint's own bridge, and only a room genuinely
+  // spanning two endpoints is still refused.
+  //
+  // The un-namespaced single-endpoint gateway does not build one: there the bridge itself is the
+  // control surface and owns every room, exactly as before.
+  const federated = bridgeMembers.length !== 1 || bridgeMembers[0]!.endpoint.namespace;
+  const roomHost = federated
+    ? new GatewayRoomHost({
+        storage,
+        broadcast: (frame) => {
+          hub.broadcast(frame);
+          raiseLiveActivityFrame(frame);
+          const roomPush = roomApprovalPush(frame);
+          if (roomPush !== undefined) raiseApprovalPush(roomPush);
+        },
+        now: () => Date.now(),
+        runtimeBotNames: () => new Set(),
+        // The roster this host names its members from. With no Hermes endpoint the overlay is the
+        // whole roster: there are no cached Hermes rows underneath it, so the base is empty by
+        // construction. With endpoints, the federated view is the one that speaks public names.
+        rosterBots: () => federation?.roster().bots ?? nativeBotPlane?.rosterBots([]) ?? [],
+        escalate: (event) => {
+          raisePush({
+            threadId: `group:${event.group}`,
+            agentName: event.displayName,
+            preview: event.text,
+          });
+        },
+      })
+    : undefined;
+  const bridge = !federated
+    ? bridgeMembers[0]!.bridge
+    : (federation = new FederatedBotControlSurface(
+        bridgeMembers.map(({ endpoint, bridge: member }) => ({ id: endpoint.id!, bridge: member })),
+        (view) => {
+          const updatedAt = view.updatedAt ?? Date.now();
+          const roster = { type: "bot_roster" as const, bots: view.bots, updatedAt };
+          const presence = { type: "bot_presence" as const, active: view.bots.filter((bot) => bot.active).map((bot) => bot.name), updatedAt };
+          hub.broadcast(roster);
+          hub.broadcast(presence);
+          raiseLiveActivityFrame(roster);
+          raiseLiveActivityFrame(presence);
+        },
+        roomHost,
+        // Legacy ownership is resolved from immutable durable membership exactly once. New rooms
+        // persist it at create, and deleted rooms read the matching turn tombstone.
+        (key) => storage.botGroup(key)?.members,
+        (key) => storage.botGroupOwner(key),
+        (key, owner) => storage.backfillBotGroupOwner(key, owner),
+        (name) => storage.botGroupKeyByName(name),
+      ));
+  // Every host that can drive a room on this gateway: each endpoint's bridge, plus the gateway's
+  // own host. On a single un-namespaced endpoint that is just the bridge, exactly as before.
+  const roomHosts: RoomHost[] = [
+    ...bridgeMembers.map(({ bridge: member }) => member),
+    ...(roomHost === undefined ? [] : [roomHost]),
+  ];
+  // Which of them owns a given room. The federated surface remembers the answer per room; a single
+  // un-namespaced bridge owns every room on the gateway.
+  const roomHostFor = (key: string): RoomHost | undefined =>
+    federation === undefined ? roomHosts[0] : federation.roomHostFor(key);
+  /** The host holding the room-member turn an attach event names, if any. Routing by room matters
+   *  on a federated gateway: the room rows are shared storage, so every host would recognize the
+   *  turn, and only the one actually driving that room has the waiter to wake. */
+  const roomHostForEvent = (agentId: string, frame: AttachV1EventFrame): RoomHost | undefined => {
+    const event = frame.event;
+    if (!("threadId" in event) || !("turnId" in event)) return undefined;
+    const owned = storage.botGroupTurnForAttach(agentId, event.threadId, event.turnId);
+    // Capability 84: a commit on a member's room thread that no room turn owns is an external write.
+    const key = owned?.key ?? storage.botGroupMemberBySession(event.threadId, agentId)?.key;
+    return key === undefined ? undefined : roomHostFor(key);
+  };
+  // agent-inbox 1. Built before the ingress it drives; every closure below reaches the ingress only
+  // once the listener is bound.
+  const assignments: AssignmentRooms = new AssignmentRooms({
+    storage,
+    broadcast: (frame) => hub.broadcast(frame),
+    now: () => Date.now(),
+    displayName: (name) => bridge.roster().bots.find((bot) => bot.name === name)?.displayName ?? name,
+    knownBot: (name) => attachV1Ingress.canQueue(name),
+    isAttached: (name) => attachV1Ingress.isAttached(name),
+    flushTaskCommands: () => attachV1Ingress.flushTaskCommands(),
+  });
+  // Every configured Hermes profile has one attach identity shared by the core thread surface and
+  // Bot Mode. Token resolution fails closed before the listener opens.
+  const nativeBotIds = profileEntries.map(([profileId]) => profileId);
+  const router = new AttachRouter();
+  let nativeSink: AttachNativeSink | undefined;
+  const attachTokens = new Map<string, string>();
+  for (const { endpoint } of parsedEndpoints) {
+    const tokens = collectAttachTokens(endpoint.config.profiles, process.env);
+    for (const [token, rawProfile] of tokens) {
+      if (storage.isAttachCredentialRevoked(token)) continue;
+      if (attachTokens.has(token))
+        throw new Error("duplicate attach credential across Hermes endpoints; every profile must use a distinct token");
+      attachTokens.set(token, publicProfileId(endpoint, rawProfile));
+    }
+  }
+  // Historical CozyAgents execution rows remain inert. Only a durable Hermes execution can
+  // reclaim its attach identity after restart.
+  for (const execution of storage.chatExecutions()) {
+    if (execution.harness === "hermes" && execution.stage !== "deleted"
+        && !storage.isAttachCredentialRevoked(execution.token)
+        && storage.nativeBotHasSession(execution.bot, execution.sessionId))
+      attachTokens.set(execution.token, execution.executionId);
+  }
+  let executionChatDriver: RunnerChatExecutionDriver | undefined;
+  let nativeBotPlane: NativeBotDataPlane | undefined;
+  let memorySurface: AttachMemorySurface | undefined;
+  let configSurface: AttachConfigSurface | undefined;
+  let chatConfiguration: GatewayChatConfiguration | undefined;
+  let historySurface: AttachHistorySurface | undefined;
+  let botsSurface: BotsSurface;
+  // Hermes profile identities negotiate the full attach-v1 capability set.
+  const allowedCapabilities = new Map<string, ReadonlySet<AttachV1Capability>>(
+    profileEntries.map(([profileId]) => [
+      profileId,
+      new Set(ATTACH_V1_CAPABILITIES),
+    ]),
+  );
+  const attachV1Ingress = new AttachV1Ingress({
+    tokens: attachTokens,
+    storage,
+    allowedCapabilities,
+    trace: traceLog,
+    observe,
+    events: {
+      onChatContext: (agentId, frame) => {
+        nativeBotPlane?.handleChatContext(agentId, frame);
+      },
+      canAcceptEvent: (agentId, frame) => {
+        if (storage.chatExecutionById(agentId)?.harness === "hermes") return nativeBotPlane?.canAccept(agentId, frame) === true;
+        if (assignments.canAcceptAttachEvent(agentId, frame)) return true;
+        if (roomHostForEvent(agentId, frame)?.canAcceptGroupAttachEvent(agentId, frame) === true) return true;
+        if (nativeBotPlane?.canAccept(agentId, frame)) return true;
+        if (!("threadId" in frame.event))
+          return (
+            frame.event.kind === "presence" || frame.event.kind === "media" || frame.event.kind === "cozyapp_upsert" || frame.event.kind === "cozyapp_action_status"
+            || frame.event.kind === "cozyapp_dashboard_upsert" || frame.event.kind === "cozyapp_action_receipt"
+          );
+        const thread = storage.threadById(frame.event.threadId);
+        return thread !== undefined && thread.agentId === agentId;
+      },
+      onEvent: (agentId, frame) => {
+        if (storage.chatExecutionById(agentId)?.harness === "hermes") return nativeBotPlane?.handle(agentId, frame) === true;
+        if (frame.event.kind === "cozyapp_upsert") {
+          try {
+            assertValidCozyAppTree(frame.event.tree);
+            storage.upsertCozyApp({ id: cozyAppPhysicalId(agentId, frame.event.appId), name: frame.event.name, creatorBot: agentId, tree: frame.event.tree, now: Date.now() });
+            hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() });
+            return true;
+          } catch {
+            // Another creator already owns this stable client id. The malicious/buggy upsert is
+            // refused without letting one bad event dead-letter and block that bot's whole stream.
+            return true;
+          }
+        }
+        // Capability row 67. The creator publishes the envelope for its own app; the physical id
+        // keeps the creator namespacing, so a plugin can write nothing but its own record.
+        if (frame.event.kind === "cozyapp_dashboard_upsert") {
+          try {
+            assertValidCozyAppDocument(frame.event.document);
+            if (frame.event.data !== undefined) assertValidCozyAppData(frame.event.data);
+            const appId = cozyAppPhysicalId(agentId, frame.event.appId);
+            const result = storage.writeCozyAppDashboard({
+              appId, creatorBot: agentId, documentVersion: frame.event.documentVersion, document: frame.event.document,
+              expectedRevision: storage.cozyAppDashboard(appId)?.revision ?? 0, now: Date.now(),
+              ...(frame.event.data === undefined ? {} : { data: frame.event.data }),
+            });
+            if (result.outcome === "written") hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() });
+          } catch {
+            // An out-of-bounds or unknown document is refused at validation and stored nowhere.
+            // One bad event must not dead-letter and block that bot's whole stream.
+          }
+          return true;
+        }
+        // The peer echoes the appId the `cozyapp_action` command carried, exactly as it does on
+        // `cozyapp_action_status`, so this id is already the stored one and is not namespaced again.
+        //
+        // THIS BRANCH ALWAYS APPLIES. A no-op is not a failure here, and unlike the v1 status event
+        // a no-op is the ORDINARY case: the gateway already stamped `delivered` when this peer
+        // acked the command, so the peer's own `running` can never change anything. Returning
+        // false would retry the event and then dead-letter it, head-of-line blocking every later
+        // event from this bot. A duplicate terminal, a terminal on an already settled action, and
+        // a receipt naming an action this bot does not own are no-ops on the same rule: nothing is
+        // written, and the stream keeps moving.
+        if (frame.event.kind === "cozyapp_action_receipt") {
+          const appId = frame.event.appId;
+          try {
+            if (frame.event.data !== undefined) assertValidCozyAppData(frame.event.data);
+          } catch {
+            return true;
+          }
+          const changed = frame.event.status === "running"
+            ? storage.markCozyAppActionDelivered(frame.event.actionRequestId, agentId, Date.now())
+            : storage.settleCozyAppAction({
+                id: frame.event.actionRequestId, appId, creatorBot: agentId, actionId: frame.event.actionId,
+                status: frame.event.status, now: Date.now(),
+                ...(frame.event.data === undefined ? {} : { data: frame.event.data }),
+              });
+          if (changed && frame.event.status !== "running")
+            nativeBotPlane?.clearCozyAppActionOrigin(agentId, frame.event.appId, frame.event.actionRequestId);
+          if (changed) hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() });
+          return true;
+        }
+        if (frame.event.kind === "cozyapp_action_status") {
+          if (storage.settleCozyAppAction({ id: frame.event.actionRequestId, appId: frame.event.appId, creatorBot: agentId, actionId: frame.event.actionId, status: frame.event.status, now: Date.now() })) {
+            nativeBotPlane?.clearCozyAppActionOrigin(agentId, frame.event.appId, frame.event.actionRequestId);
+            hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() });
+            return true;
+          }
+          return false;
+        }
+        if (assignments.handleAttachEvent(agentId, frame)) return true;
+        if (roomHostForEvent(agentId, frame)?.handleGroupAttachEvent(agentId, frame) === true) return true;
+        if (router.onV1Event(agentId, frame)) return true;
+        if (nativeBotPlane?.handle(agentId, frame)) return true;
+        if (frame.event.kind === "media" || frame.event.kind === "presence")
+          return true;
+        if (nativeSink?.handle(agentId, frame) === true) return true;
+        return acknowledgeOrphanedAttachEvent(storage, agentId, frame);
+      },
+      // Capability row 67. The peer taking the command off the wire is the public receipt's
+      // `running`, derived for every peer including one that stays at cozyapps 1.
+      onCommandDelivered: (agentId, commandId) => {
+        if (commandId.startsWith("cozyapp-action:")
+          && storage.markCozyAppActionDelivered(commandId.slice("cozyapp-action:".length), agentId, Date.now()))
+          hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() });
+      },
+      onMobileRequest: (agentId, frame) => nativeBotPlane?.mobileRequest(agentId, frame),
+      onMobileRequestRefused: (agentId, requestId) => nativeBotPlane?.refuseMobileRequest(agentId, requestId),
+      onMobileCancel: (agentId, frame) => mobileNode?.cancelRequest(agentId, frame.requestId),
+      onMemoryResult: (agentId, frame) => { memorySurface?.handle(agentId, frame); },
+      onConfigResult: (agentId, frame) => { configSurface?.handle(agentId, frame); },
+      onHistoryResult: (agentId, frame) => { historySurface?.handle(agentId, frame); },
+      // The plugin-facing receipt is the ingress' own business; this is the half the USER sees.
+      onScheduledDeliveryFailed: (agentId, failure) =>
+        nativeBotPlane?.recordScheduledDeliveryFailure(agentId, failure),
+      onHello: (agentId, activeTurns) => {
+        mobileNode?.disconnectAgent(agentId);
+        nativeBotPlane?.handleAttachHello(agentId, activeTurns);
+      },
+      onTurnHealth: (agentId, reports) => nativeBotPlane?.handleAttachTurnHealth(agentId, reports) ?? [],
+      onTaskTurnQueued: (agentId, command) => nativeBotPlane?.taskTurnQueued(agentId, command),
+      // Dashboard packet D2. The turn command is on the wire, which is the zero of the model-side
+      // timings; the gateway's own queueing before it is already its own measured series.
+      onTurnDispatched: (agentId, turnId) => nativeBotPlane?.turnDispatched(agentId, turnId),
+      onPresence: (agentId, state) => {
+        if (storage.chatExecutionById(agentId)?.harness === "hermes") return;
+        hub.broadcast({
+          type: "presence",
+          agentId,
+          state: state === "online" ? "online" : "absent",
+        });
+        nativeBotPlane?.handleAttachPresence(agentId, state);
+        if (state === "absent") mobileNode?.disconnectAgent(agentId);
+      },
+    },
+  });
+  memorySurface = new AttachMemorySurface(attachV1Ingress, 12_000, traceLog);
+  configSurface = new AttachConfigSurface(attachV1Ingress, 12_000, traceLog);
+  const harnessSettings = new GatewayHarnessSettings([
+    ...harnessModelAdapters,
+  ]);
+  const providerConnections = new GatewayProviderConnections({
+    ownsExecution: () => false,
+    knownBot: (bot) => hermesProfileIds.has(bot),
+    resolveScope: (harnessId, scopeId) => {
+      const member = clientMembers.find(({ endpoint }) => (endpoint.id ?? "default") === harnessId);
+      if (!member || !harnessSettings.adapter(harnessId).descriptor().scopes.some((scope) => scope.id === scopeId)) return undefined;
+      return publicProfileId(member.endpoint, scopeId);
+    },
+    control: {
+      list: (bot) => configSurface!.providerConnections(bot),
+      save: (bot, handoffId) => configSurface!.saveProviderConnection(bot, handoffId),
+      test: (bot, id) => configSurface!.testProviderConnection(bot, id),
+      remove: (bot, id) => configSurface!.removeProviderConnection(bot, id),
+    },
+  });
+  const attachedChatDriver = new AttachChatConfigurationDriver(configSurface);
+  const chatDriver = {
+    availability: (input: { bot: string; sessionId: string }) => (executionChatDriver ?? attachedChatDriver).availability(input),
+    computers: (input: { bot: string; sessionId: string }) => (executionChatDriver ?? attachedChatDriver).computers(input),
+    projects: (bot: string, computerId: string) => (executionChatDriver ?? attachedChatDriver).projects(bot, computerId),
+    branches: (bot: string, computerId: string, projectId: string) => (executionChatDriver ?? attachedChatDriver).branches(bot, computerId, projectId),
+    prepareContext: (input: Parameters<typeof attachedChatDriver.prepareContext>[0]) => (executionChatDriver ?? attachedChatDriver).prepareContext(input),
+  };
+  chatConfiguration = new GatewayChatConfiguration({ storage, driver: chatDriver });
+  historySurface = new AttachHistorySurface(attachV1Ingress, 12_000, traceLog);
+  const attachEndpoint: TurnEndpoint = {
+    isAttached: (agentId) => attachV1Ingress.isAttached(agentId),
+    canQueue: (agentId) => attachV1Ingress.canQueue(agentId),
+    sendTurn: (agentId, frame) => attachV1Ingress.sendTurn(agentId, frame),
+    sendSteer: (agentId, frame) => attachV1Ingress.sendSteer(agentId, frame),
+    sendInterrupt: (agentId, frame) =>
+      attachV1Ingress.sendInterrupt(agentId, frame),
+    sendApprovalResolution: (agentId, input) =>
+      attachV1Ingress.sendApprovalResolution(agentId, input),
+  };
+  for (const host of roomHosts) host.setGroupNativeTurns({
+    canQueue: (agentId) => attachV1Ingress.canQueue(agentId),
+    sendNativeTurn: (agentId, input) =>
+      attachV1Ingress.sendNativeTurn(agentId, input),
+    sendInterrupt: (agentId, input) => attachV1Ingress.sendNativeInterrupt(agentId, input),
+  });
+  assignments.setNativeTurns({ sendNativeTurn: (agentId, input) => attachV1Ingress.sendNativeTurn(agentId, input) });
+  const adapters = new Map<string, ReturnType<typeof createAttachAdapter>>();
+  /** Each configured Hermes profile has one attach-v1 turn adapter. */
+  const registerAttachAdapter = (agentId: string): void => {
+    const adapter = createAttachAdapter({
+      agentId,
+      endpoint: attachEndpoint,
+      turnTimeoutMs: config.turnTimeoutSeconds * 1000,
+    });
+    router.register(agentId, adapter);
+    adapters.set(agentId, adapter);
+  };
+  for (const [profileId] of profileEntries) registerAttachAdapter(profileId);
+  // Capability 37. Every runtime surface that would still answer for a deleted bot, torn down in
+  // one place: the token map both public attach surfaces authenticate against (the WebSocket
+  // upgrade and HTTP media share this exact Map object, so one delete covers both), the live
+  // socket and its per-profile ingress state, the capability grant, and the adapter that would
+  // otherwise keep a turn pending forever. Returns whether an attach identity was actually held,
+  // which is what the delete response reports as `tokenRevoked`.
+  killAttachIdentity = (name: string): boolean => {
+    // A successful create may clear the name fence before the host has replaced its old .env.
+    // Credential revocation therefore has its own durable, irreversible fingerprint ledger.
+    storage.revokeAttachCredentials(name, [
+      ...[...attachTokens].filter(([, owner]) => owner === name).map(([token]) => token),
+    ], Date.now());
+    storage.tasks.ownerDeleted(name, Date.now());
+    assignments.botDeleted(name);
+    mobileNode?.disconnectAgent(name);
+    const revoked = revokeAttachTokens(attachTokens, name);
+    attachV1Ingress.disconnectAgent(name);
+    allowedCapabilities.delete(name);
+    router.unregister(name);
+    adapters.delete(name);
+    return revoked;
+  };
+  const notifier = new RelayNotifier({
+    storage,
+    replyPushes: storage.tasks,
+    ...(config.pushRelayUrl === undefined
+      ? {}
+      : { relayBaseUrl: config.pushRelayUrl }),
+    log: options.notifierLog,
+    trace: traceLog,
+    observe,
+    isDeviceConnected: (deviceId) => hub.isDeviceConnected(deviceId),
+  });
+  const liveActivityNotifier = new LiveActivityNotifier({
+    storage,
+    ...(config.pushRelayUrl === undefined
+      ? {}
+      : { relayBaseUrl: config.pushRelayUrl }),
+    log: options.notifierLog,
+    trace: traceLog,
+  });
+  raiseLiveActivityFrame = (frame) => liveActivityNotifier.handleFrame(frame);
+  // Same targeting rule a 1:1 turn gets: a device holding a live socket saw the room's frame and is
+  // excluded here rather than pushed to twice.
+  raisePush = (event) => notifier.notify(event, hub.connectedDeviceIds());
+  raiseApprovalPush = (payload) =>
+    notifier.notifyApproval(payload, hub.connectedDeviceIds());
+  raiseChatMessagePush = createChatMessagePushHandler(
+    notifier,
+    () => hub.connectedDeviceIds(),
+    (event) => liveActivityNotifier.coveredDeviceIdsForChat(event),
+  );
+  mobileNode = new MobileNodeBroker({
+    taskWait: (wait) => storage.tasks.device(wait),
+    route: (deviceId, command) => hub.mobileNodeRoute(deviceId, command),
+    wake: (deviceId) => notifier.notifyMobileNodeWake(deviceId),
+    send: (deviceId, frame) => hub.sendMobileNodeFrame(deviceId, frame),
+    result: (agentId, frame) => { attachV1Ingress.sendMobileResult(agentId, frame); },
+    receipt: (receipt) => nativeBotPlane?.recordMobileReceipt(receipt) !== undefined,
+    // Capability 68. The typed lifecycle is written from what the gateway already owns: its own
+    // routing decision, its lease, the media claim and the settlement. No peer sends a step, so a
+    // Hermes peer gets the whole lifecycle without a line of change.
+    lifecycle: (event) => { storage.recordBotMobileRequest(event); },
+    trace: traceLog,
+  });
+  storage.tasks.expireDevices((peer, run, id, at) => mobileNode?.expireRequest(peer, run, id, at));
+  nativeBotPlane = new NativeBotDataPlane({
+    control: bridge,
+    storage,
+    leaderTeams: agentInbox,
+    observe,
+    ingress: attachV1Ingress,
+    nativeBots: nativeBotIds,
+    botConfig: configSurface,
+    chatConfiguration,
+    botHistory: historySurface,
+    chatSuggestion,
+    turnTimeoutMs: config.turnTimeoutSeconds * 1000,
+    staleTurnSweepMs: millis(config.staleTurnSweepSeconds),
+    staleTurnInterruptGraceMs: millis(config.staleTurnInterruptGraceSeconds),
+    staleTurnCeilingMs: millis(config.staleTurnCeilingSeconds),
+    broadcast: (frame) => {
+      hub.broadcast(frame);
+      raiseLiveActivityFrame(frame);
+    },
+    onChatMessage: (event) => raiseChatMessagePush(event),
+    onApproval: (event) => {
+      raiseApprovalPush(
+        event.outcome === undefined
+          ? {
+              kind: "approval_pending",
+              threadId: event.room === undefined ? `bot:${event.bot}` : `group:${event.room}`,
+              agentId: event.bot,
+              turnId: event.turnId,
+              toolCallId: event.toolCallId,
+              name: event.name ?? "tool",
+            }
+          : {
+              kind: "approval_resolved",
+              threadId: event.room === undefined ? `bot:${event.bot}` : `group:${event.room}`,
+              agentId: event.bot,
+              turnId: event.turnId,
+              toolCallId: event.toolCallId,
+              outcome: event.outcome,
+            },
+      );
+    },
+    now: () => Date.now(),
+    trace: traceLog,
+    mobileNode,
+  });
+  const nativePlane = nativeBotPlane;
+  // Capability 86: upstream plugin.tsx's `session.reclaimed` handling. A reclaimed Bot Chat
+  // re-proves its binding at once instead of on the next send.
+  for (const { client } of clientMembers) {
+    client.onEvent((event) => {
+      if (event.type !== "session.reclaimed") return;
+      const stored = (event.payload as { stored_session_id?: unknown } | null)?.stored_session_id;
+      if (typeof stored === "string" && stored.length > 0) nativePlane.sessionReclaimed(stored);
+    });
+  }
+  // Capability 51. A room member turn records ordinary interaction rows, so it borrows the plane's
+  // own deadline wheel and turn-settlement rule rather than growing a second copy. Wired here, like
+  // the room turn transport above, because the plane is assembled after the bridge that owns rooms.
+  for (const host of roomHosts) host.setGroupInteractionExpiry(nativePlane.groupInteractions());
+  const runnerLane = new RunnerLane({
+    ...(legacyRunnerConfigured ? { token: runnerToken } : {}), roster: runnerRoster, now: () => Date.now(),
+  });
+  executionChatDriver = new RunnerChatExecutionDriver({
+    storage, lane: runnerLane, surface: {
+      botProfile: (bot) => nativePlane.surface().botProfile(bot),
+      modelConfig: (bot) => nativePlane.surface().modelConfig(bot),
+      providerConnections: (bot) => configSurface!.providerConnections(bot),
+      prepareChatConfiguration: (peer, configuration) => configSurface!.prepareChatConfiguration(peer, configuration),
+    }, local: attachedChatDriver,
+    harness: (bot) => hermesProfileIds.has(bot) ? "hermes" : undefined,
+    name: runnerName, tokens: attachTokens,
+    isAttached: (peer) => attachV1Ingress.isAttached(peer),
+    disconnect: (peer) => attachV1Ingress.disconnectAgent(peer),
+    prepareProvider: async (bot, executionId, model) => {
+      const { handoffId } = await configSurface!.transferProviderConnection(bot, model.providerId, executionId);
+      try { await configSurface!.importProviderConnection(executionId, handoffId); }
+      finally { providerConnections.handoffs.revoke(handoffId); }
+    },
+  });
+  readMaintenanceRuntimeHealth = () => {
+    const attach = attachV1Ingress.connectionHealth(hermesProfileIds);
+    return maintenanceRuntimeHealth({
+      attach: { configured: attach.configured, online: attach.online },
+      deadLetters: storage.attachProjectionDeadLetters().length,
+    });
+  };
+  botsSurface = nativePlane.surface();
+  const nativeHistory = nativePlane.historySurface();
+  // Same rows, same overlay, both surfaces: the `bot_roster` frame and `GET /bots` are now built
+  // by one function, so a WS row carries the chat session id its REST twin carries.
+  bridge.setRosterOverlay((bots) => nativePlane.rosterBots(bots));
+  nativeSink = new AttachNativeSink({
+    storage,
+    broadcast: (frame) => {
+      hub.broadcast(frame);
+      raiseLiveActivityFrame(frame);
+    },
+    notifier,
+    connectedDeviceIds: () => hub.connectedDeviceIds(),
+    now: () => Date.now(),
+  });
+  for (const [profileId] of profileEntries)
+    attachV1Ingress.replayUnapplied(profileId);
+  const runner = new TurnRunner({
+    storage,
+    hub,
+    adapters,
+    notifier,
+    now: () => Date.now(),
+    turnTimeoutMs: config.turnTimeoutSeconds * 1000,
+    ...(options.approvalLog === undefined
+      ? {}
+      : { approvalLog: options.approvalLog }),
+  });
+
+  storage.tasks.runtime(() => undefined);
+  storage.tasks.reconcile();
+  // Always bounded. Derivation retains every delivered attachment until an explicit deletion, so
+  // an operator who sets nothing gets the conservative default rather than an unbounded store.
+  storage.artifacts.capacity(config.artifactStoreBytes ?? DEFAULT_ARTIFACT_STORE_BYTES);
+  storage.tasks.observe((frame) => {
+    hub.broadcast(frame);
+    if (frame.type === "bot_task_updated") assignments.onTaskUpdated(frame.view);
+  }, BOTS_CAPABILITY_VERSION);
+  // Capability 68: a backgrounded phone learns its Task finished. A device holding a live socket
+  // got the frame above and is excluded inside the notifier, and the announcement itself fires
+  // only on the transition that wrote capability 64's completion notification record.
+  storage.tasks.completions((notice) => {
+    notifier.notifyTaskCompletion(taskCompletionPayload(notice), hub.connectedDeviceIds(), notice.runId);
+  });
+  // A process can stop after the synchronous reply marker but before its deferred relay request.
+  // Replay only those completed, exact Run/device markers; sent rows are already safe to collapse.
+  for (const notice of storage.tasks.replyPushRecoveries())
+    notifier.recoverTaskCompletion(taskCompletionPayload(notice), notice.runId, notice.deviceId);
+  let boundPort = config.port;
+  const pairingUrl = (): string => {
+    if (config.publicUrl !== undefined) return config.publicUrl;
+    const host = config.host;
+    const advertised = host !== undefined && host !== "0.0.0.0" && host !== "::"
+      ? host
+      : primaryLanAddress() ?? "127.0.0.1";
+    return listenerOrigin(advertised, boundPort, scheme);
+  };
+  const app = createApp({
+    observe,
+    storage,
+    flushTaskCommands: () => attachV1Ingress.flushTaskCommands(),
+    assignments,
+    config,
+    gatewayInfo,
+    ...(options.notifierLog === undefined ? {} : { pushRelayLog: options.notifierLog }),
+    ...(gatewaySettings === undefined ? {} : { gatewaySettings }),
+    ...(maintenance === undefined ? {} : { maintenance }),
+    gatewaySettingsLog: traceLog,
+    harnessSettings,
+    providerConnections,
+    ...(harnessUpdates.available ? { harnessUpdates } : {}),
+    ...(hermesSessions.available ? { hermesSessions } : {}),
+    ...(hermesGlobalSkills === undefined ? {} : { hermesGlobalSkills }),
+    ...(integrations === undefined ? {} : { integrations }),
+    hermesGlobalSkillsLog: traceLog,
+    ...(harnessWorkspace.available ? { harnessWorkspace } : {}),
+    ...(options.pairingAdmission === undefined ? {} : { pairingAdmission: options.pairingAdmission }),
+    attachHealth: () => ({ ...attachV1Ingress.health(), hermes: attachV1Ingress.connectionHealth(hermesProfileIds) }),
+    observeAttachPeers: () => [...new Set(attachTokens.values())].map(id => ({
+      bot: storage.chatExecutionById(id)?.bot ?? id, peerId: id, ...attachV1Ingress.peerHealth(id),
+    })),
+    observeBotForPeer: id => storage.chatExecutionById(id)?.bot ?? id,
+    attachDeadLetters: () => storage.attachProjectionDeadLetters(),
+    releaseAttachDeadLetter: (agentId, eventId) =>
+      attachV1Ingress.releaseProjectionDeadLetter(agentId, eventId),
+    bots: botsSurface,
+    ...(botScreen === undefined ? {} : { botScreen }),
+    memory: memorySurface,
+    // The plane's guard, not the raw lane: history is a runtime-bot fact, and the 409 a Hermes bot
+    // gets is decided in one place rather than in each of the five routes.
+    ...(nativeHistory === undefined ? {} : { history: nativeHistory }),
+    ...(chatConfiguration === undefined ? {} : { chatConfiguration }),
+    attachTokens,
+    attachMediaAllowed: (agentId: string) => storage.chatExecutionById(agentId)?.stage === "ready" || allowedAttachMedia(config, agentId),
+    sendCozyAppAction: (action, deviceId) => {
+      if (!nativeBotPlane?.registerCozyAppActionOrigin(action.creatorBot, action.appId, action.id, deviceId, Math.max(30_000, config.turnTimeoutSeconds * 1000))) return false;
+      const queued = attachV1Ingress.sendCozyAppAction(action.creatorBot, {
+        appId: action.appId, actionId: action.actionId, actionRequestId: action.id,
+        values: storage.cozyAppValues(action.appId).map((value) => ({ valueId: value.valueId, type: value.type, value: value.value, revision: value.revision })),
+      });
+      if (!queued) nativeBotPlane.clearCozyAppActionOrigin(action.creatorBot, action.appId, action.id);
+      return queued;
+    },
+    cozyAppsChanged: () => hub.broadcast({ type: "cozyapps_snapshot", ...storage.cozyAppsSnapshot() }),
+    beginMobileMediaUpload: (deviceId, requestId, lease) => {
+      const claim = mobileNode?.beginMediaUpload(deviceId, requestId, lease);
+      return claim === undefined ? undefined : {
+        agentId: claim.agentId,
+        complete: (media, reason) => mobileNode?.completeMediaUpload(claim, media, reason) ?? false,
+      };
+    },
+    presenceOf: (agentId) => adapters.get(agentId)?.presence() ?? "unknown",
+    submitUserMessage: (threadId, blocks) =>
+      runner.submitUserMessage(threadId, blocks),
+    // The runner's "unsupported" outcome collapses to "interrupting" here: a turn WAS in
+    // flight, so REST answers 202, and the runner has already emitted the interrupt_unsupported
+    // error frame over the WebSocket.
+    interruptThread: (threadId) =>
+      runner.interrupt(threadId) === "idle" ? "idle" : "interrupting",
+    resolveApproval: (input) =>
+      runner.resolveApproval(
+        input.threadId,
+        input.toolCallId,
+        input.decision,
+        input.deviceId,
+      ),
+    onDeviceRevoked: (deviceId) => hub.closeDevice(deviceId),
+    pairingUrl,
+    runners: runnerRoster,
+    runnerPresence: { online: (id) => runnerLane.connectedRunners().includes(id), lastContactAt: (id) => runnerLane.lastContactAt(id), agentVersion: (id) => runnerLane.agentVersion(id) },
+    legacyRunnerConfigured,
+    onRunnerRevoked: (id) => { runnerLane.disconnectRunner(id); },
+    hermesBridgeAbsent: endpoints.length === 0,
+    now: () => Date.now(),
+  });
+
+  const server = await new Promise<Server>((resolve) => {
+    // The TLS branch swaps only the factory and its options; the fetch handler, the port, the
+    // hostname, and the upgrade dispatcher below are identical either way. https.Server extends
+    // http.Server, so everything downstream (including the 'upgrade' listener that carries /ws and
+    // /attach/v1, which therefore become wss automatically) is unchanged.
+    const s = serve(
+      {
+        fetch: app.fetch,
+        port: config.port,
+        hostname: config.host ?? "127.0.0.1",
+        ...(tls === undefined
+          ? {}
+          : {
+              createServer: createHttpsServer,
+              serverOptions: { cert: tls.cert, key: tls.key },
+            }),
+      },
+      () => {
+        resolve(s as Server);
+      },
+    );
+  });
+  // Two ws WebSocketServer instances constructed with {server, path} on the SAME http.Server
+  // would each attach their own 'upgrade' listener, and Node invokes both for every request; the
+  // non-matching one's default path check fails and it aborts the handshake, corrupting the
+  // socket the OTHER instance already claimed. Both are constructed with {noServer: true}
+  // instead, so this is the only 'upgrade' listener on the server: it dispatches by pathname, and
+  // a path matching neither endpoint gets a clean HTTP error instead of hanging.
+  const routes = new Map<string, UpgradeHandler>([
+    ["/ws", (req, socket, head) => hub.handleUpgrade(req, socket, head)],
+  ]);
+  routes.set("/attach/v1", (req, socket, head) =>
+    attachV1Ingress.handleUpgrade(req, socket, head),
+  );
+  routes.set("/runner/v1", (req, socket, head) => runnerLane.handleUpgrade(req, socket, head));
+  server.on("upgrade", createUpgradeDispatcher(routes, (pathname) =>
+    botScreen !== undefined && BotScreenSurface.matches(pathname)
+      ? (req, socket, head) => botScreen.handleUpgrade(req, socket, head)
+      : undefined));
+  // Started after the listener is up so the first roster refresh cannot race the hub it
+  // broadcasts through.
+  for (const member of bridgeMembers) member.bridge.start();
+  // Start periodic retention only after startup succeeds. A failed startup must not leave a timer
+  // repeatedly touching a database that no running gateway owns, and a later disk fault must not
+  // escape the timer callback and terminate an otherwise healthy process.
+  const attachMediaSweep = setInterval(() => {
+    try {
+      storage.pruneExpiredAttachMedia(Date.now());
+      // Capability 71. An abandoned composer must stop holding a person's words even on a gateway
+      // where nobody ever types again, so retention runs on this pass rather than only on the
+      // next write.
+      storage.pruneExpiredComposerDrafts(Date.now());
+    } catch (error) {
+      console.error(
+        `retention sweep failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }, PHOTO_SWEEP_MS);
+  attachMediaSweep.unref?.();
+  // Small indexed batches keep busy-bot history bounded without an hourly deletion burst.
+  // These expire completed activity only; durable chat and replay identities remain intact.
+  const chatRetentionSweep = setInterval(() => {
+    try {
+      const now = Date.now();
+      storage.compactBotChatToolDetails(now);
+      storage.compactAttachPayloads(now);
+    } catch (error) {
+      console.error(`chat retention sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, 15_000);
+  chatRetentionSweep.unref?.();
+  // Dashboard packet D2. Three periodic jobs, all following the retention sweep's shape above so
+  // they start and stop with the gateway process the same way, and all skipped entirely when
+  // observability is off. Every callback absorbs its own failure: a metric that can terminate the
+  // process it measures is worse than no metric.
+  const observationSweep = observeOptions.enabled
+    ? setInterval(() => {
+        try {
+          // Section 3's gateway-wide figures. Sampled on a cadence rather than only when somebody
+          // opens the dashboard, so a chart can be drawn through a night nobody was watching.
+          const health = attachV1Ingress.health();
+          observe.attachDepths({
+            online: health.online,
+            queueDepth: health.queueDepth,
+            deadLetters: health.deadLetters,
+            outboxDepth: health.pluginOutboxDepth ?? 0,
+          });
+        } catch (error) {
+          console.error(
+            `observation sweep failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }, OBSERVE_SWEEP_MS)
+    : undefined;
+  observationSweep?.unref?.();
+  // The nightly trim the design names. Hourly rather than once a day at a fixed hour: a gateway
+  // that is only ever awake in the evening would otherwise never reach its own retention pass, and
+  // a delete of nothing costs an indexed range scan that finds no rows.
+  const observationTrim = setInterval(() => {
+    try {
+      observe.trim();
+    } catch (error) {
+      console.error(
+        `observation trim failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }, OBSERVE_TRIM_MS);
+  observationTrim.unref?.();
+  const address = server.address();
+  const port =
+    address !== null && typeof address === "object"
+      ? address.port
+      : config.port;
+  boundPort = port;
+  // Section 10 and 11, the tunnel leg. Built after the port is known, because the loopback half of
+  // the comparison has to reach THIS listener; a gateway with no public URL has no tunnel to probe,
+  // so it never runs one and never records an absent hop as a zero.
+  const tunnelProbe = observeOptions.enabled && config.publicUrl !== undefined
+    ? new TunnelSelfProbe({
+        ring: observe,
+        publicUrl: config.publicUrl,
+        loopbackUrl: `${scheme}://127.0.0.1:${port}`,
+      })
+    : undefined;
+  tunnelProbe?.start(TUNNEL_PROBE_INTERVAL_MS);
+
+  return {
+    url: `${scheme}://${config.host ?? "127.0.0.1"}:${port}`,
+    port,
+    storage,
+    routes: () => app.routes.map((route) => ({ method: route.method, path: route.path })),
+    observations: { ring: observe },
+    issueSetupCode: () => {
+      const code = newSetupCode();
+      storage.createSetupCode(code, Date.now() + SETUP_CODE_TTL_MS);
+      return code;
+    },
+    close: async () => {
+      clearInterval(attachMediaSweep);
+      clearInterval(chatRetentionSweep);
+      if (observationSweep !== undefined) clearInterval(observationSweep);
+      clearInterval(observationTrim);
+      tunnelProbe?.stop();
+      const durableAttachShutdown = [...adapters.keys()].some((agentId) =>
+        attachV1Ingress.hasNegotiated(agentId),
+      );
+      hub.close();
+      // Closing attach sockets fires the disconnect path, which fails in-flight turns, so the
+      // runner's per-thread chains settle before closeAll drains them.
+      memorySurface?.close();
+      configSurface?.close();
+      historySurface?.close();
+      attachV1Ingress.close();
+      runnerLane.close();
+      // The bots bridge holds a dial-out socket and its own timers; closing it cancels both.
+      botScreen?.close();
+      await Promise.all(bridgeMembers.map((member) => member.bridge.close()));
+      await roomHost?.close();
+      nativeBotPlane.close();
+      assignments.close();
+      mobileNode?.close();
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+      if (durableAttachShutdown) runner.abandonAll();
+      else await runner.closeAll();
+      notifier.close();
+      storage.close();
+    },
+  };
+}

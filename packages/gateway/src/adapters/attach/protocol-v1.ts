@@ -1,0 +1,946 @@
+import { type Static, type TSchema, Type } from "@sinclair/typebox";
+import {
+  RichBlockSchema, BotMemoryGraphResponseSchema, BotMemoryItemSchema, BotMemoryKindSchema,
+  BotMemoryItemsResponseSchema, BotMemoryOverviewResponseSchema, BotMemoryWriteResponseSchema,
+  BotMemoryDeleteResponseSchema, BotMemorySetupRequestSchema, MobileNodeGatewayStatusResultSchema, MobileNodePurposeSchema, MobileNodeMediaDescriptorSchema,
+  type MobileNodeGatewayStatusResult,
+  CozyAppDataSchema,
+  CozyAppDocumentSchema,
+  CozyAppTreeSchema,
+  BotProfileSchema, BotProfilePatchSchema, BotProfileConfigureResponseSchema,
+  BotModelConfigSchema, BotModelConfigPatchSchema,
+  BotRoutineListResponseSchema, BotRoutineCreateRequestSchema, BotRoutinePatchSchema, BotRoutineWriteResponseSchema,
+  BotHistoryListResponseSchema, BotHistoryDiffResponseSchema, BotHistoryRestoreResponseSchema,
+  BotHistoryTryStartResponseSchema, BotHistoryTryKeepResponseSchema, BotHistoryTryDiscardResponseSchema,
+  BotHistoryResolveResponseSchema, BotHistoryResolveChoiceSchema,
+  ChatBranchListSchema, ChatComputerSchema, ChatProjectListSchema,
+  ChatSessionConfigurationSchema,
+  ModelProviderConnectionCatalogSchema, ModelProviderConnectionIdSchema,
+  BotApprovalRepairSchema, type BotApprovalRepair,
+  BotApprovalScopeSchema, type BotApprovalScope, check,
+} from "cozygateway-contract";
+
+
+/** Stable attach-v1 data-plane contract. A peer dials /attach/v1 and completes hello negotiation
+ * before either side accepts application frames. */
+const Id = Type.String({ minLength: 1, maxLength: 256 });
+const Sequence = Type.Integer({ minimum: 0 });
+
+/** The gateway's supported capability names. Hello accepts bounded unknown names and ignores them. */
+export const AttachV1CapabilitySchema = Type.Union([
+  Type.Literal("draft"),
+  Type.Literal("media"),
+  Type.Literal("tools"),
+  Type.Literal("approvals"),
+  Type.Literal("clarify"),
+  Type.Literal("scheduled"),
+  Type.Literal("mobile_node"),
+  Type.Literal("mobile_location"),
+  Type.Literal("mobile_media"),
+  Type.Literal("mobile_notifications"),
+  Type.Literal("memory_management"),
+  Type.Literal("memory_setup"),
+  /** cozychat#411: the peer states its current setup switches (`BotMemorySetupState`) on its
+   * `overview`, `setup` and `items` results. A literal of its own because a gateway that does not
+   * grant it validates those results as closed objects without the field. */
+  Type.Literal("memory_setup_state"),
+  /** Capability 60: authoritative ownership metadata on memory mutations. */
+  Type.Literal("memory_ownership"),
+  Type.Literal("delivery_receipts"),
+  Type.Literal("delegation"),
+  Type.Literal("thinking"),
+  Type.Literal("desktop_session_resume"),
+  Type.Literal("desktop_session_sync"),
+  Type.Literal("cozyapps"),
+  /** Capability row 67, com.cozylabs.cozyapps 2. A separate literal beside `cozyapps` because the
+   * flat one carries no version, exactly as `memory_ownership` sits beside `memory_management`. A
+   * peer that offers only `cozyapps` keeps every v1 behavior and sees no new frame or member. */
+  Type.Literal("cozyapps_dashboard"),
+  Type.Literal("bot_config"),
+  /** Session-scoped execution configuration travels on the same bounded request/reply frame
+   * family as bot_config, but is negotiated independently so a runtime never claims profile
+   * administration merely by supporting per-chat context. */
+  Type.Literal("chat_configuration"),
+  Type.Literal("provider_connections"),
+  /** Capability 89 of `com.cozylabs.bots`. The peer accepts client-declared remote MCP servers
+   * (`declareMcpServers` / `removeMcpServers`) on `bot_config` `profile.write`. Negotiated apart
+   * from `bot_config` so a peer never receives a declaration it did not opt into, exactly as
+   * `memory_ownership` sits beside `memory_management`. A harness offers it only when its operator
+   * turned client declarations on. */
+  Type.Literal("mcp_server_declarations"),
+  Type.Literal("bot_history"),
+  /** Capability 60: durable metadata-only local search tombstone. */
+  Type.Literal("session_deletion"),
+  Type.Literal("observation_snapshot"),
+  /** An unsequenced latest-only current-context report after a native turn. */
+  Type.Literal("chat_context"),
+]);
+export type AttachV1Capability = Static<typeof AttachV1CapabilitySchema>;
+
+export const AttachV1LimitsSchema = Type.Object({
+  maxInFlightEvents: Type.Integer({ minimum: 1, maximum: 1024 }),
+  maxInFlightBytes: Type.Integer({ minimum: 1024, maximum: 64 * 1024 * 1024 }),
+});
+
+/** One profile-local command the attached Hermes process can execute on its messaging surface.
+ * The leading slash is kept on the wire so clients never have to guess whether a catalog entry is
+ * display text or an invocation. */
+export const AttachV1SlashCommandSchema = Type.Object({
+  name: Type.String({ pattern: "^/[A-Za-z0-9_-]+$", minLength: 2, maxLength: 129 }),
+  description: Type.String({ minLength: 1, maxLength: 200 }),
+  argsHint: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
+  category: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+});
+export type AttachV1SlashCommand = Static<typeof AttachV1SlashCommandSchema>;
+
+const AttachV1CommandCatalogSchema = Type.Array(AttachV1SlashCommandSchema, {
+  maxItems: 512,
+});
+
+/** Bounded spool counters reported only on an authenticated control frame. They intentionally
+ * contain no task, event, command, profile, or instance identifier. */
+export const AttachV1TelemetrySchema = Type.Object({
+  eventOutboxDepth: Type.Integer({ minimum: 0, maximum: 1_000_000 }),
+  // A fresh durable spool has no oldest event. `null` means unknown, never an unbounded
+  // measurement. The gateway derives ACK progress from authenticated receipt time.
+  oldestEventAgeMs: Type.Union([Type.Integer({ minimum: 0, maximum: 7 * 24 * 60 * 60 * 1_000 }), Type.Null()]),
+  eventAckCursor: Sequence,
+  commandInboxDepth: Type.Integer({ minimum: 0, maximum: 1_000_000 }),
+}, { additionalProperties: false });
+export type AttachV1Telemetry = Static<typeof AttachV1TelemetrySchema>;
+
+/** The protocol version remains mandatory; optional capabilities negotiate by intersection. */
+export const AttachV1HelloSchema = Type.Object({
+  kind: Type.Literal("hello"),
+  version: Type.Literal(2),
+  instanceId: Id,
+  capabilities: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { uniqueItems: true, maxItems: 128 }),
+  resume: Type.Optional(Type.Object({ eventSequence: Sequence, commandSequence: Sequence })),
+  limits: Type.Optional(AttachV1LimitsSchema),
+  commands: Type.Optional(AttachV1CommandCatalogSchema),
+  telemetry: Type.Optional(AttachV1TelemetrySchema),
+  /** Capability 69. The turn ids this peer STILL CARRIES as running, declared at the moment it
+   *  re-attaches. It is the one fact only the peer holds: a gateway turn is durable, so a peer
+   *  that restarted, crashed, or dropped a turn internally leaves the gateway believing work is
+   *  running that no process owns, and the next thing the person says goes out as a steer on a
+   *  dead turn. An EMPTY ARRAY is a real declaration ("I hold none"); ABSENT is a peer that
+   *  cannot declare, which the gateway reads as unknown and bounds by a short grace rather than
+   *  by the long silence ceiling. Ids only: no text, thread, media or tool detail.
+   *
+   *  UNTYPED on the wire for the same reason `detail`, `repair` and `scope` are: a schema failure
+   *  on `hello` closes the whole attach socket (1002/1008), so a plugin bug that repeated an id,
+   *  or a peer legitimately holding more turns than a bound allowed, would take the profile dark
+   *  and reconnect-loop over an OPTIONAL, best-effort declaration. `sanitizeActiveTurns` below is
+   *  the sole authority: it degrades a malformed or oversized declaration to "cannot declare",
+   *  which is the safe reading, and NEVER truncates one, because a truncated declaration would
+   *  seal turns the peer actually holds. */
+  activeTurns: Type.Optional(Type.Unknown()),
+});
+export type AttachV1Hello = Static<typeof AttachV1HelloSchema>;
+
+export const AttachV1MediaDescriptorSchema = Type.Object({
+  mediaId: Id,
+  mimeType: Type.String({ minLength: 1, maxLength: 128 }),
+  byteCount: Type.Integer({ minimum: 1 }),
+  sha256: Type.String({ pattern: "^[a-f0-9]{64}$" }),
+  filename: Type.String({ minLength: 1, maxLength: 512 }),
+  family: Type.Union([Type.Literal("image"), Type.Literal("audio"), Type.Literal("video"), Type.Literal("file")]),
+  caption: Type.Optional(Type.String({ maxLength: 4096 })),
+  altText: Type.Optional(Type.String({ maxLength: 4096 })),
+  expiresAt: Type.Optional(Type.Integer({ minimum: 0 })),
+});
+export type AttachV1MediaDescriptor = Static<typeof AttachV1MediaDescriptorSchema>;
+
+/** Who is in a room, as the gateway knows them, so a peer does not have to parse them back out of
+ * the prompt header it was handed. `kind` separates the human from the bots; the human's `name`
+ * and `displayName` are the room's own label for the user and its handle is the `@user` token. */
+const TurnActor = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 128 }),
+  handle: Type.String({ minLength: 1, maxLength: 128 }),
+  displayName: Type.String({ minLength: 1, maxLength: 256 }),
+  kind: Type.Union([Type.Literal("user"), Type.Literal("member")]),
+}, { additionalProperties: false });
+
+/** Capability 88. The assignment a leader handed this turn's bot. The Task id is the same one
+ * `GET /tasks/:taskId` and the assignment routes use. */
+const TurnTask = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 256 }),
+  assignedBy: Type.String({ minLength: 1, maxLength: 128 }),
+  brief: Type.String({ minLength: 1, maxLength: 8192 }),
+  doneCriteria: Type.String({ minLength: 1, maxLength: 4096 }),
+  outputFormat: Type.Optional(Type.String({ maxLength: 2048 })),
+  deadlineAt: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+
+/** Typed provenance for one turn. Sent on room and assignment turns, and it is decoration in the
+ * strictest sense: the `text` a peer receives is byte-identical with and without it, so a peer that
+ * ignores `context` behaves exactly as it did before capability 47. */
+const TurnContext = Type.Object({
+  /** Present on room turns. Absent on an assignment turn, which has no room (capability 88). */
+  room: Type.Optional(Type.Object({
+    key: Type.String({ minLength: 1, maxLength: 128 }),
+    name: Type.String({ minLength: 1, maxLength: 128 }),
+    epoch: Type.Integer({ minimum: 0 }),
+    /** The highest room seq the member has been shown. Optional and ABSENT rather than zero when
+     * there is nothing to name: zero is a real seq in a room whose log was trimmed, so a
+     * placeholder would be a claim the gateway cannot make. */
+    seq: Type.Optional(Type.Integer({ minimum: 0 })),
+  }, { additionalProperties: false })),
+  actors: Type.Array(TurnActor, { maxItems: 8 }),
+  cause: Type.Optional(Type.Object({
+    kind: Type.Union([Type.Literal("user"), Type.Literal("member")]),
+    seq: Type.Integer({ minimum: 0 }),
+  }, { additionalProperties: false })),
+  /** Present on assignment turns only (capability 88). */
+  task: Type.Optional(TurnTask),
+}, { additionalProperties: false });
+export type AttachV1TurnContext = Static<typeof TurnContext>;
+
+const TurnCommand = Type.Object({
+  kind: Type.Literal("turn"), threadId: Id, turnId: Id, messageId: Id, text: Type.String(),
+  mediaIds: Type.Optional(Type.Array(Id, { maxItems: 16 })),
+  context: Type.Optional(TurnContext),
+  chatContext: Type.Optional(ChatSessionConfigurationSchema),
+});
+const SteerCommand = Type.Object({
+  kind: Type.Literal("steer"), threadId: Id, turnId: Id, messageId: Id, text: Type.String(),
+});
+const InterruptCommand = Type.Object({ kind: Type.Literal("interrupt"), threadId: Id, turnId: Id });
+const ResolveApprovalCommand = Type.Object({
+  kind: Type.Literal("resolve_approval"), threadId: Id, turnId: Id, approvalId: Id,
+  decision: Type.Union([Type.Literal("approve"), Type.Literal("deny")]),
+});
+const ResolveClarifyCommand = Type.Object({
+  kind: Type.Literal("resolve_clarify"), threadId: Id, turnId: Id, clarifyId: Id, optionId: Id,
+});
+/** A source-qualified handoff, not a turn. The gateway-owned thread id stays the attach lane;
+ * the plugin verifies and switches the profile-local raw Hermes id before acknowledging it. */
+const DesktopSessionResumeCommand = Type.Object({
+  kind: Type.Literal("desktop_session_resume"), threadId: Id, hermesSessionId: Id, resumeId: Id,
+});
+/** Capability 60. This is not a turn and carries no transcript, title, device, or host data. */
+const SessionDeletedCommand = Type.Object({
+  kind: Type.Literal("session_deleted"),
+  sessionSha: Type.String({ minLength: 64, maxLength: 64, pattern: "^[a-f0-9]{64}$" }),
+  deletion: Type.Object({
+    id: Id, revision: Type.Integer({ minimum: 1 }), at: Type.Integer({ minimum: 1 }),
+  }, { additionalProperties: false }),
+}, { additionalProperties: false });
+const AttachV1MemoryDataRequestSchema = Type.Object({
+  kind: Type.Literal("memory_request"), requestId: Id,
+  operation: Type.Union([Type.Literal("overview"), Type.Literal("items"), Type.Literal("item"), Type.Literal("create"), Type.Literal("update"), Type.Literal("delete"), Type.Literal("graph")]),
+  input: Type.Object({
+    sourceId: Type.Optional(Id), itemId: Type.Optional(Id), q: Type.Optional(Type.String({ maxLength: 512 })), kind: Type.Optional(BotMemoryKindSchema),
+    since: Type.Optional(Type.Integer({ minimum: 0 })), until: Type.Optional(Type.Integer({ minimum: 0 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+    content: Type.Optional(Type.String({ minLength: 1, maxLength: 32_000 })), title: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })), category: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })), tags: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })), expectedRevision: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+    /** Capability 60 internal origin metadata. REST never accepts this field. */
+    owner: Type.Optional(Type.Union([Type.Literal("person"), Type.Literal("bot")])),
+  }, { additionalProperties: false }),
+}, { additionalProperties: false });
+const AttachV1MemorySetupRequestSchema = Type.Object({
+  kind: Type.Literal("memory_request"), requestId: Id, operation: Type.Literal("setup"),
+  input: BotMemorySetupRequestSchema,
+}, { additionalProperties: false });
+export const AttachV1MemoryRequestSchema = Type.Union([
+  AttachV1MemoryDataRequestSchema, AttachV1MemorySetupRequestSchema,
+]);
+export type AttachV1MemoryRequest = Static<typeof AttachV1MemoryRequestSchema>;
+
+/** The bot-config lane, cloned from the memory lane above. A peer serving its own runtime owns its
+ * profile, model selection and routines; the gateway holds no Dashboard row for it, so the same
+ * bounded live request/reply shape carries the reads and writes those surfaces need.
+ *
+ * Every input and every result is a PUBLISHED `com.cozylabs.bots` schema rather than a lane-local
+ * restatement, so a peer implements the shapes its REST clients already read and the two can never
+ * drift. The one exception is the delete/run acknowledgement, which has no published body because
+ * neither operation answers with one. */
+const NoInput = Type.Object({}, { additionalProperties: false });
+const ConfigRequestFrame = <const O extends string, I extends TSchema>(operation: O, input: I) =>
+  Type.Object({
+    kind: Type.Literal("config_request"), requestId: Id,
+    operation: Type.Literal(operation), input,
+  }, { additionalProperties: false });
+/** A routine write names the routine it acts on separately from the published patch body, because
+ * the patch schema deliberately has no id: on REST the id is the path segment. */
+const RoutineIdInput = Type.Object({ id: Id }, { additionalProperties: false });
+const ChatProjectsInput = Type.Object({ computerId: Id }, { additionalProperties: false });
+const ChatBranchesInput = Type.Object({ computerId: Id, projectId: Id }, { additionalProperties: false });
+const ChatConfigurationReadInput = Type.Object({ sessionId: Id }, { additionalProperties: false });
+export const AttachV1ChatConfigurationReadResultSchema = Type.Object({
+  computer: ChatComputerSchema,
+  configuration: Type.Union([ChatSessionConfigurationSchema, Type.Null()]),
+}, { additionalProperties: false });
+const ChatConfigurationPrepareInput = Type.Object({ configuration: ChatSessionConfigurationSchema }, { additionalProperties: false });
+export const AttachV1ChatConfigurationPrepareResultSchema = Type.Object({ configuration: ChatSessionConfigurationSchema }, { additionalProperties: false });
+const ProviderConnectionHandoffInput = Type.Object({ handoffId: Id }, { additionalProperties: false });
+export const ProviderConnectionTransferResultSchema = Type.Object({ handoffId: Type.String({ pattern: "^[a-f0-9]{64}$" }) }, { additionalProperties: false });
+const ProviderConnectionIdInput = Type.Object({ id: ModelProviderConnectionIdSchema }, { additionalProperties: false });
+export const AttachV1ConfigRequestSchema = Type.Union([
+  ConfigRequestFrame("profile.read", NoInput),
+  ConfigRequestFrame("profile.write", BotProfilePatchSchema),
+  ConfigRequestFrame("model.read", NoInput),
+  ConfigRequestFrame("model.write", BotModelConfigPatchSchema),
+  ConfigRequestFrame("routines.list", NoInput),
+  ConfigRequestFrame("routines.create", BotRoutineCreateRequestSchema),
+  ConfigRequestFrame("routines.update", Type.Object({ id: Id, patch: BotRoutinePatchSchema }, { additionalProperties: false })),
+  ConfigRequestFrame("routines.delete", RoutineIdInput),
+  ConfigRequestFrame("routines.run", RoutineIdInput),
+  ConfigRequestFrame("chat.projects", ChatProjectsInput),
+  ConfigRequestFrame("chat.branches", ChatBranchesInput),
+  ConfigRequestFrame("chat.configuration.read", ChatConfigurationReadInput),
+  ConfigRequestFrame("chat.configuration.prepare", ChatConfigurationPrepareInput),
+  ConfigRequestFrame("providers.connections.list", NoInput),
+  ConfigRequestFrame("providers.connections.save", ProviderConnectionHandoffInput),
+  ConfigRequestFrame("providers.connections.test", ProviderConnectionIdInput),
+  ConfigRequestFrame("providers.connections.remove", ProviderConnectionIdInput),
+  ConfigRequestFrame("providers.connections.transfer", Type.Object({ id: ModelProviderConnectionIdSchema, executionId: Type.String({ pattern: "^chatx_[a-f0-9]{32}$" }) }, { additionalProperties: false })),
+  ConfigRequestFrame("providers.connections.import", ProviderConnectionHandoffInput),
+]);
+export type AttachV1ConfigRequest = Static<typeof AttachV1ConfigRequestSchema>;
+/** The answer to an operation that stores no body. `ok: false` is not a refusal channel: a peer
+ * that could not do the work answers with a non-`ok` STATUS so the reason reaches the operator. */
+export const AttachV1ConfigAckSchema = Type.Object({ ok: Type.Boolean() }, { additionalProperties: false });
+
+/** The bot-history lane, cloned from the bot-config lane above. A runtime bot checkpoints its own
+ * workspace into git (capability 50); the gateway holds no repository and no checkpoint row, so
+ * the same bounded live request/reply shape carries the reads and the four state-changing acts the
+ * layman history surface needs.
+ *
+ * NOTHING CONTENT-SHAPED crosses this lane, in either direction. A `diff` answers with per-file
+ * line COUNTS and never a patch, a checkpoint answers with a one-line summary and never a file,
+ * and a conflict answers with one bounded label per side and never the two versions themselves.
+ * That is the boundary rule, not a size limit: the workspace is where a change lives, and this
+ * lane exists to let a person choose between changes without the changes being copied to a phone.
+ *
+ * Every result is a PUBLISHED `com.cozylabs.bots` schema, for the same reason the config lane's
+ * are: the peer implements exactly the shapes its REST clients read, so the two cannot drift. */
+const HistoryRequestFrame = <const O extends string, I extends TSchema>(operation: O, input: I) =>
+  Type.Object({
+    kind: Type.Literal("history_request"), requestId: Id,
+    operation: Type.Literal(operation), input,
+  }, { additionalProperties: false });
+/** A checkpoint id as the peer minted it. Opaque on this wire: a client never parses one, and the
+ * gateway never infers a commit, a ref, or a path from it. */
+const CheckpointId = Type.String({ minLength: 1, maxLength: 128 });
+export const AttachV1HistoryRequestSchema = Type.Union([
+  HistoryRequestFrame("list", Type.Object({
+    since: Type.Optional(Type.Integer({ minimum: 0 })),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+  }, { additionalProperties: false })),
+  /** `to` absent means "against the working version", which is the comparison the Changes list
+   *  actually asks for; naming both ends is the power-user case and stays available. */
+  HistoryRequestFrame("diff", Type.Object({
+    from: CheckpointId, to: Type.Optional(CheckpointId),
+  }, { additionalProperties: false })),
+  HistoryRequestFrame("restore", Type.Object({ checkpoint: CheckpointId }, { additionalProperties: false })),
+  HistoryRequestFrame("try.start", Type.Object({
+    label: Type.String({ minLength: 1, maxLength: 200 }),
+  }, { additionalProperties: false })),
+  /** Keep and discard name no experiment: there is at most one in flight per bot and the peer owns
+   *  which. A client that had to name it would be a second place the answer is stored. */
+  HistoryRequestFrame("try.keep", NoInput),
+  HistoryRequestFrame("try.discard", NoInput),
+  HistoryRequestFrame("resolve", Type.Object({
+    choices: Type.Array(BotHistoryResolveChoiceSchema, { minItems: 1, maxItems: 200 }),
+  }, { additionalProperties: false })),
+]);
+export type AttachV1HistoryRequest = Static<typeof AttachV1HistoryRequestSchema>;
+/** Gateway-observed truth about ONE scheduled delivery occurrence, sent back to the plugin that
+ * produced it so its own spool stops guessing. `displayed` means a paired device reported the row
+ * on screen; `failed` means the occurrence is terminal in the gateway and will never be projected,
+ * with `stage` saying where it died (`authorization` at inbox admission, `projection` at the
+ * dead-letter barrier) and `reason` carrying the bounded gateway-side text.
+ *
+ * States never regress: the gateway emits at most one command per (delivery, state), keyed
+ * `rcpt:<deliveryId>:<state>`, and a plugin that receives both keeps the first terminal one. */
+const DeliveryReceiptCommand = Type.Object({
+  kind: Type.Literal("delivery_receipt"), deliveryId: Id, messageId: Id,
+  state: Type.Union([Type.Literal("displayed"), Type.Literal("failed")]),
+  at: Type.Integer({ minimum: 0 }),
+  stage: Type.Optional(Type.Union([Type.Literal("authorization"), Type.Literal("projection")])),
+  reason: Type.Optional(Type.String({ maxLength: 256 })),
+});
+/** App actions are a separate durable lane, never synthetic chat text. */
+/** `values` is the saved input the person had chosen when they tapped, so the peer can act on it.
+ * It is READ-ONLY for the peer: a value is written by the user route and by nothing else. It is
+ * present only for a peer that negotiated `cozyapps_dashboard`, so a v1 peer's command is byte
+ * identical to its pre-2 self. */
+const CozyAppActionCommand = Type.Object({
+  kind: Type.Literal("cozyapp_action"), appId: Id, actionId: Id, actionRequestId: Id,
+  values: Type.Optional(Type.Array(Type.Object({
+    valueId: Id, type: Type.Union(["string", "number", "boolean", "date", "selection"].map((name) => Type.Literal(name))),
+    value: Type.Union([Type.String({ maxLength: 512 }), Type.Number(), Type.Boolean()]),
+    revision: Type.Integer({ minimum: 1 }),
+  }, { additionalProperties: false }), { maxItems: 64 })),
+});
+
+/** Capability-free transport tombstone. It advances the durable command sequence without
+ * invoking a Hermes action when a command queued while disconnected is no longer supported by
+ * the plugin that reconnects. */
+const DiscardCommand = Type.Object({
+  kind: Type.Literal("discard"),
+  originalKind: Type.Union([
+    Type.Literal("turn"), Type.Literal("steer"), Type.Literal("interrupt"),
+    Type.Literal("resolve_approval"), Type.Literal("resolve_clarify"),
+    Type.Literal("desktop_session_resume"), Type.Literal("session_deleted"), Type.Literal("delivery_receipt"),
+    Type.Literal("cozyapp_action"),
+  ]),
+  reason: Type.String({ minLength: 1, maxLength: 512 }),
+});
+
+export const AttachV1CommandSchema = Type.Union([
+  TurnCommand, SteerCommand, InterruptCommand, ResolveApprovalCommand, ResolveClarifyCommand,
+  DesktopSessionResumeCommand, SessionDeletedCommand, DeliveryReceiptCommand, CozyAppActionCommand, DiscardCommand,
+]);
+export type AttachV1Command = Static<typeof AttachV1CommandSchema>;
+
+export const AttachV1CommandFrameSchema = Type.Object({
+  kind: Type.Literal("command"), sequence: Type.Integer({ minimum: 1 }), commandId: Id,
+  command: AttachV1CommandSchema,
+});
+export type AttachV1CommandFrame = Static<typeof AttachV1CommandFrameSchema>;
+
+const DraftEvent = Type.Object({
+  kind: Type.Literal("draft"), threadId: Id, turnId: Id, blocks: Type.Array(RichBlockSchema),
+  replace: Type.Optional(Type.Boolean()),
+});
+/** `mediaPositions`, when present, is aligned index-for-index with `mediaIds` and MUST have the
+ * same length: entry `i` is the block index BEFORE which media `i` renders (capability 32). It is
+ * all or nothing, because a partial array would silently claim index 0 for every attachment it
+ * omits. A plugin that cannot say where an attachment belongs omits the field, and the gateway
+ * then builds today's unpositioned attachments.
+ *
+ * `continues` is the plugin saying "this reply is a message, not the end of the turn". A Hermes
+ * agent loop may deliver several replies before it is done, and the gateway cannot tell them apart
+ * from the frame alone: every reply is a commit. The plugin can, because Hermes marks its own final
+ * turn delivery (the per-turn reply anchor, and its `notify` marker). An omitted or false field is
+ * the historic terminal commit, so an older plugin and an older gateway both keep today's meaning. */
+const CommitEvent = Type.Object({
+  kind: Type.Literal("commit"), threadId: Id, turnId: Id, messageId: Id,
+  blocks: Type.Array(RichBlockSchema), mediaIds: Type.Optional(Type.Array(Id, { maxItems: 16 })),
+  mediaPositions: Type.Optional(Type.Array(Type.Integer({ minimum: 0, maximum: 4096 }), { maxItems: 16 })),
+  continues: Type.Optional(Type.Boolean()),
+});
+const FailedEvent = Type.Object({
+  kind: Type.Literal("failed"), threadId: Id, turnId: Id, messageId: Id,
+  message: Type.Optional(Type.String({ maxLength: 4096 })),
+  /** Capability 69. A CLOSED reason, present only for the one failure the gateway can repair
+   *  rather than merely report: `unknown_turn` says the peer was handed a steer (or any work) for
+   *  a turn it does not hold, so the turn is over and the person's words are still unanswered.
+   *  The gateway seals that turn for owner loss and promotes the steer into a new durable turn.
+   *  Absent on every other failure and on every peer below 69, which stay byte identical. */
+  reason: Type.Optional(Type.Union([Type.Literal("unknown_turn")])),
+});
+const CancelledEvent = Type.Object({ kind: Type.Literal("cancelled"), threadId: Id, turnId: Id, messageId: Id });
+const InterruptedEvent = Type.Object({ kind: Type.Literal("interrupted"), threadId: Id, turnId: Id, messageId: Id });
+const ToolEvent = Type.Object({
+  kind: Type.Literal("tool"), threadId: Id, turnId: Id, callId: Id, name: Type.String({ minLength: 1, maxLength: 128 }),
+  status: Type.Union([Type.Literal("running"), Type.Literal("ok"), Type.Literal("error")]),
+  role: Type.Optional(Type.Union([Type.Literal("investigation"), Type.Literal("mutation"), Type.Literal("verification"), Type.Literal("unknown")])),
+  detail: Type.Optional(Type.String({ maxLength: 1024 })),
+});
+/** Closed status vocabulary for one delegated child. `queued|starting|running|stalling` are
+ * live; the rest are settled. `unknown` is the honest settle for work whose outcome cannot be
+ * proven (a restart with the child in flight) -- never rendered as failure. */
+const DelegationStatus = Type.Union([
+  Type.Literal("queued"), Type.Literal("starting"), Type.Literal("running"),
+  Type.Literal("stalling"), Type.Literal("succeeded"), Type.Literal("failed"),
+  Type.Literal("interrupted"), Type.Literal("stalled"), Type.Literal("unknown"),
+]);
+const DelegationCostStatus = Type.Union([
+  Type.Literal("estimated"), Type.Literal("reported"), Type.Literal("unknown"),
+]);
+const DelegationSchemaValidation = Type.Object({
+  valid: Type.Boolean(),
+  retries: Type.Optional(Type.Integer({ minimum: 0, maximum: 1 })),
+}, { additionalProperties: false });
+/** EPHEMERAL delegation lifecycle behind the turn's live batch card. One event is one child
+ * update; identity is (batchId, childId), never the tool name, so identical concurrent tools
+ * cannot collide. `batchId` is the parent's own `delegate_task` tool-call id until Hermes
+ * exposes its real delegation id in the lifecycle hooks (a compatibility fallback clients
+ * treat as opaque). `childId` is the Hermes child session id: the one identifier present on
+ * both the spawn and finish legs. Only bounded display metadata crosses this wire -- a
+ * truncated label and a tool NAME; never args, results, reasoning, prompts, paths, or child
+ * summaries. Like `tool`, the event is rendering state: the gateway must never let an
+ * undeliverable one dead-letter the stream (issue #193/#194). */
+const DelegationEvent = Type.Object({
+  kind: Type.Literal("delegation"), threadId: Id, turnId: Id, batchId: Id, childId: Id,
+  /** Position within the batch, from 0, stable for the child's lifetime. */
+  index: Type.Integer({ minimum: 0 }),
+  /** Children known to the batch so far; grows monotonically (exact once Hermes reports
+   * `task_count`). */
+  count: Type.Integer({ minimum: 1 }),
+  label: Type.Optional(Type.String({ maxLength: 200 })),
+  status: DelegationStatus,
+  /** Tool NAME only. */
+  currentTool: Type.Optional(Type.String({ maxLength: 128 })),
+  apiCalls: Type.Optional(Type.Integer({ minimum: 0 })),
+  toolCount: Type.Optional(Type.Integer({ minimum: 0 })),
+  costUsd: Type.Optional(Type.Number({ minimum: 0, maximum: 1_000_000 })),
+  costStatus: Type.Optional(DelegationCostStatus),
+  schemaValidation: Type.Optional(DelegationSchemaValidation),
+  durationMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 2_147_483_647 })),
+  /** MILLISECONDS, plugin clock: when the child last showed observable activity. */
+  lastActiveAt: Type.Integer({ minimum: 0 }),
+  /** Canonical Hermes delegation id (`deleg_...`) for the WHOLE batch, once the plugin has
+   * learned it from the structured `delegation_id` field of the parent `delegate_task`
+   * result. Batch-level: identical on every child event that carries it, and typically
+   * present only from the finish legs onward (async spawn legs precede the tool result).
+   * It never replaces (batchId, childId) as identity -- it exists so clients can reconcile
+   * the live card with Hermes's "[ASYNC DELEGATION BATCH COMPLETE - <deleg_id>]" row. */
+  aliasId: Type.Optional(Id),
+});
+/** EPHEMERAL rolling reasoning preview behind the turn's thinking shimmer (capability
+ * `thinking`). A deliberate, bounded reopening of the closed no-reasoning rule below: reasoning
+ * models deliver their visible reply in one end burst, so without this the whole turn is a
+ * generic spinner. One event REPLACES the previous one for its turn (latest-only; `seq` is the
+ * plugin's monotonic per-turn counter, so a stale replay cannot regress the preview). `text` is
+ * a sanitized tail preview, capped at 280 chars ON THE SCHEMA so the bound holds even against an
+ * unsanitized peer -- never tool args or results, prompts, credentials, or file paths. Never
+ * emitted after the turn's terminal, never persisted, gone on reopen. Like `draft`/`tool`, it is
+ * rendering state: an undeliverable one is skipped after bounded retries, never dead-lettered. */
+const ThinkingEvent = Type.Object({
+  kind: Type.Literal("thinking"), threadId: Id, turnId: Id,
+  text: Type.String({ maxLength: 280 }),
+  /** Plugin's per-turn preview counter, from 1. Lower-or-equal = stale, dropped. */
+  seq: Type.Integer({ minimum: 1 }),
+  /** MILLISECONDS, plugin clock: when reasoning last streamed. */
+  lastActiveAt: Type.Integer({ minimum: 0 }),
+});
+const ApprovalEvent = Type.Object({
+  kind: Type.Literal("approval"), threadId: Id, turnId: Id, approvalId: Id, callId: Id,
+  name: Type.String({ minLength: 1, maxLength: 128 }),
+  status: Type.Union([Type.Literal("pending"), Type.Literal("approved"), Type.Literal("denied"), Type.Literal("expired"), Type.Literal("cancelled")]),
+  expiresAt: Type.Optional(Type.Integer({ minimum: 0 })),
+  /** Capability 56. A short sentence naming what the approval concretely covers -- for example
+   *  which Chrome and which profile `my_browser_open` would drive. Deliberately UNBOUNDED on the
+   *  wire (a raw plugin string, not yet the display value): a length cap here would make an
+   *  oversized `detail` a schema failure, and a schema failure on `hello`/an event frame closes
+   *  the whole attach socket (1008) -- so the one field meant to be forgiving of a misbehaving
+   *  peer would instead tear down its entire session. `sanitizeApprovalDetail` below is the SOLE
+   *  authority on the 1-400 character display bound: it truncates and strips rather than the
+   *  schema refusing, so an oversized or control-character-laden value is sanitised, never a
+   *  reason to drop the frame or the connection carrying it. */
+  detail: Type.Optional(Type.String()),
+  /** Capability 62. The MCP repair proposal this approval asks about (`BotApprovalRepairSchema`
+   *  on the bots contract). UNTYPED on the wire for the same reason `detail` is unbounded: a schema
+   *  failure here would close the whole attach socket over one block, when the rule is to drop the
+   *  block and keep the approval. `sanitizeApprovalRepair` below is the sole authority. */
+  repair: Type.Optional(Type.Unknown()),
+  /** Capability 66. The typed scoped-approval block this approval carries
+   *  (`BotApprovalScopeSchema` on the bots contract). UNTYPED on the wire for the same reason
+   *  `repair` is: a schema failure here would close the whole attach socket over one block, when
+   *  the rule is to drop the block and keep the decision the person is being asked for.
+   *  `sanitizeApprovalScope` below is the sole authority. */
+  scope: Type.Optional(Type.Unknown()),
+});
+/** Capability 69. The sole authority on `hello.activeTurns`. Returns the declared turn ids, or
+ *  `undefined` meaning THIS PEER CANNOT DECLARE, which the gateway reads as neither "holds them"
+ *  nor "holds none". Everything malformed degrades to `undefined` rather than to a shorter list:
+ *  a partial declaration would make the gateway seal live work. Duplicates are collapsed, because
+ *  a repeated id says the same true thing twice. */
+export function sanitizeActiveTurns(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.length > 1024) return undefined;
+  const ids = new Set<string>();
+  for (const entry of value) {
+    if (typeof entry !== "string" || entry.length < 1 || entry.length > 256) return undefined;
+    ids.add(entry);
+  }
+  return [...ids];
+}
+
+/** Capability 78. A peer's bounded, best-effort report of the one part of an active turn that
+ * the gateway cannot observe: whether its locally-spooled interim commit is still deliverable.
+ * This stays outside the strict heartbeat schema so a malformed optional report cannot tear down
+ * an otherwise healthy attach socket. */
+export const AttachV1TurnHealthSchema = Type.Object({
+  turnId: Id,
+  execution: Type.Union([Type.Literal("active"), Type.Literal("unknown")]),
+  delivery: Type.Union([Type.Literal("open"), Type.Literal("sealed")]),
+  terminalEventId: Type.Optional(Id),
+  rejectedEvents: Type.Integer({ minimum: 0, maximum: 1_000_000 }),
+}, { additionalProperties: false });
+export type AttachV1TurnHealth = Static<typeof AttachV1TurnHealthSchema>;
+
+/** The sole authority on optional heartbeat turn health. A bad entry invalidates the WHOLE
+ * declaration: retaining a prefix would falsely imply every omitted turn is healthy. */
+export function sanitizeTurnHealth(value: unknown): AttachV1TurnHealth[] | undefined {
+  if (!Array.isArray(value) || value.length > 256) return undefined;
+  const turnIds = new Set<string>();
+  for (const report of value) {
+    if (!check(AttachV1TurnHealthSchema, report) || turnIds.has(report.turnId)) return undefined;
+    turnIds.add(report.turnId);
+  }
+  return value as AttachV1TurnHealth[];
+}
+
+/** Capability 56. Matches the C0 and C1 control character ranges (built from character codes
+ *  rather than a literal escape, so no NUL or other control byte ever sits in this source file),
+ *  plus every Unicode "Format" (Cf) code point: zero-width space and joiners, the bidi override
+ *  and isolate controls, and the byte-order mark among them. Same family capability 55 refuses in
+ *  a runner display name; here the field is display-only and at-least-once over an unversioned
+ *  peer, so it is stripped rather than a reason to refuse the whole approval. */
+const APPROVAL_DETAIL_CONTROL_CHARS = new RegExp(
+  "["
+    + String.fromCharCode(0) + "-" + String.fromCharCode(31)
+    + String.fromCharCode(127) + "-" + String.fromCharCode(159)
+    + "\\p{Cf}"
+    + "]",
+  "gu",
+);
+/** The display bound for `ApprovalEvent.detail` (capability 56): 1-400 characters, counted in
+ *  code points. */
+const APPROVAL_DETAIL_MAX_CHARS = 400;
+const APPROVAL_DETAIL_ELLIPSIS = "…";
+/** Turns a raw `ApprovalEvent.detail` into the sanitized display sentence, or `undefined` when
+ *  there is nothing left to show. Strips control/format characters, trims, and -- rather than
+ *  rejecting an overlong sentence -- truncates it at the last whole word inside the 400-character
+ *  budget and appends an ellipsis. This is deliberately forgiving: unlike a name a person typed
+ *  and can retype, `detail` is produced by a runtime peer describing its own tool call, and a
+ *  malformed one must never cost the approval itself (the frame is still accepted and the
+ *  approval still raised; only the sentence is degraded). */
+export function sanitizeApprovalDetail(raw: string): string | undefined {
+  const trimmed = raw.replace(APPROVAL_DETAIL_CONTROL_CHARS, "").trim();
+  if (trimmed.length === 0) return undefined;
+  const chars = [...trimmed];
+  if (chars.length <= APPROVAL_DETAIL_MAX_CHARS) return trimmed;
+  const budget = APPROVAL_DETAIL_MAX_CHARS - APPROVAL_DETAIL_ELLIPSIS.length;
+  let truncated = chars.slice(0, budget).join("");
+  const lastSpace = truncated.lastIndexOf(" ");
+  if (lastSpace > 0) truncated = truncated.slice(0, lastSpace);
+  return `${truncated.trimEnd()}${APPROVAL_DETAIL_ELLIPSIS}`;
+}
+/** Capability 62. Validates a raw `ApprovalEvent.repair` against the closed bots-contract block and
+ *  refuses any C0/C1 control or Unicode Format (Cf) character in the server name, an affected tool
+ *  name, or a fingerprint (the same family capability 56 strips from `detail`; here every string is
+ *  an identifier, so one bad character fails the block rather than being cut out of a name). The
+ *  block is all or nothing: a valid one is returned as sent, byte for byte, and anything else is
+ *  `undefined`, which the caller reads as "keep the approval, carry no proposal". Never a reason to
+ *  refuse the frame or the approval: the decision a person is being asked for must not be lost
+ *  over the card that describes it. */
+export function sanitizeApprovalRepair(raw: unknown): BotApprovalRepair | undefined {
+  if (!check(BotApprovalRepairSchema, raw)) return undefined;
+  const strings = [raw.server, ...raw.impact, ...Object.values(raw.fingerprint)];
+  return strings.some(unusableIdentifier) ? undefined : raw;
+}
+/** Capability 66. Validates a raw `ApprovalEvent.scope` against the closed bots-contract block and
+ *  refuses any C0/C1 control or Unicode Format (Cf) character, lone surrogate, or whitespace-only
+ *  value in any of its strings. All or nothing, exactly as capability 62's repair block is: a valid
+ *  one is returned as sent, byte for byte, and anything else is `undefined`, which the caller reads
+ *  as "keep the approval, carry no scope". Never a reason to refuse the frame or the approval. A
+ *  block that fails leaves the approval a plain one, so no standing grant can ever be made from it
+ *  and every later invocation asks again: failing this validation fails CLOSED. */
+export function sanitizeApprovalScope(raw: unknown): BotApprovalScope | undefined {
+  if (!check(BotApprovalScopeSchema, raw)) return undefined;
+  const strings = [raw.action, raw.system, raw.resource, raw.change, ...raw.effects];
+  return strings.some(unusableIdentifier) ? undefined : raw;
+}
+/** Capability 62. A repair-block string the schema accepted but no configured server, tool, or
+ *  digest is ever called: whitespace only, a C0/C1 control or Format character, or a lone
+ *  surrogate (`\p{Cs}` under the `u` flag matches an unpaired half, never a real astral pair). The
+ *  schema's `minLength`/`maxLength` bounds count UTF-16 code units, which row 62 states. */
+const LONE_SURROGATE = /\p{Cs}/u;
+function unusableIdentifier(value: string): boolean {
+  return value.trim().length === 0
+    || value.search(APPROVAL_DETAIL_CONTROL_CHARS) !== -1
+    || LONE_SURROGATE.test(value);
+}
+const ClarifyOption = Type.Object({ id: Id, label: Type.String({ minLength: 1, maxLength: 512 }) });
+const ClarifyEvent = Type.Object({
+  kind: Type.Literal("clarify"), threadId: Id, turnId: Id, clarifyId: Id,
+  prompt: Type.String({ minLength: 1, maxLength: 4096 }), options: Type.Array(ClarifyOption, { minItems: 1, maxItems: 20 }),
+  status: Type.Union([Type.Literal("pending"), Type.Literal("resolved"), Type.Literal("expired"), Type.Literal("cancelled")]),
+  expiresAt: Type.Optional(Type.Integer({ minimum: 0 })), selectedOptionId: Type.Optional(Id),
+});
+const ScheduledEvent = Type.Object({
+  kind: Type.Literal("scheduled"), threadId: Id, deliveryId: Id, messageId: Id,
+  blocks: Type.Array(RichBlockSchema), mediaIds: Type.Optional(Type.Array(Id, { maxItems: 16 })),
+  mediaPositions: Type.Optional(Type.Array(Type.Integer({ minimum: 0, maximum: 4096 }), { maxItems: 16 })),
+});
+/** The attach bearer already identifies the Hermes profile, so a semantic home target never
+ * carries a second caller-controlled profile field. Gateway admission binds it once to the
+ * selected native Bot Mode session; a retry reuses that durable binding. */
+const ScheduledCanonicalHomeEvent = Type.Object({
+  kind: Type.Literal("scheduled"), target: Type.Object({ kind: Type.Literal("canonical_home") }),
+  deliveryId: Id, messageId: Id,
+  blocks: Type.Array(RichBlockSchema), mediaIds: Type.Optional(Type.Array(Id, { maxItems: 16 })),
+  mediaPositions: Type.Optional(Type.Array(Type.Integer({ minimum: 0, maximum: 4096 }), { maxItems: 16 })),
+});
+const MediaEvent = Type.Object({ kind: Type.Literal("media"), media: AttachV1MediaDescriptorSchema });
+/** The ingress identity is the immutable creator; it is intentionally absent from this event. */
+const CozyAppUpsertEvent = Type.Object({ kind: Type.Literal("cozyapp_upsert"), appId: Id, name: Type.String({ minLength: 1, maxLength: 120 }), tree: CozyAppTreeSchema }, { additionalProperties: false });
+/** Terminal proof from the plugin that a distinct app action command ran. */
+const CozyAppActionStatusEvent = Type.Object({ kind: Type.Literal("cozyapp_action_status"), appId: Id, actionId: Id, actionRequestId: Id, status: Type.Union([Type.Literal("completed"), Type.Literal("failed")]) }, { additionalProperties: false });
+/** Capability row 67. The creator publishes the small versioned envelope for its own app. The
+ * gateway validates the document's structure and bounds and never interprets it. `data` is the
+ * source-attributed snapshot, and this is the only path that writes one. */
+const CozyAppDashboardUpsertEvent = Type.Object({
+  kind: Type.Literal("cozyapp_dashboard_upsert"), appId: Id,
+  documentVersion: Type.Integer({ minimum: 1 }), document: CozyAppDocumentSchema,
+  data: Type.Optional(CozyAppDataSchema),
+}, { additionalProperties: false });
+/** The richer receipt beside `cozyapp_action_status`: the same terminal proof, plus the peer's own
+ * `running` and the source-attributed snapshot it read. HTTP acceptance and model output are
+ * never a completed action, which is why only this event and its v1 sibling can settle one. */
+const CozyAppActionReceiptEvent = Type.Object({
+  kind: Type.Literal("cozyapp_action_receipt"), appId: Id, actionId: Id, actionRequestId: Id,
+  status: Type.Union([Type.Literal("running"), Type.Literal("completed"), Type.Literal("failed")]),
+  data: Type.Optional(CozyAppDataSchema),
+}, { additionalProperties: false });
+const PresenceEvent = Type.Object({
+  kind: Type.Literal("presence"), state: Type.Union([Type.Literal("online"), Type.Literal("degraded"), Type.Literal("absent")]),
+});
+/** Positive proof that the plugin switched this gateway-owned lane to the exact profile-local
+ * Hermes resume target. No title, transcript, tool data, or host path crosses this receipt. */
+const DesktopSessionResumedEvent = Type.Object({
+  kind: Type.Literal("desktop_session_resumed"), threadId: Id, hermesSessionId: Id, resumeId: Id,
+});
+const HermesInteractiveSessionSource = Type.Union([
+  Type.Literal("desktop"), Type.Literal("tui"), Type.Literal("cli"),
+]);
+/** One rendered SessionDB row observed after an explicitly linked desktop-capable session. The
+ * original TUI selection and current raw id are separate because compaction can resolve one raw
+ * id onto another. The gateway never treats either id as its native chat identity. */
+const DesktopSessionMessageEvent = Type.Union([
+  Type.Object({
+    kind: Type.Literal("desktop_session_message"), threadId: Id, hermesSessionId: Id,
+    source: Type.Literal("cozygateway"), rowId: Id,
+    role: Type.Union([Type.Literal("user"), Type.Literal("assistant")]),
+    text: Type.String({ minLength: 1, maxLength: 32_000 }), at: Type.Integer({ minimum: 0 }),
+  }, { additionalProperties: false }),
+  Type.Object({
+    kind: Type.Literal("desktop_session_message"), threadId: Id, hermesSessionId: Id,
+    desktopSessionId: Id, source: HermesInteractiveSessionSource, rowId: Id,
+    role: Type.Union([Type.Literal("user"), Type.Literal("assistant")]),
+    text: Type.String({ minLength: 1, maxLength: 32_000 }), at: Type.Integer({ minimum: 0 }),
+  }, { additionalProperties: false }),
+]);
+export const AttachV1MemoryResultSchema = Type.Object({
+  kind: Type.Literal("memory_result"), requestId: Id,
+  status: Type.Union([Type.Literal("ok"), Type.Literal("conflict"), Type.Literal("not_found"), Type.Literal("invalid_request"), Type.Literal("unavailable")]),
+  result: Type.Optional(Type.Union([BotMemoryOverviewResponseSchema, BotMemoryItemsResponseSchema, BotMemoryGraphResponseSchema, BotMemoryItemSchema, BotMemoryWriteResponseSchema, BotMemoryDeleteResponseSchema])),
+  message: Type.Optional(Type.String({ maxLength: 512 })), current: Type.Optional(BotMemoryItemSchema),
+}, { additionalProperties: false });
+export type AttachV1MemoryResult = Static<typeof AttachV1MemoryResultSchema>;
+/** The bot-config lane's reply. The four statuses are the four different things an operator has to
+ * do about a failure: nothing (`ok`), fix the id (`not_found`), fix the input (`invalid_request`),
+ * or go and look at the peer (`unavailable`). Collapsing them into one is what made every memory
+ * failure read the same, and this lane is not repeating it. */
+export const AttachV1ConfigResultSchema = Type.Object({
+  kind: Type.Literal("config_result"), requestId: Id,
+  status: Type.Union([Type.Literal("ok"), Type.Literal("not_found"), Type.Literal("invalid_request"), Type.Literal("unavailable")]),
+  result: Type.Optional(Type.Union([
+    BotProfileSchema, BotProfileConfigureResponseSchema, BotModelConfigSchema,
+    BotRoutineListResponseSchema, BotRoutineWriteResponseSchema, AttachV1ConfigAckSchema,
+    ChatProjectListSchema, ChatBranchListSchema, AttachV1ChatConfigurationReadResultSchema,
+    AttachV1ChatConfigurationPrepareResultSchema,
+    ModelProviderConnectionCatalogSchema,
+    ProviderConnectionTransferResultSchema,
+  ])),
+  message: Type.Optional(Type.String({ maxLength: 512 })),
+}, { additionalProperties: false });
+export type AttachV1ConfigResult = Static<typeof AttachV1ConfigResultSchema>;
+/** The bot-history lane's reply. Five statuses, one more than the config lane, because keeping an
+ * experiment has a fifth answer that is neither success nor failure: `conflict` means the work is
+ * intact and a PERSON has to choose per file. It carries its `BotHistoryTryKeepResponse` body
+ * exactly as an `ok` would, because that body IS the question being asked, and collapsing it into
+ * `unavailable` would tell someone their experiment broke when nothing broke at all. */
+export const AttachV1HistoryResultSchema = Type.Object({
+  kind: Type.Literal("history_result"), requestId: Id,
+  status: Type.Union([
+    Type.Literal("ok"), Type.Literal("conflict"), Type.Literal("not_found"),
+    Type.Literal("invalid_request"), Type.Literal("unavailable"),
+  ]),
+  result: Type.Optional(Type.Union([
+    BotHistoryListResponseSchema, BotHistoryDiffResponseSchema, BotHistoryRestoreResponseSchema,
+    BotHistoryTryStartResponseSchema, BotHistoryTryKeepResponseSchema,
+    BotHistoryTryDiscardResponseSchema, BotHistoryResolveResponseSchema,
+  ])),
+  message: Type.Optional(Type.String({ maxLength: 512 })),
+}, { additionalProperties: false });
+export type AttachV1HistoryResult = Static<typeof AttachV1HistoryResultSchema>;
+const AttachV1MobileStatusRequestSchema = Type.Object({
+  kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("device.status"),
+  threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
+}, { additionalProperties: false });
+const AttachV1MobileLocationRequestSchema = Type.Object({
+  kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("location.current"),
+  threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema,
+}, { additionalProperties: false });
+const AttachV1MobileCameraRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("camera.capture"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, camera: Type.Union([Type.Literal("front"), Type.Literal("rear")]), capture: Type.Union([Type.Literal("photo"), Type.Literal("video")]), videoDurationSeconds: Type.Literal(10) }, { additionalProperties: false });
+const AttachV1MobileFileRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("file.pick"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, selection: Type.Union([Type.Literal("photo"), Type.Literal("file")]) }, { additionalProperties: false });
+const AttachV1MobileNotificationRequestSchema = Type.Object({ kind: Type.Literal("mobile_request"), requestId: Id, command: Type.Literal("notification.present"), threadId: Id, turnId: Id, expiresAt: Type.Integer({ minimum: 0 }), purpose: MobileNodePurposeSchema, title: Type.String({ minLength: 1, maxLength: 80 }), body: Type.String({ minLength: 1, maxLength: 240 }) }, { additionalProperties: false });
+export const AttachV1MobileRequestSchema = Type.Union([AttachV1MobileStatusRequestSchema, AttachV1MobileLocationRequestSchema, AttachV1MobileCameraRequestSchema, AttachV1MobileFileRequestSchema, AttachV1MobileNotificationRequestSchema]);
+export type AttachV1MobileRequest = Static<typeof AttachV1MobileRequestSchema>;
+/** Capability 70 adds NO FIELD HERE. Which of a person's phones rings is the person's choice,
+ *  recorded on their gateway and read at admission; no peer names a target device, so none of the
+ *  five request shapes above carries one and none ever will. A frame that includes `targetDeviceId`
+ *  anyway is refused by the closed key set like any other unknown key, with the ingress's ordinary
+ *  refusal naming the field, which is the same answer a peer gets for any other contract skew.
+ *  There is deliberately no sanitizer and no tolerated spelling: a routing rule that can be checked
+ *  by reading the schema is worth more than one that has to be traced through a stripper. */
+
+/** Capability 70. Is this frame a `mobile_request` naming a device, and which request is it?
+ *
+ *  `targetDeviceId` was REMOVED from the five request shapes above, so the closed key set would
+ *  ordinarily refuse a frame carrying one by naming the field and closing the socket, the way every
+ *  other contract skew is refused. That is the wrong trade HERE. A stale peer that still sends the
+ *  field is otherwise healthy and may be holding a live conversation, queued turns and other
+ *  requests; dropping its connection over one field this gateway removed costs a person all of
+ *  that, while refusing the one request costs them only the request that was never going to be
+ *  honoured anyway. Durability of the connection wins over strictness of the key set.
+ *
+ *  Returns the request id to refuse, or `undefined` when this is not that case. A frame with no
+ *  usable request id is NOT claimed: there is nothing to answer per request, so it takes the
+ *  ordinary path and is refused as a malformed frame. */
+export function mobileRequestRefusal(
+  frame: unknown,
+): { requestId: string; field: "targetDeviceId" } | undefined {
+  if (typeof frame !== "object" || frame === null) return undefined;
+  const record = frame as Record<string, unknown>;
+  if (record["kind"] !== "mobile_request" || !("targetDeviceId" in record)) return undefined;
+  const requestId = record["requestId"];
+  if (typeof requestId !== "string" || requestId.length < 1 || requestId.length > 256) return undefined;
+  return { requestId, field: "targetDeviceId" };
+}
+
+export const AttachV1MobileCancelSchema = Type.Object({ kind: Type.Literal("mobile_cancel"), requestId: Id }, { additionalProperties: false });
+export type AttachV1MobileCancel = Static<typeof AttachV1MobileCancelSchema>;
+export const AttachV1MobileFailureStageSchema = Type.Union([
+  Type.Literal("policy"), Type.Literal("routing"), Type.Literal("dispatch"),
+  Type.Literal("response"), Type.Literal("media"), Type.Literal("receipt"),
+  Type.Literal("lifecycle"),
+]);
+export const AttachV1MobileFailureReasonSchema = Type.Union([
+  Type.Literal("no_selected_device"), Type.Literal("command_not_advertised"),
+  Type.Literal("selected_socket_unavailable"), Type.Literal("frame_send_failed"),
+  Type.Literal("phone_disconnected_pending"), Type.Literal("invalid_phone_payload"),
+  Type.Literal("lease_mismatch"), Type.Literal("cross_device_result"),
+  Type.Literal("receipt_persistence_failed"), Type.Literal("broker_closed_pending"),
+  Type.Literal("malformed_request_frame"), Type.Literal("request_expired_unanswered"),
+  Type.Literal("request_policy_rejected"), Type.Literal("selected_app_not_foreground"),
+  Type.Literal("media_validation_failed"), Type.Literal("media_storage_failed"),
+]);
+const AttachV1MobileTerminalStatusSchema = Type.Union([
+  Type.Literal("denied"), Type.Literal("expired"), Type.Literal("cancelled"),
+  Type.Literal("device_unavailable"), Type.Literal("foreground_required"), Type.Literal("policy_blocked"),
+]);
+export const AttachV1MobileResultSchema = Type.Union([
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: MobileNodeGatewayStatusResultSchema }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: Type.Object({ latitude: Type.Number({ minimum: -90, maximum: 90 }), longitude: Type.Number({ minimum: -180, maximum: 180 }) }, { additionalProperties: false }) }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: MobileNodeMediaDescriptorSchema }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: Type.Literal("ok"), result: Type.Object({ action: Type.Union([Type.Literal("approve"), Type.Literal("snooze"), Type.Literal("open"), Type.Literal("cancel")]) }, { additionalProperties: false }) }, { additionalProperties: false }),
+  Type.Object({ kind: Type.Literal("mobile_result"), requestId: Id, status: AttachV1MobileTerminalStatusSchema }, { additionalProperties: false }),
+  Type.Object({
+    kind: Type.Literal("mobile_result"), requestId: Id, status: AttachV1MobileTerminalStatusSchema,
+    stage: AttachV1MobileFailureStageSchema, reason: AttachV1MobileFailureReasonSchema,
+  }, { additionalProperties: false }),
+]);
+export type AttachV1MobileResult = Static<typeof AttachV1MobileResultSchema>;
+export type AttachV1MobileResultInput =
+  | { requestId: string; status: "ok"; result: MobileNodeGatewayStatusResult }
+  | { requestId: string; status: "ok"; result: { latitude: number; longitude: number } }
+  | { requestId: string; status: "ok"; result: { mediaId: string; mimeType: string; byteCount: number; sha256: string; filename: string; family: "image" | "audio" | "video" | "file" } }
+  | { requestId: string; status: "ok"; result: { action: "approve" | "snooze" | "open" | "cancel" } }
+  | ({ requestId: string; status: "denied" | "expired" | "cancelled" | "device_unavailable" | "foreground_required" | "policy_blocked" }
+    & Partial<{ stage: Static<typeof AttachV1MobileFailureStageSchema>; reason: Static<typeof AttachV1MobileFailureReasonSchema> }>);
+
+/** This union was deliberately closed to reasoning ("no thinking/reasoning/chain-of-thought
+ * event exists"). Capability `thinking` consciously reopens it, bounded: `ThinkingEvent` is a
+ * sanitized, latest-only, schema-capped 280-char preview -- not the chain of thought, not a
+ * transcript, and raw reasoning still never crosses this wire. */
+export const AttachV1EventSchema = Type.Union([
+  DraftEvent, CommitEvent, FailedEvent, CancelledEvent, InterruptedEvent, ToolEvent, DelegationEvent,
+  ThinkingEvent,
+  ApprovalEvent, ClarifyEvent, ScheduledEvent, ScheduledCanonicalHomeEvent, MediaEvent, CozyAppUpsertEvent, CozyAppActionStatusEvent, CozyAppDashboardUpsertEvent, CozyAppActionReceiptEvent, PresenceEvent,
+  DesktopSessionResumedEvent, DesktopSessionMessageEvent,
+]);
+export type AttachV1Event = Static<typeof AttachV1EventSchema>;
+
+export const AttachV1EventFrameSchema = Type.Object({
+  kind: Type.Literal("event"), sequence: Type.Integer({ minimum: 1 }), eventId: Id,
+  event: AttachV1EventSchema,
+});
+export type AttachV1EventFrame = Static<typeof AttachV1EventFrameSchema>;
+
+export const AttachV1DiscardReasonSchema = Type.Union([
+  Type.Literal("capability_not_negotiated"),
+  Type.Literal("unauthorized_target"),
+]);
+export type AttachV1DiscardReason = Static<typeof AttachV1DiscardReasonSchema>;
+
+export const AttachV1AckSchema = Type.Object({
+  kind: Type.Literal("ack"), channel: Type.Union([Type.Literal("event"), Type.Literal("command")]),
+  sequence: Type.Integer({ minimum: 1 }), id: Id, duplicate: Type.Optional(Type.Boolean()),
+  discarded: Type.Optional(Type.Literal(true)), reason: Type.Optional(AttachV1DiscardReasonSchema),
+});
+export type AttachV1Ack = Static<typeof AttachV1AckSchema>;
+
+export const AttachV1HeartbeatSchema = Type.Object({
+  kind: Type.Literal("heartbeat"), sentAt: Type.Integer({ minimum: 0 }),
+  telemetry: Type.Optional(AttachV1TelemetrySchema),
+  /** Capability 78. Untyped here by design: optional malformed health must not make a healthy
+   * peer reconnect-loop. `sanitizeTurnHealth` reads it as one all-or-nothing declaration. */
+  turnHealth: Type.Optional(Type.Unknown()),
+}, { additionalProperties: false });
+export const AttachV1GapSchema = Type.Object({
+  kind: Type.Literal("gap"), channel: Type.Union([Type.Literal("event"), Type.Literal("command")]),
+  requestedAfter: Sequence, earliestAvailable: Type.Integer({ minimum: 1 }), latestAvailable: Sequence,
+});
+
+export const AttachV1HelloAckSchema = Type.Object({
+  kind: Type.Literal("hello_ack"), version: Type.Literal(2), agentId: Id,
+  capabilities: Type.Array(AttachV1CapabilitySchema),
+  resume: Type.Object({ eventSequence: Sequence, commandSequence: Sequence }),
+  limits: AttachV1LimitsSchema,
+  heartbeatIntervalMs: Type.Integer({ minimum: 1000 }),
+  /** Vendor extension capability versions, keyed by capability id (e.g. `com.cozylabs.bots`),
+   *  mapped to the non-negative integer version the gateway runs. Optional and additive: a peer
+   *  that does not recognize this field ignores it, per the attach-v1 forward-compatibility rule
+   *  for unknown members. Lets a peer decide, without a round trip, whether a capability it cares
+   *  about (e.g. bot room turns raising approvals) is present at the version it expects. */
+  extensions: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 0 }))),
+});
+
+/** Optional telemetry is validated by the snapshot lane, never by a socket-fatal payload schema. */
+export const AttachV1ObservationSnapshotSchema = Type.Object({
+  kind: Type.Literal("observation_snapshot"),
+  payload: Type.Optional(Type.Unknown()),
+}, { additionalProperties: false });
+
+/** Latest-only current prompt occupancy, deliberately outside the durable transcript spool.
+ * An absent report means unavailable; runtime lifetime token totals never travel on this lane. */
+export const AttachV1ChatContextFrameSchema = Type.Object({
+  kind: Type.Literal("chat_context"),
+  threadId: Id,
+  turnId: Id,
+  usedTokens: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+  windowTokens: Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+  measurement: Type.Union([Type.Literal("reported"), Type.Literal("estimated")]),
+  source: Type.Union([
+    Type.Literal("provider_usage"),
+    Type.Literal("provider_usage_plus_estimate"),
+    Type.Literal("local_estimate"),
+  ]),
+  model: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  effort: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+}, { additionalProperties: false });
+export type AttachV1ChatContextFrame = Static<typeof AttachV1ChatContextFrameSchema>;
+
+export const AttachV1ClientFrameSchema = Type.Union([
+  AttachV1ObservationSnapshotSchema,
+  AttachV1ChatContextFrameSchema,
+  AttachV1HelloSchema,
+  AttachV1EventFrameSchema,
+  AttachV1AckSchema,
+  AttachV1GapSchema,
+  AttachV1HeartbeatSchema,
+  AttachV1MobileRequestSchema,
+  AttachV1MobileCancelSchema,
+  AttachV1MemoryResultSchema,
+  AttachV1ConfigResultSchema,
+  AttachV1HistoryResultSchema,
+]);
+export type AttachV1ClientFrame = Static<typeof AttachV1ClientFrameSchema>;
+export const AttachV1ServerFrameSchema = Type.Union([AttachV1HelloAckSchema, AttachV1CommandFrameSchema, AttachV1AckSchema, AttachV1GapSchema, AttachV1HeartbeatSchema, AttachV1MobileResultSchema, AttachV1MemoryRequestSchema, AttachV1ConfigRequestSchema, AttachV1HistoryRequestSchema]);
+export type AttachV1ServerFrame = Static<typeof AttachV1ServerFrameSchema>;

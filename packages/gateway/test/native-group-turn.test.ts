@@ -1,0 +1,423 @@
+import { describe, expect, it } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { BotGroupStateFrame } from "cozygateway-contract";
+
+import { openStorage } from "../src/storage.ts";
+import { GroupRooms } from "../src/hermes-bridge/group-rooms.ts";
+
+describe("native group turns", () => {
+  it("uses a durable gateway thread and accepts the matching attach commit", async () => {
+    const storage = openStorage(":memory:");
+    let rooms: GroupRooms;
+    const commands: Array<{ agentId: string; threadId: string; turnId: string; messageId: string; text: string }> = [];
+    rooms = new GroupRooms({
+      storage,
+      now: () => Date.now(),
+      broadcast: () => undefined,
+      memberInfo: (name) => ({ name, handle: name, displayName: name }),
+      missingMembers: async () => [],
+      nativeTurns: {
+        canQueue: () => true,
+        sendNativeTurn: (agentId, command) => {
+          commands.push({ agentId, ...command });
+          setTimeout(() => rooms.handleAttachEvent(agentId, {
+            kind: "event", sequence: 1, eventId: `commit:${command.turnId}`,
+            event: { kind: "commit", threadId: command.threadId, turnId: command.turnId,
+              messageId: `reply:${command.turnId}`, blocks: [{ type: "paragraph", text: "I can take this." }] },
+          }), 0);
+          return true;
+        },
+      },
+      pollMs: 1,
+      turnTimeoutMs: 100,
+    });
+    await rooms.create("Launch", ["scout", "luna"]);
+    rooms.send("Launch", "Please decide @scout");
+    await rooms.settled("Launch");
+
+    expect(commands[0]?.threadId).toBe("group:launch:scout");
+    expect(storage.botGroupLog("launch").some((entry) => entry.text === "I can take this.")).toBe(true);
+    await rooms.close();
+    storage.close();
+  });
+
+  it("stamps every room message with the turn that made it and hands the peer typed actors", async () => {
+    const storage = openStorage(":memory:");
+    const commands: Array<{ agentId: string; threadId: string; turnId: string; context?: unknown }> = [];
+    let rooms: GroupRooms;
+    rooms = new GroupRooms({
+      storage,
+      now: () => Date.now(),
+      broadcast: () => undefined,
+      memberInfo: (name) => ({ name, handle: name, displayName: `${name[0]?.toUpperCase() ?? ""}${name.slice(1)}` }),
+      missingMembers: async () => [],
+      nativeTurns: {
+        canQueue: () => true,
+        sendNativeTurn: (agentId, command) => {
+          commands.push({ agentId, threadId: command.threadId, turnId: command.turnId, context: command.context });
+          queueMicrotask(() => rooms.handleAttachEvent(agentId, {
+            kind: "event", sequence: commands.length, eventId: `commit:${command.turnId}`,
+            event: {
+              kind: "commit", threadId: command.threadId, turnId: command.turnId,
+              messageId: `reply:${command.turnId}`,
+              blocks: [{ type: "paragraph", text: `${agentId} is on it.` }],
+            },
+          }));
+          return true;
+        },
+      },
+      pollMs: 1, turnTimeoutMs: 100, chainDelayMs: 0,
+    });
+
+    await rooms.create("Launch", ["scout", "luna"]);
+    const sent = rooms.send("Launch", "Who can take this @everyone?");
+    await rooms.settled("Launch");
+
+    const log = storage.botGroupLog("launch");
+    const user = log[0]!;
+    const scout = log.find((entry) => entry.name === "scout")!;
+    const luna = log.find((entry) => entry.name === "luna")!;
+    // The user message is the cause of the first member turn, by seq rather than by adjacency.
+    expect(user.seq).toBe(sent.seq);
+    expect(scout.cause).toEqual({ kind: "user", seq: user.seq });
+    // The second member answered a room that already contained the first reply, and says so.
+    expect(luna.cause).toEqual({ kind: "member", seq: scout.seq });
+    // Each reply names the durable turn row that produced it, and the attach identity that carried it.
+    const scoutTurn = storage.botGroupTurn("launch", scout.turnId!)!;
+    expect(scoutTurn.member).toBe("scout");
+    expect(scoutTurn.cause).toEqual({ kind: "user", seq: user.seq });
+    expect(scout.attachTurn).toEqual({ threadId: "group:launch:scout", turnId: scout.turnId });
+    expect(commands[0]).toMatchObject({ agentId: "scout", turnId: scout.turnId });
+    // Every row is identifiable on its own, and belongs to the epoch the user send opened.
+    expect(new Set(log.map((entry) => entry.messageId)).size).toBe(log.length);
+    expect(log.every((entry) => entry.epoch === 1)).toBe(true);
+
+    // The peer receives both members as typed actors plus the human, and the prompt text is
+    // unchanged: `context` is decoration a peer may ignore entirely.
+    expect(commands[0]?.context).toEqual({
+      room: { key: "launch", name: "Launch", epoch: 1, seq: user.seq },
+      actors: [
+        { name: "scout", handle: "scout", displayName: "Scout", kind: "member" },
+        { name: "luna", handle: "luna", displayName: "Luna", kind: "member" },
+        { name: "You", handle: "user", displayName: "You", kind: "user" },
+      ],
+      cause: { kind: "user", seq: user.seq },
+    });
+    await rooms.close();
+    storage.close();
+  });
+
+  it("keeps deleted-turn ownership as a tombstone, so a late replay is acknowledged", async () => {
+    const storage = openStorage(":memory:");
+    let command: { agentId: string; threadId: string; turnId: string; messageId: string } | undefined;
+    const rooms = new GroupRooms({
+      storage, now: () => Date.now(), broadcast: () => undefined,
+      memberInfo: (name) => ({ name, handle: name, displayName: name }), missingMembers: async () => [],
+      nativeTurns: { canQueue: () => true, sendNativeTurn: (agentId, turn) => { command = { agentId, ...turn }; return true; } },
+      pollMs: 1, turnTimeoutMs: 100, chainDelayMs: 0,
+    });
+    await rooms.create("Launch", ["scout", "luna"]);
+    rooms.send("Launch", "@scout please answer");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    rooms.remove("Launch");
+    expect(command).toBeDefined();
+    const late = command!;
+    expect(rooms.handleAttachEvent(late.agentId, {
+      kind: "event", sequence: 1, eventId: "late", event: {
+        kind: "commit", threadId: late.threadId, turnId: late.turnId, messageId: "late-message",
+        blocks: [{ type: "paragraph", text: "too late" }],
+      },
+    })).toBe(true);
+    await rooms.close();
+    storage.close();
+  });
+
+  it("runs each addressed member over attach, persists their replies, and omits passes", async () => {
+    const storage = openStorage(":memory:");
+    let rooms: GroupRooms;
+    const commands: Array<{ agentId: string; threadId: string; turnId: string; text: string }> = [];
+    rooms = new GroupRooms({
+      storage,
+      now: () => Date.now(),
+      broadcast: () => undefined,
+      memberInfo: (name) => ({ name, handle: name, displayName: name }),
+      missingMembers: async () => [],
+      nativeTurns: {
+        canQueue: () => true,
+        sendNativeTurn: (agentId, command) => {
+          commands.push({ agentId, ...command });
+          const text = agentId === "scout" ? "CI is green." : "(pass)";
+          queueMicrotask(() => rooms.handleAttachEvent(agentId, {
+            kind: "event",
+            sequence: commands.length,
+            eventId: `commit:${command.turnId}`,
+            event: {
+              kind: "commit",
+              threadId: command.threadId,
+              turnId: command.turnId,
+              messageId: `reply:${command.turnId}`,
+              blocks: [{ type: "paragraph", text }],
+            },
+          }));
+          return true;
+        },
+      },
+      pollMs: 1,
+      turnTimeoutMs: 100,
+      chainDelayMs: 0,
+    });
+
+    await rooms.create("Release", ["scout", "luna"]);
+    rooms.send("Release", "Please check @scout and @luna");
+    await rooms.settled("Release");
+
+    expect(commands.map((command) => command.agentId)).toEqual(["scout", "luna"]);
+    expect(commands.map((command) => command.threadId)).toEqual(["group:release:scout", "group:release:luna"]);
+    expect(storage.botGroupLog("release").map((entry) => [entry.name, entry.text])).toEqual([
+      ["You", "Please check @scout and @luna"],
+      ["scout", "CI is green."],
+    ]);
+    await rooms.close();
+    storage.close();
+  });
+
+  it("queues a send made during a member turn behind the live drive and settles once (row 84)", async () => {
+    const storage = openStorage(":memory:");
+    const states: BotGroupStateFrame[] = [];
+    const commands: Array<{
+      agentId: string;
+      threadId: string;
+      turnId: string;
+      complete: (text: string) => void;
+    }> = [];
+    let rooms: GroupRooms;
+    rooms = new GroupRooms({
+      storage,
+      now: () => Date.now(),
+      broadcast: (frame) => { if (frame.type === "bot_group_state") states.push(frame); },
+      memberInfo: (name) => ({ name, handle: name, displayName: name }),
+      missingMembers: async () => [],
+      nativeTurns: {
+        canQueue: () => true,
+        sendNativeTurn: (agentId, command) => {
+          commands.push({
+            agentId,
+            threadId: command.threadId,
+            turnId: command.turnId,
+            complete: (text) => {
+              rooms.handleAttachEvent(agentId, {
+                kind: "event",
+                sequence: commands.length,
+                eventId: `commit:${command.turnId}`,
+                event: {
+                  kind: "commit",
+                  threadId: command.threadId,
+                  turnId: command.turnId,
+                  messageId: `reply:${command.turnId}`,
+                  blocks: [{ type: "paragraph", text }],
+                },
+              });
+            },
+          });
+          return true;
+        },
+      },
+      pollMs: 1,
+      turnTimeoutMs: 100,
+      chainDelayMs: 0,
+    });
+
+    await rooms.create("Release", ["scout", "luna"]);
+    rooms.send("Release", "Investigate first @scout");
+    expect(commands.map((command) => command.agentId)).toEqual(["scout"]);
+
+    rooms.send("Release", "This queues behind it @luna");
+    expect(commands.map((command) => command.agentId)).toEqual(["scout"]);
+    commands[0]!.complete("The first turn still completed.");
+
+    await expect.poll(() => commands.map((command) => command.agentId)).toEqual(["scout", "luna"]);
+    commands[1]!.complete("(pass)");
+    await rooms.settled("Release");
+
+    expect(storage.botGroupLog("release").map((entry) => entry.text)).toEqual([
+      "Investigate first @scout",
+      "This queues behind it @luna",
+      "The first turn still completed.",
+    ]);
+    // One drive, one epoch, one settlement: the queued thread ran after the first, not instead of it.
+    expect(states.filter((frame) => frame.state !== "running")).toHaveLength(1);
+    expect(states.at(-1)).toMatchObject({ group: "Release", state: "settled", epoch: 1 });
+    await rooms.close();
+    storage.close();
+  });
+
+  it("interrupts a timed-out member turn and ignores its late terminal (#325)", async () => {
+    const storage = openStorage(":memory:");
+    const states: BotGroupStateFrame[] = [];
+    const sent: Array<{ agentId: string; threadId: string; turnId: string }> = [];
+    const interrupts: Array<{ agentId: string; threadId: string; turnId: string }> = [];
+    const rooms = new GroupRooms({
+      storage, now: () => Date.now(),
+      broadcast: (frame) => { if (frame.type === "bot_group_state") states.push(frame); },
+      memberInfo: (name) => ({ name, handle: name, displayName: name }), missingMembers: async () => [],
+      nativeTurns: {
+        canQueue: () => true,
+        // The member never answers in time.
+        sendNativeTurn: (agentId, turn) => { sent.push({ agentId, threadId: turn.threadId, turnId: turn.turnId }); return true; },
+        sendInterrupt: (agentId, input) => { interrupts.push({ agentId, ...input }); return true; },
+      },
+      pollMs: 1, turnTimeoutMs: 20, chainDelayMs: 0,
+    });
+    await rooms.create("Launch", ["scout", "luna"]);
+    rooms.send("Launch", "@scout please answer");
+    await rooms.settled("Launch");
+
+    expect(sent).toHaveLength(1);
+    const turn = sent[0]!;
+    // The peer is told to stop, the same way `stop()` tells it.
+    expect(interrupts).toEqual([turn]);
+    const row = storage.botGroupTurn("launch", turn.turnId)!;
+    expect(row.state).toBe("timeout");
+    expect(row.consumedAt).toBeDefined();
+
+    const stateCount = states.length;
+    // What the peer sends back after the interrupt, and a commit that raced it.
+    expect(rooms.handleAttachEvent(turn.agentId, {
+      kind: "event", sequence: 1, eventId: "late-interrupted", event: {
+        kind: "interrupted", threadId: turn.threadId, turnId: turn.turnId, messageId: "late-stop",
+      },
+    })).toBe(true);
+    expect(rooms.handleAttachEvent(turn.agentId, {
+      kind: "event", sequence: 2, eventId: "late", event: {
+        kind: "commit", threadId: turn.threadId, turnId: turn.turnId, messageId: "late-message",
+        blocks: [{ type: "paragraph", text: "too late" }],
+      },
+    })).toBe(true);
+    // The sealed round is not re-driven and the late text never reaches the room.
+    expect(rooms.running("Launch")).toBe(false);
+    await rooms.settled("Launch");
+    expect(states.length).toBe(stateCount);
+    expect(storage.botGroupLog("launch").map((entry) => entry.text)).toEqual(["@scout please answer"]);
+    await rooms.close();
+    storage.close();
+  });
+
+  it("does not re-drive from a legacy unconsumed timeout row on a late terminal (#325)", async () => {
+    const storage = openStorage(":memory:");
+    const sent: string[] = [];
+    const rooms = new GroupRooms({
+      storage, now: () => Date.now(), broadcast: () => undefined,
+      memberInfo: (name) => ({ name, handle: name, displayName: name }), missingMembers: async () => [],
+      nativeTurns: { canQueue: () => true, sendNativeTurn: (_agentId, turn) => { sent.push(turn.turnId); return true; } },
+      pollMs: 1, turnTimeoutMs: 100, chainDelayMs: 0,
+    });
+    await rooms.create("Launch", ["scout", "luna"]);
+    // A row the pre-fix code timed out: state 'timeout', consumed_at still NULL.
+    const threadId = storage.ensureBotGroupThread("launch", "scout");
+    storage.beginBotGroupTurn({ key: "launch", turnId: "old-turn", member: "scout", agentId: "scout", threadId,
+      messageId: "old-message", epoch: storage.botGroup("launch")!.epoch, watermark: 0, createdAt: Date.now() });
+    storage.timeoutBotGroupTurn("launch", "old-turn", "no reply within 180s", Date.now());
+    const legacy = storage.botGroupTurn("launch", "old-turn")!;
+    expect(legacy.state).toBe("timeout");
+    expect(legacy.consumedAt).toBeUndefined();
+
+    expect(rooms.handleAttachEvent("scout", {
+      kind: "event", sequence: 1, eventId: "late", event: {
+        kind: "commit", threadId, turnId: "old-turn", messageId: "late-message",
+        blocks: [{ type: "paragraph", text: "too late" }],
+      },
+    })).toBe(true);
+    expect(rooms.running("Launch")).toBe(false);
+    await rooms.settled("Launch");
+    expect(sent).toEqual([]);
+    expect(storage.botGroupLog("launch")).toEqual([]);
+    await rooms.close();
+    storage.close();
+  });
+
+  it("shows an attach member failure as a note, fabricates no reply, and still settles", async () => {
+    const storage = openStorage(":memory:");
+    const states: BotGroupStateFrame[] = [];
+    let rooms: GroupRooms;
+    rooms = new GroupRooms({
+      storage,
+      now: () => Date.now(),
+      broadcast: (frame) => { if (frame.type === "bot_group_state") states.push(frame); },
+      memberInfo: (name) => ({ name, handle: name, displayName: name }),
+      missingMembers: async () => [],
+      nativeTurns: {
+        canQueue: () => true,
+        sendNativeTurn: (agentId, command) => {
+          queueMicrotask(() => rooms.handleAttachEvent(agentId, {
+            kind: "event",
+            sequence: 1,
+            eventId: `failed:${command.turnId}`,
+            event: {
+              kind: "failed",
+              threadId: command.threadId,
+              turnId: command.turnId,
+              messageId: `reply:${command.turnId}`,
+              message: "provider crashed",
+            },
+          }));
+          return true;
+        },
+      },
+      pollMs: 1,
+      turnTimeoutMs: 100,
+      chainDelayMs: 0,
+    });
+
+    await rooms.create("Release", ["scout", "luna"]);
+    rooms.send("Release", "Status please @scout");
+    await rooms.settled("Release");
+
+    expect(storage.botGroupLog("release").map((entry) => entry.text)).toEqual(["Status please @scout"]);
+    expect(states).toContainEqual(expect.objectContaining({
+      type: "bot_group_state",
+      group: "Release",
+      state: "running",
+      // Capability 47: the note names the member turn that failed, so the incident is traceable
+      // back to the command that caused it.
+      note: { member: "scout", reason: "failed", detail: "provider crashed", turnId: expect.any(String) },
+    }));
+    expect(states.at(-1)).toMatchObject({ group: "Release", state: "settled" });
+    await rooms.close();
+    storage.close();
+  });
+
+  it("keeps the gateway-local room transcript across a restart", async () => {
+    const path = join(mkdtempSync(join(tmpdir(), "native-group-restart-")), "gateway.sqlite");
+    let storage = openStorage(path);
+    let rooms: GroupRooms;
+    rooms = new GroupRooms({
+      storage, now: () => Date.now(), broadcast: () => undefined,
+      memberInfo: (name) => ({ name, handle: name, displayName: name }), missingMembers: async () => [],
+      nativeTurns: {
+        canQueue: () => true,
+        sendNativeTurn: (agentId, command) => {
+          queueMicrotask(() => rooms.handleAttachEvent(agentId, {
+            kind: "event", sequence: 1, eventId: "commit", event: {
+              kind: "commit", threadId: command.threadId, turnId: command.turnId,
+              messageId: "reply", blocks: [{ type: "paragraph", text: "Ready." }],
+            },
+          }));
+          return true;
+        },
+      },
+      pollMs: 1, turnTimeoutMs: 100, chainDelayMs: 0,
+    });
+    await rooms.create("Launch", ["sage", "pixel"]);
+    rooms.send("Launch", "Are we ready @sage?");
+    await rooms.settled("Launch");
+    await rooms.close();
+    storage.close();
+
+    storage = openStorage(path);
+    expect(storage.botGroup("launch")?.members).toEqual(["sage", "pixel"]);
+    expect(storage.botGroupLog("launch").map((entry) => entry.text)).toEqual(["Are we ready @sage?", "Ready."]);
+    storage.close();
+  });
+});

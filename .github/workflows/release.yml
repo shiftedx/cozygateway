@@ -1,0 +1,70 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+  attestations: write
+  id-token: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with: { node-version: 26, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm test:installer
+      - name: verify release version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test "$version" = "$(node -p "require('./packages/gateway/package.json').version")"
+          test "$version" = "$(sed -n 's/^version: //p' integrations/attach-plugin/plugin.yaml)"
+      - run: pnpm bundle
+      - name: attest release artifacts
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: dist-bundle/*
+      - name: smoke the bundle
+        run: |
+          cat > /tmp/smoke.json <<'EOF'
+          { "name": "smoke", "port": 18787, "host": "127.0.0.1",
+            "dbPath": "/tmp/smoke.db",
+            "hermesEndpoints": [{
+              "id": "default",
+              "url": "ws://127.0.0.1:19999/api/ws",
+              "tokenEnv": "SMOKE_HERMES_TOKEN",
+              "profiles": { "default": { "tokenEnv": "SMOKE_ATTACH_TOKEN" } }
+            }] }
+          EOF
+          SMOKE_HERMES_TOKEN=smoke SMOKE_ATTACH_TOKEN=smoke node dist-bundle/cozygateway.mjs serve --config /tmp/smoke.json &
+          ok=
+          attempt=1
+          while [ "$attempt" -le 15 ]; do
+            curl -fsS http://127.0.0.1:18787/health | grep -q '"contract":"v1"' && ok=1 && break
+            sleep 1
+            attempt=$((attempt + 1))
+          done
+          kill %1
+          [ "${ok:-}" = 1 ]
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+        with:
+          files: |
+            dist-bundle/THIRD_PARTY_NOTICES.txt
+            dist-bundle/cozygateway.mjs
+            dist-bundle/cozygateway.mjs.sha256
+            dist-bundle/cozygateway-hermes-attach-plugin.tar.gz
+            dist-bundle/cozygateway-hermes-attach-plugin.tar.gz.sha256
+            dist-bundle/cozygateway-installer.sh
+            dist-bundle/cozygateway-installer.sh.sha256
+            dist-bundle/gateway-supervisor.cjs
+            dist-bundle/gateway-supervisor.cjs.sha256
+            dist-bundle/install.ps1
+            dist-bundle/install.ps1.sha256
+            dist-bundle/install.sh
+            dist-bundle/install.sh.sha256
+          generate_release_notes: true

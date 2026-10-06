@@ -1,0 +1,78 @@
+{
+  "capability": {
+    "id": "com.cozylabs.bots",
+    "minimumVersion": 63
+  },
+  "note": "Capability 63, contract/ext-bots-v1.md row 63. The per-server MCP repair policy is READ-ONLY metadata: the harness owns the setting, the gateway relays it on the capability-48 bot_config profile.read, and no request shape carries it. An absent wire field is unprojected or unknown, and the gateway leaves it absent. A known CozyAgents peer may project its effective approve_once default after negotiating 63; approve_once still requires approval.",
+  "profileRead": {
+    "name": "sage",
+    "description": "",
+    "soul": "# Sage",
+    "skills": [],
+    "toolsets": [],
+    "toolsetsPinned": false,
+    "mcpServers": [
+      {
+        "name": "github",
+        "installed": true,
+        "enabled": true,
+        "repair": "approve_once"
+      },
+      {
+        "name": "linear",
+        "installed": true,
+        "enabled": true,
+        "repair": "auto_refresh"
+      },
+      {
+        "name": "notion",
+        "installed": true,
+        "enabled": false
+      }
+    ],
+    "model": {
+      "provider": "anthropic",
+      "default": "claude-sonnet"
+    },
+    "runtimeInert": []
+  },
+  "refused": [
+    {
+      "name": "github",
+      "installed": true,
+      "enabled": true,
+      "repair": "auto_reconnect"
+    },
+    {
+      "name": "github",
+      "installed": true,
+      "enabled": true,
+      "repair": "Approve_Once"
+    },
+    {
+      "name": "github",
+      "installed": true,
+      "enabled": true,
+      "repair": ""
+    },
+    {
+      "name": "github",
+      "installed": true,
+      "enabled": true,
+      "repair": null
+    }
+  ],
+  "patch": {
+    "accepted": {
+      "enabledMcpServers": ["github", "linear"]
+    },
+    "refused": {
+      "enabledMcpServers": [
+        {
+          "name": "github",
+          "repair": "auto_refresh"
+        }
+      ]
+    }
+  }
+}

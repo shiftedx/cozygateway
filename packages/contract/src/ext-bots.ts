@@ -1,0 +1,4009 @@
+/** Vendor extension `com.cozylabs.bots`. NOT part of the frozen `contract: "v1"`
+ *  core surface: it is advertised through `GatewayInfo.capabilities` (see resources.ts) and
+ *  documented in contract/ext-bots-v1.md, versioned independently. A gateway that does not
+ *  advertise the capability never emits these frames, and a client that does not recognize the
+ *  capability ignores them, exactly as the forward-compatibility rule for unknown server frames
+ *  requires.
+ *
+ *  The current version and its whole history live on `BOTS_CAPABILITY_VERSION` at the foot of this
+ *  file, and nowhere else. Naming a number up here is how this comment came to claim "version 6"
+ *  through three bumps.
+ *
+ *  Profile, catalog, and routine resources mirror Hermes control-plane data. Configured
+ *  Bot Mode chats, their sessions, messages, attachments, and turn state are gateway-owned
+ *  attach-v1 projections. Every timestamp on this wire is milliseconds. */
+import { type Static, Type } from "@sinclair/typebox";
+import { TaskWaitingOnSchema } from "./tasks.ts";
+
+import { AttachmentBlockSchema } from "./rich-blocks.ts";
+import { ApprovalOutcomeSchema, GatewayInfoSchema } from "./resources.ts";
+import {
+  ModelProviderFieldUpdateSchema,
+  ModelProviderOAuthCodeSchema,
+  ModelProviderOAuthSessionSchema,
+  ModelProviderSetupFieldSchema,
+  ModelProviderSetupMethodSchema,
+  ModelProviderSetupSchema,
+  type ModelProviderFieldUpdate,
+  type ModelProviderOAuthCode,
+  type ModelProviderOAuthSession,
+  type ModelProviderSetupField,
+  type ModelProviderSetupMethod,
+} from "./model-provider-setup.ts";
+
+/** The roster preview line. `plain` is ordinary display text with no provenance claim; `empty`
+ *  means the bot has no conversation yet. Transcript text never proves a bot-to-bot sender. */
+export const BotPreviewSchema = Type.Object({
+  kind: Type.Union([Type.Literal("plain"), Type.Literal("empty")]),
+  text: Type.String(),
+});
+export type BotPreview = Static<typeof BotPreviewSchema>;
+
+/** CozyApps is gateway-wide in `GatewayInfo`, but execution is negotiated independently by each
+ * attached Hermes profile. This additive per-bot fact prevents an old plugin from making its
+ * bot look app-ready merely because another profile (or the gateway itself) supports CozyApps.
+ * `restart_profile` is a bounded repair instruction, not an opaque transport error: the installer
+ * syncs the plugin and the next Hermes launch renegotiates its capabilities. */
+export const BotCozyAppsReadinessSchema = Type.Object({
+  status: Type.Union([Type.Literal("ready"), Type.Literal("degraded")]),
+  reason: Type.Optional(Type.Literal("cozyapps_not_negotiated")),
+  repair: Type.Optional(Type.Literal("restart_profile")),
+}, { additionalProperties: false });
+export type BotCozyAppsReadiness = Static<typeof BotCozyAppsReadinessSchema>;
+
+/** Capability 88. A bot's place on a team. Absent means `member`: only a `leader` may assign work,
+ *  and only to a bot in its `reports`. Declared here, ahead of `BotSummarySchema`, so both it and
+ *  `BotProfile`/`BotProfilePatch` further down the file can reference it. */
+export const BotTeamRoleSchema = Type.Union([Type.Literal("leader"), Type.Literal("member")]);
+export type BotTeamRole = Static<typeof BotTeamRoleSchema>;
+
+/** One roster row. `meta` is the bot's `ui_meta["hermes-bots"]` blob verbatim (or null when the
+ *  profile carries none), kept open on purpose: the desktop plugin owns that namespace and may
+ *  add keys we do not model. */
+export const BotSummarySchema = Type.Object({
+  name: Type.String(),
+  displayName: Type.String(),
+  handle: Type.String(),
+  description: Type.Union([Type.String(), Type.Null()]),
+  hasAvatar: Type.Boolean(),
+  group: Type.Union([Type.String(), Type.Null()]),
+  pinned: Type.Boolean(),
+  active: Type.Boolean(),
+  lastActiveAt: Type.Union([Type.Integer(), Type.Null()]),
+  /** Capability 87. Milliseconds of the profile's freshest kanban or tool worker heartbeat
+   *  (`profiles.list` `worker_session.last_active`), or null when it has none. Absent on older
+   *  gateways. Upstream reads a stamp under 150 s old as "Active now". */
+  workerActiveAt: Type.Optional(Type.Union([Type.Integer(), Type.Null()])),
+  /** Capability 87. `workerActiveAt` read against the GATEWAY's clock when the row was built
+   *  (under 150 s), so a phone whose clock is skewed does not misread the heartbeat. */
+  workerActive: Type.Optional(Type.Boolean()),
+  chatSessionId: Type.Union([Type.String(), Type.Null()]),
+  preview: BotPreviewSchema,
+  /** Whether this Hermes profile is synchronized into the native CozyChat data plane. */
+  syncState: Type.Union([
+    Type.Literal("ready"),
+    Type.Literal("starting"),
+    Type.Literal("setup_required"),
+  ]),
+  /** Capability-44 per-profile CozyApps status. Old clients ignore it; clients that understand
+   * it must not claim app execution is available when this profile did not negotiate `cozyapps`. */
+  cozyApps: Type.Optional(BotCozyAppsReadinessSchema),
+  /** Additive, stable explanation for a non-ready sync state. */
+  syncReason: Type.Optional(Type.Literal("cozyapps_not_negotiated")),
+  /** Additive repair instruction paired with `syncReason`. */
+  syncRepair: Type.Optional(Type.Literal("restart_profile")),
+  /** Which runtime serves this bot. Absent means Hermes, so every existing row is unchanged.
+   * A named runtime is not backed by the Hermes Dashboard: its Dashboard routes answer
+   * `409 unsupported_for_runtime`. */
+  runtime: Type.Optional(Type.Literal("cozyagents")),
+  /** Capability 54. Which paired computer runs this bot, and what that computer is called. Both
+   * are absent for a Hermes bot and for a runtime bot created before 54, and neither is ever
+   * backfilled: the gateway threw no value away, it never had one. `runnerName` is absent on its
+   * own when the runner row was revoked while its bots stayed. */
+  runnerId: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+  runnerName: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  meta: Type.Union([Type.Record(Type.String(), Type.Unknown()), Type.Null()]),
+  /** Capability 81. How to draw the bot when it is not a drawn face: an `image` served by
+   *  `GET /bots/:name/avatar` (an upload, a generated portrait or a chosen pet, all stored as the
+   *  profile's avatar asset), or a legacy `pet` slug whose thumbnail `imageUrl` serves. `imageUrl`
+   *  is gateway-relative and carries a `v` that changes when the look is rewritten, so a client
+   *  cache keyed on it refetches. Absent: draw the face `meta` describes. */
+  avatar: Type.Optional(Type.Object({
+    kind: Type.Union([Type.Literal("image"), Type.Literal("pet")]),
+    imageUrl: Type.Optional(Type.String({ minLength: 1, maxLength: 512, pattern: "^/" })),
+    petSlug: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+  }, { additionalProperties: false })),
+  /** The names this Hermes profile was renamed from (Hermes's `previous_names`, oldest first,
+   *  lowercased), so a client resolves an `@old-handle` and re-seats stored room members and
+   *  per-bot state the way upstream Desktop does. Additive under capability 82: absent when the
+   *  profile has none, on a runtime bot, and on an older gateway. */
+  previousNames: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }))),
+  /** Capability 88, additive under agent-inbox 1. Present and `"leader"` only when the gateway's
+   *  own team row says so; absent means member, matching `BotProfile.role`'s rule. Never
+   *  `"member"` on the wire. */
+  role: Type.Optional(BotTeamRoleSchema),
+});
+export type BotSummary = Static<typeof BotSummarySchema>;
+
+/** The minimum needed to create a Hermes profile, plus what the creating user chose to hand it on
+ * day one. Its soul and model still come from Hermes and the profile routes afterwards.
+ *
+ * `toolsets` and `mcpServers` are ADDITIVE and OPTIONAL (capability 33). A gateway that seeds
+ * blank-slate bots starts a bot on the `file` + `terminal` floor; these two fields name what to
+ * grant ON TOP of it at creation, so a power user does not have to earn back the tools they
+ * already know they want. Both are advisory lists, not assertions: a name the backend does not
+ * report is SKIPPED and named back in `BotCreateResponse.warnings`, never invented and never a
+ * reason to fail the create. An empty array is the same as omitting the field.
+ *
+ * The fields are additive on the wire too. `BotCreateRequestSchema` is not
+ * `additionalProperties: false`, so a gateway below 33 accepts a request carrying them and
+ * silently ignores them; the bot is still created, just without the selection. A client that must
+ * not silently drop the user's picks gates its picker on `com.cozylabs.bots >= 33`. */
+export const BotCreateRequestSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 64 }),
+  title: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  description: Type.Optional(Type.String({ maxLength: 2_000 })),
+  toolsets: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })),
+  mcpServers: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })),
+  /** Capability 49. Names the runtime that will serve the new bot. Absent means Hermes, which is
+   * every create written before 49 and therefore the unchanged default. `"cozyagents"` asks the
+   * gateway to create a runtime bot instead: no Hermes profile is written, the gateway owns the
+   * durable row and mints the attach token itself, and a CozyRunner reconciles the container.
+   * `toolsets` and `mcpServers` are Hermes seeding instructions and are ignored for this kind;
+   * anything supplied alongside it is named back in `warnings`. */
+  runtime: Type.Optional(Type.Literal("cozyagents")),
+  /** Capability 54. Which paired computer should run the new bot (`GET /runners`). Only meaningful
+   * beside `runtime: "cozyagents"`. Absent, the gateway picks the account default, then the only
+   * paired runner, and otherwise refuses: `409 no_runner_paired` when the account has none, and
+   * `409 runner_choice_required` naming the candidates when there are several and none is the
+   * default. An id that names no paired runner is `400 invalid_request` naming this field, because
+   * a client that names a machine that is not there is a client bug rather than a missing
+   * machine. */
+  runnerId: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+  /** Capability 82. Start from another bot on the same Hermes host: its config, skills and SOUL,
+   * or with `cloneAll` its whole state (memory and sessions too). Absent is a fresh bot with the
+   * bundled skills, which is every create written before 82. */
+  cloneFrom: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+  cloneAll: Type.Optional(Type.Boolean()),
+  /** Capability 82. Skip the bundled skills. Hermes refuses it beside `cloneFrom`. */
+  noSkills: Type.Optional(Type.Boolean()),
+  /** Capability 82. Default true: provider keys are copied and OAuth logins are shared from the
+   * launch profile (`mirror_credentials` + `share_auth`). False starts the bot with no keys. */
+  shareKeys: Type.Optional(Type.Boolean()),
+});
+export type BotCreateRequest = Static<typeof BotCreateRequestSchema>;
+
+/** The `POST /bots` reply. `warnings` is present only when there is something to say, and its
+ * lines are display-safe operator English about the create that just SUCCEEDED: a selected name
+ * that was skipped, or a seed that could not be written. It is never an error channel; a failed
+ * create answers `ErrorBody` with a status instead. A client below 33 ignores the field. */
+export const BotCreateResponseSchema = Type.Object({
+  bot: BotSummarySchema,
+  warnings: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 400 }), { maxItems: 16 })),
+});
+export type BotCreateResponse = Static<typeof BotCreateResponseSchema>;
+
+/** Capability 40: whether a bot's attach transport can accept a turn right now. A freshly
+ * created Hermes profile can exist before its per-profile gateway process has attached; clients
+ * use this read-only state to keep the composer closed during that provisioning seam. */
+export const BotReadinessSchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  status: Type.Union([
+    Type.Literal("setup_required"),
+    Type.Literal("starting"),
+    Type.Literal("ready"),
+  ]),
+  /** CozyApps is expressed separately from the general readiness status so a client can name the
+   * feature gap. A missing CozyApps negotiation still keeps the profile non-ready. */
+  cozyApps: Type.Optional(BotCozyAppsReadinessSchema),
+  /** Additive, stable explanation for a non-ready status. */
+  reason: Type.Optional(Type.Literal("cozyapps_not_negotiated")),
+  /** Additive repair instruction paired with `reason`. */
+  repair: Type.Optional(Type.Literal("restart_profile")),
+  updatedAt: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotReadiness = Static<typeof BotReadinessSchema>;
+
+/** The `DELETE /bots/:name` reply (capability 37). `hermesProfile` says what happened on the
+ * Hermes host: `deleted` when the dashboard removed the profile directory on this call, or
+ * `already_absent` when Hermes no longer had it and only gateway state remained. `purged` counts
+ * the durable gateway rows removed, keyed by stable store-area identifiers (they are wire ids,
+ * not presentation strings; an area with zero rows is omitted). `tokenRevoked` reports whether an
+ * attach identity stopped authenticating as part of this call. `residue` lines are display-safe
+ * operator English naming what this gateway cannot remove from where it runs (the box config
+ * entry, the token env line, the host launchd service) and pointing at the deprovision sweep.
+ * None of the residue can authenticate: the token is already dead gateway-side. */
+export const BotDeleteResponseSchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  hermesProfile: Type.Union([Type.Literal("deleted"), Type.Literal("already_absent")]),
+  purged: Type.Record(Type.String(), Type.Integer({ minimum: 0 })),
+  tokenRevoked: Type.Boolean(),
+  residue: Type.Array(Type.String({ minLength: 1, maxLength: 400 }), { maxItems: 16 }),
+});
+export type BotDeleteResponse = Static<typeof BotDeleteResponseSchema>;
+
+/** Capability 49: the operational stages a Bot Runtime can be projected in. The list is ADR 0002's
+ * whole vocabulary rather than only the stages wave 3 can reach, so a runner that learns to stop,
+ * drain, or upgrade a runtime does not need a schema change to say so. */
+export const BotRuntimeStageSchema = Type.Union([
+  Type.Literal("waiting_for_runner"),
+  Type.Literal("waiting_for_capacity"),
+  Type.Literal("pulling_image"),
+  Type.Literal("creating"),
+  Type.Literal("starting"),
+  Type.Literal("ready"),
+  Type.Literal("draining"),
+  Type.Literal("stopping"),
+  Type.Literal("stopped"),
+  Type.Literal("recovering"),
+  Type.Literal("upgrading"),
+  Type.Literal("deleting"),
+  /** Terminal for a delete: the runner has removed the container and the bot-exclusive volumes.
+   * The route stops answering for the bot once this lands, because nothing is left to project. */
+  Type.Literal("deleted"),
+  /** The gateway has purged the bot and accepted the delete, and a runner has not yet said
+   * anything about it. The bot is already gone from the roster and its credential already dead;
+   * this stage exists so a client that was watching the runtime can see the cleanup finish. */
+  Type.Literal("deletion_pending"),
+  Type.Literal("needs_attention"),
+]);
+export type BotRuntimeStage = Static<typeof BotRuntimeStageSchema>;
+
+/** Capability 49: `GET /bots/:name/runtime`. What the gateway desires (`specGeneration`), what a
+ * runner has reported back (`observedGeneration`), where its latest operation stands (`stage`),
+ * and when a runner last said anything about this bot. `observedGeneration` and
+ * `lastRunnerContactAt` are null until the first receipt arrives, which is exactly the state a
+ * bot created while no runner was connected sits in. Never carries the attach token, an image
+ * digest secret, a host path, or any runner diagnostic text. */
+export const BotRuntimeProjectionSchema = Type.Object({
+  stage: BotRuntimeStageSchema,
+  specGeneration: Type.Integer({ minimum: 1 }),
+  /** The generation a runner last confirmed RUNNING, so it only ever advances on a `ready`
+   * receipt. An in-progress stage says what is being attempted, not what is observed. */
+  observedGeneration: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  lastRunnerContactAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  /** A stable, safe error code from the latest receipt, when the runner sent one. */
+  code: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  /** Capability 54. Which paired computer this bot's operations are queued for, and its name.
+   * Absent for a runtime bot created before 54, which belongs to the account default rather than
+   * to a machine it names; `runnerName` is absent on its own once that runner row is revoked. */
+  runnerId: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+  runnerName: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+}, { additionalProperties: false });
+export type BotRuntimeProjection = Static<typeof BotRuntimeProjectionSchema>;
+
+/** Capability 61: `POST /bots/:name/runtime/recover`. The only mutable fact is the fresh
+ * operation id; `runtime` is the immediately-readable projection of that accepted operation.
+ * No credential, runner payload, or diagnostic text crosses this operator surface. */
+export const BotRuntimeRecoveryResponseSchema = Type.Object({
+  operationId: Type.String({ minLength: 4, maxLength: 128 }),
+  runtime: BotRuntimeProjectionSchema,
+}, { additionalProperties: false });
+export type BotRuntimeRecoveryResponse = Static<typeof BotRuntimeRecoveryResponseSchema>;
+
+/** Gateway-owned attach-v1 Bot Mode sessions are conversations. */
+export const BotSessionKindSchema = Type.Literal("conversation");
+export type BotSessionKind = Static<typeof BotSessionKindSchema>;
+
+export const BotSessionSummarySchema = Type.Object({
+  id: Type.String(),
+  startedAt: Type.Integer(),
+  lastActiveAt: Type.Integer(),
+  kind: BotSessionKindSchema,
+  title: Type.Optional(Type.String()),
+  preview: Type.Optional(Type.String()),
+});
+export type BotSessionSummary = Static<typeof BotSessionSummarySchema>;
+
+export const BotSessionsResponseSchema = Type.Object({
+  sessions: Type.Array(BotSessionSummarySchema),
+  activeSessionId: Type.Union([Type.String(), Type.Null()]),
+});
+export type BotSessionsResponse = Static<typeof BotSessionsResponseSchema>;
+
+export const BotSessionAdoptResponseSchema = Type.Object({
+  name: Type.String(),
+  sessionId: Type.String(),
+  previousSessionId: Type.String(),
+});
+export type BotSessionAdoptResponse = Static<typeof BotSessionAdoptResponseSchema>;
+
+/** Capability 19 `POST /bots/:name/sessions/new` response. The new gateway-owned session is
+ *  selected while the previous native transcript remains in local history and restorable through
+ *  the capability-16 adoption route. */
+export const BotNewSessionResponseSchema = Type.Object({
+  name: Type.String(),
+  sessionId: Type.String(),
+  previousSessionId: Type.String(),
+});
+export type BotNewSessionResponse = Static<typeof BotNewSessionResponseSchema>;
+
+/** A desktop/TUI session discovered from the Hermes profile's own session index. This is
+ * deliberately NOT a Bot Mode session: `hermesSessionId` is meaningful only to Hermes and is
+ * never interchangeable with a gateway-owned `sessionId`. The gateway intentionally withholds
+ * titles, previews, transcripts, tool activity, paths, and any other desktop-private data. */
+export const HermesInteractiveSessionOriginSchema = Type.Union([
+  Type.Literal("desktop"),
+  Type.Literal("tui"),
+  Type.Literal("cli"),
+]);
+export type HermesInteractiveSessionOrigin = Static<typeof HermesInteractiveSessionOriginSchema>;
+
+export const BotDesktopHermesSessionSchema = Type.Object({
+  source: Type.Literal("hermes_desktop"),
+  /** Exact Hermes surface that owns the row. Added at capability 3. */
+  origin: HermesInteractiveSessionOriginSchema,
+  hermesSessionId: Type.String({ minLength: 1, maxLength: 256 }),
+  /** Sanitized, optional display label. Preview/transcript/tool data never appears in discovery. */
+  title: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
+  startedAt: Type.Integer({ minimum: 0 }),
+  lastActiveAt: Type.Integer({ minimum: 0 }),
+  lastResumedAt: Type.Optional(Type.Integer({ minimum: 0 })),
+}, { additionalProperties: false });
+export type BotDesktopHermesSession = Static<typeof BotDesktopHermesSessionSchema>;
+
+export const BotDesktopHermesSessionsResponseSchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  source: Type.Literal("hermes_desktop"),
+  sessions: Type.Array(BotDesktopHermesSessionSchema, { maxItems: 200 }),
+}, { additionalProperties: false });
+export type BotDesktopHermesSessionsResponse = Static<typeof BotDesktopHermesSessionsResponseSchema>;
+
+/** An explicit desktop adoption. `pending` is not an adopted chat: no gateway session is selected
+ * until the attached Hermes process confirms it switched the exact profile-local raw id. */
+export const BotDesktopHermesResumeResponseSchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  source: Type.Literal("hermes_desktop"),
+  hermesSessionId: Type.String({ minLength: 1, maxLength: 256 }),
+  status: Type.Union([Type.Literal("pending"), Type.Literal("resumed")]),
+  sessionId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+}, { additionalProperties: false });
+export type BotDesktopHermesResumeResponse = Static<typeof BotDesktopHermesResumeResponseSchema>;
+
+/** Full-replace roster snapshot. Sent whenever the bridge's cached roster changes. */
+export const BotRosterFrameSchema = Type.Object({
+  type: Type.Literal("bot_roster"),
+  bots: Type.Array(BotSummarySchema),
+  updatedAt: Type.Integer(),
+});
+export type BotRosterFrame = Static<typeof BotRosterFrameSchema>;
+
+/** The "Active now" set, by profile name, as a full replace. Sent only when the set changes, so
+ *  an idle gateway is silent. */
+export const BotPresenceFrameSchema = Type.Object({
+  type: Type.Literal("bot_presence"),
+  active: Type.Array(Type.String()),
+  updatedAt: Type.Integer(),
+});
+export type BotPresenceFrame = Static<typeof BotPresenceFrameSchema>;
+
+/** One durable message in a gateway-owned attach-v1 Bot Mode transcript. `id` is a stable gateway
+ *  or attach event id and `at` is the gateway clock in milliseconds. `role` is `user` or
+ *  `assistant`; tool activity is carried separately and model reasoning never enters this shape.
+ *
+ *  `clientId` echoes an optional sender id so an optimistic row can be replaced. `attachments`
+ *  holds immutable gateway-scoped blocks for sent or received media. Their `fileId` is opaque and
+ *  resolves only through `GET /bots/:name/chat/attachments/:fileId`; it is never a URL or path. */
+/** One attachment on a durable message: the gateway-owned block, plus WHERE in the message it
+ *  renders (capability 32).
+ *
+ *  `position` is the index in this message's normalized block array BEFORE which the attachment
+ *  renders: `0` puts it above everything, `blocks.length` puts it below everything, and any value
+ *  in between puts it between those two blocks. It exists so an image written under its heading
+ *  renders under that heading instead of on a stack above the whole reply.
+ *
+ *  Absent `position` is the legacy shape and means above-stack, which is what every message
+ *  written before 32 carries and what any sender that cannot say where an attachment belongs keeps
+ *  sending. A reader MUST clamp an out-of-range value into `0...blocks.length` rather than dropping
+ *  the attachment: a sender that counts blocks differently degrades to a picture in a slightly
+ *  wrong place, never to a lost picture. A message MAY mix the two: positioned attachments render
+ *  in flow, unpositioned ones render above, and both are correct. */
+export const BotChatAttachmentSchema = Type.Composite([
+  AttachmentBlockSchema,
+  Type.Object({ position: Type.Optional(Type.Integer({ minimum: 0, maximum: 4096 })) }),
+]);
+export type BotChatAttachment = Static<typeof BotChatAttachmentSchema>;
+
+/** Capability 86. One persisted Tapback, the shape Hermes's `message.react` answers
+ *  (`tui_gateway/contracts/common.py` `MessageReaction`): at most one per author, the same emoji
+ *  again retracts it, and `null` clears. `at` is SECONDS, as Hermes stamps it. */
+export const BotMessageReactionSchema = Type.Object({
+  emoji: Type.String({ minLength: 1, maxLength: 32 }),
+  author: Type.Union([Type.Literal("user"), Type.Literal("agent")]),
+  at: Type.Optional(Type.Number()),
+});
+export type BotMessageReaction = Static<typeof BotMessageReactionSchema>;
+
+export const BotChatMessageSchema = Type.Object({
+  id: Type.String(),
+  role: Type.String(),
+  text: Type.String(),
+  at: Type.Union([Type.Integer(), Type.Null()]),
+  clientId: Type.Optional(Type.String()),
+  attachments: Type.Optional(Type.Array(BotChatAttachmentSchema)),
+  /** Capability 31. Present only on gateway-authored rows that are not conversation: a client MAY
+   *  render a marked row as a status chip rather than a bubble, and a client that does not know the
+   *  marker renders the ordinary row it already renders. The only v1 value is `delivery.failed`,
+   *  which the gateway writes with role `system` when a scheduled delivery terminally fails. */
+  marker: Type.Optional(Type.String({ maxLength: 64 })),
+  /** Capability 47, auditable ids. The attach turn this row belongs to: the user row that opened
+   *  the turn and every assistant row the turn committed carry the SAME `turnId`, which is what
+   *  lets a reader group a transcript by turn instead of guessing from adjacency. Absent on rows
+   *  written outside a turn (an imported desktop transcript, a delivery-failure notice) and on
+   *  every row written before 47. */
+  turnId: Type.Optional(Type.String({ maxLength: 256 })),
+  /** Capability 47. The bot that authored a non-user row: every `assistant` row, whether the
+   *  gateway projected it from a turn or imported it from a desktop session, and a gateway-authored
+   *  `system` row. A `user` row has no bot author and carries nothing here. It is the bot's profile
+   *  name, the same name the row's session is addressed by. */
+  authorBot: Type.Optional(Type.String({ maxLength: 128 })),
+  /** Capability 47. The `id` of the user row this row answers, for an assistant row committed by a
+   *  turn that a user message opened. It is the causation link a client would otherwise have to
+   *  infer from ordering, which is wrong the moment a scheduled or interim row lands between.
+   *  A steer shares the running turn's `turnId` and does NOT become a new `inReplyToId` target:
+   *  the question a turn answers is the one that opened it, not a mid-turn nudge. */
+  inReplyToId: Type.Optional(Type.String({ maxLength: 256 })),
+  /** Capability 86. The row's Tapbacks, absent when nobody reacted. */
+  reactions: Type.Optional(Type.Array(BotMessageReactionSchema, { maxItems: 2 })),
+});
+export type BotChatMessage = Static<typeof BotChatMessageSchema>;
+
+/** Capability 19 hard-stop response. The cross-device terminal signal remains the existing
+ *  `bot_chat_state` frame with `phase: "complete"`. */
+export const BotChatStopResponseSchema = Type.Object({
+  status: Type.Literal("stopped"),
+});
+export type BotChatStopResponse = Static<typeof BotChatStopResponseSchema>;
+
+/** New messages in a bot's native canonical chat. A DELTA, not a snapshot: `messages` carries only
+ *  newly committed durable rows, in order.
+ *
+ *  A settled assistant row in the canonical conversational session also raises the existing
+ *  encrypted `message` push for registered devices without a live socket. This changes no frame or
+ *  capability: drafts, user echoes, and tool activity stay in-band. */
+export const BotChatFrameSchema = Type.Object({
+  type: Type.Literal("bot_chat"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  messages: Type.Array(BotChatMessageSchema),
+  updatedAt: Type.Integer(),
+});
+export type BotChatFrame = Static<typeof BotChatFrameSchema>;
+
+/** The latest runtime measurement for one native conversation. This is deliberately separate from
+ * transcript rows: a provider may not report it, and a later turn makes an older sample stale
+ * without changing any durable message. `input`/`output`/`total` lifetime counters never belong
+ * here. */
+export const BotChatContextReadingSchema = Type.Object({
+  // A provider can truthfully report an empty prompt. The window remains positive, so callers
+  // never have to invent a denominator or turn this into a percentage on the wire.
+  usedTokens: Type.Integer({ minimum: 0 }),
+  windowTokens: Type.Integer({ minimum: 1 }),
+  measurement: Type.Union([Type.Literal("reported"), Type.Literal("estimated")]),
+  source: Type.Union([
+    Type.Literal("provider_usage"),
+    Type.Literal("provider_usage_plus_estimate"),
+    Type.Literal("local_estimate"),
+  ]),
+  /** Gateway receipt time, never a clock value asserted by the runtime. */
+  observedAt: Type.Integer({ minimum: 0 }),
+  stale: Type.Boolean(),
+  model: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  effort: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+}, { additionalProperties: false });
+export type BotChatContextReading = Static<typeof BotChatContextReadingSchema>;
+
+/** Full replacement of the optional context reading for one canonical bot conversation. */
+export const BotChatContextFrameSchema = Type.Object({
+  type: Type.Literal("bot_chat_context"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  context: Type.Union([BotChatContextReadingSchema, Type.Null()]),
+}, { additionalProperties: false });
+export type BotChatContextFrame = Static<typeof BotChatContextFrameSchema>;
+
+/** Durable metadata describing one successful phone-node share. Capability 39.
+ * The lease, originating device, and shared payload are deliberately absent. */
+export const BotMobileReceiptSchema = Type.Object({
+  requestId: Type.String({ minLength: 1, maxLength: 256 }),
+  bot: Type.String({ minLength: 1, maxLength: 128 }),
+  sessionId: Type.String({ minLength: 1, maxLength: 256 }),
+  turnId: Type.String({ minLength: 1, maxLength: 256 }),
+  command: Type.Union([
+    Type.Literal("device.status"),
+    Type.Literal("location.current"),
+    Type.Literal("camera.capture"),
+    Type.Literal("file.pick"),
+    Type.Literal("notification.present"),
+  ]),
+  sharedDescription: Type.Union([
+    Type.Literal("Device status"),
+    Type.Literal("Approximate location"),
+    Type.Literal("Camera photo"),
+    Type.Literal("Camera video"),
+    Type.Literal("Selected photo"),
+    Type.Literal("Selected file"),
+    Type.Literal("Notification action"),
+  ]),
+  purpose: Type.String({
+    minLength: 1,
+    maxLength: 160,
+    pattern: "^[^\\s\\u0000-\\u001f\\u007f-\\u009f]+(?: [^\\s\\u0000-\\u001f\\u007f-\\u009f]+)*$",
+  }),
+  sharedAt: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotMobileReceipt = Static<typeof BotMobileReceiptSchema>;
+
+/** Capability 68. The typed lifecycle of ONE phone capability request, bound to the exact
+ *  profile, conversation, turn, paired device and (through that device, the gateway's only user
+ *  identity) the person who owns it. The record is metadata: the lease, the phone's answer, and
+ *  any coordinate, frame or file it carried are never on it. Every request reaches exactly one
+ *  terminal state; `policy_blocked` (refused before it was ever routed to a phone) and
+ *  `foreground_required` (the device or app lifecycle prevented execution) are outcomes of their
+ *  own rather than a generic failure. */
+export const MOBILE_REQUEST_STATES = [
+  "requested", "routed", "device_received", "consent_presented", "approved", "executing",
+  "completed", "denied", "failed", "expired", "cancelled", "policy_blocked", "foreground_required",
+] as const;
+export const MOBILE_REQUEST_TERMINAL_STATES = [
+  "completed", "denied", "failed", "expired", "cancelled", "policy_blocked", "foreground_required",
+] as const;
+export const MobileRequestStateSchema = Type.Union(MOBILE_REQUEST_STATES.map((state) => Type.Literal(state)));
+export type MobileRequestState = Static<typeof MobileRequestStateSchema>;
+export type MobileRequestTerminalState = (typeof MOBILE_REQUEST_TERMINAL_STATES)[number];
+
+export const BotMobileRequestSchema = Type.Object({
+  requestId: Type.String({ minLength: 1, maxLength: 256 }),
+  bot: Type.String({ minLength: 1, maxLength: 128 }),
+  sessionId: Type.String({ minLength: 1, maxLength: 256 }),
+  turnId: Type.String({ minLength: 1, maxLength: 256 }),
+  /** The one device this request was issued for. A second device attaching never becomes the
+   *  target, and an answer from any other device is refused rather than applied. Absent only when
+   *  no device was selected at all, which is itself the outcome the record carries. */
+  deviceId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  command: BotMobileReceiptSchema.properties.command,
+  purpose: BotMobileReceiptSchema.properties.purpose,
+  state: MobileRequestStateSchema,
+  requestedAt: Type.Integer({ minimum: 0 }),
+  updatedAt: Type.Integer({ minimum: 0 }),
+  expiresAt: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotMobileRequest = Static<typeof BotMobileRequestSchema>;
+
+/** Capability 70. The phone this conversation's capability requests should go to. Everything but
+ *  `sessionId` is absent when the person recorded no choice, which is the pre-70 behavior: the
+ *  device that opened the turn is the target. The record names a paired device and nothing else:
+ *  no person, no token and no address, because a paired device IS this gateway's user identity. */
+export const BotMobilePreferredDeviceSchema = Type.Object({
+  sessionId: Type.String({ minLength: 1, maxLength: 256 }),
+  deviceId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  deviceName: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  updatedAt: Type.Optional(Type.Integer({ minimum: 0 })),
+}, { additionalProperties: false });
+export type BotMobilePreferredDevice = Static<typeof BotMobilePreferredDeviceSchema>;
+
+/** Capability 70. `null` is the clear, and it is the only way to clear: an absent field would be
+ *  indistinguishable from a client that does not know the row. */
+export const BotMobilePreferredDeviceRequestSchema = Type.Object({
+  deviceId: Type.Union([Type.String({ minLength: 1, maxLength: 256 }), Type.Null()]),
+}, { additionalProperties: false });
+export type BotMobilePreferredDeviceRequest = Static<typeof BotMobilePreferredDeviceRequestSchema>;
+
+/** Capability 71. One composer draft for one conversation on one profile, belonging to the person
+ *  rather than to any one of their phones, which is why NO device id appears here or on the write.
+ *  Empty text with a zero `updatedAt` is a conversation that has no draft; empty text with a real
+ *  `updatedAt` is a draft a send CLEARED, which is what stops another device offering to resend.
+ *  `updatedAt` is also the VERSION: it moves strictly forward on every stored change, even across a
+ *  repeated or backwards clock, so two drafts can always be ordered and a client applies only the
+ *  newer one. Without that, a slow write landing after a send's clear would put a sent message back
+ *  on another phone, which is the one thing this row exists to prevent. */
+export const BotComposerDraftSchema = Type.Object({
+  sessionId: Type.String({ minLength: 1, maxLength: 256 }),
+  text: Type.String({ maxLength: 8_000 }),
+  updatedAt: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotComposerDraft = Static<typeof BotComposerDraftSchema>;
+
+/** Capability 71. Refused rather than truncated above the bound: a draft whose end the person
+ *  cannot see is worse than a save the composer retries. */
+export const BotComposerDraftRequestSchema = Type.Object({
+  sessionId: Type.String({ minLength: 1, maxLength: 256 }),
+  text: Type.String({ maxLength: 8_000 }),
+}, { additionalProperties: false });
+export type BotComposerDraftRequest = Static<typeof BotComposerDraftRequestSchema>;
+
+/** Capability 71. A FULL REPLACE of one conversation's draft, never a delta, carrying the empty
+ *  string when a send cleared it. Safe to drop: `GET /bots/:name/drafts` is the recovery read. */
+export const BotDraftUpdatedFrameSchema = Type.Object({
+  type: Type.Literal("bot_draft_updated"),
+  bot: Type.String({ minLength: 1, maxLength: 128 }),
+  ...BotComposerDraftSchema.properties,
+}, { additionalProperties: false });
+export type BotDraftUpdatedFrame = Static<typeof BotDraftUpdatedFrameSchema>;
+
+export const BotMobileRequestListSchema = Type.Object({
+  requests: Type.Array(BotMobileRequestSchema),
+}, { additionalProperties: false });
+
+export const BotMobileReceiptFrameSchema = Type.Object({
+  type: Type.Literal("bot_mobile_receipt"),
+  ...BotMobileReceiptSchema.properties,
+}, { additionalProperties: false });
+export type BotMobileReceiptFrame = Static<typeof BotMobileReceiptFrameSchema>;
+
+/** Capability 23's exact app-facing native-turn status. `queued` means the command is durably in
+ * the attach outbox; `connectivity_lost` keeps that same durable command for replay. */
+export const BotChatStatusSchema = Type.Union([
+  Type.Literal("queued"),
+  Type.Literal("executing"),
+  Type.Literal("using_tools"),
+  Type.Literal("awaiting_input"),
+  Type.Literal("completed"),
+  Type.Literal("failed"),
+  Type.Literal("interrupted"),
+  Type.Literal("timed_out"),
+  Type.Literal("connectivity_lost"),
+]);
+export type BotChatStatus = Static<typeof BotChatStatusSchema>;
+
+export const BotChatStateCauseSchema = Type.Union([
+  Type.Literal("attach_absent"),
+  Type.Literal("attach_degraded"),
+  Type.Literal("attach_lost"),
+  Type.Literal("cancelled"),
+  Type.Literal("verification_unavailable"),
+]);
+export type BotChatStateCause = Static<typeof BotChatStateCauseSchema>;
+
+/** How a bot's native canonical chat is doing right now. `phase`, `running`, and `inflight` are the
+ * gateway's durable attach-v1 turn projection, not Dashboard session flags. `status`, `cause`, and
+ * `queuedAt` are capability-23 additions; clients below 23 retain the legacy phase behavior. */
+export const BotChatStateFrameSchema = Type.Object({
+  type: Type.Literal("bot_chat_state"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  /** `polling` = an attach-v1 turn is active; `complete` = its reply committed or capability 19
+   *  interrupted it; `timeout` = the gateway cap expired; `failed` = attach-v1 reported failure. */
+  phase: Type.Union([
+    Type.Literal("polling"),
+    Type.Literal("complete"),
+    Type.Literal("timeout"),
+    Type.Literal("failed"),
+  ]),
+  running: Type.Boolean(),
+  inflight: Type.Boolean(),
+  status: Type.Optional(BotChatStatusSchema),
+  /** Capability 78. A soft delivery watchdog is checking an active turn's interim commit. This
+   * does not alter its execution lifecycle (`phase`, `running`, or `inflight`). */
+  deliveryStatus: Type.Optional(Type.Literal("checking")),
+  cause: Type.Optional(BotChatStateCauseSchema),
+  /** Gateway-clock time when an offline command entered the durable outbox. The existing gateway
+   * turn-timeout bound applies from this instant, then the command is discarded or interrupted. */
+  queuedAt: Type.Optional(Type.Integer()),
+  waitingOn: Type.Optional(TaskWaitingOnSchema),
+  updatedAt: Type.Integer(),
+});
+export type BotChatStateFrame = Static<typeof BotChatStateFrameSchema>;
+
+/** A LIVE DRAFT of the assistant reply a bot is composing right now, streamed from attach-v1 while
+ *  the turn runs. Decoration, never the record: committed native transcript rows arrive in
+ *  `bot_chat` and are what a client stores.
+ *
+ *  Three properties make it safe to drop any subset of these frames:
+ *  - `text` is the FULL accumulated assistant text so far, not an increment, so a client never
+ *    reassembles anything and a missed frame costs nothing but a moment of staleness;
+ *  - `seq` is monotonic within one `turnId`, so a frame that arrives out of order is dropped by
+ *    comparing it against the last one rendered;
+ *  - `turnId` is gateway-minted per turn and is never reused, so a new turn on the same native
+ *    session invalidates the previous draft outright.
+ *
+ *  `done` marks the last frame of a turn: no further delta for that `turnId` will be sent, and the
+ *  reply itself is on its way over `bot_chat`. A client clears the draft on `done`, on a
+ *  `bot_chat_state` phase of `complete`/`timeout`/`failed`, or when the canonical message lands,
+ *  whichever comes first.
+ *
+ *  `room` is present only for a member's turn inside a group room, in which case `bot` is the member
+ *  profile name and `sessionId` is that member's room session, which is not a session a client
+ *  addresses anywhere else: render the draft in the room keyed on `room` + `bot`.
+ *
+ *  NOTHING derived from a model's chain of thought ever rides this frame. Attach-v1 does not define
+ *  a reasoning event, and the gateway projects only its display-safe draft blocks. */
+export const BotChatDeltaFrameSchema = Type.Object({
+  type: Type.Literal("bot_chat_delta"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  /** FULL accumulated assistant text so far. Idempotent and drop-tolerant. */
+  text: Type.String(),
+  /** Monotonic within one `turnId`, starting at 1. */
+  seq: Type.Integer(),
+  updatedAt: Type.Integer(),
+  done: Type.Optional(Type.Boolean()),
+  /** The group room this draft belongs to, for a member turn. Absent for a 1:1 chat. */
+  room: Type.Optional(Type.String()),
+});
+export type BotChatDeltaFrame = Static<typeof BotChatDeltaFrameSchema>;
+
+/** A tool call inside an attach-v1 bot turn is waiting on a human decision. Capability 10.
+ *
+ *  Why this is a bots frame and not the core `approval_pending` of contract v1.md section 5a: the
+ *  bots surface is a PARALLEL path. It has no threads, no `TurnRunner`, and no `BackendAdapter`;
+ *  every frame on it is keyed `bot` + `sessionId`, and a bot chat has no `threadId` to put in the
+ *  core frame. So the pair is mirrored onto this channel's keying and is otherwise field for field
+ *  the core pair, so one client view renders both.
+ *
+ *  `toolCallId` is the attach-v1 approval id; `turnId` is the gateway's native turn id; and `name`
+ *  is the bounded display-safe tool name supplied by the plugin. There is deliberately no argument
+ *  or command summary: a member that does not exist cannot leak. */
+/** One tool step inside a bot's turn: capability 12, the live activity a client renders as chips
+ *  while the turn runs.
+ *
+ *  Field for field this is the core `ToolCall` of `contract/v1.md` ("ToolCall") with the two members
+ *  this channel's frames always carry added, and its one free-text member removed:
+ *  - `id` -> `stepId`, `name` and `status` are the core three, and `status` uses the CORE
+ *    vocabulary `running`/`ok`/`error` rather than any new one, so a client that already renders
+ *    threads chips renders these with the same switch.
+ *  - `seq` and the timestamps are added because a bots frame is a snapshot with an ordering, not an
+ *    implicitly ordered array on a draft (see `BotToolActivityFrame`).
+ *  - capability 21 adds optional bounded, redacted `detail` and error-only `errorText`. Attach-v1
+ *    sends display-safe detail only; raw args/results, context, inline diffs, and todos are never
+ *    forwarded.
+ *
+ *  `name` is the plugin tool identifier, passed through and length-capped. It names a tool rather
+ *  than anything the tool was asked to do. */
+export const BotToolStepSchema = Type.Object({
+  /** Stable for the life of the step and unique within its `turnId`: the attach-v1 `callId` that
+   *  joins its running and terminal events. */
+  stepId: Type.String(),
+  /** Position within the turn, from 1, assigned when the gateway FIRST sees the step. It is the
+   *  order the steps started in, and it never moves once assigned. */
+  seq: Type.Integer(),
+  name: Type.String(),
+  /** `running` until the step ends. `ok` and `error` are TERMINAL: a step never leaves them.
+   *
+   *  `error` means the plugin reported that the step did not finish cleanly. Nothing about WHY is
+   *  reported beyond optional bounded `errorText`. */
+  status: Type.Union([Type.Literal("running"), Type.Literal("ok"), Type.Literal("error")]),
+  /** MILLISECONDS, gateway clock. When the gateway first saw the step. */
+  startedAt: Type.Integer(),
+  /** MILLISECONDS. Absent while `running`, present on every terminal step. */
+  endedAt: Type.Optional(Type.Integer()),
+  /** Bounded, redacted human-readable activity. Capability 21. */
+  detail: Type.Optional(Type.String()),
+  /** Bounded, redacted failure text; present only for an error step. Capability 21. */
+  errorText: Type.Optional(Type.String()),
+});
+export type BotToolStep = Static<typeof BotToolStepSchema>;
+
+/** What a bot's turn is DOING right now, as a full-replace snapshot of that turn's tool steps.
+ *  Capability 12 (issue #60).
+ *
+ *  Snapshot, not a delta, for the same reason `bot_chat_delta` carries the full accumulated text:
+ *  it makes every frame independently sufficient and any subset of them droppable. A client renders
+ *  the newest frame it has for a `turnId` and needs no reassembly, and "what happened this turn" is
+ *  read off one frame rather than folded from a stream.
+ *
+ *  - `steps` is EVERY step of the turn so far, in `seq` order, each carrying its own current status.
+ *    A step that has ended stays in the array with a terminal status; it is not removed.
+ *  - `seq` on the FRAME is monotonic within one `turnId`, from 1, so a frame that arrives out of
+ *    order is dropped by comparing it against the last one rendered. (The `seq` on a STEP is a
+ *    different number: the step's position in the turn.)
+ *  - `turnId` is the gateway's own turn id, the same value `bot_chat_delta` and
+ *    `bot_approval_pending` carry for that chat, so all three frames agree about which turn a client
+ *    is looking at.
+ *  - `done` marks the last frame of a turn: every step in it is terminal and no further frame will
+ *    be sent for that `turnId`.
+ *
+ *  `room` is present only for a member's turn inside a group room, exactly as on `bot_chat_delta`.
+ *
+ *  NOT PUSHED. Ever. Tool activity is a foreground surface: it is worth showing to someone watching
+ *  a turn run and is worth nothing to a phone in a pocket, where it would be a stream of
+ *  notifications for something nobody was asked to decide. `contract/push-v0.md` keeps its three
+ *  payload kinds -- `message`, `approval_pending`, `approval_resolved` -- and this capability adds
+ *  none. */
+export const BotToolActivityFrameSchema = Type.Object({
+  type: Type.Literal("bot_tool_activity"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  steps: Type.Array(BotToolStepSchema),
+  /** Monotonic within one `turnId`, starting at 1. */
+  seq: Type.Integer(),
+  updatedAt: Type.Integer(),
+  done: Type.Optional(Type.Boolean()),
+  /** The group room this turn belongs to, for a member turn. Absent for a 1:1 chat. */
+  room: Type.Optional(Type.String()),
+});
+export type BotToolActivityFrame = Static<typeof BotToolActivityFrameSchema>;
+
+/** One past native turn's tool steps, persisted by the gateway so history survives reconnect and
+ *  restart. Steps belong to a turn rather than a message: attach-v1 intentionally supplies no
+ *  message-to-turn join, so the gateway does not invent one. Clients can order a strip by its
+ *  gateway-clock `startedAt`/`endedAt` timestamps or key it to a live `turnId`. */
+export const BotTurnToolStepsSchema = Type.Object({
+  turnId: Type.String(),
+  /** MILLISECONDS: when the turn's FIRST step started. The chronological join to the transcript. */
+  startedAt: Type.Integer(),
+  /** MILLISECONDS: when the turn's LAST step ended. Absent while any step is still `running`, which
+   *  after a restart means a turn whose end this gateway never saw. */
+  endedAt: Type.Optional(Type.Integer()),
+  steps: Type.Array(BotToolStepSchema),
+});
+export type BotTurnToolSteps = Static<typeof BotTurnToolStepsSchema>;
+
+/** Closed status vocabulary for one delegated child. Capability 34 (subagent visibility).
+ *  `queued|starting|running|stalling` are live; the rest are settled. `unknown` is the honest
+ *  settle for work whose outcome cannot be proven (a restart with the child in flight) and is
+ *  never rendered as failure. `stalling`/`stalled` mark long-quiet work; clients may also derive
+ *  quietness from `lastActiveAt` ("quiet for 2m", not failed). */
+export const BotDelegationChildStatusSchema = Type.Union([
+  Type.Literal("queued"), Type.Literal("starting"), Type.Literal("running"),
+  Type.Literal("stalling"), Type.Literal("succeeded"), Type.Literal("failed"),
+  Type.Literal("interrupted"), Type.Literal("stalled"), Type.Literal("unknown"),
+]);
+export type BotDelegationChildStatus = Static<typeof BotDelegationChildStatusSchema>;
+
+/** Hermes's bounded cost provenance labels, an optional capability-34 enrichment. Unknown includes
+ * a missing or future upstream label; clients must not present it as an exact charge. */
+export const BotDelegationCostStatusSchema = Type.Union([
+  Type.Literal("estimated"), Type.Literal("reported"), Type.Literal("unknown"),
+]);
+export type BotDelegationCostStatus = Static<typeof BotDelegationCostStatusSchema>;
+
+/** Structured-output validation verdict from a synchronous Hermes delegation result. Absence means
+ * unavailable or not requested; it is deliberately distinct from `valid: false`. */
+export const BotDelegationSchemaValidationSchema = Type.Object({
+  valid: Type.Boolean(),
+  /** Hermes v0.21 performs at most one bounded schema retry. */
+  retries: Type.Optional(Type.Integer({ minimum: 0, maximum: 1 })),
+}, { additionalProperties: false });
+export type BotDelegationSchemaValidation = Static<typeof BotDelegationSchemaValidationSchema>;
+
+/** One delegated child of a native turn's `delegate_task` batch. Capability 34.
+ *
+ *  Identity is (batchId, childId) -- `childId` is the Hermes child session id, the one
+ *  identifier present on both the spawn and finish legs of the lifecycle, so it is the upsert
+ *  key exactly as `stepId` keys a tool step; tool names are display metadata only and can never
+ *  collide. Only bounded display text crosses this wire: a truncated task label and a tool
+ *  NAME -- never args, results, reasoning, prompts, local paths, or child summaries. */
+export const BotDelegationChildSchema = Type.Object({
+  childId: Type.String(),
+  /** Position within the batch, from 0, pinned when the gateway FIRST sees the child. */
+  index: Type.Integer(),
+  label: Type.Optional(Type.String()),
+  status: BotDelegationChildStatusSchema,
+  /** Tool NAME only. */
+  currentTool: Type.Optional(Type.String()),
+  apiCalls: Type.Optional(Type.Integer()),
+  toolCount: Type.Optional(Type.Integer()),
+  /** USD attributed by Hermes to this child. Synchronous result only; absent is unavailable. */
+  costUsd: Type.Optional(Type.Number({ minimum: 0, maximum: 1_000_000 })),
+  costStatus: Type.Optional(BotDelegationCostStatusSchema),
+  /** Present only when the child was given a structured output schema. */
+  schemaValidation: Type.Optional(BotDelegationSchemaValidationSchema),
+  /** Terminal child runtime in milliseconds. Synchronous result only. */
+  durationMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 2_147_483_647 })),
+  /** MILLISECONDS, plugin clock. When the child last showed observable activity. */
+  lastActiveAt: Type.Integer(),
+  /** MILLISECONDS, gateway clock. When the gateway first saw the child. */
+  startedAt: Type.Integer(),
+  /** MILLISECONDS. Absent while the child is live. */
+  endedAt: Type.Optional(Type.Integer()),
+});
+export type BotDelegationChild = Static<typeof BotDelegationChildSchema>;
+
+/** What one turn's `delegate_task` batch is doing, as a full-replace snapshot. Capability 34.
+ *  Same wire discipline as `bot_tool_activity`: every frame is independently sufficient, frame
+ *  `seq` is monotonic within one (turnId, batchId), `done` marks the batch fully settled, and
+ *  the frame is NOT pushed, ever. `batchId` also keys the client's reconciliation of the live
+ *  card with Hermes's synthetic "[ASYNC DELEGATION BATCH COMPLETE ...]" transcript row. A batch
+ *  may outlive its turn (async dispatch): frames legitimately arrive after the turn sealed. */
+export const BotDelegationActivityFrameSchema = Type.Object({
+  type: Type.Literal("bot_delegation_activity"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  batchId: Type.String(),
+  /** Canonical Hermes delegation id (`deleg_...`) for this batch, when known. `batchId` stays
+   *  the identity; a client whose exact-`batchId` reconciliation with Hermes's synthetic
+   *  "[ASYNC DELEGATION BATCH COMPLETE - <deleg_id>]" transcript row fails falls back to
+   *  matching that row's id against `aliasId`. Additive under capability 34. */
+  aliasId: Type.Optional(Type.String()),
+  /** Children known to the batch so far; grows monotonically. */
+  count: Type.Integer(),
+  children: Type.Array(BotDelegationChildSchema),
+  /** Monotonic within one (turnId, batchId), starting at 1. */
+  seq: Type.Integer(),
+  updatedAt: Type.Integer(),
+  done: Type.Optional(Type.Boolean()),
+});
+export type BotDelegationActivityFrame = Static<typeof BotDelegationActivityFrameSchema>;
+
+/** One past turn's delegation batch, persisted like `BotTurnToolSteps` and for the same
+ *  reason: a batch belongs to a TURN, and `startedAt` is the honest chronological join. */
+export const BotTurnDelegationsSchema = Type.Object({
+  turnId: Type.String(),
+  batchId: Type.String(),
+  /** Canonical Hermes delegation id (`deleg_...`) for this batch, when known. See
+   *  `BotDelegationActivityFrameSchema.aliasId`. */
+  aliasId: Type.Optional(Type.String()),
+  count: Type.Integer(),
+  startedAt: Type.Integer(),
+  endedAt: Type.Optional(Type.Integer()),
+  children: Type.Array(BotDelegationChildSchema),
+});
+export type BotTurnDelegations = Static<typeof BotTurnDelegationsSchema>;
+
+/** A short rolling preview of the bot's live reasoning for one native turn. Capability 35.
+ *
+ *  LATEST-ONLY full replace: `text` is the WHOLE preview, tail-truncated to 280 chars, so every
+ *  frame is independently sufficient and any subset is droppable. `seq` is monotonic within one
+ *  `turnId`; a frame whose `seq` is not greater than the last one rendered is stale and dropped.
+ *
+ *  EPHEMERAL BY DESIGN: never persisted, never in chat history, gone on reopen. The turn's
+ *  terminal is the hard stop -- no frame follows it. Privacy bounds are enforced on BOTH sides:
+ *  the plugin sanitizes (no tool args or results, no prompts, no credentials, no file paths)
+ *  and the schema caps length, so an unsanitized peer still cannot exceed the preview budget.
+ *  NOT PUSHED, ever, for the same reason tool activity is not. */
+export const BotThinkingActivityFrameSchema = Type.Object({
+  type: Type.Literal("bot_thinking_activity"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  /** Sanitized rolling tail, at most 280 chars. */
+  text: Type.String({ maxLength: 280 }),
+  /** Monotonic within one `turnId`, starting at 1. */
+  seq: Type.Integer({ minimum: 1 }),
+  updatedAt: Type.Integer(),
+});
+export type BotThinkingActivityFrame = Static<typeof BotThinkingActivityFrameSchema>;
+
+/** Capability 62. The MCP repair proposal an approval may carry: a runtime peer found one MCP
+ *  server's tool list stale (or the server crashed, refused, or would not re-list) and asks before
+ *  reconnecting it. Every set is closed and every string bounded. `server`, `impact` and both
+ *  fingerprints are configured names and opaque digests; a URL, header value, env value, or secret
+ *  is never among them, and the closed object leaves no member one could ride in. The gateway is
+ *  the authority on the block (contract/ext-bots-v1.md row 62): one that fails this schema or
+ *  carries a C0/C1 control or Unicode Format character is DROPPED and the approval kept, exactly
+ *  as a malformed capability-56 `detail` is, so a client only ever sees a block that validates.
+ *  The string bounds count UTF-16 code units, as TypeBox enforces them. */
+export const BotApprovalRepairSchema = Type.Object({
+  kind: Type.Literal("mcp_reconnect"),
+  /** The MCP server name as configured on the runtime peer. */
+  server: Type.String({ minLength: 1, maxLength: 64 }),
+  /** Tool names the repair affects; empty when the peer could not list them. */
+  impact: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 64 }),
+  scope: Type.Literal("server"),
+  /** Opaque tool-list digests from the peer's health record; either side may be unknown. */
+  fingerprint: Type.Object({
+    previous: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+    current: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+  }, { additionalProperties: false }),
+  reason: Type.Union([
+    Type.Literal("stale_tool"), Type.Literal("relist_failed"),
+    Type.Literal("crashed"), Type.Literal("unauthorized"),
+  ]),
+  /** `approve_once`: approving reconnects this server once. `auto_refresh`: the operator allowed
+   *  the peer to refresh this server on its own, it already did, and the proposal is informational. */
+  policy: Type.Union([Type.Literal("approve_once"), Type.Literal("auto_refresh")]),
+}, { additionalProperties: false });
+export type BotApprovalRepair = Static<typeof BotApprovalRepairSchema>;
+
+/** Capability 66. What kind of thing an approval is about. The first six names are the
+ *  ALWAYS-REQUIRE list: money movement, secret access or disclosure, destructive actions, locks
+ *  and alarms, public publishing, and broad account changes require a decision on every single
+ *  invocation, and no category grant or convenience policy may cover one. `other` is everything
+ *  else, the only category a person can hand a standing grant. Closed: a name outside this set
+ *  fails the block. */
+export const BotApprovalCategorySchema = Type.Union([
+  Type.Literal("money_movement"), Type.Literal("secret_access"), Type.Literal("destructive"),
+  Type.Literal("lock_or_alarm"), Type.Literal("public_publishing"), Type.Literal("account_change"),
+  Type.Literal("other"),
+]);
+export type BotApprovalCategory = Static<typeof BotApprovalCategorySchema>;
+
+/** Capability 66. The categories no grant may ever cover, from the settled rule. Exported so the
+ *  gateway, a client, and a conformance decoder all read one list rather than three copies. */
+export const ALWAYS_REQUIRE_APPROVAL_CATEGORIES: readonly BotApprovalCategory[] = [
+  "money_movement", "secret_access", "destructive", "lock_or_alarm", "public_publishing",
+  "account_change",
+];
+
+/** Capability 66. The typed scoped-approval block an approval may carry: what the action is,
+ *  which system and resource it targets, the exact material change, its side effects, why a
+ *  decision is required at all, the hash of the exact payload, when the ask expires, whether a
+ *  retry of it is idempotent, and which scope the peer is asking for.
+ *
+ *  The payload hash is the BINDING: a changed material field changes the hash, and a changed hash
+ *  can never be covered by a standing approval. The gateway is the authority on the block, exactly
+ *  as it is on capability 62's `repair`: a block that fails this schema, or carries a C0/C1 control
+ *  or Unicode Format character, a lone surrogate, or a whitespace-only string, is DROPPED while the
+ *  approval it describes is kept. The bounds count UTF-16 code units, as TypeBox enforces them.
+ *  A peer never puts a secret, credential, URL, header or env value in any string here: `change`
+ *  and `effects` describe an action, they do not carry its arguments. */
+export const BotApprovalScopeSchema = Type.Object({
+  kind: Type.Literal("scoped_approval"),
+  /** The action type, the unit a category grant is bounded by (for example `workspace.write`). */
+  action: Type.String({ minLength: 1, maxLength: 64 }),
+  category: BotApprovalCategorySchema,
+  /** The target system the action reaches (for example `workspace`, `github`, `stripe`). */
+  system: Type.String({ minLength: 1, maxLength: 64 }),
+  /** The target resource inside that system. A grant is bounded to this exact resource. */
+  resource: Type.String({ minLength: 1, maxLength: 256 }),
+  /** What `resource` actually names. `object` (the default when absent, and what every peer that
+   *  names a real target sends) is a thing the action would act on, which is what a standing
+   *  CATEGORY grant is bounded by. `action` says the peer could only name the operation itself, so
+   *  the resource is the tool rather than the object, and a category grant over it would cover every
+   *  object that tool can reach: it is refused, and only a single-use grant is on offer. */
+  resourceKind: Type.Optional(Type.Union([
+    Type.Literal("object"), Type.Literal("action"),
+  ])),
+  /** The exact material change, in one sentence a person can check. */
+  change: Type.String({ minLength: 1, maxLength: 400 }),
+  /** What else happens if it runs. Empty when the peer claims none. */
+  effects: Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 16 }),
+  /** Why a decision is required: the always-require list, the bot's guardrail level, the peer's
+   *  own policy, or the first use of this action on this resource. */
+  reason: Type.Union([
+    Type.Literal("always_require"), Type.Literal("guardrail"),
+    Type.Literal("peer_policy"), Type.Literal("first_use"),
+  ]),
+  /** Lowercase sha256 hex of the exact payload the peer would send. Material fields only: two
+   *  invocations that differ in anything a person would want to re-read differ here. */
+  payloadHash: Type.String({ pattern: "^[0-9a-f]{64}$", minLength: 64, maxLength: 64 }),
+  /** Gateway-clock milliseconds after which this ask, and any grant made from it, is dead. */
+  expiresAt: Type.Integer({ minimum: 0 }),
+  /** Whether repeating the exact payload is safe. Only `idempotent` may be covered by a standing
+   *  once grant; a mutation is never automatically replayed. */
+  retry: Type.Union([
+    Type.Literal("idempotent"), Type.Literal("not_idempotent"), Type.Literal("unknown"),
+  ]),
+  /** The scope the PEER is asking for. The person decides what is actually granted. */
+  requested: Type.Union([Type.Literal("once"), Type.Literal("category")]),
+}, { additionalProperties: false });
+export type BotApprovalScope = Static<typeof BotApprovalScopeSchema>;
+
+/** Capability 66. One standing approval the gateway holds, as the revocation view renders it.
+ *  A grant is a POLICY RECORD a later invocation is consulted against, never a stored payload to
+ *  replay: it carries the action, the category, the target, the conversation it was made in, and
+ *  when it dies. The payload hash of a `once` grant, the deciding device, and the approval it came
+ *  from stay in the gateway's own store; nothing here is a secret payload value. */
+export const BotApprovalGrantSchema = Type.Object({
+  grantId: Type.String({ minLength: 1, maxLength: 256 }),
+  /** `once`: the exact payload and target, retryable only while idempotent. `category`: any
+   *  payload of this action on this resource, until it expires or is revoked. */
+  scope: Type.Union([Type.Literal("once"), Type.Literal("category")]),
+  action: Type.String({ minLength: 1, maxLength: 64 }),
+  category: BotApprovalCategorySchema,
+  system: Type.String({ minLength: 1, maxLength: 64 }),
+  resource: Type.String({ minLength: 1, maxLength: 256 }),
+  sessionId: Type.String({ minLength: 1 }),
+  expiresAt: Type.Integer(),
+  createdAt: Type.Integer(),
+});
+export type BotApprovalGrant = Static<typeof BotApprovalGrantSchema>;
+
+/** Capability 66. Every standing approval for one bot that is neither expired nor revoked. */
+export const BotApprovalGrantsSchema = Type.Object({
+  grants: Type.Array(BotApprovalGrantSchema, { maxItems: 100 }),
+});
+export type BotApprovalGrants = Static<typeof BotApprovalGrantsSchema>;
+
+/** Capability 66. The OPTIONAL body of `POST /bots/:name/approvals/:toolCallId/approve`. A body is
+ *  not required and a client below 66 sends none, which is exactly the pre-66 request: one
+ *  invocation approved, no standing grant asked for. `grant: "category"` asks for a standing
+ *  policy record bounded by the approval's own action and resource and by `expiresAt`, which is
+ *  then required; it is refused for an always-require category. `grant: "once"` is the explicit
+ *  spelling of the default. `expiresAt` is meaningless without `grant: "category"`. */
+export const BotApprovalDecisionRequestSchema = Type.Object({
+  grant: Type.Optional(Type.Union([Type.Literal("once"), Type.Literal("category")])),
+  /** Gateway-clock milliseconds. Required with `grant: "category"`, refused otherwise. */
+  expiresAt: Type.Optional(Type.Integer({ minimum: 0 })),
+}, { additionalProperties: false });
+export type BotApprovalDecisionRequest = Static<typeof BotApprovalDecisionRequestSchema>;
+
+export const BotApprovalPendingFrameSchema = Type.Object({
+  type: Type.Literal("bot_approval_pending"),
+  bot: Type.String(),
+  /** The gateway-owned canonical-chat id used by every Bot Mode frame. */
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  toolCallId: Type.String(),
+  name: Type.String(),
+  updatedAt: Type.Integer(),
+  /** Present for an approval raised by a member turn inside a group room. */
+  room: Type.Optional(Type.String()),
+  /** Capability 77. The durable room turn's cause, present before its reply is written. */
+  cause: Type.Optional(Type.Object({
+    kind: Type.Union([Type.Literal("user"), Type.Literal("member")]),
+    seq: Type.Integer(),
+  })),
+  /** Capability 56. A sanitized, at most 400-character display sentence naming what the approval
+   *  concretely covers (for example which Chrome and which profile a browser tool would drive).
+   *  Absent when the runtime peer sent none. */
+  detail: Type.Optional(Type.String()),
+  /** Capability 62. The MCP repair proposal this approval asks about, the block the gateway
+   *  validated. Absent for every approval that is not a repair proposal. */
+  repair: Type.Optional(BotApprovalRepairSchema),
+  /** Capability 66. The validated scoped-approval block this approval carries, byte for byte as
+   *  the peer sent it. Absent for every approval raised without one. */
+  scope: Type.Optional(BotApprovalScopeSchema),
+  /** Capability 66. The standing grant the gateway consulted and is settling this approval from.
+   *  Present ONLY when a grant covered it: the card is still rendered, so the decision is visible
+   *  rather than silent, and the resolution follows on the ordinary resolved frame. */
+  grantId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+});
+export type BotApprovalPendingFrame = Static<typeof BotApprovalPendingFrameSchema>;
+
+/** A paired device submitted a decision, which is durably queued for Hermes but NOT yet
+ * confirmed. The terminal frame remains the only proof that Hermes handled it. */
+export const BotApprovalResolutionRequestedFrameSchema = Type.Object({
+  type: Type.Literal("bot_approval_resolution_requested"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  toolCallId: Type.String(),
+  updatedAt: Type.Integer(),
+});
+export type BotApprovalResolutionRequestedFrame = Static<typeof BotApprovalResolutionRequestedFrameSchema>;
+
+/** A native approval reached a terminal state. The gateway emits at most one terminal frame per
+ *  `toolCallId`; an expiry is driven by the durable attach-v1 interaction record. */
+export const BotApprovalResolvedFrameSchema = Type.Object({
+  type: Type.Literal("bot_approval_resolved"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  toolCallId: Type.String(),
+  outcome: ApprovalOutcomeSchema,
+  updatedAt: Type.Integer(),
+  room: Type.Optional(Type.String()),
+});
+export type BotApprovalResolvedFrame = Static<typeof BotApprovalResolvedFrameSchema>;
+
+/** Capability 22: a native bot paused its turn to ask the user to choose one bounded option. The
+ * stable clarifyId is the REST resolution key and options are identifiers plus display labels;
+ * arbitrary model reasoning is never present. */
+export const BotClarifyOptionSchema = Type.Object({
+  id: Type.String(),
+  label: Type.String(),
+});
+export type BotClarifyOption = Static<typeof BotClarifyOptionSchema>;
+export const BotClarifyResolveRequestSchema = Type.Object({ optionId: Type.String({ minLength: 1 }) });
+export type BotClarifyResolveRequest = Static<typeof BotClarifyResolveRequestSchema>;
+
+export const BotClarifyPendingFrameSchema = Type.Object({
+  type: Type.Literal("bot_clarify_pending"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  clarifyId: Type.String(),
+  prompt: Type.String(),
+  options: Type.Array(BotClarifyOptionSchema),
+  expiresAt: Type.Optional(Type.Integer()),
+  updatedAt: Type.Integer(),
+  /** Capability 51. Present for a clarification raised by a member turn inside a group room; then
+   *  `bot` is the member and `sessionId` is the gateway-owned `group:<room>:<member>` thread. */
+  room: Type.Optional(Type.String()),
+});
+export type BotClarifyPendingFrame = Static<typeof BotClarifyPendingFrameSchema>;
+
+/** The option selection is durably queued for Hermes but has not yet been accepted by the
+ * blocking clarification primitive. No selected option leaks to other paired devices here. */
+export const BotClarifyResolutionRequestedFrameSchema = Type.Object({
+  type: Type.Literal("bot_clarify_resolution_requested"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  clarifyId: Type.String(),
+  updatedAt: Type.Integer(),
+});
+export type BotClarifyResolutionRequestedFrame = Static<typeof BotClarifyResolutionRequestedFrameSchema>;
+
+export const BotClarifyResolvedFrameSchema = Type.Object({
+  type: Type.Literal("bot_clarify_resolved"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  turnId: Type.String(),
+  clarifyId: Type.String(),
+  outcome: Type.Union([Type.Literal("selected"), Type.Literal("expired"), Type.Literal("cancelled")]),
+  selectedOptionId: Type.Optional(Type.String()),
+  updatedAt: Type.Integer(),
+  /** Capability 51. The group room the member turn belongs to, as on the pending frame. */
+  room: Type.Optional(Type.String()),
+});
+export type BotClarifyResolvedFrame = Static<typeof BotClarifyResolvedFrameSchema>;
+
+/** `POST /bots/:name/chat/reset` selected a fresh gateway-owned session. Rebind to `sessionId`,
+ *  drop any draft, and reload. The previous local transcript is retained; the reset frame is the
+ *  cross-device signal that the selected chat changed. */
+export const BotChatResetFrameSchema = Type.Object({
+  type: Type.Literal("bot_chat_reset"),
+  bot: Type.String(),
+  /** The freshly minted canonical chat. Every device rebinds to this id. */
+  sessionId: Type.String(),
+  /** The previously selected local session. It remains in `GET /bots/:name/sessions`. */
+  previousSessionId: Type.Optional(Type.String()),
+  updatedAt: Type.Integer(),
+});
+export type BotChatResetFrame = Static<typeof BotChatResetFrameSchema>;
+
+/** A user selected an existing native session or started a new one. Every paired client rebinds to
+ *  `sessionId` and re-reads history. Both the old and new session ids are gateway-owned; the old
+ *  transcript remains available for a later manual adoption. */
+export const BotChatAdoptedFrameSchema = Type.Object({
+  type: Type.Literal("bot_chat_adopted"),
+  bot: Type.String(),
+  /** The session the canonical chat now points at. Every device rebinds to this id. */
+  sessionId: Type.String(),
+  /** The session the pin resolved to when this adoption began. Always present. */
+  previousSessionId: Type.String(),
+  updatedAt: Type.Integer(),
+});
+export type BotChatAdoptedFrame = Static<typeof BotChatAdoptedFrameSchema>;
+
+/** Capability 86. `bot_chat_reaction`: the FULL reaction list of one message after a Tapback, so a
+ *  repeated or reordered frame costs nothing. Broadcast to every paired device. */
+export const BotChatReactionFrameSchema = Type.Object({
+  type: Type.Literal("bot_chat_reaction"),
+  bot: Type.String(),
+  sessionId: Type.String(),
+  messageId: Type.String(),
+  reactions: Type.Array(BotMessageReactionSchema, { maxItems: 2 }),
+  updatedAt: Type.Integer(),
+});
+export type BotChatReactionFrame = Static<typeof BotChatReactionFrameSchema>;
+
+/** Capability 86. `PUT /bots/:name/chat/messages/:id/reaction` body: this user's Tapback, or `null`
+ *  to clear it. The key is REQUIRED so an empty body is never read as a clear. */
+export const BotChatReactionRequestSchema = Type.Object(
+  { emoji: Type.Union([Type.String({ minLength: 1, maxLength: 32 }), Type.Null()]) },
+  { additionalProperties: false },
+);
+export type BotChatReactionRequest = Static<typeof BotChatReactionRequestSchema>;
+
+export const BotChatReactionResponseSchema = Type.Object({
+  messageId: Type.String(),
+  reactions: Type.Array(BotMessageReactionSchema, { maxItems: 2 }),
+});
+export type BotChatReactionResponse = Static<typeof BotChatReactionResponseSchema>;
+
+/** Capability 86. `POST /bots/:name/bot-chat`: the profile's canonical Hermes `Bot Chat` was
+ *  resolved (or minted, `created: true`) and the bot's current chat bound to it. `resumed` carries
+ *  the gateway chat now bound; `pending` means the attached plugin has not proved the binding yet
+ *  and the current chat is unchanged. */
+export const BotCanonicalChatResponseSchema = Type.Object({
+  name: Type.String(),
+  created: Type.Boolean(),
+  status: Type.Union([Type.Literal("resumed"), Type.Literal("pending")]),
+  sessionId: Type.Optional(Type.String()),
+});
+export type BotCanonicalChatResponse = Static<typeof BotCanonicalChatResponseSchema>;
+
+/** `POST /bots/:name/chat/reset` response. `sessionId` is the selected fresh native chat and
+ *  `previousSessionId` is the prior selection. Reset changes selection; it does not erase the
+ *  gateway-owned history returned by `GET /bots/:name/sessions`. */
+export const BotChatResetResponseSchema = Type.Object({
+  name: Type.String(),
+  sessionId: Type.String(),
+  previousSessionId: Type.Optional(Type.String()),
+});
+export type BotChatResetResponse = Static<typeof BotChatResetResponseSchema>;
+
+/** `POST /bots/:name/chat/messages` body. `clientId` is the sender's own id. The gateway echoes it
+ *  on the immediately committed native user row, so the sender can de-duplicate its optimistic row. */
+export const BotChatSendRequestSchema = Type.Object({
+  text: Type.String({ minLength: 1, maxLength: 32_000 }),
+  clientId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+});
+export type BotChatSendRequest = Static<typeof BotChatSendRequestSchema>;
+
+/** `POST /bots/:name/chat/messages/displayed` body (capability 31). The ids are wire ids of rows the
+ *  device actually PUT ON SCREEN, which is the one fact a gateway cannot observe for itself: a
+ *  durable transcript row proves delivery to the gateway, and a push proves nothing at all.
+ *
+ *  Bounded at 64 per request because the app coalesces a scroll burst into one call, not because a
+ *  session is short: a client with more to report sends more requests. Unknown ids are ignored
+ *  rather than refused, so a device replaying its offline queue after a chat reset is never stuck
+ *  retrying a batch it cannot repair. */
+export const BotChatDisplayedRequestSchema = Type.Object({
+  messageIds: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { minItems: 1, maxItems: 64 }),
+  /** Capability 73. What the person actually waited, from the send being tapped to the first delta
+   *  being rendered, on the PHONE's own clock. The gateway cannot measure this and never will: it
+   *  sees an admission and a frame leaving, not a thumb and a pixel.
+   *
+   *  It is reported here rather than on a new route because this is already the one call the app
+   *  makes when a row reaches the screen. It describes THIS report: a client that has a perceived
+   *  latency to declare sends the message it belongs to on its own rather than folded into a
+   *  coalesced scroll burst, and a gateway records at most one measurement per request whatever the
+   *  batch size, so a burst can never inflate a sample count.
+   *
+   *  Never added to a gateway-measured hop and never subtracted from one. Two clocks that were
+   *  never synchronised cannot be differenced, so this is its own figure beside them. */
+  feltLatencyMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 600_000 })),
+  /** Capability 73. The radio path the phone was on. A tunnel is reported separately. */
+  networkPath: Type.Optional(Type.Union([
+    Type.Literal("wifi"),
+    Type.Literal("cellular"),
+    Type.Literal("wired"),
+    Type.Literal("other"),
+  ])),
+  vpn: Type.Optional(Type.Boolean()),
+  edgeRttMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 600_000 })),
+  edgeColo: Type.Optional(Type.String({ pattern: "^[A-Z]{3,4}$" })),
+});
+export type BotChatDisplayedRequest = Static<typeof BotChatDisplayedRequestSchema>;
+
+/** `202` body for the same route. `recorded` counts the ids that became a NEW receipt: ids already
+ *  displayed and ids naming no durable row both count zero, so a client cannot read it as an error
+ *  signal and MUST NOT retry on a low count. The route is idempotent and first-write-wins. */
+export const BotChatDisplayedResponseSchema = Type.Object({
+  recorded: Type.Integer({ minimum: 0 }),
+});
+export type BotChatDisplayedResponse = Static<typeof BotChatDisplayedResponseSchema>;
+
+/** The non-file parts of the `POST /bots/:name/chat/photos` multipart body (capability 9). The
+ *  `file` part is not modelled here on purpose: it is bytes, and what makes it acceptable is the
+ *  size cap and the magic-byte sniff the gateway runs, neither of which a JSON schema can express.
+ *
+ *  `text` is the CAPTION, and it is what the bot is actually prompted with. It is optional and
+ *  shorter-capped than a text send: a caption rides beside an image, and the 32000-character
+ *  contract on `POST /bots/:name/chat/messages` is untouched by this route. An absent or blank
+ *  caption is replaced by a neutral default prompt so the attached plugin receives an explicit
+ *  turn instruction and the transcript honestly shows the words that were submitted. */
+export const BotChatPhotoFieldsSchema = Type.Object({
+  text: Type.Optional(Type.String({ maxLength: 4_000 })),
+  clientId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+});
+export type BotChatPhotoFields = Static<typeof BotChatPhotoFieldsSchema>;
+
+/** Non-file parts of `POST /bots/:name/chat/attachments` (capability 24). */
+export const BotChatAttachmentFieldsSchema = BotChatPhotoFieldsSchema;
+export type BotChatAttachmentFields = Static<typeof BotChatAttachmentFieldsSchema>;
+
+/** `POST /bots/focus` body. The app declares what it is looking at so the bridge polls Hermes at
+ *  the desktop's cadences only while a screen is open, and idles otherwise. `null` means the app
+ *  left the bots surface. */
+export const BotFocusRequestSchema = Type.Object({
+  screen: Type.Union([Type.Literal("roster"), Type.Literal("routines"), Type.Null()]),
+});
+export type BotFocusRequest = Static<typeof BotFocusRequestSchema>;
+
+/** Where a skill on a bot came from (capability 59). Four words and no others:
+ *  `default` is one of the four this build seeds into every new bot; `catalogue` is an entry of the
+ *  peer's own vendored catalogue, which is present on the read whether or not it is installed, so a
+ *  person can find it in a search and switch it on; `proposed` was drafted by the bot itself and
+ *  installed by a person accepting it; `installed` is everything else, which is to say somebody put
+ *  it there on purpose.
+ *
+ *  OPTIONAL, and absent is silence rather than `installed`: a Hermes bot never carries it
+ *  (`profiles.describe` has no such notion and this gateway does not invent one), and neither does
+ *  a runtime peer below 59. */
+export const BotSkillSourceSchema = Type.Union([
+  Type.Literal("default"),
+  Type.Literal("catalogue"),
+  Type.Literal("installed"),
+  Type.Literal("proposed"),
+]);
+export type BotSkillSource = Static<typeof BotSkillSourceSchema>;
+
+/** One skill a bot has or could have. From capability 59 the read carries every installed skill
+ *  and every entry of the peer's vendored catalogue. Skills are a DISABLED list server-side:
+ *  `enabled` remains the inverse of `disabledSkills`, and an uninstalled catalogue row is false.
+ *  `description` is the row's one-line summary when the peer carried one. */
+export const BotSkillSchema = Type.Object({
+  name: Type.String(),
+  enabled: Type.Boolean(),
+  description: Type.Optional(Type.String()),
+  /** Whether the peer has this skill compiled and ready (capability 59). A catalogue row that
+   *  nobody has switched on yet is `false`, and switching it on is what installs it. Absent below
+   *  59 and for a Hermes bot, where every row on the list is installed by construction. */
+  installed: Type.Optional(Type.Boolean()),
+  source: Type.Optional(BotSkillSourceSchema),
+});
+export type BotSkill = Static<typeof BotSkillSchema>;
+
+/** One toolset. From capability 59 a runtime peer lists every toolset its build ships plus every
+ *  name from another backend it has no equivalent for. Toolsets are an ENABLED list and it is a
+ *  PIN: `BotProfile.toolsetsPinned` says whether the profile carries one at all, and an EMPTY
+ *  `enabledToolsets` on the write path pops it rather than disabling everything. `toolCount` is
+ *  how many tools the set resolves to. */
+export const BotToolsetSchema = Type.Object({
+  name: Type.String(),
+  enabled: Type.Boolean(),
+  label: Type.Optional(Type.String()),
+  description: Type.Optional(Type.String()),
+  toolCount: Type.Optional(Type.Integer()),
+  /** False when this peer cannot offer the toolset at all (capability 59), as opposed to offering
+   *  it switched off. A row is LISTED rather than dropped so a person who saw the name on another
+   *  bot finds an answer here instead of an absence. Absent means available. */
+  available: Type.Optional(Type.Boolean()),
+  /** One sentence saying why, present exactly when `available` is false. */
+  unavailableReason: Type.Optional(Type.String()),
+});
+export type BotToolset = Static<typeof BotToolsetSchema>;
+
+/** What one MCP server's repair costs the person watching it (capability 63).
+ *
+ *  Two literals and no others, because the name IS the contract: `approve_once` means reconnecting
+ *  that server asks first, every time; `auto_refresh` means the operator already allowed the peer
+ *  to refresh that server on its own, so a reconnect happens without a question. Those are the two
+ *  settings capability 62's `BotApprovalRepair.policy` reports on a live proposal, and this is the
+ *  same fact read off the server row instead of off one approval.
+ *
+ *  Closed for the reason every closed set on this contract is closed: an open string here would let
+ *  a peer hand a client an uninterpretable value in the position where the client renders a
+ *  PERMISSION, and a typo would render as a policy nobody set. A third name is the runtime peer's
+ *  refusal to make, not something this gateway passes through untyped. */
+export const BotMcpRepairPolicySchema = Type.Union([
+  Type.Literal("approve_once"),
+  Type.Literal("auto_refresh"),
+]);
+export type BotMcpRepairPolicy = Static<typeof BotMcpRepairPolicySchema>;
+
+/** Capability 89. A server name is a card name on the harness: lower case, no dot (a dot separates
+ *  a group), at most 64 characters. */
+const McpServerNameSchema = Type.String({ pattern: "^[a-z0-9][a-z0-9_-]{0,63}$" });
+/** Capability 89. An MCP tool or action name as servers publish them. */
+const McpToolNameSchema = Type.String({ pattern: "^[A-Za-z0-9_./:-]{1,128}$" });
+
+/** Capability 89. ONE REMOTE MCP SERVER A CHAT CLIENT DECLARES FOR ONE BOT, carried on the
+ *  `bot_config` `profile.write` as `BotProfilePatch.declareMcpServers`.
+ *
+ *  A declaration is a URL the harness DIALS, never a program the host STARTS. The object is closed
+ *  and `transport` is the single literal `http` (Streamable HTTP, which the harness falls back to
+ *  SSE on), so `command`, `args`, `env` and `cwd`, everything a stdio server needs, is simply not a
+ *  field: no body a client can send reaches host command execution. A stdio server stays the
+ *  operator's to declare in the bot's own environment, as capability 63's policy does.
+ *
+ *  NO SECRET VALUE CROSSES THE WIRE, AND A SECRET GOES ONLY WHERE THE OPERATOR SAID. A header value
+ *  is exactly one `${COZY_MCP_<NAME>}` placeholder, optionally after one auth scheme word
+ *  (`Bearer`, `Basic`, `Token`), so the phone, this gateway and every projection hold only the
+ *  variable's NAME. The `COZY_MCP_` prefix is the operator's opt-in: no other variable can be
+ *  named. Naming is not sending: the peer expands `${COZY_MCP_<NAME>}` ONLY when the declaration's
+ *  URL origin (scheme, host, port) is listed in the operator-set `COZY_MCP_<NAME>_ORIGINS` (a comma
+ *  list of origins), and otherwise refuses the whole declaration by name in `ignored`, before
+ *  anything is dialled. An entry is compared exactly against the WHATWG `URL.origin`
+ *  serialization: no wildcards, and `null` never matches. The binding is per origin, not per path,
+ *  so an operator lists only origins whose whole surface they trust with that token. So a device that can write this patch still cannot aim an operator secret
+ *  at a URL of its choosing: the origin allowlist is set on the harness, never through this lane,
+ *  and a header may not name an `_ORIGINS` variable itself.
+ *
+ *  THE URL. `mcpServerDeclarationProblem` refuses userinfo, query, fragment, backslash and
+ *  placeholders (the obvious credential slots; a path can still hold anything, so a client must not
+ *  put a secret there) and, as defence in depth, a literal loopback, unspecified, link-local or cloud
+ *  metadata host and `localhost`. The peer is the real SSRF boundary: it puts every client-declared
+ *  URL through its URL policy with private, loopback and link-local addresses blocked, refuses
+ *  `.local` hosts, and allows private hosts only under an operator setting for CLIENT declarations
+ *  that is separate from the one its own servers use; it checks the RESOLVED address, pins it for
+ *  the connection AND re-checks every redirect hop (or refuses redirects). Once any header has been
+ *  expanded it never follows a redirect off the allowlisted origin: `fetch` carries a custom header
+ *  such as `X-Api-Key` across a cross-origin redirect.
+ *
+ *  Harness-owned settings are absent for the same reason: `mutating`, capability 63's `repair`,
+ *  `groups` and the budgets are the operator's. The harness MUST treat EVERY tool of a
+ *  client-declared server as mutating, a possible effect that asks under the bot's guardrails,
+ *  whatever an absent `mutating` means for an operator's server (CozyAgents reads an absent list as
+ *  "every tool investigates", which is the opposite and must not apply here), and applies its
+ *  `approve_once` repair default.
+ *
+ *  `tools` is the allowlist of tools the harness exposes (absent: every tool the server publishes,
+ *  each still asking); `actions` narrows a tool whose calls take an `action` argument, and needs
+ *  `tools` so every key it names is one the allowlist admits.
+ *
+ *  CLOSED ON READ TOO. The projected `BotMcpServer.declaration` is validated whole with the rest of
+ *  the `profile.read`, the lane's convention, so a field added here later would make every older
+ *  gateway refuse the frame: growing this shape needs a new capability, not an optional field. */
+export const BotMcpServerDeclarationSchema = Type.Object({
+  name: McpServerNameSchema,
+  transport: Type.Literal("http"),
+  url: Type.String({ maxLength: 2048, pattern: "^https?://\\S+$" }),
+  headers: Type.Optional(Type.Record(
+    Type.String({ pattern: "^[A-Za-z0-9-]{1,64}$" }),
+    Type.String({ pattern: "^(?:(?:Bearer|Basic|Token) )?\\$\\{COZY_MCP_[A-Z0-9_]{1,64}\\}$" }),
+    { maxProperties: 8, additionalProperties: false },
+  )),
+  description: Type.Optional(Type.String({ maxLength: 200, pattern: "^[^\\u0000-\\u001f\\u007f-\\u009f]*\\S[^\\u0000-\\u001f\\u007f-\\u009f]*$" })),
+  tools: Type.Optional(Type.Array(McpToolNameSchema, { minItems: 1, maxItems: 128, uniqueItems: true })),
+  actions: Type.Optional(Type.Record(
+    McpToolNameSchema,
+    Type.Array(McpToolNameSchema, { minItems: 1, maxItems: 64, uniqueItems: true }),
+    { maxProperties: 128, additionalProperties: false },
+  )),
+}, { additionalProperties: false });
+export type BotMcpServerDeclaration = Static<typeof BotMcpServerDeclarationSchema>;
+
+/** One MCP server as the edit screen sees it: the union of the servers the profile DEFINES and the
+ *  bundled catalog's menu. `installed` is true for a server the profile defines, and the catalog's
+ *  own flag otherwise; `fromCatalog` marks a row the profile does not define yet, which is offered
+ *  so a user can turn it on (the gateway copies its definition from the launch profile on write).
+ *  `auth` is passed through only when the gateway sends it.
+ *
+ *  `repair` (capability 63) is OPTIONAL and READ-ONLY METADATA: it is the harness's own per-server
+ *  repair setting, projected onto this row so a client can say what a reconnect will cost before it
+ *  costs it. It never appears on `BotProfilePatchSchema`: `enabledMcpServers` is a list of NAMES,
+ *  and capability 89's closed `BotMcpServerDeclaration` has no `repair` field, so there is no shape
+ *  a client could send a policy in. Changing the setting is done on the harness. This gateway neither stores, computes,
+ *  writes, nor executes anything from it: it validates the closed union and relays what the peer
+ *  answered on the capability-48 `bot_config` `profile.read`.
+ *
+ *  AN ABSENT WIRE FIELD IS NOT PROJECTED OR UNKNOWN. Hermes and runtime peers below 63 omit it,
+ *  and this gateway leaves it absent. A known CozyAgents peer may project its effective
+ *  `approve_once` default after negotiating 63, even when the operator omitted that config key.
+ *  `approve_once` still asks for approval; it does not grant repair permission. */
+export const BotMcpServerSchema = Type.Object({
+  name: Type.String(),
+  installed: Type.Boolean(),
+  enabled: Type.Boolean(),
+  auth: Type.Optional(Type.String()),
+  description: Type.Optional(Type.String()),
+  transport: Type.Optional(Type.String()),
+  requires: Type.Optional(Type.Array(Type.String())),
+  fromCatalog: Type.Optional(Type.Boolean()),
+  repair: Type.Optional(BotMcpRepairPolicySchema),
+  /** Capability 89. READ-ONLY: present exactly on a server a chat client declared through
+   *  `declareMcpServers`, and it is that declaration back, which by construction holds no secret.
+   *  Its presence is what tells an edit screen the row is the client's to edit or remove; a row
+   *  without it (operator-declared, built-in, a catalog template) is not. A peer emits it only
+   *  after the gateway advertised `>= 89`, and only in this closed shape: an invalid one fails the
+   *  whole read, as every `bot_config` projection does. */
+  declaration: Type.Optional(BotMcpServerDeclarationSchema),
+});
+export type BotMcpServer = Static<typeof BotMcpServerSchema>;
+
+/** Which profile sections this gateway accepts, persists and shows back on a read, but which the
+ *  BACKEND does not consult at runtime. A client renders those sections with an honesty note
+ *  ("saved, takes effect when the gateway supports it") and gates it on this list rather than on a
+ *  Hermes version string it has no reliable way to read.
+ *
+ *  Always present, possibly empty. The names are the PATCH body's own sections, minus the
+ *  `enabled`/`disabled` prefix: `toolsets` answers for `enabledToolsets`, `mcpServers` for
+ *  `enabledMcpServers`. A client that does not recognize a name shows the generic note. */
+export const BotProfileRuntimeInertSchema = Type.Array(
+  Type.Union([Type.Literal("toolsets"), Type.Literal("mcpServers")]),
+);
+export type BotProfileRuntimeInert = Static<typeof BotProfileRuntimeInertSchema>;
+
+/** How much a bot does without asking (capability 57).
+ *
+ *  Four literals and no others, because the name IS the contract: `locked` reads and changes
+ *  nothing, `guided` asks before every change, `balanced` works in its own workspace and asks
+ *  before anything that leaves it, `autonomous` works unasked and still asks before the destructive
+ *  set no level lifts. This gateway does not interpret the value: the closed union is what makes a
+ *  fifth name the runtime peer's refusal to make, not a silent pass-through of a typo. */
+export const GuardrailLevelSchema = Type.Union([
+  Type.Literal("locked"),
+  Type.Literal("guided"),
+  Type.Literal("balanced"),
+  Type.Literal("autonomous"),
+]);
+export type GuardrailLevel = Static<typeof GuardrailLevelSchema>;
+
+const NameItem = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S" });
+
+/** `GET /bots/:name/profile`: one bot's full edit-screen state. `model.default` is the model id and
+ *  keeps the gateway's own field name; both model fields are empty strings when the profile
+ *  inherits the launch profile's model rather than pinning one.
+ *
+ *  `guardrailLevel` (capability 57) is OPTIONAL, not required: this gateway does not store or
+ *  compute it, it only relays whatever the runtime peer answers on `profile.read`. Absent for a
+ *  Hermes bot (Hermes has no notion of the field) and for a runtime peer that has not negotiated
+ *  capability 57, and never backfilled -- an absent value here is not a default, it is silence.
+ *
+ *  `guardrailCeiling` (capability 58) is OPTIONAL too and READ-ONLY: it never appears on
+ *  `BotProfilePatchSchema`, only on this read. It is the operator's ceiling on `guardrailLevel`,
+ *  set on the runtime peer rather than through this gateway; a `profile.write` asking for a level
+ *  above it is the runtime peer's own refusal to make (`400` naming the field and the ceiling), not
+ *  something this gateway enforces. Absent for a Hermes bot and for a runtime peer that has not
+ *  negotiated capability 58, and never backfilled, exactly as `guardrailLevel` is. */
+export const BotProfileSchema = Type.Object({
+  name: Type.String(),
+  description: Type.String(),
+  soul: Type.String(),
+  skills: Type.Array(BotSkillSchema),
+  toolsets: Type.Array(BotToolsetSchema),
+  toolsetsPinned: Type.Boolean(),
+  mcpServers: Type.Array(BotMcpServerSchema),
+  model: Type.Object({ provider: Type.String(), default: Type.String() }),
+  runtimeInert: BotProfileRuntimeInertSchema,
+  guardrailLevel: Type.Optional(GuardrailLevelSchema),
+  guardrailCeiling: Type.Optional(GuardrailLevelSchema),
+  /** Capability 88. Stored by the gateway, never by the peer, because the gateway is what enforces
+   *  it. Absent means member. */
+  role: Type.Optional(BotTeamRoleSchema),
+  /** Capability 88. The bots this leader may assign work to, at most 16. Absent on a member. */
+  reports: Type.Optional(Type.Array(NameItem, { maxItems: 16 })),
+});
+export type BotProfile = Static<typeof BotProfileSchema>;
+
+/** `PATCH /bots/:name/profile` body. Every field is optional and ONLY the fields present are
+ *  written, which is the desktop's "send only dirty sections" rule. The inversions are the whole
+ *  point of the shape and must not be guessed at:
+ *  - `disabledSkills` is the OFF list (send the names to disable, not the ones to keep);
+ *  - `enabledToolsets` is the ON list, and `[]` CLEARS the pin so every toolset is enabled again;
+ *  - `enabledMcpServers` is the ON list, replace semantics, unknown names skipped by the gateway.
+ *
+ *  `enabledSkills` (capability 59) is the ON list, and it is ADDITIVE, not replace-whole: it names
+ *  the skills to switch on, a runtime peer installs any of them its catalogue has and its bot does
+ *  not, and it clears each from the stored OFF list. It NEVER uninstalls and it never disables:
+ *  the OFF direction is `disabledSkills`, unchanged. A name the peer neither has nor can install is
+ *  refused BY NAME in the `applied` map while the rest of the patch still applies. Sent to a Hermes
+ *  bot it is not part of that peer's vocabulary and is not forwarded.
+ *
+ *  Every name must carry at least one non-whitespace character, which is why the item rule is a
+ *  PATTERN and not just `minLength: 1`. A single space passes a length check, and the backend then
+ *  filters it, leaving `enabledToolsets` EMPTY, which pops the pin and enables every toolset: the
+ *  maximum-permission outcome from what looks like a typo. Refused at the boundary instead.
+ *
+ *  `guardrailLevel` (capability 57) is additive, optional, and one of the four literal names and
+ *  nothing else: a body carrying any other value is `400 invalid_request` naming the field. The
+ *  gateway does not store it: the patch is forwarded to the runtime peer over the existing
+ *  `bot_config` profile lane unchanged, so a level reaches the peer the moment the schema admits
+ *  it. Sent to a Hermes bot, it is simply not part of that peer's vocabulary and is ignored.
+ *
+ *  `guardrailCeiling` (capability 58) NEVER appears here: it is read-only, set on the runtime peer
+ *  rather than through this gateway, so the field is `Type.Optional(Type.Never())` -- present at
+ *  all, with any value, is `400 invalid_request` naming the field, the same shape every other
+ *  boundary refusal on this route already answers. */
+/** Capability 80. The per-bot presentation the Hermes desktop plugin syncs through
+ *  `ui_meta["hermes-bots"]`: roster pin, roster hide, user-section membership (id plus the name that
+ *  lets another client rebuild a section it never made) and the friendly title. Every field is
+ *  optional because the blob simply lacks a key nobody wrote; an absent key is NOT `false`, which is
+ *  what lets a client push a device-local pin the first time it syncs. */
+const PresentationText = Type.String({ minLength: 1, maxLength: 128, pattern: "\\S" });
+/** Capability 81. The desktop's face string: `blobatar[:seed[:kind]]`, a geometric shape, or a
+ *  legacy `sigil-<n>`. Free-form on purpose; the client parses it. */
+const LookShape = Type.String({ minLength: 1, maxLength: 256, pattern: "\\S" });
+/** Capability 81. CozyChat's own namespaced look record inside the same blob: the exact Living Jelly
+ *  a phone chose (`jelly`), the seed it locked (`seed`), a Prism tint (`prism`, `#rrggbb`) and the
+ *  desktop `shape` it wrote beside them (`shape`), which is how a phone tells whether a desktop has
+ *  changed the look since. */
+export const BotCozyLookSchema = Type.Object({
+  jelly: Type.Optional(PresentationText),
+  seed: Type.Optional(PresentationText),
+  prism: Type.Optional(Type.String({ pattern: "^#[0-9a-fA-F]{6}$" })),
+  shape: Type.Optional(LookShape),
+  /** The desktop `color` written beside it: a colour-only desktop change also retires the record. */
+  color: Type.Optional(PresentationText),
+}, { additionalProperties: false });
+export type BotCozyLook = Static<typeof BotCozyLookSchema>;
+const ImageKind = Type.Union([Type.Literal("photo"), Type.Literal("shape")]);
+
+export const BotPresentationSchema = Type.Object({
+  pinned: Type.Optional(Type.Boolean()),
+  hidden: Type.Optional(Type.Boolean()),
+  sectionId: Type.Optional(PresentationText),
+  sectionName: Type.Optional(PresentationText),
+  title: Type.Optional(PresentationText),
+  /** Capability 81: the look. */
+  shape: Type.Optional(LookShape),
+  color: Type.Optional(PresentationText),
+  custom: Type.Optional(Type.Boolean()),
+  imageKind: Type.Optional(ImageKind),
+  cozychat: Type.Optional(BotCozyLookSchema),
+}, { additionalProperties: false });
+export type BotPresentation = Static<typeof BotPresentationSchema>;
+
+/** Capability 80. `PATCH /bots/:name/presentation` body. Only the keys present are written, `null`
+ *  clears a section or title, and every other key in the profile's `ui_meta["hermes-bots"]` blob is
+ *  kept verbatim (the gateway re-reads and re-applies on a revision conflict, never overwrites). */
+export const BotPresentationPatchSchema = Type.Object({
+  pinned: Type.Optional(Type.Boolean()),
+  hidden: Type.Optional(Type.Boolean()),
+  sectionId: Type.Optional(Type.Union([PresentationText, Type.Null()])),
+  sectionName: Type.Optional(Type.Union([PresentationText, Type.Null()])),
+  title: Type.Optional(Type.Union([PresentationText, Type.Null()])),
+  /** Capability 81: the look, set or (`null`) cleared key by key like the rest. */
+  shape: Type.Optional(Type.Union([LookShape, Type.Null()])),
+  color: Type.Optional(Type.Union([PresentationText, Type.Null()])),
+  custom: Type.Optional(Type.Union([Type.Boolean(), Type.Null()])),
+  imageKind: Type.Optional(Type.Union([ImageKind, Type.Null()])),
+  cozychat: Type.Optional(Type.Union([BotCozyLookSchema, Type.Null()])),
+  /** Capability 81: a backfill. Written only if the blob, re-read inside the compare-and-swap loop,
+   *  still has NO look key; otherwise the write is skipped and the current presentation answered.
+   *  This is how a phone's first sync can never overwrite a look another client wrote meanwhile. */
+  lookIfAbsent: Type.Optional(Type.Boolean()),
+}, { additionalProperties: false });
+export type BotPresentationPatch = Static<typeof BotPresentationPatchSchema>;
+
+/** Capability 80. `GET` and `PATCH /bots/:name/presentation` answer. `revision` is Hermes's own
+ *  per-key compare-and-swap counter for `ui_meta["hermes-bots"]` (0 when never written). */
+export const BotPresentationResponseSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 128 }),
+  presentation: BotPresentationSchema,
+  revision: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotPresentationResponse = Static<typeof BotPresentationResponseSchema>;
+
+/** Capability 81. `PUT /bots/:name/avatar`: a PNG, JPEG or WebP as a data URL (or bare base64),
+ *  at most 2 MB decoded. The format is sniffed from the bytes, never taken from the declared type. */
+export const BotAvatarSetRequestSchema = Type.Object({
+  data: Type.String({ minLength: 8, maxLength: 2_800_000 }),
+}, { additionalProperties: false });
+export type BotAvatarSetRequest = Static<typeof BotAvatarSetRequestSchema>;
+
+/** Capability 81. `PUT`/`DELETE /bots/:name/avatar` answer. */
+export const BotAvatarSetResponseSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 128 }),
+  hasAvatar: Type.Boolean(),
+  size: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotAvatarSetResponse = Static<typeof BotAvatarSetResponseSchema>;
+
+/** Capability 81. `POST /bots/:name/avatar/generate`: `probe: true` only asks whether Hermes has an
+ *  image backend; otherwise `prompt` is required. */
+export const BotAvatarGenerateRequestSchema = Type.Object({
+  prompt: Type.Optional(Type.String({ minLength: 1, maxLength: 2000, pattern: "\\S" })),
+  probe: Type.Optional(Type.Boolean()),
+}, { additionalProperties: false });
+export type BotAvatarGenerateRequest = Static<typeof BotAvatarGenerateRequestSchema>;
+
+/** Capability 81. `image` is a data URL, present only on success. The portrait is NOT saved: the
+ *  client previews it and saves it with `PUT /bots/:name/avatar`, as the desktop does. */
+export const BotAvatarGenerateResponseSchema = Type.Object({
+  available: Type.Boolean(),
+  success: Type.Optional(Type.Boolean()),
+  image: Type.Optional(Type.String()),
+  error: Type.Optional(Type.String()),
+}, { additionalProperties: false });
+export type BotAvatarGenerateResponse = Static<typeof BotAvatarGenerateResponseSchema>;
+
+/** Capability 81. One petdex companion from `GET /bots/:name/avatar/pets`. */
+export const BotAvatarPetSchema = Type.Object({
+  slug: Type.String({ minLength: 1, maxLength: 128 }),
+  displayName: Type.String(),
+  installed: Type.Boolean(),
+  curated: Type.Boolean(),
+  /** Empty for a pet hatched locally, which the thumb route still serves from disk. */
+  spritesheetUrl: Type.String(),
+}, { additionalProperties: false });
+export type BotAvatarPet = Static<typeof BotAvatarPetSchema>;
+
+export const BotAvatarPetGallerySchema = Type.Object({
+  pets: Type.Array(BotAvatarPetSchema),
+}, { additionalProperties: false });
+export type BotAvatarPetGallery = Static<typeof BotAvatarPetGallerySchema>;
+
+/** Capability 81. `POST /bots/:name/avatar/pets/thumb`: a pet's first idle frame as a PNG data URI,
+ *  cropped by Hermes (`pet.thumb`). The client sets it as the avatar with `PUT`. */
+export const BotAvatarPetThumbRequestSchema = Type.Object({
+  slug: Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._-]+$" }),
+  url: Type.Optional(Type.String({ maxLength: 1024 })),
+}, { additionalProperties: false });
+export type BotAvatarPetThumbRequest = Static<typeof BotAvatarPetThumbRequestSchema>;
+
+export const BotAvatarPetThumbResponseSchema = Type.Object({
+  ok: Type.Boolean(),
+  image: Type.Optional(Type.String()),
+}, { additionalProperties: false });
+export type BotAvatarPetThumbResponse = Static<typeof BotAvatarPetThumbResponseSchema>;
+
+/** Capability 86 (voice). The voice a bot speaks with: its OWN profile's `tts.*` on its own Hermes,
+ *  as upstream Bot Mode does (Read Aloud and auto-speak never borrow the active profile's voice).
+ *  `configured: false` means the profile has no usable `tts` block, and a client hides its speech
+ *  controls. `provider` is Hermes's provider id (`edge` when the block names none, Hermes's own
+ *  default); `voice` is that provider's configured voice when it names one. */
+export const BotVoiceSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 128 }),
+  configured: Type.Boolean(),
+  provider: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+  voice: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+}, { additionalProperties: false });
+export type BotVoice = Static<typeof BotVoiceSchema>;
+
+/** Capability 86 (voice). `POST /bots/:name/speak` body. The text is spoken as given; Hermes strips
+ *  markdown itself. The cap matches one long reply, not a document. */
+export const BotSpeakRequestSchema = Type.Object({
+  text: Type.String({ minLength: 1, maxLength: 20_000, pattern: "\\S" }),
+}, { additionalProperties: false });
+export type BotSpeakRequest = Static<typeof BotSpeakRequestSchema>;
+
+// Capability 87: the cross-connection relay doors (upstream `tui_gateway/methods_bot_relay.py`).
+// Rows and envelopes are Hermes's own snake_case shapes, forwarded verbatim in both directions.
+const RelayHandle = Type.String({ minLength: 1, maxLength: 64, pattern: "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$" });
+
+export const BotRelayAgentSchema = Type.Object({
+  profile: RelayHandle,
+  handle: RelayHandle,
+  connection_id: RelayHandle,
+  connection_label: Type.Optional(Type.String({ maxLength: 200 })),
+  title: Type.Optional(Type.String({ maxLength: 500 })),
+  description: Type.Optional(Type.String({ maxLength: 2_000 })),
+  online: Type.Optional(Type.Boolean()),
+});
+export type BotRelayAgent = Static<typeof BotRelayAgentSchema>;
+
+/** `POST /bot-relay/roster`: the agents on the phone's OTHER connections (replaces the last push).
+ *  Rows are admitted one by one (`normalizeRelayAgents`): an invalid row is dropped and an overlong
+ *  field is trimmed to upstream's limits, so one bad row never costs the whole push. */
+export const BotRelayRosterRequestSchema = Type.Object({
+  agents: Type.Array(Type.Unknown(), { maxItems: 2_000 }),
+}, { additionalProperties: false });
+export type BotRelayRosterRequest = Static<typeof BotRelayRosterRequestSchema>;
+
+/** `POST /bot-relay/drain` answer: every envelope claimed off this gateway's Hermes outbox. */
+export const BotRelayDrainResponseSchema = Type.Object({
+  envelopes: Type.Array(Type.Record(Type.String(), Type.Unknown())),
+}, { additionalProperties: false });
+export type BotRelayDrainResponse = Static<typeof BotRelayDrainResponseSchema>;
+
+/** `POST /bot-relay/deliver`: run one relayed turn in `profile`'s Bot Chat on this gateway. */
+export const BotRelayDeliverRequestSchema = Type.Object({
+  profile: Type.String({ minLength: 1, maxLength: 128 }),
+  // Hermes counts code points (16,000 + 200 attribution headroom); this cap counts UTF-16 units, so it
+  // is doubled and the exact limit is left to Hermes.
+  message: Type.String({ minLength: 1, maxLength: 32_400 }),
+  fromProfile: Type.Optional(Type.String({ maxLength: 128 })),
+  fromHandle: Type.Optional(Type.String({ maxLength: 128 })),
+  fromConnection: Type.Optional(Type.String({ maxLength: 128 })),
+}, { additionalProperties: false });
+export type BotRelayDeliverRequest = Static<typeof BotRelayDeliverRequestSchema>;
+
+/** A failed turn is an ANSWER (200) carrying the target's own typed `reason`, never an HTTP error,
+ *  so the code reaches the courier intact. */
+export const BotRelayDeliverResponseSchema = Type.Union([
+  Type.Object({ reply: Type.String() }, { additionalProperties: false }),
+  Type.Object({ error: Type.String(), reason: Type.Optional(Type.String()) }, { additionalProperties: false }),
+]);
+export type BotRelayDeliverResponse = Static<typeof BotRelayDeliverResponseSchema>;
+
+/** `POST /bot-relay/reply`: hand a reply (or a typed failure) back to the sender's waiter. */
+export const BotRelayReplyRequestSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 128 }),
+  // No cap on `reply`: Hermes itself relays a reply whole, and a refused reply would leave the
+  // sender's waiter to time out and the claimed envelope to be re-delivered (a duplicate turn).
+  reply: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  error: Type.Optional(Type.Union([Type.String({ maxLength: 16_000 }), Type.Null()])),
+  reason: Type.Optional(Type.Union([Type.String({ maxLength: 64 }), Type.Null()])),
+}, { additionalProperties: false });
+export type BotRelayReplyRequest = Static<typeof BotRelayReplyRequestSchema>;
+
+/** Capability 87. `GET /bot-relay/identity`: the id this gateway goes by on the relay, the same on
+ *  every phone (the gateway's configured name, slugged, plus the first six characters of its Hermes
+ *  install id when Hermes reports one). */
+export const BotRelayIdentitySchema = Type.Object({
+  connectionId: RelayHandle,
+  label: Type.String(),
+  /** The Hermes install behind this gateway, so a phone that ALSO reaches that install directly
+   *  recognises the two as one relay connection. Absent on a Hermes that does not report one. */
+  installId: Type.Optional(Type.String()),
+}, { additionalProperties: false });
+export type BotRelayIdentity = Static<typeof BotRelayIdentitySchema>;
+
+/** Capability 87. The gateway's Hermes queued a cross-connection envelope; a courier drains now. */
+export const BotRelayPendingFrameSchema = Type.Object({
+  type: Type.Literal("bot_relay_pending"),
+});
+export type BotRelayPendingFrame = Static<typeof BotRelayPendingFrameSchema>;
+
+export const BotProfilePatchSchema = Type.Object({
+  soul: Type.Optional(Type.String({ maxLength: 200_000 })),
+  disabledSkills: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
+  enabledSkills: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
+  enabledToolsets: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
+  enabledMcpServers: Type.Optional(Type.Array(NameItem, { maxItems: 500 })),
+  guardrailLevel: Type.Optional(GuardrailLevelSchema),
+  guardrailCeiling: Type.Optional(Type.Never()),
+  /** Capability 88. Stored by the gateway and stripped before the rest of the patch is forwarded;
+   *  a patch carrying only `role` and `reports` touches no peer. `member` clears `reports`. */
+  role: Type.Optional(BotTeamRoleSchema),
+  /** Capability 88. Replace semantics. Refused with `invalid_request` on a member, for the bot
+   *  itself, and for a name that is not a bot on this gateway. */
+  reports: Type.Optional(Type.Array(NameItem, { maxItems: 16 })),
+  /** Capability 89. Upserts, whole, the named remote servers (`BotMcpServerDeclaration`). */
+  declareMcpServers: Type.Optional(Type.Array(BotMcpServerDeclarationSchema, { minItems: 1, maxItems: 16 })),
+  /** Capability 89. Removes servers this lane declared, by name. */
+  removeMcpServers: Type.Optional(Type.Array(McpServerNameSchema, { minItems: 1, maxItems: 64, uniqueItems: true })),
+});
+export type BotProfilePatch = Static<typeof BotProfilePatchSchema>;
+
+/** Capability 89. Names a peer may keep in a plain object map, where these three reach the
+ *  prototype rather than an own entry. Refused as server, tool, action and header names. */
+const PROTOTYPE_KEYS: ReadonlySet<string> = new Set(["__proto__", "constructor", "prototype"]);
+
+/** Capability 89. Headers a declaration may not set: the transport's own framing, routing and
+ *  session (a smuggled `Host` or `Transfer-Encoding` re-aims or re-frames the request, and
+ *  `Mcp-Session-Id` would hijack or pin a session the harness owns), and ambient credentials
+ *  (`Cookie`). Compared case-insensitively; every `Proxy-*` header is included. */
+const DENIED_HEADERS: ReadonlySet<string> = new Set([
+  "host", "content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer", "cookie",
+  // The MCP transport's own session header, and the interim-response handshake.
+  "mcp-session-id", "expect",
+]);
+
+/** Capability 89. Host NAMES that mean this machine or a cloud metadata service. */
+const REFUSED_HOST_NAMES: ReadonlySet<string> = new Set([
+  "localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback", "metadata.google.internal",
+]);
+
+/** Capability 89. Why an IPv4 address (as four octets) is refused, or `undefined`. */
+function refusedIpv4(a: number, b: number, c: number, d: number): string | undefined {
+  if (a === 127) return "a loopback address";
+  if (a === 0) return "an unspecified address";
+  if (a === 169 && b === 254) return "a link-local or cloud metadata address";
+  if (a === 100 && b === 100 && c === 100 && d === 200) return "a cloud metadata address";
+  if (a === 192 && b === 0 && c === 0 && d === 192) return "a cloud metadata address";
+  return undefined;
+}
+
+/** Capability 89. A WHATWG-serialized IPv6 host (hex groups, `::` compressed, never dotted) as
+ *  its eight 16-bit groups, or `undefined` when it is not one. */
+function ipv6Groups(host: string): number[] | undefined {
+  const halves = host.split("::");
+  if (halves.length > 2) return undefined;
+  const parse = (part: string) => (part === "" ? [] : part.split(":").map((group) => /^[0-9a-f]{1,4}$/.test(group) ? parseInt(group, 16) : NaN));
+  const head = parse(halves[0]!);
+  const tail = halves.length === 2 ? parse(halves[1]!) : [];
+  const fill = 8 - head.length - tail.length;
+  if (halves.length === 1 ? head.length !== 8 : fill < 1) return undefined;
+  const groups = [...head, ...Array<number>(halves.length === 2 ? fill : 0).fill(0), ...tail];
+  return groups.some(Number.isNaN) ? undefined : groups;
+}
+
+/** Capability 89. Why a URL's host is one the gateway refuses outright, or `undefined`. Defence in
+ *  depth only: the literal forms are refusable here without a DNS lookup, and everything a name
+ *  resolves to (a private address, a `.local` host, a redirect) is the peer's URL policy to check
+ *  at connect time, as row 89 requires. `hostname` is the WHATWG-normalized one, so an IPv4 in
+ *  decimal, hex or shorthand has already been rewritten to dotted quads, and IPv6 is compressed
+ *  hex. An IPv6 form that CARRIES an IPv4 address (mapped `::ffff:0:0/96`, the deprecated
+ *  IPv4-compatible `::/96`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`) is judged as that address. */
+function refusedHost(hostname: string): string | undefined {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (REFUSED_HOST_NAMES.has(host) || host.endsWith(".localhost")) return "a loopback or metadata host";
+  const quad = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(host);
+  if (quad !== null) return refusedIpv4(Number(quad[1]), Number(quad[2]), Number(quad[3]), Number(quad[4]));
+  if (!host.includes(":")) return undefined;
+  const g = ipv6Groups(host);
+  if (g === undefined) return undefined;
+  const zero = (from: number, to: number) => g.slice(from, to).every((group) => group === 0);
+  const embedded = (high: number, low: number) => refusedIpv4(high >> 8, high & 255, low >> 8, low & 255);
+  if (zero(0, 8)) return "an unspecified address";
+  if (zero(0, 7) && g[7] === 1) return "a loopback address";
+  if ((g[0]! & 0xffc0) === 0xfe80) return "a link-local address";
+  if ((g[0]! & 0xffc0) === 0xfec0) return "a site-local address";
+  if (g[0] === 0xfd00 && g[1] === 0x0ec2 && zero(2, 7) && g[7] === 0x0254) return "a cloud metadata address";
+  if (zero(0, 5) && g[5] === 0xffff) return embedded(g[6]!, g[7]!);
+  if (zero(0, 6)) return embedded(g[6]!, g[7]!);
+  if (g[0] === 0x64 && g[1] === 0xff9b && zero(2, 6)) return embedded(g[6]!, g[7]!);
+  if (g[0] === 0x2002) return embedded(g[1]!, g[2]!);
+  return undefined;
+}
+
+/** Capability 89. What `BotProfilePatchSchema` cannot say about `declareMcpServers` and
+ *  `removeMcpServers`, as one sentence, or `undefined` when the patch is fine. The gateway answers
+ *  `400 invalid_request` with it after the schema passes; a client may run the same check first.
+ *
+ *  A name declared twice, or both declared and removed, is ambiguous about which one wins, and the
+ *  answer must not depend on a peer's iteration order. A header named twice under different cases
+ *  is the same header on the wire, and the framing, routing and cookie headers are refused. A
+ *  prototype key is refused as any name. `actions` needs `tools`, and names only tools in it. A
+ *  header may not name a `COZY_MCP_*_ORIGINS` variable: those are the operator's allowlists.
+ *
+ *  The URL must parse as http or https and carry no userinfo, query, fragment, backslash or `${...}`
+ *  placeholder, which keeps the obvious credential slots out of an address every projection shows
+ *  (a path segment can still hold anything, so a client must not put a secret there). Its host may
+ *  not be a literal loopback, unspecified, link-local, site-local or cloud metadata address (an
+ *  IPv6 form carrying one included), nor a loopback or metadata host name (`refusedHost`): defence
+ *  in depth only, since the peer's URL policy is what checks a NAME's resolved address. */
+export function mcpServerDeclarationProblem(patch: BotProfilePatch): string | undefined {
+  for (const name of patch.removeMcpServers ?? []) {
+    if (PROTOTYPE_KEYS.has(name)) return `removeMcpServers may not name ${name}`;
+  }
+  const declared = patch.declareMcpServers ?? [];
+  const names = new Set<string>();
+  for (const server of declared) {
+    if (PROTOTYPE_KEYS.has(server.name)) return `declareMcpServers may not name ${server.name}`;
+    if (names.has(server.name)) return `declareMcpServers names ${server.name} more than once`;
+    names.add(server.name);
+    if (patch.removeMcpServers?.includes(server.name) === true) {
+      return `${server.name} is in both declareMcpServers and removeMcpServers`;
+    }
+    const where = `declareMcpServers ${server.name}`;
+    if (server.url.includes("${")) return `${where} url must not carry a placeholder; put credentials in headers`;
+    if (server.url.includes("\\")) return `${where} url must not carry a backslash`;
+    let url: URL;
+    try {
+      url = new URL(server.url);
+    } catch {
+      return `${where} url must be an http or https url`;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return `${where} url must be an http or https url`;
+    if (url.username !== "" || url.password !== "") return `${where} url must not carry credentials; put them in headers`;
+    if (url.search !== "" || url.hash !== "" || server.url.includes("?") || server.url.includes("#")) {
+      return `${where} url must not carry a query or fragment; put credentials in headers`;
+    }
+    const host = refusedHost(url.hostname);
+    if (host !== undefined) return `${where} url must not point at ${host}`;
+    const headers = new Set<string>();
+    for (const [header, value] of Object.entries(server.headers ?? {})) {
+      const lower = header.toLowerCase();
+      if (PROTOTYPE_KEYS.has(lower)) return `${where} may not name header ${header}`;
+      if (DENIED_HEADERS.has(lower) || lower.startsWith("proxy-")) return `${where} may not set header ${header}`;
+      if (headers.has(lower)) return `${where} names header ${header} more than once`;
+      headers.add(lower);
+      if (/_ORIGINS\}$/.test(value)) return `${where} header ${header} may not name an _ORIGINS allowlist`;
+    }
+    for (const tool of server.tools ?? []) {
+      if (PROTOTYPE_KEYS.has(tool)) return `${where} tools may not name ${tool}`;
+    }
+    if (server.actions !== undefined) {
+      if (server.tools === undefined) return `${where} actions needs tools`;
+      for (const [tool, actions] of Object.entries(server.actions)) {
+        if (PROTOTYPE_KEYS.has(tool)) return `${where} actions may not name ${tool}`;
+        if (!server.tools.includes(tool)) return `${where} actions names ${tool}, which is not in tools`;
+        for (const action of actions) {
+          if (PROTOTYPE_KEYS.has(action)) return `${where} actions for ${tool} may not name ${action}`;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+/** The gateway's per-section `applied` map, echoed VERBATIM: its keys (`soul`, `skills`,
+ *  `toolsets`, `mcp_servers`, and any section a future gateway adds) and its booleans. Deliberately
+ *  open and deliberately NOT renamed to this API's field names, so a client reads exactly what the
+ *  backend said and an unmodeled section still reaches it. */
+export const BotProfileAppliedSchema = Type.Record(Type.String(), Type.Boolean());
+export type BotProfileApplied = Static<typeof BotProfileAppliedSchema>;
+
+/** Names a runtime accepted into profile storage but could not honour. Keys use the same backend
+ *  section vocabulary as `applied`; values are the individual requested names, so a client can
+ *  keep successful rows settled while offering refusal/retry UI only for the ignored rows. */
+export const BotProfileIgnoredSchema = Type.Record(
+  Type.String(),
+  Type.Array(NameItem, { maxItems: 500 }),
+);
+export type BotProfileIgnored = Static<typeof BotProfileIgnoredSchema>;
+
+/** `PATCH /bots/:name/profile` response. `outcome: "unsupported"` means the gateway answered with
+ *  no `applied` map at all, which is an older backend that does not report per-section results: the
+ *  write may well have landed, but nothing can confirm it, so `ok` is false and `applied` is empty.
+ *  `requested` names the body fields this call carried, so a client can pair a section with the
+ *  `applied` key that answers for it. `ignored` is additive and omitted on a clean write. It names
+ *  individual values a runtime stored but cannot currently honour, including capability 59's
+ *  `skills_enabled`, without turning an otherwise successful multi-row write into one failure. */
+export const BotProfileConfigureResponseSchema = Type.Object({
+  name: Type.String(),
+  outcome: Type.Union([Type.Literal("applied"), Type.Literal("unsupported")]),
+  ok: Type.Boolean(),
+  applied: BotProfileAppliedSchema,
+  ignored: Type.Optional(BotProfileIgnoredSchema),
+  requested: Type.Array(Type.String()),
+});
+export type BotProfileConfigureResponse = Static<typeof BotProfileConfigureResponseSchema>;
+
+/** `GET /bots/catalog`: the menus the edit screen offers, aggregated from three gateway calls.
+ *  `unavailable` names the sections whose call the gateway refused (an older backend missing a
+ *  method); those sections are EMPTY rather than absent, so a client never special-cases a missing
+ *  field. `query` echoes the skill search this catalog was built for. */
+export const BotCatalogSchema = Type.Object({
+  query: Type.String(),
+  skills: Type.Array(Type.Object({ name: Type.String(), description: Type.String() })),
+  mcpServers: Type.Array(
+    Type.Object({
+      name: Type.String(),
+      description: Type.String(),
+      installed: Type.Boolean(),
+      enabled: Type.Boolean(),
+      requires: Type.Array(Type.String()),
+      auth: Type.Optional(Type.String()),
+      transport: Type.Optional(Type.String()),
+    }),
+  ),
+  models: Type.Array(
+    Type.Object({ slug: Type.String(), name: Type.String(), models: Type.Array(Type.String()) }),
+  ),
+  unavailable: Type.Array(Type.String()),
+  updatedAt: Type.Integer(),
+});
+export type BotCatalog = Static<typeof BotCatalogSchema>;
+
+/** One model the focused bot can select. `id` is the stable picker identity
+ *  `<provider>:<model>`; `displayName` is presentation-only. From capability 36 an entry may
+ *  carry `unauthenticated: true`: Hermes kept the provider visible although its credential is
+ *  presently unusable, so a picker renders the entry disabled with a re-auth hint instead of
+ *  hiding a selection the user explicitly configured. */
+export const BotModelCatalogEntrySchema = Type.Object({
+  id: Type.String(),
+  displayName: Type.String(),
+  unauthenticated: Type.Optional(Type.Literal(true)),
+});
+export type BotModelCatalogEntry = Static<typeof BotModelCatalogEntrySchema>;
+
+/** Capability 36: one provider row from the Hermes picker payload, kept EVEN when it currently
+ *  contributes zero catalog entries (no static models and no reachable endpoint) or has lost its
+ *  credential. `modelCount` is how many catalog entries the provider contributes right now;
+ *  `authenticated: false` marks a configured provider awaiting re-auth. The gateway mirrors the
+ *  Hermes picker: every provider the user explicitly configured is visible, none silently
+ *  dropped. */
+export const BotModelProviderSchema = Type.Object({
+  slug: Type.String(),
+  name: Type.String(),
+  authenticated: Type.Boolean(),
+  modelCount: Type.Integer({ minimum: 0 }),
+  baseUrl: Type.Optional(Type.String()),
+});
+export type BotModelProvider = Static<typeof BotModelProviderSchema>;
+
+/** `GET /bots/:name/model-config`. Null follows the owning runtime's default for that axis.
+ *  The catalog comes from the owning runtime, not a gateway-maintained model list.
+ *  `providers` (capability 36) is the additive per-provider summary; a client below 36 ignores
+ *  it and keeps rendering `catalog` alone. */
+export const BotModelConfigSchema = Type.Object({
+  model: Type.Union([Type.String(), Type.Null()]),
+  effort: Type.Union([Type.String(), Type.Null()]),
+  /** Absent on older runtimes; null clears the runtime's delegation override. */
+  subagentModel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  /** Added by the HTTP route only when both Gateway and runtime support writes. */
+  subagentModelConfigurable: Type.Optional(Type.Boolean()),
+  /** Absent on older runtimes; null clears the runtime's vision override, leaving image analysis
+   *  to the primary model when it can see one and absent when it cannot. */
+  visionModel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  /** Added by the HTTP route only when both Gateway and runtime support writes. */
+  visionModelConfigurable: Type.Optional(Type.Boolean()),
+  catalog: Type.Array(BotModelCatalogEntrySchema),
+  efforts: Type.Array(Type.String()),
+  providers: Type.Optional(Type.Array(BotModelProviderSchema)),
+});
+export type BotModelConfig = Static<typeof BotModelConfigSchema>;
+
+/** `PUT /bots/:name/model-config`. Omitted leaves an axis unchanged; null clears it. */
+export const BotModelConfigPatchSchema = Type.Object({
+  model: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  effort: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  subagentModel: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 512, pattern: "\\S" }), Type.Null()])),
+  visionModel: Type.Optional(Type.Union([Type.String({ minLength: 1, maxLength: 512, pattern: "\\S" }), Type.Null()])),
+});
+export type BotModelConfigPatch = Static<typeof BotModelConfigPatchSchema>;
+
+/** Capability 41: one Hermes-owned setup field for a model provider. `isSet` is the only
+ * credential state exposed to clients; the stored value and Hermes' redacted suffix never cross
+ * the CozyGateway wire. `key` is an opaque Hermes field id (usually an environment-variable
+ * name) and is accepted back only for the provider row that advertised it. */
+export const BotModelProviderSetupFieldSchema = ModelProviderSetupFieldSchema;
+export type BotModelProviderSetupField = ModelProviderSetupField;
+
+/** A setup method surfaced by Hermes' unified provider catalog. `fields` means values may be
+ * pasted in CozyChat; `oauth` is a Hermes-hosted PKCE or device-code session; `external` is a
+ * CLI-owned login that cannot truthfully be completed by the phone and therefore carries the
+ * exact Hermes command as a handoff. */
+export const BotModelProviderSetupMethodSchema = ModelProviderSetupMethodSchema;
+export type BotModelProviderSetupMethod = ModelProviderSetupMethod;
+
+/** One provider in the same canonical order as `hermes model`. This is a setup catalog, not a
+ * second provider registry: every row and method is normalized from Hermes on each read. */
+export const BotModelProviderSetupSchema = Type.Omit(ModelProviderSetupSchema, ["models"]);
+export type BotModelProviderSetup = Static<typeof BotModelProviderSetupSchema>;
+
+export const BotModelProviderSetupCatalogSchema = Type.Object({
+  providers: Type.Array(BotModelProviderSetupSchema),
+  updatedAt: Type.Integer(),
+});
+export type BotModelProviderSetupCatalog = Static<typeof BotModelProviderSetupCatalogSchema>;
+
+/** The value is deliberately the whole body and never appears in a URL, process argument, result,
+ * or log. The route re-resolves `provider` + `field` against Hermes before forwarding it. */
+export const BotModelProviderFieldUpdateSchema = ModelProviderFieldUpdateSchema;
+export type BotModelProviderFieldUpdate = ModelProviderFieldUpdate;
+
+export const BotModelProviderOAuthSessionSchema = ModelProviderOAuthSessionSchema;
+export type BotModelProviderOAuthSession = ModelProviderOAuthSession;
+
+export const BotModelProviderOAuthCodeSchema = ModelProviderOAuthCodeSchema;
+export type BotModelProviderOAuthCode = ModelProviderOAuthCode;
+
+/** One routine's schedule. `raw` is the Hermes-native schedule string EXACTLY as the backend stores
+ *  it (`30m`, `every 2h`, `0 9 * * 1-5`), which is also exactly what a client sends back on a write:
+ *  the schedule is never re-encoded on this wire, because the picker's frequency choice is not
+ *  recoverable from the string and a round trip through a structured form would silently rewrite
+ *  schedules a desktop authored.
+ *
+ *  `human` is the gateway's own label for the shapes it can name (`Daily`, `Every 3h`, `Once (30m)`)
+ *  and is ABSENT when the string is not one of them, which is a client's signal to render `raw`
+ *  verbatim rather than a label it invented. */
+export const BotRoutineScheduleSchema = Type.Object({
+  raw: Type.String(),
+  human: Type.Optional(Type.String()),
+});
+export type BotRoutineSchedule = Static<typeof BotRoutineScheduleSchema>;
+
+/** One current Hermes cron job carrying this bot's `[bot:<name>]` tag.
+ *
+ *  `id` is the backend's `job_id` and is the ONLY identifier the write routes accept; the display
+ *  title is not unique and is not an id. `title` is the job name with the `[bot:<name>] ` tag
+ *  stripped, and falls back to `Untitled cronjob` for a tagged job with nothing after the tag.
+ *
+ *  `enabled` is the ROW STATE the desktop's switch renders, which folds three backend facts into
+ *  one: a job is enabled only when the backend's `enabled` is not false and its `state` is not
+ *  `paused`. `state` carries the backend's own word when it sent one.
+ *
+ *  `lastRun` and `nextRun` are MILLISECONDS, or null when the backend sent nothing parsable (it
+ *  sends ISO strings, and older builds send neither). */
+export const BotRoutineSchema = Type.Object({
+  id: Type.String(),
+  title: Type.String(),
+  schedule: BotRoutineScheduleSchema,
+  enabled: Type.Boolean(),
+  state: Type.Optional(Type.String()),
+  /** The job's prompt as the backend reported it, which on a list is often a PREVIEW rather than
+   *  the whole thing. Absent when the backend sent neither. */
+  prompt: Type.Optional(Type.String()),
+  lastRun: Type.Union([Type.Integer(), Type.Null()]),
+  nextRun: Type.Union([Type.Integer(), Type.Null()]),
+  /** How the last run ended, the backend's own word (`success`, `error`, ...), when it sent one. */
+  lastStatus: Type.Optional(Type.String()),
+  /** Capability-4 additive enrichment. A bounded, path-redacted explanation of why the most
+   *  recent successful run could not be delivered. Output-only; absence means Hermes sent no
+   *  current delivery failure, including after a later successful delivery clears it. */
+  lastDeliveryError: Type.Optional(Type.String({
+    minLength: 1,
+    maxLength: 512,
+    pattern: "^(?![\\s\\S]*[\\u0000-\\u001f\\u007f])[\\s\\S]+$",
+  })),
+  /** The backend's run-cap DISPLAY string, not a number: `forever`, `once`, `3 times`, `1/3`. It is
+   *  rendered, never parsed, and it is NOT what a write sends (a create sends an integer `repeat`),
+   *  because the remaining count is not recoverable from it. */
+  repeat: Type.Optional(Type.String()),
+  continuity: Type.Optional(Type.Boolean()),
+  /** Capability 83. Where each run's result goes, the backend's own word: `local` (run history
+   *  only), `bot-chat` (injected into this bot's canonical Bot Chat), or a platform target. Absent
+   *  on a gateway below 83 and on a job the backend reported no target for. */
+  deliver: Type.Optional(Type.String()),
+  /** Capability 18 accepts and preserves these selections, but current Hermes cron RPCs cannot
+   *  apply both to one run. They are inert until Hermes exposes a true per-run pair. Null means
+   *  follow the bot profile; absent means the routine predates this field. */
+  model: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  effort: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+});
+export type BotRoutine = Static<typeof BotRoutineSchema>;
+
+/** `GET /bots/:name/routines`: every routine in that bot's namespace, and nothing else. */
+export const BotRoutineListResponseSchema = Type.Object({
+  name: Type.String(),
+  routines: Type.Array(BotRoutineSchema),
+  updatedAt: Type.Integer(),
+  /** Capability 83. Hermes's own `gateway_running` from `cron.manage list`: false means the
+   *  scheduler process is not running, so these routines are saved but will not fire. Absent when
+   *  Hermes could not tell (its probe failed) or predates the field. */
+  schedulerRunning: Type.Optional(Type.Boolean()),
+});
+export type BotRoutineListResponse = Static<typeof BotRoutineListResponseSchema>;
+
+/** A schedule string and a routine title both reach a shell-quoted command line and a cron store,
+ *  so a NUL is refused at the boundary the way the desktop refuses it, and a name must carry at
+ *  least one non-whitespace character. */
+const RoutineText = (max: number) =>
+  Type.String({ minLength: 1, maxLength: max, pattern: "^(?![\\s\\S]*\\u0000)[\\s\\S]*\\S[\\s\\S]*$" });
+
+/** A delivery target word (`local`, `bot-chat`, `bot-chat:<profile>`, a platform name): one line,
+ *  no control characters, no spaces. */
+const RoutineDeliver = Type.String({ minLength: 1, maxLength: 200, pattern: "^[A-Za-z0-9_.:@#/+-]+$" });
+
+/** `POST /bots/:name/routines` body. `schedule` is the RAW Hermes schedule string, composed by the
+ *  client exactly as the desktop's picker composes it (`30m`, `every 1h`, `0 9 * * *`,
+ *  `0 9 * * 1-5`, `0 9 * * 1`, `0 9 1 * *`, `every 2h`, or free text on Advanced). The gateway does
+ *  not validate its grammar: the backend owns that, and a gateway that guessed would refuse
+ *  schedules a newer Hermes accepts.
+ *
+ *  `prompt` is the routine's INSTRUCTION, in the user's own words. The gateway, not the client,
+ *  decides how it is delivered (see `contract/ext-bots-v1.md`, routines): it may be sent bare or
+ *  wrapped in the marker-prefixed delegation the desktop uses, and a client must not build that
+ *  wrapper itself. */
+export const BotRoutineCreateRequestSchema = Type.Object({
+  title: RoutineText(200),
+  schedule: RoutineText(200),
+  prompt: RoutineText(32_000),
+  /** Stop after N runs. Absent means forever, which is the desktop's blank field. */
+  repeat: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
+  /** Each run sees the previous run's output. */
+  continuity: Type.Optional(Type.Boolean()),
+  /** Capability 83. Where each run's result goes: `bot-chat` for this bot's Bot Chat, `local` for
+   *  run history only. Absent keeps Hermes's own default (`local` for a job made here). */
+  deliver: Type.Optional(RoutineDeliver),
+  model: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  effort: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+});
+export type BotRoutineCreateRequest = Static<typeof BotRoutineCreateRequestSchema>;
+
+/** `PATCH /bots/:name/routines/:id` body. Every field is optional and only the fields present are
+ *  written. `enabled` alone is the row switch (true resumes, false pauses).
+ *
+ *  Since capability 83 every other field is an IN-PLACE update through Hermes's own cron update
+ *  (`PUT /api/cron/jobs/:id`): the routine keeps its `id`, `prompt` is optional (absent keeps the
+ *  stored instruction), and `replacedId`/`orphanedId` are never sent. `repeat` counts runs FROM
+ *  NOW, as it always has on this wire: the gateway adds the runs already completed before it
+ *  stores Hermes's total, so a routine at `1/3` patched with `repeat: 2` still runs twice more.
+ *  `enabled` composes with the other fields: the routine ends in the state the patch asked for. */
+export const BotRoutinePatchSchema = Type.Object({
+  title: Type.Optional(RoutineText(200)),
+  schedule: Type.Optional(RoutineText(200)),
+  prompt: Type.Optional(RoutineText(32_000)),
+  enabled: Type.Optional(Type.Boolean()),
+  /** Runs from now. Capability 83: `null` clears the cap, so the routine runs until stopped. */
+  repeat: Type.Optional(Type.Union([Type.Integer({ minimum: 1, maximum: 10_000 }), Type.Null()])),
+  continuity: Type.Optional(Type.Boolean()),
+  /** Capability 83. See `BotRoutineCreateRequest.deliver`. */
+  deliver: Type.Optional(RoutineDeliver),
+  model: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  effort: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+});
+export type BotRoutinePatch = Static<typeof BotRoutinePatchSchema>;
+
+/** `POST` and `PATCH` response: the routine as it now stands.
+ *
+ *  `replacedId` is the id the routine had before a rewrite, so a client can retire its old row.
+ *  `orphanedId` is the darker case: the replacement was created but the old job could not be
+ *  removed. It is reported rather than swallowed because that job still EXISTS. It is left PAUSED,
+ *  so it cannot fire and cannot double-run the routine, and it is deletable by id. */
+export const BotRoutineWriteResponseSchema = Type.Object({
+  name: Type.String(),
+  routine: BotRoutineSchema,
+  replacedId: Type.Optional(Type.String()),
+  orphanedId: Type.Optional(Type.String()),
+});
+export type BotRoutineWriteResponse = Static<typeof BotRoutineWriteResponseSchema>;
+
+/** `POST /bots/:name/routines/:id/run` response: the routine as it stands right after the peer
+ *  acknowledged the run, and the millisecond wall-clock moment that ack landed. The config lane's
+ *  `routines.run` ack itself carries neither field, so the gateway fills both in rather than
+ *  echoing the request: `startedAt` is when the peer confirmed, and `routine` comes from a fresh
+ *  `routines.list` rather than the pre-run row, so a caller sees any state the run itself changed
+ *  (for example `lastRun`, once a peer reports it). */
+export const BotRoutineRunResponseSchema = Type.Object({
+  routine: BotRoutineSchema,
+  startedAt: Type.Integer(),
+});
+export type BotRoutineRunResponse = Static<typeof BotRoutineRunResponseSchema>;
+
+/** Capability 83. One past run of a routine: a Hermes cron session (`cron_<jobId>_<stamp>`).
+ *  Times are milliseconds; `endedAt` is null while the run is still going. `status` is Hermes's
+ *  own end reason (`cron_complete`, ...), passed through. Nothing else about the session (its
+ *  system prompt, its billing) is carried. */
+export const BotRoutineRunRecordSchema = Type.Object({
+  id: Type.String(),
+  startedAt: Type.Union([Type.Integer(), Type.Null()]),
+  endedAt: Type.Union([Type.Integer(), Type.Null()]),
+  status: Type.Optional(Type.String()),
+  title: Type.Optional(Type.String()),
+  active: Type.Optional(Type.Boolean()),
+});
+export type BotRoutineRunRecord = Static<typeof BotRoutineRunRecordSchema>;
+
+/** Capability 83. `GET /bots/:name/routines/:id/runs`: newest first, at most 50. */
+export const BotRoutineRunsResponseSchema = Type.Object({
+  name: Type.String(),
+  id: Type.String(),
+  runs: Type.Array(BotRoutineRunRecordSchema),
+});
+export type BotRoutineRunsResponse = Static<typeof BotRoutineRunsResponseSchema>;
+
+/** Capability 83. `GET /bots/:name/routines/:id/runs/:runId/output`: the run's final reply, the
+ *  last non-empty assistant message of that session, bounded and path-redacted. `output` is null
+ *  when the run said nothing (a silent run, or one still going). */
+export const BotRoutineRunOutputResponseSchema = Type.Object({
+  runId: Type.String(),
+  output: Type.Union([Type.String(), Type.Null()]),
+});
+export type BotRoutineRunOutputResponse = Static<typeof BotRoutineRunOutputResponseSchema>;
+
+/** Capability 83. One slot of a Hermes automation blueprint, as Hermes's catalog describes it.
+ *  `type` is Hermes's word (`text`, `time`, `enum`, `weekdays`, ...), passed through; a client
+ *  renders one it does not know as free text. */
+export const BotRoutineBlueprintFieldSchema = Type.Object({
+  name: Type.String(),
+  type: Type.String(),
+  label: Type.String(),
+  default: Type.Optional(Type.String()),
+  options: Type.Array(Type.String()),
+  optional: Type.Boolean(),
+  help: Type.Optional(Type.String()),
+});
+export type BotRoutineBlueprintField = Static<typeof BotRoutineBlueprintFieldSchema>;
+
+export const BotRoutineBlueprintSchema = Type.Object({
+  key: Type.String(),
+  title: Type.String(),
+  description: Type.Optional(Type.String()),
+  category: Type.Optional(Type.String()),
+  scheduleHuman: Type.Optional(Type.String()),
+  fields: Type.Array(BotRoutineBlueprintFieldSchema),
+});
+export type BotRoutineBlueprint = Static<typeof BotRoutineBlueprintSchema>;
+
+/** Capability 83. `GET /bots/:name/routine-blueprints`. */
+export const BotRoutineBlueprintsResponseSchema = Type.Object({
+  name: Type.String(),
+  blueprints: Type.Array(BotRoutineBlueprintSchema),
+});
+export type BotRoutineBlueprintsResponse = Static<typeof BotRoutineBlueprintsResponseSchema>;
+
+/** Capability 83. `POST /bots/:name/routine-blueprints/:key/instantiate` body: the filled slots.
+ *  Hermes validates them; a refusal is a 400 carrying its words. */
+export const BotRoutineBlueprintInstantiateRequestSchema = Type.Object({
+  values: Type.Record(Type.String({ minLength: 1, maxLength: 64 }), Type.String({ maxLength: 2_000 })),
+});
+export type BotRoutineBlueprintInstantiateRequest = Static<typeof BotRoutineBlueprintInstantiateRequestSchema>;
+
+/** One bot's routines, as a FULL REPLACE snapshot. Sent when this gateway changed them and when a
+ *  `cron.changed` broadcast made the bridge re-read a bot whose routines some device is watching. */
+export const BotRoutinesFrameSchema = Type.Object({
+  type: Type.Literal("bot_routines"),
+  bot: Type.String(),
+  routines: Type.Array(BotRoutineSchema),
+  updatedAt: Type.Integer(),
+});
+export type BotRoutinesFrame = Static<typeof BotRoutinesFrameSchema>;
+
+/** One entry in a group room's log. `from.kind` is `user` for the human (whose display name is the
+ *  desktop's own `You`) and `member` for a bot, in which case `from.name` is the bot's profile name
+ *  and `from.displayName` is what a transcript renders. `at` is MILLISECONDS.
+ *
+ *  `seq` is the room-local ordinal and is what a client keys on: the log is TRIMMED from the head
+ *  once it passes its retention cap, so a position in the array is not stable while a `seq` is. */
+export const BotGroupMessageSchema = Type.Object({
+  seq: Type.Integer(),
+  from: Type.Object({
+    kind: Type.Union([Type.Literal("user"), Type.Literal("member")]),
+    name: Type.String(),
+    displayName: Type.String(),
+  }),
+  text: Type.String(),
+  at: Type.Integer(),
+  clientId: Type.Optional(Type.String()),
+  /** Capability 47, auditable ids. Every field below is optional because a row written before 47
+   *  carries none of them, and a reader MUST render such a row exactly as it does today.
+   *
+   *  `messageId` is the row's own durable, room-unique id. `seq` orders a room; `messageId`
+   *  identifies a message across rooms, restarts and a head trim.
+   *
+   *  `turnId` is the member turn that produced the row, and it is the SAME id as the
+   *  `bot_group_turns` row and the attach `turn` command, which is what makes a member's
+   *  contribution traceable from the transcript back to the command that asked for it. A user row
+   *  has no turn. */
+  messageId: Type.Optional(Type.String({ maxLength: 256 })),
+  turnId: Type.Optional(Type.String({ maxLength: 256 })),
+  /** The room epoch this row belongs to. A user send bumps the epoch, so every reply deliberating
+   *  on that send shares its epoch: that is how a reader tells one deliberation from the next when
+   *  a second send superseded the first mid-round. */
+  epoch: Type.Optional(Type.Integer()),
+  /** What the member was answering: the highest room seq it had been shown when its turn started,
+   *  and whose message that was. NOT "the previous row": a member that spent a minute thinking can
+   *  land after two other replies, and the honest causation is the one recorded at turn start. */
+  cause: Type.Optional(Type.Object({
+    kind: Type.Union([Type.Literal("user"), Type.Literal("member")]),
+    seq: Type.Integer(),
+  })),
+  /** The attach-v1 identity that carried the turn. `threadId` is the gateway-owned member thread
+   *  (`group:<room>:<member>`), never a Hermes Dashboard session. */
+  attachTurn: Type.Optional(Type.Object({
+    threadId: Type.String({ maxLength: 256 }),
+    turnId: Type.String({ maxLength: 256 }),
+  })),
+  /** Capability 84. The room thread this entry belongs to. A root user send's thread is its own
+   *  `messageId`; member replies carry the thread they answered. Absent on pre-84 rows. */
+  threadId: Type.Optional(Type.String({ maxLength: 128 })),
+  /** Capability 84. True on a member entry mirrored from its own room thread outside a room turn. */
+  external: Type.Optional(Type.Boolean()),
+});
+export type BotGroupMessage = Static<typeof BotGroupMessageSchema>;
+
+/** A room, without its log. `members` are Hermes profile names in the order the room was created
+ *  with, and that order is what the per-round speaker rotation turns. `state` is the room's live
+ *  orchestration state; `needsYou` is the sticky escalation flag (a member's reply mentioned
+ *  `@user`), cleared when the user sends into the room or opens it. */
+/** Capability 51. One interaction a room member is currently blocked on, projected onto the room
+ *  so a client can badge the room itself rather than discovering it only in the interaction inbox.
+ *
+ *  It is a POINTER, never a card: the id is the same `toolCallId`/`clarifyId` the inbox and the
+ *  `POST /bots/:member/approvals/:id/approve` and `POST /bots/:member/clarifications/:id` routes
+ *  already use, so the room surface carries no prompt, no tool name, no option list, and nothing a
+ *  reader could mistake for the request itself. The room transcript is unchanged: a pending
+ *  interaction is live state, and it is gone from this array the moment it settles. */
+export const BotGroupPendingInteractionSchema = Type.Object({
+  /** The member whose turn is blocked. This is the bot the resolve route is addressed to. */
+  member: Type.String({ maxLength: 256 }),
+  kind: Type.Union([Type.Literal("approval"), Type.Literal("clarify")]),
+  /** The attach-v1 approval or clarify id: the resolution key on the existing routes. */
+  id: Type.String({ maxLength: 256 }),
+  /** The room member turn that raised it. */
+  turnId: Type.String({ maxLength: 256 }),
+  /** Capability 77. The durable room turn's cause, present before its reply is written. */
+  cause: Type.Optional(Type.Object({
+    kind: Type.Union([Type.Literal("user"), Type.Literal("member")]),
+    seq: Type.Integer(),
+  })),
+});
+export type BotGroupPendingInteraction = Static<typeof BotGroupPendingInteractionSchema>;
+
+export const BotGroupSchema = Type.Object({
+  /** Capability 84. The room's stable identity: it survives a rename, so a client keys
+   *  device-local order and sections on it rather than on the name. */
+  id: Type.Optional(Type.String({ maxLength: 256 })),
+  name: Type.String(),
+  members: Type.Array(Type.String()),
+  createdAt: Type.Integer(),
+  state: Type.Union([Type.Literal("running"), Type.Literal("settled"), Type.Literal("needs_you")]),
+  needsYou: Type.Boolean(),
+  /** Bumped on every user send. A round loop that finds the epoch changed abandons the rest of its
+   *  rounds, which is how a second user message supersedes the first mid-deliberation. */
+  epoch: Type.Integer(),
+  /** Stamp of the newest log entry, or the room's creation when the log is empty. */
+  updatedAt: Type.Integer(),
+  /** Capability 51. Interactions a member of this room is currently waiting on. Absent when there
+   *  are none, so a room that never blocks is byte-identical to what it was below 51. */
+  pendingInteractions: Type.Optional(Type.Array(BotGroupPendingInteractionSchema, { maxItems: 32 })),
+  /** Capability 84. The room picture as a small image data URL. */
+  picture: Type.Optional(Type.String({ maxLength: 24_000 })),
+  /** Capability 84. Whether stop directives hold members. Always sent by 84; absent reads true. */
+  holdDetection: Type.Optional(Type.Boolean()),
+  /** Capability 84. Members currently held by a stop directive or Stop. Absent when none. */
+  holds: Type.Optional(Type.Array(Type.String(), { maxItems: 6 })),
+});
+export type BotGroup = Static<typeof BotGroupSchema>;
+
+/** `GET /bots/groups/:name`: the room plus its log. */
+export const BotGroupDetailSchema = Type.Composite([
+  BotGroupSchema,
+  Type.Object({ messages: Type.Array(BotGroupMessageSchema) }),
+]);
+export type BotGroupDetail = Static<typeof BotGroupDetailSchema>;
+
+/** New room messages. A DELTA, like `bot_chat`: only entries the gateway has not broadcast before,
+ *  in `seq` order. */
+export const BotGroupFrameSchema = Type.Object({
+  type: Type.Literal("bot_group"),
+  group: Type.String(),
+  messages: Type.Array(BotGroupMessageSchema),
+  updatedAt: Type.Integer(),
+});
+export type BotGroupFrame = Static<typeof BotGroupFrameSchema>;
+
+/** A member turn that produced no message for a reason worth showing. NEVER a fabricated room
+ *  message: a member whose turn timed out or failed contributes this note and the round carries on
+ *  with the others. `detail` is Hermes' own text verbatim when the failure came from Hermes.
+ *
+ *  A member that simply chose to pass produces no note at all: passing is ordinary, and the desktop
+ *  protocol treats it as the healthy outcome rather than as an incident.
+ *
+ *  `capped` is the third reason and the only one that is not a failure: the room stopped because it
+ *  reached its 10-message limit for this send, and `member` names the member that was next in line
+ *  and never got asked. Without it a capped room is indistinguishable from one where everybody
+ *  passed, and those mean opposite things to a reader deciding whether to send again. */
+export const BotGroupNoteSchema = Type.Object({
+  member: Type.String(),
+  reason: Type.Union([Type.Literal("timeout"), Type.Literal("failed"), Type.Literal("capped")]),
+  detail: Type.String(),
+  /** Capability 47. The member turn the note is about, when one was actually started. A `capped`
+   *  note and a member that was skipped because it is no longer a bot never got a turn, so they
+   *  carry nothing here: an id that names no command would be worse than an absent one. */
+  turnId: Type.Optional(Type.String({ maxLength: 256 })),
+});
+export type BotGroupNote = Static<typeof BotGroupNoteSchema>;
+
+/** How a room's deliberation is doing. `running` while a round loop holds the room, `settled` when
+ *  every responder passed or a cap was reached, `needs_you` when the loop settled AND some member's
+ *  reply mentioned `@user`. `round` is the zero-based round the loop is on. */
+export const BotGroupStateFrameSchema = Type.Object({
+  type: Type.Literal("bot_group_state"),
+  group: Type.String(),
+  state: Type.Union([Type.Literal("running"), Type.Literal("settled"), Type.Literal("needs_you")]),
+  round: Type.Integer(),
+  epoch: Type.Integer(),
+  note: Type.Optional(BotGroupNoteSchema),
+  updatedAt: Type.Integer(),
+  /** Capability 51. The room's pending interactions at the moment this frame was built, the same
+   *  array `BotGroup` carries. A frame is emitted when one opens and when one settles, so a client
+   *  holding the rooms screen can badge without re-reading the room. */
+  pendingInteractions: Type.Optional(Type.Array(BotGroupPendingInteractionSchema, { maxItems: 32 })),
+  /** Capability 84. One activity-feed event. `member` is "You" for `stopped`. */
+  activity: Type.Optional(Type.Object({
+    member: Type.String(),
+    kind: Type.Union([
+      Type.Literal("working"), Type.Literal("replied"), Type.Literal("passed"),
+      Type.Literal("held"), Type.Literal("stopped"),
+    ]),
+    threadId: Type.Optional(Type.String({ maxLength: 128 })),
+  })),
+  /** Capability 84. The whole room, whenever its settings or holds change. */
+  room: Type.Optional(BotGroupSchema),
+  /** Capability 84. The room's previous name, on a rename frame only. */
+  renamedFrom: Type.Optional(Type.String()),
+});
+export type BotGroupStateFrame = Static<typeof BotGroupStateFrameSchema>;
+
+/** `POST /bots/groups` body. Membership is 2 to 6 bots, the desktop's own bounds, and every name is
+ *  validated against the roster before the room exists. */
+export const BotGroupCreateRequestSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 64 }),
+  members: Type.Array(Type.String({ minLength: 1, maxLength: 64 }), { minItems: 2, maxItems: 6 }),
+});
+export type BotGroupCreateRequest = Static<typeof BotGroupCreateRequestSchema>;
+
+/** `POST /bots/groups/:name/messages` body. Same `clientId` echo contract as the 1:1 composer. */
+export const BotGroupSendRequestSchema = Type.Object({
+  text: Type.String({ minLength: 1, maxLength: 32_000 }),
+  clientId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+  /** Capability 84. Reply in this thread; absent starts a new one. */
+  threadId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+});
+export type BotGroupSendRequest = Static<typeof BotGroupSendRequestSchema>;
+
+/** Capability 84. `PATCH /bots/groups/:name`: rename, members, picture, stop-directive detection. */
+export const BotGroupPatchRequestSchema = Type.Object({
+  name: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+  members: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 64 }), { minItems: 2, maxItems: 6 })),
+  picture: Type.Optional(Type.Union([Type.String({ minLength: 11, maxLength: 24_000, pattern: "^data:image/" }), Type.Null()])),
+  holdDetection: Type.Optional(Type.Boolean()),
+}, { minProperties: 1 });
+export type BotGroupPatchRequest = Static<typeof BotGroupPatchRequestSchema>;
+
+/** Capability 84. `POST /bots/groups/:name/compress` body. */
+export const BotGroupCompressRequestSchema = Type.Object({
+  member: Type.String({ minLength: 1, maxLength: 256 }),
+});
+export type BotGroupCompressRequest = Static<typeof BotGroupCompressRequestSchema>;
+
+/** Capability 84. `POST /bots/groups/picture` body. */
+export const BotGroupPictureRequestSchema = Type.Object({
+  prompt: Type.String({ minLength: 1, maxLength: 1000 }),
+});
+export type BotGroupPictureRequest = Static<typeof BotGroupPictureRequestSchema>;
+
+/** One command the selected Hermes profile accepts through a messaging surface. The catalog is
+ * profile-owned and comes from Hermes' central registry, plugins, and installed skills. */
+export const BotSlashCommandSchema = Type.Object({
+  name: Type.String({ pattern: "^/[A-Za-z0-9_-]+$", minLength: 2, maxLength: 129 }),
+  description: Type.String({ minLength: 1, maxLength: 200 }),
+  argsHint: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
+  category: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+});
+export type BotSlashCommand = Static<typeof BotSlashCommandSchema>;
+
+export const BotSlashCommandCatalogSchema = Type.Object({
+  name: Type.String({ minLength: 1, maxLength: 256 }),
+  commands: Type.Array(BotSlashCommandSchema, { maxItems: 512 }),
+});
+export type BotSlashCommandCatalog = Static<typeof BotSlashCommandCatalogSchema>;
+
+/** One agent-sent artifact projected from every durable native Bot Mode session. The attachment
+ * remains gateway-scoped and downloads through the existing authenticated per-bot route. */
+export const BotAttachmentHistoryItemSchema = Type.Object({
+  bot: Type.String({ minLength: 1, maxLength: 256 }),
+  sessionId: Type.String({ minLength: 1 }),
+  messageId: Type.String({ minLength: 1 }),
+  caption: Type.String(),
+  at: Type.Union([Type.Integer(), Type.Null()]),
+  attachment: AttachmentBlockSchema,
+});
+export type BotAttachmentHistoryItem = Static<typeof BotAttachmentHistoryItemSchema>;
+
+export const BotAttachmentHistorySchema = Type.Object({
+  items: Type.Array(BotAttachmentHistoryItemSchema, { maxItems: 100 }),
+  nextOffset: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+});
+export type BotAttachmentHistory = Static<typeof BotAttachmentHistorySchema>;
+
+/** One approval currently awaiting a decision. This is deliberately a compact recovery snapshot,
+ * not another approval-request payload: raw tool arguments, commands, descriptions, results, and
+ * model reasoning never enter it. `createdAt` is the durable pending-record timestamp; a pending
+ * record is immutable until its terminal transition, so it cannot be confused with a resolution
+ * time. */
+export const BotPendingApprovalSchema = Type.Object({
+  bot: Type.String({ minLength: 1, maxLength: 256 }),
+  sessionId: Type.String({ minLength: 1 }),
+  turnId: Type.String({ minLength: 1 }),
+  toolCallId: Type.String({ minLength: 1 }),
+  ruleName: Type.String({ minLength: 1, maxLength: 512 }),
+  createdAt: Type.Integer(),
+  /** A device has durably submitted an action; wait for the terminal Hermes event. */
+  resolutionRequestedAt: Type.Optional(Type.Integer()),
+  /** Capability 51. The group room whose member turn raised this approval. Absent for a 1:1 chat,
+   *  which is every row written before 51. `sessionId` is then the gateway-owned
+   *  `group:<room>:<member>` thread and `turnId` is the room member turn. */
+  room: Type.Optional(Type.String()),
+  /** Capability 62. The same validated repair block the pending frame carried, so an inbox read
+   *  on a cold start renders the proposal the live frame did. Absent for every other approval. */
+  repair: Type.Optional(BotApprovalRepairSchema),
+  /** Capability 66. The same validated scoped-approval block the pending frame carried, so an
+   *  inbox opened cold renders the card the live frame did. Absent for every other approval. */
+  scope: Type.Optional(BotApprovalScopeSchema),
+  /** Capability 66. The standing grant that is settling this ask without a person tapping it, the
+   *  same id the live frame named. Present only on a covered ask, so a cold inbox read says why a
+   *  card is already resolving and which grant to revoke. */
+  grantId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+});
+export type BotPendingApproval = Static<typeof BotPendingApprovalSchema>;
+
+/** Capability 27's bounded, current-state approval inbox. It only ever represents `pending`;
+ * terminal records remain durable for idempotency but are deliberately absent. */
+export const BotPendingApprovalsSchema = Type.Object({
+  approvals: Type.Array(BotPendingApprovalSchema, { maxItems: 100 }),
+});
+export type BotPendingApprovals = Static<typeof BotPendingApprovalsSchema>;
+
+/** Compact terminal proof for an approval or clarification. A client may settle an optimistic
+ * action only after it observes this receipt, never from the action POST or queued command. */
+export const BotInteractionSettlementSchema = Type.Object({
+  bot: Type.String({ minLength: 1, maxLength: 256 }),
+  kind: Type.Union([Type.Literal("approval"), Type.Literal("clarify")]),
+  interactionId: Type.String({ minLength: 1 }),
+  sessionId: Type.String({ minLength: 1 }),
+  turnId: Type.String({ minLength: 1 }),
+  outcome: Type.Union([
+    Type.Literal("approved"), Type.Literal("denied"), Type.Literal("expired"),
+    Type.Literal("selected"), Type.Literal("cancelled"),
+  ]),
+  selectedOptionId: Type.Optional(Type.String({ minLength: 1 })),
+  settledAt: Type.Integer(),
+});
+export type BotInteractionSettlement = Static<typeof BotInteractionSettlementSchema>;
+
+/** Pending clarification recovery mirrors the approval inbox while retaining only display-safe
+ * prompt/options and the durable request marker. */
+export const BotPendingClarificationSchema = Type.Object({
+  bot: Type.String({ minLength: 1, maxLength: 256 }),
+  sessionId: Type.String({ minLength: 1 }),
+  turnId: Type.String({ minLength: 1 }),
+  clarifyId: Type.String({ minLength: 1 }),
+  prompt: Type.String({ minLength: 1, maxLength: 4096 }),
+  options: Type.Array(BotClarifyOptionSchema, { minItems: 1, maxItems: 20 }),
+  expiresAt: Type.Optional(Type.Integer()),
+  resolutionRequestedAt: Type.Optional(Type.Integer()),
+  /** Capability 51. The group room whose member turn raised it; absent for a 1:1 chat. */
+  room: Type.Optional(Type.String()),
+});
+export type BotPendingClarification = Static<typeof BotPendingClarificationSchema>;
+
+/** One bounded reconnect snapshot. Pending items and terminal receipts intentionally remain
+ * separate so a caller cannot mistake command admission for Hermes confirmation. */
+export const BotInteractionRecoverySchema = Type.Object({
+  approvals: Type.Array(BotPendingApprovalSchema, { maxItems: 100 }),
+  clarifications: Type.Array(BotPendingClarificationSchema, { maxItems: 100 }),
+  // Retention is bounded to 100 per configured bot. The aggregate must not apply a second global
+  // cap or a busy bot could hide another bot's only terminal proof from a reconnecting device.
+  settlements: Type.Array(BotInteractionSettlementSchema),
+});
+export type BotInteractionRecovery = Static<typeof BotInteractionRecoverySchema>;
+
+/** Capability id and version advertised in `GatewayInfo.capabilities` when the bots bridge is
+ *  configured.
+ *
+ *  Versioned additions are additive (a client compares `>=`, never `===`). Explicitly withdrawn
+ *  unsafe behavior is removed rather than retained; version 17 below is the historical exception:
+ *  - `1`: roster, presence, canonical-chat resolve, session list, history read.
+ *  - `2`: `POST /bots/:name/chat/messages` plus the `bot_chat` and `bot_chat_state` frames. A
+ *    client that offers a composer MUST require `>= 2`: a v1 gateway 404s that route and never
+ *    sends those frames, which without this bump reads as a silently dead composer.
+ *  - `3`: the edit-profile surface: `GET`/`PATCH /bots/:name/profile` and `GET /bots/catalog`. A
+ *    client that offers an edit screen MUST require `>= 3`, by the same rule the composer bump
+ *    used: a screen whose Save 404s reads as a broken app, not as a missing feature.
+ *  - `4`: the routines surface: `GET`/`POST /bots/:name/routines`,
+ *    `PATCH`/`DELETE /bots/:name/routines/:id`, plus the `bot_routines` frame. A client that offers
+ *    a routines pane MUST require `>= 4`. Newer Hermes replies may add the optional output-only,
+ *    bounded and host-path-redacted `lastDeliveryError` without changing the capability scalar.
+ *  - `5`: server-side group chats: the `/bots/groups` routes plus the `bot_group` and
+ *    `bot_group_state` frames. A client that offers a rooms screen MUST require `>= 5`.
+ *  - `6`: the `bot_chat_delta` frame, the live draft of a reply as it is written. No route changes
+ *    ride this bump: it exists so a client can tell "this gateway will stream" from "this gateway
+ *    is quiet right now", since a bot that never streams and a gateway that cannot stream look
+ *    identical otherwise. Everything works unchanged without it; the draft is decoration and the
+ *    `bot_chat` frame remains the record.
+ *  - `7`: `GET /bots/:name/media`, the image proxy. A client that renders the image references in a
+ *    bot's reply as pictures MUST require `>= 7`: a v6 gateway 404s the route, so an app that
+ *    reached for it anyway would replace working links with broken-image chips. Below 7 a client
+ *    keeps whatever it did before, which is to show the link. The route serves `https` sources only;
+ *    a LOCAL path on the Hermes box is refused, and the refusal is part of the contract so the app
+ *    can say so rather than spin.
+ *  - `8`: `POST /bots/:name/chat/reset` plus `bot_chat_reset`. It selects a fresh gateway-owned
+ *    session; previous local history remains listed and may be adopted later.
+ *  - `9`: photos to bots. `POST /bots/:name/chat/photos` sends one image with an optional caption,
+ *    `GET /bots/:name/chat/attachments/:fileId` serves the gateway's own copy of it back, and
+ *    `BotChatMessage.attachments` carries the `attachment` block that ties the two together. A
+ *    client that offers a photo picker MUST require `>= 9`: a version 8 gateway 404s both routes.
+ *    A client below 9 keeps working unchanged, because `attachments` is an optional field it can
+ *    ignore and no existing route or frame changed shape. What a client CANNOT infer from the
+ *    version is whether the bot on the other end can see pixels: that is decided per turn inside
+ *    hermes by the bot's own model, and a text-only model quietly gets a description instead.
+ *  - `10`: mobile approve/deny for bot chats (issue #19, bridge lane). The
+ *    `bot_approval_pending` / `bot_approval_resolved` frames plus
+ *    `POST /bots/:name/approvals/:toolCallId/approve` and `.../deny`. A client that offers an
+ *    approve/deny UI MUST require `>= 10`: a version 9 gateway 404s both routes and never sends
+ *    either frame, so the buttons would do nothing. A client below 10 keeps working unchanged --
+ *    it simply never learns that a bot is blocked on a decision, which is exactly where it was
+ *    before. What the version does NOT promise is that any approval will ever be raised: that
+ *    depends on the hermes profile running with `approvals.mode: manual` and without
+ *    `security.approval.transport`, both of which are deployment facts the wire cannot assert
+ *    (see contract/ext-bots-v1.md, "Deployment: what a bridged profile must pin").
+ *  - `11`: fresh bot chats are BORN EMPTY, and the canned opener becomes a client-side SUGGESTION
+ *    (issue #59). The one entry in this list that changes existing BEHAVIOUR rather than only adding
+ *    surface, so it is a behaviour note before it is a field:
+ *    - up to 10, opening a bot with no chat (and, from 8, resetting one) created the session and
+ *      SUBMITTED a canned opener into it, which the app then rendered as a message the USER had sent
+ *      and which the bot answered before the user had typed anything. Neither path does that any
+ *      more. The gateway submits what the user submits, and nothing else.
+ *    - `GET /bots/:name/chat/messages` gains an optional `suggestion` string, present ONLY when
+ *      `messages` is empty and the deployment configured an opener, and absent otherwise. It is
+ *      presentation-only: a client MAY show it, and MAY let the user send it AS THEIR OWN message
+ *      through the ordinary composer, and until they do it is in no transcript anywhere.
+ *    A client below 11 keeps working and keeps ignoring an optional field it never heard of, but it
+ *    will see something new from an 11 gateway: a freshly opened bot chat is genuinely empty where it
+ *    used to hold an exchange. That is the same empty payload a version 10 gateway already answered
+ *    with while a chat was being created, so nothing breaks; the chat simply no longer fills itself
+ *    in. A client that offers a suggestion chip MUST require `>= 11`, because a version 10 gateway
+ *    never sends the field.
+ *  - `12`: LIVE TOOL ACTIVITY for bot chats (issue #60). The `bot_tool_activity` frame, a
+ *    full-replace snapshot of a turn's tool steps as they run, plus a `toolSteps` array on
+ *    `GET /bots/:name/chat/messages` carrying the same steps for turns that have already finished.
+ *    A client that offers step-by-step chips MUST require `>= 12`: a version 11 gateway never sends
+ *    the frame and never sends the field, so a chip strip would sit permanently empty. A client
+ *    below 12 keeps working unchanged -- it ignores a frame type it does not know and an optional
+ *    response field it never heard of, which is exactly where it was before.
+ *
+ *    Additive throughout, and deliberately narrow. Three things it does NOT do:
+ *    - it adds NO push. Tool steps stay off `contract/push-v0.md` entirely; its payload kinds are
+ *      still `message`, `approval_pending` and `approval_resolved`. Chips are a foreground surface.
+ *    - it does not change `BotChatMessage`. The steps are NOT attached to a transcript row, because
+ *      the gateway cannot honestly say which row a turn produced (see `BotTurnToolSteps`).
+ *    - capability 12 carries no tool arguments, output, or preview text. Capability 21 later adds
+ *      only bounded, redacted display text; raw argument/result objects remain excluded.
+ *
+ *    What the version does NOT promise, exactly as with 10, is that any step will ever be reported:
+ *    hermes gates its whole tool lifecycle on `display.tool_progress`, which defaults to `all` but
+ *    which an operator can set to `off`, and a profile running that way is silent here (see
+ *    contract/ext-bots-v1.md, "Deployment: what a bridged profile must pin").
+ *  - `14`: `bot_chat_adopted`, emitted when the user manually selects a stored native session or
+ *    starts a fresh one. It tells paired clients to rebind and reload the durable local transcript.
+ *  - `15`: assistant attach-v1 media becomes gateway-owned `BotChatMessage.attachments`.
+ *  - `16`: `GET /bots/:name/sessions` and manual native-session adoption.
+ *  - `17`: WITHDRAWN AGENT INBOX (issue #95). The former heuristic Hermes projection and both
+ *    routes were removed because session text cannot prove durable A2A identity or privacy
+ *    boundaries. Clients MUST NOT infer this
+ *    withdrawn surface from `com.cozylabs.bots >= 17`; its sole future advertisement is the
+ *    separately versioned `com.cozylabs.agent-inbox` capability below.
+ *  - `18`: BOT MODEL CONFIG (issue #106). Adds authenticated GET/PUT
+ *    `/bots/:name/model-config`, backed by Hermes profile config and its configured picker catalog.
+ *    Routine records and writes accept nullable model/effort selections. The surveyed cron RPC
+ *    cannot scope both to one run, so they are preserved as inert metadata and the gateway never
+ *    mutates a profile around a routine run.
+ *  - `19`: native hard stop and fresh native chat routes.
+ *  - `20`: STREAMED ASSISTANT MEDIA (issues #118 / cozychat#220). Assistant attachments carry an
+ *    optional `mediaKind`; video and audio are ingested up to their per-kind 40 MB cap and the
+ *    authenticated attachment route supports byte ranges for AVPlayer.
+ *  - `21`: SAFE TOOL DETAILS (cozychat#224). Steps may carry bounded, defense-in-depth-redacted
+ *    `detail` and error-only `errorText`; raw argument and result objects never cross the bridge.
+ *  - `22`: NATIVE CLARIFICATION. Adds `bot_clarify_pending` / `bot_clarify_resolved` and the
+ *    authenticated option-resolution route. Pending/options/expiry are durable and stable-id
+ *    idempotent across gateway/plugin restart.
+ *  - `23`: exact native turn status/cause and durable queued-at recovery metadata.
+ *  - `24`: document attachments. `POST /bots/:name/chat/attachments` accepts one validated
+ *    common document, and attachment `mediaKind: "file"` tells clients to offer download/share.
+ *  - `25`: profile-local slash-command discovery. `GET /bots/:name/commands` returns the canonical
+ *    gateway-safe commands, plugin commands, and installed skill commands advertised by that
+ *    profile's authenticated attach plugin. The invocation is sent unchanged through the ordinary
+ *    message route; no command execution logic is duplicated in CozyGateway or a client.
+ *  - `26`: aggregate agent-sent attachment history. `GET /bots/attachments` searches and filters
+ *    artifacts across configured profiles and every durable native session without duplicating
+ *    their bytes or weakening the existing authenticated download route.
+ *  - `27`: pending approval inbox. `GET /bots/approvals?state=pending` returns at most 100
+ *    durable unresolved approvals, carrying only the bot/session/turn routing ids, tool-call id,
+ *    safe rule display name, and original pending timestamp. Resolved and expired records vanish
+ *    because the endpoint reads the same lifecycle truth as the existing action routes.
+ *  - `28`: requested-vs-confirmed approval and clarification settlement. A decision request is
+ *    durable and replayable, but `bot_*_resolved` remains reserved for the later terminal Hermes
+ *    event. `bot_*_resolution_requested` disables duplicate actions across paired devices.
+ *  - `29`: `GET /bots/approvals?state=pending` additionally returns bounded pending
+ *    clarifications and confirmed terminal settlement receipts so a reconnect can settle an
+ *    optimistic action without guessing from the action POST.
+ *  - `31`: DURABLE DELIVERY RECEIPTS. Three additive pieces, and a client gates each on `>= 31`:
+ *    - `POST /bots/:name/chat/messages/displayed` reports the wire ids of rows the device actually
+ *      put on screen. It is the only signal in this contract that a HUMAN saw a message: a durable
+ *      transcript row proves the gateway holds it, and `contract/push-v0.md` push is fire-and-forget
+ *      by construction. A client MUST require `>= 31` before sending it; a version 30 gateway
+ *      answers `404`, and a client MUST treat that as "this gateway does not collect receipts"
+ *      rather than as a lost message.
+ *    - `BotChatMessage.marker`, an optional bounded label on gateway-authored rows that are not
+ *      conversation. A client below 31 ignores it and renders the ordinary row, which is exactly
+ *      where it was before.
+ *    - role `system` on a `BotChatMessage`. Roles were never an enum on this wire (section 3), so
+ *      this adds no new rule: a client MUST render an unknown role rather than dropping the row.
+ *      The one v1 emitter is the `delivery.failed` marker row the gateway appends to a bot's
+ *      current canonical chat when a scheduled delivery terminally fails, so a cron report that
+ *      never arrived is visible to the user instead of silently absent.
+ *    What 31 does NOT add: any push, any per-attachment receipt, and any retroactive receipt for
+ *    rows that were already on screen before the client learned to report them.
+ *  - `32`: INLINE MEDIA ORDERING. `BotChatMessage.attachments` entries gain an optional
+ *    `position`, the block index BEFORE which that attachment renders (see
+ *    `BotChatAttachmentSchema` and `contract/ext-bots-v1.md`). Purely additive in both
+ *    directions: a client below 32 ignores the field and keeps its above-stack stack, and a
+ *    gateway below 32 simply never sends one. Rendering is data driven, not version gated: a
+ *    client renders in flow whenever positions are present. The emitting side is what gates on
+ *    `>= 32`. An out-of-range value clamps into `0...blocks.length`; it never drops the
+ *    attachment. */
+/** Capability 52. One paired computer that runs bots. `platform` and `version` are what the
+ *  runner reported on its last `hello`, null until it has connected once; `backends` is what that
+ *  host can actually do. Closed: a client reads exactly these fields. */
+export const RunnerSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 64 }),
+  /** Capability 55: the display name a person set with `PATCH /runners/:id {name}` when there is
+   *  one, else the name the runner itself reported on `hello`. `renamed` is how a client tells the
+   *  two apart without comparing strings. */
+  name: Type.String({ minLength: 1, maxLength: 120 }),
+  platform: Type.Union([Type.String({ maxLength: 120 }), Type.Null()]),
+  version: Type.Union([Type.String({ maxLength: 40 }), Type.Null()]),
+  backends: Type.Array(Type.String({ maxLength: 20 }), { maxItems: 4 }),
+  /** The account default: the runner an unaddressed operation belongs to. The first paired runner
+   *  holds it; `PATCH /runners/:id {default: true}` moves it. */
+  default: Type.Boolean(),
+  createdAt: Type.Integer({ minimum: 0 }),
+  lastSeenAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  /** Whether that runner holds a live `/runner/v1` socket right now. */
+  online: Type.Boolean(),
+  /** Capability 54. How many runtime bots this gateway has placed on that computer. It is what
+   *  makes the roster screen honest and what a delete warns about; a gateway below 54 sends no
+   *  count at all rather than a zero it did not measure. */
+  botCount: Type.Optional(Type.Integer({ minimum: 0 })),
+  /** Capability 55. Whether `name` is a person-set display name rather than the name the runner
+   *  itself reported: "still the default name" versus "someone renamed this". */
+  renamed: Type.Boolean(),
+}, { additionalProperties: false });
+export type Runner = Static<typeof RunnerSchema>;
+
+/** `GET /runners`. An object rather than a bare array so the route can grow a cursor without a
+ *  breaking change. */
+export const RunnersResponseSchema = Type.Object({
+  runners: Type.Array(RunnerSchema, { maxItems: 256 }),
+}, { additionalProperties: false });
+export type RunnersResponse = Static<typeof RunnersResponseSchema>;
+
+/** `PATCH /runners/:id`. `default: true` moves the account default to this runner. Capability 55
+ *  adds `name`: a trimmed 1-64 character (code points, not UTF-16 units) display name to set, with
+ *  no control or Unicode format character in it, or the literal `null`/`""` to clear it back to
+ *  the name the runner itself reports -- a whitespace-only string is refused rather than treated
+ *  as a clear. Both fields are optional and either may be sent alone; the route rejects a body
+ *  naming neither. */
+export const RunnerPatchRequestSchema = Type.Object({
+  default: Type.Optional(Type.Boolean()),
+  name: Type.Optional(Type.Union([Type.String({ maxLength: 256 }), Type.Null()])),
+}, { additionalProperties: false });
+export type RunnerPatchRequest = Static<typeof RunnerPatchRequestSchema>;
+
+/** `GET /runners/self`, authenticated by the runner's own token and nothing else. It is what the
+ *  installer polls after registering the service: the row exists the moment the pair lands, so
+ *  `attached` is the separate question of whether that machine has dialed in yet. Capability 55:
+ *  `name` is the display name once a person has set one, exactly as `GET /runners` renders it, and
+ *  `renamed` says which is which. */
+export const RunnerSelfSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 64 }),
+  name: Type.String({ minLength: 1, maxLength: 120 }),
+  platform: Type.Union([Type.String({ maxLength: 120 }), Type.Null()]),
+  default: Type.Boolean(),
+  lastSeenAt: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
+  attached: Type.Boolean(),
+  /** Compatibility alias for released Agents updaters. When supplied, equals `attached`. */
+  online: Type.Optional(Type.Boolean()),
+  /** Present only when this runner's currently attached, authenticated hello supplied a version. */
+  agentVersion: Type.Optional(Type.String({ minLength: 1, maxLength: 40 })),
+  /** Capability 55. True exactly when a person has set a display name, matching `Runner.renamed`. */
+  renamed: Type.Boolean(),
+}, { additionalProperties: false });
+export type RunnerSelf = Static<typeof RunnerSelfSchema>;
+
+/** `POST /runners/pair-code`. The device-authenticated way to mint what `cozygateway pair --kind
+ *  runner` prints, with the same 10 minute TTL and the same gateway-wide attempt bucket.
+ *  `gatewayUrl` is the origin the new computer should dial, which is not always the one the phone
+ *  is talking to. */
+export const RunnerPairCodeResponseSchema = Type.Object({
+  setupCode: Type.String({ minLength: 1, maxLength: 64 }),
+  expiresAt: Type.Integer({ minimum: 0 }),
+  gatewayUrl: Type.String({ minLength: 1, maxLength: 2048 }),
+}, { additionalProperties: false });
+export type RunnerPairCodeResponse = Static<typeof RunnerPairCodeResponseSchema>;
+
+/** `POST /pair {kind: "runner"}`. `runnerToken` is shown once and never again: the gateway stores
+ *  only its hash, exactly as it does for a device token. */
+export const RunnerPairResponseSchema = Type.Object({
+  runnerToken: Type.String({ minLength: 1 }),
+  runner: RunnerSchema,
+  gateway: GatewayInfoSchema,
+}, { additionalProperties: false });
+export type RunnerPairResponse = Static<typeof RunnerPairResponseSchema>;
+
+/** `DELETE /runners/:id`. `botCount` says how many runtime bots were placed on the computer that
+ *  was just revoked, so the app can tell the person what they have left stranded. Those bots' rows
+ *  are untouched: revoking a computer is not deleting the bots that ran on it.
+ *
+ *  `reassignedOperations` is how many of that computer's not-yet-sent operations were re-addressed
+ *  so they stay deliverable: to the account default when there is one, named in `reassignedTo`, and
+ *  otherwise to nobody, which is the same unaddressed state a pre-54 row has and is dispatched to
+ *  whichever runner becomes the default later. An operation the revoked runner had already been
+ *  sent is left alone: it may well have been applied. */
+export const RunnerDeleteResponseSchema = Type.Object({
+  ok: Type.Literal(true),
+  botCount: Type.Optional(Type.Integer({ minimum: 0 })),
+  reassignedOperations: Type.Optional(Type.Integer({ minimum: 0 })),
+  reassignedTo: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+}, { additionalProperties: false });
+export type RunnerDeleteResponse = Static<typeof RunnerDeleteResponseSchema>;
+
+/** Capability 54. The `409 runner_choice_required` body `POST /bots` answers when the account has
+ *  several computers and none of them is the default. `runners` is what the chooser renders and
+ *  what it sends back: the message names them for a person to read, and only these entries carry
+ *  the `id` a follow-up create has to put in `runnerId`. Modelled rather than left as an
+ *  undocumented extra key, because a client is expected to parse it. */
+export const RunnerChoiceRequiredBodySchema = Type.Object({
+  error: Type.Object({
+    code: Type.Literal("runner_choice_required"),
+    message: Type.String({ minLength: 1 }),
+  }, { additionalProperties: false }),
+  runners: Type.Array(
+    Type.Object({
+      id: Type.String({ minLength: 1, maxLength: 64 }),
+      name: Type.String({ minLength: 1, maxLength: 120 }),
+      /** Always false in this body, since a default is exactly what the account is missing. It is
+       *  carried anyway so the chooser reads one runner shape everywhere. */
+      isDefault: Type.Boolean(),
+    }, { additionalProperties: false }),
+    { maxItems: 256 },
+  ),
+}, { additionalProperties: false });
+export type RunnerChoiceRequiredBody = Static<typeof RunnerChoiceRequiredBodySchema>;
+
+export const BOTS_CAPABILITY_ID = "com.cozylabs.bots";
+/** Separately versioned because Hermes desktop discovery/adoption is neither a Dashboard fallback
+ * nor native Bot Mode history. A client must gate this picker and its resume action on this id,
+ * never on a later scalar value of `com.cozylabs.bots`. */
+export const HERMES_DESKTOP_SESSIONS_CAPABILITY_ID = "com.cozylabs.hermes-desktop-sessions";
+export const HERMES_DESKTOP_SESSIONS_CAPABILITY_VERSION = 4;
+/** The A2A inbox seam. Version 1 is leader assignments: `/bots/:name/assignments`,
+ * `/assignments/:taskId`, and the reinstated `GET /bots/:name/inbox` routes, all backed by
+ * gateway-owned rows rather than the withdrawn Hermes heuristic (ADR 0082). It is separate from
+ * `com.cozylabs.bots` because no later value of that scalar may be read as support for withdrawn
+ * capability 17, and it is never inferred from that scalar. */
+export const AGENT_INBOX_CAPABILITY_ID = "com.cozylabs.agent-inbox";
+export const AGENT_INBOX_CAPABILITY_VERSION = 1;
+/** Voice notes on the chat attachment route. Version 1: `POST /bots/:name/chat/attachments` also
+ * admits one `audio/mp4` (AAC `.m4a`), `audio/mpeg`, `audio/wav` or `audio/x-wav` file under the
+ * route's 20 MiB cap, and relays it to the bot as attach-v1 media of family `audio` with
+ * `mediaKind: "audio"` on the transcript row. It does not say the bot can hear it: that is the
+ * bot's own transcription, when it has one. It is its own id rather than a `com.cozylabs.bots`
+ * row because gateways at different bots versions (CozyAgents' embedded one, this one) must each
+ * be able to advertise it without claiming the other's rows. */
+export const CHAT_AUDIO_CAPABILITY_ID = "com.cozylabs.chat-audio";
+export const CHAT_AUDIO_CAPABILITY_VERSION = 1;
+/** The phone-as-node capability, advertised beside the bots one.
+ *  4: device status v2 answers over an authenticated origin, under a single-use lease.
+ *  5: the phone can also capture a photo or a short video, hand over a file the person picked,
+ *     and present an actionable notification. Each still requires its own lease and writes a
+ *     receipt, and each byte payload rides the existing attachment upload rather than the
+ *     ephemeral result frame.
+ *  6: the phone may report a non-terminal lifecycle stage of a request it holds
+ *     (`mobile_node_progress`). It is optional in the strongest sense: a phone that never sends
+ *     one behaves exactly as it did at 5, and the gateway simply knows less about that request. */
+export const MOBILE_NODE_CAPABILITY_ID = "com.cozylabs.mobile-node";
+export const MOBILE_NODE_CAPABILITY_VERSION = 6;
+/** Capability 30: a bounded, source-labelled projection of memory owned by the
+ * attached Hermes profile.  `attributes` deliberately does not exist: every
+ * field a client can render is named and bounded here, and a capability flag
+ * exists only where a client actually branches on it: the mutation verbs, the
+ * curated capacity meter and its next-session note, and `relationships`, which
+ * gates the graph destination. */
+/** `profile` is the curated About-me store. Hermes' own store calls that target
+ *  `user`; the wire keeps the reader-facing name, and `user` is not a member. */
+export const BotMemoryKindSchema = Type.Union([
+  Type.Literal("memory"), Type.Literal("profile"), Type.Literal("fact"), Type.Literal("note"),
+]);
+export type BotMemoryKind = Static<typeof BotMemoryKindSchema>;
+export const BotMemoryTimestampKindSchema = Type.Union([
+  Type.Literal("created"), Type.Literal("fileCreated"), Type.Literal("firstObserved"), Type.Literal("unknown"),
+]);
+export type BotMemoryTimestampKind = Static<typeof BotMemoryTimestampKindSchema>;
+export const BotMemoryCapabilitiesSchema = Type.Object({
+  create: Type.Boolean(), edit: Type.Boolean(), delete: Type.Boolean(),
+  relationships: Type.Boolean(), capacity: Type.Boolean(), effectiveNextSession: Type.Boolean(),
+}, { additionalProperties: false });
+export const BotMemorySourceSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 120 }),
+  displayName: Type.String({ minLength: 1, maxLength: 160 }),
+  kind: Type.String({ minLength: 1, maxLength: 80 }),
+  status: Type.Union([Type.Literal("available"), Type.Literal("degraded"), Type.Literal("unavailable"), Type.Literal("unsupported")]),
+  detail: Type.Optional(Type.String({ maxLength: 512 })),
+  capabilities: BotMemoryCapabilitiesSchema,
+  capacity: Type.Optional(Type.Object({ used: Type.Integer({ minimum: 0 }), limit: Type.Integer({ minimum: 1 }) }, { additionalProperties: false })),
+  effectiveNextSession: Type.Optional(Type.Boolean()),
+}, { additionalProperties: false });
+export type BotMemorySource = Static<typeof BotMemorySourceSchema>;
+export const BotMemoryItemSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 512 }), sourceId: Type.String({ minLength: 1, maxLength: 120 }), kind: BotMemoryKindSchema,
+  title: Type.String({ maxLength: 512 }), snippet: Type.String({ maxLength: 1_000 }), content: Type.Optional(Type.String({ maxLength: 32_000 })),
+  createdAt: Type.Optional(Type.Integer({ minimum: 0 })), updatedAt: Type.Optional(Type.Integer({ minimum: 0 })), timestampKind: BotMemoryTimestampKindSchema,
+  revision: Type.String({ minLength: 1, maxLength: 256 }), category: Type.Optional(Type.String({ maxLength: 120 })),
+  tags: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })), trustScore: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+  relativePath: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })),
+  backlinks: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { maxItems: 128 })), effectiveNextSession: Type.Optional(Type.Boolean()),
+  /** Capability 60: authoritative creator class. Absent is legacy/unknown, never inferred. */
+  owner: Type.Optional(Type.Union([Type.Literal("person"), Type.Literal("bot")])),
+}, { additionalProperties: false });
+export type BotMemoryItem = Static<typeof BotMemoryItemSchema>;
+/** The three capability-42 setup switches as the PEER's effective configuration reads them now,
+ * named as the setup request names them so a client compares the two directly. Unlike the
+ * request, all three may be false. Sources are not a substitute: they name adapters, and a peer
+ * lists an adapter whether or not its switch is on, so a client never infers these from them. */
+export const BotMemorySetupStateSchema = Type.Object({
+  memoryEnabled: Type.Boolean(), userProfileEnabled: Type.Boolean(), holographicEnabled: Type.Boolean(),
+}, { additionalProperties: false });
+export type BotMemorySetupState = Static<typeof BotMemorySetupStateSchema>;
+/** `setupAvailable` is the GATEWAY's own answer, never the peer's: it is true exactly when the
+ * attached peer negotiated capability-42 `memory_setup`, so a client knows whether
+ * `PATCH /bots/:name/memory/setup` is offered by this bot without probing it with a mutation.
+ * Absent means this deployment cannot observe the negotiation at all; it is never a promise that
+ * setup will succeed, only that the lane is there. A bot that already reports sources can still
+ * carry `true`, which is what lets a settings screen exist alongside a non-empty memory.
+ *
+ * `setup` is the PEER's answer, passed through: present only from a peer that negotiated attach-v1
+ * `memory_setup_state`, and absent means the peer did not say, never that the switches are off. */
+export const BotMemoryOverviewResponseSchema = Type.Object({ sources: Type.Array(BotMemorySourceSchema, { maxItems: 32 }), setupAvailable: Type.Optional(Type.Boolean()), setup: Type.Optional(BotMemorySetupStateSchema) }, { additionalProperties: false });
+export type BotMemoryOverviewResponse = Static<typeof BotMemoryOverviewResponseSchema>;
+/** Capability 42: exact credential-free setup choices. The union makes "at least one true" part
+ * of the normative schema while every branch remains a closed, three-required-boolean object. */
+export const BotMemorySetupRequestSchema = Type.Union([
+  Type.Object({ memoryEnabled: Type.Literal(true), userProfileEnabled: Type.Boolean(), holographicEnabled: Type.Boolean() }, { additionalProperties: false }),
+  Type.Object({ memoryEnabled: Type.Boolean(), userProfileEnabled: Type.Literal(true), holographicEnabled: Type.Boolean() }, { additionalProperties: false }),
+  Type.Object({ memoryEnabled: Type.Boolean(), userProfileEnabled: Type.Boolean(), holographicEnabled: Type.Literal(true) }, { additionalProperties: false }),
+]);
+export type BotMemorySetupRequest = Static<typeof BotMemorySetupRequestSchema>;
+export const BotMemoryItemsResponseSchema = Type.Object({ items: Type.Array(BotMemoryItemSchema, { maxItems: 100 }), sources: Type.Optional(Type.Array(BotMemorySourceSchema, { maxItems: 32 })), setupAvailable: Type.Optional(Type.Boolean()), setup: Type.Optional(BotMemorySetupStateSchema) }, { additionalProperties: false });
+export type BotMemoryItemsResponse = Static<typeof BotMemoryItemsResponseSchema>;
+export const BotMemoryGraphResponseSchema = Type.Object({ nodes: Type.Array(BotMemoryItemSchema, { maxItems: 200 }), edges: Type.Array(Type.Object({ from: Type.String({ maxLength: 512 }), to: Type.String({ maxLength: 512 }), kind: Type.Union([Type.Literal("entity"), Type.Literal("wikilink")]) }, { additionalProperties: false }), { maxItems: 400 }) }, { additionalProperties: false });
+export type BotMemoryGraphResponse = Static<typeof BotMemoryGraphResponseSchema>;
+export const BotMemoryWriteRequestSchema = Type.Object({ content: Type.String({ minLength: 1, maxLength: 32_000 }), title: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })), category: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })), tags: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 120 }), { maxItems: 64 })), expectedRevision: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })) }, { additionalProperties: false });
+export const BotMemoryDeleteRequestSchema = Type.Object({ expectedRevision: Type.String({ minLength: 1, maxLength: 256 }) }, { additionalProperties: false });
+export const BotMemoryWriteResponseSchema = Type.Object({ item: BotMemoryItemSchema }, { additionalProperties: false });
+export type BotMemoryWriteResponse = Static<typeof BotMemoryWriteResponseSchema>;
+export const BotMemoryDeleteResponseSchema = Type.Object({ id: Type.String({ minLength: 1, maxLength: 512 }), revision: Type.String({ minLength: 1, maxLength: 256 }) }, { additionalProperties: false });
+export type BotMemoryDeleteResponse = Static<typeof BotMemoryDeleteResponseSchema>;
+
+/** Capability 50: BOT HISTORY. A runtime bot checkpoints its own workspace into git and serves
+ * the layman history surface over the attach-v1 `bot_history` lane. Every shape below is a
+ * DESCRIPTION of a change, never the change: a checkpoint carries a one-line summary and the
+ * audit ids the turn already had, and a diff carries per-file counts. No file content, no patch
+ * text, and no host path ever crosses this boundary, in either direction. */
+
+/** Whether the turn that produced this checkpoint had a passing Verification receipt.
+ * `unavailable` is its own answer rather than `failed`: a turn whose checks could not run is not
+ * a turn whose checks failed, and a "Changes" row that says so is the difference between "do not
+ * restore this" and "nobody knows". */
+export const BotHistoryChecksSchema = Type.Union([
+  Type.Literal("passed"), Type.Literal("failed"), Type.Literal("unavailable"),
+]);
+export type BotHistoryChecks = Static<typeof BotHistoryChecksSchema>;
+
+/** One row of the Changes list. `summary` is the checkpoint's subject line, which is one line of
+ * the bot's own prose and never a diff. `turnId` and `messageId` are the audit ids from the
+ * commit's `Cozy-Turn` and `Cozy-Message` trailers, present only for a checkpoint a turn wrote:
+ * an "as found" checkpoint (a human edited files outside the bot) has neither. `epoch` is the
+ * policy Epoch the checkpoint was taken at, which is the "state moved" clock the checkpoint rule
+ * triggers on. */
+export const BotHistoryCheckpointSchema = Type.Object({
+  id: Type.String({ minLength: 1, maxLength: 128 }),
+  at: Type.Integer({ minimum: 0 }),
+  summary: Type.String({ maxLength: 512 }),
+  checks: BotHistoryChecksSchema,
+  turnId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  messageId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+  epoch: Type.Integer({ minimum: 0 }),
+}, { additionalProperties: false });
+export type BotHistoryCheckpoint = Static<typeof BotHistoryCheckpointSchema>;
+
+export const BotHistoryListResponseSchema = Type.Object({
+  checkpoints: Type.Array(BotHistoryCheckpointSchema, { maxItems: 200 }),
+}, { additionalProperties: false });
+export type BotHistoryListResponse = Static<typeof BotHistoryListResponseSchema>;
+
+/** What happened to one file between two checkpoints, as COUNTS. `added` and `removed` are line
+ * counts, which is what a "12 lines added" row needs and the most a client can be given without
+ * the file itself crossing the boundary. */
+export const BotHistoryDiffFileSchema = Type.Object({
+  path: Type.String({ minLength: 1, maxLength: 1024 }),
+  added: Type.Integer({ minimum: 0 }),
+  removed: Type.Integer({ minimum: 0 }),
+  status: Type.Union([
+    Type.Literal("added"), Type.Literal("modified"), Type.Literal("deleted"), Type.Literal("renamed"),
+  ]),
+}, { additionalProperties: false });
+export type BotHistoryDiffFile = Static<typeof BotHistoryDiffFileSchema>;
+
+/** The file list for one comparison. There is deliberately no `patch`, `hunks`, or `preview`
+ * field, and adding one later would be a new capability rather than an enrichment: this lane
+ * carries the shape of a change so a person can choose, and the workspace is where the change
+ * itself lives. */
+export const BotHistoryDiffResponseSchema = Type.Object({
+  files: Type.Array(BotHistoryDiffFileSchema, { maxItems: 500 }),
+}, { additionalProperties: false });
+export type BotHistoryDiffResponse = Static<typeof BotHistoryDiffResponseSchema>;
+
+export const BotHistoryRestoreRequestSchema = Type.Object({
+  checkpoint: Type.String({ minLength: 1, maxLength: 128 }),
+}, { additionalProperties: false });
+export type BotHistoryRestoreRequest = Static<typeof BotHistoryRestoreRequestSchema>;
+
+/** A restore writes a NEW checkpoint doing the restoring, which is what makes undo itself
+ * undoable. `checkpoint` is that new one and `restoredFrom` is the one whose state it carries, so
+ * a client can say "back to 3:41pm" and still address the row it just created. */
+export const BotHistoryRestoreResponseSchema = Type.Object({
+  checkpoint: Type.String({ minLength: 1, maxLength: 128 }),
+  restoredFrom: Type.String({ minLength: 1, maxLength: 128 }),
+}, { additionalProperties: false });
+export type BotHistoryRestoreResponse = Static<typeof BotHistoryRestoreResponseSchema>;
+
+/** The composer's "Try it" toggle, as one route with three actions rather than three routes: the
+ * three are mutually exclusive states of one experiment, and a client that could POST `keep`
+ * without ever having POSTed `start` is a client with two surfaces to keep in step. `label` is the
+ * person's own words for what they are trying and is required only by `start`. */
+export const BotHistoryTryRequestSchema = Type.Object({
+  action: Type.Union([Type.Literal("start"), Type.Literal("keep"), Type.Literal("discard")]),
+  label: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+}, { additionalProperties: false });
+export type BotHistoryTryRequest = Static<typeof BotHistoryTryRequestSchema>;
+
+/** `base` is the checkpoint the experiment started from, so "your working version is safe" names
+ * something the client can go back to without asking again. */
+export const BotHistoryTryStartResponseSchema = Type.Object({
+  tryId: Type.String({ minLength: 1, maxLength: 128 }),
+  base: Type.String({ minLength: 1, maxLength: 128 }),
+}, { additionalProperties: false });
+export type BotHistoryTryStartResponse = Static<typeof BotHistoryTryStartResponseSchema>;
+
+/** One file the person has to choose a side for, described in the words a chat surface can put on
+ * screen: `ours` is what the bot did in the experiment and `theirs` is the change that landed on
+ * the working version meanwhile. Both are BOUNDED LABELS, one line each, never file content or a
+ * patch: the choice a layman is asked to make is "Sage's version or the other change", and the
+ * label is what names the sides. The word conflict is never shown; it is the wire's name for the
+ * one case, not the reader's. */
+export const BotHistoryConflictFileSchema = Type.Object({
+  path: Type.String({ minLength: 1, maxLength: 1024 }),
+  ours: Type.String({ maxLength: 200 }),
+  theirs: Type.String({ maxLength: 200 }),
+}, { additionalProperties: false });
+export type BotHistoryConflictFile = Static<typeof BotHistoryConflictFileSchema>;
+
+/** Keeping an experiment. `merged` is true when the working version now carries it. `conflicts` is
+ * present only when it does not, and then it is the whole question the person has to answer: the
+ * files, and the two sides for each. That answer goes back through `POST
+ * /bots/:name/history/resolve`. */
+export const BotHistoryTryKeepResponseSchema = Type.Object({
+  merged: Type.Boolean(),
+  conflicts: Type.Optional(Type.Array(BotHistoryConflictFileSchema, { maxItems: 200 })),
+}, { additionalProperties: false });
+export type BotHistoryTryKeepResponse = Static<typeof BotHistoryTryKeepResponseSchema>;
+
+/** Throwing an experiment away. `kept` is false on the ordinary discard and exists so the one
+ * answer that matters is stated rather than inferred from a 200: a peer that could not throw the
+ * experiment away answers a non-`ok` status, and a peer that kept the work for a reason of its own
+ * says so here instead of letting a client tell the person their work is gone. */
+export const BotHistoryTryDiscardResponseSchema = Type.Object({
+  kept: Type.Boolean(),
+}, { additionalProperties: false });
+export type BotHistoryTryDiscardResponse = Static<typeof BotHistoryTryDiscardResponseSchema>;
+
+/** The person's per-file answer. `ours` is the bot's experiment, `theirs` the other change, using
+ * the same two words the conflict rows named. A path the peer did not report as conflicted is
+ * refused rather than applied. */
+export const BotHistoryResolveChoiceSchema = Type.Object({
+  path: Type.String({ minLength: 1, maxLength: 1024 }),
+  pick: Type.Union([Type.Literal("ours"), Type.Literal("theirs")]),
+}, { additionalProperties: false });
+export type BotHistoryResolveChoice = Static<typeof BotHistoryResolveChoiceSchema>;
+
+export const BotHistoryResolveRequestSchema = Type.Object({
+  choices: Type.Array(BotHistoryResolveChoiceSchema, { minItems: 1, maxItems: 200 }),
+}, { additionalProperties: false });
+export type BotHistoryResolveRequest = Static<typeof BotHistoryResolveRequestSchema>;
+
+export const BotHistoryResolveResponseSchema = Type.Object({
+  merged: Type.Boolean(),
+}, { additionalProperties: false });
+export type BotHistoryResolveResponse = Static<typeof BotHistoryResolveResponseSchema>;
+
+/** The bounded `GET /bots/:name/history` query. `since` is a millisecond wall-clock bound, the
+ * same unit `BotHistoryCheckpoint.at` reports in, so a "yesterday, 6pm" shortcut is one
+ * subtraction rather than a format to agree on. */
+export const BotHistoryListQuerySchema = Type.Object({
+  since: Type.Optional(Type.Integer({ minimum: 0 })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+}, { additionalProperties: false });
+export type BotHistoryListQuery = Static<typeof BotHistoryListQuerySchema>;
+
+/** Capability 33: create-time tool selection. `POST /bots` accepts optional `toolsets` and
+ *  `mcpServers` alongside the name, and answers `BotCreateResponse`, whose optional `warnings`
+ *  name any selection the backend did not report and could not grant. A gateway that seeds
+ *  blank-slate bots applies the selection ON TOP of the `file` + `terminal` floor. Both request
+ *  fields are optional and additive, so a client below 33 is untouched and a gateway below 33
+ *  ignores them; a picker UI gates on `>= 33` so the user is never shown a choice that will be
+ *  dropped in silence. */
+/** Capability 34: SUBAGENT VISIBILITY. When a bot delegates work to subagents mid-turn (Hermes
+ *  `delegate_task`), the batch lifecycle reaches clients as `bot_delegation_activity`
+ *  full-replace snapshots, plus a `delegations` array on `GET /bots/:name/chat/messages` so an
+ *  active batch survives reopen and reconnect. Additive exactly as capability 12 was: a client
+ *  below 34 ignores an unknown frame type and an optional response field and keeps today's
+ *  behavior (the outer delegate_task chip plus the terminal completion card); a client that
+ *  renders live batch cards gates on `>= 34`, because an older gateway never sends either.
+ *  Children carry only bounded display metadata (a truncated task label, a tool name). On Hermes
+ *  v0.21 synchronous results they may additionally carry bounded cost/provenance, structured-output
+ *  validation state, and terminal duration; older/background results omit them. Raw child
+ *  transcripts, summaries, schema errors, tokens, args, results, and paths never cross this wire,
+ *  a restart with a child in flight settles it `unknown` -- never `failed` -- and nothing here is
+ *  pushed. These optional fields consume no capability bump: capability 34 clients already ignore
+ *  unknown optional child fields, and capability 42 is reserved for memory setup. */
+/** Capability 35: LIVE THINKING PREVIEW. A deliberate, bounded reopening of the old
+ *  "no reasoning on the wire" rule (approved 2026-08: reasoning models emit their whole reply in
+ *  one end burst, so a turn otherwise shows only a generic thinking state). What crosses the wire
+ *  is `bot_thinking_activity`: a latest-only, sanitized, <=280-char rolling preview -- never the
+ *  chain of thought itself, never tool args/results, prompts, credentials, or paths. It is
+ *  ephemeral end to end: not persisted, absent from chat history, and it stops at the turn's
+ *  terminal. Additive exactly as 34 was: a client below 35 ignores the unknown frame and keeps
+ *  today's shimmer; a client that renders the preview gates on `>= 35`. */
+/** Capability 36: FULL PROVIDER VISIBILITY. `BotModelConfig` gains the optional `providers`
+ *  summary (one row per provider Hermes reported, kept even at zero selectable models or with a
+ *  lost credential) and catalog entries may carry `unauthenticated: true`. Hermes deliberately
+ *  keeps an unauthenticated configured provider visible so the picker can show the saved
+ *  selection and a re-auth affordance; the gateway now forwards that intent instead of silently
+ *  dropping the rows. Additive exactly as 33 was: a client below 36 ignores the unknown field
+ *  and marker; a client that renders the providers summary or disabled entries gates on
+ *  `>= 36`. */
+/** Capability 37: BOT DELETION. `DELETE /bots/:name` is the inverse of `POST /bots`: the Hermes
+ *  profile directory is removed through the dashboard (config, API keys, memories, sessions,
+ *  skills, cron, the synced plugin and its .env), every durable gateway row the bot owned is
+ *  purged, and the attach identity stops authenticating immediately. A running native turn
+ *  refuses the delete with `409` extension code `conflict` (the body carries `turnId`) unless
+ *  `?force=1`. Additive exactly as 33 was: a client below 37 simply never calls the route. */
+/** Capability 38: DEVICE STATUS V2. The `cozy_device_status` tool requires a normalized purpose
+ * and returns the closed, privacy-bounded mobile-node v3 status shape. Clients below 38 must not
+ * expose the tool because mobile-node v2 has been deleted rather than retained as a fallback. */
+/** Capability 39: CAPABILITY LEASES AND PHONE-SHARING RECEIPTS. Every phone-node answer requires
+ * the originating device and the server-issued, short-lived, single-use lease. A successful share
+ * emits `bot_mobile_receipt` and is returned in history as `mobileReceipts`. Receipts contain only
+ * request identity, conversation identity, command, normalized purpose, and gateway timestamp:
+ * never the lease, device id, status/location result, or another phone payload. */
+/** Capability 40: BOT READINESS. `GET /bots/:name/readiness` distinguishes a profile that exists
+ * from an attach transport that is online. The route is read-only and returns `starting` until the
+ * bot's authenticated attach-v1 hello has settled, then `ready`. A client that gates its composer
+ * on this route must require >= 40; older gateways do not expose the readiness fact. */
+/** Capability 41: MODEL PROVIDER SETUP COMPATIBILITY. Canonical provider administration now lives
+ * at gateway → harness → configuration scope under `com.cozylabs.harness-settings`. These bot
+ * routes remain temporarily so capability-41 clients do not break. */
+/** Capability 42: truthful Bot Activity previews plus credential-free, profile-local Hermes
+ * memory setup. Roster previews never infer A2A provenance from transcript text, and setup runs
+ * through the authenticated attached plugin; the gateway never opens profile configuration. */
+/** Capability 43 adds authoritative synchronization state for every visible Hermes profile and
+ * the `setup_required` readiness outcome for profiles outside the attach map. */
+/** Capability 44 adds per-profile CozyApps capability readiness, including a stable restart repair
+ * when a connected plugin did not negotiate `cozyapps`. */
+/** Capability 45: NATIVE RUNTIME BOTS. A config-declared bot served by a non-Hermes attach peer
+ * appears on the roster with `runtime: "cozyagents"` built from config plus attach presence, never
+ * from the Dashboard, and its Dashboard-backed routes answer `409 unsupported_for_runtime`. A
+ * client gating native-bot UI must require >= 45: a gateway at 44 has the CozyApps fact and no
+ * native bots at all. */
+/** Capability 46: RUNTIME BOTS IN ROOMS. A capability-45 runtime bot can be a full member of a
+ *  group room. Membership is answered from gateway config rather than from `profiles.list`, so
+ *  `POST /bots/groups` naming one succeeds and a room made only of runtime bots runs with the
+ *  Hermes Dashboard entirely out of the picture; the member turn is the same attach-v1 command on
+ *  the same gateway-owned `group:<room>:<member>` thread a Hermes member gets. A room turn's live
+ *  draft now reaches clients as `bot_chat_delta` carrying `room`, the field this schema already
+ *  reserved, terminated by an empty `done: true` frame at every settlement the turn can reach and
+ *  suppressed entirely for a draft that reads as the protocol's own `(pass)`. Tool, thinking, and
+ *  delegation activity inside a room turn is still not projected. No
+ *  new frame and no new route: a client below 46 sees a room like any other and ignores the
+ *  unknown `room` field; one that renders a room's live typing gates on `>= 46`. */
+/** Capability 47: AUDITABLE IDS. Room and 1:1 transcript rows now carry the identities the
+ * gateway already held and threw away at settlement: `BotGroupMessage` gains `messageId`,
+ * `turnId`, `epoch`, `cause` and `attachTurn`; `BotGroupNote` gains `turnId`; `BotChatMessage`
+ * gains `turnId`, `authorBot` and `inReplyToId`. The attach `turn` command gains an optional
+ * `context` so a room peer reads typed actors and causation instead of parsing the prompt header;
+ * the prompt text is byte-identical to before. Every field is additive and optional: a row
+ * written before 47 has none of them and renders exactly as it always has, and a client that
+ * shows provenance gates on `>= 47`. */
+/** Capability 48: BOT CONFIG LANE. A capability-45 runtime bot serves its own profile, model
+ * config, and routines over the attach-v1 `bot_config` request/reply lane, so `GET/PATCH
+ * /bots/:name/profile`, `GET/PUT /bots/:name/model-config`, and the routines routes answer for it
+ * instead of `409 unsupported_for_runtime`. The wire shapes are unchanged: the peer implements the
+ * same published schemas a Hermes-backed bot does. `DELETE /bots/:name`, model-provider setup, and
+ * desktop-session transcripts keep the 409, and so do the config routes when the peer did not
+ * negotiate `bot_config`. Additive: a client below 48 sees the 409 it already handles. */
+/** Capability 49: RUNTIME BOTS CREATED FROM THE APP. `POST /bots` accepts `runtime: "cozyagents"`
+ * and answers the same `201 {bot, warnings?}` a Hermes create answers, with `bot.runtime` set. The
+ * gateway writes its own durable bot row, mints the attach token, registers the identity live (no
+ * restart), and enqueues a `create_runtime` operation for a CozyRunner. `GET /bots/:name/runtime`
+ * projects `{stage, specGeneration, observedGeneration, lastRunnerContactAt}`; with no runner
+ * connected the stage is `waiting_for_runner` until one arrives. `DELETE /bots/:name` answers for
+ * a runtime bot instead of 409: it revokes the token, purges the gateway rows, and enqueues
+ * `delete_runtime`. Additive: a client below 49 never sends the field and never calls the route,
+ * and a gateway below 49 ignores an unknown request field and creates a Hermes bot, which is why a
+ * client that offers runtime creation must require `>= 49`. */
+/** Capability 50: BOT HISTORY. A capability-45 runtime bot checkpoints its own workspace into git
+ * and serves that history over the attach-v1 `bot_history` request/reply lane, so `GET
+ * /bots/:name/history`, `GET /bots/:name/history/:checkpoint/diff`, `POST
+ * /bots/:name/history/restore`, `POST /bots/:name/history/try` and `POST
+ * /bots/:name/history/resolve` answer for it. Those five routes are RUNTIME-BOT ONLY: a Hermes bot
+ * answers `409 unsupported_for_runtime`, because a Hermes profile has no checkpointed workspace
+ * behind it, and so does a runtime bot whose peer did not negotiate `bot_history`, because the
+ * section is then genuinely absent rather than temporarily unreachable.
+ *
+ * Nothing content-shaped crosses this boundary in either direction: a checkpoint carries a
+ * one-line summary and the audit ids the turn already had, a diff carries per-file line counts,
+ * and a conflict carries one bounded label per side. File bodies and patch text are not on this
+ * wire and adding them would be a new capability, not an enrichment.
+ *
+ * Additive: the routes did not exist below 50, so a client that offers Changes, Undo, or Try must
+ * require `>= 50` and a gateway below 50 answers `404`. */
+/** Capability 51: ROOM TURNS CAN ASK. A capability-45 runtime bot taking a room member turn may
+ * now raise an approval or a clarification and stream its tool steps, which below 51 were
+ * acknowledged and dropped because a room had no projection for them. That silence is why a peer
+ * had to run room turns with read-only tools; it no longer does.
+ *
+ * An approval or clarify event on a member turn is recorded in the SAME durable interaction table
+ * a 1:1 chat uses, keyed by the member bot and the attach id, with `sessionId` set to the
+ * gateway-owned `group:<room>:<member>` thread and `turnId` set to the room member turn. So it
+ * appears in `GET /bots/approvals` beside every other pending item, and `POST
+ * /bots/:member/approvals/:id/approve|deny` and `POST /bots/:member/clarifications/:id` resolve it
+ * with no new route and no changed request shape: the gateway sends the peer the same
+ * `resolve_approval` / `resolve_clarify` command it always sent. The inbox row, the
+ * `bot_approval_pending`/`bot_approval_resolved` frames (whose `room` this schema already
+ * reserved) and the `bot_clarify_pending`/`bot_clarify_resolved` frames (which gain it here) carry
+ * the room name, so a client can render the card above the right transcript.
+ *
+ * Tool events on a member turn project as `bot_tool_activity` carrying `room`: the 1:1 card shape,
+ * name and status only, EPHEMERAL and never persisted, so a room activity view can exist without
+ * a room turn's steps entering any history. Thinking and delegation activity in a room stay
+ * unprojected.
+ *
+ * The room transcript gains nothing. A pending interaction is live state, so it rides `BotGroup`
+ * and `bot_group_state` as the optional `pendingInteractions` pointer array (member, kind, id,
+ * turn) and is gone when it settles.
+ *
+ * HERMES MEMBERS ARE UNCHANGED. Only a member whose bot is a runtime bot projects any of this; a
+ * Hermes-backed member's room turn drops these events exactly as it did below 51.
+ *
+ * Additive: no new route, no changed shape, every new field optional. A client that renders a room
+ * approval card or a room activity view gates on `>= 51`; below it a room behaves as it did. */
+/** Capability 52: PAIRED RUNNERS. A computer that runs bots is paired the same way a phone is:
+ * `POST /pair {setupCode, deviceName, kind: "runner"}` consumes a runner-kind setup code and
+ * answers `{runnerToken, runner, gateway}`, minting a 32-byte per-runner token instead of a device
+ * token. `deviceName` carries the runner's name, so the request shape is additive and a client
+ * below 52 (which never sends `kind`) pairs a device exactly as it always did. A code minted for a
+ * runner and presented as a device, or the reverse, answers the existing `401 setup_code_invalid`
+ * with the existing message, so a wrong-kind code is indistinguishable from an expired one.
+ *
+ * `GET /runners`, `PATCH /runners/:id {default}` (capability 55 extends this same route with a
+ * person-set `name`) and `DELETE /runners/:id` are device-authenticated and mirror the devices
+ * routes, including the 404 for an unknown id. `POST /runners/pair-code`
+ * mints a runner code from the app with the same TTL and bucket the CLI's `pair --kind runner`
+ * uses, and `GET /runners/self` answers one row under the runner's own bearer, which is the only
+ * route that credential opens and the one an installer's health check polls. The first paired runner is
+ * the default; setting a new default clears the flag on every other row in the same transaction; a
+ * delete revokes that runner's token and closes its socket.
+ *
+ * `/runner/v1` accepts any active per-runner token and attributes the connection to that runner
+ * row, so two computers hold two sockets at once and a supersede (close `4000`) is scoped to one
+ * runner id. The operator-placed `COZYGATEWAY_RUNNER_TOKEN` remains supported as the legacy shared
+ * credential with its old single-connection behaviour. The runner's `hello` gains optional `name`,
+ * `platform` and `agentVersion`, recorded on the row on every hello that carries them, so a renamed
+ * computer renames its roster row, and projected here.
+ *
+ * A gateway with no Hermes endpoint is a supported configuration from 52: the roster and readiness
+ * answer from runtime bots alone and `/ready` reports the Hermes bridge as `absent` rather than
+ * degraded.
+ *
+ * Additive: no existing route, request or response changes, and a client that renders the roster
+ * gates on `>= 52`. */
+/** Capability 53: ROUTINE RUN NOW. `POST /bots/:name/routines/:id/run` sends `routines.run` over
+ * the existing capability-48 `bot_config` lane and answers `BotRoutineRunResponse`
+ * (`{routine, startedAt}`), so a person or a check can force a runtime bot's routine to fire
+ * immediately instead of waiting for its schedule. No new capability row: it is a route on the
+ * operation capability 48 already defined on the wire, and the config lane already carried
+ * `routines.run` before this version, unreachable for lack of a route.
+ *
+ * RUNTIME-BOT ONLY, the same rule capability 50's history routes follow: a Hermes bot answers
+ * `409 unsupported_for_runtime`, because a Hermes cron job has no on-demand trigger this gateway
+ * can reach, and so does a runtime bot whose peer did not negotiate `bot_config`, because the
+ * lane is genuinely absent rather than temporarily unreachable. An id that names no routine in the
+ * bot's namespace is `404 not_found`, exactly as it is on the other routines routes, and an
+ * offline peer is `503 backend_unavailable`.
+ *
+ * Additive: the route did not exist below 53, so a client that offers a "run now" action must
+ * require `>= 53` and a gateway below it answers `404`. */
+/** Capability 54: A CREATE PICKS A COMPUTER. `BotCreateRequest` gains optional `runnerId`, which
+ * names the paired runner (`GET /runners`) that should run the new bot. Absent, the gateway picks
+ * the account default, then the only paired runner; with none it answers `409 no_runner_paired`,
+ * which the app turns into "Add a computer first", and with several and no default it answers
+ * `409 runner_choice_required` naming them, which the app turns into a chooser. Those are two
+ * different sentences to a person, so they are two different codes. A `runnerId` naming a runner
+ * this gateway does not have is `400 invalid_request` naming the field.
+ *
+ * The chosen runner is recorded on the bot and on every operation for it, so a create, a delete and
+ * a later upgrade all reach the same machine, and `/runner/v1` hands each connected runner only the
+ * operations that name it. An operation written before 54 names no runner and goes to the account
+ * default, which is what keeps an existing single-runner deployment moving with no migration step.
+ *
+ * `BotSummary` and `BotRuntimeProjection` gain optional `runnerId` and `runnerName`, absent for a
+ * Hermes bot and for a runtime bot created before 54 and never backfilled. `Runner` gains optional
+ * `botCount`, the number of runtime bots placed on that computer, and `DELETE /runners/:id` answers
+ * it too: revoking a computer leaves its bots' rows intact and says how many they are. That revoke
+ * also re-addresses the runner's not-yet-sent operations, to the account default when there is one
+ * and to nobody when there is not, and reports the count as `reassignedOperations`, so a revoke
+ * never leaves work addressed to a machine that can no longer authenticate.
+ *
+ * The `409 runner_choice_required` body is `RunnerChoiceRequiredBody`: the message names the
+ * candidates for a person, and the `runners` array carries the ids the chooser needs.
+ *
+ * Additive: `BotCreateRequestSchema` is open and the create body a client below 54 sends is
+ * accepted unchanged, with the same response shape it already reads. A client that offers a
+ * computer picker gates it on `>= 54`. */
+/** Capability 55: A PERSON CAN RENAME A PAIRED RUNNER. `PATCH /runners/:id` gains optional `name`,
+ * a 1-64 character (code point, not UTF-16 unit, so an emoji is one toward the limit) display name
+ * alongside the existing `default`; a body naming neither, or a `name` that fails validation, is
+ * `400 invalid_request` naming the field. `name` is trimmed first, and ONLY the literal `""` or
+ * `null` clears the display name: a whitespace-only string is a mistake, not a clear, and is
+ * refused the same as an over-length one. The trimmed value may carry no C0/C1 control character
+ * and no Unicode "Format" (Cf) code point either -- zero-width space and joiners, the bidi
+ * override and isolate controls, and the byte-order mark among them -- because a name built from
+ * those renders invisible or reorders the text around it.
+ *
+ * A person-set name wins over whatever the runner reports on `hello` from then on: `hello` keeps
+ * updating the reported name in its own column exactly as it did before 55, but `GET /runners`,
+ * `GET /runners/self`, and the `runnerName` carried on a bot summary or runtime projection all
+ * render the display name once one is set. `Runner` and `RunnerSelf` both gain `renamed`, true
+ * exactly when a display name is set, so a client can tell "still the default name" from "someone
+ * renamed this" without comparing strings.
+ *
+ * Setting `name` to `""` or `null` clears the display name and returns to whatever the runner
+ * itself reports, present or future.
+ *
+ * Additive: a gateway below 55 has no `display_name` column and no `renamed` field; the migration
+ * that adds the column is nullable and idempotent, so an existing database reopens with every row
+ * unrenamed. A client that offers a rename action gates it on `>= 55`. */
+/** Capability 56: AN APPROVAL CAN NAME WHAT IT COVERS. `ApprovalEvent` on `attach-v1` gains
+ * optional `detail`, a short sentence a runtime peer sends alongside an approval it raises -- for
+ * example naming which Chrome and which profile `my_browser_open` would drive. The gateway trims
+ * it, refuses any C0/C1 control character or Unicode "Format" (Cf) code point (the same family
+ * capability 55 checks on a runner name), and bounds the display value to 1-400 characters,
+ * truncating an overlong sentence at the last whole word and appending an ellipsis. Unlike the
+ * runner-name check, a `detail` that fails any of this is SANITIZED, never a reason to refuse the
+ * frame: the approval it describes is not the sender's typo to fix, and dropping the frame over a
+ * presentation field would strand a real permission decision.
+ *
+ * `BotApprovalPendingFrame` gains the same optional `detail`, carrying the sanitized sentence
+ * when the raising event had one and omitted otherwise -- a payload with no `detail` is byte-
+ * identical to what a pre-56 gateway sent. The durable interaction row stores it alongside the
+ * existing `name`, so a reconnecting app's rebroadcast of a still-pending approval carries the
+ * same sentence the live frame did. The approve/deny resolve path, `BotApprovalResolvedFrame`, and
+ * `GET /bots/approvals` are unchanged: `detail` is a raise-time presentation field, not part of
+ * the decision.
+ *
+ * Additive: a gateway below 56 never writes `detail` into the stored payload JSON and never sends
+ * it on the frame; an event or payload that carries none behaves exactly as it did below 56. A
+ * client that renders the sentence gates it on `>= 56`. */
+/** Capability 57: THE PER-BOT GUARDRAIL LEVEL. `BotProfile` gains an optional `guardrailLevel` and
+ * `BotProfilePatch` an optional one too, one of `locked`, `guided`, `balanced`, `autonomous`,
+ * carried over the existing capability-48 `bot_config` lane on the existing `profile.read` and
+ * `profile.write` operations. No new route and no new lane.
+ *
+ * This gateway is a relay for the field, not an owner of it: it validates the closed union at the
+ * boundary and forwards the patch to the runtime peer unchanged, and it reads back exactly what
+ * the peer answers rather than computing or defaulting the value itself. A body naming a fifth
+ * value is `400 invalid_request` naming the field, the same shape every other closed-union field
+ * on this route already answers.
+ *
+ * Absent for a Hermes bot (the field is not part of the `profiles.describe` / `profiles.configure`
+ * vocabulary this gateway translates for Hermes, so a Hermes profile read never carries it and a
+ * Hermes profile write silently does not act on it), and absent for a runtime peer that has not
+ * negotiated capability 57, and never backfilled in either case: an absent value is silence, not a
+ * default the gateway invented.
+ *
+ * Additive: both schema fields are optional, so a client below 57 sends no such field and its
+ * profile saves stay byte identical to the ones it sent before, and a gateway below 57 simply never
+ * sends or accepts the field. A client that offers the level picker gates it on `>= 57`. */
+/** Capability 58: THE OPERATOR'S GUARDRAIL CEILING. `BotProfile` gains an optional
+ * `guardrailCeiling`, one of the same four literals as `guardrailLevel`, carried on the existing
+ * capability-57 `profile.read` operation of the `bot_config` lane. `BotProfilePatch` does NOT gain
+ * it: the ceiling is not something this gateway or its app write, so the field is refused on the
+ * patch, `400 invalid_request` naming the field, exactly like any other value the schema does not
+ * admit.
+ *
+ * This gateway is a relay for the field, not an owner of it, exactly as it is for `guardrailLevel`:
+ * it validates the closed union at the boundary and reads back exactly what the runtime peer
+ * answers on `profile.read`, never computing, storing, or defaulting it. The ceiling is the
+ * operator's own limit on that bot, set on the runtime peer rather than through this gateway; a
+ * `profile.write` asking for a `guardrailLevel` above the ceiling is the runtime peer's own
+ * refusal to make, `400` naming both the field and the ceiling it exceeds, so the app greys out
+ * every level above the ceiling it read rather than sending a level the peer will refuse anyway.
+ *
+ * Absent for a Hermes bot (the field is not part of the `profiles.describe` vocabulary this
+ * gateway translates for Hermes, so a Hermes profile read never carries it), and absent for a
+ * runtime peer that has not negotiated capability 58, and never backfilled in either case: an
+ * absent value is silence, not a default the gateway invented, exactly as `guardrailLevel` reads.
+ *
+ * Additive: the schema field is optional and read-only, so a client below 58 sends and reads
+ * profiles exactly as it did before, and a gateway below 58 simply never sends the field. A client
+ * that greys out levels above the ceiling gates it on `>= 58`. */
+/** Capability 59: A BOT'S WHOLE SKILL AND TOOLSET CATALOGUE. The existing profile read gains
+ * optional skill provenance and installation fields plus optional toolset availability and its
+ * reason. The patch gains `enabledSkills`, an additive ON list that installs only from the runtime
+ * peer's vendored catalogue and clears names from its stored OFF list.
+ *
+ * This gateway does not compute, install, or store the catalogue. It relays a runtime peer's rows
+ * and patch unchanged. Hermes has no matching read provenance or enable call, so the bridge never
+ * invents or forwards either.
+ *
+ * Additive: all read fields and the patch field are optional. Peers and clients below 59 retain
+ * their prior shape, and clients gate catalogue-only rows and the enable write on `>= 59`. */
+/** Capability 61: EXACT RUNTIME RECOVERY. `POST /bots/:name/runtime/recover` accepts one fresh
+ * `create_runtime` operation only when the gateway-owned bot's current operation is terminal
+ * `needs_attention`. It returns `202 {operationId, runtime}` and replays the stored operation
+ * payload, generation, runner assignment, and attach identity; only `operationId` changes.
+ * Replaying the POST is bounded: once accepted, the new waiting operation is current and the next
+ * request is `409 conflict` until a runner returns terminal `needs_attention` again. A deleted,
+ * stopped, provisioning, ready, wrong-runner, or config-declared runtime is never a recovery
+ * target. Clients that offer the action gate it on `>= 61`. */
+/** Capability 62: AN APPROVAL CAN PROPOSE AN MCP REPAIR. `ApprovalEvent` on `attach-v1` gains
+ * optional `repair`, the typed block `BotApprovalRepairSchema` describes: which MCP server, which
+ * tools it affects, the closed reason from the runtime peer's health record, the opaque
+ * before/after fingerprints, and what approving does (`approve_once` reconnects that server once;
+ * `auto_refresh` says the operator allowed the peer to refresh on its own and the proposal is
+ * informational). Nothing new for delivery, replay, or resolution: the proposal IS an approval on
+ * the existing interaction inbox, `BotApprovalPendingFrame` and `BotPendingApproval` gain the same
+ * optional `repair`, and the durable interaction row stores it, so the live frame, the rebroadcast
+ * on reconnect, and a cold-start inbox read all show the block the peer sent. The approve and deny
+ * routes, `BotApprovalResolvedFrame`, and the settlement are unchanged; the harness performs the
+ * reconnect on approve and the gateway records nothing about its outcome.
+ *
+ * The gateway treats the block exactly as capability 56 treats `detail`: it validates the closed
+ * sets and bounds and refuses any C0/C1 control or Unicode Format character in `server`, `impact`
+ * or a fingerprint, and a block that fails is DROPPED while the approval is kept, because a real
+ * permission decision must never be lost over one presentation block. A valid block is carried
+ * byte for byte.
+ *
+ * Additive: every field is optional, so an approval that is not a repair proposal is byte
+ * identical to its pre-62 self on every surface. A client that renders the repair card gates it on
+ * `>= 62` and renders any other approval as it always has. */
+/** Capability 63: THE PER-SERVER MCP REPAIR POLICY, DECLARED BEFORE IT IS EMITTED. `BotMcpServer`
+ * gains optional `repair`, closed to `approve_once` and `auto_refresh`
+ * (`BotMcpRepairPolicySchema`), carried on the existing capability-48 `bot_config` `profile.read`
+ * of the runtime peer. No new route, no new lane, no new operation: the harness already keeps this
+ * setting per MCP server, and capability 62 already reports it on one live proposal; 63 is the same
+ * fact read off the server row, so a client can say what a reconnect will cost before one is
+ * proposed.
+ *
+ * READ-ONLY METADATA. The field never appears on `BotProfilePatchSchema`, and `enabledMcpServers`
+ * stays a list of NAMES, so no request shape can carry a policy. The gateway does not store,
+ * compute, write, execute, or interpret it, exactly as it does not for capability 58's
+ * `guardrailCeiling`: it validates the closed union and relays the peer's answer. Nothing here
+ * performs a repair or mutates a policy.
+ *
+ * An absent wire field is not projected or unknown. Hermes and peers below 63 omit it, and this
+ * gateway does not backfill it. A known CozyAgents peer may project its effective `approve_once`
+ * default after negotiating 63 even without an explicit config key; that setting still requires
+ * approval and grants no repair permission. An unknown value is not tolerated: the `bot_config`
+ * lane's existing convention refuses the whole `config_result` frame, so a client never receives
+ * an unvalidated string in the position where it renders a policy.
+ *
+ * Additive: the field is optional, so a peer and a client below 63 are byte identical to their
+ * pre-63 selves. A peer emits `repair` only when the gateway advertised `com.cozylabs.bots >= 63`
+ * on `hello_ack`; a client renders the policy only on `>= 63`. */
+/** Capability 64: durable gateway Task projection, append-only stream, authenticated commands
+ * and full replacement updates. Run identity remains the attach turn. Optional unknown tool
+ * roles fail closed as possible effects. Earlier clients ignore additive frames. */
+/** Capability 65: durable gateway Artifact records with byte-verified commitment, retained
+ * originals, tombstoned deletion, supersession, and a delivery lifecycle with its own identity
+ * and retries. Delivery is separate from Task completion, and the existing attachment surface is
+ * unchanged for every client below 65. The shapes live in `artifacts.ts`. */
+/** Capability 66: typed scoped approvals. `ApprovalEvent` may carry one validated `scope` block
+ * naming the action, the target system and resource, the exact material change, the side effects,
+ * the reason a decision is required, the payload hash, the expiration, the retry behaviour and the
+ * requested scope. A decision may leave a standing grant bound to profile, user, conversation,
+ * task, target, payload hash and expiration; a grant is consulted, never replayed, and the
+ * always-require categories can never be covered by one. Additive: an approval without a block,
+ * and a decision sent with no body, are byte identical to their pre-66 selves. */
+/** Capability 68: every phone capability request has a typed lifecycle and exactly one typed
+ * terminal state, bound to profile, conversation, turn, paired device and the person that device
+ * belongs to. `GET /bots/:name/mobile-requests` is the reconciliation read a resuming app uses;
+ * `policy_blocked` and `foreground_required` are outcomes of their own. Peers send nothing new:
+ * the lifecycle is derived from the routing, lease, media and settlement the gateway already
+ * owns, so a Hermes peer gets it without a line of change. The push side of the same row is the
+ * `task_completed` payload of `contract/push-v0.md`, deduplicated against capability 64's own
+ * completion notification record. Additive: a client that never reads the route and a phone that
+ * never sends `mobile_node_progress` are byte identical to their pre-68 selves. */
+/** Capability 69: a reply is never lost to a stale native turn. Attach-v1 `hello` may declare the
+ * turn ids a peer still carries and `failed` may carry the closed `reason: "unknown_turn"`. On
+ * hello the gateway seals the ACKNOWLEDGED nonterminal turns the peer does not carry, through the
+ * existing turn transition; a turn the peer declares active, and a turn still queued in the
+ * outbox, are never sealed by reconciliation. A turn whose peer is disconnected runs on ADR 0004's
+ * provisional 120 second owner-loss lease, and one whose peer re-attached without declaring runs
+ * on a longer grace, instead of the long silence ceiling. Unanswered steers on a dead turn are
+ * promoted, in order, into a new durable turn with the same text, media and chat context, and an
+ * orphaned commit carrying words is projected rather than discarded.
+ * Additive: no route, frame, field or status value is added, and a peer that sends neither new
+ * field, like every client, is byte identical to its pre-69 self. */
+/** Capability 70: a person chooses which of their paired phones a capability request goes to, per
+ * conversation. `GET`/`PUT /bots/:name/mobile-requests/preferred-device?sessionId=` records the
+ * choice, which is read ONLY at admission and written by a device-authenticated client and by
+ * nothing else. NO PEER HAS ANY INPUT INTO WHICH PHONE RINGS: no frame carries a target device,
+ * and a `mobile_request` that includes one anyway has THAT ONE REQUEST refused, with capability
+ * 68's `policy_blocked` and `request_policy_rejected`, while the socket and everything queued on it
+ * survive: a stale peer must not lose a live conversation over one removed routing hint. One exception, stated as a rule: a CozyApp action is answered on the device that
+ * tapped it and consults no preference, because a tap's answer belongs on the screen that took it. Capability 68's binding is otherwise untouched: the target
+ * never moves, and a second device attaching never becomes one. A stored choice naming a device
+ * that is no longer paired is skipped, and admission falls through to the device that opened the
+ * turn. Additive: every peer is byte identical to its pre-70 self, and a client that writes no
+ * preference gets the pre-70 binding. */
+/** Capability 71: a composer draft follows the person rather than the phone they typed it on.
+ * `GET`/`PUT /bots/:name/drafts?sessionId=` holds one draft per profile and conversation, per
+ * person and never per device, and a successful write broadcasts `bot_draft_updated` to every
+ * paired device. The empty string is the CLEAR, written immediately rather than on the typing
+ * debounce, which is what stops a message sent on one phone still being offered on another. A
+ * draft never reaches a bot, a peer, a runtime or a model, and its text is never logged, traced or
+ * measured; the row does make an unsent draft DURABLE SERVER STATE, dropped with its conversation's
+ * history and swept after thirty days untouched. Additive: a client below 71 keeps its
+ * own per-device draft and every peer of every backend is untouched. */
+/** Capability 72: an observer device, a browser paired as a strictly read-only device.
+ * `POST /pair` accepts `kind: "observer"`, consumes an observer-kind setup code, and mints a
+ * device token whose scope is `read`. A read-scoped token is refused `403 scope_read_only` by
+ * every write route and every websocket command frame, enforced in one auth middleware rather
+ * than per route, so a write route added later is refused by construction. An observer appears on
+ * `GET /devices` and is revoked by `DELETE /devices/:id` like any device. Additive: a device
+ * paired before 72 is `scope: "write"` and refused nothing, a client that never sends
+ * `kind: "observer"` is byte identical to its pre-72 self, and no peer of any backend changes. */
+/** Capability 73: the one hop the gateway cannot measure is reported by the phone that can.
+ * `POST /bots/:name/chat/messages/displayed` gains two optional fields, `feltLatencyMs` (send
+ * tapped to first delta rendered, on the phone's own clock), radio-only `networkPath` (`wifi`,
+ * `cellular`, `wired`, `other`), `vpn`, `edgeRttMs`, and `edgeColo`, and the gateway stores them
+ * on the receipt and records at most one sample
+ * per request whatever the batch size. Neither is ever added to or subtracted from a
+ * gateway-measured figure: two clocks that were never synchronised cannot be differenced, and the
+ * dashboard shows the perceived figure beside the measured hops rather than inside them. Nothing
+ * else changes: no new route, no new frame, no peer of any backend touched, and a client below 73
+ * sends neither field and is byte identical to its pre-73 self. */
+/** Capability 74: negotiated, unsequenced observation snapshots from CozyAgents peers.
+ * The gateway stores latest state, folds numeric steps, and accumulates token and tool lifetimes.
+ * Unknown hello capability names are ignored. Peers offer this lane only after a hello acknowledgement
+ * advertises bots version 74 or later, keeping older gateways compatible. */
+/** Capability 75: read-only observer API, bounded subscriptions and content-free live projections. */
+/** Capability 76: a reply push optionally carries its Task id and suppresses its same-turn
+ * completion banner for ten seconds. */
+/** Capability 85, bot screen: a bot's headless Linux desktop (Hermes Bot Screen). The status and
+ *  lease objects are Hermes's own `display.status` / `display.lease` payloads passed through
+ *  VERBATIM (snake_case), so a client shares one decoder between a direct Hermes connection and
+ *  this gateway. They are deliberately open records: the gateway is a courier for them, not their
+ *  author, and a Hermes that grows a field must not make the frame invalid. */
+const BotScreenPayloadSchema = Type.Record(Type.String(), Type.Unknown());
+
+/** A screen started, stopped, finished installing or crashed. Full-replace status snapshot. */
+export const BotScreenStatusFrameSchema = Type.Object({
+  type: Type.Literal("bot_screen_status"),
+  bot: Type.String(),
+  status: BotScreenPayloadSchema,
+});
+export type BotScreenStatusFrame = Static<typeof BotScreenStatusFrameSchema>;
+
+/** Who drives the screen changed. `lease.epoch` is monotonic; a client drops an older one. */
+export const BotScreenLeaseFrameSchema = Type.Object({
+  type: Type.Literal("bot_screen_lease"),
+  bot: Type.String(),
+  lease: BotScreenPayloadSchema,
+});
+export type BotScreenLeaseFrame = Static<typeof BotScreenLeaseFrameSchema>;
+
+/** One line of the host package install's output. */
+export const BotScreenInstallLogFrameSchema = Type.Object({
+  type: Type.Literal("bot_screen_install_log"),
+  bot: Type.String(),
+  line: Type.String(),
+});
+export type BotScreenInstallLogFrame = Static<typeof BotScreenInstallLogFrameSchema>;
+
+/** The install ended: 0 ok, -1 cancelled, -2 no sudo, anything else failed. */
+export const BotScreenInstallDoneFrameSchema = Type.Object({
+  type: Type.Literal("bot_screen_install_done"),
+  bot: Type.String(),
+  code: Type.Integer(),
+  status: Type.Optional(BotScreenPayloadSchema),
+});
+export type BotScreenInstallDoneFrame = Static<typeof BotScreenInstallDoneFrameSchema>;
+
+/** The host needs its sudo password to install. Answered once with
+ *  `POST /bots/:name/screen/install/sudo {requestId, password}`; the gateway never stores it. */
+export const BotScreenInstallSudoFrameSchema = Type.Object({
+  type: Type.Literal("bot_screen_install_sudo"),
+  bot: Type.String(),
+  requestId: Type.String(),
+});
+export type BotScreenInstallSudoFrame = Static<typeof BotScreenInstallSudoFrameSchema>;
+
+/** Hermes withdrew a sudo request (timeout or cancel): tear the card down. */
+export const BotScreenRequestCancelFrameSchema = Type.Object({
+  type: Type.Literal("bot_screen_request_cancel"),
+  bot: Type.String(),
+  requestId: Type.String(),
+});
+export type BotScreenRequestCancelFrame = Static<typeof BotScreenRequestCancelFrameSchema>;
+
+/** Capability 77: room pending approvals expose the durable writing turn cause before a reply
+ * exists. Delivery approval pushes alone may request the time-sensitive APNs interruption level.
+ * Capability 78: optional attach heartbeat turn-health reports let the gateway detect an interim
+ * delivery seal while a turn remains active; native chat state may expose `deliveryStatus` as
+ * `checking` without changing its execution lifecycle.
+ * Capability 79: reserved, runtime-bot settings (CozyAgents gateway). Not advertised meaning here.
+ * Capability 80: `GET`/`PATCH /bots/:name/presentation` reads and writes the synced roster
+ * presentation (pin, hide, user section, title) in `ui_meta["hermes-bots"]` with Hermes's own
+ * per-key compare-and-swap; a revision conflict re-reads and re-applies only the patched keys.
+ * Capability 81: avatars. The presentation carries the look (`shape`, `color`, `custom`,
+ * `imageKind`, and CozyChat's namespaced `cozychat` record); `GET`/`PUT`/`DELETE /bots/:name/avatar`
+ * read and write the profile's avatar asset (`profiles.get_asset`/`set_asset`),
+ * `POST /bots/:name/avatar/generate` probes and runs `image.generate`, and
+ * `GET /bots/:name/avatar/pets` + `POST /bots/:name/avatar/pets/thumb` browse the petdex gallery.
+ * `BotSummary.avatar` names the image to draw.
+ * Capability 82: profile operations. `PATCH /bots/:name/identity` writes the friendly title into
+ * `ui_meta["hermes-bots"].title` through capability 80's presentation writer, and the description. `POST /bots/:name/rename` renames
+ * the Hermes profile itself. `POST /bots/:name/describe-auto` asks Hermes to write a description.
+ * `POST /bots/:name/duplicate` clones the whole profile plus its look and avatar. `POST
+ * /bots/:name/export` answers the profile's `.tar.gz` (credentials excluded by Hermes) and `POST
+ * /bots/import?name=` creates a bot from one. `GET`/`PUT`/`DELETE /bots/:name/model-pin` reads, the
+ * profile's model with the expensive-model handshake, or unpins it so the launch profile's model
+ * applies. `GET /bots/:name/provider-keys` lists the providers that take a key, and
+ * `PUT`/`DELETE /bots/:name/provider-keys/:provider` save or disconnect one, on the bot's own profile.
+ * `GET /bots/:name/skills-hub?q=` and `POST /bots/:name/skills-hub/install` search the Skills Hub
+ * and install into this bot. `POST /bots` gains `cloneFrom`, `cloneAll`, `noSkills` and
+ * `shareKeys`. Additive: every route is new and a client below 82 sends none of the fields.
+ * Capability 83: Hermes routines v2. `BotRoutine.deliver`, `BotRoutineListResponse.schedulerRunning`,
+ * create/patch `deliver`, in-place routine edits (prompt optional, id kept), `POST
+ * /bots/:name/routines/:id/run` for Hermes bots (fires Hermes's own trigger), `GET
+ * /bots/:name/routines/:id/runs`, `GET /bots/:name/routines/:id/runs/:runId/output`, and the
+ * blueprint catalog: `GET /bots/:name/routine-blueprints` and `POST
+ * /bots/:name/routine-blueprints/:key/instantiate`. */
+/** Capability 84: rooms reach Desktop parity. Threads (`threadId` on sends and entries), queued sends
+ * behind a live drive, stop directives and holds with replay on release (`holds`, `holdDetection`),
+ * Stop, rename/members/picture via `PATCH /bots/groups/:name`, per-member compress, picture
+ * generation, external writes mirrored (`external`), and an activity feed on `bot_group_state`
+ * (`activity`, plus `room`/`renamedFrom` whenever settings change). */
+/** Capability 85: bot screen. `/bots/:name/screen*` routes
+ * pass Hermes `display.*` results through verbatim, `POST /bots/:name/screen/observe` mints a
+ * gateway-owned single-use 30 s ticket redeemed on the `GET /bots/:name/screen/ws` WebSocket, which
+ * splices raw RFB to Hermes `/api/display/ws`, and the six `bot_screen_*` frames carry live state. */
+/** Capability 86 (chat semantics + reactions; bot parity S2, voice appends here): `POST
+ * /bots/:name/bot-chat` resolves the profile's canonical Hermes session titled exactly `Bot Chat`
+ * (fail closed on a failed lookup), mints it hidden when absent (`created: true`, the client sends
+ * the kickoff line), marks the install Bot-Mode-managed (`ui_meta["hermes-bots"]`) when no profile
+ * is, and binds the bot's current chat to it through the capability-4 desktop resume proof. A bound
+ * Bot Chat is never displaced by a newer desktop session. `POST /bots/:name/chat/reset` on a bound
+ * Bot Chat also ARCHIVES it in Hermes, which retires it: the next open mints a fresh one. A write of
+ * the bot's profile model clears every per-chat model override. `PUT
+ * /bots/:name/chat/messages/:id/reaction` sets or clears the user's Tapback, answers the full list
+ * and broadcasts `bot_chat_reaction`; history rows carry `reactions`.
+ *
+ * Capability 86 (voice, bot parity S8): `GET /bots/:name/voice` reports the bot's own profile
+ * `tts.*` voice, and `POST /bots/:name/speak {text}` synthesizes through it, streaming raw PCM from
+ * Hermes `/api/audio/speak-stream` or answering the whole file from `/api/audio/speak` when that
+ * voice has no chunked API. */
+/** Capability 87: the foreground relay courier. `POST /bot-relay/roster`, `/drain`, `/deliver` and
+ * `/reply` forward upstream's `bot_relay.*` RPCs to this gateway's Hermes, and the
+ * `bot_relay_pending` frame forwards `bot_relay.outbox.pending`, so a phone holding this gateway and
+ * another Hermes connection can carry `message_agent` DMs between them. `BotSummary.workerActiveAt`
+ * carries the worker heartbeat for "Active now". Additive: no existing route or frame changes. */
+/** Capability 88: team roles and the assignment turn context. `BotProfile` and `BotProfilePatch`
+ * gain optional `role` (`leader` | `member`) and `reports` (at most 16 bot names), stored by the
+ * gateway and merged into the read; a patch carrying only these two touches no peer. Attach-v1
+ * `TurnContext` gains an optional `task` beside `room` naming the Task, its leader, brief, done
+ * criteria and deadline, and `room` becomes optional because an assignment turn has none; `text`
+ * is byte-identical with and without `context`, exactly as 47 promised. The assignment surface
+ * itself is advertised on `com.cozylabs.agent-inbox` 1, never inferred from this scalar. Additive. */
+/** Capability 89: A CHAT CLIENT DECLARES A BOT'S REMOTE MCP SERVERS. `BotProfilePatch` gains
+ * `declareMcpServers` (whole upserts of `BotMcpServerDeclaration`) and `removeMcpServers` (names),
+ * carried on the existing capability-48 `bot_config` `profile.write`; `BotMcpServer` gains the
+ * read-only `declaration` on the rows a client declared. No new route and no new operation.
+ *
+ * REMOTE ONLY. `transport` is the literal `http` and the declaration is closed, so no body reaches
+ * host command execution; a stdio server stays the operator's to declare in the bot's environment.
+ * A header value is one `${COZY_MCP_<NAME>}` variable name, never a value, and the peer expands it
+ * only for a URL origin the operator listed in `COZY_MCP_<NAME>_ORIGINS`, refusing the declaration
+ * by name otherwise. The gateway refuses userinfo, query, fragment, backslash, placeholders and a
+ * literal loopback, link-local or metadata host (`mcpServerDeclarationProblem`, `400`); the peer's
+ * URL policy owns the resolved address, `.local`, private hosts (a separate operator opt-in for
+ * client declarations) and redirects (pinned, every hop re-checked, never off the allowlisted
+ * origin once a header is expanded). Every tool of a client-declared server asks.
+ *
+ * GATED THREE WAYS. The route is the write-scoped paired device's (capability 72 refuses a
+ * read-scoped one `403`). The gateway forwards either field only to a peer that offered the
+ * attach-v1 capability `mcp_server_declarations`, which a harness offers only when its operator
+ * turned client declarations on; any other runtime peer answers `409 unsupported_for_runtime` and
+ * nothing is sent. A Hermes bot answers the same `409` and nothing is written: its
+ * `profiles.configure` would take a stdio definition, which this row never grants. The lane input
+ * is rebuilt from the published patch keys, so an unknown body key never reaches a peer.
+ *
+ * The peer owns the semantics: removals, then declarations, then `enabledMcpServers`, so one save
+ * can declare and switch on. A declaration never changes enablement (a new server lands OFF), a
+ * name the client did not declare (operator, built-in, template) is refused by name in `ignored`,
+ * and its repair policy is the harness default `approve_once`. `applied` answers
+ * `mcp_servers_declared` and `mcp_servers_removed`.
+ *
+ * Additive: a client below 89 sends neither field and reads no `declaration`, and a peer receives
+ * either field only after negotiating `mcp_server_declarations`. A client offers the editor only on
+ * `>= 89`. The declaration is closed on read, so growing it needs a new capability. */
+export const BOTS_CAPABILITY_VERSION = 89;
+
+/** Capability 82. At least one field. `title` is the friendly name; the empty string clears it. */
+export const BotIdentityPatchSchema = Type.Object({
+  title: Type.Optional(Type.String({ maxLength: 120 })),
+  description: Type.Optional(Type.String({ maxLength: 2_000 })),
+});
+export type BotIdentityPatch = Static<typeof BotIdentityPatchSchema>;
+
+export const BotIdentitySchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  title: Type.String(),
+  description: Type.String(),
+});
+export type BotIdentity = Static<typeof BotIdentitySchema>;
+
+/** Capability 82. `newName` is the Hermes profile name (lowercase letters, digits, `-`, `_`). */
+export const BotRenameRequestSchema = Type.Object({
+  newName: Type.String({ minLength: 1, maxLength: 64 }),
+});
+export type BotRenameRequest = Static<typeof BotRenameRequestSchema>;
+
+/** Capability 82. `newName` absent picks `<name>-2`, `-3`, ... the first free one. */
+export const BotDuplicateRequestSchema = Type.Object({
+  newName: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+});
+export type BotDuplicateRequest = Static<typeof BotDuplicateRequestSchema>;
+
+export const BotDescribeAutoRequestSchema = Type.Object({
+  overwrite: Type.Optional(Type.Boolean()),
+});
+export type BotDescribeAutoRequest = Static<typeof BotDescribeAutoRequestSchema>;
+
+/** `ok: false` is Hermes' own inline refusal (no auxiliary model, say), not an HTTP error. */
+export const BotDescribeAutoResponseSchema = Type.Object({
+  ok: Type.Boolean(),
+  description: Type.Optional(Type.String()),
+  reason: Type.Optional(Type.String()),
+});
+export type BotDescribeAutoResponse = Static<typeof BotDescribeAutoResponseSchema>;
+
+export const BotModelPinRequestSchema = Type.Object({
+  model: Type.String({ minLength: 1, maxLength: 200 }),
+  provider: Type.String({ minLength: 1, maxLength: 120 }),
+  confirmExpensiveModel: Type.Optional(Type.Boolean()),
+});
+export type BotModelPinRequest = Static<typeof BotModelPinRequestSchema>;
+
+/** `confirmRequired` means NOTHING was written: resend with `confirmExpensiveModel: true` once the
+ * person agrees to `confirmMessage`. */
+export const BotModelPinResponseSchema = Type.Object({
+  pinned: Type.Boolean(),
+  confirmRequired: Type.Optional(Type.Boolean()),
+  confirmMessage: Type.Optional(Type.String()),
+  model: Type.Optional(Type.Object({ provider: Type.String(), model: Type.String() })),
+});
+export type BotModelPinResponse = Static<typeof BotModelPinResponseSchema>;
+
+export const BotProviderKeyRequestSchema = Type.Object({
+  apiKey: Type.String({ minLength: 1, maxLength: 4_096 }),
+});
+export type BotProviderKeyRequest = Static<typeof BotProviderKeyRequestSchema>;
+
+export const BotSkillsHubResultSchema = Type.Object({
+  name: Type.String(),
+  description: Type.String(),
+  /** What `install` takes; several hub sources can offer one `name`. */
+  identifier: Type.String(),
+  installed: Type.Optional(Type.Boolean()),
+});
+export const BotSkillsHubSearchSchema = Type.Object({
+  results: Type.Array(BotSkillsHubResultSchema),
+});
+export type BotSkillsHubSearch = Static<typeof BotSkillsHubSearchSchema>;
+
+export const BotSkillsHubInstallRequestSchema = Type.Object({
+  identifier: Type.String({ minLength: 1, maxLength: 300 }),
+});
+export type BotSkillsHubInstallRequest = Static<typeof BotSkillsHubInstallRequestSchema>;

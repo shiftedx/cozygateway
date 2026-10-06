@@ -1,0 +1,79 @@
+import { randomUUID } from "node:crypto";
+
+import type { BotGroupCause, BotGroupTurnRow, Storage } from "../storage.ts";
+import type { AttachV1TurnContext } from "../adapters/attach/protocol-v1.ts";
+
+/** Existing attach-v1 `turn` command, narrowed to what a group room needs. Group code owns the
+ * thread id; the adapter owns transport sequencing and replay. */
+export interface NativeGroupTurnEndpoint {
+  canQueue(agentId: string): boolean;
+  sendNativeTurn(agentId: string, input: {
+    threadId: string; turnId: string; messageId: string; text: string;
+    /** Capability 47. Typed room provenance for a peer that reads it; `text` is unchanged either
+     * way, so a peer that ignores it behaves exactly as it did before. */
+    context?: AttachV1TurnContext;
+  }): boolean;
+  /** Capability 84. Stop's interrupt for the member on turn. Optional: absent means best effort only. */
+  sendInterrupt?(agentId: string, input: { threadId: string; turnId: string }): boolean;
+}
+
+export type GroupTurnResult =
+  | { outcome: "spoke"; text: string }
+  | { outcome: "pass" }
+  | { outcome: "gone" }
+  | { outcome: "timeout"; detail: string }
+  | { outcome: "failed"; detail: string };
+
+export interface StartNativeMemberTurn {
+  storage: Storage;
+  endpoint: NativeGroupTurnEndpoint;
+  key: string;
+  member: string;
+  agentId: string;
+  threadId: string;
+  epoch: number;
+  watermark: number;
+  prompt: string;
+  /** What this member was answering when the turn was handed over. Persisted on the turn row so
+   * both settlement paths (the live round loop and post-restart recovery) read the same fact. */
+  cause?: BotGroupCause;
+  context?: AttachV1TurnContext;
+  now: () => number;
+  /** Capability 84. `compress` marks a maintenance turn that must never post into the room. */
+  purpose?: "group" | "compress";
+}
+
+/** Persists ownership BEFORE putting the command in the attach outbox. That ordering makes fast
+ * events, reconnect replay, and a gateway restart address the same durable row. */
+export function startNativeMemberTurn(input: StartNativeMemberTurn): { turnId: string; messageId: string } | GroupTurnResult {
+  if (!input.endpoint.canQueue(input.agentId)) {
+    return { outcome: "failed", detail: `native attach-v1 profile \"${input.agentId}\" is unavailable` };
+  }
+  const turnId = randomUUID();
+  const messageId = `${turnId}:${input.purpose ?? "group"}`;
+  if (!input.storage.beginBotGroupTurn({
+    key: input.key, turnId, member: input.member, agentId: input.agentId, threadId: input.threadId,
+    messageId, epoch: input.epoch, watermark: input.watermark,
+    ...(input.cause === undefined ? {} : { cause: input.cause }), createdAt: input.now(),
+  })) return { outcome: "failed", detail: "another member turn is already pending" };
+  if (!input.endpoint.sendNativeTurn(input.agentId, {
+    threadId: input.threadId, turnId, messageId, text: input.prompt,
+    ...(input.context === undefined ? {} : { context: input.context }),
+  })) {
+    input.storage.completeBotGroupTurn(input.agentId, input.threadId, turnId, "failed", undefined, "native attach-v1 profile is unavailable", input.now());
+    return { outcome: "failed", detail: "native attach-v1 profile is unavailable" };
+  }
+  return { turnId, messageId };
+}
+
+export function settledGroupTurn(row: BotGroupTurnRow): GroupTurnResult | undefined {
+  switch (row.state) {
+    case "pending": return undefined;
+    case "commit": {
+      const text = row.text?.trim() ?? "";
+      return text.length === 0 ? { outcome: "pass" } : { outcome: "spoke", text };
+    }
+    case "timeout": return { outcome: "timeout", detail: row.detail ?? "no reply before deadline" };
+    default: return { outcome: "failed", detail: row.detail ?? `member turn ${row.state}` };
+  }
+}

@@ -1,0 +1,1958 @@
+# CozyGateway Bot Mode extension (`com.cozylabs.bots`)
+
+Status: v1 extension, capability version 67. This extension is independent of the frozen core
+`contract/v1.md`. A gateway advertises it in `GatewayInfo.capabilities`; clients that do not
+recognize the capability ignore its routes and frames. The exact machine-readable shapes are in
+[`packages/contract/src/ext-bots.ts`](../packages/contract/src/ext-bots.ts). Objects are open and
+unions are closed, following the core contract.
+
+Scope: CozyGateway connects Hermes (and, soon, OpenClaw) bots to CozyChat. CozyAgents bots use
+CozyAgents' own bundled gateway
+([ADR 0086](../docs/adr/0086-cozygateway-connects-hermes-and-openclaw-only.md)). Both gateways
+serve this extension and share its capability rows. Rows and sections about `runtime:
+"cozyagents"` bots describe CozyAgents' bundled gateway. CozyGateway hosts no runtime bots: it
+ignores a config `bots` block (with a warning at `serve`), answers `POST /bots {runtime: "cozyagents"}` with `503
+backend_unavailable`, and has no bot-settings lane.
+
+## Ownership and boundaries
+
+Bot Mode is split deliberately:
+
+- Hermes Dashboard is the **control/read plane** for the profile roster, profile editing, model
+  configuration, catalog, and routines.
+- attach-v1 is the **Bot Mode chat data plane**. For every configured
+  `hermes.profiles.<profile>` identity, CozyGateway owns the chat session ids, transcript,
+  attachments, active-turn state, tool activity, approvals, and clarification state in its SQLite
+  store. The gateway sends commands to that profile's attached Hermes plugin and commits its
+  durable attach-v1 events back into this projection.
+- Group rooms are gateway-owned attach-v1 conversations too. They are not Hermes Dashboard
+  sessions.
+
+Therefore Bot Mode chat must never be implemented with Dashboard `session.create`,
+`session.resume`, or `prompt.submit`, nor with a Dashboard transcript as a fallback. A Dashboard
+or Hermes outage can affect control-plane reads, but it does not change the ownership of a native
+Bot Mode transcript. The one control-plane exception is capability 86: `session.create` +
+`session.title` mint the EMPTY `Bot Chat` registry row once, so the gateway's attach-owned chat can
+be bound to it. No turn is ever submitted through the Dashboard.
+
+CozyChat talks only to CozyGateway's existing HTTP, WebSocket, attachment, and push surfaces; it
+does not connect to Hermes or attach-v1.
+
+## Discovery and capability history
+
+```
+"capabilities": { "com.cozylabs.bots": 69 }
+```
+
+Versioned additions are additive and clients compare `>=`, never equality. Explicitly withdrawn or
+corrected unsafe behavior is removed rather than retained as a fallback: version 17 below is the
+sole historical withdrawal. A gateway that does not configure the extension omits the capability
+and does not register `/bots` routes.
+
+| Version | Added surface |
+| --- | --- |
+| 1 | Roster, presence, canonical chat, native session list/history. |
+| 2 | Send text, `bot_chat`, and `bot_chat_state`. |
+| 3 | Profile read/edit and catalog. |
+| 4 | Routines and `bot_routines`. Current Hermes replies may additionally expose the optional output-only, bounded, path-redacted `lastDeliveryError`. |
+| 5 | Gateway-hosted group rooms. |
+| 6 | `bot_chat_delta` draft frames. |
+| 7 | `GET /bots/:name/media` proxy. |
+| 8 | Reset chat and `bot_chat_reset`. |
+| 9 | Photo sends and attachment downloads. |
+| 10 | Approval frames and approve/deny routes. |
+| 11 | Empty-chat `suggestion`. |
+| 12 | Tool activity frames and history. |
+| 14 | `bot_chat_adopted` and manual session adoption. |
+| 15 | Assistant attachment ingestion. |
+| 16 | Native session history and manual restore. |
+| 17 | Withdrawn. The heuristic A2A inbox leaked unaffiliated human rows and cannot recover durable identity/replay state. Its routes and frames are absent, roster previews make no A2A provenance claim, and transcript-like `Message from ...` text remains ordinary text even though the current bots scalar is numerically >= 17. |
+| 18 | Per-bot model configuration. |
+| 19 | Stop and start-new-chat actions. |
+| 20 | Audio/video attachment playback with byte ranges. |
+| 21 | Redacted tool-step details. |
+| 22 | Durable native clarification events and resolution. |
+| 23 | Exact native turn status/cause and durable queued-at metadata. `cause: "verification_unavailable"` identifies a failed turn whose workspace checker is not configured; it is preserved in live state and history. Unknown failures carry no invented connectivity cause, and raw runtime diagnostics are not forwarded. |
+| 24 | Common document attachment sends and file downloads. |
+| 25 | Profile-local discovery of Hermes gateway-safe, plugin, and installed skill commands. |
+| 26 | Searchable aggregate history of agent-sent attachments across native sessions. |
+| 27 | Bounded current-state inbox for pending native approvals. |
+| 28 | Requested-vs-confirmed native approval and clarification settlement. |
+| 29 | Bounded pending clarifications and confirmed terminal settlement receipts on the recovery route. |
+| 30 | Profile-local memory read and conditional write routes. |
+| 31 | Durable delivery receipts: the displayed report, `BotChatMessage.marker`, and role `system`. |
+| 32 | Inline media ordering: `BotChatMessage.attachments[].position`. |
+| 33 | Create-time tool selection: optional `toolsets` / `mcpServers` on `POST /bots`, and `BotCreateResponse.warnings`. |
+| 34 | Subagent visibility: `bot_delegation_activity` batch snapshots and a `delegations` array on chat history. Optional Hermes v0.21 synchronous-result enrichment adds bounded child cost/provenance, schema-validation state, and terminal duration without changing the scalar. |
+| 35 | Live thinking preview: latest-only `bot_thinking_activity` frames (sanitized, <=280 chars, ephemeral). |
+| 36 | Full provider visibility: optional `providers` summary and `unauthenticated` catalog markers on `BotModelConfig`. |
+| 37 | Bot deletion: `DELETE /bots/:name`, the inverse of `POST /bots`. Removes the Hermes profile, purges gateway state, and revokes the attach identity. |
+| 38 | Device status v2: normalized status purpose and the closed mobile-node v3 operational status result; no v1 fallback. |
+| 39 | Capability leases and durable metadata-only receipts for phone-node sharing. |
+| 40 | Bot readiness: `GET /bots/:name/readiness` distinguishes a created profile from an attached bot that can accept turns. |
+| 41 | Transitional bot-scoped model-provider setup routes. Canonical ownership moved to `com.cozylabs.harness-settings` v1. |
+| 42 | Truthful Bot Activity previews (no transcript-derived A2A sender) plus credential-free profile-local Hermes memory setup through the authenticated attached plugin. |
+| 43 | The roster represents every Hermes profile and reports `syncState`; profiles not yet provisioned remain visible as `setup_required` instead of disappearing. |
+| 44 | Per-profile CozyApps readiness on `BotSummary`, with a stable `restart_profile` repair when a connected plugin did not negotiate `cozyapps`. |
+| 45 | Native runtime Bots: config-declared bots served by a non-Hermes attach peer appear on the roster with `runtime: "cozyagents"`, built from config and attach presence rather than the Dashboard; their Dashboard-backed routes answer 409 `unsupported_for_runtime`. |
+| 46 | Runtime Bots in rooms: a `runtime: "cozyagents"` bot can be a full member of a group room, its membership answered from gateway config rather than `profiles.list`, and a room turn's live draft is published as `bot_chat_delta` carrying `room`. |
+| 47 | Auditable ids: room and 1:1 transcript rows carry the identities the gateway already held at settlement. `BotGroupMessage` gains `messageId`, `turnId`, `epoch`, `cause`, and `attachTurn`; `BotGroupNote` gains `turnId`; `BotChatMessage` gains `turnId`, `authorBot`, and `inReplyToId`. Every field is optional, absent on rows written before 47, and never backfilled. |
+| 48 | Bot config lane: a runtime bot serves its own profile, model config, and routines over the attach-v1 `bot_config` lane, so those routes answer for it instead of 409. Deletion and desktop-session transcripts keep the 409, as do the bot-scoped model-provider writes; the bot-scoped model-provider read answers the read-only `com.cozylabs.harness-settings` projection of the peer's `model.read` (see 41). |
+| 49 | Runtime bots created from the app: `POST /bots` accepts `runtime: "cozyagents"` and creates a gateway-owned bot with no Hermes profile, minting its attach token and enqueueing a `create_runtime` operation for a CozyRunner. `GET /bots/:name/runtime` projects `{stage, specGeneration, observedGeneration, lastRunnerContactAt}`, and `DELETE /bots/:name` answers for a runtime bot instead of 409. |
+| 50 | Bot history: a runtime bot checkpoints its own workspace into git and serves it over the attach-v1 `bot_history` lane. Five new runtime-bot-only routes carry the Changes list, a per-file diff, restore, the try/keep/discard experiment, and the per-file conflict choice. A Hermes bot answers 409 `unsupported_for_runtime`, and so does a runtime bot whose peer did not negotiate `bot_history`. Nothing content-shaped crosses the lane: summaries and counts, never files or patches. |
+| 51 | Room turns can ask: a runtime member's approval and clarify events on a room turn land in the existing interaction inbox (`sessionId` is the `group:<room>:<member>` thread) and resolve through the existing `/bots/:member/approvals/...` and `/bots/:member/clarifications/...` routes unchanged; tool events project as ephemeral `bot_tool_activity` carrying `room`; `BotGroup` and `bot_group_state` gain the optional `pendingInteractions` pointer array. The room transcript gains nothing and Hermes members are unchanged. |
+| 52 | Paired runners: `POST /pair {setupCode, deviceName, kind: "runner"}` mints a per-runner token instead of a device token, `GET /runners`, `PATCH /runners/:id {default}` (capability 55 extends this route with a person-set `name`) and `DELETE /runners/:id` manage the roster, `POST /runners/pair-code` mints a code from the app, `GET /runners/self` answers that one row under the runner's own bearer, and `/runner/v1` accepts any active per-runner token so two computers hold two sockets at once. The runner `hello` gains optional `name`, `platform` and `agentVersion`, recorded on its row on every hello that carries them, so a renamed computer renames its roster row. A gateway with no Hermes endpoint is a supported configuration; its roster answers from runtime bots and `/ready` reports the bridge as `absent`. |
+| 53 | Routine run now: `POST /bots/:name/routines/:id/run` sends `routines.run` over the existing capability-48 `bot_config` lane and answers `BotRoutineRunResponse` (`{routine, startedAt}`), so a person or a check can force a runtime bot's routine to fire immediately. No new capability row; it is a route on the operation capability 48 already defined on the wire. RUNTIME BOTS ONLY, the same rule capability 50's history routes follow: a Hermes bot answers 409 `unsupported_for_runtime`, and so does a runtime bot whose peer did not negotiate `bot_config`. |
+| 54 | A create picks a computer: `BotCreateRequest` gains optional `runnerId` naming the paired runner that should run the new bot. Absent, the gateway picks the account default, then the only paired runner, then answers `409 no_runner_paired` with none and `409 runner_choice_required` naming the candidates when there are several and no default; an id that names no paired runner is `400 invalid_request` naming the field. The chosen runner is recorded on the bot row and on every operation for it, so a create, a delete and a later upgrade all reach the same machine, and each connected runner is handed only the operations that name it. An operation written before 54 names no runner and goes to the account default. `BotSummary` and `BotRuntimeProjection` gain optional `runnerId` and `runnerName`, absent for a Hermes bot and for a runtime bot created before 54 and never backfilled; `Runner` gains optional `botCount`, which `DELETE /runners/:id` answers too, beside the `reassignedOperations` count for the not-yet-sent work that revoke re-addresses to the account default (or to nobody). The `409 runner_choice_required` body is `RunnerChoiceRequiredBody`, whose `runners` array carries the ids the chooser needs. |
+| 55 | A person can rename a paired runner: `PATCH /runners/:id` gains optional `name`, a 1 to 64 character (code points, not UTF-16 units) display name after trimming, alongside the existing `default`; a body naming neither field, or a `name` that fails validation, is `400 invalid_request` naming the field. Only the literal `""` or `null` clears the name; a whitespace-only string is refused rather than treated as a clear. The trimmed value may carry no C0/C1 control character and no Unicode "Format" (Cf) code point either (zero-width space and joiners, the bidi override and isolate controls, the byte-order mark), because a name built from those renders invisible or reorders the surrounding text. A person-set name wins over whatever the runner reports on `hello` from then on: `hello` keeps updating the reported name in its own column exactly as before, but `GET /runners`, `GET /runners/self`, and every `runnerName` carried on a bot summary or runtime projection render the display name once one is set. `Runner` and `RunnerSelf` both gain `renamed`, true exactly when a display name is set. Setting `name` to `""` or `null` clears the display name and returns to whatever the runner itself reports. |
+| 56 | An approval can name what it covers: `ApprovalEvent` on attach-v1 gains optional `detail`, a short sentence a runtime peer sends alongside an approval it raises (for example naming which Chrome and which profile `my_browser_open` would drive). The gateway trims it, refuses the same C0/C1 control and Unicode Format (Cf) family capability 55 checks on a runner name, and bounds the display value to 1-400 characters, truncating an overlong sentence at the last whole word and appending an ellipsis -- but unlike a runner name, a `detail` that fails any of this is sanitized rather than a reason to refuse the frame, so the approval it describes is never dropped over one presentation field. `BotApprovalPendingFrame` and the durable interaction record both carry the sanitized sentence when present and omit it otherwise, so a reconnecting app's rebroadcast of a still-pending approval matches the live frame. The approve/deny resolve path and `BotApprovalResolvedFrame` are unchanged. |
+| 57 | Per-bot guardrails: `BotProfile` gains an optional `guardrailLevel` and `BotProfilePatch` an optional one too, one of `locked`, `guided`, `balanced`, `autonomous`, carried on the existing capability-48 `profile.read` and `profile.write` operations of the `bot_config` lane. No new route and no new lane. The gateway does not store or interpret the value: it validates the closed union at the boundary (a fifth name is `400 invalid_request` naming the field) and forwards the patch to the runtime peer unchanged, reading back exactly what the peer answers. Absent for a Hermes bot, because the field is not part of the `profiles.describe` / `profiles.configure` vocabulary this gateway translates for Hermes, and absent for a runtime peer that has not negotiated 57, and never backfilled in either case. A client below 57 sends no such field and its profile saves stay byte identical to the ones it sent before. |
+| 58 | The operator's guardrail ceiling: `BotProfile` gains an optional `guardrailCeiling`, one of the same four literals as `guardrailLevel`, carried on the existing capability-57 `profile.read` operation of the `bot_config` lane. `BotProfilePatch` does NOT gain it: the ceiling is set on the runtime peer, not written through this gateway, so it is refused on the patch (`400 invalid_request` naming the field). The gateway does not store or interpret the value, only relays exactly what the peer answers on a read. It is the operator's own ceiling on that bot's `guardrailLevel`; a `profile.write` asking for a level above it is the runtime peer's own refusal to make, `400` naming the field and the ceiling it exceeds, so the app greys out every level above the ceiling it read rather than sending one the peer will refuse anyway. Absent for a Hermes bot and for a runtime peer that has not negotiated 58, and never backfilled, exactly as `guardrailLevel` reads. |
+| 59 | A bot's whole skill and toolset catalogue, per bot: the capability-48 `profile.read` of the `bot_config` lane answers `skills` with a row per skill the bot HAS OR COULD HAVE (installed ones enabled unless `disabledSkills` names them, plus the peer's own vendored catalogue entries, present and switched off so a person can find one in a search) and `toolsets` with a row per toolset the peer's build ships plus every toolset name from another backend it has no equivalent for. `BotSkill` gains optional `installed` and optional `source` (`default`, `catalogue`, `installed`, `proposed`); `description` carries the row's one line summary. `BotToolset` gains optional `available` (absent means available) and `unavailableReason`, so a toolset a peer cannot offer is LISTED with its reason rather than silently missing. `BotProfilePatch` gains optional `enabledSkills`, the ON list: ADDITIVE, never replace-whole, it installs from the peer's vendored catalogue and clears each name from the stored OFF list, never uninstalls and never disables, and a name the peer neither has nor can install is named under optional `ignored.skills_enabled` while the rest of the patch applies. `applied.skills_enabled` remains true when the section was stored; `ignored` lets a client settle successful rows and offer refusal/retry UI only for the named rows. `PATCH /bots/:name/profile` accepts `enabledSkills` as one of the fields that make a body a request and relays additive `ignored` details from the runtime peer unchanged. `disabledSkills` is unchanged in shape and meaning. The gateway neither computes nor stores any of it and relays exactly what the peer answered, as it does for 57 and 58. Hermes bots are unchanged: `profiles.describe` carries no provenance, no installed flag and no availability, `profiles.configure` has no enable call, and none of it is invented for them. Additive: every read field and `ignored` are optional, so a peer below 59 and a client below 59 are byte identical to their pre-59 selves. A client below 59 reads the same two arrays it has read since capability 3 and can still switch a skill off through `disabledSkills`; it cannot switch one on, because it does not know the field. A client gates sending `enabledSkills`, and rendering rows that are not installed, on `>= 59`: a gateway below 59 answers `400 invalid_request` for an `enabledSkills`-only body, and a peer below 59 refuses a whole patch carrying a field it does not know. |
+| 60 | Memory rows may carry optional closed `owner: person\|bot`; absence remains legacy/unknown and is never inferred. A Gateway-authenticated memory create is marked `person` internally, never from caller JSON; a CozyAgents model create is `bot`. `DELETE /bots/:name/sessions/:id` deletes only one inactive, non-selected gateway-owned direct session. When its attached peer negotiated `session_deletion`, the same storage transaction appends exactly one ordered replay-safe metadata-only `session_deleted { sessionSha, deletion: { id, revision, at } }` command; no raw session id, transcript, title, device, path, group, routine, or app-action identity is accepted or sent. |
+| 61 | Exact runtime recovery: authenticated `POST /bots/:name/runtime/recover` accepts only a gateway-owned runtime bot whose latest `create_runtime` operation is terminal `needs_attention`. It atomically enqueues one fresh operation using the failed operation's exact stored payload, generation, and runner assignment while preserving the Bot identity and attach credential. A replay, concurrent request, nonterminal operation, deleted/config-owned bot, or revoked/mismatched runner is refused. |
+| 62 | An approval can propose an MCP repair: `ApprovalEvent` on attach-v1 gains optional `repair`, one typed block a runtime peer sends when it wants to reconnect an MCP server whose tool list went stale, crashed, refused, or would not re-list, and must ask first. The block is `BotApprovalRepair`: `kind` (`mcp_reconnect`), `server` (the configured MCP server name, 1-64 characters), `impact` (the affected tool names, 0-64 entries of 1-128 characters), `scope` (`server`), `fingerprint` (`{ previous?, current? }`, opaque digests of 1-128 characters), `reason` (`stale_tool`, `relist_failed`, `crashed`, `unauthorized`, from the peer's own health record), and `policy` (`approve_once`: approving reconnects that server once; `auto_refresh`: the operator allowed the peer to refresh that server on its own, it already did, and the proposal is informational). Every set is closed, both objects are closed, and no URL, header value, env value, or secret is ever in `server`, `impact`, or a fingerprint. The gateway treats the block as capability 56 treats `detail`: it validates the sets and bounds and refuses any C0/C1 control or Unicode Format (Cf) character, a lone surrogate, or a whitespace-only value in a string (the bounds count UTF-16 code units, as the schema enforces them), and a block that fails is DROPPED while the approval is kept, never a reason to refuse the frame, with one bounded content-free log line; a valid block is carried byte for byte. `BotApprovalPendingFrame` and the `BotPendingApproval` inbox row gain the same optional `repair`, and the durable interaction record stores it, so the live frame, the rebroadcast on reconnect, and a cold-start `GET /bots/approvals` read all show the block the peer sent. Resolution is the unchanged approve or deny: the peer performs the reconnect on approve, and the gateway records nothing about the outcome beyond the existing settlement. Additive: an approval that is not a repair proposal is byte identical to its pre-62 self on every surface, and a client renders the repair card only on `>= 62`. |
+| 63 | The per-server MCP repair policy, declared before it is emitted: `BotMcpServer` gains optional `repair`, closed to `approve_once` (reconnecting that server asks first, every time) and `auto_refresh` (the operator already allowed the peer to refresh that server on its own, so a reconnect happens without a question). It is the same setting capability 62 reports as `BotApprovalRepair.policy` on one live proposal, read off the server row instead, so a client can say what a reconnect will cost before one is proposed. It rides the existing capability-48 `bot_config` `profile.read` of the runtime peer: no new route, no new lane, no new operation. READ-ONLY METADATA: `BotProfilePatch` does not gain it and never will, `enabledMcpServers` stays a list of NAMES so no request shape can carry a policy, and the setting is changed on the harness rather than through this gateway. The gateway does not store, compute, write, execute, or interpret the value, exactly as it does not for capability 58's `guardrailCeiling`; it validates the closed union and relays what the peer answered. No repair is performed and no policy is mutated here. An absent wire field means the policy was not projected or is unknown, and the gateway never fills it in. Hermes and peers below 63 omit it. A known CozyAgents peer at 63 may project its effective `approve_once` default even when the operator omitted that config key: `approve_once` requires approval and does not grant repair permission. An unknown value is NOT tolerated: it follows the `bot_config` lane's existing convention, the whole `config_result` frame is invalid, the ingress refuses it with one bounded content-free log line and closes the peer's socket, and the read ends `503 backend_unavailable`, so a client never receives an unvalidated string in the position where it renders a policy. Additive: the field is optional, so a peer and a client below 63 are byte identical to their pre-63 selves. EMISSION GATING: a peer emits `repair` only when the gateway advertised `com.cozylabs.bots >= 63` on `hello_ack`, and only with one of the two names; a client renders the policy only on `>= 63`. |
+| 64 | Durable gateway Tasks: ten states, the 45 enumerated ADR 0004 reasons, append-only transitions and accepted intents, existing attach turn identity as Run identity, and full-replace `bot_task_updated` frames. See the Task surface below. |
+| 65 | Durable gateway Artifacts: byte-verified commitment over the bytes the existing attach media route stored, retained originals, explicit deletion with a tombstone, supersession and versions, a delivery lifecycle with its own identity and retries, the gateway's own `derived` records for attachments a peer delivered without declaring one, and the gateway's own join from the Run a producer named to the Task that owns it. See the Artifact surface below. |
+| 66 | An approval can name exactly what it would do, and a decision can leave a standing policy: `ApprovalEvent` on attach-v1 gains optional `scope`, one typed block a runtime peer sends alongside an approval it raises. The block is `BotApprovalScope`: `kind` (`scoped_approval`), `action` (the action type, 1-64 characters), `category` (closed: `money_movement`, `secret_access`, `destructive`, `lock_or_alarm`, `public_publishing`, `account_change`, `other`), `system` (the target system, 1-64), `resource` (the target resource, 1-256), optional `resourceKind` (closed: `object`, `action`; absent reads as `object`), `change` (the exact material change in one sentence, 1-400), `effects` (0-16 entries of 1-200 naming what else happens), `reason` (`always_require`, `guardrail`, `peer_policy`, `first_use`), `payloadHash` (lowercase sha256 hex of the exact payload, the BINDING), `expiresAt` (gateway-clock milliseconds), `retry` (`idempotent`, `not_idempotent`, `unknown`) and `requested` (`once`, `category`). Every set is closed, the object is closed, and no secret, credential, URL, header or env value is ever in a string: `change` and `effects` describe an action, they never carry its arguments. The gateway treats the block exactly as capability 62 treats `repair`: it validates the closed sets and bounds and refuses any C0/C1 control or Unicode Format (Cf) character, a lone surrogate, or a whitespace-only value, and a block that fails is DROPPED while the approval is KEPT, with one bounded content-free log line; a valid block is carried byte for byte on `bot_approval_pending`, the durable interaction record, the `GET /bots/approvals` inbox row, and the rebroadcast a reconnecting app gets. Dropping FAILS CLOSED: a plain approval can leave no grant behind and can be covered by none. BINDING AND GRANTS: `POST /bots/:name/approvals/:toolCallId/approve` gains an OPTIONAL `BotApprovalDecisionRequest` body, `{ grant?: "once" | "category", expiresAt? }`. No body is the pre-66 request and reaches the surface unchanged. A STANDING GRANT EXISTS ONLY WHERE A PERSON ASKED FOR ONE: a body-less approve, which is what every client below 66 sends and what tapping Approve sends, is one decision on one ask and records no policy at all. `grant: "once"` records a grant bound to profile, user, conversation, task, target, payload hash and expiration that covers AT MOST ONE later ask, is consulted only when the peer called the retry `idempotent`, and dies at the raising ask's own `expiresAt` or ten minutes from the decision, whichever is sooner, so the value the peer chose can only shorten it and never extend it. `grant: "category"` records a grant covering any payload of that action on that resource until `expiresAt` (required, in the future, at most one day away, `400 invalid_request` otherwise) or revocation. A decision carries at most one grant: a second decision asking for a different one is `409 approval_grant_not_recorded`, which says the decision stands and the policy was not created, because reporting success for a policy change that did not happen is worse than refusing it. A PLAIN APPROVAL CAN BE BOUND TOO, so a peer that will never send a block still benefits without changing: where a plain ask carries deterministic content, which on this wire is the rule NAME plus the capability-56 `detail` sentence naming what it concretely covers, the gateway hashes those into the same payload binding a typed ask gets, under its own target system `attach` so a derived binding can never match a grant a typed peer made against a system it named, and an explicit `once` grant then covers a later IDENTICAL plain ask under the same expiry and single-use rules. ONLY a once grant: a category grant requires a DECLARED category and never covers a plain ask, at the consult and at creation both, because a plain ask declares none and the always-require exclusion therefore cannot bite on it, so a standing category policy over one would silently pre-approve a destructive or publishing action nobody classified. Asking for a category grant on such an ask is `409 approval_category_undeclared`, which says one decision at a time is what is on offer, and no category grant matching a derived binding by any other route can answer for it either. Where a plain ask has no such content, a rule name alone being a KIND of ask rather than one ask, it is UNCOVERABLE: asking for a grant on it is `409 approval_scope_required` and no later ask is ever covered. The derived binding is internal: it is never emitted on a frame, never stored on the record, and never sent to a peer, a plain approval renders and settles exactly as it did before 66, and only a client at 66 can create the grant that covers one. The gateway records `other` on a grant derived from a plain ask, which is a placeholder for undeclared and never a claim that the action is harmless, which is exactly why a category grant is refused over one. A plain ask also claims no idempotency, so once coverage of it rests on the person's own single-use grant, the same task and the ask's own expiry rather than on a claim. A GRANT IS A POLICY RECORD, never a stored payload to replay: a changed material field changes `payloadHash` and no standing approval covers it, and an expired grant is dead whatever its scope says. The six always-require categories are covered by no grant: none is recorded for one, none is ever consulted for one, and `grant: "category"` on one is `409 approval_category_forbidden` (`409 approval_scope_required` when the approval carries no block to bound a grant by). THE TRUST BOUNDARY IS EXPLICIT: `category` is ASSERTED BY THE PEER, and the gateway has no way to classify an action at this seam, so the guarantee is only that a category the peer declared always-require is never covered by a grant. Classifying the action correctly belongs to the harness that raises it (packet 5b); the `change` sentence on the card is the person's own independent check, and it is why the card is rendered even when a grant covers the ask. When a grant does cover an ask, the gateway still raises the card, names the grant on `bot_approval_pending.grantId` AND on the durable record, and settles it through the same `resolve_approval` a tapped card sends: it relays and validates, it never executes. Because the grant is on the record, the rebroadcast on reconnect and the `BotPendingApproval` inbox row carry `grantId` too, so a person who was not watching still learns which standing approval answered for them, and can `DELETE` that grant or DENY that one ask: a deny on an ask the gateway settled from a grant REPLACES the gateway's requested decision rather than colliding with it (`409 approval_resolution_pending` still answers a second decision the gateway did not make). The first TERMINAL is untouched: this replaces a requested marker, and the peer's terminal remains the only proof either way. `GET /bots/:name/approvals/grants` is the revocation view (`BotApprovalGrant` rows: the grant id, its scope, the action, category, system, resource, conversation, expiry and creation time, never the deciding device, the payload hash or a payload value), and `DELETE /bots/:name/approvals/grants/:grantId` ends one immediately, `404` for a grant this gateway does not hold. The view is the newest 100 live grants for that bot, and IT IS THE SAME BOUNDED WINDOW THE CONSULT READS: a grant outside the window is consulted by nothing, so every grant that can answer for a person is a grant that person can see and revoke. A spent `once` grant, an expired grant and a revoked grant are all dead and appear in neither. Decision logs and traces carry ids, reason codes and the grant id only. A RESOURCE THAT IS ONLY THE TOOL CAN CARRY NO CATEGORY GRANT: `resourceKind: "action"` is a peer saying it could name the OPERATION but not the object the operation would act on, which is the honest answer for a harness that classifies a tool call rather than its arguments. A category grant covers any payload of that action on that resource, so over such a block it would cover every object that tool can reach, bounded by nothing a person was shown; `grant: "category"` on one is therefore `409 approval_category_undeclared`, the same code and the same reasoning a plain ask gets, at the decision AND at the consult, so a grant made against a real object by another peer can never match one either. `grant: "once"` is unaffected and is the whole offer there: it is bound to the payload hash, so it covers one repetition of the exact ask a person read and nothing else. Absent means `object`, so every peer and every client below this sentence is byte identical to its earlier self, and the always-require floor is untouched and still refuses first. ROOMS ARE NOT A SEPARATE LANE: an approval a runtime member raises on a capability-51 group room turn carries `scope` under exactly these rules, because a room approval is the same durable interaction row the 1:1 lane writes, keyed by the member bot and the attach approval id, with the gateway-owned member thread as its session. The block is validated once on ingest and dropped on failure while the approval is kept, the same way `detail` (56) and `repair` (62) already are there, and it rides the room's `bot_approval_pending` frame, the durable record, the `GET /bots/approvals` inbox row and the rebroadcast beside the room name. The decision routes are the unchanged 1:1 routes, so the optional decision body, the grant rules, the always-require refusals, `GET /bots/:name/approvals/grants` and its `DELETE` answer for a room approval without knowing a room exists. The CONSULT is the same one too: a room ask is checked against the standing grants before its card goes out, the frame and the durable record name the `grantId` that covers it, and it is settled through the same `resolve_approval` relay a tapped card sends, so a grant a person made in a room answers there exactly as it answers in a chat. The derivation for a plain ask, the single-use rules and the always-require exclusion have one implementation and are reached from both lanes; no grant of any kind is recorded for or consulted for an always-require category, in a room no more than in a chat. Additive: an approval with no block, and a decision sent with no body, are byte identical to their pre-66 selves on every surface, and a peer emits `scope` only when the gateway advertised `com.cozylabs.bots >= 66` on `hello_ack`; a client renders the card, sends a body, or opens the revocation view only on `>= 66`. |
+| 67 | CozyApps dashboard records: saved editable input values, action receipts with source-attributed data snapshots, and the small typed document envelope. The RECORDS THEMSELVES are gated by `com.cozylabs.cozyapps: 2` and, on the bot side, by the attach-v1 `cozyapps_dashboard` capability; this bots row is the cross-reference that numbers them, and a client reads the routes and frames off `com.cozylabs.cozyapps` rather than off this version. See `contract/ext-cozyapps-v1.md`, section CozyApps 2, for the routes, frames, bounds and the derivation a peer at cozyapps 1 gets for free. Additive: every v1 route, frame, node and action behavior is byte identical for a peer and a client that negotiate neither, and no member is added to `CozyApp` or `CozyAppAction`. |
+| 68 | Typed phone capability request lifecycle: every phone capability request carries one typed state and ends in exactly one typed terminal state, bound to the profile, conversation, turn, paired device and the person that device is paired to. `GET /bots/:name/mobile-requests?sessionId=` is the reconciliation read. `policy_blocked` and `foreground_required` are outcomes of their own. The row also adds the `task_completed` push payload for capability 64. See the phone capability request lifecycle below. |
+| 69 | Stale native turn reconciliation, so a reply is never lost to a turn nobody owns. THE GATEWAY SIDE IS THE FLOOR: it protects users of any peer, including one that never sends a new field. Attach-v1 `hello` gains optional `activeTurns` (turn ids only) and `failed` gains the closed optional `reason: "unknown_turn"`; see `contract/attach-v1.md`. On hello the gateway reconciles this profile's nonterminal native turns, and ONLY THE TURNS THIS PEER ALREADY ACKNOWLEDGED: a command still in the durable outbox is one the peer has never seen, so its absence from a declaration says nothing, and a message queued for a sleeping bot is delivered normally rather than sealed. Reconciliation runs after the outbox flush. A turn the peer DECLARED active is never sealed by reconciliation and keeps the long silence ceiling; a turn it did not name, when it declared at all, is sealed IMMEDIATELY for owner loss rather than after twenty minutes of silence, and the app learns through the existing `bot_chat_state` turn transition (`phase: "failed"`, `status: "failed"`), with no new frame, field or status value. A turn whose peer is DISCONNECTED runs on ADR 0004's provisional 120 second owner-loss lease, the same bound a Task gets. A turn whose peer was lost MID MODEL REQUEST waits one model request out before that lease clock starts: a peer that was answering the attach-v1 heartbeat within 60 seconds of losing its socket had a dispatched, unterminated model request on the turn it was carrying, which is what a peer blocked inside one long synchronous prefill looks like from the gateway, and that 4 minute window is excluded from the lease clock the same way a pending approval or device request already suspends it. The lease itself is unchanged at 120 seconds and the exclusion is bounded and applies ONCE, so a peer that never comes back is still reaped, about 6 minutes after the drop and never past a ceiling an operator shortened. That total is deliberately shorter than the 10 minute grace an attached quiet peer already gets for the same reason. The reading is taken at the instant the socket closes, because a detached peer proves nothing afterwards, and it is taken ONLY for a disconnected peer: the undeclared grace below is not extended by a heartbeat, since an undeclared peer is attached and would otherwise never leave it. This is a GATEWAY-SIDE derivation from the gateway's own delivery record and its own transport: it needs no new frame, field or peer behavior, so it covers a Hermes peer and a CozyAgents peer identically with no plugin change. A turn whose peer re-attached but could not declare runs on a longer 10 minute grace, because an attached peer that is quiet may be inside one long model call and reaping that would end live work; any frame at all resets either window, and neither ever lengthens a window an operator already shortened. A STEER left unanswered on a turn that turns out to be terminal, reaped, or answered `unknown_turn` is PROMOTED: the oldest becomes a new durable turn carrying the same text, media and chat context, the person's own message row moves onto it, and the steers that followed it are re-dispatched onto that turn in the order they were sent. Pending steers are DURABLE, so a gateway restart between a steer and its seal preserves them. Every path that does not deliver a person's words records a visible marked failed-delivery row preserving the text, and each steer is accounted for exactly once, so a steer that was answered or rescued is never also promoted. An ORPHANED COMMIT carrying user-facing text or media, arriving on a turn id this gateway never issued, is projected as an ordinary reply bound to no turn rather than acknowledged and discarded, and it settles every steer still open on that conversation, because the peer demonstrably heard the person. An orphaned frame carrying nothing a person can read is still declined. `activeTurns` is UNVALIDATED on the wire and sanitized by the gateway, the way capability 56's `detail` and 62's `repair` are: a malformed or oversized declaration degrades to "cannot declare" with one bounded log line and is NEVER truncated, because a partial declaration would seal turns the peer holds, and it is never a reason to close the socket. Both windows are provisional and re-evaluated with measured findings. Additive: a peer that sends neither field, and every client, are byte identical to their pre-69 selves, and no route, frame, field or status value is added. |
+| 70 | A person chooses which of their phones a capability request goes to, and the choice is remembered per conversation: `GET /bots/:name/mobile-requests/preferred-device?sessionId=` answers `BotMobilePreferredDevice` (`{ sessionId, deviceId?, deviceName?, updatedAt? }`, every field but `sessionId` absent when no choice was made) and `PUT` on the same path with `BotMobilePreferredDeviceRequest` (`{ deviceId }`, closed, where the literal `null` clears the choice) records one. A `sessionId` that is missing or empty is `400 invalid_request` naming the field, exactly as capability 68's reconciliation read requires one, because a preference belongs to one conversation and a write that names none could only bind the wrong one. A `deviceId` that names no device paired to this gateway is `400 invalid_request` naming the field rather than a silently stored choice that would resolve to nothing at admission time, and an unpaired device's id therefore never reaches the routing rule. THE CHOICE IS THE PERSON'S AND ONLY THE PERSON'S: it is written by a device-authenticated client and by nothing else, and NO PEER OF ANY KIND HAS ANY INPUT INTO WHICH PHONE RINGS. There is no field on any frame for one, and a `mobile_request` that carries `targetDeviceId` anyway has THAT ONE REQUEST refused, with capability 68's own `policy_blocked` terminal and the `request_policy_rejected` reason, which is exactly what it is: refused before any phone saw it. THE CONNECTION IS NOT TOUCHED. The ordinary answer to an unknown key on this wire is a named refusal and a closed socket, and that is the wrong trade here: a stale peer that still sends the field is otherwise healthy and may be holding a live conversation, queued turns and other requests, so dropping its socket costs a person all of that while refusing the one request costs them only the request that was never going to be honoured. Durability of the connection outranks strictness of the closed key set for this field. The field is still REMOVED rather than tolerated, because a spelling the gateway quietly accepts and ignores leaves the routing rule unreadable from the schema and lets a peer go on believing it is steering a request; the peer is told, per request, that it is not. The refusal carries one bounded log line naming the removed field and nothing else: the device id the peer tried to name is never logged, because it is the thing being refused rather than something to record. THE CozyApp EXCEPTION, stated because it is a rule and not an accident: a request whose origin is a registered CozyApp action is answered on the DEVICE THAT TAPPED IT and consults no stored preference, because a tap's answer belongs on the screen that took it and sending a camera prompt to a phone in another room would break the interaction the person is standing in front of. The conversation preference governs the conversation. ADMISSION READS THE CHOICE, NOTHING ELSE DOES: capability 68's binding is unchanged in every other respect, and this row only widens WHERE the one target device is resolved from. The order at admission is this conversation's stored preferred device when it names a device still paired to this gateway, then the pre-70 rule, which is the device that opened the turn; a stored choice whose device has since been unpaired is skipped rather than resolved, because a target that cannot answer is worse than the turn origin it displaced. The first of those that resolves is the target and the record's `deviceId`, and FROM THAT MOMENT ROW 68'S RULE IS THE ONLY RULE: the target never moves, a second device attaching mid-request never becomes the target however recently the preference was written, a preference written after admission changes nothing about a request already admitted, and an answer from any other device is refused rather than applied. PEER-TYPE-AGNOSTIC, exactly as row 68's binding is: a Hermes-backed bot's request is admitted against a selected device by the same rule a runtime peer's is, because the binding is keyed to the bot's identity and not to its backend. Additive: the route is new, every response field but `sessionId` is optional, no frame gains a field, every peer of every backend is byte identical to its pre-70 self, a client that never writes a preference gets the pre-70 turn-origin binding, and a client reads or writes the preference only on `>= 70`. |
+| 71 | A composer draft follows the person rather than the phone they typed it on: `GET /bots/:name/drafts?sessionId=` answers `BotComposerDraft` (`{ sessionId, text, updatedAt }`, `text` the empty string and `updatedAt` zero when this conversation has no draft) and `PUT` on the same path with `BotComposerDraftRequest` (`{ sessionId, text }`, closed) records one, where `text` is 0 to 8000 characters and the empty string IS THE CLEAR rather than a stored blank. A missing or empty `sessionId` on either verb is `400 invalid_request` naming the field, and `text` above the bound is `400 invalid_request` naming the field rather than a silent truncation, because a draft the person cannot see the end of is worse than a refused save the composer can retry. THE RECORD IS PER PROFILE AND CONVERSATION AND PER PERSON, NEVER PER DEVICE: every device paired to this gateway is the same person, so a draft written by one is read by all of them and the record carries no device id at all, which is also why one is never accepted on the write. The gateway keeps only the newest text and its `updatedAt` on the gateway's own clock, never a history, never a per-device copy and never a merge: LAST WRITE WINS, and a write whose `text` is identical to the stored one is stored again without a new notification, so a reconnecting device replaying what it already had cannot wake every other device. A successful `PUT` broadcasts `bot_draft_updated` (`{ type, bot, sessionId, text, updatedAt }`) to every paired device, so a draft appears on a second phone while it is being typed rather than only on its next read, and the clear is broadcast by the same frame carrying the empty string. THE CLEAR IS THE NO-DUPLICATE-SEND GUARANTEE AND IT CROSSES DEVICES: a send clears the draft, the clear is written IMMEDIATELY rather than on the typing debounce that carries an ordinary keystroke, and every other paired device drops its copy on the frame, so a message sent on one phone can never still be offered for sending on another. A draft is never sent to a bot, a peer, a runtime or a model: it is composer state this gateway stores for the person and hands back to their own devices, it rides no attach lane and no `bot_config` operation, and NOTHING about a Hermes-backed or runtime-backed bot changes because of it. THIS ROW MAKES AN UNSENT DRAFT DURABLE SERVER STATE, which is stated plainly because it is new: before 71 a person's unsent words never left the phone they were typed on, and after it the gateway holds the newest text of each conversation's draft, in the clear, in its own database, exactly as it holds a conversation's messages. What is stored is the text, the conversation and the timestamp, and nothing else: no device, no author, no history and no earlier version. A draft is dropped when that conversation's own history is, and an untouched draft is swept after thirty days, so an abandoned composer cannot hold text forever. A draft's TEXT is never written to a log, a trace or a metric on any path, and no log line carries its length either; the routes and the frame carry it, and nothing else does. Additive: the route and the frame are both new, a client below 71 keeps its own per-device draft and is byte identical to its pre-71 self, every peer of every backend is untouched, and a client reads, writes or renders a synced draft only on `>= 71`. |
+| 72 | An observer device: a browser can pair as a strictly read-only device so a dashboard can watch a gateway without ever being able to act on it. `POST /pair` accepts `kind: "observer"` beside `"device"` and `"runner"`, `deviceName` is required exactly as it is for a plain device pair, and the request consumes an OBSERVER-KIND setup code only, minted by `cozygateway pair --kind observer` or, from CozyChat's device list, by `POST /observers/pair-code`, which answers `{ setupCode, expiresAt, gatewayUrl }` and is shaped exactly like capability 52's `POST /runners/pair-code`, spending the same 10 minute TTL and the same gateway-wide 10-per-60-seconds bucket the unauthenticated `/pair` route spends, so a `429` with `retry-after` is the answer when it is exhausted. Minting any code revokes every older unredeemed one. AN OBSERVER CANNOT MINT AN OBSERVER: that route is a write and the one middleware below refuses a read-scoped token on it, so a read-only dashboard can never hand out another credential. A code minted for one kind and presented as another answers the same `401 setup_code_invalid` an expired code gets, with no detail telling the two apart, which is the rule capability 52 already applies to runner codes. The response shape is unchanged (`{ deviceToken, device, gateway }`). THE SCOPE IS A PROPERTY OF THE TOKEN, not of the client: the minted device row carries `scope: "read"` and every other device row carries `scope: "write"`, including every device paired before this row, so no shipped credential is ever silently downgraded. A read-scoped token is refused `403 scope_read_only` by EVERY write route, meaning every `POST`, `PUT`, `PATCH` and `DELETE` this gateway serves, explicitly including the approval, grant, config, pairing, device, runner, room, artifact and bot routes, and the refusal happens in ONE auth middleware that runs before any route handler rather than in a check each route remembers to make, so a write route added later is refused by construction rather than by review. THE CHECK IS FAIL CLOSED: it admits `write` and refuses everything else, so a device row carrying a scope a given build has never heard of, written by a newer gateway and read back after a rollback, is refused rather than treated as a full credential because it matched no known read literal. Pure read routes (`GET`, `HEAD`) accept a read token unchanged. AN OBSERVER CAN PAIR NOTHING, and that includes a replacement for itself: `POST /pair` is a write, so a request that PRESENTS a read-scoped bearer is `403 scope_read_only` and the setup code it carried is not spent. This is intended rather than incidental. A pairing request normally sends no `Authorization` header at all, so a client re-pairing after its observer token went stale clears the stored token first and pairs exactly as any client does. THE WEBSOCKET IS HELD TO THE SAME RULE: an app socket that authenticated with a read-scoped token may send `auth` and the read-only `sync` frame, and every command frame (`mobile_node_advertise`, `mobile_node_result`, `mobile_node_progress`) is refused with an `error` frame carrying `code: "scope_read_only"`, so an observer can never advertise itself as a phone capability node or answer a request on one. An observer appears on `GET /devices` like any device, with its `kind` and `scope` beside its name and last-seen time, and `DELETE /devices/:id` deletes it and closes its socket exactly as it does for any device, so revoking a dashboard needs no new surface. `Device` gains OPTIONAL `kind` (`device`, `runner` or `observer`) and `scope` (`read` or `write`); a client that reads neither renders an observer as the device it is. Additive: a client that never sends `kind: "observer"` is byte identical to its pre-72 self, a token minted before this row is `scope: "write"` and refused nothing, and no peer of any backend changes at all, so a Hermes-backed and a CozyAgents-backed gateway get the same observer with zero plugin changes. |
+| 73 | The one hop the gateway cannot measure is reported by the phone that can: `POST /bots/:name/chat/messages/displayed` gains optional `feltLatencyMs`, an integer 0 to 600000 from the send being tapped to the first delta rendered ON THE PHONE'S OWN CLOCK; radio-only `networkPath`, one of `wifi`, `cellular`, `wired`, `other`; `vpn`, a separate boolean saying whether a VPN or tunnel interface was active; `edgeRttMs`, an integer 0 to 600000 from the app's latest `/cdn-cgi/trace` round trip; and `edgeColo`, that trace response's uppercase three or four character `colo` code. THE GATEWAY CANNOT MEASURE THESE AND NEVER WILL: it sees an admission and a frame leaving, not a thumb, a pixel, the phone's radio, or a VPN. The gateway stores all five on the receipt row it already writes, nullable, records at most ONE perceived-latency and one edge sample per request whatever the batch size, and records `edgeRttMs` and `edgeColo` on the app websocket's `auth` frame when the app has probed. A client reached over LAN or not yet probed leaves the edge fields absent. The old `vpn_on` and `vpn_off` values are refused with `400 invalid_request`; `vpn: false` is distinct from an unknown or unreported VPN state. The VPN cost is the difference of two medians for the SAME device on the SAME radio with `vpn: true` and `vpn: false`, each with its own sample count. Additive: every field is optional, a client below this amendment sends none and is byte identical to its pre-73 self, and every peer of every backend is untouched. |
+| 74 | The `observation_snapshot` lane: a CozyAgents peer's own internals, published to the gateway on one negotiated capability. `observation_snapshot` is requested on `hello` only after this gateway has advertised `com.cozylabs.bots >= 74` in a prior `hello_ack`, then granted on `hello_ack` exactly as `delivery_receipts` is; unknown hello capability names are ignored by gateways at this row; the lane is ADDITIVE, meaning a peer that supports it requests one more capability on `hello` and sends nothing new unless the gateway grants it, and a peer that does not support it (every Hermes peer) is unchanged. A peer that negotiated it sends an UNSEQUENCED, NON-DURABLE `observation_snapshot` frame every 30 seconds while no turn is running, and one more at every turn terminal, whatever the interval's phase; the frame is never spooled, never ACKed and never replayed, because a snapshot is the latest state of a bot and a stale one is worse than none. One publish is in flight at a time: a slow send never stacks into a burst. The frame is `{kind: "observation_snapshot", payload}` and the payload is `{schema: "cozyagents.observation-snapshot-lane.v1", reason ("idle_interval" or "turn_terminal"), emittedAt, windowMs?, snapshot, runtime?, mcp?, prompt?, recall?, guardrails?, cache, checkpoints?, steps?, toolCalls?}`. `emittedAt` is PEER-CLOCK milliseconds, not the gateway's: the gateway records its own receive time and orders by that, never by this field. `snapshot` is the harness's own aggregate observation snapshot (`cozyagents.observation-snapshot.v1`: run outcomes, latency, provider usage, tool families, policy, delivery, context safety, observer health). `runtime` is what the PEER can see of itself: `stage` (closed: the runtime stages, or `unknown`), `backend` (`docker` or `process`), `isolation`, `bundleVersion` (a semantic version or `unavailable`), `lastContactAtMs`, `failureCode`, and optionally `specGeneration`/`observedGeneration`; a peer that does not know its spec generation OMITS it, and the gateway joins its own runner record rather than trusting a peer to restate it. `mcp` is at most 32 entries of `{server, summary (healthy, degraded, offline, unknown), layers (the six named layers, each `{value: yes/no/unknown, atMs?}`), lastSuccess?, lastFailure? (its `reason` from the closed MCP failure set), fingerprint {current?, previous?, refreshedAtMs?, changedAtMs?}, repair?}`, where `repair` is the same `mcp_reconnect` proposal shape capability 62 already carries, reduced to `{kind, reason, policy, scope, impactCount, impact (at most 16 tool names), fingerprint}`, present only while a proposal is OPEN (waiting on a person; an automatic refresh asks nobody and is never open). `prompt` is the deferred-schema posture: `{lateSchemaBytes, sharedSchemaBytes, opensOnAttach, late[] (at most 64, each `{name, kind, schemaBytes, opensOnAttach?, briefBytes?, sectionTokens?}`), shared[] (at most 64)}`. `recall` is `{source ("index" or "maintenance"), before, after, indexed, evicted, tombstoned, secrets, orphaned, dropped, bytes, rules (at most 32 rule NAMES)}`; `index` means the live index the peer read, `maintenance` the last nightly pass. `guardrails` is `{total, verdicts, actions, decisions, rules}`, counts only, every key from a closed set except the rule names: no per-decision line, no thread, turn or call id, no host, ever. `cache` is either `{availability: "reported", window: "process_lifetime", hits, misses, writes, errors, invalidations}` or `{availability: "unavailable", reason}`; the window is NAMED because process lifetime is not the ring's window, so the gateway stores it as a level and never sums it as a rate. `checkpoints` is `{written}`. `steps` is at most 64 entries of `{turn, step, model?, promptTokens?, completionTokens?, cachedTokens?, timeToFirstTokenMs?, generationMs?, prefillTokensPerSecond?, decodeTokensPerSecond?, prefix? (cached_prefix or no_prefix_cache)}`, where `turn` is an opaque `obs:<sha256 hex>` reference to the turn and `step` is the model step WITHIN THAT TURN, starting at 1 and unique only inside it; prefill is prompt tokens over time to first token and decode is completion tokens over generation time, per step, never averaged across models, and a step with no observable first token carries NO speed rather than a fabricated one. `toolCalls` is at most 64 entries of `{tool, turn, step, family?, estimated?, calls, resultTokens, callTokens, schemaShareTokens, inducedTokens, durationMs, attributed, outcomes}`, where induced tokens are result plus call plus schema share; the peer SUMS per (turn, step, tool) and sets `attributed` when several calls shared one model step, splitting result tokens by result size and call tokens by argument length inside its own recorder, and sets `estimated` when the following step had not settled so the result tokens are a size estimate rather than an observed prompt delta. THE GATEWAY FOLDS ON (bot, turn, step index): a snapshot repeats the tail of a live turn between an idle tick and that turn's terminal, and folding on anything less double-counts. THE PRIVACY RULE IS PART OF THE ROW: every name is checked against an ALLOWLIST (at most three dot-separated segments, each starting with a letter, letters, digits, `_` and `-` only, at most 48 characters), a value outside it, including any file name or credential shape, is replaced by a stable `redacted-<12 hex>` stand-in rather than published or truncated, every reason code comes from a closed set, every hash is lowercase hex at most 128 characters, every collection is bounded, and timestamps are integers, never strings. No message text, URL, path, query, argument, header, environment value or token is ever carried. Each frame is CAPPED at 64 KiB by the peer. The trim order is the recall rule list, then the card registry lists, then the MCP server rows, and only then the oldest step and tool-call entries, so the turn anatomy is the last thing given up; a trim that reaches the tails can leave a tool row whose step row is gone, and the gateway's fold MUST tolerate that orphan rather than refuse it. The worst case if every bound were multiplied out is about 140 KB uncapped, and every frame the peer actually sends is under 64 KiB. The gateway validates the payload the way it validates capability 62's `repair` block: closed sets and bounds, no C0/C1 control or Unicode Format (Cf) character, no lone surrogate, no whitespace-only value; a snapshot that fails is DROPPED whole with one bounded content-free log line, never stored in part. The gateway stores the LATEST snapshot per bot (replace, never append), folds its numeric fields into the observability series ring on the key above, and increments the bot's lifetime token table, which is outside the ring and never trimmed. A gateway that does not advertise the row receives nothing, a peer that does not negotiate it sends nothing, and a gateway with no CozyAgents peer stores nothing new. A Hermes-backed bot never sends this lane and nothing on the main tab is degraded by its absence. |
+
+| 75 | The paired read-only observer reads thirteen GET routes under `/observe/api`: overview, bots, turns, roundtrip, attach, approvals, deliveries, devices, events, series, cozyagents, cozyagents/spend and cozyagents/tools. Each requires a device token with read scope or higher, accepts window `1h`, `24h` (default), or `7d` and optional bot filter, and reports explicit empty data rather than a missing route when a window has no samples. Every aggregate includes its sample count; model speed figures below 20 samples omit percentiles. The ring retains keyed identity hashes; read routes resolve current roster names and label departed subjects as former bots. On the app websocket an observer may authenticate, sync, subscribe or unsubscribe, and no command is accepted. `observe_subscribe` names a closed set: `observe_sample`, `observe_event`, `observe_chat_delta`, `bot_task_updated`, `bot_presence`, `bot_roster`, `bot_approval_pending`, `bot_approval_resolved`. Ring writes emit validated sample and event frames only to subscribers. Chat deltas are projected to text length and sequence in `observe_chat_delta`, never text. The other subscriptions emit content-free `observe_update` invalidations containing kind and time, so the dashboard refreshes the corresponding read projection without receiving task goals, roster previews or approval descriptions. Read-scoped sync acknowledges without transcript replay. Each subscriber has a 256-frame queue; overflow drops oldest pending frames and emits `observe_gap` with the number dropped. Socket backpressure pauses draining. Unsubscribe and disconnect discard the queue. The CozyAgents panels are explicitly unavailable until an attached snapshot lane exists. Ordinary write-scoped app frames and every Hermes attach peer remain unchanged. |
+
+| 76 | A settled reply push may carry the Task id for the same turn. The gateway resolves it from the newest `task_runs.session_id` row before its fire-and-forget relay send is deferred, records that reply-push fact durably, and suppresses the queued `task_completed` push only for that Task during the following ten seconds. This collapses one fast reply and completion into one actionable banner without delaying either path or depending on delivery acknowledgement. A missing Task id remains a normal message push for old clients. The marker is written only when at least one background device is targeted, survives a gateway restart, and never applies to another Task. |
+| 77 | Room pending approval frames and room pending-interaction pointers may carry `cause: {kind: "user" or "member", seq: integer}`, copied from the durable writing turn before its reply exists. The existing capability-47 room message `turnId` and `cause` remain unchanged. Clients may resolve proven member cause chains to a user request, and must not substitute adjacency when a supplied cause is missing from retained history. Legacy rows without provenance retain their existing fallback. Delivery approval pushes alone may request the time-sensitive APNs interruption level; this does not guarantee presentation under Focus or change any approval timeout. |
+| 78 | Optional attach heartbeat turn-health reports let the gateway detect an interim delivery seal while a turn remains active; native chat state may expose `deliveryStatus` as `checking` without changing its execution lifecycle. |
+| 79 | Reserved: runtime-bot settings (CozyAgents' bundled gateway). This gateway does not advertise a meaning for 79; clients must not infer any surface from it. |
+| 80 | Synced roster presentation. `GET /bots/:name/presentation` answers `BotPresentationResponse` (`{ name, presentation, revision }`), where `presentation` is `{ pinned?, hidden?, sectionId?, sectionName?, title? }` read from the profile's `ui_meta["hermes-bots"]` blob, the same key the Hermes desktop Bot Mode plugin syncs, and `revision` is Hermes's per-key compare-and-swap counter for that key (0 when never written). An absent key is not `false`: a client uses the absence to push a device-local pin or hide the first time it syncs. `PATCH` on the same path takes `BotPresentationPatch` (closed; `pinned` and `hidden` booleans, `sectionId`, `sectionName` and `title` a non-blank string of at most 128 characters or `null` to clear) and writes through `profiles.configure {name, ui_meta: {"hermes-bots": merged}, ui_meta_expected_revisions: {"hermes-bots": revision}}`. THE MERGE KEEPS EVERY OTHER KEY VERBATIM: the gateway re-reads the blob, sets only the patched keys and writes the whole blob back under the revision it read. A revision conflict (another client wrote in between) re-reads and re-applies the same keys, up to three attempts, and then answers `409 conflict`; it never overwrites a key the patch did not name. An empty body is `400 invalid_request`. An unknown bot is `404`, a runtime-served bot is `409 unsupported_for_runtime`, and a Hermes that has not applied the write is `503 backend_unavailable`. The roster reads it for free: `BotSummary.meta` already carries the blob, so `bot_roster` reflects a write on the refresh the PATCH schedules. Additive: new routes only, no frame gains a field, and a client writes presentation only on `>= 80`. |
+| 81 | Avatars. **The look** rides the capability-80 presentation: `BotPresentation` and `BotPresentationPatch` gain `shape` (the desktop's free-form face string: `blobatar`, `blobatar:<seed>`, `blobatar:<seed>:<kind>` or `blobatar::<kind>` with `kind` one of `round`, `organic`, `boxy`, `capsule`, `nub`, `cloud`, `droplet`, `hexagon`, `sun`, `triangle`; a geometric `circle`, `squircle`, `pill`, `triangle`, `hexagon`, `cloud` or `drop`; or a legacy `sigil-<n>`), `color` (any CSS color the desktop wrote), `custom`, `imageKind` (`photo` or `shape`) and `cozychat`, CozyChat's own namespaced record `{jelly?, seed?, prism?, shape?, color?}` of the exact Living Jelly a phone chose, its seed, its Prism tint and the `shape` and `color` it wrote beside them (a phone ignores the record once either no longer matches the blob, which is how a desktop's later change, colour-only included, wins). `lookIfAbsent: true` makes a patch a backfill: the gateway re-reads the blob inside its compare-and-swap loop and skips the write (answering the current presentation) when the blob already carries any look key, so a phone's first sync never overwrites a look another client wrote after the phone's roster snapshot. Each (`custom` included) is set or cleared with `null` and merged exactly like the capability-80 keys. The roster's image `v` is a short hash of the asset's bytes, read by the gateway in the background after the roster publishes (at most four reads at once, five seconds each, never for a `shape` look), at most once a minute per profile unless `has_avatar` or the blob revision moved, and the roster republished only if a hash changed, so a picture replaced on a desktop (with or without a look write) reaches the phone on the next roster refresh. **The picture** is the profile's avatar asset: `GET /bots/:name/avatar` answers the bytes (`image/png`, `image/jpeg` or `image/webp`, from `profiles.get_asset`) or `404`; `PUT` takes `BotAvatarSetRequest` (`{data}`, its body read against a 3 MB cap whether or not a length is declared, `413` past it; a data URL or base64, at most 2 MB decoded, format SNIFFED from the bytes, never the declared type; anything else is `400`) and writes `profiles.set_asset {name, asset: "avatar", data}`; `DELETE` writes `{clear: true}`; both answer `BotAvatarSetResponse` and schedule a roster refresh. `POST /bots/:name/avatar/generate` takes `BotAvatarGenerateRequest`: `{probe: true}` answers `{available}` from `image.generate {probe}` (clients hide the option when false), and `{prompt}` answers `BotAvatarGenerateResponse` with `image` a data URL on success, using the desktop's prompt suffix and a 90 s bound; the portrait is NOT saved, the client previews it and saves it with `PUT`. `GET /bots/:name/avatar/pets` (`?localOnly=1` skips the remote manifest) answers `BotAvatarPetGallery`, installed then curated pets first; `POST /bots/:name/avatar/pets/thumb` (`{slug, url?}`) answers `{ok, image?}`, a PNG data URI of the pet's first idle frame cropped by `pet.thumb`; the gateway ignores `url` and resolves the slug's sheet from Hermes's own gallery (cached five minutes), because Hermes caches a thumbnail by slug and a client-named sheet could poison it; which the client saves with `PUT`; `GET /bots/:name/avatar/pets/:slug` answers those bytes. Image generation and the gallery are host-wide in Hermes; the bot name routes and authorizes. **The roster** gains optional `BotSummary.avatar`: `{kind: "image", imageUrl: "/bots/:name/avatar?v=<revision>"}` when the profile has an asset and `meta.imageKind` is not `shape` (a `shape` asset is only the 160 px raster of a drawn face, pushed so inter-agent notices can show it, and the live face is drawn instead), or `{kind: "pet", petSlug, imageUrl: "/bots/:name/avatar/pets/<slug>"}` for a legacy `meta.pet` slug with no asset. `v` is the asset fingerprint above (the `hermes-bots` revision until the asset has been read). A runtime-served bot is `409 unsupported_for_runtime`; an unknown bot is `404`. Additive: new routes and optional fields; a client uses them only on `>= 81`. |
+| 82 | Profile operations for Hermes-backed bots. `PATCH /bots/:name/identity` (`BotIdentityPatch`, at least one of `title` and `description`) writes the friendly title into `ui_meta["hermes-bots"].title` and the description, and answers `BotIdentity`. The title is written through capability 80's presentation writer (the same per-key compare-and-swap on the `hermes-bots` key, re-reading and re-applying only `title` on a revision conflict, never touching another key); an empty title clears it (`null`, as the desktop writes it). `POST /bots/:name/rename` (`{newName}`) renames the Hermes profile directory (Hermes keeps `previous_names`), refuses `409 conflict` while a turn is running or when the name is taken, revokes the old attach identity and asks the provisioner to enrol the new name; transcript rows this gateway holds for the old name are not carried over. `POST /bots/:name/describe-auto` (`{overwrite?}`) asks Hermes to write a description and answers `BotDescribeAutoResponse`, where `ok: false` with a `reason` is Hermes' own inline refusal. `POST /bots/:name/duplicate` (`{newName?}`, default the first free `<name>-N`) runs `profiles.create {clone_from, clone_all: true}`, copies the `hermes-bots` look with the title suffixed ` (copy)`, copies the avatar asset, and answers `BotCreateResponse`. `POST /bots/:name/export` streams the profile as `application/gzip` (Hermes excludes credential files); the staged archive is removed from the Hermes host once the stream ends or is abandoned. `POST /bots/import?name=` takes an `application/gzip` body of at most 100 MiB (the bound of Hermes' own files route), streams it onto the Hermes host through `/api/files/upload-stream` while counting bytes, so a declared length over the bound and a chunked body that runs past it both answer `413`, as does Hermes' own refusal, imports it as a new profile named `name`, removes the staged file, and answers `BotCreateResponse`. `GET /bots/:name/model-pin` answers the current pin from `profiles.describe` (`pinned: false` when the profile has none and the launch profile's model applies). `PUT /bots/:name/model-pin` (`BotModelPinRequest`) pins the profile's model through `profiles.configure`; a guarded model answers `BotModelPinResponse` with `pinned: false`, `confirmRequired: true` and Hermes' `confirmMessage` and writes nothing until the client resends with `confirmExpensiveModel: true`. `DELETE /bots/:name/model-pin` unpins, so the launch profile's model applies. `GET /bots/:name/provider-keys` answers `{providers: [{slug, name, connected}]}`, one row per provider that takes an API key on this bot's profile. `PUT /bots/:name/provider-keys/:provider` (`{apiKey}`) saves the provider's key and `DELETE` on the same path removes every key of that provider, both through the dashboard's profile-scoped `/api/env` (the same credential lifecycle `model.save_key`/`model.disconnect` run; those two RPCs carry no `profile` and reach only the launch profile on a shared socket). The key is write-only and never echoed or logged. `GET /bots/:name/skills-hub?q=` searches the Skills Hub (`BotSkillsHubSearch`, each result carrying the `identifier` to install and `installed` when this bot already has it) and `POST /bots/:name/skills-hub/install` (`{identifier}`) starts the install on this bot's profile and answers `{started, identifier}`; both go through the dashboard's profile-scoped hub routes, because the `skills.manage` RPC installs into the launch profile's skills folder whatever `profile` it is given. `POST /bots` gains optional `cloneFrom`, `cloneAll`, `noSkills` and `shareKeys` (default true). Every route answers `409 unsupported_for_runtime` for a runtime bot, and a new name (rename, duplicate, import, create) that is a runtime bot's is `409 conflict`; a duplicate's automatic name steps over runtime bots. The name `current`, which Hermes resolves to the launch profile, is reserved: `400` as a new name and as the bot of any profile operation. A clone source Hermes refuses is `400`. Additive: all routes are new and a client below 82 sends none of the fields. Also additive under 82: `BotSummary` gains optional `previousNames` (Hermes's `previous_names` for the profile, oldest first, lowercased), so a client resolves an `@old-handle` to the renamed bot, draws room entries authored under an old name as the bot's current self, and moves its per-bot state to the new name, as upstream Desktop does; absent when the profile was never renamed, on a runtime bot and on a gateway that predates it, so no capability row is spent. |
+| 83 | Hermes routines v2. `BotRoutine` gains optional `deliver` (the backend's own target word: `local` is run history only, `bot-chat` injects each result into the bot's canonical Bot Chat), `BotRoutineListResponse` gains optional `schedulerRunning` (Hermes's `gateway_running` from `cron.manage list`; `false` means the routines are saved but will not fire), and create/patch accept `deliver`. A patch that changes anything but `enabled` is now an IN-PLACE update through Hermes's `PUT /api/cron/jobs/:id?profile=`: the routine keeps its id, `prompt` is optional, and `replacedId`/`orphanedId` are never sent. `repeat` on a patch still counts runs from now (the gateway adds the completed runs), and `repeat: null` clears the cap so the routine runs until stopped. The list's `prompt` is the full instruction the routine was created with, read from `GET /api/cron/jobs?profile=` and unwrapped from the gateway's own delegation wrapper, falling back to Hermes's 100-character preview when that read fails. New routes, all scoped to the bot's routine namespace (an id outside it is 404): `POST /bots/:name/routines/:id/run` fires Hermes's own trigger and answers `BotRoutineRunResponse` once Hermes has accepted it (the run continues in the background and a `bot_routines` frame follows when it ends); `GET /bots/:name/routines/:id/runs?limit=` answers `BotRoutineRunsResponse`; `GET /bots/:name/routines/:id/runs/:runId/output` answers `BotRoutineRunOutputResponse` (the run id must belong to that routine); `GET /bots/:name/routine-blueprints` answers `BotRoutineBlueprintsResponse`; `POST /bots/:name/routine-blueprints/:key/instantiate` takes `BotRoutineBlueprintInstantiateRequest` and answers `201 BotRoutineWriteResponse`. |
+| 84 | Rooms reach Desktop parity. Threads: `BotGroupSendRequest.threadId` replies in a thread, absent starts one, and every entry from 84 carries `threadId` (a root send's thread is its own `messageId`). Sends while a drive is live queue behind it instead of superseding it. Stop directives: a user `stop`/`halt`/`pause` within two words of an `@mention` holds that member (`@all stop` holds everyone), a non-stop mention releases it, `@all` releases everyone, and code, quotes and blockquotes are ignored; a held member is skipped and the entries it missed replay in its next turn. `BotGroup` gains `holds`, `holdDetection`, `picture` and `id` (a stable identity that survives a rename). `PATCH /bots/groups/:group` renames (the room keeps its identity), edits members (2 to 6), sets or clears the picture and toggles stop-directive detection. `POST /bots/groups/:group/stop` stops the drive, interrupts the member on turn and holds every member when detection is on. `POST /bots/groups/:group/compress` runs `/compress` in one member's room thread. `POST /bots/groups/picture` generates a picture through Hermes `image.generate`. A member's commit on its room thread outside a room turn is mirrored in once with `external: true`. `bot_group_state` gains `activity` (`working`, `replied`, `passed`, `held`, `stopped`) and `room`/`renamedFrom` whenever settings or holds change. A send starting with a slash command is refused with 400. |
+| 85 | Bot screen (Hermes Bot Screen, a bot's headless Linux desktop). Routes, each passing the Hermes `display.*` result through VERBATIM (snake_case, so a client shares one decoder with a direct Hermes connection): `GET /bots/:name/screen` (`display.status`), `GET /bots/:name/screen/thumbnail` (`{data_url, suppressed?}`), `POST /bots/:name/screen/start`, `POST /bots/:name/screen/stop {force?}`, `POST /bots/:name/screen/install`, `POST /bots/:name/screen/lease/acquire {viewerId, reason?}` and `POST /bots/:name/screen/lease/release {viewerId?, force?}` (both answer `{lease}`). Hermes error 5300 answers 409 `conflict` with `hermesErrorCode: 5300` and `reason` (`viewer_mismatch` when a human holds control; retry with `force`). `POST /bots/:name/screen/install/sudo {requestId, password}` answers 204 and relays the password ONCE to the pending Hermes `display.install.sudo` server request (`""` skips); the gateway never logs or stores it; 404 when that request is not open. `POST /bots/:name/screen/observe {viewerId?}` answers the Hermes observe result plus `ticket` (the gateway's own: single-use, 30 s, bound to the device, the bot and the Hermes viewer id), `path` (`/bots/<name>/screen/ws`) and `viewer_id` (Hermes's minted id; `sha256(viewer_id)[:12]` matches `lease.viewer_hash` while this viewer holds control). The WebSocket `GET /bots/:name/screen/ws?ticket=` takes no device token: a bad, used or expired ticket is closed 4401 after accept; otherwise the gateway mints a fresh Hermes ticket and splices raw RFB binary frames both ways to Hermes `/api/display/ws?display_ticket=`, forwarding Hermes's close code (4000 control-taken, 4001 screen gone, 4401) and a client's clean 1000/1001 close (which hands the lease back); an abnormal client drop cuts the Hermes leg and keeps a human's lease, as upstream does. `GET`/`PATCH /bots/:name/screen/config` read and deep-merge `{geometry, autoStart, minFreeMemoryMb, idleStopMinutes, browserHeaded}` (`bot_desktop.*`, `browser.headed`) through the dashboard config route. `GET`/`PUT /bots/:name/screen/auto-open {enabled}` read and compare-and-swap `ui_meta['hermes-bots'].screenAutoOpen` without clobbering other keys (superseded by row 80's presentation route). Frames, sent only to clients that declare bots >= 85 (or declare nothing): `bot_screen_status {bot, status}`, `bot_screen_lease {bot, lease}`, `bot_screen_install_log {bot, line}`, `bot_screen_install_done {bot, code, status?}` (0 ok, -1 cancelled, -2 no sudo), `bot_screen_install_sudo {bot, requestId}` (to the device that pressed Install when it is connected, else broadcast) and `bot_screen_request_cancel {bot, requestId}`. |
+| 86 | Chat semantics, reactions and voice. See [Row 86 (chat semantics and reactions)](#row-86-chat-semantics-and-reactions) and [Row 86 (voice)](#row-86-voice-per-bot-read-aloud-and-auto-speak) below. |
+| 87 | The foreground relay courier (Hermes Desktop parity, `relay.ts`). A phone that holds this gateway and another Hermes connection carries `message_agent` DMs between them while it is in the foreground; the gateway only forwards the four upstream doors to its own Hermes, in Hermes's own shapes. `GET /bot-relay/identity` answers `{connectionId, label, installId?}` (`installId` is the Hermes install behind the gateway, so a phone that also reaches that install directly treats the two as one connection): the id this gateway goes by on the relay, built from server facts only (the configured name, slugged, plus the first six characters of the Hermes `install_id` from `/api/status`), so every phone derives the same id and a change on one phone never shifts it. `POST /bot-relay/roster` takes `{ agents }` and admits rows one by one as Hermes's `_normalize_roster_row` does: a row whose `profile`, `handle` or `connection_id` does not match `^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$` is dropped, `connection_label`, `title` and `description` are cut to 80, 120 and 160 characters (the description on one line), and the rest is forwarded to `bot_relay.roster.sync`, answering `{count}`; a bad row never refuses the push. `POST /bot-relay/drain` calls `bot_relay.outbox.drain` and answers `{envelopes}` verbatim (claimed envelopes are Hermes's to re-offer). `POST /bot-relay/deliver` takes `{profile, message, fromProfile?, fromHandle?, fromConnection?}` (`message` at most 32,400 UTF-16 units; Hermes owns the exact 16,000-character limit), calls `bot_relay.deliver` with `from_*` params and the upstream 1,500 s budget, and answers `{reply}` or, for a failed or refused turn, `{error, reason?}` with Hermes's typed `data.reason` (`provider_auth_or_access`, `provider_quota_limit`, `provider_rate_limit`, `provider_server_error`, `context_overflow`, `missing_config`, `model_unavailable`, `runtime_offline`, `queued_expired`, `delivery_timeout`, `target_busy`, `unknown`); a failed turn is a 200 outcome, not an HTTP error, so the code survives. `POST /bot-relay/reply` takes `{id, reply?, error?, reason?}` (no cap on `reply`: a refused reply would leave the sender's waiter to time out and the envelope to be re-delivered) and calls `bot_relay.reply` with only the keys given. The `bot_relay_pending` frame (no payload) is broadcast whenever Hermes emits `bot_relay.outbox.pending`. `BotSummary.workerActiveAt` (milliseconds or null) carries `profiles.list` `worker_session.last_active`, and `BotSummary.workerActive` is that stamp read against the gateway's own clock when the row was built (under 150 s), so a skewed phone clock cannot misread it. Routes are registered only on a single-Hermes gateway; a federated gateway answers 404 and is left out of the relay. Additive: new routes, one new frame, one optional field. |
+| 88 | Team roles and the assignment turn context. `BotProfile` and `BotProfilePatch` gain optional `role` (`leader` or `member`; absent means member) and `reports` (at most 16 bot names, leader only). The gateway stores both itself and merges them into `GET /bots/:name/profile`; `PATCH` checks them, forwards only the remaining fields to the peer, and stores them once that forward succeeds, so a patch carrying only these two touches no peer and answers `applied: { team: true }`. `reports` on a member, a report naming the bot itself, and a name that is not a bot on this gateway are `400 invalid_request`; setting `role: "member"` clears `reports` and cancels the open assignments that bot led. No nested delegation: a leader may not be a report, and a report may not become a leader (`400`). Attach-v1 `TurnContext` gains an optional `task` beside `room` (`{id, assignedBy, brief, doneCriteria, outputFormat?, deadlineAt}`, `id` being the Task id) and `room` becomes optional, because an assignment turn has no room; `text` is byte-identical with and without `context`, exactly as 47 promised. The assignment surface itself is `com.cozylabs.agent-inbox` 1, never inferred from this scalar. Additive. |
+| 89 | A chat client declares a bot's REMOTE MCP servers over the `bot_config` lane. `BotProfilePatch` gains `declareMcpServers` (1-16 `BotMcpServerDeclaration`, each a whole upsert by name) and `removeMcpServers` (1-64 server names), carried on the existing capability-48 `profile.write`; no new route and no new operation. A declaration is closed: `name` (a card name, `^[a-z0-9][a-z0-9_-]{0,63}$`), `transport` (the literal `http`: Streamable HTTP, which the harness falls back to SSE on), `url` (http or https), optional `headers` (at most 8), `description` (1-200 characters, no control character), `tools` (the allowlist the harness exposes, 1-128 unique names) and `actions` (per-tool action allowlists; needs `tools` and names only tools in it). TRUST MODEL: (1) REMOTE ONLY. There is no stdio shape: `command`, `args`, `env` and `cwd` are not fields, so no request reaches host command execution; a stdio server stays the operator's to declare in the bot's environment. (2) SECRETS BY NAME, BOUND TO ORIGINS. A header value is exactly one `${COZY_MCP_<NAME>}` placeholder, optionally after one scheme word (`Bearer`, `Basic`, `Token`), so the phone, the gateway and every projection hold only the variable's name; no other variable can be named. The peer MUST expand `${COZY_MCP_<NAME>}` only when the declaration's URL origin (scheme, host, port) is listed in the operator-set `COZY_MCP_<NAME>_ORIGINS` (a comma list of origins), and otherwise MUST refuse the declaration by name in `ignored` before dialling anything. Each entry is compared EXACTLY against the WHATWG `URL.origin` serialization of the declaration's URL (`https://ha.example.com`, `http://10.0.0.5:8123`): no wildcards, no prefix or suffix match, and an origin that serializes as `null` never matches. The binding is per ORIGIN, not per path, so an operator should list only origins whose whole surface they trust with that token; a missing variable fails that server's start by name and shows in its `requires`. The allowlist is set on the harness, never through this lane, and a header may not name an `_ORIGINS` variable. So a device that can write this patch still cannot aim an operator secret at an origin the operator did not list. (3) URL AND SSRF. The gateway refuses userinfo, query, fragment, backslash and `${...}` in the URL (the obvious credential slots; a path can still hold anything, so a client must not put a secret there) and, as defence in depth, a literal loopback (127/8, `::1`), unspecified (0/8, `::`), link-local (169.254/16, fe80::/10), deprecated site-local (fec0::/10) or cloud metadata (169.254.169.254, 100.100.100.200, 192.0.0.192, fd00:ec2::254) address, an IPv6 form carrying such an IPv4 address (IPv4-mapped `::ffff:0:0/96`, IPv4-compatible `::/96`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`), and the host names `localhost`, `*.localhost`, `localhost.localdomain`, `ip6-localhost`, `ip6-loopback` and `metadata.google.internal`. The peer is the SSRF boundary and MUST put every client-declared URL through its URL policy on the RESOLVED address with private, loopback and link-local addresses blocked and `.local` hosts refused, unless the operator allowed private hosts for CLIENT declarations specifically (a setting separate from the one its own servers use); it MUST pin the resolved address for the connection AND re-check every redirect hop against the same policy (or refuse redirects). Once any header of a declaration has been expanded, the peer MUST NOT follow a redirect that leaves the allowlisted origin: `fetch` keeps a custom header such as `X-Api-Key` across a cross-origin redirect, so following one would hand the secret to the redirect target. (4) HARNESS-OWNED SETTINGS STAY ON THE HARNESS: `mutating`, capability 63's `repair`, `groups` and the budgets are refused. The peer MUST treat EVERY tool of a client-declared server as mutating, a possible effect that asks under the bot's guardrails, regardless of the absent `mutating` field (CozyAgents reads an absent `mutating` as "every tool investigates" for an operator's server, which is the opposite and must not apply here), and uses its `approve_once` repair default. (5) GATED. The route needs a write-scoped paired device (capability 72 answers a read-scoped one `403`). The gateway forwards either field only to a peer that offered the attach-v1 capability `mcp_server_declarations`, which a harness offers only when its operator turned client declarations on (default off); any other runtime peer answers `409 unsupported_for_runtime` and no frame is sent. A Hermes bot answers the same `409` and NOTHING in the patch is written, because Hermes's `profiles.configure` would accept a stdio definition. The `profile.write` input is rebuilt from the published `BotProfilePatch` keys, so a body key the open schema passes but does not model (an `mcpServers` map, a mis-cased `DeclareMcpServers`) never reaches any peer. Cross-field rules the schema cannot state (a name declared twice or both declared and removed, a header named twice across case, the `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Expect`, `Mcp-Session-Id`, `Cookie` and `Proxy-*` headers, `__proto__`, `constructor` and `prototype` as any name, `actions` without or outside `tools`, the URL rules) are `mcpServerDeclarationProblem`, and the route answers `400 invalid_request` with its sentence. SEMANTICS (the peer's): removals, then declarations, then `enabledMcpServers`, so one save can declare and switch on; a declaration never changes enablement, so a new server lands OFF; a name the client did not declare (operator, built-in, template) is refused by name in `ignored`, for a declare or a remove. `applied` answers `mcp_servers_declared` and `mcp_servers_removed`. READ: `BotMcpServer` gains optional read-only `declaration`, present exactly on a row a client declared and equal to that declaration, which marks the row as the client's to edit or remove. It is validated whole with the rest of `profile.read`, the lane's convention (as capability 63's `repair` is): an invalid one refuses the `config_result` frame and closes the socket, so a peer emits `declaration` only after the gateway advertised `>= 89` and only in this closed shape, and GROWING THE DECLARATION NEEDS A NEW CAPABILITY, never an optional field an older gateway would refuse. Additive: a client below 89 sends neither field and reads no `declaration`; a peer receives either field only after negotiating `mcp_server_declarations`; a client offers the editor only on `>= 89`. |
+
+### Row 86 (chat semantics and reactions)
+
+**Canonical Bot Chat.** `POST /bots/:name/bot-chat` answers `BotCanonicalChatResponse` (`{ name, created, status: "resumed" | "pending", sessionId? }`). It resolves the profile's Hermes session titled exactly `Bot Chat` with `session.list {profile, title: "Bot Chat", include_hidden: true}` and FAILS CLOSED (`503`) when that lookup fails, because minting on a transient failure forks the forever chat. When the profile has none it mints one with `session.create {profile, title, hidden: true, follow_profile_config: true, source: "desktop"}` then `session.title` (a title race adopts the winner), `created: true`, and the client sends the kickoff line ("Hey, tell me about yourself!") through the ordinary message route. When no profile on the install carries `ui_meta["hermes-bots"]` it writes `{}` onto this profile under revision 0: that block and the exact title are the two preconditions of Hermes Bot Mode's `message_agent` protocol. It then binds the bot's current chat to the Bot Chat through the capability-4 exact resume proof (`desktop_session_resume`), so turns still ride attach-v1 into that Hermes session; `resumed` carries the bound gateway chat, `pending` means the plugin has not proved it and the current chat is unchanged. A chat bound to the Bot Chat is never displaced by a newer Desktop/TUI/CLI session. Registration requires a Hermes profile surface; otherwise `404`.
+
+**Retire.** `POST /bots/:name/chat/reset` on a chat bound to the Bot Chat also archives and hides that Hermes session (`PATCH /api/sessions/:id {archived, hidden}`), which retires it; the next `bot-chat` open mints a fresh one. `/new` and `/reset` typed in a Bot Chat are the client's to rewrite to `/compact` (the attach lane runs Hermes's own `/compact`).
+
+**Model.** A `PUT /bots/:name/model-config` that sets the profile model, and a capability-82 `PUT /bots/:name/model-pin` that pins it (not one answering `confirmRequired`) or `DELETE` that unpins it, clears every per-chat model override of that bot, so the profile model takes over again.
+
+**Reactions.** `PUT /bots/:name/chat/messages/:id/reaction` takes `{ emoji: string | null }` (the key is required), applies Tapback semantics (one per author, the same emoji again retracts, `null` clears), answers `BotChatReactionResponse` (`{ messageId, reactions }`) and broadcasts `bot_chat_reaction` (`{ bot, sessionId, messageId, reactions, updatedAt }`, the FULL list). History and `bot_chat` rows carry optional `reactions: [{ emoji, author: "user" | "agent", at? (seconds) }]`. Reactions are gateway-owned; agent reactions arrive only where Hermes emits them to a desktop.
+
+**Reclaim.** A Hermes `session.reclaimed` naming a bound Bot Chat re-proves its binding at once.
+
+**Mirror.** The binding is durable per bot, and the attach plugin mirrors the bound Bot Chat's external rows (a teammate's `message_agent` DM and its reply) as `desktop_session_message` whatever the session's current source (Hermes re-stamps it `cozygateway` after a gateway turn); the per-turn baseline keeps the gateway's own turn rows from echoing, also across a plugin restart, and the gateway dedupes by Hermes row id.
+
+Additive: new routes, one new frame, one optional message field; a client below 86 sees none of them.
+
+### Row 86 (voice): per-bot Read Aloud and auto-speak
+
+A bot speaks with its **own** Hermes profile's `tts.*` on its own Hermes, as upstream Bot Mode does
+(`bot-mode.md#voices`): two bots with different voices sound different, and nothing borrows the
+active profile's voice. Speech-to-text is not part of this row. The gateway adds no speech engine.
+
+- `GET /bots/:name/voice` answers `BotVoice` `{ name, configured, provider?, voice? }`, read from the
+  profile's config (`GET /api/config?profile=`). `configured` is false when the profile has no `tts`
+  block or its provider is switched off (`none`, `off`, `false`, `disabled`); a client then hides
+  its Read Aloud and auto-speak controls. A block with no provider is Hermes's default (`edge`).
+  `voice` is the provider section's `voice` (or ElevenLabs's `voice_id`) when it names one.
+- `POST /bots/:name/speak` takes `BotSpeakRequest` `{ text }` (1 to 20000 characters, not blank)
+  and synthesizes it under the bot's profile. The gateway opens Hermes's sibling socket
+  `/api/audio/speak-stream?profile=<bot>` with the link's own credential, sends
+  `{text, done: true}`, and answers in one of two shapes, told apart by `Content-Type`:
+  - **Streamed PCM.** When Hermes sends `{"type":"start","sample_rate","channels"}`, the answer is
+    `200` with `Content-Type: audio/pcm;rate=<sample_rate>;channels=<channels>` (also as
+    `X-Audio-Sample-Rate` and `X-Audio-Channels`) and a chunked body of raw little-endian int16 PCM,
+    passed through as Hermes synthesizes it, ending at Hermes's `{"type":"end"}`. The `200` is sent
+    only once the first audio frame exists; `end` before any audio is a failed synthesis (`502`).
+    A client that closes the request at any point, including before the first frame, is barge-in:
+    the gateway sends Hermes `{"stop": true}` and closes. The gateway pauses the socket while more
+    than about 512 KiB is waiting for a slow client, so back-pressure reaches Hermes.
+  - **A whole file.** When Hermes answers `{"type":"fallback"}` (the voice has no chunked API, such
+    as `edge`), the gateway calls `POST /api/audio/speak?profile=<bot>` with a 120 s synthesis
+    budget and answers `200` with the decoded audio and its own type (`audio/mpeg`, `audio/ogg`,
+    `audio/wav`, `audio/flac`). Running out of that budget is `504` with `timedOut: true`.
+- `voice.tts {profile}` is deliberately not used: it plays on the Hermes host's own speakers.
+- Errors follow the other `/bots/:name/*` routes: a blank or oversized `text` is `400
+  invalid_request`, an unknown bot `404`, a runtime-served bot `409 unsupported_for_runtime`, and a
+  synthesis Hermes refused (for example a provider whose package or key is missing) `502` with
+  `hermesError` carrying Hermes's own sentence. The 20000-character cap is per request: a client
+  splits a longer reply and speaks the pieces in order.
+- Additive: new routes only; no frame changes. A client offers speech only on `>= 86`.
+
+### Capability 69 F2b amendment
+
+The row 69 owner-loss paragraph is amended as follows. A disconnected peer's lease stays 120
+seconds. Only when the gateway observed an actual frame from that same turn in the final 30 seconds
+before detach does the detached branch receive one fixed 240 second extension, derived from two
+LV1 cold-prefill windows of about 123 seconds each. A heartbeat, hello, dispatch, or any frame from
+another turn does not qualify. The extension is never proportional to elapsed silence, applies once,
+and is capped by an operator-shortened ceiling. It never applies to the undeclared 600 second grace,
+which remains an attached-peer bound. This uses gateway-observed frame timing only, adds no wire
+field or peer behavior, and applies identically to Hermes and CozyAgents peers.
+
+Version 13 was never shipped. A client gates only the feature it renders; unknown optional fields
+and unknown server frames are ignored.
+
+`com.cozylabs.agent-inbox` is the sole advertisement for Agent Inbox, separate from
+`com.cozylabs.bots` so that no client infers the withdrawn capability-17 surface from any later
+bots version. Version 1 is leader assignments (see
+[Leader assignments](#leader-assignments-comcozylabsagent-inbox-1) below): its identity is
+gateway-owned assignment rows, not a reading of Hermes session text, which is what ADR 0082
+waited for. A gateway advertises it only when a bot on it can lead. cozygateway does not: a
+Hermes profile has no team tools, and CozyAgents bots attach to CozyAgents' bundled gateway
+(ADR 0086). Without it CozyChat hides the Agent Inbox, whose only threads are assignments, and the
+Team section. So that nothing contradicts that, while agent-inbox is not advertised a profile patch
+carrying `role` or `reports` is `400 invalid_request` ("leader teams are not available on this
+gateway"), and neither the profile read nor any roster row carries `role`. cozygateway keeps the
+routes below for a future Hermes or OpenClaw leader.
+
+`com.cozylabs.chat-audio` is likewise its own id. Version 1 means the chat attachment route
+accepts voice notes and relays them to the bot as audio (see
+[Attachments and media](#attachments-and-media) below). It does not mean the bot can hear them.
+Whether a bot understands a voice note depends on the bot: a CozyAgents bot transcribes one when
+its transcription is set up, and a Hermes profile does when its own speech-to-text is configured.
+It is not a `com.cozylabs.bots` row because gateways at different bots versions, CozyAgents'
+bundled gateway and this one, must each be able to advertise it without claiming the other's
+rows. This gateway advertises it wherever it serves Bot Mode. A client offers voice notes only
+when it is present.
+
+## Resources
+
+The TypeBox schemas are normative. The names below identify complete shapes rather than maintaining
+a second, hand-copied schema.
+
+- `BotSummary` is one control-plane roster row. Its `chatSessionId`, `preview`, and
+  `lastActiveAt` are overlaid from the configured bot's gateway-owned native chat, on every surface
+  that serves a roster row. Profile metadata remains Hermes control-plane data.
+- `BotChatMessage` is a durable native transcript row. `id` is the gateway/attach event message
+  id, `at` is gateway-clock milliseconds (or `null` when unavailable), and `clientId` is an
+  optional sender echo. Attachments are gateway-scoped opaque `fileId` values, never paths or URLs.
+  Roles are `user` or `assistant` in the conversational projection, plus, from capability 31,
+  `system` on gateway-authored rows that are not conversation. Roles are NOT an enum on this wire:
+  a client renders an unfamiliar role rather than dropping the row.
+  From capability 31 a row may also carry `marker`, a bounded label naming what a gateway-authored
+  row IS. The only v1 value is `delivery.failed`. A client that does not know a marker renders the
+  ordinary row it already renders.
+  From capability 32 an attachment entry may also carry `position`; see "Inline media ordering".
+  From capability 47 a row may carry `turnId` (the attach turn it belongs to: the user row that
+  opened the turn and every assistant row that turn committed share it), `authorBot` (the bot that
+  authored the row), and `inReplyToId` (the `id` of the user row an assistant row answers).
+  `authorBot` is present on every non-user row written from 47 on, a desktop-imported assistant row
+  included; a `user` row has no bot author and carries none. A steer shares the running turn's
+  `turnId` and does NOT become a new `inReplyToId` target: the question a turn answers is the one
+  that opened it, not a mid-turn nudge. `turnId` and `inReplyToId` are absent where no gateway turn
+  produced the row, which is the `delivery.failed` system row and a desktop-imported row. All three
+  are absent on every row written before 47. They are recorded, never inferred: a client must not
+  derive causation from ordering when they are absent, because a scheduled or interim row can land
+  between a question and its answer.
+- `BotSessionSummary` is a durable native Bot Mode session. Current native Bot Mode sessions have
+  `kind: "conversation"`; `startedAt` and `lastActiveAt` are milliseconds. They are not Hermes
+  Dashboard session records.
+- `BotProfile`, `BotCatalog`, `BotModelConfig`, and `BotRoutine` are Hermes control-plane
+  resources. The profile source may report `runtimeInert` sections that Hermes stores but does not
+  execute.
+  From capability 36 `BotModelConfig` may carry `providers`: one summary row per provider Hermes
+  reported, kept even when the provider currently contributes zero catalog entries or has lost its
+  credential (`authenticated: false`), and a catalog entry from such a provider may carry
+  `unauthenticated: true`. Hermes keeps an unauthenticated configured provider visible on purpose,
+  so the picker can show the saved selection and a re-auth affordance; a client renders those
+  entries disabled with a sign-in hint rather than hiding them, and a client below 36 ignores both
+  fields.
+  Capability 41's `BotModelProviderSetupCatalog` is the wider setup universe in the same order as
+  `hermes model`. It is normalized live from Hermes; CozyGateway has no provider registry. A setup
+  field reports only `isSet`, never a value or redacted suffix. A method is `fields`, Hermes-hosted
+  `oauth`, or an honest `external` CLI handoff.
+  For a `runtime: "cozyagents"` bot the gateway's `cozyagents` harness projects the same catalog
+  read-only from the peer's `model.read` (`providers` and `catalog`, `methods: []`). Credential entry
+  for its built-in providers is runtime-configured: the operator's environment owns the credentials,
+  so the harness-settings field and OAuth writes on a CozyAgents scope answer `404 invalid_request`
+  and the bot-scoped writes keep the 409 of capability 45.
+  From capability 63 a `BotProfile`'s `mcpServers` row may carry `repair`, the read-only projection
+  of the peer's own per-server MCP repair policy: `approve_once` or `auto_refresh` and nothing else.
+  It is metadata a client reads, never a field it writes: the profile patch has no shape for it, and
+  the setting is changed on the harness. An absent wire field is not projected or unknown. The
+  gateway keeps it absent, while a known CozyAgents peer may project its effective `approve_once`
+  default after capability 63 is negotiated. That setting requires approval, it does not grant one.
+- `BotGroup`, `BotGroupDetail`, and `BotGroupMessage` are gateway-owned room resources.
+  From capability 51 a `BotGroup` may carry `pendingInteractions`, at most 32 pointers to the
+  approvals and clarifications its members are currently blocked on; it is absent when there are
+  none, and it is live state rather than history.
+  From capability 47 a `BotGroupMessage` may carry `messageId` (the row's own durable, room-unique
+  id: `seq` orders a room, `messageId` identifies a message across rooms, restarts, and a head
+  trim), `turnId` (the member turn that produced it, the same id as the gateway's durable turn row
+  and the attach `turn` command that asked for it; a user row has no turn), `epoch` (the room epoch
+  the row belongs to, so one deliberation is distinguishable from the next when a second send
+  superseded the first), `cause` (`{ kind, seq }`: the highest room seq the member had been shown
+  when its turn STARTED, which is what it was answering, and NOT simply the preceding row), and
+  `attachTurn` (`{ threadId, turnId }`: the gateway-owned member thread that carried the turn,
+  never a Hermes Dashboard session). A `BotGroupNote` may carry `turnId` when a turn was actually
+  started; a `capped` note and a member skipped because it is no longer a bot never got one and
+  carry nothing. Every field is optional and absent on rows written before 47; a client renders
+  such a row exactly as it does today.
+- `BotSlashCommand` is one canonical command advertised by the authenticated profile plugin. Its
+  slash-prefixed `name` is the exact invocation; `description`, optional `argsHint`, and optional
+  `category` are presentation metadata. `BotSlashCommandCatalog` is the bounded ordered list.
+
+- `BotAttachmentHistoryItem` identifies one assistant attachment in a durable native transcript,
+  including its bot, session, message caption, timestamp, and ordinary opaque attachment block.
+  `BotAttachmentHistory` is a newest-first bounded page with an optional next offset.
+- `BotPendingApproval` is the safe metadata necessary to render one unresolved approval: bot,
+  session/turn ids, tool-call id, rule display name, and its pending timestamp. It carries no tool
+  arguments, commands, descriptions, results, or model reasoning. `BotPendingApprovals` is capped
+  at 100 current records and excludes all terminal history.
+- `BotApprovalScope` (capability 66) is the typed block one approval may carry: the action, its
+  category, the target system and resource, the exact material change, the side effects, the reason
+  a decision is required, the sha256 payload hash the binding is made of, the expiration, the retry
+  behaviour, and the scope the peer asked for. It describes an action; it never carries its
+  arguments, and no credential, URL, header or env value belongs in any of its strings.
+- `BotApprovalGrant` (capability 66) is one standing approval as the revocation view renders it:
+  the grant id, whether it covers one payload or a category, the action, category, system,
+  resource, conversation, expiry and creation time. The deciding device, the approval it came from
+  and a `once` grant's payload hash stay in the gateway's own store. `BotApprovalGrants` is the
+  newest 100 live records, the same bounded window the gateway consults, so no grant can answer for
+  a person without appearing here; a spent `once` grant, an expired one and a revoked one are all
+  absent.
+- `BotApprovalDecisionRequest` (capability 66) is the OPTIONAL approve body. A client below 66
+  sends none, and so does a client whose person simply tapped Approve: one invocation approved and
+  no standing grant of any kind. A grant is created only where this body asks for one.
+- `BotPendingClarification` mirrors that recovery state for one unresolved option card. Its prompt
+  and bounded option labels are the same display-safe values already sent in the pending frame.
+- `BotInteractionSettlement` is compact terminal proof for one approval or clarification: stable
+  bot/session/turn/interaction identifiers, the terminal outcome, optional selected option id, and
+  gateway settlement time. It never includes an approval decision command, tool arguments/results,
+  or an option label. The gateway retains only the newest 100 terminal receipts per bot.
+
+### Phone capability request lifecycle (capability 68)
+
+Every phone capability request has one typed state and reaches exactly one typed terminal state:
+
+```text
+requested
+routed
+device_received
+consent_presented
+approved
+executing
+completed | denied | failed | expired | cancelled | policy_blocked | foreground_required
+```
+
+`policy_blocked` means the gateway refused the request before it was ever routed to a phone, and it
+is used for NOTHING that happens after one was routed: an answer the gateway cannot accept, a media
+validation that fails and a store that refuses the bytes are all `failed`, because the request was
+already routed and run and calling that a policy block would tell a person their own gateway blocked
+work it had in fact dispatched. `foreground_required` means the device or app lifecycle prevented
+execution. Neither is folded into a generic failure, and `failed` is what is left: nothing reached a
+phone, or the answer could not be kept. The peer's own `mobile_result` status is unchanged in every
+one of these cases; only the state a person reads differs. The closed unions live in `packages/contract/src/ext-bots.ts`
+(`MOBILE_REQUEST_STATES`, `MOBILE_REQUEST_TERMINAL_STATES`, `BotMobileRequest`).
+
+BINDING. A record names the profile, the conversation, the turn and the ONE paired device the
+request was issued for. That device is also the user identity this gateway holds, because a paired
+device belongs to exactly one person's gateway. A result or a progress report from any other device
+is refused and logged rather than applied, and the request stays pending for the device it was
+issued to. A second device attaching, or the target reconnecting, never moves the target: the
+device selected at admission is the only device that answer can come from.
+
+STATE ONLY MOVES FORWARD, and the first terminal is sealed. A later answer for a request that
+already expired, was cancelled, or was refused cannot rewrite the outcome a person was already
+told, exactly as capability 64's first terminal is immutable.
+
+DERIVED, NOT REPORTED. `requested`, `routed` and the terminal states are the gateway's own routing
+decision, its lease, its media claim and its settlement, so a Hermes peer and any attach peer get
+the whole lifecycle without sending or receiving anything new; peers below 68 are byte identical.
+The four middle stages are the phone's own facts. A phone at `com.cozylabs.mobile-node >= 6` may
+report one with the `mobile_node_progress` client frame (contract v1.md, Mobile Node extension); a
+phone below it reports none, behaves exactly as it did at 5, and its requests simply carry less
+detail. `executing` is also derived with no phone change at all: a media upload claiming the lease
+IS the phone executing.
+
+NO DUPLICATE EXECUTION. When a device reconnects with a request still live, the gateway re-sends
+the original frame under the ORIGINAL request id and lease exactly as it always has, so a phone
+that never received it still gets it once. It does NOT re-send once that phone has reported a
+stage: the phone already holds the request, and a second frame is how one consent becomes two
+prompts or one action becomes two.
+
+`GET /bots/:name/mobile-requests?sessionId=` is device authenticated and answers
+`{ requests: BotMobileRequest[] }`, at most a hundred records of THAT conversation on THAT profile,
+which is what an app resuming from the background reconciles its pending requests against. The
+window is UNSETTLED REQUESTS FIRST and then the newest settled ones: a request the app came back to
+reconcile is never crowded out of the answer by finished history, however long that conversation has
+been running. A settled record is swept 30 days after it settled; an unsettled one is never swept,
+because its outcome is still owed to a person. Deleting the owning Bot takes its records with it,
+and so does deleting the conversation. A missing `sessionId` is `400 invalid_request`: a request belongs to one conversation, so a
+read naming none could only answer for the wrong one. Another conversation's request is absent
+rather than hidden. The record is metadata: no lease, no answer, and nothing the phone measured.
+The capability-39 receipt is unchanged and still written only for a share that happened.
+
+The push half of the row is the `task_completed` payload of `contract/push-v0.md`: a backgrounded
+phone learns capability 64's Task finished. It carries the task and conversation identities the
+deep link needs and no user content, and it is sent exactly once per Task, gated on the transition
+that wrote capability 64's own completion notification record, so the gateway never announces one
+twice. A device holding a live socket is excluded from the push, exactly as it is on every other
+push leg.
+
+THE CLIENT HALF OF THAT DEDUPLICATION IS THE CLIENT'S. The gateway cannot know what a phone already
+put on screen. A client announces a completion at most once per `taskId`, and the deduplication key
+is capability 64's own notification record on the Task view (`notification.taskId`, with
+`notification.createdAt` as the tiebreak), NOT a set that lives for the process: a phone that was
+pushed while backgrounded and then relaunched reads a fresh process, so an in-memory set announces
+the same completion a second time. A client that receives `task_completed` records that `taskId` as
+announced DURABLY, and a local announce for a `taskId` already recorded is suppressed. The push
+carries exactly `kind`, `taskId`, `threadId` and `agentId`; `taskId` is the key, `threadId` is where
+to land, and neither the goal nor any reply text is present, so the deep link opens
+`GET /tasks/:taskId` for anything it needs to render.
+
+TWO EDGES ARE NOT COVERED, deliberately. A request refused before admission binds to no conversation
+the gateway trusts, so it gets the peer's typed `policy_blocked` result and a bounded log line
+rather than a durable record; the conversation a rejected frame CLAIMED is not one the gateway has
+agreed the request belongs to, and writing a row under it would let a peer put records into any
+conversation string. A request dropped at the in-memory admission ceiling is dropped silently and
+fail-closed, which is the pre-68 behavior, and it records no terminal either: a durable outcome the
+peer was never told would disagree with the peer. In both cases the durable view holds no record at
+all rather than a record that says something untrue.
+
+### Choosing the target device (capability 70)
+
+Capability 68 binds a phone capability request to one paired device at admission and never moves
+it. That rule is unchanged. Capability 70 changes only WHERE the device is resolved from, and only
+at admission, so a person with two phones can say which one a request should reach instead of
+having it follow whichever device happened to open the turn.
+
+RESOLUTION ORDER, first that resolves wins:
+
+```text
+1. the conversation's stored preferred device, when it names a device still paired here
+2. the device that opened the turn (the pre-70 rule)
+```
+
+There is no third source, and in particular no peer input. WHICH OF A PERSON'S PHONES RINGS IS THE
+PERSON'S CHOICE. The preference is written by a device-authenticated client, and nothing a bot, a
+harness, a runtime or a Hermes plugin sends can name a target device: no frame carries such a
+field. A `mobile_request` that carries `targetDeviceId` anyway has THAT ONE REQUEST refused, with
+capability 68's own `policy_blocked` terminal and the `request_policy_rejected` reason, which is
+what it is: refused before any phone saw it.
+
+THE SOCKET SURVIVES, and that is a deliberate exception to how this wire answers an unknown key
+everywhere else. A named refusal and a closed connection is the right answer to a contract skew
+that makes a peer's whole understanding suspect. It is the wrong answer to one removed routing
+hint: a peer that still sends it is otherwise healthy and may be carrying a live conversation,
+queued turns and other requests, so closing its socket costs a person all of that, while refusing
+the one request costs them only the request that was never going to be honoured. The peer's next
+valid frame on the same socket is handled normally.
+
+The field is still REMOVED rather than tolerated. A spelling the gateway silently accepts and drops
+is worse than one it refuses on two counts: the routing rule stops being readable from the schema,
+and a peer that thinks it is steering a request keeps thinking so, with nothing anywhere to correct
+it. Refusing per request corrects it, once per request, without costing the connection. One bounded
+log line names the removed field; the device id the peer tried to name is never logged.
+
+ONE EXCEPTION, and it is a rule rather than an oversight: a request whose origin is a registered
+CozyApp action is answered on THE DEVICE THAT TAPPED IT, and consults no stored preference. The
+answer to a tap belongs on the screen that took it; a camera prompt appearing on a phone in another
+room because a chat preference said so would break the interaction the person is standing in front
+of. The conversation's preference governs the CONVERSATION.
+
+A stored choice whose device is no longer paired is SKIPPED rather than resolved, and admission
+falls through to the turn origin: a target that cannot answer is worse than the one it displaced.
+
+`GET /bots/:name/mobile-requests/preferred-device?sessionId=` is device authenticated and answers
+`BotMobilePreferredDevice`, `{ sessionId, deviceId?, deviceName?, updatedAt? }`, with everything but
+`sessionId` absent when this conversation has no choice recorded. `PUT` on the same path takes
+`BotMobilePreferredDeviceRequest`, `{ deviceId }`, closed, where the literal `null` clears the
+choice. A missing or empty `sessionId` is `400 invalid_request` naming the field, for capability
+68's own reason: a preference belongs to one conversation and a write naming none could only bind
+the wrong one. A `deviceId` naming no device paired to this gateway is `400 invalid_request` naming
+the field, because a stored choice that resolves to nothing at admission time is a routing rule that
+quietly does not work. A preference is dropped when the profile or the conversation it names is.
+
+ONCE ADMITTED, ROW 68 IS THE ONLY RULE. The resolved device is the record's `deviceId`, the target
+never moves, a second device attaching mid-request never becomes the target however recently the
+preference was written, a preference written after admission changes nothing about a request already
+admitted, and an answer from any other device is refused and logged rather than applied.
+
+PEER-TYPE-AGNOSTIC, exactly as row 68's binding is. A Hermes-backed bot's request is admitted
+against a selected device by the same rule a runtime peer's is, because the binding is keyed to the
+bot's identity and not to its backend.
+
+### Composer draft sync (capability 71)
+
+A composer draft follows the person, not the phone they typed it on. `GET /bots/:name/drafts?sessionId=`
+is device authenticated and answers `BotComposerDraft`, `{ sessionId, text, updatedAt }`, with `text`
+the empty string and `updatedAt` zero when there is no draft. `PUT` on the same path takes
+`BotComposerDraftRequest`, `{ sessionId, text }`, closed, where `text` is 0 to 8000 characters and
+the empty string IS THE CLEAR rather than a stored blank. A missing or empty `sessionId`, or a `text`
+above the bound, is `400 invalid_request` naming the field; an overlong draft is refused rather than
+truncated, because a draft whose end the person cannot see is worse than a save the composer retries.
+
+PER PERSON, NEVER PER DEVICE. Every device paired to this gateway is the same person, so the record
+carries no device id at all, one is never accepted on the write, and a draft written on one phone is
+read by all of them. The gateway keeps the newest text and its `updatedAt` on its own clock: no
+history, no per-device copy, no merge. LAST WRITE WINS. A write whose text equals the stored text is
+stored again but broadcasts nothing, so a reconnecting device replaying what it already had cannot
+wake every other device.
+
+A successful `PUT` broadcasts `bot_draft_updated`, `{ type, bot, sessionId, text, updatedAt }`, to
+every paired device, so a draft appears on a second phone while it is being typed rather than only
+on its next read. The clear rides the same frame carrying the empty string.
+
+THE CLEAR IS THE NO-DUPLICATE-SEND GUARANTEE, AND IT CROSSES DEVICES. A send clears the draft, the
+clear is written IMMEDIATELY rather than on the typing debounce an ordinary keystroke waits out, and
+every other paired device drops its copy on the frame. A message sent on one phone can never still
+be offered for sending on another.
+
+A draft never reaches a bot, a peer, a runtime or a model. It is composer state this gateway holds
+for the person and hands back to their own devices; it rides no attach lane and no `bot_config`
+operation, and nothing about a Hermes-backed or a runtime-backed bot changes because of it.
+
+AN UNSENT DRAFT BECOMES DURABLE SERVER STATE, and that is stated here plainly because it is new.
+Before 71 a person's unsent words never left the phone they were typed on. After it, the gateway
+holds the newest text of each conversation's draft in the clear, in its own database, exactly as it
+already holds that conversation's messages. WHAT IS STORED is the text, the conversation, the
+profile and one timestamp. WHAT IS NOT is a device, an author, a history, an earlier version, or
+anything a peer could read. A draft is dropped when its conversation's history is, and an untouched
+draft is swept after thirty days, so an abandoned composer cannot hold a person's words forever;
+that sweep runs on the gateway's own periodic retention pass, not only on the next write, so a
+gateway where nobody ever types again forgets on the same schedule as a busy one.
+A DRAFT'S TEXT IS NEVER LOGGED: not in a log line, not in a trace, not in a metric, and not as a
+length either. The two routes and the one frame carry it, and nothing else does.
+
+### Bot Activity composition
+
+A client composes Bot Activity from existing resources; there is no aggregate activity endpoint,
+inbox, transcript copy, or second database:
+
+- `GET /bots`, `bot_roster`, and `bot_presence` provide bot identity, display metadata, current
+  activity, ordinary preview text, and the canonical Bot Chat session.
+- Bot profile/model resources provide role, specialization, provider, and model detail; routine
+  routes and `bot_routines` provide owned routines.
+- `/bots/groups` provides room membership and room activity. Gateway-owned rooms remain the sole
+  group-collaboration surface.
+- Canonical Bot Chat/session/history routes remain the conversation surface.
+
+The client may source-label activity and link each row to its canonical chat or room. It must not
+claim delivery, read state, reply relationships, immutable history, or verified agent-to-agent
+provenance. A preview beginning with `Message from ...` is ordinary display text, not A2A evidence.
+
+Every profile returned by Hermes is exposed as a CozyChat bot. A configured profile reports
+`syncState: "ready"` or `"starting"`; a discovered profile without an attach identity reports
+`syncState: "setup_required"`, a null native chat id, and cannot accept native chat actions.
+Profile lifecycle belongs to Hermes, and from capability 37 both ends of it are reachable from the
+phone: `POST /bots` creates the profile and `DELETE /bots/:name` removes it. The installer's
+default dynamic `--profiles all` scope re-discovers and provisions profiles on update/repair. On a
+native install (one un-namespaced Hermes endpoint written by `agent-install.sh`) the gateway starts
+that provisioning run itself, unattended and from the already-verified local assets, after a Hermes
+profile is created or deleted through these routes, so `setup_required` is transient there: the row
+moves through `starting` to `ready` with nobody at a terminal. The run restarts the gateway service
+partway through; a client polling `GET /bots/:name/readiness` treats the transport errors of that
+restart as non-terminal, exactly as it already did. Windows installs, narrowed `--profiles` scopes,
+runtime-only repairs, and every gateway without installer state keep the manual repair path.
+
+`POST /bots` creates the Hermes profile and then SEEDS it as a blank slate: the `file` + `terminal`
+toolset floor on the `cozygateway` and `cli` platforms, `approvals.mode: manual`, inherited MCP
+servers quieted, and the profile's whole skill catalog written into its `skills.disabled` OFF-list
+so a new bot starts with no playbooks (skills have no enabled allowlist upstream, so a profile that
+names nothing has every installed skill on). Operators keep named skills on with
+`hermes.blankSlateSkillsOn`, default `[]`. A skill catalog that cannot be read leaves the key
+unwritten and adds a warning rather than guessing at half of it. A fresh profile that is seeded with nothing does not get a small toolset, it
+inherits Hermes' broad per-platform default, so the floor has to be written down to exist. The
+capability-33 `toolsets` and `mcpServers` fields name what to grant ON TOP of that floor;
+`file` and `terminal` are always included, and a name the backend does not report is skipped and
+listed in `BotCreateResponse.warnings` rather than failing the create. The seed only ever writes
+keys the profile does not already carry, and a seed that fails leaves the created bot in place with
+a warning. Operators turn the whole behaviour off with `hermes.seedBlankSlateBots: false`; an
+explicit selection is still honoured when they do, and the skills OFF-list stops exactly as the
+toolset floor does. There is no create-time `skills` field: the app's post-create
+`PATCH /bots/:name/profile disabledSkills` is replace-whole and lands after the seed, so a user's
+explicit skill selection wins wholesale while an untouched create keeps the floor. See `docs/attach-v1-operations.md`.
+
+### Bot deletion (capability 37)
+
+`DELETE /bots/:name` is the inverse of `POST /bots`, and it is written to one promise: after it
+returns, the Hermes host holds no trace of the bot. The order is deliberate and is part of the
+contract, because each step is only safe once the one before it succeeded.
+
+1. **The host first.** The gateway asks Hermes to delete the profile, which removes the whole
+   profile directory: config, API keys, memories, sessions, skills, cron jobs, the synced
+   `cozygateway` plugin and the `.env` holding its attach token. Hermes stops and uninstalls the
+   profile's gateway service as part of the same delete. If Hermes refuses or cannot be reached,
+   the route fails and NOTHING is purged: a gateway that dropped its own rows while the profile
+   kept running on the host is the exact opposite of what this route promises. Hermes answering
+   `404` is not a failure but the recovery half of the same promise, reported as
+   `hermesProfile: "already_absent"`, and the purge proceeds.
+2. **The identity next.** Before any row is dropped, the bot's attach identity is revoked in
+   process: its token is removed from the map both public attach surfaces authenticate against,
+   its live stream is closed, its capability grant and adapter are dropped. From this point the
+   token authenticates nothing, so no in-flight connection can race the purge and write rows back
+   in behind it. `tokenRevoked` reports whether an identity was held at all.
+3. **The gateway state last.** Every durable row the bot owned is deleted in one transaction:
+   the roster row, the native chat plane (active pointer, sessions, transcript, receipts, turn
+   media bindings, interactions, turn terminals), tool steps, delegations, routine overrides, the
+   attach journals (stream cursor, command outbox, event inbox, turn terminals, media blobs,
+   scheduled deliveries), group-turn tombstones, Live Activity registrations, and the bot's half of
+   the core thread surface. `purged` reports the row count per area, keyed by stable wire ids, with
+   zero-row areas omitted; it is a report of what was removed, never an assertion that it was.
+
+Group ROOMS are deliberately not deleted. A room is a user-owned resource that may name a departed
+member, and the room surface already renders a missing member honestly.
+
+A bot with a native turn in flight is refused with `409` and extension code `conflict`; the body
+carries `turnId` so a client can name the work it is about to end in its confirmation copy.
+`?force=1` overrides that one refusal and nothing else. A name neither Hermes nor this gateway
+knows answers the ordinary not-found shape, so a repeated delete is a clean `404` rather than a
+second success. Reserved profile names are refused with `400`.
+
+`residue` is a bounded list of display-safe operator English naming what this gateway cannot remove
+from where it runs: the box gateway config entry, the token line in the box `.env`, and the host
+launchd service if it outlived the profile. None of it can authenticate, because the token was
+already revoked in step 2. `scripts/deprovision-bot.sh <profile>` sweeps all of it and is
+idempotent, so it is equally safe to run after this route or on its own.
+
+### Runtime bots created from the app (capability 49)
+
+CozyAgents' bundled gateway serves this. CozyGateway answers `503 backend_unavailable` (ADR 0086).
+
+`POST /bots {"name": "sage", "runtime": "cozyagents"}` creates a Bot this gateway owns outright.
+Nothing about it touches Hermes: no profile is written, no dashboard is called, and the create does
+not fail when Hermes is unreachable. The response is the same `201 {bot, warnings?}` a Hermes create
+answers, with `bot.runtime: "cozyagents"`.
+
+What the gateway does, in this order, before it answers:
+
+1. Writes a durable `runtime_bots` row (id, display name, minted credential, `specGeneration: 1`).
+   The config-file `bots` array remains a BOOTSTRAP source for the operator-declared runtime bots of
+   capability 45; a storage row WINS on collision, because it is the one this gateway minted the
+   credential for.
+2. Mints the attach token itself, 32 bytes of CSPRNG. It is stored on that row and handed to the
+   runner on exactly one frame. It is never logged, never in a receipt, and never on any app-facing
+   response.
+3. Registers the identity LIVE, with no restart: the attach token map both public attach surfaces
+   authenticate against, the runtime and native sets, the agents row, and the roster. This is the
+   exact inverse of the revocation `DELETE /bots/:name` performs.
+4. Enqueues a durable `create_runtime` operation for a CozyRunner (`contract/runner-v1.md`).
+
+The roster row reads `syncState: "starting"` until the new peer's attach `hello` arrives, exactly as
+a freshly provisioned Hermes bot does. `toolsets` and `mcpServers` are Hermes seeding instructions
+and are ignored for this kind; supplying them adds a warning rather than failing the create.
+
+`GET /bots/:name/runtime` answers `BotRuntimeProjection`:
+
+```json
+{ "stage": "waiting_for_runner", "specGeneration": 1, "observedGeneration": null, "lastRunnerContactAt": null }
+```
+
+`stage` is the latest stage a runner receipted for this bot's newest operation. With no runner
+connected it stays `waiting_for_runner`: the gateway durably accepted the desired state and says so
+honestly rather than inventing progress, and the operation is handed over the moment a runner
+attaches. A receipt that would walk the stage backwards along the provisioning progression is
+ignored, so this value never regresses on screen.
+
+`observedGeneration` is null until a runner receipts `ready`, and only a `ready` receipt advances
+it: an in-progress stage says what is being attempted, never what is running.
+`lastRunnerContactAt` is the last moment a runner said anything about this bot or answered the
+gateway's heartbeat, and is null only while no runner has ever been in contact; a connected but
+silent-about-this-bot runner still counts as contact, which is the point of the field.
+
+`code` appears only when a receipt carried one and is a stable, safe identifier, never diagnostics.
+A bot with no gateway-owned runtime answers `409 unsupported_for_runtime`, because it has no
+runtime to project rather than being missing.
+
+`DELETE /bots/:name` on a runtime bot answers instead of refusing with 409. It applies the same
+refusals the capability-37 Hermes delete applies (a reserved name is `400`; a bot with a native turn
+in flight is `409` extension code `conflict` carrying `turnId` unless `?force=1`), then revokes the
+attach identity first, purges every durable gateway row exactly as that delete does, and enqueues
+`delete_runtime` so the runner removes the container and the bot-exclusive volumes. `hermesProfile`
+is `already_absent`, truthfully: there never was one. A config-declared runtime bot (capability 45)
+still gets the 409, because removing it means editing the config file the operator wrote.
+
+The bot is gone from the roster and its credential is dead the moment the delete returns, but the
+cleanup stays watchable: `GET /bots/:name/runtime` answers `deletion_pending`, then `deleting` once
+the runner starts, and finally `404` once the terminal `deleted` receipt lands and there is nothing
+left to project.
+
+Out of scope for 49, and deliberately not implied by it: pairing codes and short-lived runner
+credentials, upgrades and migrations, restart backoff, drain windows, isolation policy, capacity
+admission, archive and purge grace, multi-host, and reconciliation of unknown containers. See
+`docs/adr/0002-gateway-reconciled-per-bot-runtime.md` in the CozyAgents repo.
+
+### Recovering a failed runtime (capability 61)
+
+`POST /bots/:name/runtime/recover` is the explicit operator retry for an existing gateway-owned
+runtime Bot. It has no request body and returns `202 {operationId, runtime}`. The accepted operation
+has a fresh id and `waiting_for_runner` projection, but reuses the failed create's stored runtime
+spec, spec generation, runner assignment, Bot identity, and attach credential. It does not delete or
+recreate the Bot, rotate its credential, reread current deployment defaults, or edit runner state.
+
+Recovery is available only when the Bot's latest durable operation is `create_runtime` in terminal
+`needs_attention`, and its recorded runner assignment still matches a paired runner. Missing,
+deleted, config-declared, provisioning, ready, stopped, revoked-runner, and mismatched-placement
+targets are refused. Acceptance is atomic and ordered by database insertion order rather than wall
+clock time: after one request inserts the fresh operation, a replay or concurrent request sees that
+new operation as current and receives `409 conflict` instead of enqueueing another retry.
+
+### Placing a bot on a computer (capability 54)
+
+`POST /bots {"name": "sage", "runtime": "cozyagents", "runnerId": "..."}` names which paired computer
+(`GET /runners`) runs the new bot. The field is optional, so the create body a client below 54 sends
+is accepted unchanged and answers the same `201 {bot, warnings?}`.
+
+With no `runnerId` the gateway picks, in this order: the account default, then the only paired
+runner. It never picks silently between several:
+
+| Situation | Answer |
+| --- | --- |
+| No paired runner at all | `409` extension code `no_runner_paired`. The app says "Add a computer first". |
+| Several paired runners and no default | `409` `RunnerChoiceRequiredBody`: extension code `runner_choice_required`, a message naming the candidates, and a `runners` array of `{id, name, isDefault}`. The app shows a chooser and sends one of those ids back as `runnerId`; the ids are in the array only, never in the message. |
+| `runnerId` names no paired runner | `400 invalid_request` naming `runnerId`: a client bug, not a missing machine. |
+
+The chosen runner is written on the bot's row and on every operation for that bot, so a create, a
+delete and a later upgrade all reach the same machine. `/runner/v1` hands each connected runner only
+the operations that name it. An operation written before 54 names no runner and goes to the account
+default, which keeps an existing single-runner deployment moving with no migration step; with no
+default and no legacy shared credential it keeps waiting rather than being sent to an arbitrary
+machine.
+
+On a gateway whose only computer is the operator-placed shared credential, a create is placed on the
+`legacy` row and its bot carries `runnerId: "legacy"` with `runnerName: "legacy runner"`, the same
+row and name `GET /runners` already renders. Unsetting `COZYGATEWAY_RUNNER_TOKEN` is how that row is
+revoked, and it goes through no route, so nothing is re-addressed: those bots keep naming a
+credential that no longer exists. Pair the real computer BEFORE unsetting the variable, and expect
+to recreate the legacy-placed bots on it.
+
+`BotSummary` and `BotRuntimeProjection` carry optional `runnerId` and `runnerName`. Both are absent
+for a Hermes bot and for a runtime bot created before 54, and neither is ever backfilled: the
+gateway never had the value rather than having discarded it. `runnerName` is absent on its own when
+the named runner has since been revoked.
+
+`Runner.botCount` is the number of runtime bots placed on that computer, and `DELETE /runners/:id`
+answers `RunnerDeleteResponse`: `{"ok": true, "botCount": n, "reassignedOperations": m}`, plus
+`"reassignedTo"` when there was somewhere to send the work. Revoking a computer revokes its token
+and closes its socket. What happens to what was on it:
+
+- The bots keep their rows, their credentials and the `runnerId` they were given. Capability 54 has
+  no route that moves a bot to another computer, so those rows stay pointed at a machine that is
+  gone until one is added; they are stranded, not deleted, and `botCount` is the warning.
+- Operations that runner had NOT been handed yet are re-addressed, so a revoke never leaves work
+  addressed to a credential nothing can present: to the account default when there is one, named in
+  `reassignedTo`, and otherwise to nobody, which is the same unaddressed state a pre-54 row holds
+  and is dispatched to whichever runner becomes the default later.
+- An operation that runner had already been SENT is left addressed to it. It may well have been
+  applied, and handing the same mutation to a second machine is what the single-writer rule exists
+  to prevent.
+- `DELETE /bots/:name` for a bot whose computer is gone still works, and its `delete_runtime` is
+  addressed to nobody rather than to the revoked runner, so the cleanup is collectable by whichever
+  computer holds the default.
+
+### Bot history (capability 50)
+
+A runtime bot checkpoints its own workspace into git and serves that history over the attach-v1
+`bot_history` lane (see `contract/attach-v1.md`). Five routes carry the whole surface, and all five
+are RUNTIME BOTS ONLY: a Hermes bot answers `409` extension code `unsupported_for_runtime`, because
+a Hermes profile has no checkpointed workspace behind it and never did. That is not a `404`: the
+bot exists and its chat lane works, so a client hides the section rather than treating the bot as
+missing. A runtime bot whose peer did not negotiate `bot_history` gets the same `409` for the same
+reason: the section is genuinely absent rather than temporarily unreachable, and a `503` there
+would offer a retry that can never succeed. A peer that IS negotiated and simply offline answers `503
+backend_unavailable`, which is a retry worth offering.
+
+**Nothing content-shaped crosses this boundary, in either direction.** A checkpoint row carries a
+one-line summary and the audit ids the turn already had. A diff row carries a path, a status, and
+two line counts. A conflict row carries one bounded label per side. There is no field on this
+extension that carries a file body, a patch, a hunk, or a preview of one, and adding one would be a
+new capability rather than an enrichment: the workspace is where a change lives, and these routes
+exist so a person can choose between changes without the changes being copied to a phone.
+
+`BotHistoryCheckpoint.checks` is `passed`, `failed`, or `unavailable`, read from the checkpoint's
+`Cozy-Checks` trailer. `unavailable` is its own answer and not a synonym for `failed`: a turn whose
+checks could not run is not a turn whose checks failed. `turnId` and `messageId` come from the
+`Cozy-Turn` and `Cozy-Message` trailers and are present only on a checkpoint a turn wrote; an "as
+found" checkpoint, written when a human edited files outside the bot, has neither. `epoch` is the
+policy Epoch the checkpoint was taken at. Checkpoint ids are OPAQUE: never infer a commit, a ref, a
+branch, or a filesystem path from one.
+
+The `try` route is one route with three actions rather than three routes, because `start`, `keep`
+and `discard` are three states of one experiment: a client able to POST `keep` without having
+POSTed `start` would be a second place that truth is kept. There is at most one experiment in
+flight per bot and the peer owns which, so `keep` and `discard` name none.
+
+**The one conflict.** `keep` after the working version moved answers `409` extension code
+`conflict`, with `conflicts: [{path, ours, theirs}]` beside the ordinary error body. Nothing is
+lost and nothing failed; a person has to choose per file, and `ours` and `theirs` are the bounded
+labels naming the two sides. The client asks "Sage's version" or "the other change" and sends the
+answer to `POST /bots/:name/history/resolve`. The word conflict is the wire's name for this case,
+never the reader's.
+
+`resolve` with no experiment waiting on a choice answers `404 not_found`, and the PEER performs
+that check: the gateway holds no experiment state and never did, so the one side that knows
+whether there is a question outstanding is the side being asked. `keep` and `discard` with no
+experiment in flight answer the same `404` by the same route. `try.start` is the exception. A peer
+answering `not_found` to a start is failing to do something it was asked to do rather than
+reporting an absence a client can act on, so it maps to `503 backend_unavailable`, and `list` maps
+the same way for the same reason: an empty history is an empty list, never a missing one.
+
+### Slash commands
+
+`GET /bots/:name/commands` returns the last catalog advertised by that profile's authenticated
+attach plugin. It contains every Hermes command valid on a messaging gateway: enabled built-ins,
+plugin commands, and installed skill commands. Client-local CLI/TUI commands are intentionally not
+advertised because they cannot execute through Bot Mode.
+
+Clients MUST require capability `>= 25` before calling the route. Selecting an item should insert
+its canonical `name` into the ordinary composer so the user can edit arguments. Sending a command
+uses `POST /bots/:name/chat/messages` unchanged; CozyGateway and clients do not duplicate Hermes
+command parsing or execution. The most recently authenticated catalog remains readable while the
+profile is temporarily disconnected, and an empty catalog is valid.
+
+### Attachment history
+
+`GET /bots/attachments` returns only attachments sent by configured agents in durable native Bot
+Mode sessions. It accepts optional `q`, `kind` (`image`, `video`, `audio`, or `file`), `bot`,
+millisecond `since`, `offset`, and `limit` query parameters. Search is case-insensitive across the
+agent name, message caption, filename, and MIME type. Results are newest first; `limit` is bounded
+to 100 and `nextOffset` is `null` when the page is complete.
+
+Clients MUST require capability `>= 26`. This route indexes metadata only. Attachment bytes remain
+behind the existing authenticated `GET /bots/:name/chat/attachments/:fileId` route, so clients can
+preview, save, or share a result without the gateway duplicating media or exposing a path.
+
+### Pending approvals
+
+`GET /bots/approvals?state=pending` returns a bounded snapshot envelope with every currently
+unresolved native approval (ordered oldest first), every unresolved clarification, and recent
+confirmed terminal settlement receipts. `state` is optional only for a simpler initial client call;
+when supplied it must be `pending`. The route is a recovery/read surface, not a second workflow:
+the existing `POST /bots/:name/approvals/:toolCallId/approve` and `.../deny` routes settle the
+same durable records, and expired records are absent as soon as their lifecycle timer settles them.
+`resolutionRequestedAt`, when present, means the gateway durably appended one stable resolution
+command; it is not an approval or denial result and exposes neither a command id nor a decision.
+Capability 62: a row whose approval is an MCP repair proposal carries the same validated `repair`
+block its `bot_approval_pending` frame did, so an inbox opened cold renders the proposal the live
+app saw; every other row is unchanged.
+Capability 66: a row whose approval carries a scoped-approval block carries the same validated
+`scope` the live frame did, for the same reason; a row a standing grant is settling also carries
+that grant's `grantId`, so an inbox opened cold says why a card nobody tapped is already resolving
+and which grant to revoke. Every other row is unchanged.
+
+Clients MUST require capability `>= 27` before showing the global pending-requests menu or using
+this route. A client that renders the requested-versus-terminal lifecycle or submits either native
+resolution action MUST require capability `>= 28`; one that reads clarification recovery or terminal
+settlements from this envelope MUST require `>= 29`. A client keeps an action in `awaiting
+confirmation` after its POST until it observes the matching terminal receipt (or a terminal frame).
+It must never derive a decision URL from push text or retain an old action after a fresh snapshot no
+longer contains that `toolCallId`.
+
+### Canonical native chat
+
+Each configured bot always has one selected native session. `GET /bots/:name/chat` and
+`GET /bots/:name/chat/messages` create its first empty local session when needed. The session id is
+durable across gateway/plugin restart. It is not a Hermes session id and cannot be passed to a
+Dashboard RPC.
+
+`GET /bots/:name/sessions` returns that bot's local session history, newest first, and the selected
+`activeSessionId`. `POST /bots/:name/sessions/:id/adopt` selects an existing session owned by the
+same bot. `POST /bots/:name/sessions/new` selects a fresh empty session without deleting the
+previous one. `POST /bots/:name/chat/reset` likewise selects a fresh empty session, interrupts a
+running old turn when possible, and additionally sends the stronger `bot_chat_reset` notification.
+Neither action deletes prior local history; clients may present reset as “start over”, not as
+destructive erase.
+
+### Native sends, events, and suggestions
+
+`POST /bots/:name/chat/messages`, `POST /bots/:name/chat/photos`, and
+`POST /bots/:name/chat/attachments` first admit a durable attach-v1
+command, then append the user row to the native transcript and answer `202` with that row. If the
+configured attach profile cannot accept the command, the request answers `503 backend_unavailable`
+without storing transcript or media data. A text send during an active turn is admitted as a native
+attach-v1 steer under that turn's id; a photo send during an active turn returns the same `503` so
+the client can retry after the turn settles.
+The attached plugin returns draft, commit, terminal, tool, approval, and clarification events.
+Gateway projection of those durable events emits the corresponding server frames and updates the
+same transcript read by `GET /bots/:name/chat/messages`.
+
+There is no automatic greeting. When a selected transcript has no messages and
+`hermes.chatSuggestion` is non-empty, history includes optional `suggestion`. It is presentation
+text only: clients may offer it, but must not submit it automatically or display it as a transcript
+row. Once any row exists, the field is absent.
+
+`running` and `inflight` in history are the gateway's durable active-turn view. Live state frames
+are the fresher source for a composing UI. `POST /bots/:name/chat/stop` sends attach-v1 interrupt
+for that active native turn; follow-up text uses native attach-v1 steering, never Dashboard chat.
+
+### Delivery receipts (capability 31)
+
+`POST /bots/:name/chat/messages/displayed` carries 1 to 64 wire ids of transcript rows this device
+actually put on screen, and answers `202 { "recorded": n }` with the number that became a NEW
+receipt. It is the only signal in this contract that a HUMAN received a message: a durable
+transcript row proves only that the gateway holds it, and push is fire-and-forget by construction.
+
+Receipts are first-write-wins and never deleted. Ids that already have a receipt, and ids naming no
+durable row for that bot, are both ignored and both count zero, so `recorded` is not an error
+signal and a client MUST NOT retry a low count. Repeating a request is therefore free, which is
+what makes a durable offline client queue safe to flush blindly on reconnect.
+
+A client MUST gate the route on `com.cozylabs.bots >= 31` and MUST NOT send provisional
+(client-side, not yet committed) ids. A version 30 gateway answers `404`, which means "this gateway
+does not collect receipts", never "the message was lost".
+
+When a receipt lands on a row that was a scheduled delivery, the gateway tells the plugin that
+produced it over attach-v1 (`contract/attach-v1.md`, `delivery_receipt`). When a scheduled delivery
+instead fails terminally, the gateway appends one `role: "system"`, `marker: "delivery.failed"` row
+to that bot's current canonical chat: a quiet status row, not a bubble, and it raises no push.
+
+### Attachments and media
+
+Photo bytes are validated and stored by the gateway before the associated attach-v1 command is
+sent. Plugin events refer to media by opaque ids; the gateway commits acceptable media into its own
+store. `GET /bots/:name/chat/attachments/:fileId` serves only those gateway-owned bytes and
+supports a single byte range for capability 20 playback. It never exposes a Hermes-host path.
+Capability 24 additionally admits one 20 MiB document per turn: PDF; UTF-8 plain text, Markdown,
+CSV, JSON, or RTF; legacy Office; OOXML; and OpenDocument files. The gateway checks the declared
+allow-listed MIME against lightweight format bytes, stores the sanitized filename as metadata, and
+serves every attachment with `Content-Disposition: attachment` and `nosniff`.
+
+`com.cozylabs.chat-audio` 1 admits a voice note on the same route, one per turn: `audio/mp4` (AAC
+`.m4a`), `audio/mpeg` (MP3), `audio/wav`, or `audio/x-wav`. It keeps the route's 20 MiB cap, not
+the 40 MiB cap assistant audio carries. A declared `audio/m4a` or `audio/x-m4a` is stored as
+`audio/mp4`, and so is a file named `*.m4a` whose part declares no type, or a type the route does
+not admit such as `application/octet-stream`. The gateway reads that from the part's own
+`Content-Type` header, because a multipart parser reports an undeclared part as `text/plain`; a
+part that does declare `text/plain` is a text document whatever its name. Parameters on a
+declared type are ignored. The bytes are
+checked with the same magic as the [canonical allowlist](#canonical-media-allowlist): an ISO BMFF
+`ftyp` box with an audio major brand for `audio/mp4`, an ID3 tag or MPEG frame sync for
+`audio/mpeg`, and `RIFF` plus `WAVE` for WAV. Refusals take the document shapes: `413` `too_large`, `400`
+`empty`, and `415` `content_type`, each under extension code `media_refused`.
+
+Every attachment on this route, document or voice note, is stored under the accepted type's
+extension, which replaces a different one: `voice.mp4` accepted as `audio/mp4` is stored as
+`voice.m4a`, and `notes.m4a` accepted as `text/plain` as `notes.txt`. A name that already ends in
+that extension, in any case, is kept. Hermes classifies an attachment by its extension before its
+type, so a mismatched name would reach it as the wrong kind of file.
+
+The gateway decides the attach-v1 media family from the accepted MIME, exactly as
+`POST /attach/v1/media/:mediaId` does: a voice note is stored as family `audio` and its transcript
+attachment carries `mediaKind: "audio"`, while every document stays family `file`. A peer learns
+the type from `GET /attach/v1/media/:mediaId`, which serves the stored `audio/*` Content-Type;
+CozyAgents takes the family from that served type. The Hermes attach plugin hands the served MIME
+and name to Hermes, which transcribes any `audio/*` attachment when its speech-to-text is
+configured. Hermes then echoes each transcript to the chat by default (`stt_echo_transcripts`);
+the plugin drops that echo on a voice-note turn rather than committing it as an extra bot message.
+
+### Inline media ordering (capability 32)
+
+An attachment entry on `BotChatMessage.attachments` may carry an optional `position`: the index in
+that message's normalized block array BEFORE which the attachment renders. `0` renders it above
+every block, `blocks.length` renders it below every block, and any value between renders it between
+those two blocks. The point is that an image the agent wrote under a heading renders under that
+heading rather than on a stack above the whole reply.
+
+The rules, which both sides implement verbatim:
+
+- Absent `position` is the legacy shape and means above-stack. Every row written before 32 has it,
+  and any sender that cannot say where an attachment belongs keeps sending it. It is not an error
+  and it is not a downgrade.
+- A reader MUST clamp an out-of-range value into `0...blocks.length` rather than dropping the
+  attachment. A sender that counts blocks differently than the reader degrades to a picture in a
+  slightly wrong place; it never degrades to a lost picture.
+- A message MAY mix the two. Positioned attachments render in flow at their index, unpositioned
+  ones render above the message, and both are correct in the same bubble.
+- Rendering is data driven, not version gated: a client renders in flow whenever positions are
+  present. The EMITTING side is what gates on `>= 32`.
+
+On the plugin side (`contract/attach-v1.md`), the `commit` and `scheduled` events carry an optional
+`mediaPositions` array aligned index-for-index with `mediaIds`, and the gateway threads
+`mediaPositions[i]` onto the attachment it builds from `mediaIds[i]`. That array is all or nothing:
+when present it MUST have exactly the length of `mediaIds`, because a partial array would silently
+claim index `0` for every attachment it omitted. A plugin that is not certain where its attachments
+belong omits the field entirely. Message `text` is unaffected: `position` is the only new data.
+
+### Canonical media allowlist
+
+This table is the single reference for outbound media admission. The gateway upload route
+(`POST /attach/v1/media/:mediaId`) accepts exactly these MIME types, and the attach plugin's
+compatibility policy mirrors this table rather than keeping a second opinion. A type absent here is
+refused at the gateway, so a plugin that offers one is guaranteed a 415.
+
+| MIME | Extension | Family | Cap | Baseline |
+| --- | --- | --- | --- | --- |
+| `image/png` | png | image | 8 MiB | yes |
+| `image/jpeg` | jpg | image | 8 MiB | yes |
+| `image/webp` | webp | image | 8 MiB | yes |
+| `image/gif` | gif | image | 8 MiB | yes |
+| `video/mp4` | mp4 | video | 40 MiB | yes, H.264 video with AAC-LC audio |
+| `video/quicktime` | mov | video | 40 MiB | beyond baseline, accepted for existing device uploads |
+| `audio/mp4` | m4a | audio | 40 MiB | yes, AAC |
+| `audio/mpeg` | mp3 | audio | 40 MiB | yes |
+| `audio/wav`, `audio/x-wav` | wav | audio | 40 MiB | yes |
+| `application/pdf` | pdf | file | 20 MiB | yes |
+| `text/plain`, `text/markdown`, `text/csv`, `application/json`, `application/rtf`, `text/rtf` | txt, md, csv, json, rtf | file | 20 MiB | explicit document allowlist |
+| `application/msword`, `application/vnd.ms-excel`, `application/vnd.ms-powerpoint` | doc, xls, ppt | file | 20 MiB | explicit document allowlist |
+| OOXML `.docx`, `.xlsx`, `.pptx` | docx, xlsx, pptx | file | 20 MiB | explicit document allowlist |
+| OpenDocument `.odt`, `.ods`, `.odp` | odt, ods, odp | file | 20 MiB | explicit document allowlist |
+| `application/zip` | zip | file | 20 MiB | explicit file allowlist, delivered and shareable, never rendered inline |
+
+The container MIME is what the gateway checks. Codec-level facts for MP4 (H.264 plus AAC-LC,
+`yuv420p`, fast-start) are a plugin-side probe: this layer sees a container, not a stream.
+
+`audio/mp4` additionally requires one of the audio major brands `M4A `, `M4B `, `mp42`, `isom`, or
+`iso2` in its `ftyp` box, four bytes each (the trailing space in `M4A ` and `M4B ` is part of the
+brand). QuickTime's `qt  `, still-image containers such as `heic` and `avif`, and every other brand
+are refused as `audio/mp4`. `video/mp4` keeps the broader check: any ISO BMFF brand but `qt  `.
+CozyAgents' bundled gateway applies the same list.
+
+`image/svg+xml`, `text/html`, and every other type are excluded on purpose. SVG and HTML carry
+script and external references. Excluded means refused at upload, never silently transcoded.
+
+`application/zip` is admitted as a FILE attachment, not a renderable one: it is delivered, stored,
+and offered for download or share under the existing `mediaKind: "file"` shape from capability 24,
+and no client is asked to render or expand it. It shares the 20 MiB document cap, the largest cap
+any `file` type carries. The OOXML and OpenDocument packages above are ZIP containers on the wire,
+so the DECLARED type is what separates them from a bare archive; the plugin-side probe tells them
+apart by the uncompressed `[Content_Types].xml` entry an Office package stores first.
+
+Declared type is a claim, so every accepted type is additionally checked against format magic bytes
+before commit. Bytes that contradict an allowed declaration are refused exactly like a disallowed
+type.
+
+### Media rejection shapes
+
+`POST /attach/v1/media/:mediaId` answers a refusal with core `ErrorBody` plus a machine-readable
+`reason`, and never echoes any uploaded byte:
+
+| Status | `reason` | Extra fields | Cause |
+| --- | --- | --- | --- |
+| `400` | `empty` | none | zero-byte upload |
+| `413` | `too_large` | `limitBytes` | declared `Content-Length` or delivered bytes over that type's cap |
+| `415` | `content_type` | `receivedContentType` | type not on the allowlist, or bytes that do not match the declared type |
+| `422` | `digest` | none | `X-Attach-SHA256` missing or not matching the delivered bytes |
+| `409` | none | none | media id already exists with different bytes, or a delete target is referenced |
+
+`limitBytes` is the cap for the declared type, not the largest cap in the table. `receivedContentType`
+is the request header reduced to MIME token characters and truncated, so it names what arrived
+without reflecting attacker-chosen text. Error prose is gateway-authored in every branch; no message
+from a layer that touched the payload is passed through.
+
+This route is not rate limited today, so it never answers `429`. If that changes, the shape is the
+one already used by `POST /bots/:name/chat/attachments`: status `429`, extension code `rate_limited`,
+a `retryAfterMs` field, and a whole-second `Retry-After` header. A producer should treat `429` with
+`Retry-After` as retryable whether or not this route emits it yet.
+
+Every type this route accepts is downloadable through `GET /attach/v1/media/:mediaId`, which serves
+the stored MIME with `nosniff`, `Content-Disposition: attachment`, and byte-range support. There is
+no accept-but-never-serve type.
+
+`GET /bots/:name/media?src=` is a separate HTTPS media proxy for a public source URL in bot output;
+it is not a native attachment transport and it refuses unsafe/non-HTTPS sources.
+
+## HTTP routes
+
+Every route below requires device authentication. All normal failures use core `ErrorBody` unless a
+route documents an extension-specific code. Names are normalized at the boundary. The schemas named
+in this table are exported from `packages/contract/src/ext-bots.ts`.
+
+| Route | Request | Success response | Notes |
+| --- | --- | --- | --- |
+| `GET /bots` | — | `{ bots: BotSummary[], updatedAt, stale }` | Hermes control-plane roster, with native-chat overlay for configured bots, plus one row per capability-45 native runtime bot. |
+| `POST /bots` | `BotCreateRequest` | `201 BotCreateResponse` | Creates a Hermes profile and seeds it as a blank slate, or, with capability-49 `runtime: "cozyagents"`, a gateway-owned runtime bot with no Hermes profile at all. `409` extension code `conflict` when the name is taken. |
+| `GET /bots/:name/runtime` | — | `BotRuntimeProjection` | Capability 49. Where a runtime bot's container stands: stage, desired and observed generations, and last runner contact. Three answers: `200` while the runtime exists OR while its delete is still being cleaned up (`deletion_pending`, `deleting`), `409` `unsupported_for_runtime` for a bot that never had a gateway-owned runtime (a Hermes bot, or a name this gateway does not serve), and `404` once the runner's terminal `deleted` receipt lands and there is nothing left to project. |
+| `DELETE /bots/:name` | optional `?force=1` | `200 BotDeleteResponse` | Capability 37. Deletes the Hermes profile and purges every gateway row the bot owned. `409` extension code `conflict` (body carries `turnId`) when a native turn is running, unless `force=1`. `404` when neither Hermes nor this gateway knows the name. Capability 49: answers for a gateway-owned runtime bot too, revoking its credential and enqueueing `delete_runtime`. |
+| `GET /runners` | — | `{ runners: Runner[] }` | Capability 52. The paired computers that run bots, each with its name, reported platform and version, backends, `default` flag, `lastSeenAt` and live `online`. A gateway carrying the legacy shared `COZYGATEWAY_RUNNER_TOKEN` lists it as one row with id `legacy`. |
+| `POST /runners/pair-code` | — | `{ setupCode, expiresAt, gatewayUrl }` | Capability 52. Mints a runner-kind pairing code from the app: the same 10 minute TTL and the same gateway-wide 10-per-60-seconds bucket the unauthenticated `/pair` route spends, so a `429` with `retry-after` is the answer when it is exhausted. `gatewayUrl` is the origin the new computer should dial, which is the LAN address when the listener is on a wildcard. Minting any code revokes every older unredeemed one. |
+| `GET /runners/self` | — | `RunnerSelf` | Capability 52. Authenticated by the RUNNER's own bearer, not a device token, and the only route that credential opens. Answers `{id, name, platform, default, lastSeenAt, attached, renamed}` for that one runner; `attached` is whether it holds a live `/runner/v1` socket, which is a different question from whether the row exists. It also supplies legacy `online` equal to `attached` so released Agents updaters can verify their first upgrade. When the current authenticated hello supplied one, it also answers optional `agentVersion`; an offline durable roster value is never presented as proof that an update is running. `401 unauthorized` for a missing, unknown, or revoked token. Capability 55: `name` is the display name once a person has set one, exactly as `GET /runners` renders it, and `renamed` is true exactly then. |
+| `PATCH /runners/:id` | `RunnerPatchRequest` | `{ runner: Runner }` | Capability 52. `{default: true}` moves the account default and clears the previous holder in the same transaction. `default: false` and the `legacy` id are `400 invalid_request`; an unknown id is `404 not_found`. Capability 55: `name` sets the display name (1 to 64 characters, counted in code points, after trimming, with no control or Unicode format character), or clears it back to the reported name on the literal `""` or `null` -- a whitespace-only string is refused, not treated as a clear; a body naming neither `default` nor `name`, or a `name` that fails validation, is `400 invalid_request` naming the field. `default` and `name` may be sent together. |
+| `DELETE /runners/:id` | no body | `200 RunnerDeleteResponse` | Capability 52. Revokes that runner's token and closes its socket. `404 not_found` for an unknown id, exactly as `DELETE /devices/:id` answers. The `legacy` row is revoked by unsetting the environment variable and answers `400 invalid_request`. Capability 54: the body carries `botCount`, the runtime bots left on that computer, and `reassignedOperations` (with `reassignedTo` when there was a default) for the not-yet-sent work it re-addressed. Unsetting `COZYGATEWAY_RUNNER_TOKEN` is NOT this route and re-addresses nothing: a bot created on the legacy row keeps `runnerId: "legacy"`, and after the variable is unset its queued work is deliverable only in that its `delete_runtime` is then addressed to nobody and picked up by the account default. A deployment that pairs a real computer should do so before unsetting the variable, and treat those bots as bots to recreate. |
+| `POST /bots/focus` | `BotFocusRequest` | `{ ok: true }` | Hints control-plane polling while roster/routines UI is visible. |
+| `GET /bots/catalog` | optional `q` | `BotCatalog` | Hermes profile/catalog read. |
+| `GET /bots/:name/profile` | — | `BotProfile` | Hermes profile read. Capability 57: for a runtime bot this is the peer's `profile.read` answer over the `bot_config` lane, and `guardrailLevel` rides along exactly as the peer sent it, absent for a Hermes bot and for a peer below 57. Capability 58: `guardrailCeiling` rides along the same way, read-only, absent for a Hermes bot and for a peer below 58. Capability 63: each `mcpServers` row may carry `repair`, the peer's own per-server repair policy, read-only in the same sense. It is absent for Hermes and peers below 63, or when a peer does not project it. A known CozyAgents peer may project its effective `approve_once` default after negotiating 63. Capability 88: `role` and `reports` are merged in from the gateway's own team row. |
+| `PATCH /bots/:name/profile` | `BotProfilePatch` | `BotProfileConfigureResponse` | Hermes profile update. Capability 57: `guardrailLevel` in the body is forwarded to a runtime bot's peer over the `bot_config` lane unchanged and is not acted on for a Hermes bot. Capability 58: `guardrailCeiling` is never accepted in the body; a body naming it is `400 invalid_request` naming the field. Capability 63: the per-server `repair` policy has no representation in this body at all, because `enabledMcpServers` names servers by name and a capability-89 declaration has no `repair`; it is changed on the harness, never here. Capability 88: `role` and `reports` are checked and stored by the gateway and never forwarded. Capability 89: `declareMcpServers` and `removeMcpServers` reach only a runtime peer that negotiated `mcp_server_declarations`; otherwise `409 unsupported_for_runtime` and nothing is written (a Hermes bot always), team fields included. |
+| `POST /bots/:name/assignments` | `AssignmentCreateRequest` | `201 AssignmentView` | agent-inbox 1. The one route here a device token does NOT open: it takes `:name`'s own attach bearer (`401` without one, `403` for another bot's). Refusals are `409 assignment_refused` with a typed `reason`; see [Leader assignments](#leader-assignments-comcozylabsagent-inbox-1). |
+| `GET /bots/:name/assignments` | — | `AssignmentList` | agent-inbox 1. The assignments `:name` leads or answers, newest first. Also open to `:name`'s own attach bearer; another bot's bearer is `403`. |
+| `GET /assignments/:taskId` | — | `AssignmentView` | agent-inbox 1. Also open to the attach bearer of the leader or the assignee. `404` when no assignment wraps that Task, and the same `404` for a bot that is not a live party to it. |
+| `POST /assignments/:taskId/cancel` | `AssignmentCancelRequest` or no body | `AssignmentView` | agent-inbox 1. A device cancels as `user`; the leader's attach bearer cancels as `leader`; the assignee's is `403`. |
+| `POST /assignments/:taskId/acknowledge` | `AssignmentAcknowledgeRequest` | `AssignmentView` | agent-inbox 1. A device or the leader's attach bearer. Valid only from `verifying`, else `409 assignment_refused` with `reason: "not_verifying"`. |
+| `GET /bots/:name/inbox` | — | `BotInboxResponse` | agent-inbox 1. One thread per assignment `:name` leads or answers. Device only. |
+| `GET /bots/:name/inbox/:threadId/messages` | — | `BotInboxMessagesResponse` | agent-inbox 1. The leader's brief and the assignee's reply. `404` for a thread that is not `:name`'s. Device only. |
+| `GET /bots/:name/team` | — | `BotTeam` | agent-inbox 1. `{role, reports}`, `{role: "member", reports: []}` when the bot leads nothing. A device, or `:name`'s own attach bearer; another bot's bearer is `403`. This is how a runtime peer learns its role: the config lane never carries `role` or `reports`. |
+| `GET /bots/:name/presentation` | — | `BotPresentationResponse` | Capability 80. The synced roster presentation from `ui_meta["hermes-bots"]`. |
+| `PATCH /bots/:name/presentation` | `BotPresentationPatch` | `BotPresentationResponse` | Capability 80. Compare-and-swap write of only the patched keys; `409 conflict` after three lost races. |
+| `GET /bots/:name/avatar` | — | image bytes | Capability 81. The profile's avatar asset, or `404`. |
+| `PUT /bots/:name/avatar` | `BotAvatarSetRequest` | `BotAvatarSetResponse` | Capability 81. PNG, JPEG or WebP, sniffed, at most 2 MB. |
+| `DELETE /bots/:name/avatar` | — | `BotAvatarSetResponse` | Capability 81. Clears the asset. |
+| `POST /bots/:name/avatar/generate` | `BotAvatarGenerateRequest` | `BotAvatarGenerateResponse` | Capability 81. `{probe: true}` or `{prompt}`; the portrait is returned, not saved. |
+| `GET /bots/:name/avatar/pets` | optional `localOnly` | `BotAvatarPetGallery` | Capability 81. The petdex gallery. |
+| `POST /bots/:name/avatar/pets/thumb` | `BotAvatarPetThumbRequest` | `BotAvatarPetThumbResponse` | Capability 81. A pet's first idle frame as a PNG data URI. |
+| `GET /bots/:name/avatar/pets/:slug` | — | PNG bytes | Capability 81. The same thumbnail, for a legacy `meta.pet` roster row. |
+| `GET /bots/:name/voice` | — | `BotVoice` | Capability 86 (voice). The bot's own profile `tts.*` voice: `{ name, configured, provider?, voice? }`. |
+| `POST /bots/:name/speak` | `BotSpeakRequest` | audio | Capability 86 (voice). Streamed `audio/pcm;rate=<n>;channels=<n>` (int16 LE) or a whole `audio/*` file. |
+| `GET /bot-relay/identity` | — | `BotRelayIdentity` | Capability 87. This gateway's relay connection id, from server facts. |
+| `POST /bot-relay/roster` | `BotRelayRosterRequest` | `{ count }` | Capability 87. `bot_relay.roster.sync`: the agents on the phone's other connections; bad rows dropped, long fields trimmed. |
+| `POST /bot-relay/drain` | — | `BotRelayDrainResponse` | Capability 87. `bot_relay.outbox.drain`: claimed envelopes, verbatim. |
+| `POST /bot-relay/deliver` | `BotRelayDeliverRequest` | `BotRelayDeliverResponse` | Capability 87. `bot_relay.deliver`: one relayed Bot Chat turn; a failure is `{error, reason?}`. |
+| `POST /bot-relay/reply` | `BotRelayReplyRequest` | `{ ok: true }` | Capability 87. `bot_relay.reply`: the reply or typed failure for the sender's waiter. |
+| `GET /bots/:name/model-config` | — | `BotModelConfig` | Owning runtime's primary, effort, and supported subagent and vision model settings. |
+| `PUT /bots/:name/model-config` | `BotModelConfigPatch` | `BotModelConfig` | Validated model settings update in the owning runtime. |
+| `GET /bots/:name/model-providers` | — | `BotModelProviderSetupCatalog` | Capability 41 compatibility route. New clients use `com.cozylabs.harness-settings`. For a runtime bot, the `cozyagents` harness's read-only projection of the peer's `model.read`. |
+| `PUT /bots/:name/model-providers/:provider/fields/:field` | `BotModelProviderFieldUpdate` | `BotModelProviderSetupCatalog` | Writes one field through Hermes after re-validating that the field belongs to the provider. |
+| `DELETE /bots/:name/model-providers/:provider/fields/:field` | — | `BotModelProviderSetupCatalog` | Clears one Hermes-owned provider field and returns refreshed state. |
+| `POST /bots/:name/model-providers/:provider/oauth` | — | `BotModelProviderOAuthSession` | Starts a Hermes-hosted PKCE or device-code session. External CLI-only methods are rejected. |
+| `GET /bots/:name/model-providers/:provider/oauth/:sessionId` | — | `BotModelProviderOAuthSession` | Polls Hermes' session; clients stop at `approved`, `expired`, or `error`. |
+| `POST /bots/:name/model-providers/:provider/oauth/:sessionId/code` | `BotModelProviderOAuthCode` | `BotModelProviderOAuthSession` | Submits a PKCE authorization code to Hermes. |
+| `DELETE /bots/:name/model-providers/:provider/oauth/:sessionId` | — | `204 No Content` | Cancels the Hermes OAuth session. |
+| `GET /bots/:name/readiness` | — | `BotReadiness` | Capability 40. Reports `starting` until the configured attach identity is online, then `ready`. |
+| `GET /bots/:name/chat` | — | `{ name, sessionId, adoption: "created" \| "pin" }` | Resolves the selected native chat. |
+| `GET /bots/:name/chat/messages` | — | `{ name, sessionId, adoption, messages, running, inflight, updatedAt, suggestion?, toolSteps? }` | Reads native transcript and native tool history. |
+| `POST /bots/:name/chat/messages` | `BotChatSendRequest` | `202 { name, sessionId, message: BotChatMessage }` | Admits a native turn or steer, then appends locally. |
+| `POST /bots/:name/chat/messages/displayed` | `BotChatDisplayedRequest` | `202 BotChatDisplayedResponse` | Capability 31. Records that this device displayed those rows. |
+| `POST /bots/:name/chat/photos` | multipart `file`, `BotChatPhotoFields` | `202 { name, sessionId, message: BotChatMessage }` | One validated image plus optional caption. |
+| `POST /bots/:name/chat/attachments` | multipart `file`, `BotChatAttachmentFields` | `202 { name, sessionId, message: BotChatMessage }` | One validated PDF, text, RTF, Office, or OpenDocument file plus optional caption. With `com.cozylabs.chat-audio` 1, also one AAC, MP3, or WAV voice note. |
+| `POST /bots/:name/chat/stop` | — | `BotChatStopResponse` | Interrupts the current native turn; returns 409 when idle. |
+| `POST /bots/:name/chat/reset` | — | `BotChatResetResponse` | Selects a fresh native chat and emits reset. |
+| `GET /bots/:name/chat/attachments/:fileId` | optional single `Range` | attachment bytes | Gateway-owned attachment only. |
+| `GET /bots/:name/media` | `src` query | proxied media bytes | HTTPS URL proxy; not an attachment lookup. |
+| `GET /bots/:name/sessions` | — | `BotSessionsResponse` | Gateway-owned native sessions. |
+| `POST /bots/:name/sessions/new` | — | `BotNewSessionResponse` | Fresh native chat, previous history retained. |
+| `POST /bots/:name/sessions/:id/adopt` | — | `BotSessionAdoptResponse` | Selects an owned native session. |
+| `DELETE /bots/:name/sessions/:id` | — | `204 No Content` | Capability 60. Deletes only an owned, inactive, non-selected native direct session. |
+| `GET /bots/:name/routines` | — | `BotRoutineListResponse` | Hermes routine read. |
+| `POST /bots/:name/routines` | `BotRoutineCreateRequest` | `BotRoutineWriteResponse` | Hermes routine create. |
+| `PATCH /bots/:name/routines/:id` | `BotRoutinePatch` | `BotRoutineWriteResponse` | Hermes routine update. |
+| `DELETE /bots/:name/routines/:id` | — | `{ id }` | Hermes routine delete. |
+| `POST /bots/:name/routines/:id/run` | — | `BotRoutineRunResponse` | Capability 83 for Hermes bots: fires Hermes's own trigger and answers once Hermes accepted it. Capability 53 (runtime bots, removed with them): Sends `routines.run` over the existing capability-48 `bot_config` lane so a person or a check can force the routine to fire now. `409 unsupported_for_runtime` for a Hermes bot or for a runtime bot whose peer did not negotiate `bot_config`, `404 not_found` for a routine id this bot's namespace does not have, `503 backend_unavailable` for an offline peer. |
+| `GET /bots/:name/routines/:id/runs` | optional `limit` (1-50, default 20) | `BotRoutineRunsResponse` | Capability 83. The routine's past runs, newest first. |
+| `GET /bots/:name/routines/:id/runs/:runId/output` | — | `BotRoutineRunOutputResponse` | Capability 83. The run's final reply, bounded to 16000 characters and path-redacted. |
+| `GET /bots/:name/routine-blueprints` | — | `BotRoutineBlueprintsResponse` | Capability 83. Hermes's automation blueprint catalog. |
+| `POST /bots/:name/routine-blueprints/:key/instantiate` | `BotRoutineBlueprintInstantiateRequest` | `201 BotRoutineWriteResponse` | Capability 83. Creates the blueprint's job in this bot's cron store. |
+| `GET /bots/groups` | — | `{ groups: BotGroup[] }` | Gateway-owned rooms. |
+| `POST /bots/groups` | `BotGroupCreateRequest` | `201 { group: BotGroup }` | Creates a gateway-owned room. |
+| `GET /bots/groups/:group` | — | `BotGroupDetail` | Reads a gateway-owned room. |
+| `DELETE /bots/groups/:group` | — | `204 No Content` | Deletes a gateway-owned room. |
+| `POST /bots/groups/:group/messages` | `BotGroupSendRequest` | `202 { group, message: BotGroupMessage }` | Queues member turns through attach-v1. |
+| `PATCH /bots/groups/:group` | `BotGroupPatchRequest` | `{ group: BotGroup }` | Capability 84. Rename, members, picture, `holdDetection`. `409 conflict` for a taken name. |
+| `POST /bots/groups/:group/stop` | `{}` | `{ group: BotGroup }` | Capability 84. Stops the drive and interrupts the member on turn. |
+| `POST /bots/groups/:group/compress` | `BotGroupCompressRequest` | `{ member, text }` | Capability 84. `/compress` in one member's room thread. `409 conflict` while the room is running. |
+| `POST /bots/groups/picture` | `BotGroupPictureRequest` | `{ image }` | Capability 84. A data URL from Hermes `image.generate`; `503 backend_unavailable` without one. |
+| `POST /bots/:name/approvals/:toolCallId/approve` | optional `BotApprovalDecisionRequest` (capability 66) | `202 { status: "requested" }` | Durably requests a native approval; the terminal event confirms it. A body may ask for a standing grant. |
+| `POST /bots/:name/approvals/:toolCallId/deny` | — | `202 { status: "requested" }` | Durably requests a native denial; the terminal event confirms it. |
+| `GET /bots/approvals` | optional `state=pending` | `BotInteractionRecovery` | Bounded pending approvals/clarifications plus confirmed terminal receipts. |
+| `GET /bots/:name/approvals/grants` | — | `BotApprovalGrants` | Capability 66. The standing approvals this bot holds that are neither expired nor revoked. |
+| `DELETE /bots/:name/approvals/grants/:grantId` | — | `200 { status: "revoked" }` | Capability 66. Ends one standing approval immediately; `404` for a grant this gateway does not hold. |
+| `GET /bots/:name/mobile-requests/preferred-device?sessionId=` | — | `BotMobilePreferredDevice` | Capability 70. The phone this conversation's capability requests should go to; every field but `sessionId` is absent when no choice was recorded. `404 not_found` for a bot this gateway does not hold. |
+| `PUT /bots/:name/mobile-requests/preferred-device?sessionId=` | `BotMobilePreferredDeviceRequest` | `BotMobilePreferredDevice` | Capability 70. Records the choice, or clears it with a `null` `deviceId`. An unpaired `deviceId`, or a missing `sessionId`, is `400 invalid_request` naming the field; a bot this gateway does not hold is `404 not_found`, never a `200` echoing a choice that was not stored. |
+| `GET /bots/:name/drafts?sessionId=` | — | `BotComposerDraft` | Capability 71. This conversation's composer draft for the person, empty text and a zero `updatedAt` when there is none. `404 not_found` for a bot this gateway does not hold. |
+| `PUT /bots/:name/drafts` | `BotComposerDraftRequest` | `BotComposerDraft` | Capability 71. Stores the newest draft, last write wins; the empty string is the clear. `updatedAt` moves strictly forward on every stored change, so it is the version a client orders two drafts by. Broadcasts `bot_draft_updated` unless the text is unchanged. `404 not_found` for a bot this gateway does not hold. |
+| `POST /bots/:name/clarifications/:clarifyId` | `BotClarifyResolveRequest` | `202 { outcome: "requested" }` | Durably requests a clarification option; the terminal event confirms it. |
+| `GET /bots/:name/memory` | — | `BotMemoryOverviewResponse` | Profile-local source health/capabilities only; the gateway never opens Hermes files or provider storage. |
+| `PATCH /bots/:name/memory/setup` | `BotMemorySetupRequest` | `BotMemoryOverviewResponse` | Applies the three credential-free Hermes settings through the attached profile and returns a fresh authoritative projection. |
+| `GET /bots/:name/memory/items` | bounded `q`, `source`, `kind`, `since`, `until`, `cursor`, `limit` | `BotMemoryItemsResponse` | Stable, source-labelled page (at most 100). One unavailable source is reported in `sources` without hiding healthy results. |
+| `GET /bots/:name/memory/graph` | bounded `q`, `source`, `since`, `until`, `limit` | `BotMemoryGraphResponse` | At most 200 nodes / 400 Holographic entity or vault wikilink edges. |
+| `GET /bots/:name/memory/sources/:source/items/:id` | — | `BotMemoryItem` | Full bounded content for one source-native item. |
+| `POST /bots/:name/memory/sources/:source/items` | `BotMemoryWriteRequest` | `201 BotMemoryWriteResponse` | Native source create. |
+| `PATCH /bots/:name/memory/sources/:source/items/:id` | `BotMemoryWriteRequest` with `expectedRevision` | `BotMemoryWriteResponse` | Conditional native source edit; stale data is `409 conflict` with `current` when available. |
+| `DELETE /bots/:name/memory/sources/:source/items/:id` | `BotMemoryDeleteRequest` | `BotMemoryDeleteResponse` | Conditional native source delete; stale data is `409 conflict`. |
+| `GET /bots/:name/history` | optional `since`, `limit` | `BotHistoryListResponse` | Capability 50, runtime bots only. The Changes list: one row per checkpoint, newest first, at most 200. `since` is a millisecond wall-clock bound in the same unit `at` reports. |
+| `GET /bots/:name/history/:checkpoint/diff` | optional `to` | `BotHistoryDiffResponse` | Capability 50, runtime bots only. Per-file line counts for that checkpoint; `to` absent compares against the working version. Never a patch, never file content. |
+| `POST /bots/:name/history/restore` | `BotHistoryRestoreRequest` | `BotHistoryRestoreResponse` | Capability 50, runtime bots only. Undo, and "go back to". Writes a NEW checkpoint doing the restoring, so undo is itself undoable; the answer names that new checkpoint and the one it restored from. |
+| `POST /bots/:name/history/try` | `BotHistoryTryRequest` | `BotHistoryTryStartResponse`, `BotHistoryTryKeepResponse`, or `BotHistoryTryDiscardResponse` | Capability 50, runtime bots only. One route, three actions. `start` requires `label` and answers `{tryId, base}`; `keep` answers `{merged: true}` or `409` extension code `conflict` carrying `conflicts`; `discard` answers `{kept: false}`. A `label` on `keep` or `discard` is `400`. |
+| `POST /bots/:name/history/resolve` | `BotHistoryResolveRequest` | `BotHistoryResolveResponse` | Capability 50, runtime bots only. The person's per-file answer to that one `409`: `ours` is the bot's experiment, `theirs` the change that landed meanwhile. |
+
+`BotRoutine.lastDeliveryError` is optional read-only capability-4 enrichment from Hermes'
+`last_delivery_error`. The gateway flattens control characters, limits it to 512 characters, and
+redacts POSIX, Windows drive, UNC, and home-relative paths before it reaches a response or
+`bot_routines` frame. It is not a create/patch field and is never carried into a replacement job.
+`bot_routines` remains a full-replacement snapshot, so a later row without the field clears an
+older displayed delivery failure.
+
+Memory uses the attached plugin's `memory_management` attach-v1 capability and request id, not
+Dashboard file routes. `MemoryItem.timestampKind` is `created` for provider/native explicit dates,
+`fileCreated` for a vault filesystem birth time, `firstObserved` for a curated legacy entry tracked
+by the plugin-side sidecar, and `unknown` otherwise. Absolute vault roots never cross this boundary.
+Memory content never rides a websocket frame, push, heartbeat, telemetry, or trace record.
+
+`MemoryItem.kind` is one of `memory`, `profile`, `fact`, `note`: `profile` is the curated About-me
+store, which the plugin's own store calls `user`; that store-side name is not a wire value. Every
+memory route spends a per-device token budget and answers `429 rate_limited` with `retryAfterMs`
+when it is empty, reads included: the attached plugin serves one memory request at a time, and a
+second request arriving while one is in flight is answered `unavailable` rather than queued.
+
+`BotMemoryOverviewResponse.setupAvailable` and `BotMemoryItemsResponse.setupAvailable` are the
+GATEWAY's own optional booleans, not the plugin's: `true` exactly when the attached peer negotiated
+`memory_setup`, so a client knows `PATCH /bots/:name/memory/setup` is offered for this bot without
+probing it with a mutation, and an absent field means this deployment observed nothing. It is a
+fact about the peer and not about the memory: a bot that already reports sources still carries
+`true`, which is what lets a settings screen exist next to a non-empty memory rather than only on a
+first-run empty one.
+
+`BotMemoryOverviewResponse.setup` and `BotMemoryItemsResponse.setup` are the PEER's optional
+statement of the three capability-42 switches as its effective configuration reads them now:
+`BotMemorySetupState` `{ memoryEnabled, userProfileEnabled, holographicEnabled }`, closed, all three
+required booleans, named as the setup request names them. Unlike the request, all three may be
+false. A peer includes it only after negotiating attach-v1 `memory_setup_state`, and the gateway
+passes it through unchanged; the `PATCH /bots/:name/memory/setup` answer carries it re-read after
+the write. Absent means the peer did not say, never that the switches are off, and a client must
+not infer the switches from `sources` instead: sources name adapters, which a peer lists whether or
+not their switch is on (a Hermes profile always lists `holographic`, as `unavailable` when it is not
+the provider). The field is additive and needs no capability row: a client reads its presence.
+
+Capability 42 setup additionally negotiates `memory_setup`. Its closed request requires
+`memoryEnabled`, `userProfileEnabled`, and `holographicEnabled`, all booleans, with at least one
+true. The plugin changes only `memory.memory_enabled`, `memory.user_profile_enabled`, and the
+Holographic selection. Disabling Holographic preserves any different provider. It writes through
+Hermes' native atomic config writer, re-reads effective configuration, and returns `sources()`;
+requested values are never echoed as proof. The mutation is replay-safe by request id. Old plugins,
+offline profiles, failed writes, and unconfirmed state return bounded display-safe errors. No
+memory content, secret, provider configuration, or host path is logged, traced, pushed, or returned.
+
+An unavailable attach-v1 identity is a `503 backend_unavailable` on native chat actions. A profile
+that exists but is not configured as a native identity must not fall through to Dashboard chat.
+
+### Pairing a runner (capability 52)
+
+`POST /pair` is the core contract's unauthenticated pairing route and is unchanged for a device.
+With `kind: "runner"` it consumes a runner-kind setup code (minted by `cozygateway pair --kind
+runner`) and answers `RunnerPairResponse`: `{runnerToken, runner, gateway}`. `deviceName` carries
+the runner's name, so the request stays additive and a client below 52 never sends `kind` and pairs
+a device exactly as it always did. `deviceName` is required for a device pair and optional for a
+runner pair, checked at the route rather than in the schema.
+
+A code minted for a runner and presented as a device, or the reverse, answers the existing `401
+setup_code_invalid` with the existing message: a wrong-kind code is indistinguishable from an
+expired one. The 4 KiB body cap, the 10-attempts-per-60-seconds bucket, the 10-minute TTL and
+single use are unchanged and apply identically to both kinds.
+
+The runner token authenticates `/runner/v1` and `GET /runners/self` and nothing else. It cannot read
+chats, list devices or create bots, and `DELETE /runners/:id` revokes it, after which both answer as
+though it had never existed.
+
+A code is minted either at a terminal with `cozygateway pair --kind runner` or from the app with
+`POST /runners/pair-code`, which is device-authenticated and spends the same bucket. Both write the
+same row, so a code from either place pairs the same way.
+
+### A gateway with no Hermes endpoint (capability 52)
+
+`hermesEndpoints` is optional from 52. A gateway configured without one starts and advertises
+`com.cozylabs.bots`, but not the two Hermes-shaped capabilities beside it
+(`com.cozylabs.hermes-desktop-sessions`, `com.cozylabs.mobile-node`), because there is genuinely
+no Dashboard behind them. `/health` and `/ready` report `bridges: {"hermes": "absent"}` and
+`/ready` answers `200`: there is no bridge to alarm on or de-route from, and restarting the
+process would fix nothing.
+
+On CozyGateway such a gateway serves no bots: `botRuntimes` is `[]` and `POST /bots` answers
+`503 backend_unavailable`. CozyAgents' bundled gateway, which has no Hermes endpoint, serves
+`/bots` and `/runners` from its own runtime-bot rows, and its `com.cozylabs.harness-settings`
+`cozyagents` harness answers from runtime bots' config lanes, one read-only scope per runtime bot.
+
+### Subagent model configuration
+
+`GET /bots/:name/model-config` may include `subagentModel`, a qualified model ID
+or `null` for the owning runtime's default. Its absence means the runtime does
+not expose this setting. The HTTP route adds `subagentModelConfigurable: true`
+only when Gateway supports the write and the runtime exposes the field. Clients
+must gate editing on this marker, because an older Gateway can pass through an
+additive read field while rejecting the corresponding write.
+
+`PUT /bots/:name/model-config` accepts a child-only `{ "subagentModel": "provider:model" }`
+patch. Omission preserves the selection; `null` clears the override. Unknown
+models are rejected by the owning runtime's catalog validation. An unsupported
+runtime rejects the patch before any accompanying primary setting is changed.
+Credentials never cross this contract.
+
+CozyAgents serves this over the existing `model.read` / `model.write` attach
+config lane and persists the selection in its state directory. An unset child
+override inherits the effective parent chat model, including custom endpoints.
+Hermes reads and updates its profile-scoped native `delegation` configuration;
+clearing it restores Hermes's own primary-model inheritance. Gateway-only
+custom primary models use a session override and are not that native default.
+Hermes child selections currently use its built-in catalog, excluding Gateway
+`custom-*` provider entries.
+Hermes reloads profile delegation configuration at the next child spawn; already
+running children keep their creation-time model. No process restart is required
+under normal profile configuration.
+Legacy Hermes provider-only or direct-endpoint delegation configurations cannot
+be represented by this picker and omit `subagentModel`; existing primary model
+settings remain editable and preserve that delegation configuration.
+
+Onboarding creates the bot first and waits for runtime readiness, then reads
+this model configuration and offers a child model when supported. The same
+setting remains editable afterward. Retrying this setup step uses the created
+bot's identity rather than creating a duplicate bot. Older servers and runtimes
+continue onboarding without the new control.
+
+### Vision model configuration
+
+`GET /bots/:name/model-config` may include `visionModel`, a qualified model ID
+or `null` for "no separate vision model". Its absence means the runtime does not
+expose this setting. The HTTP route adds `visionModelConfigurable: true` only
+when Gateway supports the write and the runtime exposes the field, and clients
+gate editing on that marker for the same reason they gate the subagent picker:
+an older Gateway can pass an additive read field through while rejecting the
+corresponding write.
+
+`PUT /bots/:name/model-config` accepts a vision-only
+`{ "visionModel": "provider:model" }` patch. Omission preserves the selection;
+`null` clears it. Unknown models are rejected by the owning runtime's catalog
+validation. A patch naming this field on a bot whose fresh read omits it is
+refused `400 invalid_request "vision model configuration is unavailable for this
+bot"` before anything is written, so a refused vision write never leaves a
+changed primary model behind it. Credentials never cross this contract.
+
+The vision model is the model that analyzes an image when the bot's primary
+model cannot accept one. Unset means "the primary model, if it can see;
+otherwise no image analysis at all".
+
+CozyAgents serves this over the existing `model.read` / `model.write` attach
+config lane and persists the selection in its state directory beside the
+subagent selection. Its `image_analyze` tool is offered when the primary model
+accepts images or a vision model is set; with a set vision model and a
+text-only primary, the tool answers with that model's description of the picture
+instead of the picture itself.
+
+Hermes reads and updates its profile-scoped native `auxiliary.vision`
+configuration, which is what its `vision_analyze` path asks. Clearing it
+restores Hermes' own behaviour. The patch never carries `auxiliary.vision.api_key`,
+so the credential configured in Hermes survives every write, and it clears
+`base_url` for the same precedence reason the delegation patch does. Hermes
+vision selections use its built-in catalog, excluding Gateway `custom-*`
+provider entries. A legacy provider-only or direct-endpoint `auxiliary.vision`
+configuration cannot be represented by this picker and omits `visionModel`;
+existing primary model settings remain editable and preserve that configuration.
+Hermes reads `auxiliary.vision` when its `vision_analyze` path next runs, so a
+changed selection applies to the next image, not to a description already in
+progress.
+
+Direct connections have no vision setting: the Hermes API Server exposes no
+configuration endpoint, and OpenClaw's `agents.defaults.imageModel` is writable
+only under `operator.admin` scope, which a direct client does not request.
+
+## Interactive Hermes session continuation
+
+`com.cozylabs.hermes-desktop-sessions: 4` is deliberately separate from Bot Mode. It exposes
+source-qualified Desktop, TUI, and CLI sessions without placing their raw Hermes ids in native
+session history:
+
+| Route | Response | Rule |
+| --- | --- | --- |
+| `GET /bots/:name/desktop-sessions` | `{ name, source: "hermes_desktop", sessions }` | Lists Hermes `source: "desktop"`, `"tui"`, or `"cli"` conversation rows for that exact profile. Each row carries its exact `origin`, `hermesSessionId`, timestamps, optional sanitized `title`, and optional `lastResumedAt`; no preview, transcript, tool row, media, host path, or private Dashboard metadata is exposed. |
+| `POST /bots/:name/desktop-sessions/:hermesSessionId/resume` | `202 BotDesktopHermesResumeResponse` | Exact manual adoption. Normally waits briefly for a positive plugin confirmation and answers `status: "resumed"` + a distinct gateway `sessionId`; a bounded timeout answers `status: "pending"` with no session id. |
+
+The request re-lists the profile's eligible desktop rows, stages a new gateway-owned session id,
+and imports the selected `session.resume` snapshot through the existing rendered-role, compaction,
+media-directive, and path-redaction filters. Imported row ids are source-qualified and idempotent.
+The staged chat is not selected until the attached profile confirms it switched its stable attach
+lane to the exact profile-local Hermes target. A confirmation mismatch, a running lane, a foreign
+profile, a cron/routine/group/machine row, an unavailable capability, or any unproven switch fails
+closed. Normal subsequent sends keep the gateway session id as `threadId`; the plugin holds the
+private raw Hermes mapping and strict runner metadata proves it still targets that same context.
+
+Version 2 additionally permits the attached profile, after negotiated `desktop_session_sync`, to
+project a newly observed rendered `user` or `assistant` SessionDB row into its already-owned native
+chat. The row carries the source-qualified current raw id and stable row id; an interactive row also
+carries the original selected Hermes id and is accepted only when that exact persisted resume
+binding is confirmed. Replays are idempotent, and this projection never selects a chat or changes a
+turn state. Capability 3 broadens that exact proof from TUI to Desktop, TUI, and CLI origins.
+
+Capability 4 makes the gateway authoritative for the active interactive conversation. Before a
+canonical chat read or send, it compares the selected gateway conversation's latest real message
+timestamp with the newest source-qualified Desktop, TUI, or CLI row, using `lastActiveAt`, then
+`startedAt`, then opaque id as deterministic tie-breakers. A newer external row is selected only
+after the same exact plugin resume proof described above. A running native turn is never redirected.
+An empty, newly allocated gateway placeholder has no conversational activity and cannot outrank an
+existing external conversation merely because it was created later.
+
+If the selected gateway session already binds to the newest external row, the gateway keeps that
+session id. It may privately re-prove the plugin mapping after an attach process restart, but that
+no-op confirmation MUST NOT emit `bot_chat_adopted`. A capability-4 client therefore MUST NOT run
+its own automatic desktop-session picker or present a continuation banner during chat opening; the
+ordinary canonical history response is already the latest proven session. Discovery and the exact
+manual route remain available for administration and compatibility.
+
+## Server frames
+
+All frames travel on the existing authenticated `/ws` and are members of the closed core
+`ServerFrame` union. `updatedAt`, message timestamps, and tool timestamps are milliseconds.
+
+- `bot_roster`: complete `BotSummary[]` control-plane roster snapshot. It is the same overlay
+  `GET /bots` returns, rows and fields alike: `chatSessionId` carries the bot's real native chat
+  session, so a client can join a `bot_chat_delta`, `bot_chat_state`, or `bot_tool_activity` frame
+  to the roster row it belongs to.
+- `bot_presence`: complete active profile-name set.
+- `bot_inbox_activity` (agent-inbox 1): `{bot, threadId, updatedAt, taskId, state}`, once per
+  participant whenever a leader assignment may have moved. See
+  [Leader assignments](#leader-assignments-comcozylabsagent-inbox-1).
+- `bot_chat`: native transcript delta. `messages` contains only newly committed rows.
+- `bot_chat_state`: current native-turn phase: `polling`, `complete`, `timeout`, or `failed`.
+  Capability 23 additionally carries exact `status`: `queued`, `executing`, `using_tools`,
+  `awaiting_input`, `completed`, `failed`, `interrupted`, `timed_out`, or `connectivity_lost`.
+  `cause` distinguishes absent/degraded/lost attach transport and cancellation; `queuedAt` is the
+  durable outbox admission time. The existing gateway turn-timeout bound starts at `queuedAt`; on
+  expiry the gateway discards an unacknowledged command or queues an interrupt for an acknowledged
+  one, then projects `timed_out`.
+- `bot_chat_delta`: full accumulated assistant draft for one native turn. `seq` is monotonic within
+  `turnId`; `done` ends that draft. Clients may drop drafts and rely on committed `bot_chat` rows.
+  Capability 46: when `room` is present the draft belongs to that room's member turn rather than to
+  a 1:1 chat, and `sessionId` is the gateway-owned group thread rather than a chat session.
+- `bot_chat_reset`: a reset selected a fresh native session. Rebind and reload its history.
+- `bot_chat_adopted`: a new/adopt action selected an existing native session. Rebind and reload.
+- `bot_tool_activity`: full-replace steps for a native turn. `BotToolStep.detail` and `errorText`
+  are bounded/redacted display text; raw inputs and outputs never cross this contract.
+- `bot_delegation_activity` (capability 34): full-replace children of one native turn's
+  `delegate_task` batch. Identity is (`batchId`, `childId`); `seq` is monotonic within one
+  (`turnId`, `batchId`) and `done` marks the batch fully settled. `label` is bounded display
+  text and `currentTool` is a tool NAME; child args, results, reasoning, summaries, prompts,
+  and paths never cross this contract. A batch may outlive its turn (async dispatch), so frames
+  legitimately arrive after the turn sealed; a restart with a child in flight settles it
+  `unknown` -- never `failed`. Active and past batches also ride chat history as the optional
+  `delegations` array, so reconnect does not erase a live card, and `batchId` keys client
+  reconciliation with the terminal "[ASYNC DELEGATION BATCH COMPLETE ...]" transcript row.
+  When the attach plugin learns the canonical Hermes delegation id (`deleg_...`) from the
+  structured `delegation_id` field of the parent `delegate_task` result, the snapshot frame
+  and each history batch carry it as an optional batch-level `aliasId`. Identity stays
+  (`batchId`, `childId`); a client whose exact-`batchId` reconciliation of that completion
+  row fails falls back to matching the row's `deleg_...` id against `aliasId`. The alias
+  typically appears from the batch's terminal legs onward (async spawn legs precede the tool
+  result) and may be absent entirely under an older Hermes. Additive under capability 34: a
+  below-capability or alias-unaware client ignores it.
+  Hermes v0.21 synchronous parent results may also enrich a terminal child with `costUsd` and the
+  closed `costStatus` (`estimated`, `reported`, or `unknown`), `schemaValidation` (`valid` plus at
+  most one retry), and `durationMs`. These values are optional: absence means unavailable, an older
+  result, or a background delegation, while `schemaValidation.valid: false` is an explicit failed
+  verdict. They persist in the same child row and therefore survive reconnect/restart after receipt.
+  Raw summaries, schema errors, token counts, tool traces, output, arguments, results, and paths are
+  never serialized. Identity remains (`batchId`, `childId`); structured result rows join only by
+  their explicit `task_index` to the existing spawn index.
+- `bot_thinking_activity` (capability 35): latest-only sanitized preview of the bot's live
+  reasoning for one native turn, shown in the thinking shimmer. `text` is a tail-truncated
+  <=280-char display string (schema-enforced); `seq` is monotonic within `turnId` and a
+  lower-or-equal frame is stale. EPHEMERAL BY DESIGN: never persisted, never in chat history,
+  gone on reopen, and no frame follows the turn's terminal. This is a conscious, bounded
+  reopening of the old "no reasoning on the wire" rule: the preview crosses, the chain of
+  thought does not -- tool args, results, prompts, credentials, and file paths never appear.
+  NOT pushed, ever.
+- `bot_approval_pending`, `bot_approval_resolution_requested`, and `bot_approval_resolved`:
+  durable native tool-approval lifecycle. The requested frame means outbox admission only; a
+  terminal frame is emitted solely from the later plugin terminal event (or local expiry).
+  Capability 62: `bot_approval_pending` may carry `repair`, the validated MCP repair proposal of
+  row 62; absent for every approval that is not one.
+  Capability 66: `bot_approval_pending` may carry `scope`, the validated scoped-approval block of
+  row 66, and `grantId`, the standing grant the gateway consulted and is settling the approval
+  from; both are absent for every approval that has neither.
+- `bot_clarify_pending`, `bot_clarify_resolution_requested`, and `bot_clarify_resolved`: durable
+  native clarification lifecycle. A
+  pending card contains only a display prompt and bounded option ids/labels, never model reasoning.
+  Capability 51: `bot_clarify_pending` and `bot_clarify_resolved` may carry `room`, as the approval
+  pair already could, when the clarification was raised by a room member turn.
+- `bot_group`, `bot_group_state`: durable gateway-owned group-room transcript and state.
+  Capability 51: `bot_group_state` may carry `pendingInteractions`, the same optional pointer array
+  `BotGroup` carries, and a frame is emitted when one opens and when one settles so a client can
+  badge the room without re-reading it.
+- `bot_draft_updated` (capability 71): the newest composer draft for one conversation on one
+  profile, `{ bot, sessionId, text, updatedAt }`. It is a full replace, never a delta, and the
+  empty string is the CLEAR that stops every other paired device offering a message already sent.
+  It carries no device id, because the draft belongs to the person and not to the phone that typed
+  it, and it is never sent to a peer, a runtime or a model. Safe to drop: the next
+  `GET /bots/:name/drafts?sessionId=` is the recovery read. `updatedAt` is its VERSION and moves
+  strictly forward on every stored change, even when the gateway clock repeats a millisecond or
+  steps backwards, so "which of these two is newer" always has an answer at the one moment it
+  matters: a send's clear racing the keystroke before it. A client applies a draft only when its
+  `updatedAt` is newer than the one it holds. A client may declare `com.cozylabs.bots` on the
+  `auth` frame; one that declares a version below 71 is not sent this frame at all, so a below-71
+  client is byte identical rather than receiving one frame it drops. A client that declares
+  nothing is sent it and ignores it, which is what every client shipped before the declaration
+  existed does.
+
+Frames are independently safe to drop where their schema says they are deltas or snapshots.
+Committed transcript history remains the recovery source after reconnect.
+
+## Error and privacy rules
+
+- Capability 45. `BotSummary.runtime` names which runtime serves the bot. It is optional and
+  absent means Hermes, so every existing row is unchanged; the only other value is `"cozyagents"`,
+  a config-declared bot served by a non-Hermes attach peer whose row is built from gateway config
+  and attach presence rather than the Dashboard. Chat, readiness, approvals, and clarifications
+  work for such a bot exactly as they do for a Hermes-backed one, and since capability 46 so do
+  rooms: see the capability-46 note below. Roster
+  `stale` is a fact about the Hermes control plane only; it says nothing about a runtime bot, whose
+  row is always current because it is built from local config and live attach presence.
+- Capability 46. A runtime bot is a full room member. `POST /bots/groups` naming one succeeds:
+  room membership is resolved against gateway config as well as `profiles.list`, so a bot the
+  roster is listing is never refused as "not a bot on this gateway", and a room whose members are
+  all runtime bots is created and run without the Hermes Dashboard being consulted at all, on a
+  gateway with no `hermesEndpoints` entry as well as on one with a single plain endpoint
+  (capability 52): a room is gateway-owned, so the absence of an endpoint is never a reason to
+  refuse one. On a gateway with two or more endpoints, a
+  room is hosted by the ONE host its membership resolves to, where a member named
+  `<endpoint>:<profile>` resolves to that endpoint and a runtime bot, named bare on every gateway
+  shape, resolves to no endpoint at all: a room whose members all live on a single endpoint is
+  hosted by that endpoint and created, run and answered exactly as it is on a single-endpoint
+  gateway, and a room whose members are all runtime bots is hosted by the gateway itself. A room
+  whose membership spans two or more endpoints has no host and is refused
+  `503 backend_unavailable`, "cross-endpoint groups are not supported". A room stays on the host
+  it was created on for its whole life: it is addressed, listed and deleted there without its
+  ownership being re-derived, and a membership that comes to name a bot on a different endpoint is
+  refused `503 backend_unavailable` naming both hosts rather than migrating the room. A single
+  `namespace: true` endpoint is RESERVED and not configurable: a gateway namespaces its bot names
+  when, and only when, it has two or more endpoints, so a lone endpoint always serves bare names and
+  hosts every room itself. A gateway that ever gains that shape follows the same rule as two or more
+  endpoints. None of this
+  moves a route, frame, schema or version; it is which host serves the same bytes. The
+  member turn is unchanged in every other respect: the same attach-v1 `turn` command on the same
+  gateway-owned `group:<room>:<member>` thread, the same rounds, the same transcript. A member's
+  display name and handle in the room come from its roster row, which for a runtime bot is the
+  config-declared one. A room turn's live draft is published as `bot_chat_delta` with `room` set to
+  the room name, `bot` set to the member, and `sessionId` set to that group thread: it is live text,
+  never history, and a client that does not know the field renders nothing new. Every room bubble
+  the gateway opens it also closes, with one final `bot_chat_delta` carrying `room`, an empty
+  `text`, and `done: true`, at whichever settlement the turn reaches: a reply, a failure, a
+  cancellation, an interrupt, the gateway's own turn timeout, or a drive abandoned because the room
+  was deleted or superseded. A turn that never streamed opens no bubble and gets no frames at all.
+  A draft that reads as the protocol's own pass is never published, matching the rule that keeps
+  `(pass)` out of the transcript; drafts are coalesced latest-only inside a 100 ms window, and every
+  frame carries the whole accumulated text, so a dropped one costs a reader nothing. Tool, thinking,
+  and delegation activity inside a room turn is deliberately not projected in this version; tool
+  activity arrives in capability 51 below, thinking and delegation still do not.
+- Capability 51. A ROOM member turn can now ask. Below 51 a room acknowledged and dropped a
+  member's `approval`, `clarify` and `tool` events, which is why a runtime peer had to run room
+  turns with read-only tools: a bot that cannot ask for permission must never need it.
+  An approval or clarification raised by a RUNTIME member's room turn is recorded in the same
+  durable interaction record a 1:1 chat writes, keyed by the member bot and the attach id, with
+  `sessionId` set to the gateway-owned `group:<room>:<member>` thread and `turnId` set to the room
+  member turn. It therefore appears in `GET /bots/approvals` beside every other pending item,
+  carrying the room name as the optional `room` field, and `POST
+  /bots/:member/approvals/:id/approve|deny` and `POST /bots/:member/clarifications/:id` resolve it
+  with no new route, no changed request or response shape, and the same `resolve_approval` /
+  `resolve_clarify` command the gateway has always sent the peer. The
+  `bot_approval_pending`/`bot_approval_resolved` and `bot_clarify_pending`/`bot_clarify_resolved`
+  frames carry `room` so the card can be rendered above the right transcript. A room interaction
+  carrying an `expiresAt` runs on the same deadline the 1:1 lane arms, so it expires on its own
+  clock rather than waiting for anything; and one still pending when its member turn seals is
+  EXPIRED by that turn's settlement, with the terminal frame the 1:1 lane emits. Either way a card
+  that would resolve into a turn that is over is closed rather than left tappable.
+  Tool events on a member turn project as `bot_tool_activity` carrying `room`, `bot` set to the
+  member and `sessionId` set to the member thread: the 1:1 card shape, with `name` and `status`
+  only. A room is where several bots and a human read each other's activity, so the projection
+  stays at the narrowest useful thing and does NOT carry the 1:1 card's bounded `detail`; arguments
+  and results were never on this wire. It is EPHEMERAL: never persisted, never in any history, and
+  sealed by one final `done: true` frame at whichever settlement the turn reaches, exactly like the
+  live draft. Thinking and delegation activity in a room stay unprojected.
+  The room TRANSCRIPT gains nothing. A pending interaction is live state, so it rides `BotGroup`
+  and `bot_group_state` as the optional `pendingInteractions` array: one pointer per blocked
+  member, carrying `member`, `kind`, the resolution `id`, and the room `turnId`, and nothing a
+  reader could mistake for the request itself. It is absent when there are none.
+  HERMES MEMBERS ARE UNCHANGED. Only a member whose bot is a capability-45 runtime bot projects any
+  of this; a Hermes-backed member's room turn drops these events exactly as it did below 51,
+  acknowledged and unprojected, because the Hermes plugin has never been asked to raise one inside
+  a room and a half-projected lane is worse than none.
+- Capability 51, consequence for the CozyAgents peer. The read-only rule CozyAgents applies to room
+  turns exists only because this gateway had no way to carry a question out of a room: a peer that
+  cannot ask for approval must not run a tool that would need it, so wave-2 Track P-B restricted
+  room turns to tools that never ask. That reason is gone. A room turn now reaches the same
+  approval and clarification surface a 1:1 turn reaches, through the same commands, so the peer MAY
+  lift the restriction and run a room turn with its ordinary toolset. The change belongs to
+  CozyAgents and is not made here; this gateway only guarantees the lane. Two facts the peer should
+  hold onto when it does: a room member turn is SERIAL within its room, so a turn blocked on a human
+  holds the room's whole deliberation until it settles or the gateway's turn timeout seals it, and a
+  pending interaction is expired when its turn seals, so a peer must not sit on an unanswered
+  question past its own turn.
+- Capability 48. A runtime bot's profile, model-config and routines routes are served by its own
+  peer over the attach-v1 `bot_config` lane (see `contract/attach-v1.md`), so they answer normally
+  rather than 409. Nothing about their request or response shape changes: the peer implements the
+  same published schemas the Hermes-backed bot does. A peer that did not negotiate `bot_config`
+  keeps the 409 on those routes, because the section is genuinely absent rather than temporarily
+  unreachable, and a peer that is simply offline answers `503 backend_unavailable`.
+- Capability 48. `GET /bots/:name/profile` and `GET /bots/:name/model-config` on a runtime bot
+  answer `404 not_found` when the peer serves the bot but has nothing stored for that section (a
+  bot brought up before its profile was written, or one that pins no model). The message says the
+  bot has no stored profile or model config; it does NOT say the bot is missing, because it is not:
+  the bot is on the roster and its chat lane works, and a client must keep the row and show the
+  section as empty rather than dropping the bot. This is deliberately distinguished from `503
+  backend_unavailable`, which is the answer when the peer is offline or unreachable and a retry is
+  the right thing to offer. A write, a routines list, or a routines create that the peer refuses
+  stays a `503`; a routine id that names nothing is the ordinary `404` about that routine.
+- A Dashboard-backed surface asked about a bot whose `runtime` is not Hermes answers `409` with
+  extension code `unsupported_for_runtime`. The body is the core `ErrorBody` plus `runtime` (the
+  bot's runtime) and `feature` (the surface method name, for example `botProfile` or `routines`).
+  Since capability 48 this covers the desktop-session and delete surfaces and the bot-scoped
+  model-provider writes; the profile, model-config, and routines surfaces answer over the config
+  lane instead, the model-provider read answers the read-only `com.cozylabs.harness-settings`
+  projection of that lane's `model.read`, and all of them fall back to this 409 when the peer did
+  not negotiate `bot_config`. It is deliberately not a `404`: the bot exists and its chat lane works, so a client
+  must hide or disable that section rather than treat the bot as missing.
+- Native session ids, attach message ids, and attachment ids are opaque. Never infer a filesystem
+  path, Hermes Dashboard id, or URL from them.
+- Attachment and media validation rejects unsafe bytes, unsupported types, oversized bodies, and
+  invalid ranges before those values enter a transcript.
+- Tool detail, approval display names, clarification prompts/options, group notes, and the
+  capability-35 thinking preview are presentation fields. Raw tool arguments, results, command
+  text, and full model reasoning are not serialized; the thinking preview is a sanitized,
+  bounded display tail, not the chain of thought.
+- Provider credentials and authorization codes may appear only in the authenticated request body
+  for the one write that consumes them. They never appear in URLs, process arguments, responses,
+  logs, WebSocket frames, or gateway persistence. Provider reads expose only `isSet`; even Hermes'
+  redacted suffix is discarded at the bridge.
+- A client handles an unknown extension frame or optional field by ignoring it, then re-reads the
+  documented REST state when it needs recovery.
+
+
+### Durable Task surface (capability 64)
+
+Task is the durable requested outcome; its Run id is the existing attach turn id. Task state is
+reduced from the append-only event stream, never independently written. The closed states and
+reasons, view, command bodies and update frame are defined in `packages/contract/src/tasks.ts`.
+ADR 0004 enumerates 45 distinct reasons; the earlier prose count of 46 was clerical.
+
+Paired-device authenticated routes are `GET /bots/:name/tasks`, `GET /bots/groups/:name/tasks`, and
+`GET /tasks/:taskId`. Lists accept `state`; reads accept an exclusive numeric `cursor` and bounded
+`limit` and return `{ view, events, nextCursor? }`. Five commands are
+`POST /tasks/:taskId/{cancel,pause,resume,retry,scope}`. Every body carries `idempotencyKey`;
+`scope` also requires nonempty `goal`. An identical replay returns its original accepted view;
+a changed payload under the same key and a command refused in the current state return
+`409 conflict` with that state. Terminal states refuse commands except cancel of cancelled.
+
+`bot_task_updated` carries one appended `event` and a complete replacement `view`. Subscription
+and cold read share the same derivation. Below capability 64 clients retain existing chat behavior.
+Admission includes each direct or room member work-bearing turn, excluding commands declared in
+the peer's slash-command catalog. An absent or unknown optional attach tool `role` means a possible
+effect. The gateway never automatically redispatches acknowledged work. The owner-loss lease is
+120 seconds, provisional until live model qualification resumes.
+
+A first terminal remains immutable for both the Task and row 23. A later acknowledged reply may
+still be delivered idempotently under existing source ownership and explicit-cancel guards;
+reply delivery cannot replace a previously sealed outcome or complete the Task. Journal recovery
+reapplies the authoritative first terminal and clears only its exact stale turn pointer.
+
+Artifact commitment remains owned by initiative 4. The optional source-bound reference reader
+receives Task, Bot, authenticated peer, session and Run identity. It must return only canonical
+explicit declarations and commitment status for that source. At final proof, declared reference
+identities are retained; a missing later reference is unproven and keeps the Task verifying.
+There is no default commitment reader, and attachments, file IDs and delivery are not substituted
+for commitment evidence. Seam tests exercise this join only, not production Artifact validation.
+
+`no_recovery_remaining` also has no automatic producer. A trusted internal operator/policy reader
+must supply an explicit decision identity, issuer, Task/Run binding and recorded reason. The gateway
+persists that decision before appending `failed`, only from blocked and only after actual execution
+has ended. The reader is absent by default; retry budget exhaustion and timeout do not substitute
+for such a decision. No extra public Task command is introduced.
+
+### Artifact surface (capability 65)
+
+An Artifact is a declared Task output the gateway owns: a stable identity, provenance to its Bot,
+producing peer, session, Task and Run, plus filename, media type, byte size, SHA-256, validation
+status, version and supersession, and the producer's `draft` / `review_copy` / `final` mark. The
+closed states, marks, validation values and delivery states are defined in
+`packages/contract/src/artifacts.ts`.
+
+The `mark` is OPTIONAL on a declaration and on a record. Its three values are the three things a
+producer can say, and there is no value for "the producer did not say", so that is absence: a
+declaration that omits `mark` stores and lists no mark, a client renders no mark, and absence is
+never read as `draft`, which is a claim nobody made. This is the same rule a `derived` record
+already follows.
+
+There is no second upload authority. Bytes reach the gateway through the existing
+`POST /attach/v1/media/:mediaId` route, which already validates the allowlisted type, the declared
+size and the digest. Commitment then recomputes the SHA-256 and the byte count over those STORED
+bytes and requires both to equal the declaration. Metadata alone is never validation: a digest
+mismatch, a size mismatch, absent bytes, or an exceeded operator capacity all record
+`commit_failed` with the reason on the record, visibly, rather than silently dropping either the
+declaration or the bytes. `validation` says what the bytes proved rather than why the commit
+failed: `mismatch` only for a digest or size mismatch, `unvalidated` when the bytes were never
+there to compare, and `verified` for a capacity refusal, where the bytes did match and the store
+refused to retain them.
+
+Producer routes use the attach bearer and are scoped to the authenticated identity, so a foreign
+or guessed id is the same `404` an absent one gets: `POST /attach/v1/artifacts` declares,
+`GET /attach/v1/artifacts/:artifactId` reads, `POST /attach/v1/artifacts/:artifactId/commit`
+commits one `mediaId`, `POST /attach/v1/artifacts/:artifactId/deliveries` retries delivery under a
+new delivery id, and `POST /attach/v1/artifacts/:artifactId/deliveries/:deliveryId` reports the one
+platform fact the producer owns (`delivered` or `failed`).
+
+Paired-device routes are `GET /bots/:name/artifacts`, `GET /bots/groups/:name/artifacts`,
+`GET /artifacts/:artifactId`, `GET /artifacts/:artifactId/latest` (the supersession chain's tip),
+`GET /artifacts/:artifactId/content`, and `DELETE /artifacts/:artifactId`. Discovery never needs
+the chat message the Artifact was mentioned in. `content` serves the retained original with
+`nosniff` and `Content-Disposition: attachment`, never a host path or a credential; `location` on
+the record is that gateway-relative path and is absent on a tombstone.
+
+Delivery is a separate object with its own identity and states. `queued` is NOT received;
+`delivered` is platform commitment; `acknowledged` is authenticated client receipt or download and
+says nothing about whether a person read the Artifact. A download served by this gateway is itself
+the platform commitment for that attempt, so it records both facts at once. Duplicate receipts and
+reconnecting clients update once and keep the first fact. A retry is only available once the
+current attempt failed, references the SAME committed Artifact, and never re-admits the generating
+Task or Run; a completed Task stays completed when its delivery fails.
+
+Originals are retained until an explicit deletion. Age, the media staging deadline, storage
+cleanup, and deleting the conversation the Artifact was produced in do not remove one; committing
+clears the staging deadline on those bytes for exactly that reason. Deleting the owning Bot is
+itself an explicit deletion and takes the records with it. An explicit `DELETE` leaves a truthful
+tombstone carrying the provenance, the digest and the version while the bytes stop being reachable
+(`410` on `content`); the bytes themselves go through the existing unreferenced-media rule, so an
+object still reachable as a durable attachment stays reachable there.
+
+Capability 65 is also the canonical Artifact commitment producer capability 64 declared and left
+absent: the Task's source-bound reference reader is bound to these records, scoped by Task, Bot,
+authenticated peer, session and Run, and reports only explicit declarations and their real
+commitment status. Attachments, file ids and delivery are still not commitment evidence, and a
+Task never leaves `verifying` on a declared reference that has not committed.
+
+Waiting is bounded, and a Task is never sealed `completed` on an artifact that is missing. A
+required reference that reaches a TERMINAL state without committing releases the Task from
+`verifying` into `blocked`: a refused commitment with `artifact_commit_failed`, and a record
+deleted before it ever committed with `verification_failed`, because those are different facts. A
+record deleted AFTER it committed proved its bytes and does not reopen its Task. And when the
+producing Run's execution has ended while a required reference is still only declared, the Task
+settles `failed` with `verification_failed` after ADR 0004's provisional 120 second lease, the same
+bound owner loss gets: no absence episode is opened for a Run that already ended, so nothing else
+would ever settle it.
+
+### The Task join, resolved from the Run
+
+A producer cannot name a Task. The Task id is minted gateway-side at turn admission and no
+attach-v1 frame carries it to a peer; capability 64 made the EXISTING attach turn identity the Run
+identity, and that is what a producer already holds. So a declaration names its `sessionId` and its
+`runId`, and THE GATEWAY resolves the owning Task itself and records the join on the record. There
+is no new frame to the peer, and `taskId` on the record is the gateway's own fact rather than a
+peer's claim.
+
+Three things must all hold or there is no join: the Run is one this authenticated peer owns, the
+Task that Run belongs to is a Task of the same Bot the record is filed under, and the declared
+session is that Run's own session. A wrong-bot Run therefore cannot join another bot's Task, and
+one peer's Run identity cannot reach another peer's Task.
+
+A Run this gateway cannot map records ABSENT Task provenance and never guesses: `taskId` is left
+off the record while `runId` stays exactly as the producer stated it, so a reader can tell a
+declaration whose Run did not resolve (`runId` present, `taskId` absent) from one that named no
+Run at all (both absent). Nothing is inferred from the session, the filename or the bytes.
+
+The join is decided at declaration and, when it was absent there, again at commitment, which is
+when the record becomes a fact about a Task. A join already recorded is never re-decided, so a
+commit replayed after a process restart answers with the same Task, the same `committedAt` and one
+reference on the Task. Once joined, the record is in that Task's artifact reference set: it keeps
+the Task `verifying` until it commits, drives `artifact_commit_failed` when it fails, and appears
+in `GET /tasks/:taskId`'s `artifacts`.
+
+`taskId` on `POST /attach/v1/artifacts` is accepted for the first row 65 clients and IGNORED: it
+is dropped rather than stored, because a Task id a peer supplies is a claim this gateway did not
+resolve. A peer reads the record's `taskId` back from the declare or commit response.
+
+### Leader assignments (com.cozylabs.agent-inbox 1)
+
+A leader is a bot whose gateway-owned `role` is `leader` (capability 88). It may assign one
+bounded piece of work to a bot in its `reports`; a member cannot assign, and there is no nested
+delegation: a leader's `reports` may not name another leader, and a bot that is in anyone's
+`reports` may not become a leader (both `400 invalid_request`). Bot names are trimmed and
+lowercased, as everywhere else. The schemas are in `packages/contract/src/assignments.ts`.
+
+**One id.** An assignment wraps exactly one capability-64 Task and is addressed by that Task's own
+id: `taskId` is the same string in the create response, every assignment route, `GET
+/tasks/:taskId`, the attach turn's `context.task.id` and the `bot_inbox_activity` frame. The
+assignee's turn runs on a gateway-owned thread, `assignment:<taskId>`, and the assignment row, the
+Task and the attach outbox record are written in one transaction, so a refused enqueue leaves
+nothing behind. Every Task rule (waits, owner absence, cancel, retry) applies unchanged while the
+assignment is open: a Task retried from `blocked` runs again on the same thread and its reply
+answers the assignment. A FAILED assignment is a durable decision that no recovery remains for
+its Task (below): the Task refuses retry and resume, closes `failed`, and the leader creates a new
+assignment to try again.
+
+**Assign.** `POST /bots/:name/assignments` takes `AssignmentCreateRequest`
+(`{to, brief, doneCriteria, outputFormat?, deadlineMs?, idempotencyKey?}`) and answers
+`201 AssignmentView`. It is authenticated by `:name`'s OWN attach bearer: no device token is
+involved in a bot-to-bot call, a device token is `401`, and another bot's bearer is `403`.
+`idempotencyKey` is scoped to the leader: a repeated delivery answers the same Task and queues
+nothing, and the same key with a different `to`, `brief` or `doneCriteria` is `409 conflict`. The
+deadline defaults to 30 minutes and is 1 minute to 4 hours; it is the turn's own timeout. The
+comparison under an `idempotencyKey` covers the whole request, `deadlineMs` and `outputFormat`
+included.
+
+**Refusals** are typed. A refused assign or acknowledge answers `409` with
+`AssignmentRefusalBody`, `{ error: { code: "assignment_refused", message }, reason }`:
+
+| `reason` | When |
+| --- | --- |
+| `not_leader` | The caller's role is not `leader`. |
+| `not_a_report` | `to` is not in the leader's `reports`, or is no longer a bot on this gateway. |
+| `assignee_unavailable` | `to` is not attached right now. Nothing is created. |
+| `assignee_busy` | `to` already holds an open assignment from any leader. |
+| `leader_task_cap` | The leader already has 8 open assignments. |
+| `not_verifying` | An acknowledgement arrived while the assignment was not `verifying`. |
+
+**The turn.** The assignee receives an ordinary attach-v1 `turn` whose `text` is, verbatim:
+
+```
+[Task from <leader display name>] <brief>
+Done when: <doneCriteria>
+Reply format: <outputFormat, or "a short result followed by a `Result:` block">
+Deadline: <local time>
+End your reply with a `Result:` block listing status (done | partial | blocked), what changed, and any artifacts as paths or links.
+```
+
+and whose `context` carries `task` (capability 88) with the same facts typed and NO `room`. A
+stock Hermes profile answers it with no plugin change (the Hermes plugin ignores `context`). A
+runtime peer that reads `context` must accept a context with `task` and no `room` before it can
+be an assignee: CozyAgents today dereferences `context.room.name` (`prompt-size.ts`,
+`runtime.ts`) and must be fixed before CozyAgents assignees ship. Its final reply is stored as `finalText`; the last line
+that starts with `Result:` (also `**Result:**` or `**Result**:`; a status word after it on the
+same line counts as the status) opens a block whose `status:` must be `done`, `partial` or `blocked`,
+whose `artifacts:` line (a comma list and/or `- ` bullets) names up to 32 references, and whose
+other lines become `summary`. A reply with no valid block has no `result`: its absence is recorded
+and never invented.
+
+The artifacts rule, written here for CozyAgents' bundled gateway too, where leader assignments
+are being ported:
+
+1. Lines are read in order. A `status:`, `summary:`, `changed:` or `what changed:` line, bulleted
+   or not, is always that key. The `artifacts:` line starts a listing; each bullet (`- ` or `* `)
+   after it is listed too, until a line that is neither.
+2. The text after `artifacts:`, and each listed bullet, is split into parts. Each Markdown link
+   `[text](url)` is first replaced by its URL. The text is then split at each comma followed by
+   whitespace or ending the text, so a comma inside a URL splits nothing.
+3. Each part is trimmed and unwrapped from one pair of backticks, then judged on its own. It is a
+   reference when it has no whitespace and is a URL (`scheme://...`), or else, being neither `n/a`
+   in any case nor an email address (an `@` with no `/`), is a path (contains `/`) or a file name
+   (ends in `.` and an extension of letters and digits with at least one letter). Any other part
+   is prose and is dropped: `none`, `N/A`, `v1.2`, `kyle@example.com` and `e.g.` name nothing.
+4. The listing never reaches `summary`, so `artifacts: none` names no artifact and adds nothing.
+   References are deduplicated in order and capped at 32.
+
+Drafts, tool steps, approvals and clarifications on an assignment thread have no projection in v1
+and are acknowledged so the peer's stream keeps moving.
+
+**State** is derived on every read and never stored. First match wins:
+
+1. The leader (or a device) acknowledged: that outcome, `completed` or `failed`.
+2. A party was deleted and its Task went with it: the state recorded at that moment (below).
+3. The Task completed and no failure was recorded: `failed` when it completed only at or after
+   the deadline (a read that said `failed` never turns back), else `verifying` for 24 hours, even if a cancel
+   was asked and lost the race to the reply, so delivered work stays acknowledgeable. When the
+   window lapses unacknowledged it closes as `completed`, or as `failed` when the `Result:` status
+   was `blocked`.
+4. The Task has otherwise settled (or is gone): `cancelled` when cancellation was asked, `failed`
+   when a failure was recorded (`deadline`, or the turn's own failure text), else the Task's own
+   `cancelled` or `failed`.
+5. The Task is live: `failed` once a failure is recorded or the deadline has passed, so a read
+   never shows live work past its deadline; a Task still proving its own work (`verifying`) reads
+   `running`; `waiting_for_device` reads `blocked`; every other live state is itself (`queued`,
+   `running`, `waiting_for_approval`, `waiting_for_user_input`, `blocked`).
+
+A cancel asks the Task to cancel and answers the resulting state; it reads `cancelled` only once
+the Task has settled, never before (`cancelledBy` says it was asked). The deadline and a failed
+turn are never recorded on the Task as a person's cancel, and both follow the capability-64 state
+machine (ADR 0004). The deadline is hard: the gateway records `failure: "deadline"` and blocks
+the Task on the edge that fits where it stands, all with actor `gateway`: its own `run_timed_out`
+from `running`, `verifying` or any wait (a paused Task included), after which a running turn is
+interrupted; `command_discarded` from `queued`, where nothing ran, and a turn still in the outbox is
+withdrawn unsent. A failed turn is the harness's own `run_failed`, `running -> blocked`, and its
+message becomes the assignment's `failure`. Only the Task's CURRENT Run speaks for the assignment:
+a reply or failure from a Run a retry superseded records nothing. A Task left live after its
+assignment failed (a retry accepted just before, then never dispatched) is blocked the same way by
+the sweep. In both cases the recorded failure is the durable decision that no
+recovery remains (issuer `assignment`): Task reconciliation appends `blocked -> failed`
+`no_recovery_remaining` (actor `gateway`) as soon as the Run has ended, at once for a failed or
+withdrawn turn and on the interrupted Run's terminal otherwise. Until then the Task reads
+`blocked` and refuses retry and resume, and no retry is ever dispatched on the thread. A reply
+that arrives after a recorded failure does not reopen the work. Open means any state but `completed`, `failed` and `cancelled`, so `verifying` still
+holds the assignee.
+
+**Rename and delete.** A rename moves the bot's team row, every `reports` entry naming it, and
+its side of every assignment (through `previous_names` too). Demoting or deleting a leader
+cancels its open assignments as `user`. Deleting a bot removes its team row and its name from
+every other leader's `reports`, and the deleted side of each assignment is tombstoned: a later bot
+of the same name cannot list, read, acknowledge or cancel it, nor see it in its inbox. A deleted
+assignee's Task goes with its other private Tasks, so the leader keeps a readable view frozen at
+deletion: open work reads `cancelled` with `failure: "assignee deleted"`, and delivered work that
+was waiting on the leader closes as an unacknowledged window would.
+
+**Reads.** The inbox thread is the assignment's `threadId`; it carries no state of its own, and a
+client joins it to `GET /bots/:name/assignments` by `threadId`. Its messages use the room
+`BotGroupMessage` shape: the leader's brief, then the assignee's reply once there is one.
+
+A bot that is not a live party gets the same `404` from `GET /assignments/:taskId` as for a Task
+that does not exist.
+
+`GET /bots/:name/team` is the one read a runtime peer needs to know whether it leads: the config
+lane never carries `role` or `reports`, so a peer asks here with its own attach bearer.
+
+`team` joins `assignments` in the reserved room names (`/bots/groups/:name` and
+`/bots/:name/<suffix>` are both three-segment addresses, so a room named `team` would sit exactly
+where this route lives): `POST /bots/groups` refuses to create one, `400 invalid_request`. A room
+already named `team` from before this route existed is not renamed or deleted; it is simply
+shadowed and unreachable at `/bots/groups/team` until it is renamed.
+
+A leader's roster row (`BotSummary`, both a Hermes profile's and a runtime bot's) carries
+`role: "leader"`; a member's carries no `role` key at all, the same absent-means-member rule
+`BotProfile.role` already follows.
+
+**Frame.** `bot_inbox_activity` `{bot, threadId, updatedAt, taskId, state}` is sent once per live
+participant whenever an assignment may have moved: on assign, cancel, acknowledgement, the
+assignee's reply or failure, every update of the wrapped Task, the deadline, a deletion, and the
+lapse of the 24 hour verifying window (announced once, including a lapse that happened while the
+gateway was down). `updatedAt` is the assignment's own `updatedAt`, which follows its Task. Like
+every capability-gated frame it goes to every paired client except one whose `auth` frame declared
+`com.cozylabs.agent-inbox` below `1`; a client that did not declare the id receives it.
+
+### Derived records, for peers that never declare one
+
+`origin` says where a record came from and is closed: `declared` is a peer that used the producer
+routes above, `derived` is the gateway's own record for an attachment a peer delivered without
+declaring anything. The field is OPTIONAL on the wire and a record that omits it reads as
+`declared`, which is what every record written before the field existed is.
+
+A peer below 65, Hermes included, needs no change to have its files discoverable. When such a peer
+commits a message that carries attachments, the gateway derives exactly one record per stored
+object, pointing at the SAME stored bytes: no copy, no second upload, and the same discovery,
+download, deletion, supersession and retention rules a declared record gets. Its identity is a
+function of the producing peer and the stored object, so a redelivery, a replayed event and a
+duplicate receipt all name the record that already exists.
+
+A derived record claims only what the gateway knows: `filename`, `mediaType`, `sizeBytes`, the
+producing Bot, and `sourceMessageId`, the chat message the attachment arrived in. `validation` is
+`unvalidated` and `sha256`, `mark`, `taskId` and `runId` are ABSENT, because nothing was declared
+to prove the bytes against, no producer named a `draft` / `review_copy` / `final` mark, and no Task
+provenance exists. `sha256` is therefore optional on a record and present exactly when `origin` is
+`declared`; `mark` is optional on a declared record too, where it is present exactly when the
+producer stated one.
+
+Delivery states come from the same two facts as a declared record. Projecting the attachment into
+the durable transcript and announcing it IS the platform commitment, so a derived record starts
+`delivered`; the row 31 displayed receipt for its `sourceMessageId` is the acknowledgement, and it
+still says nothing about whether a person read the artifact.
+
+A capable peer that declares media the gateway already derived a record for UPGRADES that record in
+place rather than adding a second one: the commit answers with the existing identity, which is the
+identity clients already discovered, carrying the declaration's digest, mark, Task and Run, and the
+declaring record id it replaced stops resolving. A peer MUST read `artifactId` from the commit
+response rather than assume its own, and a requirement the producing Task recorded against the
+retired id follows the surviving one, so a successful commitment never leaves a Task verifying
+against an identity that no longer resolves. Nothing is derived for media a record already BINDS,
+which a declaration does at its commit: a declaration still in flight names no stored object yet,
+so its attachment is derived and its commit then upgrades that record in place.
+
+Retention follows the Artifact rule, not the attachment rule: a derived record's original is
+retained until an explicit Artifact deletion, so deleting the message or the conversation the
+attachment arrived in no longer removes the bytes and the media staging deadline stops applying to
+them. An explicitly deleted derived record is never re-derived by a later redelivery or receipt.
+The operator's retained-bytes ceiling counts each stored object ONCE, so a derived record and the
+declaration that upgrades from it, or two records over one object, retain one copy between them.
+The ceiling is bounded by default, not infinite, because derivation retains every delivered
+attachment: an operator who configures none gets the gateway's conservative default. The ceiling
+binds derivation as well: over it, the record is written as `commit_failed` with
+`failureReason: "capacity"` and binds no bytes, so the refusal is visible and the attachment keeps
+exactly the retention it already had. A later delivery of that attachment retries it, so raising
+the ceiling is enough to retain it.
+
+Additive: a client below 65 never calls these routes and its attachment behavior is byte identical
+to its pre-65 self. A client at 65 written before `origin` existed still decodes every record; a
+`derived` one omits `sha256` and `mark`, and a `declared` one omits `mark` when its producer left
+it unstated. A peer at 65 that still sends `mark` and `taskId` is decoded unchanged: its `mark` is
+stored as it always was and its `taskId` is dropped in favor of the gateway's own join.

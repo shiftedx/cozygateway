@@ -1,0 +1,372 @@
+import { chmodSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+
+import { type Static, Type } from "@sinclair/typebox";
+import { ContractViolation, assertValid } from "cozygateway-contract";
+
+/** Hermes is the only supported runtime. Each profile is configured once and the same attach-v1
+ * identity powers both the frozen core thread surface and Bot Mode. */
+export const HermesBridgeConfigSchema = Type.Object({
+  /** The Hermes gateway WebSocket URL, e.g. ws://homelab:8790/api/ws */
+  url: Type.String({ minLength: 1 }),
+  /** How the WS upgrade is authenticated. "token" (default) is the loopback shape: the credential
+   *  rides the upgrade URL. "password" is the gated shape: the bridge logs in to the dashboard
+   *  over HTTP and mints a fresh single-use ws ticket for every connect. */
+  authMode: Type.Optional(Type.Union([Type.Literal("token"), Type.Literal("password")])),
+  /** Token mode: NAME of the env var holding the session token (loopback) or a pre-minted ticket.
+   *  Required when authMode is "token"; unused in password mode. */
+  tokenEnv: Type.Optional(Type.String({ minLength: 1 })),
+  /** Token mode: which upgrade-URL query parameter the credential rides. Default "token". */
+  authParam: Type.Optional(Type.Union([Type.Literal("token"), Type.Literal("ticket")])),
+  /** Password mode: the dashboard username. Not a secret, so it lives in the config file. */
+  username: Type.Optional(Type.String({ minLength: 1 })),
+  /** Password mode: NAME of the env var holding the dashboard password. The value itself NEVER
+   *  appears in the config file. */
+  passwordEnv: Type.Optional(Type.String({ minLength: 1 })),
+  /** Password mode: which registered dashboard auth provider the login names. "basic" is the
+   *  bundled implementation and the default, not the protocol: a dashboard that registers another
+   *  password provider (an LDAP bind, say) names it here. A provider the dashboard does not know
+   *  answers 404, and the bridge says so by name. */
+  provider: Type.Optional(Type.String({ minLength: 1 })),
+  /** Password mode: HTTP origin of the dashboard, e.g. http://homelab:9119. Defaults to the WS
+   *  URL's origin with ws -> http and wss -> https. */
+  baseUrl: Type.Optional(Type.String({ minLength: 1 })),
+  /** Profile names this gateway keeps off its roster. They remain REAL profiles Hermes-side, and
+   *  every by-name `/bots/:name` route still addresses them; they are only left out of `GET /bots`
+   *  and the `bot_roster` frames. This is for a box whose Hermes also runs automation or service
+   *  profiles that are not bots anybody should chat with. Matched case-insensitively, since Hermes
+   *  stores profile ids lowercase. */
+  hiddenProfiles: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  /** The Hermes profile this bridge's own link runs on. It scopes Dashboard configuration reads
+   *  used by the routine and profile-control surfaces. Optional because Hermes does not expose the
+   *  profile a gateway process was launched under. */
+  profile: Type.Optional(Type.String({ minLength: 1 })),
+  /** Whether `POST /bots` seeds a newly created profile as a BLANK SLATE: the `file` + `terminal`
+   *  toolset floor on the `cozygateway` and `cli` platforms, and `approvals.mode: manual` so the
+   *  bot has to ask before it earns anything else. Default true. Set false to leave created
+   *  profiles on Hermes' broad per-platform defaults. Only ever seeds keys the profile does not
+   *  already have, so it cannot walk back a bot the user has since armed. */
+  seedBlankSlateBots: Type.Optional(Type.Boolean()),
+  /** Skill names a blank-slate bot keeps ON. Default `[]`: skills are gated by a per-profile
+   *  `skills.disabled` OFF-list with no enabled allowlist behind it, so a fresh profile with no
+   *  such list has every installed skill on. The seed writes the profile's own skill catalog minus
+   *  this floor. Autonomy comes from the `file` + `terminal` toolsets, not from playbooks, and a
+   *  skill is one approval (or one tap in the app's skills picker) away. Only read when
+   *  `seedBlankSlateBots` is true, and only written onto a profile that carries no OFF-list yet. */
+  blankSlateSkillsOn: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+  /** The opener an EMPTY bot chat offers a client (capability 11, issue #59). Defaults to the line
+   *  this gateway used to submit by itself, "Hey, tell me about yourself!".
+   *
+   *  It is a SUGGESTION and nothing else: the gateway never submits it, and it enters the
+   *  conversation only if the user chooses to send it as their own message. Set it to the empty
+   *  string to offer nothing at all, which leaves a fresh chat completely bare. */
+  chatSuggestion: Type.Optional(Type.String()),
+  /** Profile id -> one attach identity. Token values live only in the named environment variables. */
+  profiles: Type.Record(
+    Type.String({ minLength: 1 }),
+    Type.Object({
+      tokenEnv: Type.String({ minLength: 1 }),
+      name: Type.Optional(Type.String({ minLength: 1 })),
+      avatar: Type.Optional(Type.String({ minLength: 1 })),
+    }),
+    { minProperties: 1 },
+  ),
+});
+export type HermesBridgeConfig = Static<typeof HermesBridgeConfigSchema>;
+
+export const HermesEndpointConfigSchema = Type.Intersect([
+  HermesBridgeConfigSchema,
+  Type.Object({
+    /** Stable gateway-local namespace. It is part of every app-facing bot id. */
+    id: Type.String({ minLength: 1, maxLength: 48, pattern: "^[a-z0-9][a-z0-9_-]*$" }),
+    /** Optional human label for settings UI; identity never depends on it. */
+    label: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+  }),
+]);
+export type HermesEndpointConfig = Static<typeof HermesEndpointConfigSchema>;
+
+/** Optional gateway-native TLS. Both halves are required together: a cert without a key (or the
+ *  reverse) is a half-configured deployment, not a default, and is refused rather than quietly
+ *  falling back to plaintext. Paths only -- key material never enters the config file. Omitting the
+ *  whole block leaves the gateway on plain HTTP exactly as before, which stays the right default
+ *  for a box that already terminates TLS in a reverse proxy in front of it. */
+const TlsConfigSchema = Type.Object({
+  /** Path to the PEM certificate chain, leaf first. */
+  certFile: Type.String({ minLength: 1 }),
+  /** Path to the matching unencrypted PEM private key. */
+  keyFile: Type.String({ minLength: 1 }),
+});
+export type TlsConfig = Static<typeof TlsConfigSchema>;
+
+const GatewayConfigSchema = Type.Object({
+  name: Type.String({ minLength: 1 }),
+  port: Type.Integer({ minimum: 1, maximum: 65535, default: 8787 }),
+  host: Type.Optional(Type.String({ minLength: 1 })),
+  dbPath: Type.String({ minLength: 1, default: "cozygateway.db" }),
+  /** Optional operator-enforced wall-clock bound in seconds. The default is disabled because
+   *  active agent turns can legitimately run longer than ten minutes while using tools or
+   *  compacting context. A positive value interrupts through the same path as a manual stop.
+   *  Config-file only; not env-driven (see applyEnvOverrides). */
+  turnTimeoutSeconds: Type.Integer({ minimum: 0, default: 0 }),
+  /** Stale-turn reaper. A native Bot Mode turn is durable, so a turn nothing ever terminalizes
+   *  shows as "thinking" on every device until an operator repairs the row by hand. These bound
+   *  that: the sweep interval, the silence allowed after an ACKED interrupt, and the hard ceiling
+   *  of total silence (no drafts, no tool steps, no interim commits -- a working turn is never
+   *  silent). 0 disables the sweep or either reading; omitted leaves the data plane's own
+   *  defaults in force. Config-file only. */
+  staleTurnSweepSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
+  staleTurnInterruptGraceSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
+  staleTurnCeilingSeconds: Type.Optional(Type.Integer({ minimum: 0 })),
+  /** Capability 65. Operator ceiling, in bytes, on the retained Artifact originals this gateway
+   *  holds. A commit or a derivation that would exceed it fails visibly with `capacity` on the
+   *  record rather than reclaiming an original: retention is only ended by an explicit deletion.
+   *  Omitted means the conservative default in artifacts.ts (2 GiB), never an unbounded store,
+   *  because every delivered attachment is now retained as a derived Artifact. Config-file only. */
+  artifactStoreBytes: Type.Optional(Type.Integer({ minimum: 1 })),
+  /** Capability id -> integer version, surfaced verbatim as GatewayInfo.capabilities (contract
+   *  v1.md section 5). Optional; a gateway with nothing to advertise omits it and gets an empty
+   *  map (see server.ts). Ids under com.cozylabs.* are vendor extensions. */
+  capabilities: Type.Optional(Type.Record(Type.String(), Type.Integer({ minimum: 1 }))),
+  /** Private push relay origin used by the authenticated `/push` proxy. The gateway and relay may
+   *  share a Docker network without exposing the relay listener on the public host. */
+  pushRelayUrl: Type.Optional(Type.String({ minLength: 1 })),
+  /** HTTPS origin advertised to phones when a user-managed tunnel or reverse proxy fronts the
+   *  gateway. Presence is a deployment posture, not merely display text: the listener must remain
+   *  on exact loopback so the public proxy is the only network path into the plaintext origin. */
+  publicUrl: Type.Optional(Type.String({ minLength: 1 })),
+  /** Hermes runtimes. Profile ids are bare for one endpoint and namespaced for multiple.
+   *  Optional: absent and empty mean the same thing, no Hermes bridge, and `/ready` then reports
+   *  the bridge as `absent` rather than degraded. Such a gateway serves no bots. */
+  hermesEndpoints: Type.Optional(Type.Array(HermesEndpointConfigSchema, { maxItems: 32 })),
+  tls: Type.Optional(TlsConfigSchema),
+  /** Dashboard packet D2. The observation ring: a seven day series and events store fed by the
+   *  timing the gateway already computes on every turn, heartbeat and sweep.
+   *
+   *  OFF BY DEFAULT, and off means off: with `enabled` false no writer fires, no timing state is
+   *  kept in memory, and the two tables stay empty, so a gateway that never turns it on behaves
+   *  exactly as it did before the ring existed. An operator opts in to a store of durations and
+   *  counts about their own machine; nobody opts them in.
+   *
+   *  `retentionDays` bounds the ring rather than the disk: the nightly trim deletes anything
+   *  older. Effective retention is capped at 14 days; longer legacy values still load.
+   *  Config-file only, following turnTimeoutSeconds and artifactStoreBytes above. */
+  observability: Type.Optional(Type.Object({
+    enabled: Type.Boolean({ default: false }),
+    retentionDays: Type.Integer({ minimum: 1, maximum: 365, default: 7 }),
+    prices: Type.Optional(Type.Record(Type.String(), Type.Object({
+      inputPerMillion: Type.Optional(Type.Number({ minimum: 0 })),
+      cachedInputPerMillion: Type.Optional(Type.Number({ minimum: 0 })),
+      outputPerMillion: Type.Optional(Type.Number({ minimum: 0 })),
+    }, { additionalProperties: false }))),
+  })),
+});
+export type GatewayConfig = Static<typeof GatewayConfigSchema>;
+
+export interface ResolvedHermesEndpoint {
+  id: string;
+  label: string | undefined;
+  namespace: boolean;
+  config: HermesBridgeConfig;
+}
+
+export function hermesEndpoints(config: GatewayConfig): ResolvedHermesEndpoint[] {
+  const configured = config.hermesEndpoints ?? [];
+  const namespace = configured.length > 1;
+  return configured.map(({ id, label, ...endpoint }) => ({
+    id,
+    label,
+    namespace,
+    config: endpoint,
+  }));
+}
+
+export function publicProfileId(endpoint: ResolvedHermesEndpoint, profile: string): string {
+  const normalized = profile.trim().toLowerCase();
+  return endpoint.namespace ? `${endpoint.id}:${normalized}` : normalized;
+}
+
+/** Dashboard packet D2. The observation ring's settings with the omitted case spelled out, so no
+ *  caller has to remember that "no `observability` section" and "`enabled: false`" are the same
+ *  posture. An operator who writes the section but omits a field gets the schema default. */
+export function observability(config: GatewayConfig): { enabled: boolean; retentionDays: number } {
+  const configured = config.observability;
+  return {
+    enabled: configured?.enabled ?? false,
+    // Accept legacy config values, but diagnostic history never outlives the 14-day policy.
+    retentionDays: Math.min(configured?.retentionDays ?? 7, 14),
+  };
+}
+
+const LOOPBACK_LISTENERS = new Set(["127.0.0.1", "::1", "localhost"]);
+
+/** Validate and canonicalize the one public-deployment interface. Kept here so config files,
+ * programmatic hosts, CLI pairing, and startup all share the same invariant rather than each
+ * learning a slightly different definition of an HTTPS origin. */
+export function validatePublicDeployment(config: GatewayConfig): GatewayConfig {
+  if (config.publicUrl === undefined) return config;
+  if (/[\u0000-\u0020\u007f]/.test(config.publicUrl)) {
+    throw new ContractViolation("publicUrl must be a strict HTTPS origin", "/publicUrl");
+  }
+  const isOriginSyntax = /^https:\/\/[^/?#]+\/?$/i.test(config.publicUrl);
+  let url: URL;
+  try {
+    url = new URL(config.publicUrl);
+  } catch {
+    throw new ContractViolation("publicUrl must be a strict HTTPS origin", "/publicUrl");
+  }
+  if (
+    !isOriginSyntax ||
+    url.protocol !== "https:" ||
+    url.hostname === "" ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.pathname !== "/" ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
+    throw new ContractViolation("publicUrl must be a strict HTTPS origin", "/publicUrl");
+  }
+  const listener = config.host ?? "127.0.0.1";
+  if (!LOOPBACK_LISTENERS.has(listener.toLowerCase())) {
+    throw new ContractViolation(
+      "publicUrl requires an exact loopback listener (127.0.0.1, ::1, or localhost)",
+      "/host",
+    );
+  }
+  return url.origin === config.publicUrl ? config : { ...config, publicUrl: url.origin };
+}
+
+/** Said once at `serve` when a config still carries a `bots` block. */
+export const IGNORED_BOTS_BLOCK_WARNING =
+  "cozygateway: ignoring the config's `bots` block. cozygateway connects Hermes bots and hosts no CozyAgents runtime bots; CozyAgents bots attach to CozyAgents' bundled gateway. Remove the block to silence this.";
+
+export function loadConfig(path: string, warn: (message: string) => void = () => {}): GatewayConfig {
+  const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
+  const withDefaults =
+    typeof raw === "object" && raw !== null
+      ? { port: 8787, dbPath: "cozygateway.db", turnTimeoutSeconds: 0, ...raw }
+      : raw;
+  // Removed shapes are refused BY NAME rather than ignored. An absent `hermesEndpoints` is valid,
+  // so a config still carrying the old top-level `hermes` block would otherwise start silently
+  // with no Hermes at all.
+  if (typeof withDefaults === "object" && withDefaults !== null && "hermes" in withDefaults)
+    throw new ContractViolation(
+      "the top-level `hermes` block was replaced by `hermesEndpoints`; move it there, or remove it for a gateway with no Hermes",
+      "/hermes",
+    );
+  // A `bots` block named CozyAgents runtime bots, which this gateway stopped hosting in 0.8.6. Read
+  // by nothing, it left each such peer refused `1008` forever (ADR 0086). `cozyagents init` told
+  // people to paste one here through v0.2.17, so refusing it would stop an upgraded gateway from
+  // starting at all. It is dropped and named instead.
+  if (typeof withDefaults === "object" && withDefaults !== null && "bots" in withDefaults) {
+    delete (withDefaults as Record<string, unknown>).bots;
+    warn(IGNORED_BOTS_BLOCK_WARNING);
+  }
+  const config = validatePublicDeployment(assertValid(GatewayConfigSchema, withDefaults) as GatewayConfig);
+  const endpointIds = new Set<string>();
+  for (const endpoint of config.hermesEndpoints ?? []) {
+    if (endpointIds.has(endpoint.id))
+      throw new ContractViolation(`duplicate Hermes endpoint id "${endpoint.id}"`, "/hermesEndpoints");
+    endpointIds.add(endpoint.id);
+  }
+  const seen = new Set<string>();
+  for (const endpoint of hermesEndpoints(config)) {
+    for (const rawProfile of Object.keys(endpoint.config.profiles)) {
+      const profile = publicProfileId(endpoint, rawProfile);
+      if (profile.length === 0) {
+        throw new ContractViolation("Hermes profile ids must not be blank", "/hermesEndpoints/profiles");
+      }
+      if (seen.has(profile)) {
+        throw new ContractViolation(`duplicate Hermes profile id "${profile}"`, "/hermesEndpoints/profiles");
+      }
+      seen.add(profile);
+    }
+  }
+  return config;
+}
+
+function replaceConfigBytes(path: string, contents: string | NodeJS.ArrayBufferView): void {
+  const mode = statSync(path).mode & 0o777;
+  const temp = join(dirname(path), `.cozygateway.config.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(temp, contents, { mode });
+    chmodSync(temp, mode);
+    renameSync(temp, path);
+  } catch (error) {
+    try { unlinkSync(temp); } catch { /* nothing was written */ }
+    throw error;
+  }
+}
+
+/** Proves the source file can be read, validated, and atomically replaced without changing its
+ * bytes. Replacing the actual target is intentional: a writable single-file bind mount can allow
+ * sibling files yet still reject rename-over-target with EBUSY. */
+export function probeConfigPersistence(path: string): void {
+  loadConfig(path);
+  const contents = readFileSync(path);
+  replaceConfigBytes(path, contents);
+  loadConfig(path);
+}
+
+/** Atomic, permission-preserving whole-file replacement used by the authenticated management API. */
+export function saveConfig(path: string, config: GatewayConfig): void {
+  replaceConfigBytes(path, `${JSON.stringify(config, null, 2)}\n`);
+}
+
+/** Apply container-friendly environment overrides on top of a loaded config. Returns a new object;
+ *  the input is not mutated. */
+const nonEmpty = (value: string | undefined): string | undefined =>
+  value !== undefined && value.length > 0 ? value : undefined;
+
+export function applyEnvOverrides(
+  config: GatewayConfig,
+  env: Record<string, string | undefined>,
+): GatewayConfig {
+  const next: GatewayConfig = { ...config };
+  const host = env["COZYGATEWAY_HOST"];
+  if (host !== undefined && host.length > 0) next.host = host;
+  const portRaw = env["COZYGATEWAY_PORT"];
+  if (portRaw !== undefined && portRaw.length > 0) {
+    const port = Number(portRaw);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error(`invalid COZYGATEWAY_PORT "${portRaw}"`);
+    }
+    next.port = port;
+  }
+  const dbPath = env["COZYGATEWAY_DB_PATH"];
+  if (dbPath !== undefined && dbPath.length > 0) next.dbPath = dbPath;
+  const pushRelayUrl = env["COZYGATEWAY_PUSH_RELAY_URL"];
+  if (pushRelayUrl !== undefined && pushRelayUrl.length > 0) next.pushRelayUrl = pushRelayUrl;
+  // Container-friendly single-runtime target override. Credentials remain in the named env vars.
+  const hermesUrl = env["COZYGATEWAY_HERMES_URL"];
+  if (hermesUrl !== undefined && hermesUrl.length > 0 && next.hermesEndpoints?.length === 1) {
+    next.hermesEndpoints = [{ ...next.hermesEndpoints[0]!, url: hermesUrl }];
+  }
+  // Gateway-native TLS, container-friendly: the paths ride the environment so a compose file can
+  // mount certs and switch the listener without a config-file edit. Only PATHS -- the key material
+  // stays on the mounted volume. Empty strings are treated as unset, matching the other overrides,
+  // so a compose file that always exports `COZY_TLS_CERT_FILE: "${COZY_TLS_CERT_FILE:-}"` does not
+  // accidentally half-configure TLS.
+  const certFile = nonEmpty(env["COZY_TLS_CERT_FILE"]);
+  const keyFile = nonEmpty(env["COZY_TLS_KEY_FILE"]);
+  if (certFile !== undefined || keyFile !== undefined) {
+    const resolvedCert = certFile ?? next.tls?.certFile;
+    const resolvedKey = keyFile ?? next.tls?.keyFile;
+    // Half-configured is refused rather than dropped back to plaintext: an operator who set one
+    // half meant to serve TLS, and a silent fallback would put an unencrypted listener on the port
+    // they believed was encrypted.
+    if (resolvedCert === undefined || resolvedKey === undefined) {
+      throw new Error(
+        "TLS is half-configured: set BOTH COZY_TLS_CERT_FILE and COZY_TLS_KEY_FILE (or neither, " +
+          "to serve plain HTTP behind a reverse proxy)",
+      );
+    }
+    next.tls = { certFile: resolvedCert, keyFile: resolvedKey };
+  }
+  return next;
+}
+
+export function observabilityPrices(config: GatewayConfig): import("./observe/prices.ts").ObservePriceSheet {
+  return config.observability?.prices ?? {};
+}

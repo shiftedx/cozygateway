@@ -1,0 +1,202 @@
+# Self-hosting CozyGateway with Docker
+
+The Docker image is a Hermes-only CozyGateway. It contains no sample bot, mock backend, or Hermes
+Dashboard. You mount a real Hermes configuration and pass its credentials separately. This keeps
+the Dashboard control plane private while CozyGateway exposes only the phone-facing gateway.
+
+For the normal host install, use the one-line installer instead. Docker is the advanced-operator
+path for a machine that already runs Hermes and can give the gateway private reachability to its
+Dashboard.
+
+## Prepare the two operator files
+
+Copy the Compose settings and the configuration template:
+
+```sh
+cp .env.example .env
+mkdir -p local/config local/secrets
+cp docker/cozygateway.config.example.json local/config/cozygateway.config.json
+sudo chown -R 1000:1000 local/config
+chmod 750 local/config
+chmod 640 local/config/cozygateway.config.json
+```
+
+The image runs as the `node` user (UID 1000), which must be able to create a sibling temporary file
+in `local/config` and rename it over the configuration. That directory is mounted writable so
+authenticated gateway renames remain atomic and survive restarts. Do not replace it with a
+single-file bind mount: Docker cannot atomically replace a bind-mounted file. Keep secrets in the
+separate `local/secrets` directory, which is not mounted into the container.
+
+Edit `local/config/cozygateway.config.json`. It is the one canonical runtime shape: a `hermes` control
+connection plus one or more attach-v1 `profiles`. It contains environment variable names, never
+credential values.
+
+```json
+{
+  "name": "cozygateway",
+  "host": "0.0.0.0",
+  "port": 8787,
+  "dbPath": "/data/cozygateway.db",
+  "hermesEndpoints": [{
+    "id": "default",
+    "url": "ws://hermes:9119/api/ws",
+    "authMode": "password",
+    "username": "cozybridge",
+    "passwordEnv": "COZYGATEWAY_HERMES_PASSWORD",
+    "baseUrl": "http://hermes:9119",
+    "profiles": {
+      "sage": { "name": "Sage", "tokenEnv": "COZYGATEWAY_ATTACH_TOKEN_SAGE" }
+    }
+  }]
+}
+```
+
+Use a service name such as `hermes` when the Dashboard is on a private Compose network. The shipped
+template uses `host.docker.internal` for a Dashboard deliberately reachable on the Docker host;
+Compose adds the Linux `host-gateway` mapping. A Dashboard bound only to host loopback is not
+reachable from an ordinary bridge container: put it on a private Docker network or bind it to a
+private host interface. Never publish the Dashboard port to the internet.
+
+Create the secret environment file named in `.env`; restrict it to the variables referenced by the
+config:
+
+```sh
+umask 077
+cat > local/secrets/cozygateway.env <<'EOF'
+COZYGATEWAY_HERMES_PASSWORD='replace-with-the-dashboard-password'
+COZYGATEWAY_ATTACH_TOKEN_SAGE='replace-with-Sage-attach-token'
+EOF
+chmod 600 local/secrets/cozygateway.env
+```
+
+If an environment value contains `$`, single-quote it in this file so Compose keeps it literal.
+For token-based Dashboard auth instead, replace the password fields with
+`"tokenEnv": "COZYGATEWAY_HERMES_TOKEN"` and add that variable to the secret file. See
+[`packages/gateway/README.md`](../packages/gateway/README.md) for the control-auth variants.
+
+## Chat activity and diagnostic retention
+
+Completed tool activity keeps full detail for seven days, then only the tool name, outcome,
+ordering, and timing. Completed summaries expire after 14 days. Active work and turns without
+terminal evidence remain protected. Applied transport copies lose expendable payload content after
+14 days, while cursor identities and delivery/media/task proofs remain available for recovery.
+Chat messages, files, and unresolved approvals are preserved.
+
+Hermes expires ACKed draft/tool/thinking and terminal copies older than 14 days. It retains raw
+media, interaction, scheduled-delivery and other specialized payloads needed by its recovery paths.
+Processed command bodies and tiny replay identities are not covered by this event-payload cleanup.
+The existing attach heartbeat runs one small harness cleanup pass after responding, with no extra
+watchdog. A cleanup error is logged without interrupting the connection.
+
+Maintenance runs in small batches every 15 seconds, so a large old backlog drains gradually.
+SQLite reuses freed pages; cleanup does not run a blocking `VACUUM` or immediately shrink the
+database file. Diagnostic observations default to seven days and are capped at 14 days even when
+an older configuration requests more.
+
+The reference Compose deployment rotates stdout/stderr through three 10 MB files per container,
+with a 1 MB nonblocking log-delivery buffer. Overflow drops diagnostic log lines, not durable chat.
+Docker's local driver limits bytes and file count, not age; a quiet old log may remain past 14 days.
+Configure a 14-day expiry in any external collector or host/Hermes log manager. Do not manually
+delete Docker-owned log files. Logging changes apply when containers are recreated through the
+normal release process. [Docker logging options](https://docs.docker.com/engine/logging/drivers/local/)
+
+## Artifact retention and the store ceiling
+
+From capability 65 the gateway keeps a durable Artifact record for every file a bot delivers,
+including files from bots that know nothing about Artifacts: the record points at the bytes the
+gateway already stored, and those bytes are retained until the Artifact is explicitly deleted.
+
+This changes retention for attachments that previously expired. Before 65 a producer could stage an
+attachment with an expiry and the gateway reclaimed it; now a delivered attachment is retained, so a
+bot that sends a screenshot every turn accumulates bytes in the SQLite store instead of
+self-pruning. Deleting the message or the conversation does not reclaim them. Deleting the Artifact
+does, and so does deleting the owning bot.
+
+The store is bounded. `artifactStoreBytes` in the config file is the ceiling, in bytes, on retained
+Artifact originals, and it defaults to 2 GiB when omitted:
+
+```json
+{
+  "name": "cozygateway",
+  "dbPath": "/data/cozygateway.db",
+  "artifactStoreBytes": 5368709120
+}
+```
+
+Over the ceiling nothing is deleted and nothing is silently dropped: the record is written with
+`state: "commit_failed"` and `failureReason: "capacity"`, binds no bytes, and shows up in the bot's
+artifact list, while the attachment keeps exactly the retention it already had. Raising the ceiling
+lets the next delivery of that attachment retain it for real. Size the value against the disk behind
+`dbPath`, and remember each stored object counts once no matter how many records name it.
+
+## Start and pair
+
+```sh
+docker compose up --build -d
+docker compose exec gateway node dist/cli.js pair \
+  --config /config/cozygateway.config.json \
+  --url https://gateway.example.net
+```
+
+The `--url` value is the exact origin CozyChat receives. Omit it only for a local/LAN setup where
+the loopback default is intentionally correct. The gateway itself is the only service published by
+the default Compose file, and it is published on `127.0.0.1:8787` only; its SQLite state is in
+`gateway-data`. To deliberately expose plaintext on a trusted LAN, compose the LAN overlay:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d
+```
+
+Do not use that overlay for an internet-facing deployment. Use one of the TLS overlays below and
+pair using its HTTPS origin instead.
+
+The Hermes attach plugin for every configured profile points at the gateway's reachable origin and
+uses that profile's `tokenEnv` value. The profile list drives both regular conversations and Bot
+Mode; there is no second agent backend to configure.
+
+For a direct `docker run`, the same rule applies: mount the config and supply the secret file.
+
+```sh
+docker build -f packages/gateway/Dockerfile -t cozygateway .
+docker run --rm -p 8787:8787 \
+  --add-host host.docker.internal:host-gateway \
+  --env-file ./local/secrets/cozygateway.env \
+  -v "$PWD/local/config:/config:rw" \
+  -v gateway-data:/data \
+  cozygateway
+```
+
+## Connectivity and TLS
+
+The gateway's `8787` listener is the phone-facing surface. Keep the Hermes Dashboard private; it
+is a control-plane dependency, not a public service. Choose your own reachability method for the
+gateway (private LAN, Tailscale, or a Cloudflare Tunnel with a domain) and advertise that origin at
+pair time. [`docs/connectivity.md`](connectivity.md) covers those choices and their security
+boundaries.
+
+For HTTPS termination, compose either overlay on the base file:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.tls-caddy.yml up -d
+docker compose -f docker-compose.yml -f docker-compose.tls-native.yml up -d
+```
+
+The Caddy overlay publishes only Caddy on `80`/`443`; the gateway remains private on the Compose
+network. The native overlay mounts a PEM certificate and key set by `COZY_TLS_CERT_HOST_PATH` and
+`COZY_TLS_KEY_HOST_PATH`; combine it with `docker-compose.lan.yml` when the TLS listener needs to
+be reachable off-host. See [`docs/tls.md`](tls.md) for certificate expectations and CozyChat's
+trust-on-first-use behavior.
+
+## Push relay
+
+By default, authenticated `/push` requests use `https://push.cozylabs.ai` with encrypted payloads.
+The optional `local-push` profile is only for developers with an app signed by their own Apple team:
+
+```sh
+COZYGATEWAY_PUSH_RELAY_URL=http://relay:8788 \
+  docker compose --profile local-push up --build -d
+```
+
+Set all APNs fields in `.env` and mount the `.p8` key as documented in `docker-compose.yml`; keep
+the relay private to the Compose network. A self-hosted relay cannot send push notifications for
+the store app because APNs credentials belong to its publisher team.
