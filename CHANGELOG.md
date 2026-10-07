@@ -4,6 +4,16 @@ CozyGateway is pre-1.0. Each minor series below groups the tags that shipped it;
 a series are fixes to the series' own changes. Release notes for each published version live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases).
 
+## Unreleased
+
+- Repair preserves operator-owned gateway and Hermes endpoint settings, including
+  profile presentation and independently configured endpoints, while refreshing
+  the managed connection and selected profile credentials. Invalid saved config
+  shapes are refused before the installer replaces the file.
+- The Windows installer gate also runs the native bootstrap lock, transaction,
+  Dashboard ownership and persisted state identity suites. Native transaction
+  coverage rejects junction escapes before changing assets or outside files.
+
 ## 0.9.1 (2026-10-05): maintenance
 
 A maintenance release with no behavior changes. Update with `cozygateway repair`; profiles,

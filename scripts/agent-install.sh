@@ -564,8 +564,10 @@ try {
   const names = recorded.split(',');
   if (new Set(names).size !== names.length) throw Error('duplicate profiles');
   const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-  if (!Array.isArray(config.hermesEndpoints) || config.hermesEndpoints.length !== 1) throw Error('endpoint');
-  const profiles = config.hermesEndpoints[0].profiles;
+  if (!Array.isArray(config.hermesEndpoints)) throw Error('endpoint');
+  const managed = config.hermesEndpoints.filter(endpoint => endpoint.id === 'default');
+  if (managed.length !== 1) throw Error('endpoint');
+  const profiles = managed[0].profiles;
   if (!profiles || Array.isArray(profiles) || typeof profiles !== 'object' || Object.keys(profiles).some(name => !names.includes(name))) throw Error('unrecorded profiles');
   const env = parseEnv(fs.readFileSync(envPath, 'utf8'));
   const survivors = [];
@@ -1600,13 +1602,26 @@ const profiles = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
 let existing = {};
 try {
   existing = JSON.parse(fs.readFileSync(output, 'utf8'));
-  if (existing === null || Array.isArray(existing) || typeof existing !== 'object') existing = {};
+  if (existing === null || Array.isArray(existing) || typeof existing !== 'object') {
+    throw new Error('saved gateway configuration must be an object');
+  }
 } catch (error) {
   if (error.code !== 'ENOENT') throw error;
 }
+if (existing.hermesEndpoints !== undefined && !Array.isArray(existing.hermesEndpoints)) {
+  throw new Error('saved hermesEndpoints must be an array');
+}
+const endpoints = existing.hermesEndpoints ?? [];
+const previous = endpoints.find(endpoint => endpoint.id === 'default') ?? {};
+const endpoint = { ...previous, id: 'default', url: `ws://127.0.0.1:${dashboardPort}/api/ws`, authMode: 'token', tokenEnv: 'COZYGATEWAY_HERMES_TOKEN', profile: 'default', profiles: Object.fromEntries(
+  Object.entries(profiles).map(([id, managedProfile]) => [id, { ...previous.profiles?.[id], ...managedProfile }]),
+) };
+for (const key of ['authParam', 'username', 'passwordEnv', 'provider', 'baseUrl']) delete endpoint[key];
 const managed = {
-  name: 'cozygateway', host, port: Number(port), dbPath, ...(publicUrl === '' ? {} : { publicUrl }),
-  hermesEndpoints: [{ id: 'default', url: `ws://127.0.0.1:${dashboardPort}/api/ws`, authMode: 'token', tokenEnv: 'COZYGATEWAY_HERMES_TOKEN', profile: 'default', profiles }],
+  name: existing.name ?? 'cozygateway', host, port: Number(port), dbPath: existing.dbPath ?? dbPath, ...(publicUrl === '' ? {} : { publicUrl }),
+  hermesEndpoints: endpoints.some(endpoint => endpoint.id === 'default')
+    ? endpoints.map(previous => previous.id === 'default' ? endpoint : previous)
+    : [endpoint, ...endpoints],
 };
 delete existing.publicUrl;
 if (existing.pushRelayUrl === undefined) managed.pushRelayUrl = pushRelayUrl;

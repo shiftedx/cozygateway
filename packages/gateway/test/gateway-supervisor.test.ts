@@ -41,7 +41,7 @@ require('node:child_process').spawn = () => {
     "--maintenance-worker", "unused",
     "--database", "unused",
   ], {
-    env: { ...process.env, NODE_OPTIONS: `--require=${preload}`, COZYGATEWAY_SPAWN_LOG: log },
+    env: { ...process.env, NODE_OPTIONS: `--require=${JSON.stringify(preload)}`, COZYGATEWAY_SPAWN_LOG: log },
     timeout: 10_000,
   })).rejects.toMatchObject({ code: 1 });
   expect((await readFile(log, "utf8")).trim().split("\n")).toHaveLength(4);
@@ -55,6 +55,7 @@ test("supervisor starts its preferred-port Dashboard isolated from a machine bac
   const bundle = join(directory, "bundle.cjs");
   const hermes = join(directory, "hermes");
   const log = join(directory, "hermes.log");
+  const preload = join(directory, "preload.cjs");
   const port = await new Promise<number>((done) => {
     const server = createServer().listen(0, "127.0.0.1", () => {
       const { port } = server.address() as AddressInfo;
@@ -79,6 +80,17 @@ const server = require('node:http').createServer((request, response) => {
 }).listen(Number(args[args.indexOf('--port') + 1]), '127.0.0.1');
 `);
   await chmod(hermes, 0o700);
+  // Windows cannot execute a shebang fixture. Keep the supervisor's real launch
+  // and readiness paths, adapting only this fixture to the host Node executable.
+  await writeFile(preload, `
+const processes = require('node:child_process');
+for (const name of ['spawn', 'spawnSync']) {
+  const original = processes[name];
+  processes[name] = (command, args, options) => command === ${JSON.stringify(hermes)}
+    ? original(process.execPath, [command, ...args], options)
+    : original(command, args, options);
+}
+`);
 
   const { stderr } = await execFileAsync(process.execPath, [
     resolve("../..", "scripts/gateway-supervisor.cjs"),
@@ -95,7 +107,7 @@ const server = require('node:http').createServer((request, response) => {
     "--hermes-launcher", hermes,
     "--owner-helper", "unused",
     "--dashboard-port", String(port),
-  ], { timeout: 10_000 });
+  ], { timeout: 10_000, env: { ...process.env, NODE_OPTIONS: `--require=${JSON.stringify(preload)}` } });
   expect(stderr).toBe("");
   const launches = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[])
     .filter((args) => !args.includes("--help"));

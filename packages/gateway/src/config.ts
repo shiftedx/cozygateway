@@ -274,7 +274,7 @@ export function loadConfig(path: string, warn: (message: string) => void = () =>
   for (const endpoint of hermesEndpoints(config)) {
     for (const rawProfile of Object.keys(endpoint.config.profiles)) {
       const profile = publicProfileId(endpoint, rawProfile);
-      if (profile.length === 0) {
+      if (rawProfile.trim().length === 0) {
         throw new ContractViolation("Hermes profile ids must not be blank", "/hermesEndpoints/profiles");
       }
       if (seen.has(profile)) {

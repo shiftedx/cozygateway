@@ -1507,21 +1507,6 @@ function Get-PersistedRepairMode {
     if ($line -eq 'repair_mode=runtime-only') { return 'runtime-only' }
     return $null
 }
-function Get-PersistedRepairProfiles {
-    param([string] $StatePath)
-    if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
-        Fail 'repair metadata is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 | iex'
-    }
-    $line = (Get-Content -LiteralPath $StatePath | Where-Object { $_ -like 'profiles=*' } | Select-Object -Last 1)
-    if ($null -eq $line) {
-        Fail 'repair metadata is invalid. Reinstall with: irm https://cozylabs.ai/install.ps1 | iex'
-    }
-    $profiles = $line.Substring(9)
-    if ([string]::IsNullOrWhiteSpace($profiles) -or $profiles -notmatch '^(?:default|[A-Za-z0-9][A-Za-z0-9._-]{0,63})(?:,(?:default|[A-Za-z0-9][A-Za-z0-9._-]{0,63}))*$') {
-        Fail 'repair metadata is invalid. Reinstall with: irm https://cozylabs.ai/install.ps1 | iex'
-    }
-    return $profiles
-}
 
 # Windows ignores POSIX modes. Restrict this generated configuration to the
 # invoking user and SYSTEM instead of leaving inherited readable ACLs behind.
@@ -2438,7 +2423,6 @@ if ($Repair) {
     if ($repairMode -eq 'runtime-only') {
         Write-Info 'repair refreshes verified runtime assets, then restarts CozyGateway'
     } else {
-        $InstallerArguments = @('--profiles', (Get-PersistedRepairProfiles $statePath)) + @($InstallerArguments)
         Write-Info 'repair refreshes verified runtime and plugin assets, then restarts CozyGateway and Hermes attachment'
     }
 }
@@ -2523,12 +2507,12 @@ try {
     $bash = Resolve-GitBash $env:COZYGATEWAY_GIT_BASH
     $listener = @(Select-Listener $alreadyConfigured $InstallerArguments)
     if ($alreadyConfigured) { $listener += '--no-qr' }
-    # The same profile scope is preserved for regular reruns and repair.
+    # The shared installer hydrates saved profile scope, including all-profile
+    # discovery and cleanup of profiles that no longer exist. Only an operator
+    # supplied --profiles argument should override that state.
     if ($alreadyConfigured -and -not $Repair -and $InstallerArguments -notcontains '--profiles') {
         if ((Get-PersistedRepairMode $statePath) -eq 'runtime-only') {
             if ($InstallerArguments -notcontains '--runtime-only') { $InstallerArguments = @('--runtime-only') + @($InstallerArguments) }
-        } elseif (Test-Path -LiteralPath $statePath -PathType Leaf) {
-            $InstallerArguments = @('--profiles', (Get-PersistedRepairProfiles $statePath)) + @($InstallerArguments)
         }
     }
     New-Item -ItemType Directory -Force -Path $bin | Out-Null

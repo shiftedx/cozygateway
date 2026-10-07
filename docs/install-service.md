@@ -88,6 +88,12 @@ or repeat the one-paste line when the installed command itself is damaged. Both
 paths fetch and verify one matched release while preserving the recorded profile
 scope and operator-owned gateway settings.
 
+Repair keeps the gateway name, database path, independent Hermes endpoints, and
+the managed `default` endpoint's label, roster visibility, chat suggestion, blank-slate
+settings, and selected profiles' names and avatars. It refreshes that endpoint's
+Dashboard URL, authentication, and selected profile membership and token references.
+Saved listener and public-origin settings change only with explicit installer flags.
+
 ## Uninstall
 
 The same command works in Terminal on macOS/Linux and PowerShell on Windows:
