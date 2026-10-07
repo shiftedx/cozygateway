@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -11,12 +12,13 @@ from pathlib import Path
 
 from cozygateway.adapter import AttachAdapter
 from cozygateway.chat_execution import ChatExecutionBootstrapError, prepare_execution
+from cozygateway.private_files import assert_private_fd, write_private_text
 
 
 class ChatExecutionBootstrapTests(unittest.TestCase):
     def _spec(self, directory: Path, workspace: Path) -> Path:
         path = directory / "execution.json"
-        path.write_text(json.dumps({
+        write_private_text(path, json.dumps({
             "executionId": "chatx_0123456789abcdef0123456789abcdef",
             "sourceBotId": "source-bot",
             "sessionId": "session-1",
@@ -28,8 +30,7 @@ class ChatExecutionBootstrapTests(unittest.TestCase):
             "model": {"id": "example-model", "endpoint": "https://models.example.test/v1"},
             "transferRequired": True,
             "healthPort": 19091,
-        }), encoding="utf-8")
-        path.chmod(0o600)
+        }))
         return path
 
     def test_prepares_isolated_home_plugin_persona_and_single_session_environment(self) -> None:
@@ -54,8 +55,11 @@ class ChatExecutionBootstrapTests(unittest.TestCase):
             self.assertTrue((plan.home / "plugins" / "cozygateway" / "plugin.yaml").is_file())
             self.assertEqual((plan.home / "SOUL.md").read_text(encoding="utf-8"), "# Source persona")
             self.assertNotIn("private-attach-token", (plan.home / "config.yaml").read_text(encoding="utf-8"))
-            self.assertEqual(stat.S_IMODE((plan.home / "config.yaml").stat().st_mode), 0o600)
-            self.assertEqual(stat.S_IMODE((plan.home / "SOUL.md").stat().st_mode), 0o600)
+            for name in ("config.yaml", "SOUL.md"):
+                with (plan.home / name).open("rb") as handle:
+                    assert_private_fd(handle.fileno())
+                if os.name != "nt":
+                    self.assertEqual(stat.S_IMODE((plan.home / name).stat().st_mode), 0o600)
             config = (plan.home / "config.yaml").read_text(encoding="utf-8")
             self.assertIn("skills:", config)
             self.assertIn("platform_toolsets:", config)
@@ -94,12 +98,19 @@ class ChatExecutionBootstrapTests(unittest.TestCase):
         adapter._execution_session_id = None
         self.assertTrue(adapter._execution_thread_allowed("session-2"))
 
-    def test_rejects_symlink_execution_spec(self) -> None:
+    def test_rejects_linked_execution_spec_or_reparse_parent(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             workspace = root / "workspace"; workspace.mkdir()
             target = self._spec(root, workspace)
-            linked = root / "linked.json"; linked.symlink_to(target)
+            if os.name == "nt":
+                source = root / "source"; source.mkdir()
+                target.replace(source / "execution.json")
+                linked_dir = root / "linked"
+                subprocess.run(["cmd", "/c", "mklink", "/J", str(linked_dir), str(source)], check=True, capture_output=True)
+                linked = linked_dir / "execution.json"
+            else:
+                linked = root / "linked.json"; linked.symlink_to(target)
             with self.assertRaisesRegex(ChatExecutionBootstrapError, "unreadable"):
                 prepare_execution(linked)
 
@@ -108,7 +119,14 @@ class ChatExecutionBootstrapTests(unittest.TestCase):
             root = Path(raw)
             workspace = root / "workspace"; workspace.mkdir()
             path = self._spec(root, workspace)
-            path.chmod(0o644)
+            if os.name == "nt":
+                # Add a real Everyone read grant; POSIX mode bits do not describe
+                # Windows confidentiality. The loader must inspect the native DACL.
+                script = "$ErrorActionPreference='Stop'; $p=$env:COZYGATEWAY_TEST_SPEC; $a=[System.Security.AccessControl.FileSecurity]::new(); $a.SetAccessRuleProtection($true,$false); $a.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.WindowsIdentity]::GetCurrent().User,'FullControl','Allow')); $a.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),'Read','Allow')); [System.IO.File]::SetAccessControl($p,$a)"
+                env = {**os.environ, "COZYGATEWAY_TEST_SPEC": str(path), "PSModulePath": str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/Modules")}
+                subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", "-"], input=script, text=True, env=env, check=True, capture_output=True)
+            else:
+                path.chmod(0o644)
             with self.assertRaisesRegex(ChatExecutionBootstrapError, "must not"):
                 prepare_execution(path)
 

@@ -13,6 +13,15 @@ a series are fixes to the series' own changes. Release notes for each published 
 - The Windows installer gate also runs the native bootstrap lock, transaction,
   Dashboard ownership and persisted state identity suites. Native transaction
   coverage rejects junction escapes before changing assets or outside files.
+- Hermes provider credentials and execution files use flushed atomic writes with
+  private native Windows ACLs; permission failures preserve the original file
+  and release temporary handles. Execution specifications reject shared access
+  and linked paths while retaining standard macOS system-directory aliases.
+- WebP media declarations are consistent across host MIME registries, and real
+  Windows read-permission failures are reported as unreadable, including cached
+  media. Integration tests close SQLite handles before cleanup and verify upload
+  concurrency without depending on machine speed.
+- Personal home examples in source and fixtures use generic operator paths.
 
 ## 0.9.1 (2026-10-05): maintenance
 

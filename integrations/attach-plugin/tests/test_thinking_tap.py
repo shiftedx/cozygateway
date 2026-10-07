@@ -32,7 +32,7 @@ class SanitizeThinkingTests(unittest.TestCase):
 
     def test_redacts_paths_credentials_and_code_spans(self):
         raw = (
-            "open /Users/kyle/Secrets/notes.txt then home ~/Documents/repos/x and call with "
+            "open /Users/operator/Secrets/notes.txt then home ~/Documents/repos/x and call with "
             "api_key=sk_live_abcdefghijklmnop123456 plus `rm -rf /tmp/x` and "  # gitleaks:allow
             '```json {"arg": "secret-value"} ``` then Authorization: Bearer abc.def.ghi'
         )
