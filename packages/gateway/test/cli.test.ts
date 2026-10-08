@@ -85,6 +85,27 @@ async function statusLinesForHealth(health: unknown): Promise<string[]> {
   }
 }
 
+describe("read-only configuration validation", () => {
+  it("validates without changing configuration, creating storage, or starting services", async () => {
+    const { configPath, dbPath } = tempConfig();
+    const before = readFileSync(configPath, "utf8");
+    const runtime = { restartHermesProfile: vi.fn(), waitForGatewayReady: vi.fn() };
+    expect(await runCli(["validate-config", "--config", configPath], undefined, runtime)).toBe(0);
+    expect(readFileSync(configPath, "utf8")).toBe(before);
+    expect(existsSync(dbPath)).toBe(false);
+    expect(runtime.restartHermesProfile).not.toHaveBeenCalled();
+    expect(runtime.waitForGatewayReady).not.toHaveBeenCalled();
+  });
+
+  it("refuses invalid retained configuration without changing its bytes", async () => {
+    const { configPath, dbPath } = tempConfig({ name: "" });
+    const before = readFileSync(configPath, "utf8");
+    await expect(runCli(["validate-config", "--config", configPath])).rejects.toThrow();
+    expect(readFileSync(configPath, "utf8")).toBe(before);
+    expect(existsSync(dbPath)).toBe(false);
+  });
+});
+
 describe("cozygateway pair", () => {
   it("prints a QR payload and persists the code", async () => {
     const { configPath, dbPath } = tempConfig();

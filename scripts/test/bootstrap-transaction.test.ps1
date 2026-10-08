@@ -325,6 +325,40 @@ try {
     try { Recover-BootstrapTransaction $root (Join-Path $root 'bin') $assets } catch { $failed = $true }
     Assert-True $failed 'a foreign Task must block recovery before mutation'
     Assert-True ((Read-TestFile (Join-Path (Join-Path $root 'bin') 'cozygateway.mjs')) -eq 'fresh:cozygateway.mjs') 'a foreign Task must preserve promoted bytes for inspection'
+    # Windows directory junctions exercise real reparse-point refusal without
+    # requiring the additional privilege needed for file symbolic links.
+    if (Test-BootstrapWindows) {
+        $redirectDirectory = $outside + '-directory'
+        New-Item -ItemType Directory -Path $redirectDirectory -Force | Out-Null
+        try {
+            New-InterruptedFixture
+            $inventoryPath = Join-Path $backup 'inventory'
+            Copy-Item -LiteralPath $inventoryPath -Destination (Join-Path $redirectDirectory 'inventory')
+            $redirectedInventory = Read-TestFile (Join-Path $redirectDirectory 'inventory')
+            Remove-Item -LiteralPath $inventoryPath -Force
+            New-Item -ItemType Junction -Path $inventoryPath -Target $redirectDirectory -ErrorAction Stop | Out-Null
+            try {
+                $failed = $false
+                try { Recover-BootstrapTransaction $root (Join-Path $root 'bin') $assets } catch { $failed = $true }
+                Assert-True $failed 'junction inventory must fail closed'
+                Assert-True ((Read-TestFile (Join-Path (Join-Path $root 'bin') 'cozygateway.mjs')) -eq 'fresh:cozygateway.mjs') 'junction inventory must fail before asset mutation'
+                Assert-True ((Read-TestFile (Join-Path $redirectDirectory 'inventory')) -eq $redirectedInventory) 'junction inventory must not alter outside bytes'
+            } finally { [IO.Directory]::Delete($inventoryPath) }
+
+            New-InterruptedFixture
+            $localPath = Join-Path $root 'local'
+            Remove-Item -LiteralPath $localPath -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Junction -Path $localPath -Target $redirectDirectory -ErrorAction Stop | Out-Null
+            try {
+                $failed = $false
+                try { Recover-BootstrapTransaction $root (Join-Path $root 'bin') $assets } catch { $failed = $true }
+                Assert-True $failed 'junction runtime parent must fail closed'
+                Assert-True ((Read-TestFile (Join-Path (Join-Path $root 'bin') 'cozygateway.mjs')) -eq 'fresh:cozygateway.mjs') 'junction runtime parent must fail before asset mutation'
+                Assert-True ((Read-TestFile (Join-Path $redirectDirectory 'inventory')) -eq $redirectedInventory) 'junction runtime parent must not alter outside bytes'
+            } finally { [IO.Directory]::Delete($localPath) }
+        } finally { Remove-Item -LiteralPath $redirectDirectory -Recurse -Force }
+    }
+
     New-InterruptedFixture
     $inventoryPath = Join-Path $backup 'inventory'
     Remove-Item -LiteralPath $inventoryPath -Force
@@ -333,7 +367,7 @@ try {
         New-Item -ItemType SymbolicLink -Path $inventoryPath -Target $outside -ErrorAction Stop | Out-Null
         $redirected = $true
     } catch [System.UnauthorizedAccessException] {
-        Write-Host 'bootstrap transaction helper tests: reparse inventory case skipped (symlink privilege unavailable)'
+        Write-Host 'bootstrap transaction helper tests: supplementary file-symbolic-link probe unavailable (privilege required); native junction refusal exercised'
     }
     if ($redirected) {
         $failed = $false

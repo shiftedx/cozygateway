@@ -3,7 +3,9 @@
 Every fixture is synthesized in code. No binary files are committed.
 """
 
+import csv
 import os
+import subprocess
 import struct
 import tempfile
 import threading
@@ -181,6 +183,24 @@ class MediaDescriptorTestCase(unittest.TestCase):
             handle.write(payload)
         return path
 
+    def linked_file(self, target, name):
+        """Use a native directory junction on Windows, a file symlink elsewhere."""
+        if os.name != "nt":
+            link = os.path.join(self.tmp.name, name)
+            os.symlink(target, link)
+            return link
+        junction = os.path.join(self.tmp.name, name + "-junction")
+        command = (
+            "$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path '%s' -Target '%s' | Out-Null"
+            % (junction.replace("'", "''"), os.path.dirname(target).replace("'", "''"))
+        )
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            check=True, capture_output=True,
+        )
+        self.addCleanup(os.rmdir, junction)
+        return os.path.join(junction, os.path.basename(target))
+
 
 class ReadinessTests(MediaDescriptorTestCase):
     def test_missing_file_raises_actionable_error(self):
@@ -207,36 +227,45 @@ class ReadinessTests(MediaDescriptorTestCase):
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores file permissions")
     def test_unreadable_file_raises(self):
         path = self.write("secret.png", png_bytes())
-        os.chmod(path, 0o000)
-        self.addCleanup(os.chmod, path, 0o600)
+        probe(path)  # A cached descriptor must not bypass a later permission denial.
+        if os.name == "nt":
+            output = subprocess.check_output(["whoami.exe", "/user", "/fo", "csv"], text=True)
+            sid = list(csv.reader(output.splitlines()))[1][1]
+            subprocess.run(["icacls.exe", path, "/deny", "*" + sid + ":(RD)"], check=True, capture_output=True)
+            self.addCleanup(subprocess.run, ["icacls.exe", path, "/remove:d", "*" + sid], check=True, capture_output=True)
+            with self.assertRaises(PermissionError):
+                with open(path, "rb"):
+                    pass
+        else:
+            os.chmod(path, 0o000)
+            self.addCleanup(os.chmod, path, 0o600)
         with self.assertRaises(MediaProbeError) as ctx:
             probe(path)
         self.assertEqual(ctx.exception.code, "unreadable")
 
-    def test_symlink_inside_allowed_roots_is_followed(self):
+    def test_native_linked_path_inside_allowed_roots_is_followed(self):
         target = self.write("real.png", png_bytes())
-        link = os.path.join(self.tmp.name, "link.png")
-        os.symlink(target, link)
+        link = self.linked_file(target, "link.png")
         descriptor = probe(link, allowed_roots=[self.tmp.name])
         self.assertEqual(descriptor.realpath, os.path.realpath(target))
         self.assertEqual(descriptor.mime, "image/png")
 
-    def test_symlink_escaping_allowed_roots_raises(self):
+    def test_native_linked_path_escaping_allowed_roots_raises(self):
         outside = tempfile.TemporaryDirectory()
         self.addCleanup(outside.cleanup)
         target = os.path.join(outside.name, "outside.png")
         with open(target, "wb") as handle:
             handle.write(png_bytes())
-        link = os.path.join(self.tmp.name, "escape.png")
-        os.symlink(target, link)
+        link = self.linked_file(target, "escape.png")
         with self.assertRaises(MediaProbeError) as ctx:
             probe(link, allowed_roots=[self.tmp.name])
         self.assertEqual(ctx.exception.code, "symlink_escape")
         self.assertIn("outside the allowed media roots", str(ctx.exception))
 
-    def test_broken_symlink_reports_missing_target(self):
-        link = os.path.join(self.tmp.name, "dangling.png")
-        os.symlink(os.path.join(self.tmp.name, "gone.png"), link)
+    def test_native_linked_path_reports_missing_target_file(self):
+        target = self.write("gone.png", png_bytes())
+        link = self.linked_file(target, "dangling.png")
+        os.unlink(target)
         with self.assertRaises(MediaProbeError) as ctx:
             probe(link)
         self.assertEqual(ctx.exception.code, "missing")
@@ -270,6 +299,13 @@ class ReadinessTests(MediaDescriptorTestCase):
 
 
 class DetectionTests(MediaDescriptorTestCase):
+    def test_webp_declaration_does_not_depend_on_host_mime_registration(self):
+        with patch("cozygateway.media_descriptor.mimetypes.guess_type", return_value=(None, None)):
+            descriptor = probe(self.write("image.webp", webp_bytes()))
+        self.assertEqual(descriptor.declared_mime, "image/webp")
+        self.assertEqual(descriptor.detected_mime, "image/webp")
+        self.assertEqual(descriptor.compatibility, "supported")
+
     def test_extension_and_bytes_agree(self):
         cases = [
             ("a.png", png_bytes(), "image/png", "image"),

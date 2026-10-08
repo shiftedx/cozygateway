@@ -4,6 +4,28 @@ CozyGateway is pre-1.0. Each minor series below groups the tags that shipped it;
 a series are fixes to the series' own changes. Release notes for each published version live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases).
 
+## Unreleased
+
+- Repair preserves operator-owned gateway and Hermes endpoint settings, including
+  profile presentation and independently configured endpoints, while refreshing
+  the managed connection and selected profile credentials. Invalid saved config
+  settings are validated by the shipped Gateway before the installer replaces
+  the file, including nested schema and duplicate profile identity checks.
+  `cozygateway validate-config --config <path>` validates without starting
+  services or changing the file.
+- The Windows installer gate also runs the native bootstrap lock, transaction,
+  Dashboard ownership and persisted state identity suites. Native transaction
+  coverage rejects junction escapes before changing assets or outside files.
+- Hermes provider credentials and execution files use flushed atomic writes with
+  private native Windows ACLs; permission failures preserve the original file
+  and release temporary handles. Execution specifications reject shared access
+  and linked paths while retaining standard macOS system-directory aliases.
+- WebP media declarations are consistent across host MIME registries, and real
+  Windows read-permission failures are reported as unreadable, including cached
+  media. Integration tests close SQLite handles before cleanup and verify upload
+  concurrency without depending on machine speed.
+- Personal home examples in source and fixtures use generic operator paths.
+
 ## 0.9.1 (2026-10-05): maintenance
 
 A maintenance release with no behavior changes. Update with `cozygateway repair`; profiles,

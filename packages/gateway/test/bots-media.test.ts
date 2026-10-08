@@ -127,11 +127,11 @@ describe("media source rules", () => {
   // screenshots) and serving them would be a file-read primitive over the whole box. Each of these
   // shapes reaches the guard by a different route, which is why they are all pinned.
   it.each([
-    "/Users/kyle/Desktop/out.png",
+    "/Users/operator/Desktop/out.png",
     "./out.png",
     "../out.png",
     "~/out.png",
-    "C:\\Users\\kyle\\out.png",
+    "C:\\Users\\operator\\out.png",
     "\\\\share\\out.png",
     "file:///tmp/out.png",
   ])("refuses the local path %s", (src) => {
@@ -573,7 +573,7 @@ describe("GET /bots/:name/media", () => {
 
   it("400s a local path with reason local_path", async () => {
     const { authed } = await setup(async () => imageResponse());
-    const res = await authed(mediaPath("/Users/kyle/Desktop/out.png"));
+    const res = await authed(mediaPath("/Users/operator/Desktop/out.png"));
     expect(res.status).toBe(400);
     expect(await res.json()).toMatchObject({ error: { code: "media_refused" }, reason: "local_path" });
   });

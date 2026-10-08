@@ -185,7 +185,7 @@ function decodeChatRow(raw: unknown): DecodedRow | undefined {
   if (!compaction && !RENDERED_ROLES.has(role)) return undefined;
   // User rows only, and that scoping matters. These directives are written by hermes into the row it
   // persists for a turn the USER sent, so a user row carrying one is machinery. An assistant that
-  // writes `/Users/kyle/out.png` into its reply is writing prose about a file it made, which is the
+  // writes `/home/operator/out.png` into its reply is writing prose about a file it made, which is the
   // very thing `GET /bots/:name/media` refuses to fetch and the app renders as a chip, and editing it
   // out of the bot's own words would be rewriting the conversation.
   const renderedRole = role === "system" ? "assistant" : role;

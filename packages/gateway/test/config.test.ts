@@ -101,6 +101,17 @@ describe("loadConfig", () => {
     expect(() => loadConfig(path)).toThrow(/duplicate Hermes profile id/i);
   });
 
+  it("rejects a blank profile id even when endpoints namespace their profiles", () => {
+    const path = writeConfig({
+      name: "federated",
+      hermesEndpoints: [
+        { id: "home", ...hermes, profiles: { "   ": { tokenEnv: "EMPTY_ATTACH_TOKEN" } } },
+        { id: "studio", ...hermes },
+      ],
+    });
+    expect(() => loadConfig(path)).toThrow(/Hermes profile ids must not be blank/);
+  });
+
   it("loads multiple endpoints and gives every profile a stable endpoint namespace", () => {
     const config = loadConfig(writeConfig({
       name: "federated",

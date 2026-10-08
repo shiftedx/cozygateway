@@ -59,6 +59,14 @@ same machine. Updates preserve the saved listener and public origin unless an ex
 the posture. Use `--clear-public-url --bind-host 0.0.0.0` to explicitly leave the public posture and
 return to LAN access; `--clear-public-url` cannot be combined with `--public-url`.
 
+Repair stages its proposed configuration and validates it with the shipped Gateway before
+replacing the saved file. Invalid retained settings leave the saved file unchanged. To validate
+an operator-edited file without starting services, contacting Hermes or changing configuration:
+
+```sh
+cozygateway validate-config --config cozygateway.config.json
+```
+
 Check the service:
 
 ```sh
@@ -87,6 +95,12 @@ Update or repair with `cozygateway repair` (`cozygateway update` is an alias),
 or repeat the one-paste line when the installed command itself is damaged. Both
 paths fetch and verify one matched release while preserving the recorded profile
 scope and operator-owned gateway settings.
+
+Repair keeps the gateway name, database path, independent Hermes endpoints, and
+the managed `default` endpoint's label, roster visibility, chat suggestion, blank-slate
+settings, and selected profiles' names and avatars. It refreshes that endpoint's
+Dashboard URL, authentication, and selected profile membership and token references.
+Saved listener and public-origin settings change only with explicit installer flags.
 
 ## Uninstall
 

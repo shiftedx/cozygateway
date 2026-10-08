@@ -146,6 +146,10 @@ class GatewaySequenceHoleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.gateway.gaps_sent, [])
         self.assertEqual(self.gateway.event_kinds, ["draft", "presence", "draft", "draft"])
+        # Admission happens before the client receives and persists the ACK.
+        await self.gateway.wait_for(
+            lambda: spool.pending_events(10, 1_000_000) == [], what="the spool to drain",
+        )
         self.assertEqual(spool.pending_events(10, 1_000_000), [])
 
     async def test_an_existing_durable_hole_heals_itself_on_the_first_gap(self):

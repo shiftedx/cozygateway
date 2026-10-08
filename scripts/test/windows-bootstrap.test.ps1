@@ -670,6 +670,37 @@ try {
     Assert-True ($missingRepairMetadata.ExitCode -ne 0) 'repair with missing metadata must fail closed'
     Assert-True ($missingRepairMetadata.Output -match 'repair metadata is unavailable. Reinstall with: irm https://cozylabs.ai/install.ps1 \| iex') 'repair metadata failures must print canonical reinstall guidance'
 
+    # Saved scopes belong to the common installer: an explicit --profiles
+    # request would disable its all-scope refresh and absent-profile hygiene.
+    $scopeHome = Join-Path $temp 'saved scope gateway'
+    $scopeLocal = Join-Path $scopeHome 'local'
+    New-Item -ItemType Directory -Force -Path $scopeLocal | Out-Null
+    Write-Utf8NoBom (Join-Path $scopeLocal 'cozygateway.config.json') '{}'
+    $scopeEnvironment = @{
+        'PATH' = "$fakeBin;$env:PATH"
+        'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
+        'COZYGATEWAY_HOME' = $scopeHome
+        'COZYGATEWAY_GIT_BASH' = $fakeBash
+        'COZYGATEWAY_TEST_HERMES' = (Join-Path $fakeBin 'hermes.cmd')
+    }
+    foreach ($scope in @('narrow', 'all')) {
+        Write-Utf8NoBom (Join-Path $scopeLocal 'install-state') "harness=hermes`nprofiles=default,absent-profile`nprofile_scope=$scope`n"
+        foreach ($repair in @($false, $true)) {
+            $scopeBootstrap = Join-Path $scopeHome 'bin\cozygateway-bootstrap.ps1'
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $scopeBootstrap) | Out-Null
+            Copy-Item -LiteralPath $installer -Destination $scopeBootstrap -Force
+            $scopeHash = (Get-FileHash -LiteralPath $scopeBootstrap -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-Utf8NoBom "$scopeBootstrap.sha256" "$scopeHash  install.ps1`n"
+            Remove-Item -LiteralPath $eventLog -Force -ErrorAction SilentlyContinue
+            $scopeArguments = if ($repair) { @('-Repair') } else { @() }
+            $scopeResult = Invoke-Bootstrap $installer $scopeEnvironment $scopeArguments
+            Assert-True ($scopeResult.ExitCode -eq 0) "saved $scope scope repair=$repair must reach the shared installer: $($scopeResult.Output)"
+            $scopeHandoff = @(Get-Content -LiteralPath $eventLog | Where-Object { $_ -match '^bash:' }) -join "`n"
+            Assert-True ($scopeHandoff -match '--service-platform Windows' -and $scopeHandoff -notmatch '--profiles') "saved $scope scope repair=$repair must be hydrated from state, not made explicit: $scopeHandoff"
+        }
+    }
+    Remove-Item -LiteralPath $eventLog -Force -ErrorAction SilentlyContinue
+
     $result = Invoke-Bootstrap $installer @{
         'PATH' = "$fakeBin;$env:PATH"
         'COZYGATEWAY_INSTALL_ASSET_BASE' = $fixtures
@@ -1103,8 +1134,12 @@ write_windows_task_xml
             $nativeTaskCreated = $true
             $nativeQuery = (& (Join-Path $env:SystemRoot 'System32\schtasks.exe') /Query /TN $nativeTaskName /XML 2>&1 | Out-String)
             Assert-True ($LASTEXITCODE -eq 0 -and $nativeQuery.Contains("<UserId>$focusedSid</UserId>")) "registered task must retain the current-user identity: $nativeQuery"
+            Write-Host 'PASS native current-user Task Scheduler registration and identity query'
         } finally {
-            if ($nativeTaskCreated) { & (Join-Path $env:SystemRoot 'System32\schtasks.exe') /Delete /F /TN $nativeTaskName 2>$null | Out-Null }
+            if ($nativeTaskCreated) {
+                & (Join-Path $env:SystemRoot 'System32\schtasks.exe') /Delete /F /TN $nativeTaskName 2>$null | Out-Null
+                Assert-True ($LASTEXITCODE -eq 0) 'native fixture task must be removed after registration validation'
+            }
         }
     }
 

@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import json
-import os
 import ssl
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -13,6 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from .profile_env import profile_env, profile_home
+from .private_files import reject_links, write_private_json
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -98,20 +97,14 @@ class ProviderConnectionStore:
         return value
 
     def _read(self) -> List[Dict[str, Any]]:
+        reject_links(self._path)
         try:
             data = json.loads(self._path.read_text())
             return data if isinstance(data, list) else []
         except (OSError, ValueError): return []
 
     def _write(self, rows: List[Dict[str, Any]]) -> None:
-        self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=".provider-", dir=self._path.parent)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w") as handle: json.dump(rows, handle, separators=(",", ":"))
-            os.replace(temporary, self._path); os.chmod(self._path, 0o600)
-        finally:
-            if os.path.exists(temporary): os.unlink(temporary)
+        write_private_json(self._path, rows)
 
     @staticmethod
     def _public(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -132,6 +125,7 @@ class BotModelDefaultStore:
         self._path = path or Path(profile_env("COZYGATEWAY_BOT_MODEL_PATH") or (home / "cozygateway-bot-model.json"))
 
     def read(self) -> Dict[str, Optional[str]]:
+        reject_links(self._path)
         try:
             value = json.loads(self._path.read_text())
         except (OSError, ValueError):
@@ -141,12 +135,5 @@ class BotModelDefaultStore:
         return {"model": model if isinstance(model, str) and model else None, "effort": None}
 
     def write(self, model: Optional[str]) -> Dict[str, Optional[str]]:
-        self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=".bot-model-", dir=self._path.parent)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w") as handle: json.dump({"model": model}, handle, separators=(",", ":"))
-            os.replace(temporary, self._path); os.chmod(self._path, 0o600)
-        finally:
-            if os.path.exists(temporary): os.unlink(temporary)
+        write_private_json(self._path, {"model": model})
         return self.read()

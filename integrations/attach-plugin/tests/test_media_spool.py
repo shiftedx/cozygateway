@@ -9,12 +9,10 @@ from cozygateway.attach_spool import AttachSpool
 class MediaLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.path = os.path.join(self.tmp.name, "spool.sqlite")
         self.spool = AttachSpool(self.path)
-
-    def tearDown(self):
-        self.spool.close()
-        self.tmp.cleanup()
+        self.addCleanup(self.spool.close)
 
     def test_happy_path_walks_prepared_to_displayed(self):
         for state in ("prepared", "uploaded", "journaled", "projected", "displayed"):
@@ -119,12 +117,10 @@ class MediaLifecycleTests(unittest.TestCase):
 class MediaDedupeClaimTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.path = os.path.join(self.tmp.name, "spool.sqlite")
         self.spool = AttachSpool(self.path)
-
-    def tearDown(self):
-        self.spool.close()
-        self.tmp.cleanup()
+        self.addCleanup(self.spool.close)
 
     def test_first_claim_wins_and_a_retry_reuses_it(self):
         first = self.spool.media_dedupe_claim("occ-1", "sha-a", "home:cleo", "media-1")

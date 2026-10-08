@@ -488,8 +488,9 @@ class MediaDescriptor:
 
 
 _MIME_ALIASES = {"audio/x-wav": "audio/wav", "audio/wave": "audio/wav", "audio/vnd.wave": "audio/wav", "audio/x-m4a": "audio/mp4"}
-_PROJECT_MIME_BY_EXTENSION = {".md": "text/markdown"}
-_UTF8_TEXT_MIME_TYPES = frozenset(_PROJECT_MIME_BY_EXTENSION.values())
+# Windows MIME registration is optional; these extensions have stable project semantics.
+_PROJECT_MIME_BY_EXTENSION = {".md": "text/markdown", ".webp": "image/webp"}
+_UTF8_TEXT_MIME_TYPES = frozenset({"text/markdown"})
 
 
 def _declared_mime(path: str) -> str:
@@ -520,6 +521,15 @@ def _check_readiness(path: str, allowed_roots: Optional[Iterable[str]], stabilit
         raise fail("not_regular", "%s is not a regular file. Only regular files can be uploaded." % expanded)
     if not os.access(realpath, os.R_OK):
         raise fail("unreadable", "%s is not readable by this process. Fix the file permissions and try again." % expanded)
+    # Windows os.access does not inspect DACLs. Check an actual read handle even
+    # on cache hits, without reading or hashing the file again.
+    try:
+        with open(realpath, "rb"):
+            pass
+    except PermissionError as err:
+        raise fail("unreadable", "%s is not readable by this process. Fix the file permissions and try again." % expanded) from err
+    except OSError as err:
+        raise fail("read_failed", "%s could not be read: %s" % (expanded, err)) from err
     size_bytes = os.stat(realpath).st_size
     if size_bytes == 0:
         raise fail("empty", "%s is zero bytes. Wait for the writer to finish or regenerate the file." % expanded)
@@ -563,6 +573,8 @@ def _read_head_and_hash(
                 decoder.decode(b"", final=True)
             except UnicodeDecodeError:
                 text_error = "Markdown attachments must be valid UTF-8 text."
+    except PermissionError as err:
+        raise MediaProbeError("unreadable", "%s is not readable by this process. Fix the file permissions and try again." % label, path=label) from err
     except OSError as err:
         raise MediaProbeError("read_failed", "%s could not be read: %s" % (label, err), path=label) from err
     return head, digest.hexdigest(), text_error

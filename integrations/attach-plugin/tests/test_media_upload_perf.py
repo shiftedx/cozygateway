@@ -114,19 +114,54 @@ class MediaUploadPerfTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_six_attachments_upload_in_parallel_but_never_more_than_three(self):
         paths = self._pngs(6)
-        held = 0.08
-        self.gateway.script_upload(*(upload_ok(delay_s=held) for _ in paths))
+        self.gateway.script_upload(*(upload_ok(delay_s=0.08) for _ in paths))
+        admitted = asyncio.Queue()
+        gates = []
+        active = 0
+        peak = 0
+        upload = self.client.upload_media
 
-        started = time.monotonic()
-        result = await self._proactive(paths)
-        elapsed = time.monotonic() - started
+        async def held_upload(*args, **kwargs):
+            nonlocal active, peak
+            gate = asyncio.Event()
+            gates.append(gate)
+            active += 1
+            peak = max(peak, active)
+            admitted.put_nowait(gate)
+            try:
+                await gate.wait()
+                return await upload(*args, **kwargs)
+            finally:
+                active -= 1
+
+        with patch.object(self.client, "upload_media", new=held_upload):
+            send = asyncio.create_task(self._proactive(paths))
+            try:
+                for wave in range(2):
+                    # All three slots must enter before any is released. A serial
+                    # implementation cannot reach this barrier; an unbounded one
+                    # admits the next wave while these uploads are still held.
+                    ready = [await asyncio.wait_for(admitted.get(), 5) for _ in range(3)]
+                    await asyncio.sleep(0)
+                    self.assertTrue(admitted.empty(), "uploads exceeded the three-slot cap")
+                    self.assertEqual(len(gates), (wave + 1) * 3)
+                    self.assertEqual(active, 3)
+                    self.assertFalse(send.done())
+                    for gate in ready:
+                        gate.set()
+                result = await asyncio.wait_for(send, 5)
+            finally:
+                for gate in gates:
+                    gate.set()
+                if not send.done():
+                    send.cancel()
+                await asyncio.gather(send, return_exceptions=True)
 
         self.assertEqual(result["state"], "journaled")
         self.assertEqual(len(self.gateway.uploads), 6)
+        self.assertEqual(peak, 3)
         self.assertGreater(self.gateway.peak_upload_concurrency, 1)
         self.assertLessEqual(self.gateway.peak_upload_concurrency, MEDIA_UPLOAD_CONCURRENCY)
-        # Six serial uploads would take at least 6 * held. Three at a time takes two waves.
-        self.assertLess(elapsed, 6 * held)
 
     async def test_concurrent_uploads_keep_their_slot_order_on_the_commit(self):
         paths = self._pngs(4)

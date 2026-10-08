@@ -78,25 +78,26 @@ class InterimReplyTests(unittest.IsolatedAsyncioTestCase):
         return adapter, client
 
     async def test_reset_notice_then_reply_survives_the_real_durable_spool(self):
-        with tempfile.TemporaryDirectory() as directory:
-            spool = AttachSpool(str(Path(directory) / "attach.sqlite"))
-            self.addCleanup(spool.close)
-            adapter, _ = self._adapter()
-            client = AttachV1Client(AttachV1ClientConfig(
-                gateway_url="https://gateway.example.test", token="test", spool=spool,
-            ))
-            adapter._client = client
-            await adapter.send("thread", "Session automatically reset (inactive for 24h).")
-            await adapter.send("thread", "Still researching the openings.")
-            await adapter.send("thread", "Research complete.", reply_to="turn", metadata={"notify": True})
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        spool = AttachSpool(str(Path(directory) / "attach.sqlite"))
+        self.addCleanup(spool.close)
+        adapter, _ = self._adapter()
+        client = AttachV1Client(AttachV1ClientConfig(
+            gateway_url="https://gateway.example.test", token="test", spool=spool,
+        ))
+        adapter._client = client
+        self.addAsyncCleanup(client.close)
+        await adapter.send("thread", "Session automatically reset (inactive for 24h).")
+        await adapter.send("thread", "Still researching the openings.")
+        await adapter.send("thread", "Research complete.", reply_to="turn", metadata={"notify": True})
 
-            events = [frame["event"] for frame in spool.pending_events(20, 100000)]
-            commits = [event for event in events if event["kind"] == "commit"]
-            self.assertEqual(len(commits), 3, "reset notice must not block subsequent replies")
-            self.assertEqual([event.get("continues", False) for event in commits], [True, True, False])
-            self.assertEqual(commits[-1]["blocks"], [{"type": "paragraph", "text": "Research complete."}])
-            with self.assertRaises(TerminalSealed):
-                spool.enqueue_event({"kind": "draft", "threadId": "thread", "turnId": "turn", "blocks": []})
+        events = [frame["event"] for frame in spool.pending_events(20, 100000)]
+        commits = [event for event in events if event["kind"] == "commit"]
+        self.assertEqual(len(commits), 3, "reset notice must not block subsequent replies")
+        self.assertEqual([event.get("continues", False) for event in commits], [True, True, False])
+        self.assertEqual(commits[-1]["blocks"], [{"type": "paragraph", "text": "Research complete."}])
+        with self.assertRaises(TerminalSealed):
+            spool.enqueue_event({"kind": "draft", "threadId": "thread", "turnId": "turn", "blocks": []})
 
     async def test_a_mid_run_reply_commits_its_message_and_keeps_the_turn(self):
         adapter, client = self._adapter()

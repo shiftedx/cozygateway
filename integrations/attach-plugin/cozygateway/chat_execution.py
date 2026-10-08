@@ -22,6 +22,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+from .private_files import assert_private_fd, reject_links, secure_directory, write_private_text
 
 
 class ChatExecutionBootstrapError(ValueError):
@@ -79,6 +80,7 @@ def _profile_list(profile: Mapping[str, Any], name: str) -> list[str]:
 def _private_spec_bytes(path: Path) -> bytes:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
+        reject_links(path)
         fd = os.open(path, flags)
     except OSError as exc:
         raise ChatExecutionBootstrapError("execution spec is unreadable") from exc
@@ -86,8 +88,10 @@ def _private_spec_bytes(path: Path) -> bytes:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise ChatExecutionBootstrapError("execution spec must be a regular file")
-        if stat.S_IMODE(info.st_mode) & 0o077:
-            raise ChatExecutionBootstrapError("execution spec must not be group- or world-readable")
+        try:
+            assert_private_fd(fd)
+        except OSError as exc:
+            raise ChatExecutionBootstrapError("execution spec must not grant access to other users") from exc
         with os.fdopen(fd, "rb", closefd=False) as handle:
             return handle.read(_MAX_SPEC_BYTES + 1)
     finally:
@@ -116,6 +120,10 @@ def load_spec(path: Path) -> ChatExecutionSpec:
     if branch is not None and (not isinstance(branch, str) or not branch.strip() or len(branch.strip()) > 200 or any(c in branch for c in "\\\x00\r\n")):
         raise ChatExecutionBootstrapError("workspace.branch is invalid")
     raw_workspace_path = Path(_nonempty(raw.get("workspacePath"), "workspacePath", maximum=4096)).expanduser()
+    try:
+        reject_links(raw_workspace_path)
+    except OSError as exc:
+        raise ChatExecutionBootstrapError("workspacePath must be a real directory") from exc
     try: workspace_path = raw_workspace_path.resolve(strict=True)
     except OSError as exc: raise ChatExecutionBootstrapError("workspacePath is unavailable") from exc
     if raw_workspace_path.is_symlink() or not workspace_path.is_dir(): raise ChatExecutionBootstrapError("workspacePath must be a real directory")
@@ -150,27 +158,11 @@ def load_spec(path: Path) -> ChatExecutionSpec:
     )
 
 def _secure_dir(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        path.chmod(0o700)
-    except OSError:
-        pass
+    secure_directory(path)
 
 
 def _write_private(path: Path, content: str) -> None:
-    _secure_dir(path.parent)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-    finally:
-        # os.fdopen closes normally; this only protects an exception before it takes ownership.
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    write_private_text(path, content)
 
 
 
@@ -214,6 +206,7 @@ def _write_launch_metadata(home: Path, spec: ChatExecutionSpec) -> None:
 def _copy_plugin(home: Path) -> Path:
     plugin_root = Path(__file__).resolve().parent.parent
     target = home / "plugins" / "cozygateway"
+    reject_links(target)
     if target.exists():
         shutil.rmtree(target)
     shutil.copytree(
