@@ -65,6 +65,9 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with: { python-version: "3.11" }
       - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: validate repair config with the real Windows CLI
+        run: pnpm --filter cozygateway exec vitest run test/installer-config-preservation.test.ts test/cli.test.ts
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-bootstrap.test.ps1
       - run: node --test scripts/test/windows-hidden-supervisor.test.mjs
       - run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test/windows-launcher-stop.test.ps1

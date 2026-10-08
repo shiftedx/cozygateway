@@ -1595,9 +1595,11 @@ write_gateway_config() {
   umask 077; printf '{' > "$map"
   for p in "${SELECTED[@]}"; do env_name="$(token_env_name "$p")"; printf '%s\n' "$comma\"$p\":{\"tokenEnv\":\"$env_name\"}" >> "$map"; comma=,; done
   printf '}\n' >> "$map"
-  "$NODE_RESOLVED" - "$map" "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$DASHBOARD_PORT" "$PUBLIC_URL" "$PUSH_RELAY_URL_DEFAULT" <<'NODE'
+  "$NODE_RESOLVED" - "$map" "$CONFIG_JSON" "$BIND_HOST" "$PORT" "$LOCAL_DIR/cozygateway.sqlite" "$DASHBOARD_PORT" "$PUBLIC_URL" "$PUSH_RELAY_URL_DEFAULT" "$BUNDLE_PATH" <<'NODE'
 const fs = require('node:fs');
-const [mapPath, output, host, port, dbPath, dashboardPort, publicUrl, pushRelayUrl] = process.argv.slice(2);
+const { execFileSync } = require('node:child_process');
+const { randomUUID } = require('node:crypto');
+const [mapPath, output, host, port, dbPath, dashboardPort, publicUrl, pushRelayUrl, bundlePath] = process.argv.slice(2);
 const profiles = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
 let existing = {};
 try {
@@ -1625,9 +1627,15 @@ const managed = {
 };
 delete existing.publicUrl;
 if (existing.pushRelayUrl === undefined) managed.pushRelayUrl = pushRelayUrl;
-const temporary = `${output}.new`;
-fs.writeFileSync(temporary, JSON.stringify({ ...existing, ...managed }, null, 2) + '\n', { mode: 0o600 });
-fs.renameSync(temporary, output);
+const temporary = `${output}.new-${randomUUID()}`;
+try {
+  fs.writeFileSync(temporary, JSON.stringify({ ...existing, ...managed }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  // ADR 0080: the shipped Gateway owns schema and profile identity validation, not the installer.
+  execFileSync(process.execPath, [bundlePath, 'validate-config', '--config', temporary], { shell: false, windowsHide: true, stdio: 'pipe' });
+  fs.renameSync(temporary, output);
+} finally {
+  try { fs.unlinkSync(temporary); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
 NODE
   chmod 600 "$CONFIG_JSON" "$map"
 }

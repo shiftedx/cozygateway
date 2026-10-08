@@ -59,6 +59,14 @@ same machine. Updates preserve the saved listener and public origin unless an ex
 the posture. Use `--clear-public-url --bind-host 0.0.0.0` to explicitly leave the public posture and
 return to LAN access; `--clear-public-url` cannot be combined with `--public-url`.
 
+Repair stages its proposed configuration and validates it with the shipped Gateway before
+replacing the saved file. Invalid retained settings leave the saved file unchanged. To validate
+an operator-edited file without starting services, contacting Hermes or changing configuration:
+
+```sh
+cozygateway validate-config --config cozygateway.config.json
+```
+
 Check the service:
 
 ```sh

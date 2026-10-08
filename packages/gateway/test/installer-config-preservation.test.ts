@@ -1,11 +1,12 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.ts";
 
+const validator = join(import.meta.dirname, "../dist/cli.js");
 const installer = readFileSync(join(import.meta.dirname, "../../../scripts/agent-install.sh"), "utf8");
 // Execute the writer shipped in the installer; this does not register services or touch Hermes.
 const writer = installer.match(/write_gateway_config\(\)[\s\S]*?<<'NODE'\r?\n([\s\S]*?)\r?\nNODE/)?.[1];
@@ -19,7 +20,8 @@ function repairConfig(existing: unknown, check: (path: string, result: ReturnTyp
     if (existing !== undefined) writeFileSync(configPath, JSON.stringify(existing));
     writeFileSync(mapPath, JSON.stringify({ default: { tokenEnv: "NEW_DEFAULT_TOKEN" }, added: { tokenEnv: "NEW_ADDED_TOKEN" } }));
     expect(writer).toBeDefined();
-    const run = () => spawnSync(process.execPath, ["-", mapPath, configPath, "127.0.0.1", "8787", join(root, "managed.db"), "9119", "", "https://relay.example.com"], { input: writer, encoding: "utf8" });
+    expect(() => readFileSync(validator)).not.toThrow();
+    const run = () => spawnSync(process.execPath, ["-", mapPath, configPath, "127.0.0.1", "8787", join(root, "managed.db"), "9119", "", "https://relay.example.com", validator], { input: writer, encoding: "utf8" });
     check(configPath, run(), run);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -61,7 +63,7 @@ describe("installer configuration repair", () => {
       expect(result.status, String(result.stderr)).toBe(0);
       expect(result.stdout).toBe("default");
       writeFileSync(mapPath, JSON.stringify(Object.fromEntries(String(result.stdout).split(",").map(id => [id, { tokenEnv: "COZYGATEWAY_ATTACH_TOKEN_" + id.toUpperCase() }]))));
-      const written = spawnSync(process.execPath, ["-", mapPath, configPath, "127.0.0.1", "8787", join(root, "managed.db"), "9119", "", "https://relay.example.com"], { input: writer, encoding: "utf8" });
+      const written = spawnSync(process.execPath, ["-", mapPath, configPath, "127.0.0.1", "8787", join(root, "managed.db"), "9119", "", "https://relay.example.com", validator], { input: writer, encoding: "utf8" });
       expect(written.status, String(written.stderr)).toBe(0);
       const config = loadConfig(configPath);
       expect(config.hermesEndpoints?.find(endpoint => endpoint.id === "default")?.profiles).toEqual({ default: { tokenEnv: "COZYGATEWAY_ATTACH_TOKEN_DEFAULT", name: "Friendly bot" } });
@@ -121,10 +123,26 @@ describe("installer configuration repair", () => {
     });
   });
 
+  it.each([
+    { name: "", dbPath: "operator.db" },
+    { name: "gateway", dbPath: 42 },
+    { name: "gateway", observability: { enabled: "yes" } },
+    { name: "gateway", hermesEndpoints: [{ id: "default", url: "ws://127.0.0.1:9119/api/ws", label: 1 }] },
+    { name: "gateway", hermesEndpoints: [{ id: "remote", url: "wss://remote.example.com/api/ws", profiles: { default: { name: 1 } } }] },
+    { name: "gateway", hermesEndpoints: [{ id: "remote", url: "wss://remote.example.com/api/ws" }, { id: "remote", url: "wss://other.example.com/api/ws" }] },
+  ].map(existing => ({ existing })))("refuses invalid retained settings before replacing saved bytes: $existing", ({ existing }) => {
+    repairConfig(existing, (path, result) => {
+      expect(result.status).not.toBe(0);
+      expect(readFileSync(path, "utf8")).toBe(JSON.stringify(existing));
+      expect(readdirSync(join(path, "..")).filter(name => name.startsWith("gateway.json.new-"))).toEqual([]);
+    });
+  });
+
   it.each([null, [], "invalid", { name: "gateway", hermesEndpoints: "invalid" }].map(existing => ({ existing })))("refuses invalid saved configuration without replacing it: $existing", ({ existing }) => {
     repairConfig(existing, (path, result) => {
       expect(result.status).not.toBe(0);
       expect(readFileSync(path, "utf8")).toBe(JSON.stringify(existing));
+      expect(readdirSync(join(path, "..")).filter(name => name.startsWith("gateway.json.new-"))).toEqual([]);
     });
   });
 });

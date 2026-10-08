@@ -9,7 +9,10 @@ a series are fixes to the series' own changes. Release notes for each published 
 - Repair preserves operator-owned gateway and Hermes endpoint settings, including
   profile presentation and independently configured endpoints, while refreshing
   the managed connection and selected profile credentials. Invalid saved config
-  shapes are refused before the installer replaces the file.
+  settings are validated by the shipped Gateway before the installer replaces
+  the file, including nested schema and duplicate profile identity checks.
+  `cozygateway validate-config --config <path>` validates without starting
+  services or changing the file.
 - The Windows installer gate also runs the native bootstrap lock, transaction,
   Dashboard ownership and persisted state identity suites. Native transaction
   coverage rejects junction escapes before changing assets or outside files.

@@ -24,7 +24,7 @@ import {
   validateListenerHost,
 } from "./configure.ts";
 
-const USAGE = `usage: cozygateway [status|configure|serve|pair] --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>] [--kind device|runner|observer]\nInstalled service commands: cozygateway repair | update | uninstall [--purge] [--dry-run]`;
+const USAGE = `usage: cozygateway [status|configure|validate-config|serve|pair] --config <path> [--url <http(s)://host[:port]>] [--ttl <minutes>] [--kind device|runner|observer]\nInstalled service commands: cozygateway repair | update | uninstall [--purge] [--dry-run]`;
 
 export interface CliIo {
   interactive: boolean;
@@ -392,6 +392,12 @@ export async function runCli(argv: string[], suppliedIo?: CliIo, runtime: CliRun
     } finally {
       io.close();
     }
+  }
+
+  if (command === "validate-config") {
+    // Read-only validation uses the same schema and identity constraints as service startup.
+    loadConfig(configPath);
+    return 0;
   }
 
   if (command === "status") {
