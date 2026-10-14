@@ -1,0 +1,452 @@
+import { randomUUID } from "node:crypto";
+
+import { Value } from "@sinclair/typebox/value";
+import {
+  BotModelConfigSchema,
+  BotProfileConfigureResponseSchema,
+  BotProfilePatchSchema,
+  BotProfileSchema,
+  BotRoutineListResponseSchema,
+  BotRoutineWriteResponseSchema,
+  ChatBranchListSchema,
+  ChatProjectListSchema,
+  ModelProviderConnectionCatalogSchema,
+} from "cozygateway-contract";
+import type {
+  BotModelConfig,
+  BotModelConfigPatch,
+  BotProfile,
+  BotProfileConfigureResponse,
+  BotProfilePatch,
+  BotRoutineCreateRequest,
+  BotRoutineListResponse,
+  BotRoutinePatch,
+  BotRoutineWriteResponse,
+  ChatBranchList,
+  ChatBranch,
+  ChatComputer,
+  ChatProjectList,
+  ChatProject,
+  ChatSessionConfiguration,
+  ModelProviderConnectionCatalog,
+} from "cozygateway-contract";
+
+import { BackendUnavailable } from "../errors.ts";
+import { createPhotoRateLimiter, type PhotoRateLimiter } from "./photos.ts";
+import {
+  AttachV1ChatConfigurationPrepareResultSchema,
+  AttachV1ChatConfigurationReadResultSchema,
+  AttachV1ConfigAckSchema,
+  ProviderConnectionTransferResultSchema,
+} from "../adapters/attach/protocol-v1.ts";
+import type { AttachV1ConfigRequest, AttachV1ConfigResult } from "../adapters/attach/protocol-v1.ts";
+import type { ConfigSendOutcome } from "../adapters/attach/ingress-v1.ts";
+import type { BotRoutineList } from "./bridge.ts";
+import type { ProfileConfigureResult } from "./profile.ts";
+import { BotNotFound } from "./crud.ts";
+import { ModelConfigInvalid } from "./model-config.ts";
+import { RoutineNotFound, type RoutineWriteResult } from "./routines.ts";
+import { emitTrace, traceId, type TraceLog } from "../trace.ts";
+import type { ChatConfigurationDriver } from "../chat-configuration.ts";
+
+export type ConfigOperation = AttachV1ConfigRequest["operation"];
+type ConfigInput = AttachV1ConfigRequest["input"];
+type ConfigResult = NonNullable<AttachV1ConfigResult["result"]>;
+
+/** Per-bot budget for the config lane. A config read costs the peer a file read or a scheduler
+ *  scan it serves one at a time, so an editor gets a generous burst and a fast refill while a loop
+ *  is stopped here rather than at the peer. Same bucket as the photo and memory lanes, with the
+ *  config lane's own numbers: the key is the BOT, because this lane has no device id.
+ *
+ *  That key is a deliberate trade and it has a cost worth stating: the bucket is shared by every
+ *  device editing that bot, so one looping client throttles the others until it refills. The bot is
+ *  still the right key, because the thing being protected is the ONE peer serving it, and a
+ *  per-device bucket would let N devices spend N times the budget the peer can absorb. */
+export const CONFIG_RATE_CAPACITY = 30;
+export const CONFIG_RATE_REFILL_MS = 1_000;
+export type ConfigRateLimiter = PhotoRateLimiter;
+export function createConfigRateLimiter(opts: { capacity?: number; refillMs?: number } = {}): ConfigRateLimiter {
+  return createPhotoRateLimiter({ capacity: opts.capacity ?? CONFIG_RATE_CAPACITY, refillMs: opts.refillMs ?? CONFIG_RATE_REFILL_MS });
+}
+
+/** The peer is attached but never offered `bot_config`, which is a different fact from "offline"
+ *  and gets a different answer: the caller turns this into the same `409 unsupported_for_runtime`
+ *  a bot with no config lane at all receives, because the section really is absent rather than
+ *  temporarily unreachable. */
+export class ConfigNotNegotiated extends Error {
+  readonly bot: string;
+  constructor(bot: string) {
+    super(`bot "${bot}" is attached but its peer did not negotiate bot_config`);
+    this.name = "ConfigNotNegotiated";
+    this.bot = bot;
+  }
+}
+
+/** The peer serves this bot but holds nothing for the section that was read: a bot brought up
+ *  without a profile written yet, or one that pins no model. It extends `BotNotFound` because that
+ *  is the class every bots route already answers `404 not_found`, and the message is rewritten so
+ *  the answer says what is missing rather than claiming the bot is. The bot is NOT missing: it is
+ *  on the roster and its chat lane works. Reporting this as `503` instead made an empty profile
+ *  indistinguishable from an offline peer, so a client offered a retry that could never succeed.
+ *
+ *  Only a BODYLESS read raises it. A write, a `routines.list`, or a `routines.create` answering
+ *  `not_found` is the peer failing to do something it was asked to do, and stays a `503`. */
+export class ConfigNotFound extends BotNotFound {
+  constructor(bot: string, section: string) {
+    super(bot);
+    this.name = "ConfigNotFound";
+    this.message = `bot "${bot}" has no stored ${section} on the runtime that serves it`;
+  }
+}
+
+/** A config request the peer refused because of what it carried, reported with the peer's own
+ *  words. It extends `ModelConfigInvalid` because that is the class every bots route already
+ *  answers `400 invalid_request` and this lane adds no route change; the subclass keeps its own
+ *  name so a log line still says which lane refused. The alternative was reusing
+ *  `RoutineRefused`, whose route text reads "hermes refused the cron add" -- a sentence about a
+ *  backend that is not involved, in front of a user editing a runtime bot's profile. */
+export class ConfigInvalidRequest extends ModelConfigInvalid {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConfigInvalidRequest";
+  }
+}
+
+/** The nine config operations, named as the surface methods they answer for rather than as wire
+ *  strings, so the native data plane routes to them without restating the lane's vocabulary. */
+export interface ConfigSurface {
+  botProfile(name: string): Promise<BotProfile>;
+  configureProfile(name: string, patch: BotProfilePatch): Promise<ProfileConfigureResult>;
+  modelConfig(name: string): Promise<BotModelConfig>;
+  configureModel(name: string, patch: BotModelConfigPatch): Promise<BotModelConfig>;
+  routines(name: string): Promise<BotRoutineList>;
+  createRoutine(name: string, input: BotRoutineCreateRequest): Promise<RoutineWriteResult>;
+  patchRoutine(name: string, id: string, patch: BotRoutinePatch): Promise<RoutineWriteResult>;
+  deleteRoutine(name: string, id: string): Promise<void>;
+  /** Trigger one run now. It has no REST route in this version; the lane carries it so a peer
+   *  implements the whole set once rather than growing a second wire change later. */
+  runRoutine(name: string, id: string): Promise<void>;
+  chatProjects(name: string, computerId: string): Promise<ChatProjectList>;
+  chatBranches(name: string, computerId: string, projectId: string): Promise<ChatBranchList>;
+  readChatConfiguration(name: string, sessionId: string): Promise<{
+    computer: ChatComputer;
+    configuration: ChatSessionConfiguration | null;
+  }>;
+  prepareChatConfiguration(name: string, configuration: ChatSessionConfiguration): Promise<{
+    configuration: ChatSessionConfiguration;
+  }>;
+  providerConnections(name: string): Promise<ModelProviderConnectionCatalog>;
+  saveProviderConnection(name: string, handoffId: string): Promise<ModelProviderConnectionCatalog>;
+  testProviderConnection(name: string, id: string): Promise<ModelProviderConnectionCatalog>;
+  removeProviderConnection(name: string, id: string): Promise<ModelProviderConnectionCatalog>;
+}
+
+interface Pending {
+  agentId: string;
+  operation: ConfigOperation;
+  /** The routine this request acts on, so a `not_found` names the routine and not the bot. */
+  routineId: string | undefined;
+  resolve: (value: ConfigResult) => void;
+  reject: (reason: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+/** The reply shape each operation must produce. A peer that answers `ok` with the wrong body is
+ *  refused rather than cast, because casting is how a routines pane ends up rendering a profile. */
+function validResult(operation: ConfigOperation, result: unknown): result is ConfigResult {
+  switch (operation) {
+    case "profile.read": return Value.Check(BotProfileSchema, result);
+    case "profile.write": return Value.Check(BotProfileConfigureResponseSchema, result);
+    case "model.read": case "model.write": return Value.Check(BotModelConfigSchema, result);
+    case "routines.list": return Value.Check(BotRoutineListResponseSchema, result);
+    case "routines.create": case "routines.update": return Value.Check(BotRoutineWriteResponseSchema, result);
+    case "routines.delete": case "routines.run": return Value.Check(AttachV1ConfigAckSchema, result);
+    case "chat.projects": return Value.Check(ChatProjectListSchema, result);
+    case "chat.branches": return Value.Check(ChatBranchListSchema, result);
+    case "chat.configuration.read": return Value.Check(AttachV1ChatConfigurationReadResultSchema, result);
+    case "chat.configuration.prepare": return Value.Check(AttachV1ChatConfigurationPrepareResultSchema, result);
+    case "providers.connections.list": case "providers.connections.save":
+    case "providers.connections.test": case "providers.connections.remove": case "providers.connections.import":
+      return Value.Check(ModelProviderConnectionCatalogSchema, result);
+    case "providers.connections.transfer": return Value.Check(ProviderConnectionTransferResultSchema, result);
+  }
+}
+
+/** The operator-facing reading of each refusal, kept apart for the same reason the memory lane
+ *  keeps them apart: an unconfigured bot, an offline peer, and an attached peer that speaks an
+ *  older hello need three different fixes. */
+const CONFIG_UNAVAILABLE: Record<Exclude<ConfigSendOutcome, "sent" | "capability_not_negotiated">, string> = {
+  unknown_bot: "this bot has no attach profile on this gateway",
+  not_attached: "this bot's peer is not attached right now",
+};
+
+/** The routine an operation acts on, when it acts on one. `routines.create` and `routines.list`
+ *  name none, and neither do the profile and model operations. */
+function routineIdOf(input: ConfigInput): string | undefined {
+  return typeof input === "object" && input !== null && "id" in input ? input.id : undefined;
+}
+
+export interface AttachConfigSurfaceOptions {
+  rateLimiter?: ConfigRateLimiter;
+  now?: () => number;
+}
+
+/** Correlates the bounded live attach-v1 bot-config lane. A clone of `AttachMemorySurface`: it
+ *  retains only a waiter, never config content, and a disconnected peer fails immediately so a
+ *  timed-out write cannot execute later after reconnect. */
+export class AttachConfigSurface implements ConfigSurface {
+  readonly #pending = new Map<string, Pending>();
+  readonly #endpoint: { sendConfigRequest(agentId: string, input: AttachV1ConfigRequest): ConfigSendOutcome };
+  readonly #timeoutMs: number;
+  readonly #trace: TraceLog | undefined;
+  readonly #rate: ConfigRateLimiter;
+  readonly #now: () => number;
+
+  constructor(
+    endpoint: { sendConfigRequest(agentId: string, input: AttachV1ConfigRequest): ConfigSendOutcome },
+    timeoutMs = 12_000,
+    trace?: TraceLog,
+    opts: AttachConfigSurfaceOptions = {},
+  ) {
+    this.#endpoint = endpoint;
+    this.#timeoutMs = timeoutMs;
+    this.#trace = trace;
+    this.#rate = opts.rateLimiter ?? createConfigRateLimiter();
+    this.#now = opts.now ?? Date.now;
+  }
+
+  #request(agentId: string, operation: ConfigOperation, input: ConfigInput): Promise<ConfigResult> {
+    const requestId = randomUUID();
+    return new Promise<ConfigResult>((resolve, reject) => {
+      const spend = this.#rate.take(agentId, this.#now());
+      if (!spend.ok) {
+        emitTrace(this.#trace, "bot_config_rate_limited", { profile: traceId(agentId), operation, retryAfterMs: spend.retryAfterMs });
+        reject(new BackendUnavailable(`too many bot config requests for this bot; retry in ${spend.retryAfterMs}ms`));
+        return;
+      }
+      const timer = setTimeout(() => {
+        if (this.#pending.delete(requestId)) reject(new BackendUnavailable("bot config reply timed out"));
+      }, this.#timeoutMs);
+      timer.unref();
+      this.#pending.set(requestId, { agentId, operation, routineId: routineIdOf(input), resolve, reject, timer });
+      // The public methods below keep operation and input paired; this assertion bridges that
+      // correlation across the internal union-valued helper parameters.
+      const request = { kind: "config_request", requestId, operation, input } as AttachV1ConfigRequest;
+      const outcome = this.#endpoint.sendConfigRequest(agentId, request);
+      if (outcome === "sent") return;
+      clearTimeout(timer);
+      this.#pending.delete(requestId);
+      emitTrace(this.#trace, "bot_config_unavailable", { profile: traceId(agentId), operation, reason: outcome });
+      reject(
+        outcome === "capability_not_negotiated"
+          ? new ConfigNotNegotiated(agentId)
+          : new BackendUnavailable(`bot config is unavailable for this bot: ${CONFIG_UNAVAILABLE[outcome]}`),
+      );
+    });
+  }
+
+  async botProfile(name: string): Promise<BotProfile> {
+    return await this.#request(name, "profile.read", {}) as BotProfile;
+  }
+  async configureProfile(name: string, patch: BotProfilePatch): Promise<ProfileConfigureResult> {
+    // The wire body is the PUBLISHED configure response, which additionally echoes the bot name.
+    // The internal result deliberately does not carry it twice: the caller already knows it.
+    const result = await this.#request(name, "profile.write", publishedPatch(patch)) as BotProfileConfigureResponse;
+    return {
+      outcome: result.outcome,
+      ok: result.ok,
+      applied: result.applied,
+      ...(result.ignored === undefined ? {} : { ignored: result.ignored }),
+      requested: result.requested as ProfileConfigureResult["requested"],
+    };
+  }
+  async modelConfig(name: string): Promise<BotModelConfig> {
+    return await this.#request(name, "model.read", {}) as BotModelConfig;
+  }
+  async configureModel(name: string, patch: BotModelConfigPatch): Promise<BotModelConfig> {
+    return await this.#request(name, "model.write", patch) as BotModelConfig;
+  }
+  async routines(name: string): Promise<BotRoutineList> {
+    const { name: bot, routines, updatedAt } = await this.#request(name, "routines.list", {}) as BotRoutineListResponse;
+    return { name: bot, routines, updatedAt };
+  }
+  async createRoutine(name: string, input: BotRoutineCreateRequest): Promise<RoutineWriteResult> {
+    return this.#write(await this.#request(name, "routines.create", input));
+  }
+  async patchRoutine(name: string, id: string, patch: BotRoutinePatch): Promise<RoutineWriteResult> {
+    return this.#write(await this.#request(name, "routines.update", { id, patch }));
+  }
+  async deleteRoutine(name: string, id: string): Promise<void> {
+    await this.#request(name, "routines.delete", { id });
+  }
+  async runRoutine(name: string, id: string): Promise<void> {
+    await this.#request(name, "routines.run", { id });
+  }
+  async chatProjects(name: string, computerId: string): Promise<ChatProjectList> {
+    return await this.#request(name, "chat.projects", { computerId }) as ChatProjectList;
+  }
+  async chatBranches(name: string, computerId: string, projectId: string): Promise<ChatBranchList> {
+    return await this.#request(name, "chat.branches", { computerId, projectId }) as ChatBranchList;
+  }
+  async readChatConfiguration(name: string, sessionId: string): Promise<{
+    computer: ChatComputer;
+    configuration: ChatSessionConfiguration | null;
+  }> {
+    return await this.#request(name, "chat.configuration.read", { sessionId }) as {
+      computer: ChatComputer;
+      configuration: ChatSessionConfiguration | null;
+    };
+  }
+  async prepareChatConfiguration(name: string, configuration: ChatSessionConfiguration): Promise<{
+    configuration: ChatSessionConfiguration;
+  }> {
+    return await this.#request(name, "chat.configuration.prepare", { configuration }) as {
+      configuration: ChatSessionConfiguration;
+    };
+  }
+  async providerConnections(name: string): Promise<ModelProviderConnectionCatalog> {
+    return await this.#request(name, "providers.connections.list", {}) as ModelProviderConnectionCatalog;
+  }
+  async saveProviderConnection(name: string, handoffId: string): Promise<ModelProviderConnectionCatalog> {
+    return await this.#request(name, "providers.connections.save", { handoffId }) as ModelProviderConnectionCatalog;
+  }
+  async testProviderConnection(name: string, id: string): Promise<ModelProviderConnectionCatalog> {
+    return await this.#request(name, "providers.connections.test", { id }) as ModelProviderConnectionCatalog;
+  }
+  async removeProviderConnection(name: string, id: string): Promise<ModelProviderConnectionCatalog> {
+    return await this.#request(name, "providers.connections.remove", { id }) as ModelProviderConnectionCatalog;
+  }
+  async transferProviderConnection(name: string, id: string, executionId: string): Promise<{ handoffId: string }> {
+    return await this.#request(name, "providers.connections.transfer", { id, executionId }) as { handoffId: string };
+  }
+  async importProviderConnection(name: string, handoffId: string): Promise<ModelProviderConnectionCatalog> {
+    return await this.#request(name, "providers.connections.import", { handoffId }) as ModelProviderConnectionCatalog;
+  }
+
+  /** The published write response minus the bot name the caller already holds. `replacedId` and
+   *  `orphanedId` are carried only when the peer sent them: an absent key means no rewrite
+   *  happened, and inventing one would hand a client an id to retire that never existed. */
+  #write(result: ConfigResult): RoutineWriteResult {
+    const written = result as BotRoutineWriteResponse;
+    return {
+      routine: written.routine,
+      ...(written.replacedId === undefined ? {} : { replacedId: written.replacedId }),
+      ...(written.orphanedId === undefined ? {} : { orphanedId: written.orphanedId }),
+    };
+  }
+
+  handle(agentId: string, frame: AttachV1ConfigResult): boolean {
+    const pending = this.#pending.get(frame.requestId);
+    if (pending === undefined || pending.agentId !== agentId) return false;
+    this.#pending.delete(frame.requestId);
+    clearTimeout(pending.timer);
+    if (frame.status === "ok" && validResult(pending.operation, frame.result)) pending.resolve(frame.result);
+    else if (frame.status === "ok") pending.reject(new BackendUnavailable("bot config returned an invalid reply"));
+    else pending.reject(refusal(pending, frame));
+    return true;
+  }
+
+  close(): void {
+    for (const pending of this.#pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new BackendUnavailable("gateway is shutting down"));
+    }
+    this.#pending.clear();
+  }
+}
+
+/** Adapter for the attached runtime's session-execution lane. The current protocol deliberately
+ * offers its executor computer through `chat.configuration.read`; it does not advertise a host
+ * inventory, so this adapter exposes only that same executor rather than inventing computers.
+ * A runtime that cannot prepare the selected context is unavailable before the gateway persists
+ * a selection or admits a turn. */
+export class AttachChatConfigurationDriver implements ChatConfigurationDriver {
+  readonly #surface: ConfigSurface;
+
+  constructor(surface: ConfigSurface) { this.#surface = surface; }
+
+  async availability(input: { bot: string; sessionId: string }): Promise<{ available: boolean; unavailableReason?: string }> {
+    try {
+      await this.#surface.readChatConfiguration(input.bot, input.sessionId);
+      return { available: true };
+    } catch (error) {
+      if (error instanceof ConfigNotNegotiated) return { available: false, unavailableReason: "the attached runtime does not support session execution configuration" };
+      if (error instanceof BackendUnavailable) return { available: false, unavailableReason: error.message };
+      throw error;
+    }
+  }
+
+  async computers(input: { bot: string; sessionId: string }): Promise<readonly ChatComputer[]> {
+    const result = await this.#surface.readChatConfiguration(input.bot, input.sessionId);
+    return [result.computer];
+  }
+
+  async projects(bot: string, computerId: string): Promise<readonly ChatProject[]> {
+    return (await this.#surface.chatProjects(bot, computerId)).projects;
+  }
+
+  async branches(bot: string, computerId: string, projectId: string): Promise<readonly ChatBranch[]> {
+    return (await this.#surface.chatBranches(bot, computerId, projectId)).branches;
+  }
+
+  async prepareContext(input: {
+    bot: string;
+    sessionId: string;
+    workspace: import("cozygateway-contract").ChatWorkspaceSelection | null;
+    model: import("cozygateway-contract").ChatModelSelection | null;
+  }): Promise<{ workspacePrepared: boolean }> {
+    const configuration: ChatSessionConfiguration = {
+      sessionId: input.sessionId,
+      workspace: input.workspace,
+      model: input.model,
+    };
+    const result = await this.#surface.prepareChatConfiguration(input.bot, configuration);
+    if (JSON.stringify(result.configuration) !== JSON.stringify(configuration))
+      throw new BackendUnavailable("runtime prepared a different chat configuration");
+    return { workspacePrepared: input.workspace !== null };
+  }
+}
+
+/** The patch as the PUBLISHED schema names it, and nothing else. `BotProfilePatchSchema` is open,
+ *  as every object on this contract is, so a body key the schema does not model passes validation;
+ *  forwarding the parsed body whole would hand a peer an unvalidated `mcpServers` map or a
+ *  mis-cased `DeclareMcpServers` that no gate ever looked at, and would slip past the capability-89
+ *  `mcp_server_declarations` gate, which reads the published names. Rebuilt from the schema's own
+ *  keys rather than closed at the boundary, so an older client sending an extra key still saves. */
+/** Capability 88's `role` and `reports` are published but GATEWAY-OWNED: the route checks and
+ *  stores them itself and strips them before forwarding, so no peer ever receives them. Excluded
+ *  here too, so a caller that forgot to strip them still cannot hand a peer the team. */
+const GATEWAY_OWNED: ReadonlySet<string> = new Set(["role", "reports"]);
+const PATCH_KEYS = (Object.keys(BotProfilePatchSchema.properties) as (keyof BotProfilePatch)[])
+  .filter((key) => !GATEWAY_OWNED.has(key));
+function publishedPatch(patch: BotProfilePatch): BotProfilePatch {
+  const out: Record<string, unknown> = {};
+  for (const key of PATCH_KEYS) {
+    if (patch[key] !== undefined) out[key] = patch[key];
+  }
+  return out as BotProfilePatch;
+}
+
+/** A non-`ok` status, turned into the error the existing bot routes already answer correctly.
+ *  This lane adds no route change, so it speaks in the vocabulary those routes read:
+ *  `RoutineNotFound` is their 404, `ConfigInvalidRequest` their 400, `BackendUnavailable` their
+ *  503. */
+function refusal(pending: Pick<Pending, "agentId" | "operation" | "routineId">, frame: AttachV1ConfigResult): Error {
+  const message = frame.message ?? "the bot's peer refused the config request";
+  if (frame.status === "not_found") {
+    if (pending.routineId !== undefined) return new RoutineNotFound(pending.routineId);
+    const section = MISSING_SECTION[pending.operation];
+    if (section !== undefined) return new ConfigNotFound(pending.agentId, section);
+  }
+  if (frame.status === "invalid_request") return new ConfigInvalidRequest(message);
+  return new BackendUnavailable(`bot config is unavailable for this bot: ${message}`);
+}
+
+/** The bodyless reads, and what a `not_found` on each of them means is missing. An operation absent
+ *  from this table has no "nothing stored" answer to give: a write acts on something the caller
+ *  just supplied, and both `routines.list` and `routines.create` answer for a store whose empty
+ *  state is an empty list, not an absence. */
+const MISSING_SECTION: Partial<Record<ConfigOperation, string>> = {
+  "profile.read": "profile",
+  "model.read": "model config",
+};

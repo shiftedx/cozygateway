@@ -1,0 +1,14 @@
+[Unit]
+Description=CozyGateway Docker Compose maintenance supervisor
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/cozygateway/maintenance.env
+ExecStart=/usr/bin/python3 %h/cozygateway/scripts/compose-maintenance-supervisor.py
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

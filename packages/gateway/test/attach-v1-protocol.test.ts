@@ -1,0 +1,415 @@
+import { describe, expect, it } from "vitest";
+import { check } from "cozygateway-contract";
+
+import {
+  AttachV1ClientFrameSchema,
+  AttachV1EventFrameSchema,
+  AttachV1HelloSchema,
+  AttachV1MemoryRequestSchema,
+  AttachV1ServerFrameSchema,
+  sanitizeApprovalDetail,
+  sanitizeApprovalRepair,
+} from "../src/adapters/attach/protocol-v1.ts";
+
+describe("attach-v1 protocol", () => {
+  it("keeps memory setup exact on the management lane", () => {
+    const request = {
+      kind: "memory_request", requestId: "setup-1", operation: "setup",
+      input: { memoryEnabled: true, userProfileEnabled: false, holographicEnabled: false },
+    };
+    expect(check(AttachV1MemoryRequestSchema, request)).toBe(true);
+    expect(check(AttachV1MemoryRequestSchema, { ...request, input: { ...request.input, provider: "external" } })).toBe(false);
+    expect(check(AttachV1MemoryRequestSchema, { ...request, input: { memoryEnabled: false, userProfileEnabled: false, holographicEnabled: false } })).toBe(false);
+    expect(check(AttachV1MemoryRequestSchema, { ...request, input: { memoryEnabled: true, userProfileEnabled: false } })).toBe(false);
+  });
+
+  it("carries optional typed room context on a turn command without touching its text", () => {
+    const turn = { kind: "turn", threadId: "group:launch:scout", turnId: "t-1", messageId: "m-1", text: "prompt" };
+    const frame = (command: Record<string, unknown>): unknown =>
+      ({ kind: "command", sequence: 1, commandId: "cmd-1", command });
+    // A peer that never sends or reads context is unaffected: the field is optional.
+    expect(check(AttachV1ServerFrameSchema, frame(turn))).toBe(true);
+    expect(check(AttachV1ServerFrameSchema, frame({
+      ...turn,
+      context: {
+        room: { key: "launch", name: "Launch", epoch: 2, seq: 7 },
+        actors: [
+          { name: "scout", handle: "scout", displayName: "Scout", kind: "member" },
+          { name: "You", handle: "user", displayName: "You", kind: "user" },
+        ],
+        cause: { kind: "user", seq: 7 },
+      },
+    }))).toBe(true);
+    // `seq` is absent rather than zero when a room has nothing to name, because zero is a real
+    // seq in a trimmed room.
+    expect(check(AttachV1ServerFrameSchema, frame({
+      ...turn,
+      context: { room: { key: "launch", name: "Launch", epoch: 2 }, actors: [] },
+    }))).toBe(true);
+    // Closed: an unknown actor kind or an unknown context field is a sender the gateway does not
+    // speak, not a field to ignore.
+    expect(check(AttachV1ServerFrameSchema, frame({
+      ...turn,
+      context: {
+        room: { key: "launch", name: "Launch", epoch: 2, seq: 7 },
+        actors: [{ name: "scout", handle: "scout", displayName: "Scout", kind: "bot" }],
+      },
+    }))).toBe(false);
+    expect(check(AttachV1ServerFrameSchema, frame({
+      ...turn,
+      context: { room: { key: "launch", name: "Launch", epoch: 2, seq: 7 }, actors: [], extra: true },
+    }))).toBe(false);
+  });
+
+  it("carries an optional task context in place of room on an assignment turn, text unchanged", () => {
+    const turn = { kind: "turn", threadId: "assignment:t1", turnId: "run", messageId: "run:assignment", text: "[Task from Lead] Check CI" };
+    const frame = (command: Record<string, unknown>): unknown =>
+      ({ kind: "command", sequence: 1, commandId: "cmd-1", command });
+    const task = { id: "t1", assignedBy: "lead", brief: "Check CI", doneCriteria: "main is green", deadlineAt: 10 };
+    const withTask = { ...turn, context: { actors: [], task } };
+    expect(check(AttachV1ServerFrameSchema, frame(withTask))).toBe(true);
+    expect(check(AttachV1ServerFrameSchema, frame({ ...turn, context: { actors: [], task: { ...task, outputFormat: "JSON" } } }))).toBe(true);
+    expect(check(AttachV1ServerFrameSchema, frame({ ...turn, context: { actors: [], task: { ...task, deadlineAt: -1 } } }))).toBe(false);
+    expect(check(AttachV1ServerFrameSchema, frame({ ...turn, context: { actors: [], task: { ...task, extra: true } } }))).toBe(false);
+    expect(withTask.text).toBe(turn.text);
+  });
+
+  it("negotiates capabilities, cursor and backpressure limits with one hello shape", () => {
+    expect(check(AttachV1HelloSchema, {
+      kind: "hello",
+      version: 2,
+      instanceId: "plugin-1",
+      capabilities: ["draft", "media", "tools", "approvals", "clarify", "scheduled", "mobile_node", "mobile_location"],
+      resume: { eventSequence: 41, commandSequence: 8 },
+      limits: { maxInFlightEvents: 32, maxInFlightBytes: 1048576 },
+      commands: [
+        { name: "/status", description: "Show session status", category: "Session" },
+        { name: "/queue", description: "Queue the next prompt", argsHint: "<prompt>" },
+      ],
+    })).toBe(true);
+    // There is no second hello shape to fall back to. A peer that still speaks version 1 fails
+    // the schema outright rather than negotiating a quietly reduced capability set.
+    expect(check(AttachV1HelloSchema, {
+      kind: "hello", version: 1, instanceId: "plugin-1", capabilities: ["draft", "mobile_node"],
+    })).toBe(false);
+    expect(check(AttachV1HelloSchema, {
+      kind: "hello", version: 2, instanceId: "plugin-1", capabilities: ["draft"],
+      telemetry: { eventOutboxDepth: 3, oldestEventAgeMs: 4, eventAckCursor: 5, commandInboxDepth: 7 },
+    })).toBe(true);
+    // A brand-new spool has no oldest row or ACK progress yet. Those are unknown aggregate
+    // measurements, not a malformed hello that should strand the plugin before it can reconnect.
+    expect(check(AttachV1HelloSchema, {
+      kind: "hello", version: 2, instanceId: "fresh-plugin", capabilities: ["draft"],
+      telemetry: { eventOutboxDepth: 0, oldestEventAgeMs: null, eventAckCursor: 0, commandInboxDepth: 0 },
+    })).toBe(true);
+    expect(check(AttachV1HelloSchema, { kind: "hello", version: 0, instanceId: "x", capabilities: [] })).toBe(false);
+    expect(check(AttachV1HelloSchema, {
+      kind: "hello", version: 2, instanceId: "x", capabilities: [],
+      commands: [{ name: "status", description: "missing slash" }],
+    })).toBe(false);
+  });
+
+  it("accepts stable sequenced commands and all terminal event states", () => {
+    expect(check(AttachV1ServerFrameSchema, {
+      kind: "command",
+      sequence: 9,
+      commandId: "cmd-9",
+      command: { kind: "turn", threadId: "thread", turnId: "turn", messageId: "user-msg", text: "hello" },
+    })).toBe(true);
+    expect(check(AttachV1ServerFrameSchema, {
+      kind: "command",
+      sequence: 10,
+      commandId: "cmd-cancelled",
+      command: { kind: "discard", originalKind: "resolve_approval", reason: "capability not negotiated: approvals" },
+    })).toBe(true);
+    for (const kind of ["commit", "failed", "cancelled", "interrupted"] as const) {
+      const event = {
+        kind,
+        threadId: "thread",
+        turnId: "turn",
+        messageId: "assistant-msg",
+        ...(kind === "commit" ? { blocks: [{ type: "paragraph", text: "done" }] } : {}),
+      };
+      expect(check(AttachV1EventFrameSchema, {
+        kind: "event", sequence: 1, eventId: `event-${kind}`, event,
+      })).toBe(true);
+    }
+  });
+
+  it("models tools, approvals, clarifications, scheduled delivery and media by stable id", () => {
+    const events = [
+      { kind: "tool", threadId: "t", turnId: "u", callId: "call", name: "search", status: "running" },
+      { kind: "approval", threadId: "t", turnId: "u", approvalId: "approval", callId: "call", name: "shell", status: "pending", expiresAt: 2000 },
+      { kind: "clarify", threadId: "t", turnId: "u", clarifyId: "clarify", prompt: "Which?", options: [{ id: "a", label: "A" }], status: "pending", expiresAt: 2000 },
+      { kind: "scheduled", threadId: "home", deliveryId: "cron-1", messageId: "m1", blocks: [{ type: "paragraph", text: "report" }] },
+      { kind: "media", media: { mediaId: "media-1", mimeType: "image/png", byteCount: 8, sha256: "a".repeat(64), filename: "x.png", family: "image" } },
+    ];
+    events.forEach((event, index) => expect(check(AttachV1EventFrameSchema, {
+      kind: "event", sequence: index + 1, eventId: `e-${index}`, event,
+    })).toBe(true));
+  });
+
+  it("models bounded source-qualified desktop session rows", () => {
+    const event = {
+      kind: "event", sequence: 1, eventId: "desktop-row",
+      event: {
+        kind: "desktop_session_message", threadId: "native-chat", hermesSessionId: "raw-current",
+        desktopSessionId: "raw-selected", source: "tui", rowId: "row-1", role: "assistant",
+        text: "continued on desktop", at: 1_800_000_000_000,
+      },
+    };
+    expect(check(AttachV1EventFrameSchema, event)).toBe(true);
+    const { desktopSessionId: _desktopSessionId, ...mobileRow } = event.event;
+    expect(check(AttachV1EventFrameSchema, {
+      ...event,
+      event: { ...mobileRow, source: "cozygateway" },
+    })).toBe(true);
+    expect(check(AttachV1EventFrameSchema, {
+      ...event,
+      event: { ...event.event, source: "tui", desktopSessionId: undefined },
+    })).toBe(false);
+    expect(check(AttachV1EventFrameSchema, {
+      ...event,
+      event: { ...event.event, role: "tool" },
+    })).toBe(false);
+  });
+
+  it("has replay, ack, gap and heartbeat control frames but no reasoning event", () => {
+    expect(check(AttachV1ClientFrameSchema, { kind: "ack", channel: "command", sequence: 7, id: "cmd-7" })).toBe(true);
+    expect(check(AttachV1ServerFrameSchema, { kind: "ack", channel: "event", sequence: 4, id: "event-4", duplicate: true })).toBe(true);
+    expect(check(AttachV1ServerFrameSchema, {
+      kind: "ack", channel: "event", sequence: 5, id: "event-5",
+      discarded: true, reason: "unauthorized_target",
+    })).toBe(true);
+    expect(check(AttachV1ServerFrameSchema, { kind: "gap", channel: "event", requestedAfter: 1, earliestAvailable: 8, latestAvailable: 20 })).toBe(true);
+    expect(check(AttachV1ClientFrameSchema, { kind: "gap", channel: "command", requestedAfter: 1, earliestAvailable: 2, latestAvailable: 4 })).toBe(true);
+    expect(check(AttachV1ClientFrameSchema, { kind: "heartbeat", sentAt: 100 })).toBe(true);
+    expect(check(AttachV1ClientFrameSchema, {
+      kind: "heartbeat", sentAt: 100,
+      telemetry: { eventOutboxDepth: 1, oldestEventAgeMs: 2, eventAckCursor: 3, commandInboxDepth: 5 },
+    })).toBe(true);
+    expect(check(AttachV1ClientFrameSchema, {
+      kind: "heartbeat", sentAt: 100,
+      telemetry: { eventOutboxDepth: 1, oldestEventAgeMs: 2, eventAckCursor: 3, commandInboxDepth: 5, lastEventAckProgressAt: 4 },
+    })).toBe(false);
+    // The old closed rule survives for anything unbounded: a raw `reasoning` event still fails.
+    expect(check(AttachV1EventFrameSchema, { kind: "event", sequence: 1, eventId: "leak", event: { kind: "reasoning", text: "secret" } })).toBe(false);
+  });
+
+  it("lets a delegation event carry the canonical batch alias without changing identity", () => {
+    const frame = {
+      kind: "event", sequence: 12, eventId: "deleg-1",
+      event: {
+        kind: "delegation", threadId: "thread", turnId: "turn",
+        batchId: "call_d3R3sBldNWhDI0Kqqqk3P2Xi", childId: "20260825_195359_003db6",
+        index: 0, count: 1, status: "succeeded", lastActiveAt: 5,
+        aliasId: "deleg_c6eb9310",
+      },
+    };
+    expect(check(AttachV1EventFrameSchema, frame)).toBe(true);
+    // Alias-free events stay exactly as they were: an older plugin never sends the field.
+    const { aliasId: _omitted, ...bare } = frame.event;
+    expect(check(AttachV1EventFrameSchema, { ...frame, event: bare })).toBe(true);
+  });
+
+  it("admits only bounded structured delegation result enrichment", () => {
+    const event = (body: Record<string, unknown>) => ({
+      kind: "event", sequence: 1, eventId: "deleg-enriched",
+      event: {
+        kind: "delegation", threadId: "thread", turnId: "turn", batchId: "batch",
+        childId: "child", index: 0, count: 1, status: "succeeded", lastActiveAt: 5,
+        ...body,
+      },
+    });
+    expect(check(AttachV1EventFrameSchema, event({
+      costUsd: 0.125, costStatus: "reported",
+      schemaValidation: { valid: false, retries: 1 }, durationMs: 2345,
+    }))).toBe(true);
+    expect(check(AttachV1EventFrameSchema, event({}))).toBe(true);
+    expect(check(AttachV1EventFrameSchema, event({
+      schemaValidation: { valid: false, retries: 1, schema_errors: ["/private/path"] },
+    }))).toBe(false);
+    for (const invalid of [
+      { costUsd: -1 }, { costStatus: "exact" },
+      { schemaValidation: { valid: false, retries: 2 } }, { durationMs: -1 },
+    ]) expect(check(AttachV1EventFrameSchema, event(invalid))).toBe(false);
+  });
+
+  it("carries a bounded latest-only thinking preview and refuses anything past its bounds", () => {
+    const event = (body: Record<string, unknown>) => ({
+      kind: "event", sequence: 1, eventId: "think-1",
+      event: { kind: "thinking", threadId: "thread", turnId: "turn", text: "weighing the two options", seq: 1, lastActiveAt: 1_800_000_000_000, ...body },
+    });
+    expect(check(AttachV1EventFrameSchema, event({}))).toBe(true);
+    expect(check(AttachV1EventFrameSchema, event({ text: "x".repeat(280) }))).toBe(true);
+    // The 280-char cap is enforced ON THE SCHEMA: an unsanitized peer cannot exceed it.
+    expect(check(AttachV1EventFrameSchema, event({ text: "x".repeat(281) }))).toBe(false);
+    // `seq` starts at 1 and is an integer: 0 and fractions cannot express "latest".
+    expect(check(AttachV1EventFrameSchema, event({ seq: 0 }))).toBe(false);
+    expect(check(AttachV1EventFrameSchema, event({ seq: 1.5 }))).toBe(false);
+    expect(check(AttachV1EventFrameSchema, event({ lastActiveAt: -1 }))).toBe(false);
+    // The preview is one bounded text field: no blocks, args, or attachments ride along.
+    expect(check(AttachV1EventFrameSchema, event({ seq: undefined }))).toBe(false);
+  });
+
+  it("keeps negotiated mobile requests and results outside the durable envelopes", () => {
+    expect(check(AttachV1ClientFrameSchema, {
+      kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Report phone readiness",
+    })).toBe(true);
+    expect(check(AttachV1ClientFrameSchema, { kind: "mobile_cancel", requestId: "request-1" })).toBe(true);
+    expect(check(AttachV1ClientFrameSchema, { kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000 })).toBe(false);
+    expect(check(AttachV1ClientFrameSchema, { kind: "mobile_request", requestId: "request-1", command: "device.status", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: " bad  spacing " })).toBe(false);
+    expect(check(AttachV1ClientFrameSchema, {
+      kind: "mobile_request", requestId: "location-1", command: "location.current", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Find coffee",
+    })).toBe(true);
+    expect(check(AttachV1ClientFrameSchema, {
+      kind: "mobile_request", requestId: "location-1", command: "location.current", threadId: "thread-1", turnId: "turn-1", expiresAt: 1_000, purpose: "Find coffee", extra: true,
+    })).toBe(false);
+    expect(check(AttachV1ClientFrameSchema, { kind: "mobile_cancel", requestId: "request-1", extra: true })).toBe(false);
+    expect(check(AttachV1ServerFrameSchema, {
+      kind: "mobile_result", requestId: "request-1", status: "ok", result: {
+        appState: "background", batteryBand: "high", lowPowerMode: false, thermalState: "fair",
+        networkClass: "wifi", capabilities: [
+          { command: "device.status", permission: "not_required" },
+          { command: "location.current", permission: "authorized" },
+          { command: "camera.capture", permission: "authorized" },
+          { command: "file.pick", permission: "not_required" },
+          { command: "notification.present", permission: "not_required" },
+        ],
+        wakeReason: "deep_link", authenticatedReachable: true, lastAuthenticatedPresenceAt: 1_234,
+      },
+    })).toBe(true);
+    expect(check(AttachV1ServerFrameSchema, {
+      kind: "mobile_result", requestId: "request-1", status: "ok", result: {
+        appState: "foreground", lowPowerMode: false,
+        capabilities: [
+          { command: "device.status", permission: "not_required", ssid: "secret" },
+          { command: "location.current", permission: "authorized" },
+        ],
+        authenticatedReachable: true, lastAuthenticatedPresenceAt: 1_234,
+      },
+    })).toBe(false);
+    expect(check(AttachV1ServerFrameSchema, {
+      kind: "mobile_result", requestId: "legacy", status: "ok", result: { foreground: true },
+    })).toBe(false);
+    expect(check(AttachV1ServerFrameSchema, {
+      kind: "mobile_result", requestId: "location-1", status: "ok", result: { latitude: 41.88, longitude: -87.63 },
+    })).toBe(true);
+  });
+
+  it("accepts an approval event carrying capability-56 detail on the wire", () => {
+    const event = {
+      kind: "approval", threadId: "t", turnId: "u", approvalId: "approval", callId: "call",
+      name: "my_browser_open", status: "pending", expiresAt: 2000,
+      detail: "Would drive Chrome (Work profile).",
+    };
+    expect(check(AttachV1EventFrameSchema, {
+      kind: "event", sequence: 1, eventId: "e-detail", event,
+    })).toBe(true);
+  });
+});
+
+describe("sanitizeApprovalDetail (capability 56)", () => {
+  it("trims whitespace and passes a short, clean sentence through unchanged", () => {
+    expect(sanitizeApprovalDetail("  Would drive Chrome (Work profile).  "))
+      .toBe("Would drive Chrome (Work profile).");
+  });
+
+  it("strips C0/C1 control characters and Unicode format code points rather than refusing them", () => {
+    // \u0000 (NUL, C0), \u0007 (BEL, C0), \u200b (zero-width space, Unicode Format/Cf).
+    const withControls = "Would drive Chrome\u0000 (Work\u200bprofile)\u0007.";
+    expect(sanitizeApprovalDetail(withControls)).toBe("Would drive Chrome (Workprofile).");
+  });
+
+  it("returns undefined when nothing survives trimming and sanitizing", () => {
+    expect(sanitizeApprovalDetail("   ")).toBeUndefined();
+    // Whitespace plus a lone zero-width space and a NUL: still nothing a person would read.
+    expect(sanitizeApprovalDetail(" \u0000\u200b ")).toBeUndefined();
+  });
+
+  it("truncates an overlong sentence at a word boundary and appends an ellipsis, never rejecting it", () => {
+    const word = "profile";
+    const long = Array.from({ length: 80 }, () => word).join(" "); // far over 400 chars
+    const sanitized = sanitizeApprovalDetail(long);
+    expect(sanitized).toBeDefined();
+    expect([...sanitized!].length).toBeLessThanOrEqual(400);
+    expect(sanitized!.endsWith("…")).toBe(true);
+    // Truncation lands on a whole word: strip the ellipsis and the remainder is still
+    // whitespace-separated repetitions of the same word, never a mid-word cut.
+    const withoutEllipsis = sanitized!.slice(0, -1);
+    expect(withoutEllipsis.trim().split(" ").every((part) => part === word)).toBe(true);
+  });
+
+  it("keeps a detail already within the 400-character budget byte-identical apart from trimming", () => {
+    const exact = "a".repeat(400);
+    expect(sanitizeApprovalDetail(exact)).toBe(exact);
+  });
+});
+
+/** Capability 62 (contract/ext-bots-v1.md row 62). The repair proposal rides the approval event as
+ *  one typed block. Like `detail`, the WIRE schema must never fail over it (a schema failure closes
+ *  the whole attach socket), so `sanitizeApprovalRepair` is the sole authority: a valid block is
+ *  carried byte for byte and an invalid one is dropped while the approval is kept. */
+describe("sanitizeApprovalRepair (capability 62)", () => {
+  const repair = {
+    kind: "mcp_reconnect",
+    server: "github",
+    impact: ["github_search_issues", "github_create_issue"],
+    scope: "server",
+    fingerprint: { previous: "sha256:1f3a", current: "sha256:9c0e" },
+    reason: "stale_tool",
+    policy: "approve_once",
+  };
+
+  it("carries a valid block byte for byte", () => {
+    const sanitized = sanitizeApprovalRepair(repair);
+    expect(sanitized).toEqual(repair);
+    expect(JSON.stringify(sanitized)).toBe(JSON.stringify(repair));
+    expect(sanitizeApprovalRepair({ ...repair, impact: [], fingerprint: {} }))
+      .toEqual({ ...repair, impact: [], fingerprint: {} });
+  });
+
+  it("drops the block for an oversize impact entry, a control character in server, or an unknown kind", () => {
+    expect(sanitizeApprovalRepair({ ...repair, impact: ["t".repeat(129)] })).toBeUndefined();
+    // \u0000 (NUL, C0) and \u200b (zero-width space, Unicode Format/Cf): a name built from these
+    // renders invisible or reorders the card, so the whole block goes, not the character.
+    expect(sanitizeApprovalRepair({ ...repair, server: "git\u0000hub" })).toBeUndefined();
+    expect(sanitizeApprovalRepair({ ...repair, server: "git\u200bhub" })).toBeUndefined();
+    expect(sanitizeApprovalRepair({ ...repair, kind: "restart" })).toBeUndefined();
+  });
+
+  it("drops the block for a control or format character anywhere else a string sits", () => {
+    expect(sanitizeApprovalRepair({ ...repair, impact: ["github_search\u0007issues"] })).toBeUndefined();
+    expect(sanitizeApprovalRepair({ ...repair, fingerprint: { current: "sha256:\u202e9c0e" } })).toBeUndefined();
+  });
+
+  it("drops a whitespace-only name and a lone surrogate, which no configured server or tool is called", () => {
+    expect(sanitizeApprovalRepair({ ...repair, server: "   " })).toBeUndefined();
+    expect(sanitizeApprovalRepair({ ...repair, impact: [" "] })).toBeUndefined();
+    expect(sanitizeApprovalRepair({ ...repair, server: "git\ud800hub" })).toBeUndefined();
+    expect(sanitizeApprovalRepair({ ...repair, fingerprint: { current: "\udc00" } })).toBeUndefined();
+    // A real astral code point is a valid pair, not a lone surrogate.
+    expect(sanitizeApprovalRepair({ ...repair, server: "git\u{1F600}hub" })).toEqual({ ...repair, server: "git\u{1F600}hub" });
+  });
+
+  it("drops anything that is not the closed object", () => {
+    expect(sanitizeApprovalRepair("mcp_reconnect")).toBeUndefined();
+    expect(sanitizeApprovalRepair(null)).toBeUndefined();
+    expect(sanitizeApprovalRepair([repair])).toBeUndefined();
+    expect(sanitizeApprovalRepair({ ...repair, url: "https://mcp.example" })).toBeUndefined();
+    const { fingerprint: _drop, ...noFingerprint } = repair;
+    expect(sanitizeApprovalRepair(noFingerprint)).toBeUndefined();
+  });
+
+  it("never fails the event frame: the wire accepts a valid block and garbage alike", () => {
+    const base = {
+      kind: "approval", threadId: "t", turnId: "u", approvalId: "approval", callId: "call",
+      name: "mcp_reconnect", status: "pending",
+    };
+    for (const value of [repair, "nope", 7, { kind: "restart" }]) {
+      expect(check(AttachV1EventFrameSchema, {
+        kind: "event", sequence: 1, eventId: "e-repair", event: { ...base, repair: value },
+      })).toBe(true);
+    }
+  });
+});

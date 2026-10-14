@@ -1,0 +1,102 @@
+# Reference deployment: mount an explicit Hermes config and secret environment. The optional local
+# relay is in the local-push profile for developers with their own publisher-team APNs key.
+services:
+  gateway:
+    # Bound stdout/stderr even when a bot floods traces. Docker owns rotation and compression.
+    logging: &bounded-logs
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+        mode: non-blocking
+        max-buffer-size: "1m"
+    build:
+      context: .
+      dockerfile: packages/gateway/Dockerfile
+    environment:
+      COZYGATEWAY_HOST: "0.0.0.0"
+      COZYGATEWAY_PORT: "8787"
+      COZYGATEWAY_DB_PATH: "/data/cozygateway.db"
+      # Hosted push works with the store app because CozyLabs holds that publisher team's APNs key.
+      # Payloads are end-to-end encrypted. Override for a local-push developer relay if needed.
+      COZYGATEWAY_PUSH_RELAY_URL: "${COZYGATEWAY_PUSH_RELAY_URL:-https://push.cozylabs.ai}"
+    # This file supplies exactly the environment variables named by hermes.tokenEnv/passwordEnv and
+    # hermes.profiles.*.tokenEnv in the mounted config. It is not copied into the image.
+    env_file:
+      - "${COZYGATEWAY_SECRETS_FILE:?set COZYGATEWAY_SECRETS_FILE to a Hermes secrets env file}"
+    ports:
+      # The reference deployment is local by default. Add docker-compose.lan.yml only after
+      # choosing a trusted LAN or TLS posture; it is the deliberate opt-in to all host interfaces.
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - gateway-data:/data
+      - "${COZYGATEWAY_CONFIG_DIR:?set COZYGATEWAY_CONFIG_DIR to the writable config directory}:/config:rw"
+    # Lets the example config reach a private Hermes Dashboard on the Docker host. For a Hermes
+    # service on the same Compose network, use that service name in hermes.url instead.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Pointed at /ready, not /health: docker's restart policy below only reacts to the container
+    # process exiting, never to a failing healthcheck, so nothing here restarts on an unhealthy
+    # result. That is exactly why /ready is the right target -- when the hermes bridge is offline,
+    # /ready correctly reports unhealthy and docker ps shows "(unhealthy)", a truthful signal an
+    # operator or monitor can alarm on, with no restart loop cycling a gateway process that was
+    # never the thing that broke. A dead upstream bridge is not fixed by restarting this container.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:'+(process.env.COZYGATEWAY_PORT||8787)+'/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      # 30s, not 5s: the hermes bridge needs a login plus a ws-ticket handshake to come online
+      # after the process starts, and a 5s start_period would show the gateway "(unhealthy)" for
+      # that entire ordinary startup window before the bridge has had a chance to connect.
+      start_period: 30s
+    # Only reacts to the process exiting (a crash), never to a failing healthcheck above.
+    restart: unless-stopped
+
+  relay:
+    logging: *bounded-logs
+    # A self-hosted relay cannot push to the store app: APNs keys are scoped to the publisher team.
+    # This profile is for developers signing their own app with their own Apple team.
+    profiles: ["local-push"]
+    build:
+      context: .
+      dockerfile: packages/relay/Dockerfile
+    command:
+      ["node", "dist/cli.js", "--host", "0.0.0.0", "--port", "${COZY_RELAY_PORT:-8788}", "--db", "/data/relay.db"]
+    environment:
+      # Optional APNs (set all four to enable real push; leave empty for webhook-only).
+      APNS_KEY_P8_PATH: "${APNS_KEY_P8_PATH:-}"
+      APNS_KEY_ID: "${APNS_KEY_ID:-}"
+      APNS_TEAM_ID: "${APNS_TEAM_ID:-}"
+      APNS_TOPIC: "${APNS_TOPIC:-}"
+    expose:
+      - "${COZY_RELAY_PORT:-8788}"
+    volumes:
+      - relay-data:/data
+      # - "${APNS_KEY_P8_HOST_PATH}:/keys/apns.p8:ro"
+    # Stays on /health, unlike the gateway above: the relay has no backend link of its own to be
+    # ready for (no bridge, no upstream it proxies), so its liveness IS its readiness and a
+    # separate /ready would report nothing /health does not already say.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:${COZY_RELAY_PORT:-8788}/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  gateway-data:
+  relay-data:
