@@ -1,0 +1,452 @@
+import { createHash } from "node:crypto";
+
+import type { Storage, PushRegistrationRow } from "./storage.ts";
+import type { Notifier } from "./turns.ts";
+import { encryptPushPayload, type ApprovalPushPayload, type PushPayload, type TaskCompletionPushPayload } from "./push-crypto.ts";
+import { emitTrace, traceId, type TraceLog } from "./trace.ts";
+import type { ObservationRing } from "./observe/ring.ts";
+
+/** The small durable seam the notifier needs. Keeping it structural preserves the notifier's
+ * bare-storage unit tests and makes the synchronous write explicit at server assembly. */
+export interface ReplyPushTracker {
+  replyPushTask(sessionId: string, runId: string | undefined): { taskId: string; runId: string } | undefined;
+  noteReplyPush(marker: { taskId: string; runId: string; deviceId: string }): void;
+  replyPushState(marker: { taskId: string; runId: string; deviceId: string }): "scheduled" | "sent" | undefined;
+  markReplyPushSent(marker: { taskId: string; runId: string; deviceId: string }): void;
+  clearReplyPush(marker: { taskId: string; runId: string; deviceId: string }): void;
+}
+
+export const PREVIEW_MAX_CHARS = 200;
+const NOTIFY_TIMEOUT_MS = 10_000;
+
+/** The relay's registered push categories (contract/push-v0.md, "POST /notify"). They are the ONE
+ *  piece of routing metadata the relay sees in the clear; everything describing the tool call
+ *  rides inside the ciphertext it has no key for. */
+const APPROVAL_CATEGORY = {
+  approval_pending: "approval.pending",
+  approval_resolved: "approval.resolved",
+} as const;
+
+const CHAT_MESSAGE_CATEGORY = "message";
+const TASK_COMPLETED_CATEGORY = "task.completed";
+const MOBILE_NODE_WAKE_ROUTING = {
+  category: "mobile.status.wake",
+  collapseId: "mobile.status",
+} as const;
+
+export interface ChatMessagePushEvent {
+  bot: string;
+  displayName: string;
+  messageId: string;
+  chatSessionId: string;
+  /** The attach turn identity. Without it a retry's older reply is not eligible for collapse. */
+  turnId?: string;
+  /** The settled reply's text. Truncated here to PREVIEW_MAX_CHARS; encrypted end to end, so the
+   *  relay sees only ciphertext (the redaction boundary is unchanged). */
+  preview: string;
+}
+
+/** The identities a completion push carries, from the Task the gateway just settled. A ROOM Task's
+ *  thread is the room turn's own session (`group:<room>:<member>`), which is what every room
+ *  surface in this gateway addresses; a 1:1 Task keeps the namespaced `bot:<name>` the approval
+ *  payloads use, because its session id is the harness's own and means nothing to a client. */
+export function taskCompletionPayload(
+  notice: { taskId: string; bot: string; sessionId: string; room?: string },
+): TaskCompletionPushPayload {
+  return {
+    kind: "task_completed",
+    taskId: notice.taskId,
+    threadId: notice.room === undefined ? `bot:${notice.bot}` : notice.sessionId,
+    agentId: notice.bot,
+  };
+}
+
+/** A stable, opaque APNs coalescing key for one bot chat. Digesting instead of truncating preserves
+ *  uniqueness for arbitrary Hermes session ids while staying inside the relay's 64-character and
+ *  identifier-only rules. */
+export function chatMessageCollapseId(bot: string, chatSessionId: string): string {
+  const digest = createHash("sha256")
+    .update(bot)
+    .update("\0")
+    .update(chatSessionId)
+    .digest("base64url");
+  return `botmsg.${digest}`;
+}
+
+/** The collapse-id charset and bound the relay enforces (`[A-Za-z0-9_.:-]`, 1 to 64). It is the
+ *  only caller-controlled cleartext string besides the ciphertext, so a raw command or path cannot
+ *  pass it. Checked HERE as well, so a toolCallId that could not be a collapse id is caught before
+ *  a doomed request goes out rather than as an opaque relay 400. */
+const COLLAPSE_ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/** Slices `text` to at most `maxUnits` UTF-16 code units, but never mid-surrogate-pair. A
+ *  plain `.slice(0, maxUnits)` can land the cut between a surrogate pair's high and low half,
+ *  producing a lone high surrogate that serializes as U+FFFD (replacement character) instead
+ *  of the astral character it started. If the unit at the cut boundary is a high surrogate,
+ *  its low half was about to be dropped anyway, so drop the high half too and land one unit
+ *  earlier, on a real code-point boundary. */
+function truncateAtCodePointBoundary(text: string, maxUnits: number): string {
+  if (text.length <= maxUnits) return text;
+  let end = maxUnits;
+  const boundaryUnit = text.charCodeAt(end - 1);
+  if (boundaryUnit >= 0xd800 && boundaryUnit <= 0xdbff) end -= 1;
+  return text.slice(0, end);
+}
+
+export interface RelayNotifierDeps {
+  storage: Storage;
+  fetchImpl?: typeof fetch;
+  /** Optional process-wide relay target. When configured, notification delivery and the device
+   *  registration proxy use the same private relay origin. */
+  relayBaseUrl?: string;
+  log?: (message: string) => void;
+  /** Live per-device presence check (see `WsHub.isDeviceConnected`). Optional: when omitted,
+   *  `#send` skips the late recheck and relies solely on the `connectedDeviceIds` snapshot
+   *  `notify()` was called with. Wired in at server assembly to narrow the race where a
+   *  device's socket becomes live between the commit-time snapshot and the fire-and-forget
+   *  send actually going out (issue #11). */
+  isDeviceConnected?: (deviceId: string) => boolean;
+  trace?: TraceLog;
+  /** Dashboard packet D2. Push outcomes as a countable series beside the existing `relay_result`
+   *  trace, not instead of it: the trace is a line an operator tails, this is what a chart reads. */
+  observe?: ObservationRing;
+  replyPushes?: ReplyPushTracker;
+}
+
+/** Posts encrypted notification payloads to each registered device's relay.
+ *  Fire-and-forget by contract: notify() never throws, never rejects, and never blocks
+ *  the turn that triggered it (design spec, section 4). */
+export class RelayNotifier implements Notifier {
+  #closed = false;
+  readonly #shutdown = new AbortController();
+
+  /** Stop deferred work before storage closes. Scheduled markers remain durable for recovery. */
+  close(): void {
+    this.#closed = true;
+    this.#shutdown.abort();
+    this.#inflightReplyPushes.clear();
+    this.#pendingCompletions.clear();
+  }
+
+  readonly #storage: Storage;
+  readonly #fetch: typeof fetch;
+  readonly #relayBaseUrl: string | undefined;
+  readonly #log: (message: string) => void;
+  readonly #isDeviceConnected: ((deviceId: string) => boolean) | undefined;
+  readonly #trace: TraceLog | undefined;
+  readonly #observe: ObservationRing | undefined;
+  readonly #replyPushes: ReplyPushTracker | undefined;
+  /** Markers created by this process only. A durable `scheduled` marker after restart is recovery
+   * work, not proof that a reply reached the relay. */
+  readonly #inflightReplyPushes = new Set<string>();
+  readonly #pendingCompletions = new Map<string, { registration: PushRegistrationRow; payload: TaskCompletionPushPayload; routing: { category: string; collapseId: string } }>();
+
+  constructor(deps: RelayNotifierDeps) {
+    this.#storage = deps.storage;
+    this.#fetch = deps.fetchImpl ?? fetch;
+    this.#relayBaseUrl = deps.relayBaseUrl;
+    this.#log = deps.log ?? ((message: string) => process.stderr.write(`${message}\n`));
+    this.#isDeviceConnected = deps.isDeviceConnected;
+    this.#trace = deps.trace;
+    this.#observe = deps.observe?.enabled === true ? deps.observe : undefined;
+    this.#replyPushes = deps.replyPushes;
+  }
+
+  notify(
+    event: { threadId: string; agentName: string; preview: string; runId?: string },
+    connectedDeviceIds: ReadonlySet<string>,
+  ): void {
+    const registrations = this.#registrations();
+    if (registrations === undefined) return;
+    // Per-device targeting (issue #11): a device with a live socket at commit time gets its
+    // update over the WS instead, so it is excluded here rather than pushed to redundantly.
+    const targets = registrations.filter((registration) => !connectedDeviceIds.has(registration.deviceId));
+    if (targets.length === 0) return;
+    const task = this.#replyPushes?.replyPushTask(event.threadId, event.runId);
+    // This is deliberately synchronous and precedes #send's setImmediate. Tasks.append queues
+    // its completion callback before this notifier call, so only a durable write here can make
+    // the callback observe a reply notification for the same turn.
+    const payload: PushPayload = {
+      kind: "message",
+      threadId: event.threadId,
+      agentName: event.agentName,
+      preview: truncateAtCodePointBoundary(event.preview, PREVIEW_MAX_CHARS),
+      ...(task === undefined ? {} : { taskId: task.taskId }),
+    };
+    for (const registration of targets) {
+      this.#sendReply(registration, payload, task);
+    }
+  }
+
+  #replyKey(marker: { taskId: string; runId: string; deviceId: string }): string {
+    return `${marker.taskId}\u0000${marker.runId}\u0000${marker.deviceId}`;
+  }
+
+  /** The reply marker has a deliberately narrow lifetime. It is `inflight` only in this process,
+   * becomes durable `sent` only after the relay accepts, and retains a recovery marker until
+   * any required per-device completion fallback is accepted or no longer needed. */
+  #sendReply(
+    registration: PushRegistrationRow,
+    payload: PushPayload,
+    task: { taskId: string; runId: string } | undefined,
+    routing?: { category: string; collapseId: string; interruptionLevel?: "time-sensitive" },
+  ): void {
+    if (task === undefined || this.#replyPushes === undefined) {
+      void this.#send(registration, payload, routing).catch((err: unknown) => {
+        this.#log(`push: notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`);
+      });
+      return;
+    }
+    const marker = { ...task, deviceId: registration.deviceId };
+    const key = this.#replyKey(marker);
+    this.#replyPushes.noteReplyPush(marker);
+    this.#inflightReplyPushes.add(key);
+    void this.#send(registration, payload, routing).then((outcome) => {
+      if (this.#closed) return;
+      this.#inflightReplyPushes.delete(key);
+      if (outcome === "sent") {
+        this.#replyPushes?.markReplyPushSent(marker);
+        this.#pendingCompletions.delete(key);
+      } else {
+        this.#replyPushes?.clearReplyPush(marker);
+        this.#sendPendingCompletion(key, marker);
+      }
+    }).catch((err: unknown) => {
+      if (this.#closed) return;
+      this.#inflightReplyPushes.delete(key);
+      this.#log(`push: notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`);
+      this.#sendPendingCompletion(key, marker);
+    });
+  }
+
+  #sendPendingCompletion(key: string, marker: { taskId: string; runId: string; deviceId: string }): void {
+    if (this.#closed) return;
+    const pending = this.#pendingCompletions.get(key);
+    if (pending === undefined) return;
+    this.#pendingCompletions.delete(key);
+    // Keep the original scheduled marker through fallback failure and process loss.
+    this.#replyPushes?.noteReplyPush(marker);
+    void this.#send(pending.registration, pending.payload, pending.routing).then(() => {
+      if (this.#closed) return;
+      this.#replyPushes?.clearReplyPush(marker);
+    }).catch((err: unknown) => {
+      this.#log(`push: task completion fallback failed for device ${pending.registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+
+  /** Schedule one silent wake for a selected idle device. The boolean means only that a matching
+   *  registration was found and its fire-and-forget relay send was scheduled; APNs delivery is
+   *  deliberately unknowable at this seam. */
+  notifyMobileNodeWake(deviceId: string): boolean {
+    const registration = this.#registrations()?.find((candidate) => candidate.deviceId === deviceId);
+    if (registration === undefined) return false;
+    void this.#send(registration, { kind: "mobile_node_wake" }, MOBILE_NODE_WAKE_ROUTING).catch((err: unknown) => {
+      this.#log(
+        `push: mobile-node wake failed for device ${registration.deviceId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+    return true;
+  }
+
+  /** A settled canonical bot reply. It uses the existing encrypted message payload and adds only
+   *  the relay-visible category/collapse pair needed for a burst from one bot chat to coalesce. */
+  notifyChatMessage(event: ChatMessagePushEvent, connectedDeviceIds: ReadonlySet<string>): void {
+    const registrations = this.#registrations();
+    if (registrations === undefined) return;
+    const targets = registrations.filter((registration) => !connectedDeviceIds.has(registration.deviceId));
+    if (targets.length === 0) return;
+    const task = this.#replyPushes?.replyPushTask(event.chatSessionId, event.turnId);
+    const payload: PushPayload = {
+      kind: "message",
+      threadId: `bot:${event.bot}`,
+      agentName: event.displayName,
+      preview: truncateAtCodePointBoundary(event.preview, PREVIEW_MAX_CHARS),
+      ...(task === undefined ? {} : { taskId: task.taskId }),
+    };
+    const routing = {
+      category: CHAT_MESSAGE_CATEGORY,
+      collapseId: chatMessageCollapseId(event.bot, event.chatSessionId),
+    };
+    for (const registration of targets) {
+      this.#sendReply(registration, payload, task, routing);
+    }
+  }
+
+  /** The out-of-band leg of the approval lifecycle (issue #19 section 2). Same fire-and-forget
+   *  contract as `notify`, and the SAME targeting rule: a device holding a live socket already got
+   *  the `approval_pending` / `approval_resolved` frame, so it is excluded rather than told twice.
+   *
+   *  What is different from a message push is the two cleartext fields the relay is allowed to see:
+   *  the category (so the app can attach Approve and Deny buttons to the notification without the
+   *  relay learning anything) and the collapse id, which is the `toolCallId` so a resolved or
+   *  expired approval REPLACES its own pending banner in place instead of leaving a lock-screen
+   *  "approve this?" for a decision that is already made. */
+  notifyApproval(payload: ApprovalPushPayload, connectedDeviceIds: ReadonlySet<string>): void {
+    const collapseId = payload.toolCallId;
+    if (!COLLAPSE_ID_RE.test(collapseId)) {
+      // Refused rather than truncated or silently downgraded to an uncategorized push: two ids
+      // sharing a 64-byte prefix would collapse into one notification, and a wrongly collapsed
+      // approval is a wrongly answered approval. The frame already went out over every live
+      // socket, so what is lost is the banner, not the approval.
+      this.#log(
+        `push: approval ${payload.kind} not sent: its toolCallId cannot be a collapse id (contract/push-v0.md)`,
+      );
+      return;
+    }
+    const registrations = this.#registrations();
+    if (registrations === undefined) return;
+    const targets = registrations.filter((registration) => !connectedDeviceIds.has(registration.deviceId));
+    if (targets.length === 0) return;
+    const category = APPROVAL_CATEGORY[payload.kind];
+    for (const registration of targets) {
+      void this.#send(registration, payload, { category, collapseId,
+        ...(payload.kind === "approval_pending" && payload.name === "send_file" ? { interruptionLevel: "time-sensitive" as const } : {}),
+      }).catch((err: unknown) => {
+        this.#log(
+          `push: approval notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  }
+
+  /** A Task finished while the phone was backgrounded. Same fire-and-forget contract and the same
+   *  targeting rule as every leg above: a device holding a live socket already got the
+   *  `bot_task_updated` frame and announced from it, so it is excluded rather than told twice. The
+   *  other half of that deduplication is the caller's: this is invoked only when capability 64's
+   *  completion notification record was newly written for the Task, which happens once. */
+  notifyTaskCompletion(payload: TaskCompletionPushPayload, connectedDeviceIds: ReadonlySet<string>, runId?: string): void {
+    const collapseId = payload.taskId;
+    if (!COLLAPSE_ID_RE.test(collapseId)) {
+      // Refused rather than truncated, for the reason the approval leg gives: two ids sharing a
+      // 64-byte prefix would collapse into one notification.
+      this.#log(`push: task completion not sent: its taskId cannot be a collapse id (contract/push-v0.md)`);
+      return;
+    }
+    const registrations = this.#registrations();
+    if (registrations === undefined) return;
+    const targets = registrations.filter((registration) => !connectedDeviceIds.has(registration.deviceId));
+    for (const registration of targets) {
+      const marker = runId === undefined ? undefined : { taskId: payload.taskId, runId, deviceId: registration.deviceId };
+      const key = marker === undefined ? undefined : this.#replyKey(marker);
+      if (marker !== undefined && key !== undefined && this.#inflightReplyPushes.has(key) && this.#replyPushes?.replyPushState(marker) === "scheduled") {
+        // The reply may still fail after this queued completion callback. Keep the exact payload
+        // for that device so the failure path can deliver completion rather than losing it.
+        this.#pendingCompletions.set(key, { registration, payload, routing: { category: TASK_COMPLETED_CATEGORY, collapseId } });
+        continue;
+      }
+      if (marker !== undefined && this.#replyPushes?.replyPushState(marker) === "sent") {
+        this.#log(`push: task completion suppressed after sent reply push for ${payload.taskId}/${runId}/${registration.deviceId}`);
+        continue;
+      }
+      void this.#send(registration, payload, { category: TASK_COMPLETED_CATEGORY, collapseId }).then(() => {
+        if (this.#closed) return;
+        if (marker !== undefined) this.#replyPushes?.clearReplyPush(marker);
+      }).catch((err: unknown) => {
+        this.#log(
+          `push: task completion notify failed for device ${registration.deviceId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  }
+
+  /** Startup recovery for a marker that survived before its deferred reply request ran. The marker
+   * remains scheduled until the relay accepts this completion, so another restart retries it. */
+  recoverTaskCompletion(payload: TaskCompletionPushPayload, runId: string, deviceId: string): void {
+    if (this.#closed) return;
+    const marker = { taskId: payload.taskId, runId, deviceId };
+    const registration = this.#registrations()?.find((candidate) => candidate.deviceId === deviceId);
+    if (registration === undefined) { this.#replyPushes?.clearReplyPush(marker); return; }
+    const collapseId = payload.taskId;
+    if (!COLLAPSE_ID_RE.test(collapseId)) { this.#replyPushes?.clearReplyPush(marker); return; }
+    void this.#send(registration, payload, { category: TASK_COMPLETED_CATEGORY, collapseId }).then(() => {
+      if (this.#closed) return;
+      this.#replyPushes?.clearReplyPush(marker);
+    }).catch((err: unknown) => {
+      this.#log(`push: task completion recovery failed for device ${deviceId}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+
+  #registrations(): PushRegistrationRow[] | undefined {
+    if (this.#closed) return undefined;
+    try {
+      return this.#storage.pushRegistrations();
+    } catch (err) {
+      this.#log(`push: reading registrations failed: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  }
+
+  async #send(
+    registration: PushRegistrationRow,
+    payload: PushPayload,
+    /** Both or neither, per contract/push-v0.md: the relay 400s a body carrying only one. */
+    routing?: { category: string; collapseId: string; interruptionLevel?: "time-sensitive" },
+  ): Promise<"sent" | "skipped" | "not_found" | "closed"> {
+    // Yield one macrotask before the presence recheck. Without this yield the recheck would
+    // run in the same synchronous span as notify()'s commit-time snapshot and could never
+    // observe anything newer. setImmediate callbacks run after pending I/O callbacks, so a WS
+    // auth frame already sitting in the socket's event queue at commit time gets processed
+    // first and the recheck below sees the device as connected. Only this fire-and-forget
+    // send path defers; the commit-time notify decision in the turn runner stays fully
+    // synchronous, and one macrotask of extra push latency is invisible at human scale.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (this.#closed) return "closed";
+    // Late recheck, narrowing (not closing) the race window: the device may have connected
+    // since notify()'s commit-time snapshot was taken. Skip the send without touching the
+    // registration row, which is prunable only on a relay 404, not on this kind of skip.
+    if (this.#isDeviceConnected?.(registration.deviceId) === true) return "skipped";
+    const ciphertext = encryptPushPayload(registration.pushKey, payload);
+    const relayBaseUrl = this.#relayBaseUrl ?? registration.relayUrl;
+    const url = `${relayBaseUrl.replace(/\/+$/, "")}/notify`;
+    let res: Response;
+    try {
+      res = await this.#fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          pushId: registration.pushId,
+          ciphertext,
+          ...(routing === undefined ? {} : routing),
+        }),
+        signal: AbortSignal.any([AbortSignal.timeout(NOTIFY_TIMEOUT_MS), this.#shutdown.signal]),
+      });
+      // Old strict relays reject the new field before delivery. Only that explicit schema
+      // rejection is safe to retry; uncertain network/server failures may already have delivered.
+      if (res.status === 400 && routing?.interruptionLevel === "time-sensitive") {
+        const rejection: unknown = await res.json().catch(() => undefined);
+        if (this.#closed) return "closed";
+        if (typeof rejection === "object" && rejection !== null && "error" in rejection) {
+          const error = rejection.error;
+          if (typeof error === "object" && error !== null && "code" in error && "message" in error
+            && error.code === "invalid_request" && error.message === "malformed notify body") {
+            if (this.#isDeviceConnected?.(registration.deviceId) === true) return "skipped";
+            this.#log("push: relay rejected delivery urgency; retrying once at the ordinary interruption level");
+            res = await this.#fetch(url, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ pushId: registration.pushId, ciphertext, category: routing.category, collapseId: routing.collapseId }),
+              signal: AbortSignal.any([AbortSignal.timeout(NOTIFY_TIMEOUT_MS), this.#shutdown.signal]),
+            });
+          }
+        }
+      }
+    } catch (error) {
+      if (this.#closed) return "closed";
+      emitTrace(this.#trace, "relay_result", { device: traceId(registration.deviceId), result: "network_error" });
+      this.#observe?.pushResult(registration.deviceId, "network_error");
+      throw error;
+    }
+    if (this.#closed) return "closed";
+    emitTrace(this.#trace, "relay_result", { device: traceId(registration.deviceId), result: res.ok ? "ok" : res.status === 404 ? "not_found" : "http_error" });
+    this.#observe?.pushResult(registration.deviceId, res.ok ? "ok" : res.status === 404 ? "not_found" : "http_error");
+    if (res.status === 404) {
+      // The relay no longer knows this id; the registration is dead weight (push-v0). Prune it.
+      this.#storage.deletePushRegistration(registration.deviceId);
+      return "not_found";
+    }
+    if (!res.ok) throw new Error(`relay returned HTTP ${res.status}`);
+    return "sent";
+  }
+}

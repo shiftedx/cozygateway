@@ -1,0 +1,6680 @@
+"""Platform adapter for the gateway attach protocol.
+
+This is the only module that imports the harness tree, and it does so LAZILY inside
+methods so the package stays importable (e.g. to call :func:`register`) without the
+harness on the path. The wire logic lives in the harness-free siblings:
+:mod:`.attach_client` (transport), :mod:`.text_blocks` (markdown to blocks), and
+:mod:`.tool_chips` (the tool-chip tracker).
+
+How the harness's native stream maps onto the attach protocol:
+
+* The adapter dials OUT to the gateway ``/attach/v1`` WS and authenticates header-only
+  with a bearer token. Nothing listens on the agent host.
+* A gateway ``turn`` frame is injected as a synthetic inbound message. The frame's
+  ``threadId`` becomes the harness chat id (so a thread resumes one session) and
+  the ``turnId`` rides ``message_id`` (so the streamed reply anchors to its turn).
+* As the model streams, the harness calls the draft surface with the FULL
+  accumulated text per flush. The adapter normalizes that text to typed blocks,
+  folds in the current tool chips, and sends one ``draft`` frame (full replace).
+* The terminal reply is delivered through ``send()``: one final ``draft`` then a
+  single ``done``. An empty reply with no prior content sends ``failed`` instead.
+* Any exception on the turn path sends a best-effort ``failed`` and per-turn state
+  is dropped in a ``finally`` so nothing leaks across turns.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import inspect
+import json
+import logging
+import math
+import mimetypes
+import os
+import random
+import re
+import threading
+import time
+from collections import OrderedDict
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from urllib.error import HTTPError
+from typing import Any, Dict, List, Optional, Set, Tuple
+from pathlib import Path
+
+from .attach_client import (
+    AttachAuthError,
+    AttachSupersededError,
+    InterruptFrame,
+    SteerFrame,
+    TurnFrame,
+)
+from .attach_client_v1 import (
+    HELLO_ACK_TIMEOUT_SECONDS,
+    MOBILE_FAILURE_REASONS,
+    MOBILE_FAILURE_STAGES,
+    MOBILE_STATUS_VALUES,
+    AttachV1Client,
+    AttachV1ClientConfig,
+    _is_device_status,
+    _is_location,
+    _is_media,
+    _is_notification,
+    _media_byte_limit,
+    normalize_location_purpose,
+)
+from .attach_spool import AttachSpool, INTERACTIVE_SESSION_SOURCES
+from .media_descriptor import (
+    MEDIA_COMPATIBILITY_POLICY,
+    MediaDescriptor,
+    MediaProbeError,
+    detect_mime,
+    family_for,
+    probe as probe_media,
+)
+from .text_blocks import (
+    IncrementalNormalizer,
+    block_split_index,
+    normalize_text_to_blocks,
+)
+from .tool_chips import ToolChipTracker
+from .memory import MemoryConflict, MemoryError, MemoryManager
+from .profile_env import owning_home, profile_env, profile_name_for_home, serves_routed_profile
+
+logger = logging.getLogger(__name__)
+
+# The registered platform name. It is also the value the harness stamps into the
+# per-turn session context, so the tool hooks can filter to this platform's turns.
+PLATFORM_NAME = "cozygateway"
+# Upstream Bot Mode's canonical chat title (hermes_state CANONICAL_BOT_CHAT_TITLE).
+CANONICAL_BOT_CHAT_TITLE = "Bot Chat"
+
+# The harness binds these task-local session identifiers per turn and propagates
+# them into the tool worker thread. They are harness-defined identifiers, used only
+# to route a tool event back to the right turn.
+SESSION_PLATFORM_KEY = "HERMES_SESSION_PLATFORM"  # harness-defined identifier
+SESSION_CHAT_ID_KEY = "HERMES_SESSION_CHAT_ID"  # harness-defined identifier
+
+# The harness's pre_tool_call / post_tool_call hook payload carries the tool
+# call's real per-call id under this key (empty string when the harness has none
+# to give). Present on both legs, it lets a chip's open and close pair exactly;
+# see tool_chips.ToolChipTracker for the name#n fallback used otherwise.
+TOOL_CALL_ID_KEY = "tool_call_id"  # harness-defined identifier
+
+# A neutral inbound identity for the injected message. The turn was already
+# authorized by the gateway that issued the token, so the adapter marks it
+# role-authorized to pass the harness's per-message authorization gate.
+INBOUND_USER = "user"
+
+# Capability 69's closed refusal reason: work handed to this peer for a turn it does not hold.
+# It covers both refusals here, since a turn whose strict session binding this process can no
+# longer resolve is a turn it cannot hold either.
+#
+# A refusal that never reaches the gateway is worse than a visible failure: the gateway keeps the
+# turn running to its cap, the person's next message arrives as a steer on that turn, and a plugin
+# that no longer holds it answers as a fresh inbound whose events are declined as orphaned. The
+# reason is what lets the gateway promote that steer instead of guessing from free text.
+UNKNOWN_TURN_REASON = "unknown_turn"
+
+
+def _truthy(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"} if value else False
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a positive float from the owning profile's env, falling back on unset/garbage."""
+    raw = profile_env(name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if (math.isfinite(value) and value > 0) else default
+
+
+# What Hermes finalizes a native stream with when the turn produced no text at
+# all ("Native streams MUST close with finish=true even when empty", the native
+# branch of ``_finalize_turn``). Not an answer, so never a commit.
+_NATIVE_STREAM_PLACEHOLDERS = ("", "✅")
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read an on/off switch from the owning profile's env; anything unrecognised is the default."""
+    raw = (profile_env(name) or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read a positive int from the owning profile's env, falling back on unset/garbage."""
+    raw = profile_env(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+@dataclass(frozen=True)
+class _Owner:
+    """The Hermes profile an attach belongs to, captured while Hermes had it bound.
+
+    ``scoped`` is Hermes' own routing answer (``serves_routed_profile``): True on any multiplexed
+    gateway, where ``home`` is the profile Hermes bound around this adapter's creation, connect or a
+    cron send (the launch profile's own home when it bound none). False on a standalone gateway, even
+    while cron binds that profile's own scope: there the process env IS the profile's.
+    """
+
+    scoped: bool = False
+    home: Optional[str] = None
+
+
+def _current_owner() -> _Owner:
+    return _Owner(True, owning_home()) if serves_routed_profile() else _Owner()
+
+
+@dataclass(frozen=True)
+class _AttachSettings:
+    gateway_url: str
+    token: str
+    ca_file: Optional[str]
+
+
+def _attach_settings(pconfig: Any) -> _AttachSettings:
+    """Dial settings for the profile bound now: its env first, then ``PlatformConfig.extra``.
+
+    Standalone that env is ``os.environ``; served by a multiplexed gateway it is the profile's own
+    ``.env`` through Hermes' secret scope, and a missing value stays missing (never the host's).
+    """
+    extra = getattr(pconfig, "extra", {}) or {}
+    return _AttachSettings(
+        gateway_url=(profile_env("COZYGATEWAY_URL") or extra.get("gateway_url") or "").rstrip("/"),
+        token=profile_env("COZYGATEWAY_TOKEN") or extra.get("token", ""),
+        ca_file=profile_env("COZYGATEWAY_CA_FILE") or extra.get("ca_file") or None,
+    )
+
+
+def _default_spool_path(owner: _Owner) -> str:
+    """The spool for a profile with no ``COZYGATEWAY_SPOOL_PATH``.
+
+    Standalone keeps the historical ``~/.hermes`` path. A profile served by a multiplexed gateway
+    keeps it under its own home instead, so two profiles never contend for one spool (its transport
+    lease would park the second).
+    """
+    if owner.scoped and owner.home:
+        return os.path.join(owner.home, "cozygateway-attach-v1.sqlite")
+    return os.path.join(os.path.expanduser("~"), ".hermes", "cozygateway-attach-v1.sqlite")
+
+
+def _fresh_attach_token(fallback: str, owner: _Owner = _Owner()) -> str:
+    """Reload the profile secret so a rotated token can heal without a process restart.
+
+    A profile served by a multiplexed gateway rereads ITS home's ``.env`` (even when the dial runs
+    outside its scope) and otherwise keeps the token it had; it never reads the process env, which
+    belongs to the launch profile.
+    """
+    hermes_home = (owner.home or "") if owner.scoped else os.getenv("HERMES_HOME", "").strip()
+    if hermes_home:
+        try:
+            from agent.secret_scope import load_env_file  # harness-defined identifier
+            from pathlib import Path
+
+            token = load_env_file(Path(hermes_home) / ".env").get("COZYGATEWAY_TOKEN", "")
+            if token.strip():
+                return token.strip()
+        except Exception:
+            logger.debug("attach: could not refresh token from the profile env", exc_info=True)
+    if owner.scoped:
+        return fallback.strip()
+    return (os.getenv("COZYGATEWAY_TOKEN") or fallback).strip()
+
+
+_COMMAND_NAME = re.compile(r"^/[A-Za-z0-9_-]{1,128}$")
+# Hermes's STT transcript echo, exactly as ``_echo_stt_transcripts`` formats it.
+_TRANSCRIPT_ECHO = re.compile('\U0001F399\ufe0f "(.*)"', re.DOTALL)
+
+# A one-shot proactive sender shares its spool with the resident adapter.  Keep a
+# bounded shutdown in the foreground, but if a broken websocket watcher refuses
+# to stop, retain the lease until that watcher really exits rather than allowing
+# a second connection to supersede it.
+_ONE_SHOT_CLEANUP_SECONDS = 0.25
+_ONE_SHOT_CLEANUP_TASKS: Set[asyncio.Task] = set()
+
+
+def consumed_as_command(event: Any) -> Optional[str]:
+    """The canonical Hermes command this inbound message will be CONSUMED as, or ``None``.
+
+    A message whose text is a Hermes slash command never reaches the agent loop: Hermes
+    dispatches it from the command registry and returns the notice, so no agent turn runs and
+    no streaming draft is ever produced. The gateway, meanwhile, opened a durable turn for it.
+    Everything that seals such a turn hangs off knowing it IS one, so the reading is taken from
+    Hermes' own registry rather than from a leading slash: an unknown ``/word`` is ordinary text
+    that the agent answers, and sealing that turn early would cut off a real reply.
+
+    Fails CLOSED. With no registry on the path (a standalone import, a test without the harness
+    stubs) there is no agent either, so guessing buys nothing and mis-reading costs a live turn.
+    """
+    text = str(getattr(event, "text", "") or "").strip()
+    if not text.startswith("/"):
+        return None
+    try:
+        name = event.get_command()
+    except Exception:  # noqa: BLE001 - a foreign event shape is simply not a command
+        return None
+    if not isinstance(name, str) or not name:
+        return None
+    try:
+        from hermes_cli.commands import (  # harness-defined identifiers
+            is_gateway_known_command,
+            resolve_command,
+        )
+    except Exception:  # noqa: BLE001 - no registry, no command dispatch to seal after
+        logger.debug("attach: Hermes command registry unavailable", exc_info=True)
+        return None
+    try:
+        definition = resolve_command(name)
+        canonical = getattr(definition, "name", None) or name
+        if not is_gateway_known_command(canonical):
+            # A config-defined quick command resolves inside Hermes and is invisible here; the
+            # gateway's stale-turn reaper is the belt for that narrow case.
+            return None
+    except Exception:  # noqa: BLE001 - a registry fault must not change turn handling
+        logger.debug("attach: Hermes command resolution failed", exc_info=True)
+        return None
+    return str(canonical)
+
+
+def hermes_gateway_commands() -> List[Dict[str, str]]:
+    """Return the commands this Hermes profile exposes to messaging clients.
+
+    Hermes owns command semantics. CozyGateway only carries this structured projection in the
+    authenticated attach hello, so built-ins, plugins, config gates, and installed skill commands
+    stay aligned with the same registry Telegram and Discord use.
+    """
+    catalog: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+
+    def append(name: str, description: str, args_hint: str = "", category: str = "") -> None:
+        invocation = name if name.startswith("/") else f"/{name}"
+        if not _COMMAND_NAME.fullmatch(invocation) or invocation.lower() in seen:
+            return
+        clean_description = " ".join(str(description).split()).strip() or f"Run {invocation}"
+        entry = {
+            "name": invocation,
+            "description": clean_description[:200],
+        }
+        clean_hint = " ".join(str(args_hint).split()).strip()
+        clean_category = " ".join(str(category).split()).strip()
+        if clean_hint:
+            entry["argsHint"] = clean_hint[:160]
+        if clean_category:
+            entry["category"] = clean_category[:80]
+        catalog.append(entry)
+        seen.add(invocation.lower())
+
+    try:
+        from hermes_cli.commands import (
+            COMMAND_REGISTRY,
+            _is_gateway_available,
+            _iter_plugin_command_entries,
+            _resolve_config_gates,
+        )
+
+        overrides = _resolve_config_gates()
+        for command in COMMAND_REGISTRY:
+            if _is_gateway_available(command, overrides):
+                append(command.name, command.description, command.args_hint, command.category)
+        for name, description, args_hint in _iter_plugin_command_entries():
+            append(name, description, args_hint, "Plugins")
+    except Exception:
+        logger.debug("attach: Hermes command registry unavailable", exc_info=True)
+
+    try:
+        from agent.skill_commands import get_skill_commands
+
+        for name, info in sorted((get_skill_commands() or {}).items()):
+            if not isinstance(info, dict):
+                continue
+            append(str(name), str(info.get("description") or "Skill"), category="Skills")
+    except Exception:
+        logger.debug("attach: Hermes skill commands unavailable", exc_info=True)
+
+    return catalog[:512]
+
+
+# ---------------------------------------------------------------------------
+# The one media upload path
+# ---------------------------------------------------------------------------
+
+# A file the agent generated moments ago may still be flushing when its path is
+# named, so the probe samples its size twice this far apart before trusting the
+# bytes (spec finding 8). The probe runs on a worker thread, so the wait never
+# stalls the event loop.
+MEDIA_STABILITY_WAIT_SECONDS = _env_float("COZYGATEWAY_MEDIA_STABILITY_WAIT", 0.1)
+
+# 429 is the one upload status worth re-attempting inside a single send: the
+# gateway said exactly how long to wait and the bytes are already in hand. 5xx
+# and dropped sockets stay failures here, because the durable delivery journal
+# already owns those retries and a second one would only double the latency.
+MEDIA_RETRY_AFTER_CAP_SECONDS = 2.0
+
+# Lifecycle states that prove these exact bytes already reached the gateway for
+# this occurrence, so a replay reuses the id instead of uploading a second copy.
+MEDIA_ALREADY_UPLOADED_STATES = frozenset({"uploaded", "journaled", "projected", "displayed"})
+
+# The delivery id a reply made inside a live conversation journals its attachments under. It is
+# derived from the turn rather than assigned, so the gateway can rebuild the same id from the
+# commit it already saw and address a receipt back at these rows.
+TURN_DELIVERY_PREFIX = "turn:"
+
+# Attachments of one reply upload in parallel, because each one spends nearly all of
+# its time waiting on a socket. Three at a time is where a multi-attachment reply
+# stops being the slowest thing in the turn without turning one person's send into a
+# burst the gateway has to absorb.
+MEDIA_UPLOAD_CONCURRENCY = 3
+
+# The per-file caps are the gateway's own (contract/ext-bots-v1.md, "Canonical media
+# allowlist"), read through the client so the two cannot drift. The contract sets no
+# aggregate, so this is the plugin's guard on one occurrence: 16 attachments at the
+# video cap would be 640 MiB moved for a single message.
+# ponytail: a fixed number, not a policy engine. If the gateway ever publishes an
+# aggregate cap, delete this constant and read that one.
+MEDIA_AGGREGATE_MAX_BYTES = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class MediaDestination:
+    """Where one delivery is going, in the single shape every path agrees on.
+
+    Spec finding 6: response delivery, standalone media, ``send_message`` and cron
+    must not each infer the target differently. ``key`` is what content idempotency
+    is scoped by, so the same bytes going somewhere else is a separate claim.
+    """
+
+    kind: str
+    thread_id: str = ""
+
+    @property
+    def key(self) -> str:
+        return self.kind if self.kind == "canonical_home" else "%s:%s" % (self.kind, self.thread_id)
+
+
+@dataclass
+class MediaBatch:
+    """What one delivery's attachments actually became. Never a delivery claim."""
+
+    uploaded: List[Dict[str, Any]] = field(default_factory=list)
+    failed: List[Dict[str, Any]] = field(default_factory=list)
+    # Inline block positions for the ACCEPTED attachments, index-for-index with
+    # ``media_ids``. ``None`` means the caller had none, which is legacy above-stack
+    # placement.
+    media_positions: Optional[List[int]] = None
+
+    @property
+    def media_ids(self) -> List[str]:
+        return [entry["mediaId"] for entry in self.uploaded]
+
+    @property
+    def error_lines(self) -> List[str]:
+        """The bounded human-readable failure lines the durable result ABI carries."""
+        return [str(entry["error"]) for entry in self.failed]
+
+    def attachment_descriptors(self) -> List[Dict[str, Any]]:
+        """The deliberately small attachment receipt surface for an agent tool.
+
+        ``uploaded`` is an internal transport record: it needs a source path and a
+        digest for retries and cleanup.  Those are not facts an agent needs (and a
+        source path is especially not a fact it may disclose), so tool results must
+        pass through this one narrowing seam.
+        """
+        return [{
+            "attachmentId": str(entry["mediaId"]),
+            "name": str(entry["path"]),
+            "mimeType": str(entry["mime"]),
+            "bytes": int(entry["bytes"]),
+            "mediaKind": str(entry["family"]),
+        } for entry in self.uploaded]
+
+    def failure_sentence(self) -> str:
+        """One plain sentence naming what the person will NOT see (spec finding 2)."""
+        names = [str(entry["path"]) for entry in self.failed]
+        if not names:
+            return ""
+        if len(names) == 1:
+            listed = names[0]
+        elif len(names) == 2:
+            listed = " and ".join(names)
+        else:
+            listed = ", ".join(names[:-1]) + ", and " + names[-1]
+        return "I could not attach %s." % listed
+
+    def partial_result(self, message_id: Optional[str]) -> Dict[str, Any]:
+        return {
+            "state": "partial",
+            "messageId": message_id,
+            "uploaded": [dict(entry) for entry in self.uploaded],
+            "failed": [dict(entry) for entry in self.failed],
+        }
+
+
+def _client_supports(client: Any, capability: str) -> bool:
+    """Whether the gateway advertised ``capability`` on this connection.
+
+    An empty/absent set means the client has not handshaken (or predates capability
+    advertisement); that is not evidence of refusal, so it reads as permitted.
+    """
+    capabilities = getattr(client, "_capabilities", None)
+    return capability in capabilities if capabilities else True
+
+
+def _policy_block_reason(descriptor: MediaDescriptor) -> Optional[str]:
+    """Refuse locally only what the bytes PROVE the client cannot render.
+
+    Spec finding 9 wants an explicit compatibility policy; findings 1 and 8 want the
+    refusal to happen before a network request. But an inconclusive probe is not
+    evidence: when the bytes do not identify a type and the extension claims one the
+    policy supports, this fails OPEN and lets the upload run. The gateway verifies
+    magic numbers as the backstop and answers 415, which is a truthful rejection from
+    the authority rather than a guess from a sniffer.
+    """
+    if descriptor.compatibility != "unsupported":
+        return None
+    if (
+        descriptor.declared_mime == "text/markdown"
+        and descriptor.mime != descriptor.declared_mime
+    ):
+        return descriptor.incompatibility_reason or "The Markdown attachment is not valid UTF-8 text."
+    if descriptor.detected_mime == "application/octet-stream":
+        rule = MEDIA_COMPATIBILITY_POLICY.get(descriptor.declared_mime)
+        if rule is not None and rule["status"] == "supported":
+            return None
+    return descriptor.incompatibility_reason or (
+        "%s is not an allowed attachment type." % descriptor.mime
+    )
+
+
+def _retry_after_seconds(exc: HTTPError) -> float:
+    try:
+        value = float((exc.headers or {}).get("Retry-After", "") or 0)
+    except (AttributeError, TypeError, ValueError):
+        value = 0.0
+    return min(max(value, 0.05), MEDIA_RETRY_AFTER_CAP_SECONDS)
+
+
+def _media_failure(
+    path: str,
+    descriptor: Optional[MediaDescriptor],
+    status: Optional[Any],
+    error: str,
+    media_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """One refused attachment, in the shape a partial result reports (finding 2).
+
+    ``path`` is the basename only: a failure line travels into agent output and logs,
+    and the directory a file sits in is nobody else's business.
+    """
+    return {
+        "path": os.path.basename(path)[:128] or "attachment",
+        "mime": descriptor.mime if descriptor is not None else (
+            mimetypes.guess_type(path)[0] or "application/octet-stream"
+        ),
+        "status": status,
+        "error": error,
+        "mediaId": media_id,
+    }
+
+
+def _media_positions_for_draft(
+    draft: str, cleaned: str, paths: List[str]
+) -> Optional[List[int]]:
+    """Where each path's marker line sat in the block flow of the delivered text.
+
+    A ``position`` is the index in the message's normalized block array BEFORE which
+    the attachment renders, so an image written under its heading renders under that
+    heading instead of on a stack above the whole reply.
+
+    The draft still carries the ``MEDIA:``/local-file marker lines (Hermes strips them
+    only after the message handler returns), so the marker line IS the author's chosen
+    spot. This locates each path's line in the draft, removes every marker line, checks
+    that what remains normalizes to exactly the blocks the delivered ``cleaned`` text
+    normalizes to, and then asks the shared normalizer how many blocks precede each cut.
+
+    Answers ``None`` -- for ALL paths, never a partial array -- whenever any of that is
+    not certain: a path named on more than one line, a marker inside a paragraph or a
+    code fence, or a draft whose leftovers no longer match what Hermes delivered. The
+    caller then omits positions entirely and the reader gets today's above-stack
+    rendering, which is the whole point: an uncertain index must degrade to a picture in
+    the wrong place, never to a lost picture.
+    """
+    if not paths:
+        return None
+    lines = re.sub(r"\r\n?", "\n", draft).split("\n")
+    marker_line: Dict[str, int] = {}
+    for path in paths:
+        hits = [index for index, line in enumerate(lines) if path in line]
+        if len(hits) != 1:
+            return None
+        marker_line[path] = hits[0]
+    markers = set(marker_line.values())
+    stripped = "\n".join(line for index, line in enumerate(lines) if index not in markers)
+    if normalize_text_to_blocks(stripped) != normalize_text_to_blocks(cleaned):
+        return None
+    positions: List[int] = []
+    for path in paths:
+        preceding = sum(1 for index in range(marker_line[path]) if index not in markers)
+        position = block_split_index(stripped, preceding)
+        if position is None:
+            return None
+        positions.append(position)
+    return positions
+
+
+@dataclass
+class _PreparedMedia:
+    """One attachment after probing: either a refusal, or bytes ready for the wire."""
+
+    index: int
+    path: str
+    descriptor: Optional[MediaDescriptor] = None
+    media_id: Optional[str] = None
+    failure: Optional[Dict[str, Any]] = None
+
+
+class MediaUploadService:
+    """Local paths to gateway media ids: one implementation, four callers.
+
+    The active-turn terminal send, the proactive tool send, the standalone/resend
+    surfaces and the cron lane all call :meth:`upload`, so probing, the compatibility
+    gate, content idempotency, the exact upload MIME and the durable lifecycle marks
+    happen once and identically (spec P1, "unified delivery path").
+
+    Nothing here claims delivery. The batch says what the gateway accepted and what it
+    refused; the caller journals. A row only moves past ``journaled`` when a receipt
+    says so, so "uploaded" and "journaled" can never be read as "the person saw it".
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        delivery_id: str,
+        destination: MediaDestination,
+        spool: Optional[AttachSpool] = None,
+    ) -> None:
+        self._client = client
+        self._delivery_id = delivery_id
+        self._destination = destination
+        self._spool = spool if spool is not None else getattr(client, "_spool", None)
+
+    # -- durable lifecycle ---------------------------------------------------
+    def _mark(self, media_id: str, state: str, **fields: Any) -> str:
+        """Record one lifecycle transition. A spool-less caller still delivers."""
+        spool = self._spool
+        if spool is None:
+            return "unavailable"
+        try:
+            return spool.media_mark(self._delivery_id, media_id, state, **fields)
+        except Exception:  # noqa: BLE001 - observability must never fail a delivery
+            logger.debug("attach: media lifecycle mark failed", exc_info=True)
+            return "unavailable"
+
+    def _row_state(self, media_id: str) -> Optional[str]:
+        spool = self._spool
+        if spool is None:
+            return None
+        try:
+            for row in spool.media_rows(self._delivery_id):
+                if row["mediaId"] == media_id:
+                    return str(row["state"])
+        except Exception:  # noqa: BLE001 - an unreadable row only costs a re-upload
+            logger.debug("attach: media lifecycle read failed", exc_info=True)
+        return None
+
+    def mark_journaled(self, media_ids: List[str]) -> None:
+        """The commit carrying these ids was accepted by the durable event journal."""
+        for media_id in media_ids:
+            self._mark(media_id, "journaled")
+
+    def mark_blocked(self, media_ids: List[str], detail: str) -> None:
+        """The occurrence was abandoned before it was journaled (atomic rollback)."""
+        for media_id in media_ids:
+            self._mark(media_id, "blocked", detail=detail[:512])
+
+    # -- upload --------------------------------------------------------------
+    async def upload(
+        self, paths: List[str], positions: Optional[List[int]] = None
+    ) -> MediaBatch:
+        """Upload ``paths``; ``positions`` (when given) is aligned index-for-index.
+
+        Positions ride alongside the slots, they never reorder them: an attachment the
+        gateway refuses drops its position with it, and the ones that survive keep the
+        block index the author wrote them at.
+        """
+        batch = MediaBatch()
+        if positions is not None and len(positions) != len(paths):
+            positions = None
+        if not paths:
+            return batch
+        if not _client_supports(self._client, "media"):
+            # The one cheap authorization check this API offers: the hello ack says
+            # whether this connection may carry media at all, and it costs nothing.
+            # ponytail: attach-v1 has no destination-authorization endpoint (only
+            # POST/GET/DELETE media and GET deliveries), so "may this target receive
+            # this?" is still only answered when the delivery is journaled. Inventing
+            # a preflight route belongs to the gateway lane, not here.
+            for path in paths:
+                batch.failed.append(
+                    _media_failure(path, None, "media_unavailable", "%s: media_unavailable" % (
+                        os.path.basename(path)[:128] or "attachment",
+                    ))
+                )
+            return batch
+        limiter = asyncio.Semaphore(MEDIA_UPLOAD_CONCURRENCY)
+
+        async def prepare(index: int, path: str) -> "_PreparedMedia":
+            async with limiter:
+                return await self._prepare(index, path)
+
+        # Probe every path first. The sizes decide whether the occurrence is sendable at
+        # all, and no byte goes on the wire until they do (spec finding 8).
+        prepared = list(await asyncio.gather(
+            *(prepare(index, path) for index, path in enumerate(paths))
+        ))
+        refusal = self._aggregate_refusal(prepared)
+        if refusal is not None:
+            batch.failed.extend(refusal)
+            return batch
+
+        async def send(item: "_PreparedMedia") -> Tuple[bool, Dict[str, Any]]:
+            if item.failure is not None:
+                return False, item.failure
+            async with limiter:
+                return await self._send(item)
+
+        # gather preserves argument order, so a media id keeps the slot its index gave it
+        # however the uploads interleave.
+        accepted_positions: List[int] = []
+        results = await asyncio.gather(*(send(item) for item in prepared))
+        for item, (ok, record) in zip(prepared, results):
+            if ok:
+                batch.uploaded.append(record)
+                if positions is not None:
+                    accepted_positions.append(positions[item.index])
+            else:
+                batch.failed.append(record)
+        if positions is not None:
+            batch.media_positions = accepted_positions
+        return batch
+
+    async def _prepare(self, index: int, path: str) -> "_PreparedMedia":
+        """Probe one path and answer every question that does not need the network."""
+        name = os.path.basename(path)[:128] or "attachment"
+        try:
+            descriptor = await asyncio.to_thread(
+                probe_media, path, stability_wait_s=MEDIA_STABILITY_WAIT_SECONDS
+            )
+        except MediaProbeError as err:
+            logger.warning("attach: %s is not ready to upload: %s", name, err)
+            return _PreparedMedia(index, path, failure=_media_failure(
+                path, None, err.code, "%s: %s" % (name, err.code)))
+        except Exception as exc:  # noqa: BLE001 - a probe fault is that file's failure
+            return _PreparedMedia(index, path, failure=_media_failure(
+                path, None, None, _proactive_media_error(path, exc)))
+
+        media_id = _proactive_media_id(self._delivery_id, index, descriptor.sha256)
+        reason = _policy_block_reason(descriptor)
+        if reason is not None:
+            # No network request: the bytes already answered the question (finding 8).
+            return _PreparedMedia(index, path, descriptor, failure=self._blocked(
+                media_id, path, descriptor, "unsupported_media_type",
+                "%s (%s, family=%s): unsupported_media_type"
+                % (name, descriptor.mime, descriptor.family),
+                reason,
+            ))
+
+        limit = _media_byte_limit(descriptor.mime)
+        if descriptor.size_bytes > limit:
+            detail = "%s is %d bytes, over the %d byte cap for %s" % (
+                name, descriptor.size_bytes, limit, descriptor.mime,
+            )
+            return _PreparedMedia(index, path, descriptor, failure=self._blocked(
+                media_id, path, descriptor, "too_large",
+                "%s: too_large (%s)" % (name, detail), detail,
+            ))
+        return _PreparedMedia(index, path, descriptor, media_id)
+
+    def _aggregate_refusal(self, prepared: List["_PreparedMedia"]) -> Optional[List[Dict[str, Any]]]:
+        """Refuse the whole occurrence when its attachments together are too much.
+
+        Individually legal files can still add up to more than one message should move,
+        and half a message is not a useful outcome, so this is all or nothing.
+        """
+        total = sum(
+            item.descriptor.size_bytes for item in prepared
+            if item.failure is None and item.descriptor is not None
+        )
+        if total <= MEDIA_AGGREGATE_MAX_BYTES:
+            return None
+        detail = "%d attachments total %d bytes, over the %d byte cap for one message" % (
+            len(prepared), total, MEDIA_AGGREGATE_MAX_BYTES,
+        )
+        logger.warning("attach: refusing delivery %s locally: %s", self._delivery_id, detail)
+        failures = []
+        for item in prepared:
+            if item.failure is not None:
+                failures.append(item.failure)
+                continue
+            name = os.path.basename(item.path)[:128] or "attachment"
+            failures.append(self._blocked(
+                item.media_id or "", item.path, item.descriptor, "too_large",
+                "%s: too_large (%s)" % (name, detail), detail,
+            ))
+        return failures
+
+    def _blocked(
+        self,
+        media_id: str,
+        path: str,
+        descriptor: Optional[MediaDescriptor],
+        status: str,
+        error: str,
+        detail: str,
+    ) -> Dict[str, Any]:
+        """One attachment refused before any network request, recorded durably."""
+        if media_id:
+            self._mark(
+                media_id, "blocked", detail=detail,
+                sha256=descriptor.sha256 if descriptor is not None else None,
+                path_meta=descriptor.filename if descriptor is not None else None,
+            )
+        logger.warning("attach: refusing %s locally: %s", os.path.basename(path)[:128], detail)
+        return _media_failure(path, descriptor, status, error, media_id or None)
+
+    async def _send(self, item: "_PreparedMedia") -> Tuple[bool, Dict[str, Any]]:
+        """Claim the slot, then put one prepared file on the wire."""
+        path, descriptor = item.path, item.descriptor
+        assert descriptor is not None and item.media_id is not None
+        name = os.path.basename(path)[:128] or "attachment"
+        media_id = self._claim(item.index, descriptor, item.media_id)
+        if self._row_state(media_id) in MEDIA_ALREADY_UPLOADED_STATES:
+            return True, self._accepted(media_id, path, descriptor, reused=True)
+        self._mark(
+            media_id, "prepared", sha256=descriptor.sha256, path_meta=descriptor.filename,
+        )
+        if descriptor.mime_mismatch:
+            logger.info(
+                "attach: %s is named %s but its bytes are %s; uploading as the bytes",
+                name, descriptor.declared_mime, descriptor.detected_mime,
+            )
+        for attempt in (0, 1):
+            try:
+                await self._client.upload_media(
+                    media_id, descriptor.path, descriptor.family,
+                    mime=descriptor.mime, sha256=descriptor.sha256,
+                )
+            except HTTPError as exc:
+                if exc.code == 429 and attempt == 0:
+                    await asyncio.sleep(_retry_after_seconds(exc))
+                    continue
+                return False, self._refused(media_id, path, descriptor, exc, exc.code)
+            except Exception as exc:  # noqa: BLE001 - one file, not the whole send
+                return False, self._refused(media_id, path, descriptor, exc, None)
+            self._mark(media_id, "uploaded")
+            return True, self._accepted(media_id, path, descriptor, reused=False)
+        # Unreachable: the loop above either returns or retries exactly once.
+        return False, _media_failure(path, descriptor, None, "%s: upload_failed" % name, media_id)
+
+    def _claim(self, index: int, descriptor: MediaDescriptor, media_id: str) -> str:
+        """Persisted idempotency: (occurrence slot, content hash, destination).
+
+        The slot index is part of the occurrence key on purpose. Identity is the bytes,
+        so a rewritten file is a genuinely new claim and a retry of the same send is not;
+        but two attachments that happen to hold identical bytes in ONE message are two
+        attachments, and collapsing them would silently drop one from the person's view.
+        """
+        spool = self._spool
+        if spool is None:
+            return media_id
+        try:
+            claim = spool.media_dedupe_claim(
+                "%s#%d" % (self._delivery_id, index),
+                descriptor.sha256,
+                self._destination.key,
+                media_id,
+            )
+        except Exception:  # noqa: BLE001 - a failed claim costs one duplicate upload
+            logger.debug("attach: media dedupe claim failed", exc_info=True)
+            return media_id
+        return str(claim.get("media_id") or media_id)
+
+    def _accepted(
+        self, media_id: str, path: str, descriptor: MediaDescriptor, *, reused: bool
+    ) -> Dict[str, Any]:
+        return {
+            "mediaId": media_id,
+            "path": descriptor.filename,
+            "mime": descriptor.mime,
+            "family": descriptor.family,
+            "bytes": descriptor.size_bytes,
+            "sha256": descriptor.sha256,
+            "reused": reused,
+            "source": path,
+        }
+
+    def _refused(
+        self,
+        media_id: str,
+        path: str,
+        descriptor: MediaDescriptor,
+        exc: Exception,
+        status: Optional[int],
+    ) -> Dict[str, Any]:
+        detail = _proactive_media_error(descriptor.path, exc, descriptor)
+        self._mark(media_id, "upload_failed", detail=detail)
+        logger.warning(
+            "attach: upload refused for delivery %s media %s: %s",
+            self._delivery_id, media_id, detail,
+        )
+        return _media_failure(path, descriptor, status, detail, media_id)
+
+
+def _profile_from_hermes_home() -> str:
+    """The profile this process IS, when nothing configured it.
+
+    Neither `plugins.entries.cozygateway.config.profile` nor `HERMES_PROFILE` is set in a normal
+    per-profile install, so the adapter used to hold an empty profile while the live-turn gate
+    demanded a non-empty one, and every phone-node call was refused with `profile_mismatch`
+    (observed 2026-08-26). A per-profile Hermes runs with
+    `HERMES_HOME=<...>/profiles/<name>`, so the process already knows its own name; deriving it
+    here means a new bot needs no extra configuration to use its phone as a node.
+
+    Returns "" when the home is absent or is not a profile directory (the default profile, a test
+    harness), which leaves the gate exactly as fail-closed as it was.
+    """
+    return profile_name_for_home((os.getenv("HERMES_HOME") or "").strip())
+
+
+@dataclass
+class _CozyAppActionGate:
+    """A per-app FIFO action lane plus the callers that still reference it."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    waiters: int = 0
+
+
+class AttachAdapter:
+    """The platform methods, mixed into a concrete adapter subclass by the factory.
+
+    Kept as a plain class so the wire logic is readable and testable in isolation;
+    :func:`_make_adapter_class` produces the concrete subclass the plugin registers.
+    """
+
+    # The stream consumer splits a reply that exceeds this into multiple sends, and
+    # each send commits once. This platform renders any length, so the cap is raised
+    # far above any reply to keep a turn a single commit.
+    MAX_MESSAGE_LENGTH = 1_000_000
+
+    # Attach drafts are the durable turn message under construction, not
+    # disposable previews. Keep Hermes tool-boundary segment breaks on the
+    # draft path; only the true turn-final send may emit ``done`` and clean up.
+    draft_stream_is_message = True
+
+    # Hermes' second, ungated streaming transport. `_resolve_native_streaming`
+    # (gateway/stream_consumer_transport.py) needs this class attribute AND a
+    # truthy `supports_native_streaming` probe before it will route frames
+    # through `send_stream_frame`, and the native branch of `_should_edit` then
+    # pushes every delta with no edit-rate limit at all.
+    #
+    # It is False HERE and set from the same switch as the probe on the concrete
+    # class (`_make_adapter_class`), because the attribute has a second reader
+    # that never consults the probe: `gateway/slash_commands.py`'s
+    # `_deliver_approval_confirmation` sends an `/approve` or `/deny`
+    # confirmation through the adapter directly when it is True, instead of
+    # returning the text for Hermes' own delivery. Declaring it True
+    # unconditionally would therefore change that path with the transport still
+    # off, which is not what "off" may mean. With the switch off this adapter is
+    # what it was before the transport existed, on every path.
+    SUPPORTS_NATIVE_STREAMING = False
+
+    # -- construction ---------------------------------------------------------
+    def _attach_init(self, config: Any) -> None:
+        extra = getattr(config, "extra", {}) or {}
+        # Retained so a proactive media send can fall back to the durable one-shot
+        # journal when this adapter's own socket is not writable.
+        self._pconfig: Any = config
+        # A multiplexed Hermes gateway builds a served profile's adapter inside that profile's
+        # scope (gateway/run.py `_start_one_profile_adapters`), so every setting below is that
+        # profile's own. Remember which profile it was for the reads that happen later.
+        self._owner: _Owner = _current_owner()
+        settings = _attach_settings(config)
+        self.gateway_url: str = settings.gateway_url
+        # The attach bearer token. Header-only; never logged, never in a URL.
+        self.token: str = settings.token
+        if self._owner.scoped:
+            # HERMES_PROFILE and HERMES_HOME in the process env name the launch profile.
+            self._profile: str = (
+                str(extra.get("profile") or "").strip() or profile_name_for_home(self._owner.home)
+            )
+        else:
+            self._profile = (
+                str(extra.get("profile") or os.getenv("HERMES_PROFILE") or "").strip()
+                or _profile_from_hermes_home()
+            )
+        # Present only on a remote execution adapter. Its provider-import operation is refused on
+        # the ordinary source profile, so a handoff id cannot be consumed into arbitrary state.
+        self._execution_id: Optional[str] = str(extra.get("execution_id") or profile_env("COZYGATEWAY_EXECUTION_ID") or "").strip() or None
+        # A remote execution process owns exactly one gateway conversation.
+        self._execution_session_id: Optional[str] = str(profile_env("COZYGATEWAY_EXECUTION_SESSION_ID") or "").strip() or None
+        self.ca_file: Optional[str] = settings.ca_file
+        self._spool_path: Optional[str] = extra.get("spool_path") or profile_env("COZYGATEWAY_SPOOL_PATH") or None
+        self._spool: Optional[AttachSpool] = None
+        self._client: Optional[Any] = None
+        self._watcher: Optional[asyncio.Task] = None
+        self._desktop_mirror_task: Optional[asyncio.Task] = None
+        self._closing: bool = False
+        self._ready = asyncio.Event()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._reconnect_initial: float = _env_float(
+            "COZYGATEWAY_RECONNECT_INITIAL_SECONDS", 0.5
+        )
+        self._reconnect_max: float = _env_float("COZYGATEWAY_RECONNECT_MAX_SECONDS", 30.0)
+        # Injectable so tests are deterministic.
+        self._reconnect_sleep = asyncio.sleep
+        self._reconnect_jitter = random.random
+        # How long an acked interrupt waits for Hermes' own terminal before sealing the turn
+        # itself. Long enough for a live run's stop notice, short enough that a phone showing
+        # "thinking" over a dead turn recovers while the operator is still looking at it.
+        self._interrupt_seal_grace: float = _env_float(
+            "COZYGATEWAY_INTERRUPT_SEAL_GRACE_SECONDS", 5.0
+        )
+        self._interrupt_sleep = asyncio.sleep
+        # Per-thread active turn id: set on inject, read by the draft / terminal
+        # surfaces, dropped when the turn ends.
+        self._active_turn: Dict[str, str] = {}
+        # One private action lane per CozyApp.  Two actions for the same app share
+        # its ``__cozyapp__:<appId>`` chat id, so their turn anchors must never
+        # overlap; actions for different apps remain independent.
+        self._cozyapp_action_gates: Dict[str, _CozyAppActionGate] = {}
+        # Gateway-owned attach lane -> exact Hermes raw session target. This is populated only
+        # after the resident runner confirms `switch_session`; it is never inferred from chat_id.
+        self._desktop_session_bindings: Dict[str, Tuple[str, str]] = {}
+        # The only window in which this adapter itself is writing a mobile-originated row. The
+        # separate mirror worker skips it, then advances its durable cursor once the inject ends.
+        self._desktop_mirror_injections: Set[str] = set()
+        # thread -> (turn id, inbound source) for an injected turn whose mirror baseline is owed at
+        # SETTLE time. Upstream ``handle_message`` only spawns the run, so baselining right after
+        # it returned saw none of the turn's rows and the mirror echoed them back.
+        self._mirror_settles: Dict[str, Tuple[str, Any]] = {}
+        # thread -> the running settle baseline, which the NEXT turn awaits before its own flush:
+        # otherwise that flush mirrors the previous turn's rows before they are baselined.
+        self._settle_tasks: Dict[str, "asyncio.Task[Any]"] = {}
+        self._desktop_mirror_interval = _env_float(
+            "COZYGATEWAY_DESKTOP_SESSION_SYNC_INTERVAL_SECONDS", 1.0,
+        )
+        # Delegation batch id -> the turn that dispatched it, pinned at the batch's first
+        # event and bounded oldest-first. An async ``delegate_task`` batch outlives its turn,
+        # and a late finish leg must land on the ORIGINAL turn id (the gateway's post-seal
+        # projection carve-out expects it), not whatever turn is active by then.
+        self._delegation_turns: "OrderedDict[str, str]" = OrderedDict()
+        self._delegation_turns_max = 64
+        # Per-turn live-reasoning preview state (capability ``thinking``): a rolling raw
+        # buffer, the last sanitized emit, and the coalescing task. Keyed by turn id and
+        # dropped at that turn's local seal, so a delta landing after the terminal finds
+        # nothing to emit into.
+        self._thinking: Dict[str, _ThinkingState] = {}
+        # Injectable so tests are deterministic (same pattern as ``_interrupt_sleep``).
+        self._thinking_sleep = asyncio.sleep
+        # (threadId, turnId) already seen or in flight: a repeat is dropped, but
+        # only within a bounded retention window -- see below.
+        #
+        # Bounded oldest-first: an OrderedDict used as an ordered set (values are
+        # unused). A turn's entry is NOT dropped the moment it seals (done/failed);
+        # it stays until evicted by the cap. That gives a re-dial replaying a
+        # just-sealed turn (or one still in flight) a WINDOW-BOUNDED dedupe
+        # guarantee, not an unconditional one: the replay is deduped as long as
+        # fewer than `_seen_turns_max` other distinct turns have arrived since the
+        # original. Once that many intervening distinct turns have arrived, the
+        # entry is evicted and a later replay is treated as a new turn (and would
+        # re-execute, even if the original is still in flight). This trades an
+        # unbounded-duration redelivery guarantee for bounded memory over a
+        # long-lived process.
+        self._seen_turns: OrderedDict[Tuple[str, str], None] = OrderedDict()
+        # Turns this process actually terminalized (a commit, failed, cancelled or interrupted
+        # frame went out for them), oldest first and bounded like ``_seen_turns``. Arrival is not
+        # a terminal: a turn that reached this process and then died without one must still be
+        # answered, so only this record exempts a late interrupt from its typed refusal.
+        self._sealed_turns: OrderedDict[Tuple[str, str], None] = OrderedDict()
+        self._seen_turns_max: int = _env_int("COZYGATEWAY_SEEN_TURNS_MAX", 512)
+        # Per-turn accumulated text (the last full flush) and tool-chip tracker.
+        self._turn_text: Dict[str, str] = {}
+        self._tool_chips: Dict[str, ToolChipTracker] = {}
+        # Per-turn incremental block-normalization cache: makes repeated draft
+        # flushes over a long streaming reply proportional to newly arrived text
+        # rather than re-normalizing the whole accumulated reply every time (see
+        # IncrementalNormalizer). Wire output stays byte-identical full-replace.
+        self._normalizers: Dict[str, IncrementalNormalizer] = {}
+        # Whether any draft for a turn has carried visible content yet.
+        self._content_seen: Dict[str, bool] = {}
+        # Hermes strips terminal MEDIA/local-file directives only after the
+        # message handler returns. Attach-v1 must know those paths before its
+        # terminal send seals the turn, so retain them at that boundary.
+        self._turn_media: Dict[str, List[str]] = {}
+        # Voice notes an inbound turn carried, each owed at most one dropped transcript echo.
+        self._voice_note_echoes: Dict[str, int] = {}
+        # Where each of those paths sat in the reply's block flow, when the draft
+        # said so unambiguously: ``{turnId: (cleanedBlocks, {path: position})}``.
+        # Absent (or dropped at send time) means legacy above-stack placement.
+        self._turn_media_positions: Dict[str, Tuple[List[Any], Dict[str, int]]] = {}
+        # Hermes subsequently runs its conventional per-platform media phase.
+        # Remember successful atomic uploads so those calls can be acknowledged
+        # without a duplicate upload or a misleading fallback warning.
+        self._absorbed_media: OrderedDict[str, None] = OrderedDict()
+        self._absorbed_media_max = 512
+        # Hermes' clarify callback gives the platform stable clarify ids plus display choices.
+        # Keep the bounded id→answer map and original wire presentation until the durable
+        # resolution command is executed and its terminal confirmation is journaled.
+        self._clarify_choices: Dict[str, Dict[str, str]] = {}
+        self._clarify_context: Dict[str, Tuple[str, List[Dict[str, str]]]] = {}
+        # Strong refs to fire-and-forget tasks; the loop keeps only a weak ref to a
+        # bare create_task result, so hold each here until it finishes.
+        self._background_tasks: Set[asyncio.Task] = set()
+        self._memory_manager = MemoryManager(extra, self._owner.home if self._owner.scoped else os.getenv("HERMES_HOME"))
+        # A memory request reads real files and provider SQL, so it runs on a worker
+        # thread and exactly one runs at a time. A second request arriving while one
+        # is in flight is refused immediately: queueing them would let a search
+        # keystroke stream build an unbounded backlog of full-vault scans.
+        self._memory_busy: Optional[str] = None
+        # Completed mutations by request id, so a replay of a request the gateway
+        # already gave up waiting for returns the first outcome instead of applying
+        # the write a second time. Bounded oldest-first.
+        self._memory_results: OrderedDict[str, Tuple[str, Optional[Dict[str, Any]], Optional[str], Optional[Dict[str, Any]]]] = OrderedDict()
+        self._memory_results_max = 64
+
+    def _attach_token_provider(self) -> Any:
+        """The dial-time token source: this adapter's profile, rotated tokens included."""
+        owner = getattr(self, "_owner", _Owner())
+        return lambda: _fresh_attach_token(self.token, owner)
+
+    def _spawn_background(self, loop: asyncio.AbstractEventLoop, coro: Any) -> None:
+        task = loop.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _normalize(self, turn_id: str, text: str) -> List[Any]:
+        """Normalize ``text`` to blocks via this turn's incremental cache.
+
+        Byte-identical to calling ``normalize_text_to_blocks(text)`` directly, but
+        does work proportional to what changed since the last call for this turn
+        (see :class:`IncrementalNormalizer`). One instance per turn id, so a
+        second concurrent turn never shares (or corrupts) another's cache.
+        """
+        normalizer = self._normalizers.get(turn_id)
+        if normalizer is None:
+            normalizer = IncrementalNormalizer()
+            self._normalizers[turn_id] = normalizer
+        return normalizer.update(text)
+
+    def set_message_handler(self, handler: Any) -> None:
+        """Stage safe local reply media, and seal a turn Hermes consumed as a command.
+
+        This wrapper is the ONE seam that sees both halves of a command dispatch: the message
+        going in, and whatever Hermes made of it coming out. See ``_seal_consumed_command`` for
+        why the second half has to be watched at all.
+        """
+
+        async def wrapped(event: Any) -> Any:
+            chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+            chat_id = chat_id if isinstance(chat_id, str) else None
+            active = self._active_turn.get(chat_id) if chat_id else None
+            command = consumed_as_command(event) if active else None
+            # Only the message that OPENED the turn can seal it: a steer injects
+            # "<turnId>:steer" and an interrupt injects no anchor at all, and neither one owns
+            # the turn's outcome.
+            command_turn = active if command and getattr(event, "message_id", None) == active else None
+            try:
+                response = await handler(event)
+            except BaseException:
+                if command_turn:
+                    await self._seal_consumed_command(chat_id, command_turn, command, failed=True)
+                raise
+            turn_id = self._active_turn.get(chat_id) if chat_id else None
+            if turn_id and isinstance(response, str):
+                self._stage_response_media(turn_id, response)
+            if command_turn:
+                await self._seal_consumed_command(chat_id, command_turn, command, response=response)
+            return response
+
+        self._message_handler = wrapped  # harness-defined callback slot
+
+    async def on_processing_complete(self, event: Any, outcome: Any) -> None:
+        """Sample an injected turn only after Hermes finished its background task."""
+        await super().on_processing_complete(event, outcome)  # type: ignore[misc]
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict) or metadata.get("cozygateway_context_turn") is not True:
+            return
+        outcome_name = str(getattr(outcome, "value", outcome)).lower()
+        if outcome_name != "success":
+            return
+        source = getattr(event, "source", None)
+        chat_id = getattr(source, "chat_id", None)
+        turn_id = getattr(event, "message_id", None)
+        session_key = self._dispatch_session_key(source)
+        if (not isinstance(chat_id, str) or not chat_id or not isinstance(turn_id, str) or not turn_id
+                or not isinstance(session_key, str) or not session_key):
+            return
+        # BasePlatformAdapter invokes this before it releases the session guard or starts a queued
+        # successor, so `turn.agent` still belongs to this exact completed turn.
+        await self._report_turn_context(chat_id, turn_id, session_key)
+
+    async def _seal_consumed_command(
+        self,
+        chat_id: str,
+        turn_id: str,
+        command: str,
+        response: Any = None,
+        failed: bool = False,
+    ) -> None:
+        """Seal the turn a Hermes command consumed, when nothing else will.
+
+        A command notice that HAS text already seals its turn on the ordinary reply path: Hermes
+        delivers it through ``send`` with the turn's own reply anchor and its ``notify`` marker,
+        which reads as the terminal delivery (see ``_hermes_final_delivery``) and commits.
+
+        The hole is a command that produces no text -- ``/start`` returns "", a handler returns
+        ``None``, a handler raises -- and the ones that hang. Nothing is ever sent, so the durable
+        turn the gateway opened for that message stays open: the app shows "thinking" until an
+        operator repairs the row by hand (issue #190). A command dispatch is over when the handler
+        returns, so this is the moment the floor terminal is honest.
+
+        The floor is deliberately not an empty ``commit``: that would append a blank assistant
+        bubble to the transcript. A raised handler seals ``failed`` (something went wrong and the
+        user should see that); a silent one seals ``cancelled``, which ends the turn without
+        inventing a message. A hang produces no return at all and is the gateway reaper's job.
+        """
+        text = getattr(response, "text", response)  # unwrap Hermes' EphemeralReply
+        if not failed and isinstance(text, str) and text.strip():
+            return  # Hermes' own notify delivery seals this one.
+        client = self._client
+        if self._active_turn.get(chat_id) != turn_id or client is None:
+            return
+        logger.info("attach: sealing turn %s consumed as /%s with no reply", turn_id, command)
+        try:
+            if failed:
+                await client.send_failed(chat_id, turn_id, f"/{command} failed")
+            else:
+                await client.send_cancelled(chat_id, turn_id)
+        except Exception:  # noqa: BLE001 - a seal that cannot be sent must not crash dispatch
+            # The local anchor stays: the turn is still open on the wire, so the reaper (and any
+            # later frame for it) must still find it here.
+            logger.debug("attach: command turn seal failed", exc_info=True)
+            return
+        self._mark_sealed(chat_id, turn_id)
+        self._cleanup_turn(chat_id, turn_id)
+
+    def _stage_response_media(self, turn_id: str, response: str) -> None:
+        """Mirror Hermes' safe extraction without altering its delivery input.
+
+        The draft still holds the marker lines here, so this is also the ONE moment
+        that can see where the author put each attachment. The block index is captured
+        alongside the path; the terminal send puts it on the wire only if the delivered
+        text still agrees with this snapshot.
+        """
+        try:
+            media, cleaned = self.extract_media(response)  # type: ignore[attr-defined]
+            explicit = [
+                path
+                for path, _is_voice in self.filter_media_delivery_paths(media)  # type: ignore[attr-defined]
+            ]
+        except Exception:  # noqa: BLE001 - a staging fault must not lose text
+            logger.debug("attach: terminal media staging failed", exc_info=True)
+            return
+        paths = list(dict.fromkeys(str(path) for path in explicit if path))
+        if not paths:
+            return
+        staged = paths[:16]
+        self._turn_media[turn_id] = staged
+        self._turn_media_positions.pop(turn_id, None)
+        try:
+            positions = _media_positions_for_draft(response, str(cleaned or ""), staged)
+        except Exception:  # noqa: BLE001 - placement is a nicety; the picture is not
+            logger.debug("attach: inline media positions unavailable", exc_info=True)
+            return
+        if positions is None:
+            return
+        self._turn_media_positions[turn_id] = (
+            normalize_text_to_blocks(str(cleaned or "")),
+            dict(zip(staged, positions)),
+        )
+
+    def _staged_positions(self, turn_id: str, paths: List[str]) -> Optional[List[int]]:
+        """The staged block positions for exactly ``paths``, or ``None``.
+
+        All or nothing: a turn whose attachments arrived from more than one place (a
+        staged draft marker plus a path handed in by metadata) has no single authored
+        order to honor, so the whole delivery falls back to legacy placement rather
+        than positioning some attachments and stacking the rest.
+        """
+        staged = self._turn_media_positions.get(turn_id)
+        if staged is None:
+            return None
+        _blocks, positions = staged
+        if any(path not in positions for path in paths):
+            return None
+        return [positions[path] for path in paths]
+
+    def _positions_still_true(self, turn_id: str, blocks: List[Any]) -> bool:
+        """Whether the sealed blocks are still the draft the positions were measured on.
+
+        The measured blocks must remain a PREFIX of what is being sealed, which lets the
+        one legitimate late edit through (the "I could not attach ..." sentence appended
+        after a refused upload) while rejecting any rewrite that would move the indices.
+        A holding prefix also keeps every position in range, since each one was counted
+        inside those measured blocks.
+        """
+        staged = self._turn_media_positions.get(turn_id)
+        if staged is None:
+            return False
+        measured, _positions = staged
+        return list(blocks[: len(measured)]) == list(measured)
+
+    @staticmethod
+    def _media_family(path: str) -> str:
+        family = (mimetypes.guess_type(path)[0] or "application/octet-stream").partition("/")[0]
+        return family if family in {"image", "audio", "video"} else "file"
+
+    @staticmethod
+    def _media_key(path: str) -> str:
+        return os.path.realpath(os.path.expanduser(path))
+
+    def _remember_absorbed_media(self, path: str) -> None:
+        key = self._media_key(path)
+        self._absorbed_media[key] = None
+        self._absorbed_media.move_to_end(key)
+        while len(self._absorbed_media) > self._absorbed_media_max:
+            self._absorbed_media.popitem(last=False)
+
+    def _consume_absorbed_media(self, path: str) -> bool:
+        key = self._media_key(path)
+        if key not in self._absorbed_media:
+            return False
+        self._absorbed_media.pop(key)
+        return True
+
+    # -- connection lifecycle -------------------------------------------------
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # The harness forwards a keyword-only ``is_reconnect`` flag on every dial.
+        # A dial here is always a fresh connection, so the distinction needs no
+        # special handling.
+        del is_reconnect
+        if not self.gateway_url or not self.token:
+            logger.error("attach: COZYGATEWAY_URL and COZYGATEWAY_TOKEN must be set")
+            self._set_fatal_error(  # type: ignore[attr-defined]
+                "config_missing",
+                "COZYGATEWAY_URL and COZYGATEWAY_TOKEN must be set",
+                retryable=False,
+            )
+            return False
+        self._closing = False
+        if self._spool is None:
+            spool_path = self._spool_path or _default_spool_path(getattr(self, "_owner", _Owner()))
+            self._spool = AttachSpool(str(spool_path))
+        if not self._spool.acquire_transport_lease():
+            self._set_fatal_error(  # type: ignore[attr-defined]
+                "transport_owned",
+                "another CozyGateway adapter owns this durable spool",
+                retryable=True,
+            )
+            return False
+        self._client = AttachV1Client(
+            AttachV1ClientConfig(
+                gateway_url=self.gateway_url,
+                token=self.token,
+                token_provider=self._attach_token_provider(),
+                spool=self._spool,
+                ca_file=self.ca_file,
+                on_turn=self._on_turn,
+                on_steer=self._on_steer,
+                on_interrupt=self._on_interrupt,
+                on_approval=self._dispatch_approval_command,
+                on_clarify=self._dispatch_clarify_command,
+                on_desktop_resume=self._on_desktop_resume_command,
+                on_memory=self._on_memory_command,
+                on_config=self._on_config_request,
+                on_cozyapp_action=self._on_cozyapp_action_command,
+                on_ready=self._on_transport_ready,
+                commands=hermes_gateway_commands(),
+                # Capability 69. Only the resident adapter declares: it is the process that
+                # actually carries turns. The one-shot proactive client below carries none and
+                # deliberately declares nothing, because an empty declaration from it would tell
+                # the gateway that this profile holds no turns at all.
+                active_turns=self._active_turn_ids,
+            )
+        )
+        try:
+            await self._client.connect()
+        except AttachAuthError as exc:
+            self._spool.release_transport_lease()
+            logger.error("attach: dial rejected (%s)", exc)
+            self._set_fatal_error(  # type: ignore[attr-defined]
+                "auth_rejected", str(exc), retryable=False
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001
+            self._spool.release_transport_lease()
+            logger.error("attach-v1: failed to dial /attach/v1 -- %s", exc)
+            self._set_fatal_error(  # type: ignore[attr-defined]
+                "connect_failed", str(exc), retryable=True
+            )
+            return False
+        if self._watcher is not None and not self._watcher.done():
+            self._watcher.cancel()
+        self._loop = asyncio.get_running_loop()
+        self._watcher = asyncio.create_task(self._watch_loop())
+        try:
+            await asyncio.wait_for(
+                self._ready.wait(),
+                2 * HELLO_ACK_TIMEOUT_SECONDS + 0.5,
+            )
+        except asyncio.TimeoutError:
+            await self.disconnect()
+            self._set_fatal_error(  # type: ignore[attr-defined]
+                "handshake_timeout",
+                "attach-v1 did not become writable",
+                retryable=True,
+            )
+            return False
+        return True
+
+    def _on_transport_ready(self) -> None:
+        """Publish connected state only after the server accepts the hello."""
+        if self._closing:
+            return
+        self._ready.set()
+        try:
+            from .execution_health import current
+            health = current()
+            if health is not None: health.mark_attach_online()
+        except Exception:
+            logger.debug("attach: execution health attach update failed", exc_info=True)
+        self._mark_connected()  # type: ignore[attr-defined]
+        _register_active_adapter(self)
+        client = self._client
+        if (getattr(client, "desktop_session_sync_available", False)
+                and (self._desktop_mirror_task is None or self._desktop_mirror_task.done())):
+            self._desktop_mirror_task = asyncio.create_task(self._mirror_desktop_sessions())
+        logger.info("attach-v1: connected and writable at %s", self.gateway_url)
+
+    async def _watch_loop(self) -> None:
+        """Drain the socket; re-dial on a benign drop, stop on a fatal close."""
+        while not self._closing:
+            client = self._client
+            if client is None:
+                return
+            try:
+                await client.watch()
+            except AttachSupersededError:
+                logger.warning("attach: connection superseded; stopping")
+                await self.disconnect()
+                return
+            except AttachAuthError:
+                logger.warning("attach: credential rejected; retrying with bounded backoff")
+            if self._closing:
+                return
+            self._ready.clear()
+            _unregister_active_adapter(self)
+            self._mark_disconnected()  # type: ignore[attr-defined]
+            logger.warning("attach-v1: /attach/v1 dropped; reconnecting")
+            if not await self._redial():
+                return
+
+    async def _redial(self) -> bool:
+        """Re-dial with capped, jittered exponential backoff.
+
+        Returns True once reconnected, or False if we stop because the adapter is
+        closing or the dial hit a fatal (auth / superseded) condition. A jittered
+        floor delay runs before every dial so an accept-then-close gateway cannot
+        spin a hot loop and a fleet cannot stampede a just-restarted gateway.
+        """
+        delay = self._reconnect_initial
+        while not self._closing:
+            await self._reconnect_sleep(delay * (1.0 + self._reconnect_jitter()))
+            if self._closing:
+                return False
+            client = self._client
+            if client is None:
+                return False
+            try:
+                await client.connect()
+            except AttachSupersededError as exc:
+                logger.warning("attach: reconnect superseded (%s); stopping", exc)
+                await self.disconnect()
+                return False
+            except AttachAuthError as exc:
+                logger.warning(
+                    "attach: reconnect credential rejected (%s); retrying (backoff ~%.1fs)",
+                    exc,
+                    delay,
+                )
+                delay = min(delay * 2, self._reconnect_max)
+                continue
+            except Exception as exc:  # noqa: BLE001 - transient: back off and retry
+                logger.warning(
+                    "attach: reconnect failed (%s); retrying (backoff ~%.1fs)", exc, delay
+                )
+                delay = min(delay * 2, self._reconnect_max)
+                continue
+            logger.info("attach-v1: re-dialed %s; awaiting hello_ack", self.gateway_url)
+            return True
+        return False
+
+    async def disconnect(self) -> None:
+        self._closing = True
+        self._ready.clear()
+        _unregister_active_adapter(self)
+        self._mark_disconnected()  # type: ignore[attr-defined]
+        mirror_task = self._desktop_mirror_task
+        self._desktop_mirror_task = None
+        if mirror_task is not None and mirror_task is not asyncio.current_task():
+            mirror_task.cancel()
+            try:
+                await mirror_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - teardown is best effort
+                pass
+        watcher = self._watcher
+        self._watcher = None
+        # The watch loop itself calls disconnect() on a fatal close; cancelling and
+        # awaiting the CURRENT task would self-cancel mid-teardown, so skip it there
+        # (the loop returns right after this call).
+        if watcher is not None and watcher is not asyncio.current_task():
+            watcher.cancel()
+            try:
+                await watcher
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        if self._client is not None:
+            await self._client.close()
+            self._client = None
+        if self._spool is not None:
+            self._spool.release_transport_lease()
+            self._spool.close()
+            self._spool = None
+
+    async def request_device_status(self, thread_id: str, turn_id: str, purpose: str) -> Dict[str, Any]:
+        """One live-turn Mobile Node request; no client means no phone action."""
+        client = self._client
+        loop = self._loop
+        if client is None or loop is None or loop.is_closed():
+            return {"status": "device_unavailable"}
+        pending = None
+        try:
+            if asyncio.get_running_loop() is loop:
+                return await client.request_device_status(thread_id, turn_id, purpose)
+            pending = asyncio.run_coroutine_threadsafe(
+                client.request_device_status(thread_id, turn_id, purpose), loop,
+            )
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            if pending is not None:
+                pending.cancel()
+            return {"status": "cancelled"}
+        except Exception:  # noqa: BLE001 - an attach fault is never a tool crash
+            return {"status": "device_unavailable"}
+
+    async def request_location(self, thread_id: str, turn_id: str, purpose: str) -> Dict[str, Any]:
+        client = self._client
+        loop = self._loop
+        if client is None or loop is None or loop.is_closed():
+            return {"status": "device_unavailable"}
+        pending = None
+        try:
+            if asyncio.get_running_loop() is loop:
+                return await client.request_location(thread_id, turn_id, purpose)
+            pending = asyncio.run_coroutine_threadsafe(
+                client.request_location(thread_id, turn_id, purpose), loop,
+            )
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            if pending is not None:
+                pending.cancel()
+            return {"status": "cancelled"}
+        except Exception:  # noqa: BLE001 - an attach fault is never a tool crash
+            return {"status": "device_unavailable"}
+
+    async def request_mobile(self, command: str, thread_id: str, turn_id: str, purpose: str, **options: Any) -> Dict[str, Any]:
+        client, loop = self._client, self._loop
+        if client is None or loop is None or loop.is_closed():
+            return {"status": "device_unavailable"}
+        call = client._request_mobile(command, thread_id, turn_id, purpose, options)
+        try:
+            return await call if asyncio.get_running_loop() is loop else await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(call, loop))
+        except asyncio.CancelledError:
+            return {"status": "cancelled"}
+        except Exception:  # noqa: BLE001
+            return {"status": "device_unavailable"}
+
+    async def upsert_cozyapp(self, app_id: str, name: str, tree: Dict[str, Any]) -> bool:
+        """Journal an app tree on the loop that owns the attach client and SQLite spool.
+
+        Hermes invokes model-facing tools from its tool-worker loop.  The resident
+        attach client is created by :meth:`connect` on this adapter's loop, and its
+        async locks and SQLite spool are therefore not safe to touch directly from
+        that worker.  Keep the operation inside the adapter lifecycle just as the
+        other model-facing requests do.
+        """
+        client, loop = self._client, self._loop
+        if client is None or loop is None or loop.is_closed():
+            return False
+        pending = None
+        try:
+            call = client.upsert_cozyapp(app_id, name, tree)
+            if asyncio.get_running_loop() is loop:
+                return bool(await call)
+            pending = asyncio.run_coroutine_threadsafe(call, loop)
+            return bool(await asyncio.wrap_future(pending))
+        except asyncio.CancelledError:
+            if pending is not None:
+                pending.cancel()
+            raise
+        except Exception as exc:  # noqa: BLE001 - tool result carries the safe public failure
+            # Do not log app identity or tree content: model-authored content can be private.
+            logger.warning("attach: CozyApps publish unavailable error=%s", type(exc).__name__[:80])
+            return False
+
+    def _inbound_source(self, thread_id: str, *, message_id: Optional[str] = None) -> Any:
+        """Build the synthetic-inbound ``source`` shared by turn, steer, and interrupt.
+
+        ``_handle_turn``, ``_handle_steer``, and ``_handle_interrupt`` each inject a message on
+        the SAME thread and must resolve to the SAME harness session -- a steer or interrupt that
+        landed on a different chat id, user id, or authorization than the turn it targets would
+        either miss the running session or (worse) silently open a new one. Routing all three
+        through one helper keeps that same-session-identity invariant in lockstep: a future field
+        added to the source only has to change here, and cannot drift between call sites.
+
+        ``chat_id`` is the thread key, so all three frame types resume the one harness session.
+        A non-empty user id plus ``role_authorized`` carries the upstream (gateway-issued token)
+        authorization through the harness's per-message auth gate; the turn was already
+        authorized by the gateway that issued the token, so the identity here is deliberately
+        neutral (see ``INBOUND_USER``).
+        """
+        source = self.build_source(  # type: ignore[attr-defined]
+            chat_id=thread_id,
+            chat_type="dm",
+            user_name=INBOUND_USER,
+            user_id=INBOUND_USER,
+            message_id=message_id,
+            role_authorized=True,
+        )
+        # Deliberately unstamped: ``build_source`` already carries a real multiplex route when
+        # ``gateway.profile_routes`` resolves one, and nothing else may add a profile here.
+        # Hermes derives the session key of an internally routed turn twice -- the adapter seam
+        # namespaces it by ``source.profile``, the runner seam does not -- and drops the turn
+        # when either disagrees with the strict binding recorded in ``_desktop_session_bindings``.
+        # Stamping the loader-owned profile made the two derivations disagree and dropped every
+        # turn on a resumed desktop thread. The live-turn profile gate reads the same route
+        # through ``_session_profile_route`` instead, so it stays exact and fail-closed.
+        return source
+
+    def _session_profile_route(self) -> str:
+        """The profile Hermes will carry in this adapter's live-turn session context.
+
+        A single-profile gateway resolves no profile route, so its turns carry no profile and
+        this is ``""``. A multiplexed gateway stamps the route in ``build_source``, so the live
+        turn carries a name and the gate demands this adapter's own. With no runner to describe
+        the process shape (an isolated unit context), keep demanding the adapter's own profile
+        rather than relaxing the gate on a topology this plugin cannot see.
+        """
+        config = getattr(getattr(self, "gateway_runner", None), "config", None)
+        if config is None or getattr(config, "multiplex_profiles", False):
+            return self._profile or ""
+        return ""
+
+    @staticmethod
+    def _sync_session_db(runner: Any, store: Any = None) -> Any:
+        """Find Hermes' synchronous SessionDB beneath version-specific async wrappers."""
+        candidates = (
+            getattr(store, "session_db", None), getattr(store, "_session_db", None),
+            getattr(store, "store", None), getattr(store, "_store", None),
+            getattr(runner, "session_db", None), getattr(runner, "_session_db", None),
+        )
+        for candidate in candidates:
+            db = getattr(candidate, "_db", candidate)
+            if callable(getattr(db, "get_session", None)) and callable(getattr(db, "resolve_resume_session_id", None)):
+                return db
+        return None
+
+    @staticmethod
+    def _latest_message_row_id(session_db: Any, session_id: str) -> int:
+        rows = session_db.get_messages(session_id, limit=1, latest=True)
+        if not rows:
+            return 0
+        try:
+            return max(0, int(rows[0].get("id", 0)))
+        except (AttributeError, TypeError, ValueError):
+            return 0
+
+    async def _baseline_mobile_mirror_link(self, thread_id: str, source: Any) -> None:
+        """Record the just-injected phone turn so it can never be mirrored back to its origin."""
+        spool = self._spool
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        if spool is None or runner is None or store is None:
+            return
+        try:
+            session_key = self._dispatch_session_key(source)
+            if not session_key:
+                return
+            entry = await store.lookup_by_session_key(session_key)
+            session_id = getattr(entry, "session_id", None)
+            if not isinstance(session_id, str) or not session_id:
+                return
+            db = self._sync_session_db(runner, store)
+            if db is None:
+                return
+            row = await asyncio.to_thread(db.get_session, session_id)
+            if not isinstance(row, dict):
+                return
+            # A fresh native lane is safe to establish only when it is exactly the synthetic
+            # CozyGateway row. Resumed TUI lanes already have a link and retain their TUI source.
+            if (str(row.get("source") or "").strip().lower() == PLATFORM_NAME
+                    and not bool(row.get("hidden"))
+                    and str(row.get("chat_id") or "") == thread_id):
+                cursor = await asyncio.to_thread(self._latest_message_row_id, db, session_id)
+                spool.upsert_desktop_session_link(
+                    thread_id=thread_id,
+                    current_hermes_session_id=session_id,
+                    source=PLATFORM_NAME,
+                    desktop_session_id=None,
+                    last_message_row_id=cursor,
+                )
+                return
+            # An exact prior interactive adoption keeps its source identity but must advance beyond mobile
+            # rows written on that shared raw session before the mirror worker next polls.
+            binding = self._desktop_session_bindings.get(thread_id)
+            link = next((item for item in spool.desktop_session_links() if item["threadId"] == thread_id), None)
+            link_source = str(link.get("source") or "") if link is not None else ""
+            # The bound Bot Chat needs no in-process binding: after a plugin restart the lane still
+            # runs in it (durable switch), and skipping this baseline would echo the gateway's own
+            # turn rows back through the mirror.
+            bound_bot_chat = (link is not None and link_source in INTERACTIVE_SESSION_SOURCES
+                              and await asyncio.to_thread(self._is_bound_bot_chat, db, link))
+            if (link is not None and link_source in INTERACTIVE_SESSION_SOURCES
+                    and (bound_bot_chat or (
+                        binding is not None and binding[0] == session_key
+                        and str(row.get("source") or "").strip().lower() == link_source))):
+                # Compression can rotate the active SessionEntry after adoption.  The durable
+                # link's root remains the proof; resolve it before accepting the new active tip.
+                linked_tip = await asyncio.to_thread(
+                    db.resolve_resume_session_id, str(link["currentHermesSessionId"]),
+                )
+                if linked_tip != session_id:
+                    return
+                cursor = await asyncio.to_thread(self._latest_message_row_id, db, session_id)
+                spool.advance_desktop_session_link(
+                    thread_id=thread_id,
+                    expected_current_hermes_session_id=str(link["currentHermesSessionId"]),
+                    current_hermes_session_id=session_id, expected_source=link_source,
+                    expected_desktop_session_id=link.get("desktopSessionId"), last_message_row_id=cursor,
+                )
+        except Exception:  # noqa: BLE001 - mirroring may never affect a phone turn
+            logger.debug("attach: could not baseline desktop session mirror", exc_info=True)
+
+    @staticmethod
+    def _is_bound_bot_chat(db: Any, link: Dict[str, Any]) -> bool:
+        """Whether a mirror link's adopted registry row is the profile's canonical Bot Chat."""
+        desktop_session_id = link.get("desktopSessionId")
+        if not desktop_session_id:
+            return False
+        row = db.get_session(str(desktop_session_id))
+        return isinstance(row, dict) and str(row.get("title") or "") == CANONICAL_BOT_CHAT_TITLE
+
+    async def _mirror_desktop_session_link(
+        self, client: Any, spool: Any, db: Any, link: Dict[str, Any], *, allow_active: bool = False,
+    ) -> None:
+        """Journal one linked session's unseen rows, preserving its durable identity.
+
+        This is deliberately a serialized-continuation primitive, not a concurrent merge.  A
+        caller that is about to inject a mobile turn uses ``allow_active`` to flush the preceding
+        desktop segment before the injection guard begins.
+        """
+        thread_id = str(link["threadId"])
+        if not allow_active and (
+            thread_id in self._desktop_mirror_injections
+            or self._active_turn.get(thread_id) is not None
+        ):
+            return
+        source = str(link.get("source") or "")
+        if source != PLATFORM_NAME and source not in INTERACTIVE_SESSION_SOURCES:
+            return
+        try:
+            current = await asyncio.to_thread(
+                db.resolve_resume_session_id, str(link["currentHermesSessionId"]),
+            )
+            if not isinstance(current, str) or not current:
+                return
+            session = await asyncio.to_thread(db.get_session, current)
+            if not isinstance(session, dict):
+                return
+            session_source = str(session.get("source") or "").strip().lower()
+            if source == PLATFORM_NAME:
+                if (session_source != PLATFORM_NAME or bool(session.get("hidden"))
+                        or str(session.get("chat_id") or "") != thread_id):
+                    return
+            elif not link.get("desktopSessionId") or (
+                    session_source != source
+                    # Bot parity S2: the bound Bot Chat is followed WHATEVER its source. Hermes
+                    # re-stamps it ``cozygateway`` after a gateway turn, yet teammates'
+                    # ``message_agent`` DMs keep landing in it. The turn baseline already moved the
+                    # cursor past the gateway's own rows, so only external rows are mirrored.
+                    and not await asyncio.to_thread(self._is_bound_bot_chat, db, link)):
+                return
+
+            after = int(link["lastMessageRowId"])
+            rows = await asyncio.to_thread(db.get_messages, current, limit=100, after_id=after)
+            for message in rows:
+                row_id = int(message.get("id", 0))
+                if row_id <= after:
+                    continue
+                expected_current = str(link["currentHermesSessionId"])
+                # A CozyGateway-origin session is the native phone lane. Its turn and commit
+                # frames have already projected every transcript row to CozyChat, so sending a
+                # second ``desktop_session_message`` here would render an echo. Keep a durable
+                # high-water cursor nonetheless: it bounds restart polling and lets a later
+                # explicit Desktop/TUI/CLI adoption begin at exactly this handoff point.
+                if source == PLATFORM_NAME:
+                    if not spool.advance_desktop_session_link(
+                        thread_id=thread_id,
+                        expected_current_hermes_session_id=expected_current,
+                        current_hermes_session_id=current,
+                        expected_source=source,
+                        expected_desktop_session_id=link.get("desktopSessionId"),
+                        last_message_row_id=row_id,
+                    ):
+                        return
+                    link["currentHermesSessionId"] = current
+                    after = row_id
+                    continue
+                role = str(message.get("role") or "")
+                text = message.get("content")
+                if role not in {"user", "assistant"} or not isinstance(text, str) or not text.strip():
+                    if not spool.advance_desktop_session_link(
+                        thread_id=thread_id,
+                        expected_current_hermes_session_id=expected_current,
+                        current_hermes_session_id=current,
+                        expected_source=source,
+                        expected_desktop_session_id=link.get("desktopSessionId"),
+                        last_message_row_id=row_id,
+                    ):
+                        return
+                    link["currentHermesSessionId"] = current
+                    after = row_id
+                    continue
+                raw_at = message.get("timestamp", 0)
+                try:
+                    at = int(float(raw_at) * 1000) if float(raw_at) < 1_000_000_000_000 else int(float(raw_at))
+                except (TypeError, ValueError):
+                    at = 0
+                sent = await client.send_desktop_session_message(
+                    thread_id=thread_id,
+                    current_hermes_session_id=current,
+                    source=source,
+                    desktop_session_id=link.get("desktopSessionId"),
+                    expected_current_hermes_session_id=expected_current,
+                    message_row_id=row_id,
+                    role=role,
+                    text=text,
+                    at=max(0, at),
+                )
+                if not sent:
+                    return
+                link["currentHermesSessionId"] = current
+                after = row_id
+        except Exception:  # noqa: BLE001 - one row cannot kill a long-lived mirror
+            logger.debug("attach: desktop session mirror poll failed", exc_info=True)
+
+    async def _flush_desktop_session_before_injection(self, thread_id: str) -> None:
+        """Flush the prior Desktop segment before a serialized mobile continuation begins."""
+        client = self._client
+        spool = self._spool
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        if (client is None or spool is None or runner is None or store is None
+                or not getattr(client, "desktop_session_sync_available", False)):
+            return
+        db = self._sync_session_db(runner, store)
+        if db is None:
+            return
+        link = next((item for item in spool.desktop_session_links() if item["threadId"] == thread_id), None)
+        if link is not None:
+            await self._mirror_desktop_session_link(client, spool, db, link, allow_active=True)
+
+    async def _mirror_desktop_sessions(self) -> None:
+        """Poll durable linked rows off the socket watch loop and journal unseen transcript rows."""
+        while not self._closing:
+            client = self._client
+            spool = self._spool
+            runner = getattr(self, "gateway_runner", None)
+            store = getattr(runner, "async_session_store", None)
+            if client is not None and spool is not None and runner is not None and store is not None and getattr(client, "desktop_session_sync_available", False):
+                db = self._sync_session_db(runner, store)
+                if db is not None:
+                    for link in spool.desktop_session_links():
+                        await self._mirror_desktop_session_link(client, spool, db, link)
+            try:
+                await asyncio.sleep(self._desktop_mirror_interval)
+            except asyncio.CancelledError:
+                return
+
+    # -- inbound turn ---------------------------------------------------------
+    def _execution_thread_allowed(self, thread_id: object) -> bool:
+        """Fail closed when this child process receives another conversation's frame."""
+        expected = getattr(self, "_execution_session_id", None)
+        return expected is None or thread_id == expected
+
+    def _execution_workspace_root(self, session_id: str) -> Optional[Path]:
+        """The dedicated child process carries its resolved workspace without re-making a worktree."""
+        if not self._execution_session_id or session_id != self._execution_session_id:
+            return None
+        raw = profile_env("COZYGATEWAY_EXECUTION_WORKSPACE_ROOT", "")
+        try:
+            root = Path(raw).resolve(strict=True)
+            return root if root.is_dir() and Path.cwd().resolve() == root else None
+        except OSError:
+            return None
+
+    def toolsets_for_source(self, source: Any) -> Optional[List[str]]:
+        """Execution profile tool/MCP allow-list via Hermes' public adapter hook."""
+        if self._execution_session_id is None or getattr(source, "chat_id", None) != self._execution_session_id:
+            return None
+        try:
+            profile = json.loads(profile_env("COZYGATEWAY_SOURCE_PROFILE_JSON", "{}"))
+        except json.JSONDecodeError:
+            return []
+        selected = profile.get("enabledToolsets", [])
+        mcp = profile.get("enabledMcpServers", [])
+        if not isinstance(selected, list) or not isinstance(mcp, list): return []
+        return [item for item in [*selected, *mcp] if isinstance(item, str) and item.strip()]
+
+    async def _apply_execution_launch_model(self, source: Any) -> bool:
+        """Install bootstrap model metadata on this child session before a turn can run."""
+        if self._execution_session_id is None:
+            return True
+        try:
+            selected = json.loads(profile_env("COZYGATEWAY_EXECUTION_MODEL_JSON", "{}"))
+        except json.JSONDecodeError:
+            return False
+
+        if not selected:
+            return True
+        # Runner launch metadata uses {provider?, endpoint?, id}; a direct chat model
+        # selection uses {providerId, modelId}. Endpoint-only custom models deliberately wait
+        # for the execution-scoped provider import and subsequent chat prepare request.
+        provider = selected.get("providerId") or selected.get("provider")
+        model = selected.get("modelId") or selected.get("id")
+        if not isinstance(provider, str) or not provider or not isinstance(model, str) or not model:
+            return not bool(selected.get("endpoint"))
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        if runner is None or store is None:
+            return False
+        try:
+            entry = await store.get_or_create_session(source)
+            await store.set_model_override(entry.session_key, {"model": model, "provider": provider})
+            if provider.startswith("custom-"):
+                from .provider_connections import ProviderConnectionStore
+                override = ProviderConnectionStore().runtime_override(provider, model)
+                if override is None:
+                    return False
+                runner._session_state(entry.session_key).conversation.model_override = override
+            runner._evict_cached_agent(entry.session_key)
+            return True
+        except Exception:
+            logger.debug("attach: could not install execution launch model", exc_info=True)
+            return False
+
+    @staticmethod
+    def _set_session_effort(runner: Any, session_key: str, effort: Any) -> bool:
+        """Apply a Hermes reasoning level to exactly one GatewayRunner session.
+
+        Hermes Gateway exposes ``_set_session_reasoning_override`` specifically for the
+        session-scoped ``/reasoning`` command. It feeds ``_resolve_session_reasoning_config``
+        at turn dispatch, so it neither writes config.yaml nor changes another conversation.
+        ``None`` means inherit this isolated profile's configured default.
+        """
+        setter = getattr(runner, "_set_session_reasoning_override", None)
+        if not callable(setter):
+            return effort is None
+        if effort is None:
+            setter(session_key, None)
+            return True
+        if not isinstance(effort, str):
+            return False
+        try:
+            from hermes_constants import parse_reasoning_effort
+            parsed = parse_reasoning_effort(effort)
+        except Exception:
+            return False
+        if parsed is None:
+            return False
+        setter(session_key, parsed)
+        return True
+
+    def _on_turn(self, turn: TurnFrame) -> None:
+        """Bound to the client's ``on_turn``: schedule the inject as a task.
+
+        Runs on the drain loop; the actual inject is fired-and-forgotten so a slow
+        turn never blocks the socket. Deduplicated on (threadId, turnId) within a
+        bounded retention window: the dedupe set is capped, evicting the oldest
+        entry once it overflows, so a replay arriving after `_seen_turns_max` other
+        distinct turns is treated as new rather than deduped (see ``_seen_turns``
+        for the exact boundary).
+        """
+        if not self._execution_thread_allowed(turn.thread_id):
+            logger.warning("attach: execution process refused a turn for another session")
+            return
+        key = (turn.thread_id, turn.turn_id)
+        if key in self._seen_turns:
+            # Not moved to MRU here: a duplicate delivery does not extend its own
+            # retention window.
+            logger.debug("attach: dropping duplicate turn %s", key)
+            return
+        self._seen_turns[key] = None
+        while len(self._seen_turns) > self._seen_turns_max:
+            self._seen_turns.popitem(last=False)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # not in an event loop (defensive)
+        self._spawn_background(loop, self._handle_turn(turn))
+
+    async def _on_config_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Serve the narrow session-execution lane without touching profile-wide settings.
+
+        Hermes' AsyncSessionStore persists a model override on one session key and the runner
+        rebuilds that session's cached agent before its next turn. That is the only public,
+        isolated model seam available to this adapter. Workspace/project routing has no matching
+        attach-safe API: its Hermes RPC takes a host path, which this wire deliberately never
+        carries, so those selections are refused rather than treated as decoration.
+        """
+        operation = request.get("operation")
+        input_value = request.get("input")
+        if not isinstance(operation, str) or not isinstance(input_value, dict):
+            return {"status": "invalid_request", "message": "invalid config request"}
+        if operation in {"model.read", "model.write"}:
+            return await self._on_model_config_request(operation, input_value)
+        if operation.startswith("providers.connections."):
+            try:
+                from .provider_connections import ProviderConnectionStore
+                provider_store = getattr(self, "_provider_connections", None)
+                if provider_store is None:
+                    provider_store = ProviderConnectionStore(); self._provider_connections = provider_store
+                if operation == "providers.connections.list":
+                    if input_value: return {"status": "invalid_request", "message": "list accepts no input"}
+                    return {"status": "ok", "result": provider_store.catalog()}
+                if operation == "providers.connections.save":
+                    handoff_id = input_value.get("handoffId")
+                    client = self._client
+                    fetch = getattr(client, "fetch_provider_handoff", None)
+                    if not isinstance(handoff_id, str) or not callable(fetch):
+                        return {"status": "invalid_request", "message": "handoffId is required"}
+                    handoff = await fetch(handoff_id)
+                    if handoff is None: return {"status": "unavailable", "message": "provider handoff is unavailable or expired"}
+                    return {"status": "ok", "result": provider_store.save(handoff)}
+                if operation == "providers.connections.transfer":
+                    identifier, execution_id = input_value.get("id"), input_value.get("executionId")
+                    transfer = getattr(self._client, "transfer_provider_connection", None)
+                    if not isinstance(identifier, str) or not isinstance(execution_id, str) or not callable(transfer):
+                        return {"status": "invalid_request", "message": "id and executionId are required"}
+                    handoff_id = await transfer(execution_id, provider_store.transfer_payload(identifier))
+                    if handoff_id is None: return {"status": "unavailable", "message": "provider transfer was not accepted"}
+                    return {"status": "ok", "result": {"handoffId": handoff_id}}
+                if operation == "providers.connections.import":
+                    handoff_id = input_value.get("handoffId")
+                    fetch = getattr(self._client, "fetch_provider_handoff", None)
+                    if self._execution_id is None: return {"status": "unavailable", "message": "provider import requires a scoped execution adapter"}
+                    if not isinstance(handoff_id, str) or not callable(fetch):
+                        return {"status": "invalid_request", "message": "handoffId is required"}
+                    handoff = await fetch(handoff_id)
+                    if handoff is None: return {"status": "unavailable", "message": "provider handoff is unavailable or expired"}
+                    return {"status": "ok", "result": provider_store.import_connection(handoff)}
+                identifier = input_value.get("id")
+                if not isinstance(identifier, str) or not identifier:
+                    return {"status": "invalid_request", "message": "connection id is required"}
+                if operation == "providers.connections.test": return {"status": "ok", "result": provider_store.test(identifier)}
+                if operation == "providers.connections.remove": return {"status": "ok", "result": provider_store.remove(identifier)}
+            except KeyError:
+                return {"status": "not_found", "message": "provider connection was not found"}
+            except Exception:
+                logger.debug("attach: provider connection request failed", exc_info=True)
+                return {"status": "unavailable", "message": "provider connection operation failed"}
+            return {"status": "invalid_request", "message": "unknown provider connection operation"}
+        try:
+            from .chat_context import ChatContextError, HermesChatContext, set_hermes_session_cwd
+            contexts = HermesChatContext(self._profile)
+        except Exception:
+            return {"status": "unavailable", "message": "local Hermes chat context is unavailable"}
+        if operation == "chat.projects":
+            computer_id = input_value.get("computerId")
+            if not isinstance(computer_id, str) or not computer_id:
+                return {"status": "invalid_request", "message": "computerId is required"}
+            try: return {"status": "ok", "result": {"projects": contexts.projects(computer_id)}}
+            except ChatContextError as exc: return {"status": "invalid_request", "message": str(exc)}
+        if operation == "chat.branches":
+            computer_id, project_id = input_value.get("computerId"), input_value.get("projectId")
+            if not isinstance(computer_id, str) or not isinstance(project_id, str) or not computer_id or not project_id:
+                return {"status": "invalid_request", "message": "computerId and projectId are required"}
+            try: return {"status": "ok", "result": {"branches": contexts.branches(computer_id, project_id)}}
+            except ChatContextError as exc: return {"status": "invalid_request", "message": str(exc)}
+        if operation == "chat.configuration.read":
+            session_id = input_value.get("sessionId")
+            if not isinstance(session_id, str) or not session_id:
+                return {"status": "invalid_request", "message": "sessionId is required"}
+            if not self._execution_thread_allowed(session_id):
+                return {"status": "invalid_request", "message": "chat session is not owned by this execution"}
+            return {
+                "status": "ok",
+                "result": {
+                    "computer": {"id": contexts.computer_id, "name": contexts.computer_name, "isAvailable": contexts.computer_available},
+                    "configuration": None,
+                },
+            }
+        if operation != "chat.configuration.prepare":
+            return {"status": "unavailable", "message": "this runtime does not serve that config operation"}
+        configuration = input_value.get("configuration")
+        if not isinstance(configuration, dict):
+            return {"status": "invalid_request", "message": "configuration is required"}
+        session_id = configuration.get("sessionId")
+        if not self._execution_thread_allowed(session_id):
+            return {"status": "invalid_request", "message": "chat session is not owned by this execution"}
+        workspace = configuration.get("workspace")
+        model = configuration.get("model")
+        if (not isinstance(session_id, str) or not session_id
+                or workspace is not None and not isinstance(workspace, dict)
+                or model is not None and not isinstance(model, dict)):
+            return {"status": "invalid_request", "message": "malformed chat configuration"}
+        if isinstance(model, dict) and (not isinstance(model.get("providerId"), str) or not model.get("providerId")
+                                       or not isinstance(model.get("modelId"), str) or not model.get("modelId")):
+            return {"status": "invalid_request", "message": "model providerId and modelId are required"}
+        if isinstance(model, dict) and model.get("effort") is not None:
+            if not isinstance(model.get("effort"), str):
+                return {"status": "invalid_request", "message": "model effort is invalid"}
+            try:
+                from hermes_constants import parse_reasoning_effort
+                valid_effort = parse_reasoning_effort(model["effort"])
+            except Exception:
+                valid_effort = None
+            if valid_effort is None:
+                return {"status": "invalid_request", "message": "model effort is invalid"}
+            if not callable(getattr(getattr(self, "gateway_runner", None), "_set_session_reasoning_override", None)):
+                return {"status": "unavailable", "message": "this Hermes build has no isolated effort override"}
+        if self._active_turn.get(session_id) is not None:
+            return {"status": "invalid_request", "message": "chat session is running"}
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        if runner is None or store is None:
+            return {"status": "unavailable", "message": "Hermes session store is unavailable"}
+        try:
+            source = self._inbound_source(session_id)
+            entry = await store.get_or_create_session(source)
+            runtime_override = None
+            if isinstance(model, dict) and str(model["providerId"]).startswith("custom-"):
+                from .provider_connections import ProviderConnectionStore
+                runtime_override = ProviderConnectionStore().runtime_override(model["providerId"], model["modelId"])
+                if runtime_override is None:
+                    return {"status": "not_found", "message": "custom provider connection was not found"}
+            if workspace is not None:
+                root = self._execution_workspace_root(session_id) or contexts.prepare_workspace(workspace, session_id)
+                # A standalone execution owns one OS process whose launch cwd is the resolved
+                # runner worktree. It deliberately avoids TUI's in-process cwd setter and never
+                # creates a second worktree. Shared Hermes adapters still use the session setter.
+                if self._execution_workspace_root(session_id) is None and not set_hermes_session_cwd(entry.session_key, root):
+                    return {"status": "unavailable", "message": "this Hermes build cannot set this session workspace"}
+            if model is None:
+                await store.set_model_override(entry.session_key, None)
+                if not self._set_session_effort(runner, entry.session_key, None):
+                    return {"status": "unavailable", "message": "this Hermes build cannot clear this session effort"}
+            else:
+                # AsyncSessionStore sanitizes the persisted value to model/provider/base_url and
+                # resolves credentials locally; no credential crosses the attach config lane.
+                await store.set_model_override(entry.session_key, {
+                    "model": model["modelId"], "provider": model["providerId"],
+                })
+                if runtime_override is not None:
+                    # Hermes' persistent store intentionally strips api_key. Its runtime session
+                    # state is the legitimate per-session seam that supplies the key to this turn.
+                    state = runner._session_state(entry.session_key)
+                    state.conversation.model_override = runtime_override
+                if not self._set_session_effort(runner, entry.session_key, model.get("effort")):
+                    return {"status": "invalid_request", "message": "model effort is not supported by this Hermes build"}
+            runner._evict_cached_agent(entry.session_key)
+        except ChatContextError as exc:
+            return {"status": "invalid_request", "message": str(exc)}
+        except Exception:
+            logger.debug("attach: session model preparation failed", exc_info=True)
+            return {"status": "unavailable", "message": "Hermes could not prepare this session model"}
+        try:
+            from .execution_health import current
+            health = current()
+            if health is not None: health.mark_configuration_ready()
+        except Exception:
+            logger.debug("attach: execution health configuration update failed", exc_info=True)
+        return {"status": "ok", "result": {"configuration": configuration}}
+
+    async def _on_model_config_request(self, operation: str, input_value: Dict[str, Any]) -> Dict[str, Any]:
+        """Serve custom-provider bot defaults without editing Hermes' process-wide config.
+
+        A profile default is stored as an opaque provider/model reference.  At dispatch it is
+        re-resolved from the private connection store and installed in the target session only.
+        """
+        from .provider_connections import BotModelDefaultStore, ProviderConnectionStore
+        providers = getattr(self, "_provider_connections", None)
+        if providers is None:
+            providers = ProviderConnectionStore(); self._provider_connections = providers
+        defaults = getattr(self, "_bot_model_defaults", None)
+        if defaults is None:
+            defaults = BotModelDefaultStore(); self._bot_model_defaults = defaults
+        if operation == "model.write":
+            if not input_value or set(input_value) - {"model", "effort"}:
+                return {"status": "invalid_request", "message": "invalid model patch"}
+            if input_value.get("effort") not in (None,):
+                return {"status": "unavailable", "message": "this Hermes attachment has no isolated effort default"}
+            if "model" in input_value:
+                selected = input_value["model"]
+                if selected is not None:
+                    if not isinstance(selected, str) or not self._custom_model_available(providers, selected):
+                        return {"status": "invalid_request", "message": "unknown custom provider model"}
+                defaults.write(selected)
+        return {"status": "ok", "result": self._bot_model_config(providers, defaults)}
+
+    @staticmethod
+    def _custom_model_available(providers: Any, selected: str) -> bool:
+        for connection in providers.catalog().get("connections", []):
+            prefix = str(connection.get("id") or "") + ":"
+            if selected.startswith(prefix):
+                return selected[len(prefix):] in set(connection.get("models") or []) | set(connection.get("manualModels") or [])
+        return False
+
+    @staticmethod
+    def _bot_model_config(providers: Any, defaults: Any) -> Dict[str, Any]:
+        catalog, rows = [], []
+        for connection in providers.catalog().get("connections", []):
+            identifier = connection["id"]
+            models = sorted(set(connection.get("models") or []) | set(connection.get("manualModels") or []))
+            catalog.extend({"id": f"{identifier}:{model}", "displayName": model} for model in models)
+            rows.append({"slug": identifier, "name": connection["name"], "authenticated": True,
+                         "modelCount": len(models), "baseUrl": connection["baseUrl"]})
+        return {"model": defaults.read()["model"], "effort": None, "catalog": catalog, "efforts": [], "providers": rows}
+
+    async def _apply_bot_default_model(self, turn: TurnFrame, source: Any) -> bool:
+        """Set a custom bot default on this session just before dispatch, never globally."""
+        if turn.chat_context is not None and turn.chat_context.get("model") is not None:
+            return True  # A prepared per-chat override wins over the bot default.
+        from .provider_connections import BotModelDefaultStore, ProviderConnectionStore
+        defaults = getattr(self, "_bot_model_defaults", None)
+        if defaults is None:
+            defaults = BotModelDefaultStore(); self._bot_model_defaults = defaults
+        selected = defaults.read()["model"]
+        if selected is None:
+            return True
+        providers = getattr(self, "_provider_connections", None)
+        if providers is None:
+            providers = ProviderConnectionStore(); self._provider_connections = providers
+        provider, separator, model = selected.partition(":")
+        override = providers.runtime_override(provider, model) if separator and model else None
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        if override is None or runner is None or store is None:
+            return False
+        try:
+            entry = await store.get_or_create_session(source)
+            await store.set_model_override(entry.session_key, {"model": model, "provider": provider})
+            runner._session_state(entry.session_key).conversation.model_override = override
+            runner._evict_cached_agent(entry.session_key)
+            return True
+        except Exception:
+            logger.debug("attach: could not install bot default for session", exc_info=True)
+            return False
+
+    async def _handle_turn(self, turn: TurnFrame) -> None:
+        """Inject one turn frame as a synthetic inbound message."""
+        from gateway.platforms.base import MessageEvent, cache_media_bytes  # harness-defined identifiers
+
+        self._active_turn[turn.thread_id] = turn.turn_id
+        # See _inbound_source for why turn/steer/interrupt share one source builder.
+        # message_id is the per-turn reply anchor.
+        # Hermes binds HERMES_SESSION_MESSAGE_ID from SessionSource.message_id,
+        # not MessageEvent.message_id. Carry the gateway-issued turn id on the
+        # trusted source so worker/deferred ContextVar copies retain it.
+        source = self._inbound_source(turn.thread_id, message_id=turn.turn_id)
+        if not await self._apply_execution_launch_model(source) or not await self._apply_bot_default_model(turn, source):
+            await self._safe_failed(turn.thread_id, turn.turn_id, "bot model unavailable")
+            self._cleanup_turn(turn.thread_id, turn.turn_id)
+            return
+        # The persisted link represents the prior serialized Desktop segment. Drain it before
+        # any mobile write starts; text/time dedupe would lose legitimate repeated turns. Hermes
+        # 0.20.5's cross-process ``session_turn_leases`` serializes this session lineage, so this
+        # high-water baseline is safe for handoff (but is intentionally not a concurrent merge).
+        settling = self._settle_tasks.get(turn.thread_id)
+        if settling is not None:
+            # The previous phone turn's baseline must land first (it is bounded by its idle wait).
+            await asyncio.shield(settling)
+        await self._flush_desktop_session_before_injection(turn.thread_id)
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        client = self._client
+        if client is not None:
+            for media_id in turn.media_ids:
+                try:
+                    data, filename, mime = await client.download_media(media_id)
+                    cached = cache_media_bytes(data, filename=filename, mime_type=mime)
+                    if cached is not None:
+                        media_urls.append(cached.path)
+                        media_types.append(cached.media_type)
+                except Exception:  # noqa: BLE001 - one bad attachment must not drop the turn
+                    logger.debug("attach: could not materialize inbound media %s", media_id, exc_info=True)
+        voice_notes = sum(1 for media_type in media_types if str(media_type).startswith("audio/"))
+        if voice_notes:
+            self._voice_note_echoes[turn.turn_id] = voice_notes
+        binding = self._desktop_session_bindings.get(turn.thread_id)
+        metadata: Dict[str, Any] = {"cozygateway_context_turn": True}
+        if binding is not None:
+            # The runner validates this strict binding immediately before dispatch, so a stale
+            # replay cannot fall through to get_or_create_session and land in a new context.
+            metadata.update({
+                "gateway_session_key": binding[0],
+                "gateway_session_id": binding[1],
+                "gateway_session_strict": True,
+            })
+        event = MessageEvent(
+            text=turn.text,
+            source=source,
+            message_id=turn.turn_id,
+            media_urls=media_urls,
+            media_types=media_types,
+            metadata=metadata,
+        )
+        if binding is not None and not await self._binding_dispatchable(binding, event):
+            # Hermes would drop this turn inside one of its two strict checks and say nothing,
+            # so the gateway would hold it until its cap. Refuse it out loud instead.
+            logger.warning("attach: refusing turn %s; its desktop session binding no longer holds", turn.turn_id)
+            await self._safe_failed(turn.thread_id, turn.turn_id, reason=UNKNOWN_TURN_REASON)
+            self._cleanup_turn(turn.thread_id, turn.turn_id)
+            return
+        # Session sync supports serialized handoff, not concurrent two-writer merges.  Keep this
+        # guard across the entire injected turn and baseline before releasing it, so a poller can
+        # never reflect the phone's own rows back while this lane is being written.
+        #
+        # The guard is released, and the baseline taken, when the turn SETTLES (``_cleanup_turn``
+        # on its final commit or failure, then the runner going idle), not when ``handle_message``
+        # returns: upstream only spawns the run there. Trade-off: a row an external writer (a
+        # teammate's ``message_agent`` DM) adds to this lane's session DURING the phone's turn is
+        # covered by that baseline and is not mirrored; it is still in Hermes's transcript.
+        self._desktop_mirror_injections.add(turn.thread_id)
+        self._mirror_settles[turn.thread_id] = (turn.turn_id, source)
+        try:
+            await self.handle_message(event)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - best-effort failed, then clean up
+            logger.debug("attach: handle_message raised", exc_info=True)
+            await self._safe_failed(turn.thread_id, turn.turn_id, "turn error")
+            self._cleanup_turn(turn.thread_id, turn.turn_id)
+
+    def _settle_mirror(self, chat_id: str, turn_id: str) -> None:
+        """Schedule the owed baseline for an injected turn that just settled (see ``_handle_turn``)."""
+        pending = self._mirror_settles.get(chat_id)
+        if pending is None or pending[0] != turn_id:
+            return
+        del self._mirror_settles[chat_id]
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._desktop_mirror_injections.discard(chat_id)
+            return
+        task = loop.create_task(self._settle_mirror_after_idle(chat_id, pending[1]))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        self._settle_tasks[chat_id] = task
+        task.add_done_callback(
+            lambda done, chat=chat_id: self._settle_tasks.pop(chat, None)
+            if self._settle_tasks.get(chat) is done else None)
+
+    async def _settle_mirror_after_idle(self, chat_id: str, source: Any) -> None:
+        """Baseline once the runner has finished writing the turn's rows, then release the guard."""
+        try:
+            runner = getattr(self, "gateway_runner", None)
+            session_key = self._dispatch_session_key(source)
+            is_running = getattr(runner, "_is_session_running", None)
+            # Bounded: a runner that never reports idle still releases the guard.
+            for _ in range(240):
+                if not session_key or not callable(is_running) or not is_running(session_key):
+                    break
+                await asyncio.sleep(0.25)
+            await self._baseline_mobile_mirror_link(chat_id, source)
+        except Exception:  # noqa: BLE001 - mirroring may never affect a phone turn
+            logger.debug("attach: settle baseline failed", exc_info=True)
+        finally:
+            if chat_id not in self._mirror_settles:
+                self._desktop_mirror_injections.discard(chat_id)
+
+    async def _report_turn_context(self, chat_id: str, turn_id: str, session_key: str) -> None:
+        """Report the runtime's current prompt occupancy after a completed injected turn.
+
+        Hermes' cumulative input/output counters are intentionally never read here. The upstream
+        context-breakdown helper combines its provider anchor with the final persisted response,
+        so this is the next-prompt occupancy after the turn rather than the last API request.
+        """
+        client = self._client
+        if not isinstance(client, AttachV1Client):
+            return
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        state_for = getattr(runner, "_session_state", None)
+        if (not isinstance(session_key, str) or not session_key or not callable(state_for)
+                or store is None):
+            return
+        try:
+            state = state_for(session_key)
+            agent = getattr(getattr(state, "turn", None), "agent", None)
+            if agent is None:
+                return
+            entry = await store.lookup_by_session_key(session_key)
+            session_id = getattr(entry, "session_id", None)
+            db = self._sync_session_db(runner, store)
+            if not isinstance(session_id, str) or not session_id or db is None:
+                return
+            history = await asyncio.to_thread(db.get_messages, session_id, limit=10_000)
+            if not isinstance(history, list):
+                return
+            from agent.context_breakdown import compute_session_context_breakdown
+            reading = await asyncio.to_thread(compute_session_context_breakdown, agent, history)
+            used_tokens = reading.get("context_used")
+            window_tokens = reading.get("context_max")
+            source_name = reading.get("context_source")
+            if (not isinstance(used_tokens, int) or isinstance(used_tokens, bool) or used_tokens < 0
+                    or not isinstance(window_tokens, int) or isinstance(window_tokens, bool) or window_tokens < 1
+                    or source_name not in {"provider_usage", "provider_usage_plus_estimate", "local_estimate"}):
+                return
+            await client.send_chat_context(
+                chat_id,
+                turn_id,
+                used_tokens=used_tokens,
+                window_tokens=window_tokens,
+                measurement="reported" if source_name == "provider_usage" else "estimated",
+                source=source_name,
+                model=reading.get("model").strip() if isinstance(reading.get("model"), str) else None,
+            )
+        except Exception:  # noqa: BLE001 - an optional meter must not change turn outcome
+            logger.debug("attach: could not report current chat context", exc_info=True)
+
+    def _on_desktop_resume_command(self, command: Dict[str, Any]) -> None:
+        """Schedule one explicit, source-qualified Desktop/TUI session adoption."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_background(loop, self._handle_desktop_resume_command(command))
+
+    def _on_cozyapp_action_command(self, command: Dict[str, Any]) -> None:
+        """Schedule private execution without blocking attach command/replay processing."""
+        loop = self._loop
+        if loop is None:
+            client = self._client
+            if isinstance(client, AttachV1Client):
+                self._spawn_background(asyncio.get_running_loop(), client.finish_cozyapp_action(command, "failed"))
+            return
+        self._spawn_background(loop, self._handle_cozyapp_action_command(command))
+
+    async def _handle_cozyapp_action_command(self, command: Dict[str, Any]) -> None:
+        """Run a structured app action in a private Hermes session, never a user chat lane."""
+        from gateway.platforms.base import MessageEvent  # harness-defined identifier
+
+        client = self._client
+        app_id = command.get("appId")
+        action_id = command.get("actionId")
+        request_id = command.get("actionRequestId")
+        if not isinstance(client, AttachV1Client) or not all(isinstance(value, str) and value for value in (app_id, action_id, request_id)):
+            if isinstance(client, AttachV1Client): await client.finish_cozyapp_action(command, "failed")
+            return
+        chat_id = f"__cozyapp__:{app_id}"
+        gate = self._cozyapp_action_gates.get(app_id)
+        if gate is None:
+            gate = _CozyAppActionGate()
+            self._cozyapp_action_gates[app_id] = gate
+        # Count waiters before the first await.  This lets the final caller remove
+        # an idle gate without a brief unlocked window where a third same-app
+        # action could create a different lock and run alongside a queued action.
+        gate.waiters += 1
+        try:
+            async with gate.lock:
+                # Private context retains normal tool policy (including consent-gated phone tools), but
+                # send/send_draft below intentionally discard model prose so this is not a chat thread.
+                self._active_turn[chat_id] = request_id
+                try:
+                    prompt = (
+                        "Structured CozyApp action. This is not a chat message. "
+                        f"appId={app_id}; actionId={action_id}; actionRequestId={request_id}. "
+                        "Perform the requested refresh or action using your existing tools. If the app UI must change, "
+                        "call cozyapp_upsert with a complete validated replacement tree. Do not ask for hidden approval."
+                    )
+                    event = MessageEvent(
+                        text=prompt,
+                        source=self._inbound_source(chat_id, message_id=request_id),
+                        message_id=request_id,
+                        metadata={"cozyappAction": {"appId": app_id, "actionId": action_id, "actionRequestId": request_id}, "private": True},
+                    )
+                    await self.handle_message(event)  # type: ignore[attr-defined]
+                    await client.finish_cozyapp_action(command, "completed")
+                except Exception:
+                    await client.finish_cozyapp_action(command, "failed")
+                finally:
+                    self._cleanup_turn(chat_id, request_id)
+        finally:
+            gate.waiters -= 1
+            if gate.waiters == 0 and self._cozyapp_action_gates.get(app_id) is gate:
+                self._cozyapp_action_gates.pop(app_id, None)
+
+    async def _handle_desktop_resume_command(self, command: Dict[str, Any]) -> None:
+        """Switch the stable attach lane to an exact profile-local Hermes session.
+
+        The command ACK says only that the plugin spool received it. The sole success proof is the
+        durable `desktop_session_resumed` event emitted after every verification and switch below.
+        Any unavailable internal API or failed check is intentionally a silent refusal: the gateway
+        leaves its staged mapping pending and never routes a later user turn by approximation.
+        """
+        thread_id = command.get("threadId")
+        raw_id = command.get("hermesSessionId")
+        resume_id = command.get("resumeId")
+        if (not all(isinstance(value, str) and 0 < len(value) <= 256 for value in (thread_id, raw_id, resume_id))
+                or not self._execution_thread_allowed(thread_id)):
+            return
+        if any(marker in raw_id for marker in ("\x00", "\r", "\n", "..", "/", "\\")):
+            return
+        if self._active_turn.get(thread_id) is not None:
+            return
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        if runner is None or store is None:
+            return
+        try:
+            source = self._inbound_source(thread_id)
+            # The key both of Hermes' strict checks will derive for this thread, in whichever
+            # topology this process runs; see _dispatch_session_key.
+            session_key = self._dispatch_session_key(source)
+            if not session_key:
+                return
+            if runner._is_session_running(session_key):
+                return
+            # Hermes has changed the async wrapper's private field spelling across releases. The
+            # underlying SessionDB contract is stable; require both exact lookup and compression
+            # resolution rather than guessing if this running Hermes does not expose either.
+            # GatewayRunner exposes an AsyncSessionDB whose methods are coroutines.  This command
+            # runs on the event loop but needs the underlying synchronous SessionDB for the two
+            # exact, side-effect-free checks below; calling the wrapper without await silently
+            # treats coroutine objects as rows.  Keep the candidate spelling compatibility, then
+            # unwrap only the documented wrapper field before checking the stable SessionDB API.
+            session_db = self._sync_session_db(runner, store)
+            raw = session_db.get_session(raw_id) if session_db is not None else None
+            raw_source = str(raw.get("source") or "").strip().lower() if isinstance(raw, dict) else ""
+            # Bot parity S2: the profile's canonical "Bot Chat" stays adoptable after a gateway turn
+            # re-stamped its source ``cozygateway``; the exact title is Hermes's own UNIQUE identity.
+            canonical_bot_chat = (raw_source == PLATFORM_NAME and isinstance(raw, dict)
+                                  and str(raw.get("title") or "") == CANONICAL_BOT_CHAT_TITLE)
+            if not isinstance(raw, dict) or (raw_source not in INTERACTIVE_SESSION_SOURCES
+                                             and not canonical_bot_chat):
+                return
+            target = session_db.resolve_resume_session_id(raw_id)
+            target_row = session_db.get_session(target) if isinstance(target, str) and target else None
+            if (not isinstance(target, str) or not target or not isinstance(target_row, dict)
+                    or str(target_row.get("source") or "").strip().lower() != raw_source):
+                return
+            await store.get_or_create_session(source)
+            switched = await store.switch_session(session_key, target)
+            # Hermes 0.20.x returns SessionEntry; older wrapper seams returned the id directly.
+            # Accept the latter only when it is an exact string match, never arbitrary equality.
+            switched_id = getattr(switched, "session_id", switched)
+            if not isinstance(switched_id, str) or switched_id != target:
+                return
+            runner._evict_cached_agent(session_key)
+            if not runner._is_session_running(session_key):
+                runner._release_running_agent_state(session_key)
+            self._desktop_session_bindings[thread_id] = (session_key, target)
+            spool = self._spool
+            if spool is not None:
+                baseline = await asyncio.to_thread(self._latest_message_row_id, session_db, target)
+                # This is the only intentional retarget: an explicit, idle, serialized desktop
+                # adoption. Ordinary retries use insert-only links and cannot discard an outbox tail.
+                spool.reset_desktop_session_link(
+                    thread_id=thread_id, current_hermes_session_id=target,
+                    # A re-adopted Bot Chat keeps the interactive link shape the mirror speaks.
+                    source="desktop" if canonical_bot_chat else raw_source,
+                    desktop_session_id=raw_id, last_message_row_id=baseline,
+                )
+            client = self._client
+            if client is not None:
+                await client.send_desktop_session_resumed(thread_id, raw_id, resume_id)
+        except Exception:  # noqa: BLE001 - no exact proof means no resume
+            logger.debug("attach: desktop session resume refused", exc_info=True)
+
+    # -- mid-turn steer -------------------------------------------------------
+    def _on_steer(self, frame: SteerFrame) -> None:
+        """Bound to the client's ``on_steer``: schedule the injection as a task."""
+        if not self._execution_thread_allowed(frame.thread_id):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_background(loop, self._handle_steer(frame))
+
+    async def _handle_steer(self, frame: SteerFrame) -> None:
+        """Inject a mid-turn steer as another inbound message on the same thread.
+
+        Deliberately does NOT touch ``_active_turn``, ``_seen_turns``, or seal anything: with the
+        agent-side config ``busy_input_mode=steer``, the harness's busy handler routes this
+        injection into the running turn natively, and the continued reply keeps streaming under
+        the original ``turn_id`` (still held in ``_active_turn[thread_id]``).
+        """
+        from gateway.platforms.base import MessageEvent  # harness-defined identifier
+
+        if not await self._holds_turn(frame.thread_id, frame.turn_id):
+            return
+        # See _inbound_source for why turn/steer/interrupt share one source builder.
+        source = self._inbound_source(frame.thread_id)
+        # A distinct message_id for the injected message; the running turn's reply anchor is left
+        # untouched so continued drafts still anchor to the original turn.
+        event = MessageEvent(text=frame.text, source=source, message_id=f"{frame.turn_id}:steer")
+        try:
+            await self.handle_message(event)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - a steer must never crash the drain loop
+            logger.debug("attach: steer injection raised", exc_info=True)
+
+    # -- hard interrupt -------------------------------------------------------
+    def _on_interrupt(self, frame: InterruptFrame) -> None:
+        """Bound to the client's ``on_interrupt``: schedule the native stop as a task."""
+        if not self._execution_thread_allowed(frame.thread_id):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_background(loop, self._handle_interrupt(frame))
+
+    async def _handle_interrupt(self, frame: InterruptFrame) -> None:
+        """Hard-stop the thread's running turn via an injected native ``/stop`` command.
+
+        The harness exposes no callable interrupt entry point; its real hard-stop seam is an
+        injected ``/stop`` slash-command message. ``stop`` is a member of the harness's
+        ``ACTIVE_SESSION_BYPASS_COMMANDS``, so a ``/stop`` message delivered through
+        ``handle_message`` on a busy session bypasses the queue and dispatches the harness's
+        native interrupt-and-clear path (hard-stopping the run); on an idle session it is a
+        clean no-op. This is the same injected-command seam ``_handle_steer`` rides to inject
+        steer text, so it needs no extra harness import and this module stays importable
+        without the harness on the path.
+
+        A live run stops and Hermes delivers its own stop notice, which seals the turn on the
+        ordinary reply path. When there is no live Hermes work for the turn -- it was consumed as
+        a command, or the run died -- the inject is a clean no-op and NOTHING seals: the interrupt
+        is acked on the wire and the phone keeps showing "thinking" (issue #190, three acked
+        interrupts, no terminal). So the seal is guaranteed here instead: after a short grace for
+        Hermes' own terminal, a turn still open is sealed ``interrupted``. The grace is what keeps
+        the live path's notice text: whoever seals first wins, and Hermes wins when it is alive.
+
+        A failed inject must never crash the drain loop, so it degrades to a best-effort no-op
+        (debug-log-and-return) -- and still seals, because an interrupt the operator asked for
+        must terminalize either way.
+        """
+        from gateway.platforms.base import MessageEvent  # harness-defined identifier
+
+        if not await self._holds_turn(frame.thread_id, frame.turn_id, quiet_when_sealed_here=True):
+            return
+        # See _inbound_source for why turn/steer/interrupt share one source builder.
+        source = self._inbound_source(frame.thread_id)
+        # A slash command, not a turn: the injected text must be exactly "/stop" (the harness
+        # recognizes the command from the message text via MessageEvent.get_command), and no
+        # reply anchor is attached -- a command carries no turn-derived message_id, and the
+        # running turn's anchor is left untouched.
+        event = MessageEvent(text="/stop", source=source)
+        try:
+            await self.handle_message(event)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - an interrupt must never crash the drain loop
+            logger.debug("attach: interrupt injection raised", exc_info=True)
+        await self._seal_interrupted(frame.thread_id, frame.turn_id)
+
+    async def _holds_turn(self, thread_id: str, turn_id: str, *, quiet_when_sealed_here: bool = False) -> bool:
+        """True when ``turn_id`` is this process's running turn on ``thread_id``.
+
+        A steer or an interrupt only means anything against the turn it names. When this plugin
+        does not hold that turn -- it restarted, or the turn was already sealed -- injecting the
+        steer text anyway starts a fresh reply whose draft and commit events the gateway declines
+        as orphaned, and the person's words are lost with them. Answer the frame on its own turn
+        id instead, so the gateway can settle that turn and carry the text forward.
+
+        ``quiet_when_sealed_here`` is the interrupt's one exemption: a turn this process ran and
+        already TERMINALIZED lost a harmless race, it carries no text to preserve, and a failed
+        terminal on it would only contradict the reply it already delivered. The exemption keys on
+        a terminal actually sent, never on arrival: a turn that reached this process and then died
+        without one is precisely the silence this exists to remove.
+        """
+        if self._active_turn.get(thread_id) == turn_id:
+            return True
+        if quiet_when_sealed_here and (thread_id, turn_id) in self._sealed_turns:
+            logger.debug("attach: interrupt for turn %s arrived after it was sealed here", turn_id)
+            return False
+        logger.warning("attach: refusing a frame for turn %s; this process does not hold it", turn_id)
+        await self._safe_failed(thread_id, turn_id, reason=UNKNOWN_TURN_REASON)
+        return False
+
+    async def _seal_interrupted(self, thread_id: str, turn_id: str) -> None:
+        """Emit the ``interrupted`` terminal for ``turn_id`` unless something else sealed it."""
+        if self._interrupt_seal_grace > 0:
+            await self._interrupt_sleep(self._interrupt_seal_grace)
+        client = self._client
+        if self._active_turn.get(thread_id) != turn_id or client is None:
+            return  # Hermes sealed it (with its own notice text, which is the better terminal).
+        logger.info("attach: interrupt sealing turn %s; no Hermes terminal arrived", turn_id)
+        try:
+            await client.send_interrupted(thread_id, turn_id)
+        except Exception:  # noqa: BLE001 - the drain loop outlives one failed frame
+            logger.debug("attach: interrupted frame emit failed", exc_info=True)
+            return
+        self._mark_sealed(thread_id, turn_id)
+        self._cleanup_turn(thread_id, turn_id)
+
+    def _on_approval_command(self, command: Dict[str, Any]) -> None:
+        """Resolve a durable v1 approval through Hermes' native slash-command seam."""
+        thread_id = command.get("threadId")
+        decision = command.get("decision")
+        if not isinstance(thread_id, str) or decision not in {"approve", "deny"} or not self._execution_thread_allowed(thread_id):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_background(loop, self._handle_approval_command(thread_id, decision))
+
+    async def _dispatch_approval_command(self, command: Dict[str, Any]) -> None:
+        thread_id = command.get("threadId")
+        decision = command.get("decision")
+        if isinstance(thread_id, str) and decision in {"approve", "deny"} and self._execution_thread_allowed(thread_id):
+            await self._handle_approval_command(thread_id, decision)
+
+    async def _handle_approval_command(self, thread_id: str, decision: str) -> None:
+        from gateway.platforms.base import MessageEvent  # harness-defined identifier
+
+        event = MessageEvent(
+            text="/approve" if decision == "approve" else "/deny",
+            source=self._inbound_source(thread_id),
+        )
+        try:
+            await self.handle_message(event)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            logger.debug("attach: approval command injection raised", exc_info=True)
+            raise
+
+    def _on_clarify_command(self, command: Dict[str, Any]) -> None:
+        """Feed the selected stable option back into the same native conversation."""
+        thread_id = command.get("threadId")
+        turn_id = command.get("turnId")
+        clarify_id = command.get("clarifyId")
+        option_id = command.get("optionId")
+        if (not all(isinstance(value, str) and value for value in (thread_id, turn_id, clarify_id, option_id))
+                or not self._execution_thread_allowed(thread_id)):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_background(loop, self._handle_clarify_command(thread_id, turn_id, clarify_id, option_id))
+
+    #: Operations that change memory, and so must not be applied twice for one request id.
+    _MEMORY_MUTATIONS = ("create", "update", "delete", "setup")
+
+    def _on_memory_command(self, command: Dict[str, Any]) -> None:
+        """Hand the request to a background task so the receive loop keeps reading.
+
+        The client awaits this callback inline, so serving the request here would
+        hold up every other frame on the socket for the duration of a vault scan.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._spawn_background(loop, self._handle_memory_command(command))
+
+    def _remember_memory_result(
+        self, request_id: str, status: str, result: Optional[Dict[str, Any]] = None,
+        message: Optional[str] = None, current: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._memory_results[request_id] = (status, result, message, current)
+        self._memory_results.move_to_end(request_id)
+        while len(self._memory_results) > self._memory_results_max:
+            self._memory_results.popitem(last=False)
+
+    async def _handle_memory_command(self, command: Dict[str, Any]) -> None:
+        """Serve an ephemeral request while the authenticated attach socket is live.
+
+        The work itself runs on a worker thread: a full-vault scan is filesystem
+        work measured in seconds, and doing it inline would stall this profile's
+        heartbeats and turn traffic behind one search keystroke.
+        """
+        request_id, operation, input = command.get("requestId"), command.get("operation"), command.get("input")
+        client = self._client
+        if not isinstance(request_id, str) or not isinstance(operation, str) or not isinstance(input, dict) or not isinstance(client, AttachV1Client):
+            return
+        mutation = operation in self._MEMORY_MUTATIONS
+        replayed = self._memory_results.get(request_id) if mutation else None
+        if replayed is not None:
+            status, result, message, current = replayed
+            await client.send_memory_result(request_id, status, result=result, message=message, current=current)
+            return
+        if self._memory_busy is not None and self._memory_busy != request_id:
+            await client.send_memory_result(
+                request_id, "unavailable",
+                message="memory is busy with another request; try again in a moment",
+            )
+            return
+        self._memory_busy = request_id
+        try:
+            try:
+                result = await asyncio.to_thread(self._memory_manager.execute, operation, input)
+                if mutation: self._remember_memory_result(request_id, "ok", result=result)
+                await client.send_memory_result(request_id, "ok", result=result)
+            except MemoryConflict as error:
+                if mutation: self._remember_memory_result(request_id, "conflict", message=str(error), current=error.current)
+                await client.send_memory_result(request_id, "conflict", message=str(error), current=error.current)
+            except MemoryError as error:
+                if mutation: self._remember_memory_result(request_id, error.status, message=str(error))
+                await client.send_memory_result(request_id, error.status, message=str(error))
+            except Exception as error:
+                # Named by exception class, never with exc_info: a UnicodeDecodeError
+                # carries the offending file bytes in its args. A generic "source
+                # unavailable" here is what hid a TypeError for a whole adapter.
+                logger.debug("attach: memory management failed (%s: %s)", operation, type(error).__name__)
+                await client.send_memory_result(
+                    request_id, "unavailable",
+                    message=f"the memory request could not be completed ({type(error).__name__})",
+                )
+        finally:
+            if self._memory_busy == request_id: self._memory_busy = None
+
+    async def _dispatch_clarify_command(self, command: Dict[str, Any]) -> None:
+        thread_id = command.get("threadId")
+        turn_id = command.get("turnId")
+        clarify_id = command.get("clarifyId")
+        option_id = command.get("optionId")
+        if (all(isinstance(value, str) and value for value in (thread_id, turn_id, clarify_id, option_id))
+                and self._execution_thread_allowed(thread_id)):
+            await self._handle_clarify_command(thread_id, turn_id, clarify_id, option_id)
+
+    async def _handle_clarify_command(
+        self, thread_id: str, turn_id: str, clarify_id: str, option_id: str,
+    ) -> None:
+        # Resolve Hermes' actual blocking clarify primitive. Injecting the option id as ordinary
+        # chat text can be rejected as an invalid selection and can start/steer an unrelated turn.
+        # The pending map is established by send_clarify below and uses stable wire ids.
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify  # harness-defined identifier
+
+            choices = self._clarify_choices.get(clarify_id, {})
+            context = self._clarify_context.get(clarify_id)
+            answer = choices.get(option_id)
+            client = self._client
+            if not clarify_id or answer is None or context is None or not isinstance(client, AttachV1Client):
+                raise RuntimeError("clarification mapping is unavailable")
+            if not resolve_gateway_clarify(clarify_id, answer):
+                raise RuntimeError("Hermes no longer has the clarification pending")
+            prompt, options = context
+            if await client.send_clarify_resolved(
+                thread_id, turn_id, clarify_id, prompt, options, option_id,
+            ) is None:
+                raise RuntimeError("clarification confirmation could not be journaled")
+            self._clarify_choices.pop(clarify_id, None)
+            self._clarify_context.pop(clarify_id, None)
+        except Exception:  # noqa: BLE001
+            logger.debug("attach: clarify response injection raised", exc_info=True)
+            raise
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[List[Any]],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Project Hermes' blocking clarify callback into attach-v1 instead of plain chat text."""
+        del session_key, metadata
+        from gateway.platforms.base import SendResult  # harness-defined identifier
+
+        client = self._client
+        turn_id = self._active_turn.get(chat_id)
+        labels = [str(choice).strip()[:512] for choice in (choices or []) if str(choice).strip()]
+        if not isinstance(client, AttachV1Client) or not turn_id or not labels:
+            return SendResult(success=False, error="attach-v1 clarification requires an active turn and choices")
+        wire_options = [{"id": f"option-{index}", "label": label} for index, label in enumerate(labels[:20], start=1)]
+        self._clarify_choices[clarify_id] = {item["id"]: item["label"] for item in wire_options}
+        wire_prompt = str(question)[:4096]
+        self._clarify_context[clarify_id] = (wire_prompt, wire_options)
+        expires_at: Optional[int] = None
+        try:
+            from tools.clarify_gateway import get_clarify_timeout  # harness-defined identifier
+
+            expires_at = int((time.time() + float(get_clarify_timeout())) * 1000)
+        except Exception:
+            pass
+        queued = await client.send_clarify(
+            chat_id, turn_id, clarify_id, wire_prompt, wire_options, expires_at,
+        )
+        if queued is None:
+            self._clarify_choices.pop(clarify_id, None)
+            self._clarify_context.pop(clarify_id, None)
+            return SendResult(success=False, error="clarification turn is already terminal")
+        return SendResult(success=True, message_id=clarify_id)
+
+    def observe_approval_event(
+        self,
+        chat_id: str,
+        approval_id: str,
+        name: str,
+        status: str,
+        scope: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        loop = self._loop
+        if loop is None:
+            return
+        turn_id = self._active_turn.get(chat_id)
+        client = self._client
+        if not turn_id or not isinstance(client, AttachV1Client):
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                client.send_approval(
+                    chat_id, turn_id, approval_id, approval_id, name, status, scope=scope,
+                ),
+                loop,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("attach: approval lifecycle emit failed", exc_info=True)
+
+    # -- streaming drafts -----------------------------------------------------
+    def supports_draft_streaming(
+        self, chat_type: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """This platform renders a live draft preview for every chat type."""
+        return True
+
+    def streaming_overflow_limit(self) -> int:
+        """A large split budget so a long reply is never fragmented into many sends."""
+        return 1_000_000
+
+    async def send_draft(
+        self,
+        chat_id: str,
+        draft_id: int,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Emit one ephemeral ``draft`` for the full accumulated text.
+
+        The harness calls this per flush with the FULL text (not a delta). It must
+        stay ephemeral: a ``done`` here would fragment the reply (the terminal
+        commit is owned by ``send()``). A failure returns ``success=False`` so the
+        harness backs off cleanly; it never raises into the consumer.
+        """
+        from gateway.platforms.base import SendResult  # harness-defined identifier
+
+        if chat_id.startswith("__cozyapp__:"):
+            return SendResult(success=True)
+
+        turn_id = self._active_turn.get(chat_id)
+        if self._client is None or not turn_id:
+            # No live socket or no anchor yet: skip this frame without disabling
+            # the transport (success keeps drafts flowing).
+            return SendResult(success=True)
+        self._turn_text[turn_id] = content
+        blocks = self._normalize(turn_id, content)
+        chips = self._chips(turn_id)
+        if not blocks and not chips:
+            return SendResult(success=True)  # nothing materialized yet
+        self._content_seen[turn_id] = True
+        try:
+            await self._client.send_draft(chat_id, turn_id, blocks, tool_calls=chips)
+        except (AttachAuthError, AttachSupersededError) as exc:
+            return SendResult(success=False, error=str(exc))
+        except Exception as exc:  # noqa: BLE001 - degrade to a clean back-off
+            logger.debug("attach: send_draft failed", exc_info=True)
+            return SendResult(success=False, error=str(exc))
+        return SendResult(success=True)
+
+    # -- native streaming transport -------------------------------------------
+    def supports_native_streaming(
+        self, chat_type: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Whether this profile takes Hermes' ungated per-delta transport.
+
+        Off unless ``COZYGATEWAY_NATIVE_STREAMING`` says otherwise, and the reason
+        is the turn lifecycle rather than the cadence. On the native transport
+        Hermes owns delivery end to end: ``send()`` is never called for the
+        answer, and every finalize frame arrives here as the same
+        ``send_stream_frame(..., finalize=True)``. That includes the one
+        ``_finalize_boundary_stream`` sends BEFORE an approval or clarify prompt,
+        which this platform cannot tell apart from the turn-final one, and a
+        finalize here commits and seals the turn. Sealing a turn that is about to
+        ask a person a question is worse than a slow stream, so the default lane
+        stays the draft one, whose cadence the seeded ``streaming.edit_interval``
+        and ``streaming.buffer_threshold`` already bring down to the run loop's
+        own 0.05s tick.
+        """
+        return _env_flag("COZYGATEWAY_NATIVE_STREAMING", False)
+
+    async def send_stream_frame(
+        self,
+        text: str,
+        *,
+        finalize: bool = False,
+        chat_id: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        **_kwargs: Any,
+    ) -> bool:
+        """One native-stream frame, carrying the FULL text so far (not a delta).
+
+        An interim frame is the same ``draft`` the debounced path emits, so the
+        wire the app sees is unchanged: one ``bot_chat_delta`` per frame, just
+        more of them. A finalize frame is the turn's terminal delivery and goes
+        through ``send`` so the commit, the media, the receipts and the seal all
+        stay in the one place that has ever owned them.
+
+        Returns a bool because that is what the harness reads; False permanently
+        disables native streaming for the run and falls back to send/edit, so a
+        frame that merely has nowhere to go yet answers True.
+        """
+        if not chat_id or chat_id.startswith("__cozyapp__:"):
+            return True
+        if finalize:
+            # Hermes closes a contentless native stream with a bare placeholder
+            # ("✅"). Committing that would append a checkmark bubble no other
+            # transport produces; delivered as the empty reply it is, it takes
+            # `send`'s existing "no content ever materialized" seal instead.
+            active = self._active_turn.get(chat_id)
+            body = "" if text.strip() in _NATIVE_STREAM_PLACEHOLDERS else text
+            result = await self.send(
+                chat_id, body, reply_to=reply_to or turn_id or active,
+                metadata={"notify": True},
+            )
+            return bool(getattr(result, "success", False))
+        result = await self.send_draft(chat_id, 0, text)
+        return bool(getattr(result, "success", False))
+
+    # -- tool-chip tap --------------------------------------------------------
+    def observe_tool_event(
+        self,
+        chat_id: str,
+        phase: str,
+        tool_name: str,
+        detail: Optional[str],
+        call_id: Optional[str] = None,
+    ) -> None:
+        """Sync entry from the agent worker thread (the native tool hooks). Never raises.
+
+        Hops the fold and emit onto the adapter's event loop so all tracker and
+        draft work happens single-threaded. A missing loop degrades silently.
+        """
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._apply_tool_event(chat_id, str(phase), str(tool_name), detail, call_id),
+                loop,
+            )
+        except Exception:  # noqa: BLE001 - a dead loop must degrade silently
+            logger.debug("attach: observe_tool_event schedule failed", exc_info=True)
+
+    async def _apply_tool_event(
+        self,
+        chat_id: str,
+        phase: str,
+        tool_name: str,
+        detail: Optional[str],
+        call_id: Optional[str] = None,
+    ) -> None:
+        """Fold one tool event into this turn's tracker, then emit a draft."""
+        turn_id = self._active_turn.get(chat_id)
+        if not turn_id:
+            return
+        tracker = self._tool_chips.setdefault(turn_id, ToolChipTracker())
+        if phase == "start":
+            tracker.open(tool_name, detail, call_id=call_id)
+        else:
+            tracker.close(tool_name, ok=(phase != "error"), detail=detail, call_id=call_id)
+        self._content_seen[turn_id] = True
+        await self._emit_tool_draft(chat_id, turn_id)
+
+    async def _emit_tool_draft(self, chat_id: str, turn_id: str) -> None:
+        """Push one draft carrying the current text plus tool chips. Never raises."""
+        if self._client is None:
+            return
+        blocks = self._normalize(turn_id, self._turn_text.get(turn_id, ""))
+        chips = self._chips(turn_id)
+        if not blocks and not chips:
+            return
+        try:
+            await self._client.send_draft(chat_id, turn_id, blocks, tool_calls=chips)
+        except (AttachAuthError, AttachSupersededError):
+            return
+        except Exception:  # noqa: BLE001 - a chip is presentation-only
+            logger.debug("attach: tool-chip draft failed", exc_info=True)
+
+    # -- delegation-card tap ---------------------------------------------------
+    def observe_delegation_event(self, chat_id: str, payload: Dict[str, Any]) -> None:
+        """Sync entry from an agent/delegation worker thread (subagent lifecycle hooks).
+        Never raises.
+
+        Hops onto the adapter's event loop, exactly as ``observe_tool_event`` does, so the
+        turn pinning and the send happen single-threaded. A missing loop degrades silently.
+        """
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._apply_delegation_event(chat_id, dict(payload)), loop
+            )
+        except Exception:  # noqa: BLE001 - a dead loop must degrade silently
+            logger.debug("attach: observe_delegation_event schedule failed", exc_info=True)
+
+    async def _apply_delegation_event(self, chat_id: str, payload: Dict[str, Any]) -> None:
+        """Emit one ephemeral ``delegation`` event pinned to the turn that dispatched its batch.
+
+        The batch's turn is pinned at its FIRST event (the chat's active turn at dispatch): an
+        async ``delegate_task`` batch legitimately outlives its turn, so a finish leg arriving
+        after the seal still carries the original turn id and the gateway's post-seal
+        projection settles the right card. The spool exempts ``delegation`` events from the
+        turn's terminal seal for the same reason.
+        """
+        batch_id = str(payload.get("batch_id") or "")
+        child_id = str(payload.get("child_id") or "")
+        client = self._client
+        if not batch_id or not child_id or not isinstance(client, AttachV1Client):
+            return
+        turn_id = self._delegation_turns.get(batch_id) or self._active_turn.get(chat_id)
+        if not turn_id:
+            return
+        if batch_id not in self._delegation_turns:
+            self._delegation_turns[batch_id] = turn_id
+            while len(self._delegation_turns) > self._delegation_turns_max:
+                self._delegation_turns.popitem(last=False)
+        try:
+            await client.send_delegation(
+                chat_id,
+                turn_id,
+                batch_id,
+                child_id,
+                index=int(payload.get("index") or 0),
+                count=int(payload.get("count") or 1),
+                status=str(payload.get("status") or "unknown"),
+                label=payload.get("label"),
+                tool_count=payload.get("tool_count"),
+                last_active_at=payload.get("last_active_at"),
+                alias_id=payload.get("alias_id"),
+                cost_usd=payload.get("cost_usd"),
+                cost_status=payload.get("cost_status"),
+                schema_validation=payload.get("schema_validation"),
+                duration_ms=payload.get("duration_ms"),
+            )
+        except Exception:  # noqa: BLE001 - a card is presentation-only
+            logger.debug("attach: delegation event emit failed", exc_info=True)
+
+    # -- live thinking tap -----------------------------------------------------
+    def observe_reasoning_delta(self, delta: str) -> None:
+        """Sync entry from Hermes' plugin-stream worker thread (``on_stream_delta``).
+        Never raises.
+
+        Hops onto the adapter's event loop, exactly as ``observe_tool_event`` does, so the
+        routing, coalescing, and send happen single-threaded. A missing loop degrades silently.
+        """
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._apply_reasoning_delta(delta), loop)
+        except Exception:  # noqa: BLE001 - a dead loop must degrade silently
+            logger.debug("attach: observe_reasoning_delta schedule failed", exc_info=True)
+
+    async def _apply_reasoning_delta(self, delta: str) -> None:
+        """Fold one raw reasoning delta into the active turn's rolling preview.
+
+        ponytail: the stream-hook payload carries no chat id and its worker thread has no
+        session context, so the delta routes to the SOLE active turn; with two chats live at
+        once the preview is dropped whole (never misrouted -- the reply itself is untouched).
+        Ceiling: concurrent-chat turns show no thinking preview. Upgrade path: chat context on
+        Hermes' stream-hook payload (proposed upstream), or a hermes-session -> chat map.
+        """
+        if len(self._active_turn) != 1:
+            return
+        ((chat_id, turn_id),) = self._active_turn.items()
+        state = self._thinking.setdefault(turn_id, _ThinkingState())
+        state.buffer = (state.buffer + delta)[-_THINKING_BUFFER_MAX_CHARS:]
+        if state.task is not None and not state.task.done():
+            return  # an emit is already scheduled; it reads the buffer when it fires
+        delay = max(0.0, THINKING_COALESCE_SECONDS - (time.monotonic() - state.last_emit))
+        state.task = asyncio.get_running_loop().create_task(
+            self._emit_thinking_after(chat_id, turn_id, delay)
+        )
+
+    async def _emit_thinking_after(self, chat_id: str, turn_id: str, delay: float) -> None:
+        """Emit one coalesced preview after ``delay``: at most one send per coalesce window,
+        each carrying the full sanitized tail (latest-only on the wire). Never raises."""
+        try:
+            if delay > 0:
+                await self._thinking_sleep(delay)
+            state = self._thinking.get(turn_id)
+            if state is None:
+                return
+            state.last_emit = time.monotonic()
+            client = self._client
+            # The seal is the hard stop: a delta scheduled before the terminal but firing
+            # after it finds the turn gone and emits nothing (the spool seal backstops this).
+            if client is None or self._active_turn.get(chat_id) != turn_id:
+                return
+            text = _sanitize_thinking(state.buffer)
+            if not text or text == state.last_text:
+                return
+            state.seq += 1
+            state.last_text = text
+            await client.send_thinking(
+                chat_id, turn_id, text,
+                seq=state.seq, last_active_at=int(time.time() * 1000),
+            )
+        except Exception:  # noqa: BLE001 - a preview is presentation-only
+            logger.debug("attach: thinking emit failed", exc_info=True)
+
+    def _chips(self, turn_id: str) -> Optional[List[Any]]:
+        tracker = self._tool_chips.get(turn_id)
+        chips = tracker.chips() if tracker else []
+        return chips or None
+
+    def _consume_transcript_echo(self, turn_id: str, content: str) -> bool:
+        """True for Hermes's echo of a voice-note transcript, which is then not a message.
+
+        Hermes transcribes an inbound voice note with its own STT and, by default
+        (``stt_echo_transcripts``), echoes each transcript to the chat as ``🎙️ "…"`` through this
+        surface with no reply anchor and no ``notify`` mark, so it would commit as an extra bot
+        message. The phone already shows the voice note it sent, and Hermes already hands the
+        transcript to the model. Only that exact form is dropped, and at most once per voice note
+        the turn carried; the same text on any other turn is an ordinary interim reply.
+        """
+        owed = self._voice_note_echoes.get(turn_id, 0)
+        if owed <= 0 or not _TRANSCRIPT_ECHO.fullmatch(content or ""):
+            return False
+        self._voice_note_echoes[turn_id] = owed - 1
+        return True
+
+    def _caller_active_turn(self, chat_id: str) -> Optional[str]:
+        """The in-flight turn on ``chat_id`` -- only when the caller belongs to it.
+
+        A scheduled/proactive send (a cron report, any caller with no turn
+        affiliation) must never ride an in-flight turn it does not own; it takes the
+        session-independent scheduled path exactly as it would with no turn active.
+        See ``_caller_owns_active_turn``.
+        """
+        turn_id = self._active_turn.get(chat_id)
+        if turn_id and not _caller_owns_active_turn(turn_id):
+            return None
+        return turn_id
+
+    # -- terminal reply -------------------------------------------------------
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Deliver one reply of a turn: a full draft, then ``done``.
+
+        The gateway commits the latest draft as a durable message. That commit also SEALS the
+        turn, unless this is a reply the agent produced part-way through its run, in which case
+        it is marked ``continues`` and the turn keeps running (see ``_hermes_final_delivery``).
+        An empty terminal reply with no prior visible content sends ``failed`` instead. Any
+        exception on the path sends a best-effort ``failed``; per-message state is dropped in
+        ``finally``, so the next reply of the same turn starts from a clean draft.
+        """
+        from gateway.platforms.base import SendResult  # harness-defined identifier
+
+        if chat_id.startswith("__cozyapp__:"):
+            return SendResult(success=True)
+
+        client = self._client
+        active_turn = self._caller_active_turn(chat_id)
+        turn_id = reply_to or active_turn
+        # An interim reply commits its message and leaves the turn running. See
+        # ``_hermes_final_delivery`` for how the two are told apart.
+        continues = bool(
+            active_turn
+            and turn_id == active_turn
+            and not _hermes_final_delivery(reply_to, active_turn, metadata)
+        )
+        if client is None:
+            return SendResult(success=False, error="attach not connected")
+        if continues and self._consume_transcript_echo(turn_id, content):
+            return SendResult(success=True)
+        if isinstance(metadata, dict) and metadata.get("_interim_send") and active_turn:
+            # Hermes emits error/status notices through the ordinary platform
+            # send surface while the agent keeps working. Render the latest
+            # notice into the mutable draft, but never seal or clean up the
+            # turn; the final reply below remains the sole owner of ``done``.
+            base_text = self._turn_text.get(active_turn, "")
+            notice = content.strip() if content else ""
+            draft_text = "\n\n".join(part for part in (base_text, notice) if part)
+            blocks = self._normalize(active_turn, draft_text)
+            chips = self._chips(active_turn)
+            if blocks or chips:
+                self._content_seen[active_turn] = True
+                try:
+                    await client.send_draft(chat_id, active_turn, blocks, tool_calls=chips)
+                except (AttachAuthError, AttachSupersededError) as exc:
+                    return SendResult(success=False, error=str(exc))
+                except Exception as exc:  # noqa: BLE001 - status is best-effort
+                    logger.debug("attach: interim draft failed", exc_info=True)
+                    return SendResult(success=False, error=str(exc))
+            return SendResult(success=True)
+        if not turn_id:
+            # Hermes' cron "live adapter delivery" calls this surface with no in-flight
+            # turn and a placeholder chat id. A thread-scoped scheduled event is only
+            # accepted for the gateway's CURRENT native session, so an unpinned target
+            # must ride the session-independent canonical-home form instead; otherwise
+            # the placeholder (or a stale thread) is quarantined as unauthorized_target.
+            metadata_thread = metadata.get("thread_id") if isinstance(metadata, dict) else None
+            pinned_thread = str(metadata_thread or "").strip()
+            canonical_home = not pinned_thread
+            target_thread = pinned_thread or str(chat_id or "").strip()
+            blocks = normalize_text_to_blocks(content)
+            if not isinstance(client, AttachV1Client) or not blocks:
+                return SendResult(success=False, error="no in-flight turn")
+            if not canonical_home and not target_thread:
+                return SendResult(success=False, error="no in-flight turn")
+            delivery_key = ""
+            try:
+                from gateway.session_context import get_session_env  # harness-defined identifier
+
+                delivery_key = str(
+                    get_session_env("HERMES_SESSION_ID")
+                    or get_session_env("HERMES_SESSION_KEY")
+                    or ""
+                ).strip()
+            except Exception:
+                pass
+            if not delivery_key:
+                delivery_key = hashlib.sha256(
+                    f"{chat_id}\0{target_thread}\0{content}".encode("utf-8")
+                ).hexdigest()
+            delivery_id = "scheduled:" + delivery_key
+            message_id = "scheduled-" + hashlib.sha256(
+                delivery_id.encode("utf-8")
+            ).hexdigest()[:32]
+            frame = await client.send_scheduled(
+                target_thread or None,
+                delivery_id,
+                message_id,
+                blocks,
+                canonical_home=canonical_home,
+            )
+            if frame is None:
+                return SendResult(success=False, error="scheduled delivery unavailable")
+            # Journaled and durable. Projection is asynchronous (spec finding 4): a
+            # receipt arriving later upgrades the durable row, and ``delivery_state``
+            # answers "did it land". Blocking the caller here only ever taught a slow
+            # projection to look like a failure.
+            receipt = _durable_receipt(self._spool, delivery_id)
+            if receipt == "blocked":
+                return SendResult(success=False, error="scheduled delivery blocked")
+            if receipt == "failed":
+                return SendResult(success=False, error="scheduled delivery failed")
+            result = SendResult(success=True, message_id=message_id)
+            if receipt != "projected":
+                # Accepted-pending, exactly as the proactive-media path reports it.
+                # Hermes core reads any non-network false result as a FORMATTING
+                # failure and posts a second plain-text copy of the same reply, so a
+                # durable acceptance returned as false duplicated a message that was
+                # about to be displayed (incident 2026-08-24). Acceptance is what this
+                # surface can honestly report; the lifecycle stays in the spool rows
+                # and ``delivery_state``, which only move on a receipt.
+                _decorate_send_result(
+                    result,
+                    "delivery_lifecycle",
+                    {
+                        "state": "journaled",
+                        "accepted_pending": True,
+                        "deliveryId": delivery_id,
+                        "messageId": message_id,
+                    },
+                )
+            return result
+        keep_active = continues
+        try:
+            # The authoritative terminal text, or the last streamed buffer when the
+            # terminal content is empty or whitespace (a draft-only turn).
+            final_text = content if (content and content.strip()) else self._turn_text.get(
+                turn_id, ""
+            )
+            chips = self._chips(turn_id)
+            media_ids: List[str] = []
+            media_positions: Optional[List[int]] = None
+            uploaded_paths: List[str] = []
+            media_result: Optional[Dict[str, Any]] = None
+            service: Optional[MediaUploadService] = None
+            raw_media: List[Any] = list(self._turn_media.get(turn_id, []))
+            if isinstance(metadata, dict):
+                metadata_media = metadata.get("media_files") or metadata.get("media") or []
+                if isinstance(metadata_media, (list, tuple)):
+                    raw_media.extend(metadata_media)
+            if isinstance(client, AttachV1Client):
+                paths = list(dict.fromkeys(path for path in raw_media if isinstance(path, str) and path))
+                service = MediaUploadService(
+                    client,
+                    delivery_id=TURN_DELIVERY_PREFIX + turn_id,
+                    destination=MediaDestination("active_turn", chat_id),
+                    spool=self._spool,
+                )
+                sendable = paths[:16]
+                batch = await service.upload(
+                    sendable, self._staged_positions(turn_id, sendable)
+                )
+                media_ids = batch.media_ids
+                media_positions = batch.media_positions
+                uploaded_paths = [str(entry["source"]) for entry in batch.uploaded]
+                if batch.failed:
+                    # The text still commits, but it says so. Committing a reply that
+                    # silently lost its central artifact is the failure mode spec
+                    # finding 2 was written about.
+                    for line in batch.error_lines:
+                        logger.warning(
+                            "attach: one reply media upload failed (%s); committing the remaining reply",
+                            line,
+                        )
+                    sentence = batch.failure_sentence()
+                    final_text = "\n\n".join(
+                        part for part in (final_text.strip(), sentence) if part
+                    )
+                    media_result = batch.partial_result(turn_id)
+            blocks = self._normalize(turn_id, final_text)
+            if media_positions is not None and not self._positions_still_true(turn_id, blocks):
+                # The delivered text is not the draft the positions were measured
+                # against. Ship the attachments the way they have always shipped.
+                media_positions = None
+            had_content = self._content_seen.get(turn_id, False)
+            if blocks or chips or media_ids:
+                # Full replace with the reply's view, then commit it. The commit seals the turn
+                # unless this is an interim reply, which only projects its message.
+                await client.send_draft(chat_id, turn_id, blocks, tool_calls=chips)
+                if isinstance(client, AttachV1Client):
+                    await client.send_done(
+                        chat_id, turn_id, media_ids=media_ids,
+                        media_positions=media_positions, continues=continues,
+                    )
+                else:
+                    # attach-v0 has no additive field to say "keep the turn open", so it keeps
+                    # its historic terminal meaning rather than being quietly misreported.
+                    await client.send_done(chat_id, turn_id)
+            elif had_content:
+                # Nothing new to draw, but earlier drafts carried content: commit the
+                # latest good draft. Do not send an empty draft (it would wipe it).
+                if isinstance(client, AttachV1Client):
+                    await client.send_done(
+                        chat_id, turn_id, media_ids=media_ids,
+                        media_positions=media_positions, continues=continues,
+                    )
+                else:
+                    await client.send_done(chat_id, turn_id)
+            elif continues:
+                # An interim reply with nothing in it is a no-op, not a failed turn: the agent
+                # is still working and owns the terminal outcome.
+                return SendResult(success=True)
+            else:
+                # No content ever materialized for this turn.
+                await client.send_failed(chat_id, turn_id, "empty reply")
+                return SendResult(success=True)
+            if service is not None and media_ids:
+                # A turn walks journaled -> displayed with nothing in between. `projected` is a
+                # state the wire has no receipt for on this path: the gateway commits a turn from
+                # the same frame that seals it, so there is no separate projection signal to
+                # report. The next honest fact about these attachments is a phone saying it drew
+                # them, which arrives as a delivery_receipt keyed by this same delivery id.
+                service.mark_journaled(media_ids)
+            for uploaded_path in uploaded_paths:
+                self._remember_absorbed_media(uploaded_path)
+        except (AttachAuthError, AttachSupersededError) as exc:
+            return SendResult(success=False, error=str(exc))
+        except Exception as exc:  # noqa: BLE001 - best-effort failed on the way out
+            # `failed` seals the turn, interim or not, so the anchor goes with it.
+            keep_active = False
+            await self._safe_failed(chat_id, turn_id, "turn error")
+            return SendResult(success=False, error=str(exc))
+        finally:
+            if not keep_active:
+                # Every path that reaches here with the turn closed has put a terminal on the
+                # wire (a commit, or the failed one of the two error paths above).
+                self._mark_sealed(chat_id, turn_id)
+            self._cleanup_turn(chat_id, turn_id, keep_active=keep_active)
+        result = SendResult(success=True, message_id=turn_id)
+        if media_result is not None:
+            _decorate_send_result(result, "media_result", media_result)
+        return result
+
+    async def send_or_update_status(
+        self,
+        chat_id: str,
+        status_key: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Render Hermes lifecycle status into the mutable draft, never as a terminal reply."""
+        del status_key
+        interim_metadata = dict(metadata or {})
+        interim_metadata["_interim_send"] = True
+        return await self.send(chat_id, content, metadata=interim_metadata)
+
+    async def media_delivery_receipt(
+        self, delivery_id: str, timeout_seconds: float = 0.5
+    ) -> Optional[Dict[str, Any]]:
+        """Read one media delivery receipt through this adapter's live transport.
+
+        Tool handlers must never reach into a client directly: the adapter owns both
+        the socket readiness boundary and the bounded HTTP reader.  A missing or
+        temporarily unwritable client is indistinguishable from no new gateway fact.
+        Local durable rows remain the fallback in that case.
+        """
+        client, loop = self._client, self._loop
+        if not isinstance(client, AttachV1Client) or not self._ready.is_set():
+            return None
+        timeout = max(0.05, min(float(timeout_seconds), 1.0))
+        pending = None
+        try:
+            if loop is None or asyncio.get_running_loop() is loop:
+                return await client.delivery_receipt(delivery_id, timeout)
+            if loop.is_closed():
+                return None
+            pending = asyncio.run_coroutine_threadsafe(
+                client.delivery_receipt(delivery_id, timeout), loop
+            )
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            if pending is not None:
+                pending.cancel()
+            raise
+        except Exception:  # noqa: BLE001 - status must not invent a failure from a read error
+            logger.debug("attach: media delivery receipt read failed", exc_info=True)
+            return None
+
+    async def media_delivery_status_snapshot(
+        self, delivery_id: str, timeout_seconds: float = 0.5
+    ) -> Dict[str, Any]:
+        """Read remote and local receipt facts on the spool-owning event loop."""
+        loop = self._loop
+        if loop is None or asyncio.get_running_loop() is loop:
+            return await self._media_delivery_status_snapshot_on_owner_loop(
+                delivery_id, timeout_seconds
+            )
+        if loop.is_closed():
+            return {"receipt": None, "rows": [], "localReceipt": None}
+        pending = asyncio.run_coroutine_threadsafe(
+            self._media_delivery_status_snapshot_on_owner_loop(delivery_id, timeout_seconds),
+            loop,
+        )
+        try:
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            pending.cancel()
+            raise
+
+    async def _media_delivery_status_snapshot_on_owner_loop(
+        self, delivery_id: str, timeout_seconds: float
+    ) -> Dict[str, Any]:
+        receipt = await self.media_delivery_receipt(delivery_id, timeout_seconds)
+        rows = _safe_media_rows(self._spool, delivery_id)
+        local_receipt = None
+        if self._spool is not None:
+            try:
+                local_receipt = self._spool.delivery_receipt_row(delivery_id)
+            except Exception:  # noqa: BLE001 - remote receipt remains usable
+                logger.debug("attach: local delivery receipt read failed", exc_info=True)
+        return {"receipt": receipt, "rows": rows, "localReceipt": local_receipt}
+
+    async def send_proactive(
+        self,
+        chat_id: str,
+        message: str,
+        media_files: List[str],
+        *,
+        canonical_home: bool,
+        delivery_key: str,
+        media_positions: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """Commit one tool-originated delivery through the resident writable socket.
+
+        ``media_positions``, when given, is aligned index-for-index with ``media_files``
+        and says which block each attachment renders before.
+
+        Hermes tool handlers run on their own event loop.  The resident attach client,
+        its asyncio locks, and its SQLite spool belong to the adapter loop that opened
+        them, so cross that boundary before probing or uploading any bytes.  Crossing
+        halfway through leaves a successfully uploaded object without a journal row.
+        """
+        loop = self._loop
+        if loop is None or asyncio.get_running_loop() is loop:
+            return await self._send_proactive_on_owner_loop(
+                chat_id,
+                message,
+                media_files,
+                canonical_home=canonical_home,
+                delivery_key=delivery_key,
+                media_positions=media_positions,
+            )
+        if loop.is_closed():
+            return _proactive_failure("attach_not_writable")
+        pending = asyncio.run_coroutine_threadsafe(
+            self._send_proactive_on_owner_loop(
+                chat_id,
+                message,
+                media_files,
+                canonical_home=canonical_home,
+                delivery_key=delivery_key,
+                media_positions=media_positions,
+            ),
+            loop,
+        )
+        try:
+            return await asyncio.wrap_future(pending)
+        except asyncio.CancelledError:
+            pending.cancel()
+            raise
+
+    async def _send_proactive_on_owner_loop(
+        self,
+        chat_id: str,
+        message: str,
+        media_files: List[str],
+        *,
+        canonical_home: bool,
+        delivery_key: str,
+        media_positions: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """Run one proactive occurrence on the loop that owns client and spool."""
+        client = self._client
+        if not isinstance(client, AttachV1Client) or not self._ready.is_set():
+            return _proactive_failure("attach_not_writable")
+        delivery_id, message_id = _proactive_identity(delivery_key)
+        if len(media_files) > 16:
+            return _proactive_failure("media_count_exceeded", delivery_id, message_id)
+        service = MediaUploadService(
+            client,
+            delivery_id=delivery_id,
+            destination=MediaDestination(
+                "canonical_home" if canonical_home else "thread", chat_id
+            ),
+            spool=self._spool,
+        )
+        sendable = list(media_files[:16])
+        batch = await service.upload(
+            sendable,
+            list(media_positions[:16]) if media_positions is not None else None,
+        )
+        media_ids = batch.media_ids
+        if batch.failed:
+            await client.rollback_uploaded_media(media_ids)
+            service.mark_blocked(media_ids, "atomic occurrence abandoned before journal")
+            return _proactive_failure(
+                "media_upload_failed", delivery_id, message_id, batch.error_lines
+            )
+        blocks = normalize_text_to_blocks(message)
+        if not blocks and not media_ids:
+            return _proactive_failure("empty_delivery", delivery_id, message_id)
+        frame = await client.send_scheduled(
+            chat_id,
+            delivery_id,
+            message_id,
+            blocks,
+            media_ids,
+            canonical_home=canonical_home,
+            media_positions=batch.media_positions,
+        )
+        if frame is None:
+            return _proactive_failure("scheduled_delivery_unavailable", delivery_id, message_id)
+        service.mark_journaled(media_ids)
+        result: Dict[str, Any] = {
+            "state": "journaled",
+            "accepted_pending": True,
+            "deliveryId": delivery_id,
+            "messageId": message_id,
+            "eventId": frame["eventId"],
+            "attachments": batch.attachment_descriptors(),
+        }
+        # Projection is asynchronous and durable (spec finding 4). The delivery is
+        # accepted and pending; the receipts machinery upgrades the rows when the
+        # gateway answers, and a timeout is never reinterpreted as a failure.
+        receipt = _durable_receipt(self._spool, delivery_id)
+        if receipt == "projected":
+            result["state"] = "projected"
+            result["accepted_pending"] = False
+        elif receipt in {"blocked", "failed"}:
+            # A terminal rejection that already landed is not an acceptance. Say so
+            # here, or the caller reads "journaled" and reports a success the person
+            # will never see.
+            result["state"] = receipt
+            result["accepted_pending"] = False
+        return result
+
+    def _dispatch_session_key(self, source: Any) -> Optional[str]:
+        """The session key Hermes itself will resolve for a turn injected on ``source``.
+
+        The adapter seam is the derivation to follow, because it is the one that reads the same
+        order Hermes uses at dispatch in BOTH topologies: an explicit route on the source, then
+        this adapter's owner profile (set only on a multiplexed gateway), then the session store's
+        resolver. On a single-profile install that yields the shared ``agent:main`` lane; on a
+        multiplexed one it yields ``agent:<owner profile>``, which is also what the runner derives
+        there because the profile message handler stamps the source before it. Recording a binding
+        off the raw runner call instead would put it on the wrong lane in the multiplexed case and
+        move the very drop this fix removed.
+
+        Falls back to the runner seam when the harness exposes no adapter seam (older Hermes, unit
+        fakes), and returns None when neither is reachable.
+        """
+        derive_event_key = getattr(self, "_event_session_key", None)
+        if callable(derive_event_key):
+            try:
+                from gateway.platforms.base import MessageEvent  # harness-defined identifier
+
+                key = derive_event_key(MessageEvent(text="", source=source))
+                if isinstance(key, str) and key:
+                    return key
+            except Exception:  # noqa: BLE001 - fall through to the runner seam
+                logger.debug("attach: adapter session key derivation unavailable", exc_info=True)
+        derive_source_key = getattr(getattr(self, "gateway_runner", None), "_session_key_for_source", None)
+        if callable(derive_source_key):
+            try:
+                key = derive_source_key(source)
+                if isinstance(key, str) and key:
+                    return key
+            except Exception:  # noqa: BLE001 - nothing left to derive with
+                logger.debug("attach: runner session key derivation unavailable", exc_info=True)
+        return None
+
+    async def _binding_dispatchable(self, binding: Tuple[str, str], event: Any) -> bool:
+        """True when Hermes will still accept ``event`` against its strict binding.
+
+        Both of Hermes' strict checks return silently on a mismatch, which leaves the gateway
+        holding a running turn nobody will ever answer. So run them here first, on the frame that
+        is about to be dispatched: the adapter seam's key must equal the bound key, and the bound
+        key must still resolve to the pinned session (a ``/new``, a compaction retip or an
+        eviction moves it). Only a proven mismatch refuses the turn; an unreachable seam or a
+        raising lookup leaves the turn exactly as it was before this check existed.
+        """
+        session_key, pinned = binding
+        derive_event_key = getattr(self, "_event_session_key", None)
+        if callable(derive_event_key):
+            try:
+                derived = derive_event_key(event)
+            except Exception:  # noqa: BLE001 - an underivable key is not proof of a stale binding
+                logger.debug("attach: could not derive the adapter session key", exc_info=True)
+                derived = None
+            if isinstance(derived, str) and derived and derived != session_key:
+                logger.warning("attach: bound session key is not the one this adapter derives")
+                return False
+        lookup = getattr(getattr(getattr(self, "gateway_runner", None), "async_session_store", None),
+                         "lookup_by_session_key", None)
+        if not callable(lookup):
+            return True
+        try:
+            entry = await lookup(session_key)
+        except Exception:  # noqa: BLE001 - an unanswerable store is not proof of a stale binding
+            logger.debug("attach: could not resolve the bound session key", exc_info=True)
+            return True
+        if entry is None or getattr(entry, "session_id", None) != pinned:
+            logger.warning("attach: pinned session for the bound key is no longer the current one")
+            return False
+        return True
+
+    async def _safe_failed(
+        self, chat_id: str, turn_id: str, message: Optional[str] = None, *,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Emit a ``failed`` frame, swallowing any error (best-effort teardown).
+
+        ``reason`` is the capability 69 refusal vocabulary; the client drops it again unless the
+        gateway advertised that capability, and a transport that predates the argument entirely
+        never sees it.
+        """
+        client = self._client
+        if client is None:
+            return
+        try:
+            if reason is not None and self._accepts_reason(client.send_failed):
+                await client.send_failed(chat_id, turn_id, message, reason=reason)
+            else:
+                await client.send_failed(chat_id, turn_id, message)
+        except Exception:  # noqa: BLE001 - already failing; nothing more to do
+            logger.debug("attach: failed frame emit failed", exc_info=True)
+            return
+        self._mark_sealed(chat_id, turn_id)
+
+    @staticmethod
+    def _accepts_reason(send_failed: Any) -> bool:
+        """True when this transport's ``send_failed`` takes the capability 69 ``reason``."""
+        try:
+            return "reason" in inspect.signature(send_failed).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def _active_turn_ids(self) -> List[str]:
+        """The turn ids this process still carries, for the hello declaration (capability 69)."""
+        return list(dict.fromkeys(self._active_turn.values()))
+
+    def _mark_sealed(self, chat_id: str, turn_id: str) -> None:
+        """Record that a terminal frame for this turn actually went out from this process."""
+        key = (chat_id, turn_id)
+        self._sealed_turns.pop(key, None)
+        self._sealed_turns[key] = None
+        while len(self._sealed_turns) > self._seen_turns_max:
+            self._sealed_turns.popitem(last=False)
+
+    def _cleanup_turn(self, chat_id: str, turn_id: str, keep_active: bool = False) -> None:
+        """Drop the per-MESSAGE state a reply leaves behind, and by default the turn with it.
+
+        ``keep_active`` is for an interim reply: its message is complete, so the draft buffer,
+        chips and staged media go, but the turn is still running and the thread's reply anchor
+        must survive. Without it the drafts and tool chips the agent produces for the REST of the
+        run find no active turn and are dropped on the floor.
+        """
+        self._turn_text.pop(turn_id, None)
+        self._turn_media.pop(turn_id, None)
+        self._turn_media_positions.pop(turn_id, None)
+        self._tool_chips.pop(turn_id, None)
+        self._normalizers.pop(turn_id, None)
+        self._content_seen.pop(turn_id, None)
+        if not keep_active:
+            self._voice_note_echoes.pop(turn_id, None)
+            # NOT on the interim path: resetting mid-turn would restart the preview ``seq``
+            # at 1, which the gateway rightly drops as stale for the rest of the turn.
+            self._thinking.pop(turn_id, None)
+        if not keep_active and self._active_turn.get(chat_id) == turn_id:
+            self._active_turn.pop(chat_id, None)
+        if not keep_active:
+            self._settle_mirror(chat_id, turn_id)
+
+    async def _proactive_media_send(
+        self,
+        chat_id: str,
+        path: str,
+        caption: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Any:
+        """Deliver one standalone file that no in-flight turn owns.
+
+        Hermes calls the per-media surfaces outside a turn too (a scheduled report, a
+        resend of an earlier attachment). The base adapter has no attach transport and
+        reports "native ... send unavailable", so route through the same proactive
+        upload/commit machinery the tool path uses. Without a caller-pinned thread the
+        delivery is session independent (canonical home), because a thread-scoped
+        scheduled event is only accepted for the gateway's current native session.
+        """
+        from gateway.platforms.base import SendResult  # harness-defined identifier
+
+        metadata_thread = metadata.get("thread_id") if isinstance(metadata, dict) else None
+        pinned_thread = str(metadata_thread or "").strip()
+        canonical_home = not pinned_thread
+        target_thread = pinned_thread or str(chat_id or "").strip()
+        if not canonical_home and not target_thread:
+            return SendResult(success=False, error="no delivery target")
+        text = caption or ""
+        # Idempotent per file plus occurrence, exactly as the send_message tool path is:
+        # a retry of the same occurrence must not double-post the attachment.
+        delivery_key = "media:" + hashlib.sha256(
+            "\0".join(
+                [
+                    _occurrence_key(),
+                    PLATFORM_NAME,
+                    target_thread,
+                    "canonical_home" if canonical_home else "thread",
+                    self._media_key(path),
+                    text,
+                ]
+            ).encode("utf-8")
+        ).hexdigest()
+        if self._ready.is_set() and isinstance(self._client, AttachV1Client):
+            result = await self.send_proactive(
+                target_thread,
+                text,
+                [path],
+                canonical_home=canonical_home,
+                delivery_key=delivery_key,
+            )
+        else:
+            result = await enqueue_proactive_delivery(
+                getattr(self, "_pconfig", None),
+                thread_id=target_thread,
+                delivery_key=delivery_key,
+                message=text,
+                media_files=[path],
+                canonical_home=canonical_home,
+            )
+        state = result.get("state")
+        media_errors = result.get("media_errors") or []
+        if state in {"projected", "displayed"}:
+            self._remember_absorbed_media(path)
+            return SendResult(success=True, message_id=result.get("messageId"))
+        if state == "suppressed":
+            return SendResult(success=True)
+        if result.get("accepted_pending") and not media_errors:
+            # Durably journaled with every attachment uploaded. This is Hermes' own
+            # media surface, where a False result makes it emit "native ... send
+            # unavailable" and try again; that would fire on every healthy delivery
+            # now that projection is asynchronous. The truthful lifecycle lives in the
+            # media_lifecycle rows and delivery_state(), which stay at "journaled"
+            # until a receipt says otherwise: this is an acceptance, not a receipt.
+            self._remember_absorbed_media(path)
+            pending = SendResult(success=True, message_id=result.get("messageId"))
+            _decorate_send_result(pending, "delivery_lifecycle", dict(result))
+            return pending
+        if state == "blocked":
+            error = "scheduled media delivery blocked"
+        elif state == "failed":
+            error = str(result.get("error") or "scheduled media delivery failed")
+        else:
+            error = "scheduled media delivery journaled; projection not yet confirmed"
+        if media_errors:
+            detail = "; ".join(str(entry) for entry in media_errors)[:512]
+            error = f"{error} ({detail})"
+        return SendResult(success=False, error=error)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Acknowledge video already committed atomically by ``send``, else deliver it."""
+        if self._consume_absorbed_media(video_path):
+            from gateway.platforms.base import SendResult  # harness-defined identifier
+
+            return SendResult(success=True)
+        turn_id = self._caller_active_turn(chat_id)
+        if turn_id and video_path in self._turn_media.get(turn_id, []):
+            result = await self.send(chat_id, caption or "", reply_to=turn_id, metadata=metadata)
+            if getattr(result, "success", False):
+                self._consume_absorbed_media(video_path)
+            return result
+        return await self._proactive_media_send(chat_id, video_path, caption, metadata)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Acknowledge a document already committed atomically by ``send``, else deliver it."""
+        if self._consume_absorbed_media(file_path):
+            from gateway.platforms.base import SendResult  # harness-defined identifier
+
+            return SendResult(success=True)
+        turn_id = self._caller_active_turn(chat_id)
+        if turn_id and file_path in self._turn_media.get(turn_id, []):
+            result = await self.send(chat_id, caption or "", reply_to=turn_id, metadata=metadata)
+            if getattr(result, "success", False):
+                self._consume_absorbed_media(file_path)
+            return result
+        return await self._proactive_media_send(chat_id, file_path, caption, metadata)
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Acknowledge audio already committed atomically by ``send``, else deliver it."""
+        if self._consume_absorbed_media(audio_path):
+            from gateway.platforms.base import SendResult  # harness-defined identifier
+
+            return SendResult(success=True)
+        turn_id = self._caller_active_turn(chat_id)
+        if turn_id and audio_path in self._turn_media.get(turn_id, []):
+            result = await self.send(chat_id, caption or "", reply_to=turn_id, metadata=metadata)
+            if getattr(result, "success", False):
+                self._consume_absorbed_media(audio_path)
+            return result
+        return await self._proactive_media_send(chat_id, audio_path, caption, metadata)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Acknowledge a local image already committed atomically by ``send``, else deliver it."""
+        if self._consume_absorbed_media(image_path):
+            from gateway.platforms.base import SendResult  # harness-defined identifier
+
+            return SendResult(success=True)
+        turn_id = self._caller_active_turn(chat_id)
+        if turn_id and image_path in self._turn_media.get(turn_id, []):
+            result = await self.send(chat_id, caption or "", reply_to=turn_id, metadata=metadata)
+            if getattr(result, "success", False):
+                self._consume_absorbed_media(image_path)
+            return result
+        return await self._proactive_media_send(chat_id, image_path, caption, metadata)
+
+    # -- no-op surfaces the protocol does not model ---------------------------
+    async def send_typing(self, chat_id: str, metadata: Any = None) -> None:
+        """The attach protocol has no typing indicator; a no-op that cannot fail."""
+        return None
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """The attach protocol has no typing indicator; a no-op that cannot fail."""
+        return None
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        # A thread renders as a dm-shaped surface keyed by its id.
+        return {"name": chat_id, "type": "dm", "chat_id": chat_id}
+
+    def format_message(self, content: str) -> str:
+        # Normalization happens in text_blocks; deliver content unchanged.
+        return content
+
+
+# ---------------------------------------------------------------------------
+# Native tool-lifecycle hook wiring.
+#
+# The harness exposes process-global pre_tool_call / post_tool_call hooks. They do
+# not carry a chat id, but the harness binds the per-turn (platform, chat_id) into
+# task-local session context and propagates it into the tool worker thread, so a
+# hook recovers the same thread id the turn was injected under. The hooks route to
+# every active adapter via the registry below; each adapter is enrolled at connect
+# and withdrawn at disconnect.
+# ---------------------------------------------------------------------------
+
+_ACTIVE_ADAPTERS: "Set[Any]" = set()
+_ACTIVE_ADAPTERS_LOCK = threading.Lock()
+_CURRENT_TOOL_OCCURRENCE: ContextVar[Optional[str]] = ContextVar(
+    "cozygateway_tool_occurrence", default=None
+)
+
+
+def _register_active_adapter(adapter: Any) -> None:
+    with _ACTIVE_ADAPTERS_LOCK:
+        _ACTIVE_ADAPTERS.add(adapter)
+
+
+def _unregister_active_adapter(adapter: Any) -> None:
+    with _ACTIVE_ADAPTERS_LOCK:
+        _ACTIVE_ADAPTERS.discard(adapter)
+
+
+def _active_adapters_snapshot() -> List[Any]:
+    with _ACTIVE_ADAPTERS_LOCK:
+        return list(_ACTIVE_ADAPTERS)
+
+
+def _current_turn_platform_and_chat() -> Tuple[Optional[str], Optional[str]]:
+    """Read (platform, chat_id) for the current turn from the harness session context.
+
+    Imported lazily so this module stays importable without the harness installed.
+    """
+    from gateway.session_context import get_session_env  # harness-defined identifier
+
+    return (
+        get_session_env(SESSION_PLATFORM_KEY) or None,
+        get_session_env(SESSION_CHAT_ID_KEY) or None,
+    )
+
+
+def _current_turn_message_and_cron() -> Tuple[Optional[str], bool, Optional[str]]:
+    """The injected message id is the active turn id; cron never has one."""
+    from gateway.session_context import get_session_env  # harness-defined identifier
+
+    return (
+        get_session_env("HERMES_SESSION_MESSAGE_ID") or None,
+        _truthy(get_session_env("HERMES_CRON_SESSION")),
+        get_session_env("HERMES_SESSION_PROFILE") or None,
+    )
+
+
+def _hermes_final_delivery(
+    reply_to: Optional[str],
+    active_turn: str,
+    metadata: Optional[Dict[str, Any]],
+) -> bool:
+    """True when this ``send`` is Hermes's OWN terminal delivery for ``active_turn``.
+
+    A Hermes agent loop can reply several times before it is finished: ``send_message`` to the
+    current chat during iteration 5 of 90 arrives on this same surface as the answer that ends
+    the turn. The frame is identical, so the gateway cannot tell them apart -- it used to seal
+    the turn on the first one, discard every later tool event and draft, and force-terminalize
+    the still-running tool steps ("1 did not finish"). This adapter can tell them apart, because
+    Hermes stamps its terminal delivery twice over and nothing else carries either mark:
+
+    * ``reply_to`` is the turn's own reply anchor. ``_handle_turn`` injects the turn with
+      ``message_id=turn_id``, and Hermes replies to that anchor
+      (``_reply_anchor_for_event`` -> ``event.message_id``) only for the final response.
+    * ``metadata["notify"]`` is Hermes's "this is user-visible final content" marker
+      (``_mark_notify_metadata``), applied to every terminal reply and to nothing else.
+
+    A mid-run ``send_message`` carries neither: the tool builds its own metadata
+    (``thread_id`` at most) and passes no ``reply_to``. Both marks are checked because either one
+    alone would be a single point of failure, and the cost of a false negative is only that the
+    turn waits for its configured timeout instead of sealing at once.
+    """
+    if reply_to and reply_to == active_turn:
+        return True
+    return isinstance(metadata, dict) and metadata.get("notify") is True
+
+
+def _caller_owns_active_turn(turn_id: str) -> bool:
+    """True when the CALLER's own session is the session that owns ``turn_id``.
+
+    ``send`` is a shared platform surface. A live turn's terminal reply arrives on
+    it from inside that turn's own session, but Hermes also delivers a cron/routine
+    report through the very same surface with no turn affiliation at all, from a
+    session whose context is a cron run. ``_active_turn`` is keyed by chat id alone,
+    so without this check a scheduled delivery that lands on a chat with an
+    unrelated turn in flight is absorbed by that turn: its text replaces the live
+    draft, ``done`` seals it, ``_cleanup_turn`` steals the turn from its real owner,
+    and ``send`` returns success -- so no ``scheduled`` frame is ever journaled and
+    the scheduler records a delivery that never happened.
+
+    The harness binds the turn's message id (``HERMES_SESSION_MESSAGE_ID``) into the
+    task-local session context of the turn that is running, and marks a cron run with
+    ``HERMES_CRON_SESSION``; a cron session has no message id. A steer injects
+    ``<turn_id>:steer`` as the message id while the original turn keeps streaming, so
+    the prefix form counts as the same turn. When the harness context is unavailable
+    (a standalone import, a test without the harness stubs) the historic behaviour is
+    preserved: the active turn is adopted.
+    """
+    try:
+        message_id, cron, _profile = _current_turn_message_and_cron()
+    except Exception:  # noqa: BLE001 - no harness context to judge affiliation by
+        return True
+    if cron:
+        return False
+    if not message_id:
+        return True
+    return message_id == turn_id or message_id.startswith(f"{turn_id}:")
+
+
+def _mobile_tool_result(
+    status: str,
+    result: Optional[Dict[str, Any]] = None,
+    stage: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> str:
+    payload: Dict[str, Any] = {"status": status}
+    if result is not None:
+        payload["result"] = result
+    if status != "ok" and stage in MOBILE_FAILURE_STAGES and reason in MOBILE_FAILURE_REASONS:
+        payload["stage"], payload["reason"] = stage, reason
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def _valid_mobile_artifact_filename(value: Any) -> bool:
+    """True for a display name that cannot smuggle a device path into Hermes."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 255
+        and value == value.strip()
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and not re.search(r"[\x00-\x1f\x7f-\x9f]", value)
+    )
+
+
+def _mobile_artifact_audit(descriptor: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        descriptor["mediaId"], descriptor["mimeType"], descriptor["byteCount"],
+        descriptor["sha256"], descriptor["filename"], descriptor["family"],
+    )
+
+
+def _cache_mobile_artifact_bytes(data: bytes, *, filename: str, mime_type: str) -> Any:
+    """Small lazy boundary around Hermes's controlled attachment cache."""
+    from gateway.platforms.base import cache_media_bytes  # harness-defined interface
+
+    return cache_media_bytes(data, filename=filename, mime_type=mime_type)
+
+
+async def _materialize_mobile_artifact(adapter: Any, descriptor: Dict[str, Any]) -> Any:
+    """Verify, cache, and expose one phone artifact through Hermes's real model seams.
+
+    Images become the supported multimodal tool-result envelope. PDFs use Hermes's
+    established document-cache/read_file contract. Other families fail closed: a
+    descriptor or local path alone is not evidence that the configured model can inspect it.
+    """
+    failure = _mobile_tool_result(
+        "device_unavailable", stage="media", reason="media_validation_failed"
+    )
+    if not _is_media(descriptor) or not _valid_mobile_artifact_filename(descriptor.get("filename")):
+        return failure
+    # A structurally valid descriptor is safe to retain as the audit reference even
+    # when the authenticated bytes later fail verification. It contains no device path.
+    failure = _mobile_tool_result(
+        "device_unavailable", dict(descriptor), "media", "media_validation_failed"
+    )
+
+    media_id = descriptor["mediaId"]
+    mime = descriptor["mimeType"].split(";", 1)[0].strip().lower()
+    family = descriptor["family"]
+    if mime != descriptor["mimeType"] or family_for(mime) != family:
+        return failure
+    rule = MEDIA_COMPATIBILITY_POLICY.get(mime)
+    if not rule or rule.get("status") != "supported":
+        return failure
+    # Hermes has a native model-visible seam for raster images and a supported
+    # cached-document path for PDF. Video/audio/archives have neither in a tool result.
+    if family == "image":
+        if mime not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+            return failure
+    elif mime != "application/pdf" or family != "file":
+        return failure
+
+    audit = _mobile_artifact_audit(descriptor)
+    cache: "OrderedDict[str, Tuple[Tuple[Any, ...], Any]]" = getattr(
+        adapter, "_mobile_artifact_cache", None
+    )
+    if cache is None:
+        cache = OrderedDict()
+        setattr(adapter, "_mobile_artifact_cache", cache)
+    cached_entry = cache.get(media_id)
+    if cached_entry is not None:
+        if cached_entry[0] != audit:
+            return failure
+        cache.move_to_end(media_id)
+        return cached_entry[1]
+
+    declared_bytes = descriptor["byteCount"]
+    byte_limit = _media_byte_limit(mime)
+    if declared_bytes > byte_limit:
+        return failure
+    try:
+        data, downloaded_name, downloaded_mime = await adapter._client.download_media(
+            media_id, max_bytes=byte_limit
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - download failures are bounded tool failures
+        return failure
+    downloaded_mime = str(downloaded_mime).split(";", 1)[0].strip().lower()
+    if (
+        len(data) != declared_bytes
+        or hashlib.sha256(data).hexdigest() != descriptor["sha256"]
+        or downloaded_mime != mime
+        or downloaded_name != descriptor["filename"]
+        or detect_mime(data) != mime
+    ):
+        return failure
+
+    cache_ext = {
+        "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+        "image/gif": ".gif", "application/pdf": ".pdf",
+    }[mime]
+    # The device's filename remains display-only audit metadata. The host cache
+    # sees a controlled media-id name and canonical extension, never a source path.
+    cache_filename = f"mobile_{media_id}{cache_ext}"
+    try:
+        cached = _cache_mobile_artifact_bytes(
+            data, filename=cache_filename, mime_type=mime
+        )
+    except Exception:  # noqa: BLE001 - never claim an artifact the controlled cache refused
+        return failure
+    if cached is None or getattr(cached, "media_type", None) != mime:
+        return failure
+
+    audit_text = (
+        f"Verified phone artifact {descriptor['filename']} "
+        f"(mediaId={media_id}, sha256={descriptor['sha256']}, bytes={declared_bytes})."
+    )
+    if family == "image":
+        if getattr(cached, "kind", None) != "image":
+            return failure
+        result: Any = {
+            "_multimodal": True,
+            "content": [
+                {"type": "text", "text": audit_text + " The image is attached natively; inspect it now."},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+                }},
+            ],
+            "text_summary": audit_text + " A vision-capable model is required to inspect it.",
+        }
+    else:
+        if getattr(cached, "kind", None) != "document" or not getattr(cached, "path", None):
+            return failure
+        result = {
+            "_multimodal": True,
+            "content": [{
+                "type": "text",
+                "text": (
+                    audit_text + f" The verified PDF is available at {cached.path}. "
+                    "Read it with read_file before answering the user."
+                ),
+            }],
+            "text_summary": audit_text + " The verified PDF is available to the document tools.",
+        }
+    cache[media_id] = (audit, result)
+    cache.move_to_end(media_id)
+    # Image entries carry an inline base64 part. Four maximum keeps the resident
+    # adapter's worst-case retained image payload bounded to roughly 32 MiB of
+    # source bytes (plus encoding overhead); replay safety does not justify 32.
+    while len(cache) > 4:
+        cache.popitem(last=False)
+    return result
+
+
+def _log_mobile_policy_block(
+    reason: str,
+    *,
+    actual_platform: Optional[str] = None,
+    chat_present: Optional[bool] = None,
+    cron: Optional[bool] = None,
+    adapter_count: Optional[int] = None,
+    profile_present: Optional[bool] = None,
+    profile_match: Optional[bool] = None,
+    message_present: Optional[bool] = None,
+    message_match: Optional[bool] = None,
+) -> None:
+    """Log a bounded reason code and non-sensitive policy comparisons only."""
+    comparisons = [f"expected_platform={PLATFORM_NAME}"]
+    if actual_platform is not None:
+        comparisons.append(f"actual_platform={str(actual_platform)[:32]}")
+    for key, value in (
+        ("chat_present", chat_present),
+        ("cron", cron),
+        ("adapter_count", adapter_count),
+        ("profile_present", profile_present),
+        ("profile_match", profile_match),
+        ("message_present", message_present),
+        ("message_match", message_match),
+    ):
+        if value is not None:
+            comparisons.append(f"{key}={value}")
+    logger.warning("attach mobile policy blocked reason=%s %s", reason, " ".join(comparisons))
+
+
+async def _cozy_device_status(args: Dict[str, Any], **_kwargs: Any) -> str:
+    """The one MN-0 tool: only a live CozyGateway turn may reach the phone."""
+    purpose = normalize_location_purpose(args.get("purpose"))
+    if purpose is None:
+        _log_mobile_policy_block("invalid_status_purpose")
+        return _mobile_tool_result("policy_blocked")
+    return await _cozy_mobile(
+        lambda adapter, chat_id, turn_id: adapter.request_device_status(chat_id, turn_id, purpose),
+    )
+
+
+async def _cozy_request_location(args: Dict[str, Any], **_kwargs: Any) -> str:
+    purpose = normalize_location_purpose(args.get("purpose"))
+    if purpose is None:
+        _log_mobile_policy_block("invalid_location_purpose")
+        return _mobile_tool_result("policy_blocked")
+    return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_location(chat_id, turn_id, purpose), location=True)
+
+async def _cozy_capture_camera(args: Dict[str, Any], **_kwargs: Any) -> str:
+    purpose, camera, capture = normalize_location_purpose(args.get("purpose")), args.get("camera"), args.get("capture")
+    if purpose is None or camera not in {"front", "rear"} or capture not in {"photo", "video"}:
+        return _mobile_tool_result("policy_blocked")
+    return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_mobile("camera.capture", chat_id, turn_id, purpose, camera=camera, capture=capture, videoDurationSeconds=10), media=True)
+
+async def _cozy_pick_file(args: Dict[str, Any], **_kwargs: Any) -> str:
+    purpose, selection = normalize_location_purpose(args.get("purpose")), args.get("selection")
+    if purpose is None or selection not in {"photo", "file"}:
+        return _mobile_tool_result("policy_blocked")
+    return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_mobile("file.pick", chat_id, turn_id, purpose, selection=selection), media=True)
+
+async def _cozy_present_notification(args: Dict[str, Any], **_kwargs: Any) -> str:
+    purpose, title, body = normalize_location_purpose(args.get("purpose")), args.get("title"), args.get("body")
+    if purpose is None or not isinstance(title, str) or not isinstance(body, str) or not 0 < len(title) <= 80 or not 0 < len(body) <= 240:
+        return _mobile_tool_result("policy_blocked")
+    return await _cozy_mobile(lambda adapter, chat_id, turn_id: adapter.request_mobile("notification.present", chat_id, turn_id, purpose, title=title, body=body), notification=True)
+
+
+def _resolve_live_origin() -> Optional[Tuple[Any, str, str, str]]:
+    """Resolve the sole adapter allowed to act for this exact live turn.
+
+    Mobile-node requests and live attachment sends have the same trust boundary:
+    they may act only for the adapter, profile, chat, and turn that originated the
+    current model call.  This resolver owns the fail-closed checks and their
+    intentionally path-free audit logs; callers retain their operation-specific
+    result envelope and any post-await lease checks.
+    """
+    try:
+        platform, chat_id = _current_turn_platform_and_chat()
+        message_id, cron, profile = _current_turn_message_and_cron()
+    except Exception:  # noqa: BLE001 - an unavailable harness context is noninteractive
+        _log_mobile_policy_block("session_context_unavailable")
+        return None
+    if platform != PLATFORM_NAME:
+        _log_mobile_policy_block("wrong_platform", actual_platform=platform)
+        return None
+    if not chat_id:
+        _log_mobile_policy_block("missing_chat_id", chat_present=False)
+        return None
+    if cron:
+        _log_mobile_policy_block("cron_session", chat_present=True, cron=True)
+        return None
+    adapters = [
+        adapter for adapter in _active_adapters_snapshot()
+        if getattr(adapter, "_active_turn", {}).get(chat_id)
+    ]
+    if len(adapters) != 1:
+        _log_mobile_policy_block("active_adapter_count", adapter_count=len(adapters))
+        return None
+    origin_adapter = adapters[0]
+    # Exact equality against the route this adapter's own turns carry: "" for a single-profile
+    # process (whose inbound source is deliberately unstamped so one session key serves both of
+    # Hermes' derivations), its own profile name for a multiplexed one. A foreign or absent
+    # route never matches, so the gate stays closed.
+    route = getattr(origin_adapter, "_session_profile_route", None)
+    expected_profile = route() if callable(route) else (getattr(origin_adapter, "_profile", "") or "")
+    if (profile or "") != expected_profile:
+        _log_mobile_policy_block(
+            "profile_mismatch", profile_present=bool(profile), profile_match=False
+        )
+        return None
+    turn_id = origin_adapter._active_turn[chat_id]
+    if message_id != turn_id:
+        _log_mobile_policy_block(
+            "turn_message_mismatch", message_present=bool(message_id), message_match=False
+        )
+        return None
+    # The lease that callers re-check after an await compares adapters to this value, so hold
+    # the adapter's own identity: a single-profile process carries no route to compare against.
+    return origin_adapter, chat_id, turn_id, getattr(origin_adapter, "_profile", "") or ""
+
+
+_SEND_MEDIA_CAPTION_MAX = 4096
+_LIVE_MEDIA_DELIVERY_RE = re.compile(r"^scheduled:live-media:[0-9a-f]{64}$")
+_MEDIA_RECEIPT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_MEDIA_RECEIPT_MAX_ITEMS = 16
+
+
+def _safe_media_ids(value: Any) -> List[str]:
+    """Accept a small list of opaque media ids, never an arbitrary wire payload."""
+    if not isinstance(value, list):
+        return []
+    safe: List[str] = []
+    for item in value:
+        if isinstance(item, str) and _MEDIA_RECEIPT_ID_RE.fullmatch(item):
+            safe.append(item)
+            if len(safe) == _MEDIA_RECEIPT_MAX_ITEMS:
+                break
+    return safe
+
+
+def _safe_tool_attachments(value: Any) -> List[Dict[str, Any]]:
+    """Defence in depth for the only media descriptor tool results may expose."""
+    if not isinstance(value, list):
+        return []
+    safe: List[Dict[str, Any]] = []
+    for item in value[:_MEDIA_RECEIPT_MAX_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        attachment_id = item.get("attachmentId")
+        name = item.get("name")
+        mime_type = item.get("mimeType")
+        size = item.get("bytes")
+        kind = item.get("mediaKind")
+        if (
+            not isinstance(attachment_id, str) or not _MEDIA_RECEIPT_ID_RE.fullmatch(attachment_id)
+            or not isinstance(name, str) or not name or os.path.basename(name) != name or len(name) > 128
+            or not isinstance(mime_type, str) or not mime_type or len(mime_type) > 128
+            or not isinstance(size, int) or isinstance(size, bool) or not 0 <= size <= MEDIA_AGGREGATE_MAX_BYTES
+            or not isinstance(kind, str) or kind not in {"image", "audio", "video", "file"}
+        ):
+            continue
+        safe.append({
+            "attachmentId": attachment_id,
+            "name": name,
+            "mimeType": mime_type,
+            "bytes": size,
+            "mediaKind": kind,
+        })
+    return safe
+
+
+def _media_delivery_flags(state: str, media_verified: bool = False) -> Dict[str, bool]:
+    """Keep delivery claims monotonic and deliberately weaker than transport success."""
+    accepted = state in {"journaled", "admitted", "projected", "displayed"}
+    return {
+        "accepted": accepted,
+        "pending": state in {"journaled", "admitted"},
+        "committed": state in {"projected", "displayed"},
+        "displayed": state == "displayed",
+        "verified": media_verified is True,
+    }
+
+
+def _send_media_tool_result(
+    *,
+    accepted: bool,
+    state: str,
+    conversation_id: Optional[str],
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> str:
+    """Return the small, path-free contract for ``cozy_send_media``.
+
+    A proactive delivery is only *accepted* once it is durably journaled; that is
+    deliberately weaker than saying a person has received it.  Do not copy media
+    upload diagnostics here: even a basename can disclose a private local path.
+    """
+    payload: Dict[str, Any] = {
+        "accepted": accepted,
+        "state": state[:32],
+        "conversationId": conversation_id[:256] if isinstance(conversation_id, str) else None,
+    }
+    payload.update(_media_delivery_flags(state))
+    payload["accepted"] = accepted
+    if isinstance(result, dict):
+        if isinstance(result.get("accepted_pending"), bool):
+            payload["pending"] = result["accepted_pending"]
+        payload["verified"] = result.get("mediaVerified") is True
+        attachments = _safe_tool_attachments(result.get("attachments"))
+        if attachments:
+            payload["attachments"] = attachments
+        for key in ("deliveryId", "messageId", "eventId", "error"):
+            value = result.get(key)
+            if isinstance(value, str) and value:
+                # ``send_proactive`` returns symbolic failure codes.  Keep that
+                # contract narrow so a future transport exception cannot smuggle
+                # a source path into a model-visible result.
+                if key != "error" or re.fullmatch(r"[A-Za-z0-9_:-]{1,128}", value):
+                    payload[key] = value[:256]
+        result_error = result.get("error")
+        if isinstance(result_error, str):
+            failure_phase = {
+                "media_upload_failed": "upload",
+                "scheduled_delivery_unavailable": "journal",
+                "scheduled_not_supported": "journal",
+                "attach_not_writable": "transport",
+                "delivery_failed": "delivery",
+            }.get(result_error)
+            if failure_phase is not None:
+                payload["failurePhase"] = failure_phase
+    if error:
+        payload["error"] = error[:128]
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def _safe_media_rows(spool: Optional[AttachSpool], delivery_id: str) -> List[Dict[str, Any]]:
+    """Return lifecycle facts with neither filesystem metadata nor content hashes."""
+    if spool is None:
+        return []
+    try:
+        rows = spool.media_rows(delivery_id)
+    except Exception:  # noqa: BLE001 - unreadable local state is simply absent state
+        logger.debug("attach: media lifecycle read failed", exc_info=True)
+        return []
+    safe: List[Dict[str, Any]] = []
+    for row in rows[:_MEDIA_RECEIPT_MAX_ITEMS]:
+        media_id = row.get("mediaId")
+        state = row.get("state")
+        name = row.get("pathMeta")
+        if not isinstance(media_id, str) or not _MEDIA_RECEIPT_ID_RE.fullmatch(media_id):
+            continue
+        if not isinstance(state, str) or state not in {
+            "prepared", "uploaded", "journaled", "projected", "displayed", "blocked", "upload_failed",
+        }:
+            continue
+        item: Dict[str, Any] = {"attachmentId": media_id, "state": state, "lifecycle": state}
+        if isinstance(name, str) and name and os.path.basename(name) == name and len(name) <= 128:
+            item["name"] = name
+        safe.append(item)
+    return safe
+
+
+def _media_status_tool_result(
+    delivery_id: str, message_id: str, state: str, receipt: Optional[Dict[str, Any]], rows: List[Dict[str, Any]],
+    *, error: Optional[str] = None,
+) -> str:
+    """A bounded status result that never repackages raw receipt diagnostics."""
+    media_verified = bool(receipt and receipt.get("mediaVerified") is True)
+    payload: Dict[str, Any] = {
+        "state": state, "lifecycle": state, "deliveryId": delivery_id, "messageId": message_id,
+        **_media_delivery_flags(state, media_verified),
+        "expectedMediaIds": _safe_media_ids(receipt.get("expectedMediaIds")) if receipt else [],
+        "committedMediaIds": _safe_media_ids(receipt.get("committedMediaIds")) if receipt else [],
+        "mediaVerified": media_verified, "media": rows,
+    }
+    if error:
+        payload["error"] = error
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def _valid_send_media_paths(value: Any) -> Optional[List[str]]:
+    """Accept only the declared JSON-array shape, before a transport is selected."""
+    if not isinstance(value, list) or not 1 <= len(value) <= 16:
+        return None
+    if any(not isinstance(path, str) or not path or not os.path.isabs(path) for path in value):
+        return None
+    return list(value)
+
+
+def _send_media_delivery_key(
+    occurrence: str, chat_id: str, caption: str, paths: List[str]
+) -> str:
+    """Bind an attachment commit to one native tool occurrence, never a target argument."""
+    material = json.dumps(
+        {"occurrence": occurrence, "conversation": chat_id, "caption": caption, "paths": paths},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "live-media:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+async def _cozy_send_media(args: Dict[str, Any], **kwargs: Any) -> str:
+    """Commit attachments to exactly the currently-originating live conversation."""
+    paths = _valid_send_media_paths(args.get("paths"))
+    caption = args.get("caption", "")
+    if (
+        paths is None
+        or not isinstance(caption, str)
+        or len(caption) > _SEND_MEDIA_CAPTION_MAX
+    ):
+        _log_mobile_policy_block("invalid_send_media_args")
+        return _send_media_tool_result(
+            accepted=False, state="blocked", conversation_id=None, error="invalid_arguments"
+        )
+
+    origin = _resolve_live_origin()
+    if origin is None:
+        return _send_media_tool_result(
+            accepted=False, state="blocked", conversation_id=None, error="policy_blocked"
+        )
+    origin_adapter, chat_id, _turn_id, _profile = origin
+
+    # Hooks set the real call id for this tool.  The fallback preserves the existing
+    # session-context behaviour in older harnesses, while the hook makes a second
+    # call in the same turn a distinct durable delivery.
+    occurrence = str(kwargs.get(TOOL_CALL_ID_KEY) or _occurrence_key()).strip()
+    delivery_key = _send_media_delivery_key(occurrence, chat_id, caption, paths)
+    delivery_id, message_id = _proactive_identity(delivery_key)
+    try:
+        result = await origin_adapter.send_proactive(
+            chat_id,
+            caption,
+            paths,
+            canonical_home=False,
+            delivery_key=delivery_key,
+        )
+    except asyncio.CancelledError:
+        return _send_media_tool_result(
+            accepted=False, state="failed", conversation_id=chat_id, error="cancelled"
+        )
+    except Exception:  # noqa: BLE001 - never expose a local exception or a path
+        logger.warning("attach live media send failed", exc_info=True)
+        return _send_media_tool_result(
+            accepted=False,
+            state="failed",
+            conversation_id=chat_id,
+            result=_proactive_failure("delivery_failed", delivery_id, message_id),
+        )
+    if not isinstance(result, dict):
+        return _send_media_tool_result(
+            accepted=False,
+            state="failed",
+            conversation_id=chat_id,
+            result=_proactive_failure("delivery_failed", delivery_id, message_id),
+        )
+    result = dict(result)
+    result.setdefault("deliveryId", delivery_id)
+    result.setdefault("messageId", message_id)
+    state = result.get("state") if isinstance(result.get("state"), str) else "failed"
+    accepted = state in {"journaled", "projected", "displayed"}
+    return _send_media_tool_result(
+        accepted=accepted, state=state, conversation_id=chat_id, result=result
+    )
+
+
+async def _cozy_media_delivery_status(args: Dict[str, Any], **_kwargs: Any) -> str:
+    """Read one prior live-media delivery without making another delivery attempt."""
+    delivery_id = args.get("deliveryId") if isinstance(args, dict) else None
+    if not isinstance(delivery_id, str) or not _LIVE_MEDIA_DELIVERY_RE.fullmatch(delivery_id):
+        return _media_status_tool_result("", "", "blocked", None, [], error="invalid_delivery_id")
+    origin = _resolve_live_origin()
+    message_id = _proactive_identity(delivery_id[len("scheduled:"):])[1]
+    if origin is None:
+        return _media_status_tool_result(delivery_id, message_id, "blocked", None, [], error="policy_blocked")
+    origin_adapter, _chat_id, _turn_id, _profile = origin
+    receipt: Optional[Dict[str, Any]] = None
+    rows: List[Dict[str, Any]] = []
+    local_receipt: Optional[Dict[str, Any]] = None
+    snapshot_reader = getattr(origin_adapter, "media_delivery_status_snapshot", None)
+    if callable(snapshot_reader):
+        try:
+            snapshot = await snapshot_reader(delivery_id, 0.5)
+        except Exception:  # noqa: BLE001 - local journal remains the truthful fallback
+            snapshot = None
+        if isinstance(snapshot, dict):
+            candidate = snapshot.get("receipt")
+            candidate_rows = snapshot.get("rows")
+            if isinstance(candidate_rows, list):
+                rows = candidate_rows
+            candidate_local = snapshot.get("localReceipt")
+            if isinstance(candidate_local, dict):
+                local_receipt = candidate_local
+        if isinstance(candidate, dict) and candidate.get("state") in {
+            "admitted", "projected", "blocked", "displayed", "failed",
+        }:
+            receipt = candidate
+    else:
+        reader = getattr(origin_adapter, "media_delivery_receipt", None)
+        if callable(reader):
+            try:
+                candidate = await reader(delivery_id, 0.5)
+            except Exception:  # noqa: BLE001 - local journal remains the truthful fallback
+                candidate = None
+            if isinstance(candidate, dict) and candidate.get("state") in {
+                "admitted", "projected", "blocked", "displayed", "failed",
+            }:
+                receipt = candidate
+        spool = getattr(origin_adapter, "_spool", None)
+        rows = _safe_media_rows(spool, delivery_id)
+        if spool is not None:
+            try:
+                candidate = spool.delivery_receipt_row(delivery_id)
+                if isinstance(candidate, dict):
+                    local_receipt = candidate
+            except Exception:  # noqa: BLE001 - same fallback as a transient gateway 404
+                logger.debug("attach: local delivery receipt read failed", exc_info=True)
+    if receipt is not None:
+        state = str(receipt["state"])
+        # The HTTP ABI keeps its durable projection fact at the top level.  A
+        # later terminal display is additive (`projected` +
+        # `terminal:{state:"displayed"}`), rather than a replacement top-level
+        # state.  Treat that terminal fact as the lifecycle answer, while still
+        # leaving verification exclusively to `mediaVerified` below.
+        terminal = receipt.get("terminal")
+        if (
+            state == "projected"
+            and isinstance(terminal, dict)
+            and terminal.get("state") == "displayed"
+        ):
+            state = "displayed"
+    elif local_receipt is not None and local_receipt.get("state") in {"displayed", "failed"}:
+        state = str(local_receipt["state"])
+    elif rows:
+        state = "journaled"
+    else:
+        state = "unknown"
+    return _media_status_tool_result(delivery_id, message_id, state, receipt, rows)
+
+
+async def _cozy_mobile(request: Any, location: bool = False, media: bool = False, notification: bool = False) -> str:
+    origin = _resolve_live_origin()
+    if origin is None:
+        return _mobile_tool_result("policy_blocked")
+    origin_adapter, chat_id, turn_id, profile = origin
+    try:
+        outcome = await request(origin_adapter, chat_id, turn_id)
+    except asyncio.CancelledError:
+        return _mobile_tool_result("cancelled")
+    # The admitted tuple above is the request's immutable origin. Hermes' current
+    # message context may legitimately move while a person answers the phone sheet;
+    # only replacement or loss of that exact origin adapter/turn invalidates its lease.
+    after_adapters = [
+        adapter for adapter in _active_adapters_snapshot()
+        if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
+        and (getattr(adapter, "_profile", "") or "") == profile
+    ]
+    if len(after_adapters) != 1 or after_adapters[0] is not origin_adapter:
+        _log_mobile_policy_block("origin_turn_changed_after_request")
+        return _mobile_tool_result("policy_blocked")
+    status = outcome.get("status")
+    result = outcome.get("result")
+    valid = _is_location(result) if location else _is_media(result) if media else _is_notification(result) if notification else _is_device_status(result)
+    if status == "ok" and not valid:
+        status, result = "device_unavailable", None
+    if status == "ok" and media and isinstance(result, dict):
+        try:
+            artifact_result = await _materialize_mobile_artifact(origin_adapter, result)
+        except asyncio.CancelledError:
+            return _mobile_tool_result("cancelled")
+        # The download is still part of the admitted lease. Mutable Hermes message
+        # context may move while bytes are fetched; only loss or replacement of the
+        # immutable origin adapter/profile/chat/turn invalidates their release.
+        final_adapters = [
+            adapter for adapter in _active_adapters_snapshot()
+            if getattr(adapter, "_active_turn", {}).get(chat_id) == turn_id
+            and (getattr(adapter, "_profile", "") or "") == profile
+        ]
+        if len(final_adapters) != 1 or final_adapters[0] is not origin_adapter:
+            _log_mobile_policy_block("origin_turn_changed_after_artifact_download")
+            return _mobile_tool_result("policy_blocked")
+        return artifact_result
+    return _mobile_tool_result(
+        status if isinstance(status, str) and status in MOBILE_STATUS_VALUES else "device_unavailable",
+        result if isinstance(result, dict) else None,
+        outcome.get("stage") if isinstance(outcome.get("stage"), str) else None,
+        outcome.get("reason") if isinstance(outcome.get("reason"), str) else None,
+    )
+
+
+_COZYAPP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_COZYAPP_NODE_FORMS: Dict[str, Tuple[Set[str], Set[str]]] = {
+    "stack": ({"id", "kind", "children"}, set()),
+    "section": ({"id", "kind", "children"}, {"title"}),
+    "text": ({"id", "kind", "text"}, {"style"}),
+    "image": ({"id", "kind", "source"}, {"alt"}),
+    "list": ({"id", "kind", "items"}, set()),
+    "keyValue": ({"id", "kind", "key", "value"}, set()),
+    "button": ({"id", "kind", "label", "actionId", "role"}, set()),
+}
+_COZYAPP_MAX_DEPTH = 12
+_COZYAPP_MAX_NODES = 200
+_COZYAPP_MAX_TREE_BYTES = 128 * 1024
+
+
+def _cozyapp_string_length(value: str) -> int:
+    """Match TypeBox/JavaScript ``maxLength`` semantics for astral characters."""
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _validate_cozyapp_upsert(app_id: Any, name: Any, tree: Any) -> Optional[str]:
+    """Mirror the closed CozyApps v1 payload contract before its durable journal write.
+
+    Gateway remains the security authority.  This local mirror prevents a tool call
+    from being acknowledged as queued when its complete tree will be discarded by
+    Gateway's validator after the fact.
+    """
+    if not isinstance(app_id, str) or _COZYAPP_ID_RE.fullmatch(app_id) is None:
+        return "appId must be 1-128 letters, digits, '_' or '-'"
+    if not isinstance(name, str) or not 1 <= _cozyapp_string_length(name) <= 120:
+        return "name must be 1-120 characters"
+    if not isinstance(tree, dict) or set(tree) != {"root"}:
+        return "tree must be exactly {root: NODE}"
+
+    node_count = 0
+    node_ids: Set[str] = set()
+
+    def valid_string(value: Any, minimum: int, maximum: int) -> bool:
+        return isinstance(value, str) and minimum <= _cozyapp_string_length(value) <= maximum
+
+    def walk(node: Any, depth: int) -> Optional[str]:
+        nonlocal node_count
+        if not isinstance(node, dict):
+            return "each tree node must be an object"
+        kind = node.get("kind")
+        if not isinstance(kind, str) or kind not in _COZYAPP_NODE_FORMS:
+            return "node kind is not supported"
+        required, optional = _COZYAPP_NODE_FORMS[kind]
+        keys = set(node)
+        if keys - required - optional:
+            return f"{kind} node contains unsupported properties"
+        if not required <= keys:
+            return f"{kind} node is missing required properties"
+        node_id = node.get("id")
+        if not isinstance(node_id, str) or _COZYAPP_ID_RE.fullmatch(node_id) is None:
+            return "node ids must be 1-128 letters, digits, '_' or '-'"
+        if node_id in node_ids:
+            return "node ids must be unique"
+        if depth > _COZYAPP_MAX_DEPTH:
+            return "tree exceeds maximum depth"
+        node_count += 1
+        if node_count > _COZYAPP_MAX_NODES:
+            return "tree exceeds maximum nodes"
+        node_ids.add(node_id)
+
+        if kind in {"stack", "section"}:
+            children = node.get("children")
+            if not isinstance(children, list) or len(children) > 100:
+                return f"{kind} children must contain at most 100 nodes"
+            if kind == "section" and "title" in node and not valid_string(node["title"], 0, 8192):
+                return "section title must be at most 8192 characters"
+            for child in children:
+                error = walk(child, depth + 1)
+                if error is not None:
+                    return error
+            return None
+        if kind == "text":
+            if not valid_string(node.get("text"), 0, 8192):
+                return "text content must be at most 8192 characters"
+            style = node.get("style")
+            if "style" in node and (not isinstance(style, str) or style not in {"body", "title", "caption"}):
+                return "text style is not supported"
+            return None
+        if kind == "image":
+            source = node.get("source")
+            if not valid_string(source, 1, 2048) or not source.startswith("https://"):
+                return "image source must be an HTTPS URL"
+            if "alt" in node and not valid_string(node["alt"], 0, 512):
+                return "image alt text must be at most 512 characters"
+            return None
+        if kind == "list":
+            items = node.get("items")
+            if not isinstance(items, list) or len(items) > 100 or any(not valid_string(item, 1, 2048) for item in items):
+                return "list items must contain 1-100 strings of at most 2048 characters"
+            return None
+        if kind == "keyValue":
+            if not valid_string(node.get("key"), 1, 512) or not valid_string(node.get("value"), 0, 8192):
+                return "keyValue key/value properties are invalid"
+            return None
+        if not valid_string(node.get("label"), 1, 256):
+            return "button label must be 1-256 characters"
+        action_id = node.get("actionId")
+        if not isinstance(action_id, str) or _COZYAPP_ID_RE.fullmatch(action_id) is None:
+            return "button actionId must be 1-128 letters, digits, '_' or '-'"
+        role = node.get("role")
+        if not isinstance(role, str) or role not in {"primary", "secondary", "destructive"}:
+            return "button role is not supported"
+        return None
+
+    error = walk(tree["root"], 1)
+    if error is not None:
+        return error
+    try:
+        encoded = json.dumps(tree, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError):
+        return "tree must contain only valid JSON values"
+    return "tree exceeds maximum serialized size" if len(encoded) > _COZYAPP_MAX_TREE_BYTES else None
+
+
+async def _cozyapp_upsert(args: Dict[str, Any], **_kwargs: Any) -> str:
+    """The model-facing app authoring primitive; Gateway remains the final authority."""
+    origin = _resolve_live_origin()
+    if origin is None:
+        return json.dumps({"ok": False, "error": "cozy app creation requires an active CozyGateway chat"})
+    adapter = origin[0]
+    client = getattr(adapter, "_client", None)
+    app_id, name, tree = args.get("appId"), args.get("name"), args.get("tree")
+    validation_error = _validate_cozyapp_upsert(app_id, name, tree)
+    if validation_error is not None:
+        return json.dumps({"ok": False, "error": f"invalid CozyApp: {validation_error}"})
+    if client is None:
+        return json.dumps({"ok": False, "error": "CozyApps is unavailable"})
+    try:
+        accepted = await adapter.upsert_cozyapp(app_id, name, tree)
+    except Exception:
+        accepted = False
+    return json.dumps({"ok": accepted, "appId": app_id} if accepted else {"ok": False, "error": "CozyApps is unavailable"})
+
+
+def _preview(value: Any, limit: int = 200) -> Optional[str]:
+    """A short string preview of a hook payload, truncated, or None when absent."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            import json
+
+            text = json.dumps(value, default=str)
+        except Exception:  # noqa: BLE001
+            text = str(value)
+    text = text.strip()
+    if not text:
+        return None
+    return text[:limit]
+
+
+def _tool_call_id(kwargs: Dict[str, Any]) -> Optional[str]:
+    """The harness's real per-call id from a hook payload, or None if absent.
+
+    The harness always passes the key (see ``TOOL_CALL_ID_KEY``), defaulting it to
+    ``""`` when it has no id to give, so an empty/blank value means "no id" the
+    same as a missing key.
+    """
+    raw = kwargs.get(TOOL_CALL_ID_KEY)
+    if not raw:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def _dispatch_tool_hook(phase: str, kwargs: Dict[str, Any]) -> None:
+    """Forward one native tool hook firing to the active adapters. Never raises.
+
+    Runs on the agent tool worker thread. Filters to this platform's turns via the
+    session context and hands ``(chat_id, phase, tool_name, detail, call_id)`` to
+    every active adapter, which hops it back onto its own loop.
+    """
+    try:
+        platform, chat_id = _current_turn_platform_and_chat()
+        if platform != PLATFORM_NAME or not chat_id:
+            # Deliberately silent: these process-global hooks fire for every
+            # platform's turns, so logging here would spam legitimate traffic.
+            return
+        adapters = _active_adapters_snapshot()
+        if not adapters:
+            return
+        tool_name = str(kwargs.get("tool_name") or "")
+        if not tool_name:
+            return
+        call_id = _tool_call_id(kwargs)
+        if tool_name == "delegate_task":
+            # Delegation has its own bounded structured child projection. The ordinary durable
+            # tool chip may name the tool, but must never retain its task prompts, summaries,
+            # result rows, schema errors, token data, tool traces, or paths as generic detail.
+            detail = None
+            if phase != "start":
+                phase = "error" if str(kwargs.get("status") or "").lower() == "error" else "complete"
+        elif tool_name in {
+            "cozy_device_status", "cozy_request_location",
+            "cozy_capture_camera", "cozy_pick_file",
+            "cozy_send_media", "cozy_media_delivery_status",
+        }:
+            # Purpose and phone payloads are live-turn-only data. Tool chips may name the
+            # operation, but never retain either side of this sensitive exchange as detail.
+            # Media results can contain a cache path or base64 model attachment, so this
+            # guard also prevents those from being projected back to CozyChat.
+            detail = None
+        elif phase == "start":
+            detail = _preview(kwargs.get("args"))
+        elif str(kwargs.get("status") or "").lower() == "error":
+            detail = _preview(kwargs.get("error_message") or kwargs.get("result"))
+            phase = "error"
+        else:
+            detail = _preview(kwargs.get("result"))
+            phase = "complete"
+        for adapter in adapters:
+            adapter.observe_tool_event(chat_id, phase, tool_name, detail, call_id)
+    except Exception:  # noqa: BLE001 - a chip must never crash the tool loop
+        logger.debug("attach: tool-hook dispatch failed", exc_info=True)
+
+
+def _pre_tool_call(**kwargs: Any) -> None:
+    """``pre_tool_call`` hook: the chip-open leg. Observer only (returns None)."""
+    tool_name = str(kwargs.get("tool_name") or "")
+    if tool_name in {"send_message", "cozy_send_media"}:
+        _CURRENT_TOOL_OCCURRENCE.set(_tool_call_id(kwargs))
+    elif tool_name == "delegate_task":
+        # The batch id for this call's delegation cards: the parent's own tool-call id (the
+        # documented fallback until Hermes exposes its real delegation_id to lifecycle hooks).
+        # Task-local, so it rides the ``contextvars.copy_context()`` Hermes hands each child
+        # worker and outlives this hook for the whole batch.
+        _CURRENT_DELEGATION_CALL.set(_tool_call_id(kwargs))
+    _dispatch_tool_hook("start", kwargs)
+
+
+def _post_tool_call(**kwargs: Any) -> None:
+    """``post_tool_call`` hook: the chip-close leg (carries the outcome)."""
+    try:
+        _dispatch_tool_hook("complete", kwargs)
+    finally:
+        tool_name = str(kwargs.get("tool_name") or "")
+        if tool_name in {"send_message", "cozy_send_media"}:
+            _CURRENT_TOOL_OCCURRENCE.set(None)
+        elif tool_name == "delegate_task":
+            try:
+                _record_delegation_alias(
+                    _tool_call_id(kwargs),
+                    _delegation_alias_from_result(kwargs.get("result")),
+                )
+                _record_delegation_result(
+                    _tool_call_id(kwargs), kwargs.get("result")
+                )
+            except Exception:  # noqa: BLE001 - result capture must never crash the tool loop
+                logger.debug("attach: delegation result capture failed", exc_info=True)
+            _CURRENT_DELEGATION_CALL.set(None)
+
+
+# ---------------------------------------------------------------------------
+# Subagent lifecycle hook wiring (live delegation batch cards).
+#
+# ``delegate_task`` fires ``subagent_start`` / ``subagent_stop`` for every child it spawns.
+# Spawn legs run under a copy of the parent tool thread's context, so the same task-local
+# session context that routes tool chips routes them; an async batch's finish legs can
+# consolidate on a thread with NO session context, so the association made at spawn is
+# retained: a bounded parent-session -> (chat, batch) map. Hermes's hook payloads expose no
+# delegation id or task index (a proposed upstream extension), so the batch id is the parent's
+# own ``delegate_task`` tool-call id captured by ``pre_tool_call``, indices are assigned in
+# spawn order, and the child's session id -- the one identifier present on BOTH legs -- pairs
+# them (the wire ``childId``). Only bounded display text leaves this module: a truncated goal
+# as the label and a tool count; never summaries, args, results, prompts, or paths.
+# ---------------------------------------------------------------------------
+
+#: The parent's live ``delegate_task`` call id, task-local so it propagates into the
+#: ``contextvars.copy_context()`` Hermes hands each child worker.
+_CURRENT_DELEGATION_CALL: ContextVar[Optional[str]] = ContextVar(
+    "cozygateway_delegation_call", default=None
+)
+
+
+@dataclass
+class _DelegationBatch:
+    """Everything a finish leg needs when it arrives with no session context."""
+
+    chat_id: str
+    batch_id: str
+    #: Canonical Hermes delegation id (``deleg_...``) once learned from the parent
+    #: ``delegate_task`` result; batch-level, keep-first, rides subsequent frames as
+    #: ``aliasId`` so clients can reconcile the async completion row.
+    alias_id: Optional[str] = None
+    #: child session id -> stable batch index, in spawn order.
+    indices: Dict[str, int] = field(default_factory=dict)
+
+
+#: batch id -> its batch, bounded oldest-first. Eviction beyond the cap orphans that batch's
+#: remaining finish legs (they drop, and the gateway's stale sweep settles the cards
+#: ``unknown``): a bounded loss, priced against an unbounded registry.
+_DELEGATION_BATCHES: "OrderedDict[str, _DelegationBatch]" = OrderedDict()
+#: parent session id -> its most recent batch id: the context-free finish leg's route in.
+_DELEGATION_PARENT_LATEST: Dict[str, str] = {}
+_DELEGATION_BATCHES_LOCK = threading.Lock()
+_DELEGATION_BATCHES_MAX = 32
+
+#: call id -> alias captured by ``_post_tool_call`` before any lifecycle leg created the
+#: batch. Defensive only: async spawn legs run INSIDE the ``delegate_task`` call, so the
+#: batch normally exists first. Bounded oldest-first, same price policy as the batches map.
+_DELEGATION_PENDING_ALIASES: "OrderedDict[str, str]" = OrderedDict()
+_DELEGATION_PENDING_ALIASES_MAX = 32
+
+#: The shape Hermes mints (``tools/delegation_live_log.py::new_live_delegation_id``:
+#: ``deleg_`` + 8 hex chars); bounded loosely so a longer future id still matches.
+_DELEGATION_ALIAS_RE = re.compile(r"^deleg_[A-Za-z0-9]{4,64}$")
+#: EXPLICIT documented fallback: the live-transcript directory segment
+#: ``.../delegation/live/<deleg_id>/task-<n>.log`` returned in ``live_transcripts``
+#: (``tools/delegation_live_log.py`` names the directory with the batch's delegation id).
+#: A path-segment extraction, never free-text prose parsing.
+_DELEGATION_LIVE_PATH_RE = re.compile(r"/delegation/live/(deleg_[A-Za-z0-9]+)/")
+
+
+def _delegation_alias_from_result(result: Any) -> Optional[str]:
+    """The canonical delegation id from a ``delegate_task`` result, or None.
+
+    Hermes returns the tool result as one JSON object string; the async
+    "dispatched" payload carries a structured top-level ``delegation_id``
+    (``tools/delegate_tool.py``) that matches ``cache/delegation/live/<id>/``.
+    Fallback: the id segment of a ``live_transcripts`` path (see
+    ``_DELEGATION_LIVE_PATH_RE``). An older result shape yields None and the
+    batch simply has no alias -- everything else keeps working.
+    """
+    payload: Any = result
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text.startswith("{"):
+            return None
+        try:
+            payload = json.loads(text)
+        except Exception:  # noqa: BLE001 - an unparseable result means no alias
+            return None
+    if not isinstance(payload, dict):
+        return None
+    alias = payload.get("delegation_id")
+    if isinstance(alias, str) and _DELEGATION_ALIAS_RE.match(alias):
+        return alias
+    transcripts = payload.get("live_transcripts")
+    if isinstance(transcripts, list):
+        for path in transcripts:
+            if not isinstance(path, str):
+                continue
+            match = _DELEGATION_LIVE_PATH_RE.search(path.replace("\\", "/"))
+            if match:
+                return match.group(1)
+    return None
+
+
+def _record_delegation_alias(call_id: Optional[str], alias: Optional[str]) -> None:
+    """Attach ``alias`` to the batch for ``call_id`` (or park it for a late batch)."""
+    if not call_id or not alias:
+        return
+    with _DELEGATION_BATCHES_LOCK:
+        batch = _DELEGATION_BATCHES.get(call_id)
+        if batch is not None:
+            if batch.alias_id is None:
+                batch.alias_id = alias
+            return
+        _DELEGATION_PENDING_ALIASES[call_id] = alias
+        while len(_DELEGATION_PENDING_ALIASES) > _DELEGATION_PENDING_ALIASES_MAX:
+            _DELEGATION_PENDING_ALIASES.popitem(last=False)
+
+
+# Bounded public projection of Hermes v0.21's synchronous child-result contract. Background
+# dispatch returns only a top-level dispatch receipt, so it deliberately emits none of these.
+_DELEGATION_COST_MAX_USD = 1_000_000.0
+_DELEGATION_COST_STATUSES = {"estimated", "reported", "unknown"}
+_DELEGATION_DURATION_MAX_MS = 2_147_483_647
+_DELEGATION_SCHEMA_RETRIES_MAX = 1
+
+
+def _delegation_result_payload(result: Any) -> Optional[Dict[str, Any]]:
+    payload = result
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text.startswith("{"):
+            return None
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _finite_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _record_delegation_result(call_id: Optional[str], result: Any) -> None:
+    """Project only bounded, structured synchronous child-result metadata.
+
+    Hermes result rows identify children by explicit ``task_index``. Child lifecycle hooks are
+    emitted synchronously while Hermes builds the task list in that same order, which is the
+    existing spawn index retained in ``batch.indices``. No child summary, schema error, token,
+    trace, output, argument, or path is copied from the result.
+    """
+    if not call_id:
+        return
+    payload = _delegation_result_payload(result)
+    rows = payload.get("results") if payload is not None else None
+    if not isinstance(rows, list):
+        return
+    with _DELEGATION_BATCHES_LOCK:
+        batch = _DELEGATION_BATCHES.get(call_id)
+        if batch is None:
+            return
+        child_by_index = {index: child_id for child_id, index in batch.indices.items()}
+        count = len(batch.indices)
+        alias_id = batch.alias_id
+
+    events: List[Dict[str, Any]] = []
+    seen: Set[int] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        task_index = row.get("task_index")
+        if (
+            isinstance(task_index, bool)
+            or not isinstance(task_index, int)
+            or task_index in seen
+        ):
+            continue
+        child_id = child_by_index.get(task_index)
+        if child_id is None:
+            continue
+        raw_status = str(row.get("status") or "").strip().lower()
+        if raw_status not in {"completed", "failed", "interrupted"}:
+            continue
+        seen.add(task_index)
+        event: Dict[str, Any] = {
+            "batch_id": call_id,
+            "child_id": child_id,
+            "index": task_index,
+            "count": count,
+            "status": _DELEGATION_STATUS_MAP[raw_status],
+            "last_active_at": int(time.time() * 1000),
+        }
+        if alias_id:
+            event["alias_id"] = alias_id
+
+        cost = _finite_number(row.get("cost_usd"))
+        if cost is not None and 0 <= cost <= _DELEGATION_COST_MAX_USD:
+            raw_cost_status = str(row.get("cost_status") or "unknown").strip().lower()
+            event["cost_usd"] = cost
+            event["cost_status"] = (
+                raw_cost_status
+                if raw_cost_status in _DELEGATION_COST_STATUSES
+                else "unknown"
+            )
+
+        schema_valid = row.get("schema_valid")
+        if isinstance(schema_valid, bool):
+            validation: Dict[str, Any] = {"valid": schema_valid}
+            retries = row.get("schema_retries")
+            if (
+                not isinstance(retries, bool)
+                and isinstance(retries, int)
+                and 0 <= retries <= _DELEGATION_SCHEMA_RETRIES_MAX
+            ):
+                validation["retries"] = retries
+            event["schema_validation"] = validation
+
+        duration_seconds = _finite_number(row.get("duration_seconds"))
+        if duration_seconds is not None and 0 <= duration_seconds <= _DELEGATION_DURATION_MAX_MS / 1000:
+            duration_ms = int(duration_seconds * 1000)
+            event["duration_ms"] = duration_ms
+        events.append(event)
+
+    if not events:
+        return
+    adapters = _active_adapters_snapshot()
+    for event in events:
+        for active_adapter in adapters:
+            active_adapter.observe_delegation_event(batch.chat_id, event)
+
+
+#: Hermes child result statuses -> the closed wire vocabulary. ``cancelled`` renders as
+#: ``interrupted`` (the vocabulary is closed and the user asked for the stop). An unrecognized
+#: terminal maps to ``unknown`` -- the honest "cannot prove the outcome" -- NEVER ``failed``.
+_DELEGATION_STATUS_MAP = {
+    "completed": "succeeded",
+    "succeeded": "succeeded",
+    "success": "succeeded",
+    "failed": "failed",
+    "error": "failed",
+    "timeout": "failed",
+    "interrupted": "interrupted",
+    "cancelled": "interrupted",
+}
+
+
+def _delegation_batch_for(
+    parent_key: str, chat_id: Optional[str], call_id: Optional[str]
+) -> Optional[_DelegationBatch]:
+    """The batch one lifecycle leg belongs to, creating it when routable. None = not ours.
+
+    Resolution order: the exact batch for the leg's own ``delegate_task`` call id (keeps
+    (batchId, childId) stable when batches overlap); else the parent's latest batch (the
+    context-free finish leg); else -- with session context proving this platform's turn -- a
+    new batch. Without context and without an association the leg is not routable.
+    """
+    with _DELEGATION_BATCHES_LOCK:
+        if call_id:
+            batch = _DELEGATION_BATCHES.get(call_id)
+            if batch is not None:
+                return batch
+        elif parent_key in _DELEGATION_PARENT_LATEST:
+            batch = _DELEGATION_BATCHES.get(_DELEGATION_PARENT_LATEST[parent_key])
+            if batch is not None:
+                return batch
+        if not chat_id:
+            return None
+        batch_id = call_id or "deleg-{:x}-{:06x}".format(
+            int(time.time() * 1000), random.getrandbits(24)
+        )
+        batch = _DelegationBatch(
+            chat_id=chat_id,
+            batch_id=batch_id,
+            alias_id=_DELEGATION_PENDING_ALIASES.pop(batch_id, None),
+        )
+        _DELEGATION_BATCHES[batch_id] = batch
+        _DELEGATION_PARENT_LATEST[parent_key] = batch_id
+        while len(_DELEGATION_BATCHES) > _DELEGATION_BATCHES_MAX:
+            evicted_id, _evicted = _DELEGATION_BATCHES.popitem(last=False)
+            for parent, latest in list(_DELEGATION_PARENT_LATEST.items()):
+                if latest == evicted_id:
+                    del _DELEGATION_PARENT_LATEST[parent]
+        return batch
+
+
+def _dispatch_delegation_hook(leg: str, kwargs: Dict[str, Any]) -> None:
+    """Forward one subagent lifecycle hook firing to the active adapters. Never raises."""
+    try:
+        child_raw = kwargs.get("child_session_id")
+        child_id = str(child_raw).strip() if child_raw else ""
+        if not child_id:
+            # Without the shared key the two legs cannot pair; an unkeyed card would render
+            # as a permanent orphan, so the event is dropped whole.
+            return
+        try:
+            platform, chat_id = _current_turn_platform_and_chat()
+        except Exception:  # noqa: BLE001 - consolidation threads may have no harness context
+            platform, chat_id = None, None
+        if platform is not None and platform != PLATFORM_NAME:
+            return
+        parent_key = str(kwargs.get("parent_session_id") or "").strip() or (chat_id or "")
+        if not parent_key:
+            return
+        batch = _delegation_batch_for(
+            parent_key,
+            chat_id if platform == PLATFORM_NAME else None,
+            _CURRENT_DELEGATION_CALL.get(),
+        )
+        if batch is None:
+            return
+        adapters = _active_adapters_snapshot()
+        if not adapters:
+            return
+        with _DELEGATION_BATCHES_LOCK:
+            index = batch.indices.setdefault(child_id, len(batch.indices))
+            count = len(batch.indices)
+            alias_id = batch.alias_id
+        payload: Dict[str, Any] = {
+            "batch_id": batch.batch_id,
+            "child_id": child_id,
+            "index": index,
+            "count": count,
+            "last_active_at": int(time.time() * 1000),
+        }
+        if alias_id:
+            payload["alias_id"] = alias_id
+        if leg == "start":
+            payload["status"] = "running"
+            label = _preview(kwargs.get("child_goal"))
+            if label:
+                payload["label"] = label
+        else:
+            raw_status = str(kwargs.get("child_status") or "").strip().lower()
+            payload["status"] = _DELEGATION_STATUS_MAP.get(raw_status, "unknown")
+            history = kwargs.get("tool_call_history")
+            if isinstance(history, list):
+                payload["tool_count"] = len(history)
+        for adapter in adapters:
+            adapter.observe_delegation_event(batch.chat_id, payload)
+    except Exception:  # noqa: BLE001 - a card must never crash the agent loop
+        logger.debug("attach: delegation-hook dispatch failed", exc_info=True)
+
+
+def _subagent_start(**kwargs: Any) -> None:
+    """``subagent_start`` hook: a child's spawn leg. Observer only (returns None)."""
+    _dispatch_delegation_hook("start", kwargs)
+
+
+def _subagent_stop(**kwargs: Any) -> None:
+    """``subagent_stop`` hook: a child's finish leg (carries the outcome)."""
+    _dispatch_delegation_hook("stop", kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Live thinking preview tap (capability ``thinking``).
+#
+# Reasoning models emit their visible reply in one end burst, so a turn otherwise shows only a
+# generic thinking state. Hermes streams reasoning deltas to plugins through the supported
+# ``on_stream_delta`` hook (kind == "reasoning"), gated OFF by default behind the user config
+# ``plugins.stream_reasoning_deltas: true``. The hook hands RAW chain-of-thought on a worker
+# thread with no session context, so this tap (a) filters to this platform's surface, (b)
+# routes inside the adapter, (c) coalesces to at most one emit per second, and (d) sanitizes
+# hard before a single character reaches the wire: fenced/inline code (where tool args and
+# results get quoted), credential-looking assignments and opaque token runs, and filesystem
+# paths are all dropped or redacted, then the tail is truncated to the 280-char preview the
+# gateway schema also enforces. Redaction over fidelity, always: this is a shimmer preview,
+# not a transcript.
+# ---------------------------------------------------------------------------
+
+THINKING_PREVIEW_MAX_CHARS = 280
+THINKING_COALESCE_SECONDS = 1.0
+_THINKING_BUFFER_MAX_CHARS = 4096
+
+_THINKING_FENCED_RE = re.compile(r"```.*?(?:```|$)", re.S)
+_THINKING_INLINE_CODE_RE = re.compile(r"`[^`]*`")
+_THINKING_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)\b(token|secret|password|passwd|api[_-]?key|apikey|authorization|credential)s?\b\s*[:=]\s*\S+"
+)
+_THINKING_BEARER_RE = re.compile(r"(?i)\bbearer\s+\S+")
+_THINKING_OPAQUE_RE = re.compile(r"\b[A-Za-z0-9+/_-]{20,}={0,2}\b")
+_THINKING_PATH_RE = re.compile(r"(?:~|/|[A-Za-z]:\\)(?:[\w.-]+[/\\])+[\w.-]*")
+
+
+@dataclass
+class _ThinkingState:
+    """One turn's rolling preview: raw tail, last emit, and the coalescing task."""
+
+    buffer: str = ""
+    seq: int = 0
+    last_text: str = ""
+    last_emit: float = 0.0
+    task: Optional[asyncio.Task] = None
+
+
+def _sanitize_thinking(text: str) -> str:
+    """A bounded display preview of raw model reasoning.
+
+    Order matters: code spans go first (tool args/results are quoted there), then credential
+    shapes, then paths, then whitespace collapse and TAIL truncation (the newest reasoning is
+    the interesting end). Over-redaction of an odd long word is an accepted price.
+    """
+    text = _THINKING_FENCED_RE.sub(" ", text)
+    text = _THINKING_INLINE_CODE_RE.sub(" ", text)
+    # Bearer before the assign shape: "authorization: bearer <token>" must lose the token,
+    # not just the word "bearer".
+    text = _THINKING_BEARER_RE.sub("[redacted]", text)
+    text = _THINKING_SECRET_ASSIGN_RE.sub(lambda m: f"{m.group(1)}=[redacted]", text)
+    text = _THINKING_OPAQUE_RE.sub("[redacted]", text)
+    text = _THINKING_PATH_RE.sub("[path]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > THINKING_PREVIEW_MAX_CHARS:
+        text = "\u2026" + text[-(THINKING_PREVIEW_MAX_CHARS - 1):]
+    return text
+
+
+def _on_stream_delta(**kwargs: Any) -> None:
+    """``on_stream_delta`` hook: the live-reasoning tap. Observer only, never raises.
+
+    Runs on Hermes' bounded plugin-stream worker thread (drop-oldest under backlog), which
+    carries no session contextvars -- so no ``get_session_env`` here; the surface field and the
+    adapter's own active-turn state do the routing. Content deltas (``kind == "text"``) already
+    reach this platform through the draft path and are ignored.
+    """
+    try:
+        if kwargs.get("kind") != "reasoning":
+            return
+        if str(kwargs.get("surface") or "") != PLATFORM_NAME:
+            return
+        delta = str(kwargs.get("delta") or "")
+        if not delta:
+            return
+        for adapter in _active_adapters_snapshot():
+            adapter.observe_reasoning_delta(delta)
+    except Exception:  # noqa: BLE001 - a preview must never crash the stream worker
+        logger.debug("attach: reasoning-hook dispatch failed", exc_info=True)
+
+
+#: The Hermes approval surfaces whose prompt this platform actually answers.
+#:
+#: Both of these route through ``tools/approval.py::_await_gateway_decision``: the
+#: request is parked on the session's approval queue, the platform is told about it
+#: through ``notify_cb``, and the agent blocks on that queue entry until the
+#: canonical approval timeout elapses. A ``/approve`` or ``/deny`` injected by
+#: ``_handle_approval_command`` resolves exactly that entry, so a card drawn for one
+#: of these is a card a tap can settle.
+ANSWERABLE_APPROVAL_SURFACES = frozenset({"gateway", "mcp-elicitation"})
+
+
+def _is_answerable_approval(kwargs: Dict[str, Any]) -> bool:
+    """True when THIS platform's approve/deny is the thing being waited on.
+
+    Hermes fires ``pre_approval_request`` / ``post_approval_response`` for every
+    approval surface, and most of them are decided somewhere no phone can reach:
+
+    * ``surface="smart"`` -- ``approvals.mode: smart`` asks an auxiliary LLM
+      guardian first. The pre hook fires, the aux model answers a second or two
+      later, and the post hook fires with ``choice="smart_approve"`` /
+      ``"smart_deny"``. A human was never in that loop.
+    * ``surface="cli"`` -- an interactive prompt on the operator's own terminal.
+    * ``surface="transport:<name>"`` -- a registered approval transport plugin has
+      replaced every built-in prompt surface, including this one.
+    * ``coalesced=True`` -- a FOLLOWER of an identical concurrent approval. It only
+      adopts whatever the leader is answered with; it has no prompt of its own.
+
+    Forwarding those is what made an Approve/Deny card appear and vanish before the
+    user could act: the card was a read-out of somebody else's decision, drawn with
+    buttons, and terminated the moment that decision landed. Only the surfaces this
+    platform is the decider for become cards.
+    """
+    if kwargs.get("coalesced"):
+        return False
+    return str(kwargs.get("surface") or "").strip() in ANSWERABLE_APPROVAL_SURFACES
+
+
+# Capability 66. How long a block this peer raises stays answerable, in milliseconds. It matches
+#: the gateway's own default approval deadline, and it is a CEILING on any standing grant made
+#: from the ask: a grant dies at the ask's own expiry or sooner, never later.
+APPROVAL_SCOPE_TTL_MS = 600_000
+
+#: Capability 66's closed category set, in the order the classifier tries them. Order is
+#: load-bearing: the five specific families are tested before `destructive`, so "delete the
+#: payment method" is an account change rather than a plain deletion, and a call that matches
+#: nothing lands on `other`, the one category a standing category grant can ever cover.
+#:
+#: Matching is on the ACTION IDENTITY only (the Hermes pattern key or tool name), never on the
+#: command text or its arguments: row 66 forbids a secret, credential, URL, header or env value in
+#: any wire string, and this plugin cannot tell one from a path.
+_APPROVAL_CATEGORY_MARKERS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("money_movement", (
+        "pay", "payment", "charge", "invoice", "transfer", "refund", "payout", "checkout",
+        "purchase", "stripe", "billing_charge",
+    )),
+    ("secret_access", (
+        "secret", "credential", "password", "passphrase", "token", "apikey", "api_key",
+        "keychain", "vault", "private_key", "ssh_key",
+    )),
+    ("lock_or_alarm", (
+        "lock", "unlock", "alarm", "arm", "disarm", "door", "garage", "deadbolt", "siren",
+    )),
+    ("public_publishing", (
+        "publish", "post", "tweet", "broadcast", "release", "deploy", "share", "send_email",
+        "send_mail", "announce",
+    )),
+    ("account_change", (
+        "account", "role", "permission", "member", "invite", "subscription", "plan", "iam",
+        "owner", "acl",
+    )),
+    ("destructive", (
+        "rm", "delete", "remove", "destroy", "drop", "truncate", "wipe", "erase", "format",
+        "kill", "purge", "overwrite", "reset",
+    )),
+)
+
+#: What the classifier will read as an action identity, in order of preference.
+_APPROVAL_ACTION_KEYS = ("pattern_key", "tool_name", "tool", "name")
+
+
+def _approval_action_identity(kwargs: Dict[str, Any]) -> Optional[str]:
+    """The stable name of the ACTION being asked about, or ``None`` when there is none.
+
+    A `pattern_key` like ``terminal:rm`` is Hermes' own name for the rule that stopped the call, so
+    it is the best identity available; a bare tool name is the fallback. Anything else, including a
+    blank string, means this plugin cannot say what the action is, and row 66's answer to that is a
+    plain approval rather than a guess.
+    """
+    for key in _APPROVAL_ACTION_KEYS:
+        value = kwargs.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _approval_category(action: str) -> Optional[str]:
+    """Place one action identity in capability 66's closed category set, or answer ``None``.
+
+    ``None`` means THIS PLUGIN CANNOT SAY, and it is deliberately not `other`. `other` is the one
+    category a standing CATEGORY grant can ever cover, so answering it for an action nobody placed
+    would unlock exactly the grant row 66 withholds from a plain ask, and for the same stated
+    reason: "a standing category policy over one would silently pre-approve a destructive or
+    publishing action nobody classified". `terminal:rm` places; `terminal:rmdir`, `fs:unlink` and
+    `bank:wire` do not, and a card offering "Always allow" over one of those is the failure this
+    guards. An unplaced call emits no block at all, which leaves the plain pre-66 card and the
+    person's own single-use grant on the derived binding as the only coverage there can be.
+    """
+    haystack = re.sub(r"[^a-z0-9]+", "_", action.lower())
+    tokens = {token for token in haystack.split("_") if token}
+    for category, markers in _APPROVAL_CATEGORY_MARKERS:
+        for marker in markers:
+            # A whole word always counts. A substring counts only for a long marker: `rm` is a
+            # substring of `terminal` and `confirm`, and `arm` of `format`, so a short marker
+            # matched loosely would classify half the catalogue as destructive.
+            if marker in tokens or (len(marker) >= 6 and marker in haystack):
+                return category
+    return None
+
+
+#: An action identity is the ONLY thing that reaches a wire string, so it is the only thing that has
+#: to be checked for one. A rule name has no whitespace, no scheme, no path separator and no
+#: assignment in it; anything that does is carrying a value, and row 66 forbids a URL, a path, a
+#: credential or an env value in any of these strings.
+_UNSAFE_IDENTITY = re.compile(r"[\s=/\\]|://|\.\.")
+
+
+def _is_wire_safe_identity(action: str) -> bool:
+    return not _UNSAFE_IDENTITY.search(action)
+
+
+def _approval_payload_hash(kwargs: Dict[str, Any], action: str) -> str:
+    """The BINDING: sha256 over the material fields, so a changed payload is a changed ask.
+
+    The digest is the one place the command text and its arguments may be read, because a digest
+    reveals none of it. It deliberately excludes the clock, the approval id and the session, so two
+    identical invocations bind identically and a person's standing grant means what it says.
+    """
+    material = {
+        "action": action,
+        "command": kwargs.get("command"),
+        "arguments": kwargs.get("arguments") if isinstance(kwargs.get("arguments"), dict) else None,
+    }
+    try:
+        encoded = json.dumps(material, sort_keys=True, default=str, ensure_ascii=True)
+    except Exception:  # noqa: BLE001
+        encoded = repr(material)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def classify_approval_scope(
+    kwargs: Dict[str, Any], now_ms: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Capability 66's ``BotApprovalScope`` for one Hermes approval, or ``None``.
+
+    Row 66 puts this work here on purpose: "Classifying the action correctly belongs to the harness
+    that raises it." What the classifier promises is narrow and checkable:
+
+    * every wire string is built from the ACTION IDENTITY and Hermes' own human description, never
+      from the command, its arguments, a URL or an env value;
+    * it asks for ``once`` and claims ``unknown`` idempotency, so the gateway can never cover a
+      later ask from it without the person's own single-use grant; and
+    * it answers ``None`` for a call it cannot place, which leaves the plain deny-only card that
+      every Hermes approval gets today. Failing to classify FAILS CLOSED.
+    """
+    action_identity = _approval_action_identity(kwargs)
+    if action_identity is None or not _is_wire_safe_identity(action_identity):
+        return None
+    category = _approval_category(action_identity)
+    if category is None:
+        return None
+    system, _, remainder = action_identity.partition(":")
+    if not remainder:
+        # No namespace to read: an MCP tool is `server__tool`, and a bare tool name belongs to the
+        # harness itself rather than to a named external system.
+        server, sep, tool = action_identity.partition("__")
+        system, remainder = (server, tool) if sep else ("hermes", action_identity)
+    resource = (remainder or action_identity)
+    # COMPOSED, never copied. Hermes' own description is a fine sentence for a person and a bad one
+    # for this field: on the answerable surface it carries the call's arguments (the write guard
+    # builds "Write to protected agent-instruction file(s): <absolute paths>."), and row 66 says
+    # `change` describes an action and never carries its arguments. So the sentence is built from
+    # the two identifiers this plugin already vouched for and nothing else.
+    change = f"Run {action_identity} on {resource} in {system or 'hermes'}."
+    return {
+        "kind": "scoped_approval",
+        "action": action_identity[:64],
+        "category": category,
+        "system": (system or "hermes")[:64],
+        # The action's own target as this plugin can honestly name it: the operation, not its
+        # arguments. A category grant is bounded to it, which is why it must be stable and must
+        # never carry a value a person would not want stored in a policy record.
+        "resource": resource[:256],
+        # The resource is the OPERATION, not the object it would act on: the object lives in the
+        # call's arguments and row 66 forbids one in a wire string. Saying so is what stops a
+        # standing CATEGORY grant being recorded over it, which would otherwise cover every object
+        # that tool can reach. A single-use grant, bound to the payload hash, is still on offer.
+        "resourceKind": "action",
+        "change": change[:400],
+        "effects": [],
+        # Hermes stopped the call under its own approval policy. This peer does not know whether
+        # the operator's guardrail or an always-require rule is what did it, and inventing
+        # `always_require` here would claim a floor the gateway is the authority on.
+        "reason": "peer_policy",
+        "payloadHash": _approval_payload_hash(kwargs, action_identity),
+        "expiresAt": int(now_ms if now_ms is not None else time.time() * 1000) + APPROVAL_SCOPE_TTL_MS,
+        # This plugin cannot prove a Hermes tool call is safe to repeat, and `idempotent` is the
+        # only value a standing once grant is consulted for. `unknown` is the honest answer and the
+        # closed one.
+        "retry": "unknown",
+        "requested": "once",
+    }
+
+
+def _dispatch_approval_hook(phase: str, kwargs: Dict[str, Any]) -> None:
+    """Observer-only Hermes approval hook → attach-v1 lifecycle event."""
+    try:
+        platform, chat_id = _current_turn_platform_and_chat()
+        if platform != PLATFORM_NAME or not chat_id:
+            return
+        if not _is_answerable_approval(kwargs):
+            return
+        approval_id = _tool_call_id(kwargs)
+        if approval_id is None:
+            return
+        if phase == "pending":
+            status = "pending"
+        else:
+            choice = str(kwargs.get("choice") or "").lower()
+            status = (
+                "approved" if choice in {"once", "session", "always", "approve", "approved", "allow"}
+                else "denied" if choice in {"deny", "denied"}
+                else "expired" if choice in {"timeout", "expired"}
+                else "cancelled"
+            )
+        name = str(kwargs.get("pattern_key") or kwargs.get("tool_name") or "tool")
+        # Capability 66. Only the ask carries a block: a settlement names a decision already made,
+        # and there is nothing left to scope. A call the classifier cannot place answers `None`,
+        # which is the plain pre-66 approval.
+        scope = classify_approval_scope(kwargs) if phase == "pending" else None
+        for adapter in _active_adapters_snapshot():
+            adapter.observe_approval_event(chat_id, approval_id, name, status, scope=scope)
+    except Exception:  # noqa: BLE001
+        logger.debug("attach: approval-hook dispatch failed", exc_info=True)
+
+
+def _pre_approval_request(**kwargs: Any) -> None:
+    _dispatch_approval_hook("pending", kwargs)
+
+
+def _post_approval_response(**kwargs: Any) -> None:
+    _dispatch_approval_hook("resolved", kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Registration.
+# ---------------------------------------------------------------------------
+
+
+def _make_adapter_class() -> type:
+    """Build the concrete platform-adapter subclass (imports the harness lazily)."""
+    from gateway.config import Platform  # harness-defined identifier
+    from gateway.platforms.base import BasePlatformAdapter  # harness-defined identifier
+
+    class _AttachPlatformAdapter(AttachAdapter, BasePlatformAdapter):
+        # The one place the native-streaming attribute is ever True. Read once, at
+        # class build, from the same switch `supports_native_streaming` reads, so
+        # the attribute and the probe can never disagree and an unset switch
+        # leaves every Hermes branch that reads the attribute alone.
+        SUPPORTS_NATIVE_STREAMING = _env_flag("COZYGATEWAY_NATIVE_STREAMING", False)
+
+        def __init__(self, config: Any, **_kwargs: Any) -> None:
+            try:
+                platform = Platform(PLATFORM_NAME)
+            except ValueError:
+                # The core Platform enum is closed; a plugin platform registers its
+                # name with the loader, so fall back to a generic value if present.
+                platform = getattr(Platform, "WEBHOOK", None) or next(iter(Platform))
+            BasePlatformAdapter.__init__(self, config=config, platform=platform)
+            self._attach_init(config)
+
+    return _AttachPlatformAdapter
+
+
+def check_requirements() -> bool:
+    """Dependency check: the outbound client needs ``websockets``."""
+    try:
+        import websockets  # noqa: F401
+
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _env_enablement() -> Optional[Dict[str, Any]]:
+    """``env_enablement_fn``: seed ``PlatformConfig.extra`` from the profile's own attach env.
+
+    Hermes calls this while it loads a profile's config under that profile's scope
+    (gateway/config_env.py ``_enable_plugin_platform``). On a multiplexer it builds the launch
+    profile's adapter unscoped, so this seed is where that adapter's settings come from.
+    """
+    url, token = profile_env("COZYGATEWAY_URL"), profile_env("COZYGATEWAY_TOKEN")
+    if not (url and token):
+        return None
+    seed: Dict[str, Any] = {"gateway_url": url, "token": token}
+    for key, name in (("spool_path", "COZYGATEWAY_SPOOL_PATH"), ("ca_file", "COZYGATEWAY_CA_FILE")):
+        value = profile_env(name)
+        if value:
+            seed[key] = value
+    return seed
+
+
+def is_connected(*_args: Any) -> bool:
+    """Configured iff both the gateway URL and the token are present for the owning profile.
+
+    Hermes asks this while loading each profile's config under that profile's scope
+    (gateway/config_env.py `_enable_plugin_platform`), so on a multiplexed gateway it answers for
+    the profile being loaded, not the launch profile whose env the process carries.
+    """
+    return bool(profile_env("COZYGATEWAY_URL") and profile_env("COZYGATEWAY_TOKEN"))
+
+
+async def _standalone_send(
+    pconfig: Any,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[List[str]] = None,
+    force_document: bool = False,
+    delivery_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Compatibility wrapper for Hermes' out-of-process cron sender.
+
+    Cron and the live gateway share the Hermes home directory, so this process appends to the same
+    WAL-backed event spool. The live adapter notices it on the next heartbeat and delivers it with
+    the stream's one monotonic sequence; opening a competing socket here would incorrectly
+    supersede the resident adapter.
+    """
+    del force_document
+    target_thread = str(thread_id or chat_id or "").strip()
+    # A cron session id is caller-owned and unique per execution while remaining stable across
+    # delivery retries. Fall back to a content-addressed key for older harnesses that do not
+    # expose session context; this still prevents retry duplication without inventing a clock.
+    run_key = str(delivery_key or "").strip()
+    try:
+        from gateway.session_context import get_session_env  # harness-defined identifier
+
+        if not run_key:
+            run_key = str(get_session_env("HERMES_SESSION_ID") or get_session_env("HERMES_SESSION_KEY") or "").strip()
+    except Exception:
+        pass
+    if not run_key:
+        run_key = hashlib.sha256(f"{target_thread}\0{message}".encode("utf-8")).hexdigest()
+    result = await enqueue_proactive_delivery(
+        pconfig,
+        thread_id=target_thread,
+        delivery_key=run_key,
+        message=message,
+        media_files=media_files,
+        canonical_home=True,
+    )
+    return result
+
+
+async def _hermes_standalone_send(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Translate durable Cozy states into upstream Hermes' success/error ABI."""
+    return _hermes_delivery_result(await _standalone_send(*args, **kwargs))
+
+
+def _hermes_delivery_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate a durable Cozy delivery state into upstream Hermes' success/error ABI.
+
+    Confirmed projection and durable acceptance both report success. Reporting an
+    accepted-pending occurrence as an error taught every caller that a healthy delivery
+    had failed: hermes core retried it as a formatting failure and duplicated the
+    message, and the scheduler kept the projection-timeout string as the run's delivery
+    error long after the occurrence reached ``displayed`` (incident 2026-08-24). Only a
+    rejection is an error now; ``delivery_state()`` still answers "did it land".
+    """
+    state = result.get("state")
+    if state == "projected":
+        return {**result, "success": True}
+    if state == "suppressed":
+        return {**result, "success": True, "delivered": False}
+    if result.get("error"):
+        return result
+    if state == "blocked":
+        return {**result, "error": "delivery was blocked before projection"}
+    if state == "journaled_partial":
+        # Journaled, but an attachment was lost on the way. A partial occurrence is
+        # still a failure of the delivery the caller asked for.
+        return {
+            **result,
+            "error": "delivery is partially journaled and projection is not yet confirmed",
+        }
+    if state == "journaled" and result.get("accepted_pending"):
+        return {**result, "success": True, "pending": True}
+    return {
+        **result,
+        "error": "delivery is durable but projection is not yet confirmed",
+    }
+
+
+def _resident_adapter() -> Optional[AttachAdapter]:
+    with _ACTIVE_ADAPTERS_LOCK:
+        return next(
+            (
+                adapter
+                for adapter in _ACTIVE_ADAPTERS
+                if isinstance(adapter, AttachAdapter) and not adapter._closing
+            ),
+            None,
+        )
+
+
+def _occurrence_key(args: Optional[Dict[str, Any]] = None) -> str:
+    """The caller-owned occurrence id a delivery key is derived from.
+
+    Stable across retries of one occurrence and distinct between occurrences: the active
+    tool call first, then the caller's own idempotency fields, then the harness session
+    identifiers. An empty result is honest; callers still mix in their own material.
+    """
+    key = str(_CURRENT_TOOL_OCCURRENCE.get() or "").strip()
+    if not key and isinstance(args, dict):
+        key = str(args.get("tool_call_id") or args.get("idempotency_key") or "").strip()
+    if not key:
+        try:
+            from gateway.session_context import get_session_env  # harness-defined identifier
+
+            key = str(
+                get_session_env("HERMES_SESSION_MESSAGE_ID")
+                or get_session_env("HERMES_SESSION_ID")
+                or get_session_env("HERMES_SESSION_KEY")
+                or ""
+            ).strip()
+        except Exception:
+            pass
+    return key
+
+
+
+# The upstream frame that owns every Hermes platform send. A plugin
+# ``send_message_handler`` is invoked from there on BOTH lanes (see
+# ``_upstream_send_payload``), but only the tool lane fills ``args``.
+#
+# Both halves matter. The module alone is not enough: ``tools.send_message_tool``
+# also owns ``_handle_send``, ``_send_via_adapter`` and ``_registry_standalone_send``,
+# and each of those holds a DIFFERENT ``message``/``media_files`` binding (or none at
+# all). ``_send_to_platform`` is the one function that provably holds the complete
+# outbound request -- it is the ``def`` that takes ``message`` and ``media_files`` as
+# parameters and calls the handler itself.
+_UPSTREAM_SEND_MODULE = "tools.send_message_tool"
+_UPSTREAM_SEND_FUNCTION = "_send_to_platform"
+
+# How far above the handler the upstream sender can sit. The handler is reached
+# through ``_send_message_handler`` -> ``_scheduler_lane_send`` -> here, so the
+# sender is normally three frames up; the margin absorbs any future in-plugin or
+# upstream wrapper without letting the search wander into unrelated callers.
+_UPSTREAM_SEND_MAX_DEPTH = 8
+
+
+def _normalized_media_paths(media_files: Any) -> List[str]:
+    """Accept both media shapes Hermes hands a platform plugin.
+
+    The in-plugin callers pass plain paths. The upstream ``standalone_sender_fn``
+    contract (and cron's ``_deliver_result``, which forwards
+    ``BasePlatformAdapter.extract_media`` output verbatim) passes ``(path, is_voice)``
+    pairs instead. Only the string form used to survive, so every attachment on a
+    scheduled report was dropped before the upload loop ever saw it.
+    """
+    paths: List[str] = []
+    for entry in media_files or []:
+        if isinstance(entry, (tuple, list)):
+            entry = entry[0] if entry else None
+        if isinstance(entry, str) and entry:
+            paths.append(entry)
+    return paths
+
+
+def _upstream_send_payload() -> Optional[Dict[str, Any]]:
+    """Recover the outbound payload Hermes does not hand a plugin send handler.
+
+    ``tools/send_message_tool.py::_send_to_platform`` (the ``def`` at :925) routes EVERY
+    non-builtin platform through ``entry.send_message_handler`` and returns whatever it
+    returns, with no fallback to ``standalone_sender_fn``. It fills ``args`` only on the
+    ``send_message`` TOOL lane; cron's ``_deliver_result`` calls the same function with
+    ``args=None`` and the report in the positional ``message`` parameter. A registered
+    handler therefore shadows this plugin's standalone cron sender and is handed an EMPTY
+    request: the report is journaled nowhere, and "no text and no media" reads as silence,
+    which the scheduler records as a delivered run with no error (hermes 0.20.5).
+
+    Read the payload the caller already holds instead of inventing an empty one. The
+    recovery is deliberately narrow: only the ``_send_to_platform`` frame is trusted, and
+    any other caller yields ``None`` so the handler fails loudly rather than delivering
+    nothing quietly.
+
+    Two details of that frame decide what a scheduled report actually carries:
+
+    * ``message`` is the WHOLE outbound text; ``chunk`` is only the current slice of the
+      platform-limit loop. Upstream ``return``s inside that loop on the handler lane
+      (send_message_tool.py:1289-1297), so recovering ``chunk`` delivers slice one and
+      silently drops the rest. Recovering ``message`` delivers the report intact and
+      keeps the derived delivery key identical on every invocation, so media rides
+      exactly one durable occurrence even if a future upstream drops that early return.
+    * ``media_files`` is read from the SAME frame as the text, so the attachments always
+      belong to the message they were extracted from.
+    """
+    frame = inspect.currentframe()
+    try:
+        for _ in range(_UPSTREAM_SEND_MAX_DEPTH):
+            frame = frame.f_back if frame is not None else None
+            if frame is None:
+                return None
+            if frame.f_globals.get("__name__") != _UPSTREAM_SEND_MODULE:
+                continue
+            if frame.f_code.co_name != _UPSTREAM_SEND_FUNCTION:
+                continue
+            local_vars = frame.f_locals
+            for key in ("message", "chunk"):
+                text = local_vars.get(key)
+                if isinstance(text, str) and text.strip():
+                    return {
+                        "message": text,
+                        "media_files": local_vars.get("media_files"),
+                        "thread_id": local_vars.get("thread_id"),
+                    }
+            return None
+        return None
+    finally:
+        del frame
+
+
+async def _scheduler_lane_send(chat_id: str, pconfig: Any) -> Dict[str, Any]:
+    """Serve a send that carries no tool request: cron, routines, any upstream caller.
+
+    This is the lane ``standalone_sender_fn`` would own if the registered handler did not
+    shadow it, so it delivers through exactly that sender.
+    """
+    payload = _upstream_send_payload()
+    if payload is None:
+        logger.warning(
+            "attach: send_message handler invoked with no message payload and no "
+            "recoverable upstream text; refusing to report a delivery",
+        )
+        return {
+            "error": (
+                "cozygateway received a send with no message payload: the caller passed "
+                "no send_message args and no recoverable text, so nothing was delivered"
+            ),
+        }
+    return _hermes_delivery_result(
+        await _standalone_send(
+            pconfig,
+            chat_id,
+            payload["message"],
+            thread_id=payload.get("thread_id"),
+            media_files=payload.get("media_files"),
+        )
+    )
+
+
+async def _send_message_handler(
+    args: Dict[str, Any], chat_id: str, platform_name: str, pconfig: Any
+) -> Dict[str, Any]:
+    """Own Hermes ``send_message`` so Cozy media is never dropped as unsupported.
+
+    Upstream routes every plugin-platform send through this one hook, tool call or not.
+    A request with no ``message`` key is not a tool call: it is the cron/scheduler lane
+    this handler shadows, and it is served by the standalone sender instead.
+    """
+    request = args or {}
+    if "message" not in request:
+        return await _scheduler_lane_send(chat_id, pconfig)
+
+    from gateway.platforms.base import BasePlatformAdapter  # harness-defined identifier
+
+    raw_message = str(request.get("message") or "")
+    extracted, cleaned = BasePlatformAdapter.extract_media(raw_message)
+    filtered = BasePlatformAdapter.filter_media_delivery_paths(extracted)
+    media_files = [str(path) for path, _is_voice in filtered]
+    # The tool's raw message still holds the marker lines, so this lane can place its
+    # attachments in the block flow exactly the way the terminal reply lane does.
+    media_positions = _media_positions_for_draft(raw_message, cleaned, media_files)
+    target = str(request.get("target") or "").strip().lower()
+    canonical_home = target == platform_name
+    key_material = "\0".join([platform_name, chat_id, cleaned, *media_files])
+    occurrence_key = _occurrence_key(request)
+    delivery_key = "tool:" + hashlib.sha256(
+        f"{occurrence_key}\0{key_material}".encode("utf-8")
+    ).hexdigest()
+    resident = _resident_adapter()
+    if resident is not None and resident._ready.is_set():
+        return _hermes_delivery_result(
+            await resident.send_proactive(
+                chat_id,
+                cleaned,
+                media_files,
+                canonical_home=canonical_home,
+                delivery_key=delivery_key,
+                media_positions=media_positions,
+            )
+        )
+    return _hermes_delivery_result(
+        await enqueue_proactive_delivery(
+            pconfig,
+            thread_id=chat_id,
+            delivery_key=delivery_key,
+            message=cleaned,
+            media_files=media_files,
+            media_positions=media_positions,
+            canonical_home=canonical_home,
+        )
+    )
+
+
+def _proactive_spool_path(pconfig: Any, spool_path: Optional[str]) -> str:
+    if spool_path:
+        return spool_path
+    extra = getattr(pconfig, "extra", {}) or {}
+    return str(
+        extra.get("spool_path")
+        or profile_env("COZYGATEWAY_SPOOL_PATH")
+        or _default_spool_path(_current_owner())
+    )
+
+
+def _proactive_media_id(delivery_id: str, index: int, sha256: Optional[str] = None) -> str:
+    """Mint a scheduled attachment id in the ONE shape the device can fetch back.
+
+    The bytes of a scheduled attachment are stored and retained exactly like a live-turn
+    attachment's, but the device-facing fetch route validates the id before it looks
+    anything up (``isPhotoFileId`` / ``FILE_ID_RE`` = 32 lowercase hex,
+    packages/gateway/src/hermes-bridge/photos.ts:308-312, used at
+    packages/gateway/src/hermes-bridge/routes.ts:1250). A ``scheduled_media_``-prefixed
+    id passes the permissive upload validator but fails that one, so the photo rendered
+    from the delivery and then read as "no longer available" on every later visit --
+    a fetch rejection, never an expiry or a rollback.
+
+    A live-turn attachment once used ``uuid.uuid4().hex`` (32 hex). This id is the
+    deterministic counterpart of that shape, and every path now mints ids here: the same
+    digest as before, minus the prefix, so it stays stable across retries of one
+    occurrence (retries must reuse the id, not upload a second copy) while being servable
+    for as long as the message lives.
+
+    ``sha256`` makes the id content addressed. Retrying an occurrence reuses the id, but
+    a file rewritten in place between attempts is different bytes and so gets a different
+    id: one id must never point at two different payloads.
+    """
+    material = f"{delivery_id}\0{index}" if sha256 is None else f"{delivery_id}\0{index}\0{sha256}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def _durable_receipt(spool: Optional[AttachSpool], delivery_id: str) -> Optional[str]:
+    """The projection state a receipt has ALREADY established, without waiting for one.
+
+    Replaces the two-second projection stall (spec finding 4): a receipt that arrived
+    while the upload was in flight still counts, and one that has not arrived leaves the
+    delivery pending rather than failed.
+    """
+    if spool is None:
+        return None
+    try:
+        row = spool.delivery_receipt_row(delivery_id)
+    except Exception:  # noqa: BLE001 - an unreadable receipt is simply not one
+        logger.debug("attach: durable receipt read failed", exc_info=True)
+        return None
+    if not row:
+        return None
+    state = str(row.get("state") or "")
+    if state == "displayed":
+        return "projected"
+    if state == "failed" and row.get("stage") == "authorization":
+        return "blocked"
+    return state or None
+
+
+def _decorate_send_result(result: Any, field: str, payload: Dict[str, Any]) -> None:
+    """Carry structured detail on the harness' SendResult when it allows it.
+
+    ``media_result`` is the media outcome; ``delivery_lifecycle`` is the accepted-pending
+    state a durable send has no upstream field for (``SendResult`` models success and
+    error only). Hermes owns that class, so a slotted or frozen build simply does not
+    carry either one: the committed reply text, the durable spool rows and
+    ``delivery_state()`` remain the authority.
+    """
+    try:
+        setattr(result, field, payload)
+    except Exception:  # noqa: BLE001 - decoration is never worth failing a send for
+        logger.debug("attach: could not decorate SendResult with %s", field, exc_info=True)
+
+
+def _proactive_identity(delivery_key: str) -> Tuple[str, str]:
+    delivery_id = "scheduled:" + delivery_key
+    message_id = "scheduled-" + hashlib.sha256(
+        delivery_id.encode("utf-8")
+    ).hexdigest()[:32]
+    return delivery_id, message_id
+
+
+def _apply_projection(
+    result: Dict[str, Any], receipt: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    if receipt is None:
+        return result
+    if receipt.get("state") in {"projected", "blocked"}:
+        result["state"] = receipt["state"]
+        result["accepted_pending"] = False
+        if receipt["state"] == "projected":
+            result["projectedAt"] = receipt.get("projectedAt")
+        else:
+            result["attempts"] = receipt.get("attempts")
+    return _merge_receipt_extensions(result, receipt)
+
+
+def _merge_receipt_extensions(
+    result: Dict[str, Any], receipt: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Surface the additive receipt fields when the gateway sends them.
+
+    "projected" remains the cron-ABI success. These fields only ever add detail, so a gateway that
+    predates durable receipts (and omits them) leaves the result exactly as it was.
+    """
+    displayed_at = receipt.get("displayedAt")
+    if isinstance(displayed_at, int) and not isinstance(displayed_at, bool):
+        result["displayedAt"] = displayed_at
+    terminal = receipt.get("terminal")
+    if isinstance(terminal, dict) and isinstance(terminal.get("state"), str):
+        result["terminal"] = dict(terminal)
+    return result
+
+
+def delivery_state(pconfig: Any, delivery_key: str) -> Dict[str, Any]:
+    """Read the locally persisted terminal state of one delivery occurrence.
+
+    ``delivery_key`` is the same key the send used (the Hermes session id, or the caller-supplied
+    key), so ops and Cleo can ask "did that 3:03 AM report ever land?" without a live socket. A key
+    already carrying the ``turn:`` prefix names a REPLY made in a live conversation, whose media is
+    journaled under that same id; it is answerable the moment the phone reports the row on screen,
+    which is the question an agent actually gets asked ("did you see the picture?").
+
+    Returns ``{"state": "unknown", ...}`` when no receipt has arrived yet. ``media`` is present only
+    when the occurrence carried attachments, so the scheduled reading is unchanged for text.
+    """
+    if delivery_key.startswith(TURN_DELIVERY_PREFIX):
+        delivery_id = delivery_key
+        message_id = delivery_key[len(TURN_DELIVERY_PREFIX):]
+    else:
+        delivery_id, message_id = _proactive_identity(delivery_key)
+    spool = AttachSpool(_proactive_spool_path(pconfig, None))
+    try:
+        row = spool.delivery_receipt_row(delivery_id)
+        media = spool.media_rows(delivery_id)
+    finally:
+        spool.close()
+    result: Dict[str, Any] = dict(row) if row is not None else {"state": "unknown"}
+    result["deliveryId"] = delivery_id
+    result["messageId"] = message_id
+    if media:
+        result["media"] = media
+    return result
+
+
+def _proactive_media_error(
+    path: str, exc: Exception, descriptor: Optional[MediaDescriptor] = None
+) -> str:
+    """One bounded, human-readable upload failure line. Never carries payload bytes.
+
+    An HTTP rejection (notably ``415`` for a type the gateway does not accept) also
+    names the file's detected MIME and family, because "io_error" on its own left
+    production guessing which attachment the gateway refused and why.
+    """
+    name = os.path.basename(path)[:128] or "attachment"
+    if isinstance(exc, HTTPError):
+        mime = descriptor.mime if descriptor is not None else (
+            mimetypes.guess_type(path)[0] or "application/octet-stream"
+        )
+        family = descriptor.family if descriptor is not None else AttachAdapter._media_family(path)
+        phrase = str(getattr(exc, "reason", "") or "")[:64].strip()
+        detail = f"http_{exc.code}"
+        if phrase:
+            detail = f"{detail} {phrase}"
+        return f"{name} ({mime}, family={family}): {detail}"
+    if isinstance(exc, FileNotFoundError):
+        reason = "not_found"
+    elif isinstance(exc, PermissionError):
+        reason = "access_denied"
+    elif isinstance(exc, ValueError) and "size cap" in str(exc):
+        reason = "size_limit"
+    elif isinstance(exc, OSError):
+        reason = "io_error"
+    else:
+        reason = "upload_failed"
+    return f"{name}: {reason}"
+
+
+def _proactive_failure(error: str, delivery_id: Optional[str] = None, message_id: Optional[str] = None, media_errors: Optional[List[str]] = None) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"state": "failed", "accepted_pending": False, "error": error}
+    if delivery_id is not None:
+        result["deliveryId"] = delivery_id
+    if message_id is not None:
+        result["messageId"] = message_id
+    if media_errors:
+        result["media_errors"] = media_errors
+    return result
+
+
+async def _proactive_projection(client: AttachV1Client, delivery_id: str, timeout_seconds: float) -> Optional[Dict[str, Any]]:
+    deadline = time.monotonic() + max(0.0, min(timeout_seconds, 2.0))
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining < 0:
+            return None
+        try:
+            receipt = await client.delivery_receipt(delivery_id, max(0.05, remaining))
+        except Exception:  # noqa: BLE001 - journaled state remains the honest fallback
+            return None
+        if receipt is not None and receipt.get("state") in {"projected", "blocked"}:
+            return receipt
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(0.05, remaining))
+
+
+def _release_one_shot_transport(spool: AttachSpool) -> None:
+    spool.release_transport_lease()
+    spool.close()
+
+
+def _retain_one_shot_cleanup(task: asyncio.Task) -> asyncio.Task:
+    _ONE_SHOT_CLEANUP_TASKS.add(task)
+    task.add_done_callback(_ONE_SHOT_CLEANUP_TASKS.discard)
+    return task
+
+
+def _defer_one_shot_transport_release(
+    client: AttachV1Client, watch_task: asyncio.Task, spool: AttachSpool
+) -> None:
+    """Retain a stuck one-shot lease until socket and watcher have stopped."""
+
+    async def release_when_settled() -> None:
+        try:
+            await asyncio.shield(watch_task)
+        except BaseException:  # A failed/cancelled watcher is still settled.
+            pass
+        await client.wait_closed()
+        _release_one_shot_transport(spool)
+
+    _retain_one_shot_cleanup(asyncio.create_task(release_when_settled()))
+
+
+async def _wait_one_shot_watcher(watch_task: asyncio.Task) -> bool:
+    try:
+        await asyncio.wait_for(asyncio.shield(watch_task), _ONE_SHOT_CLEANUP_SECONDS)
+        return True
+    except asyncio.TimeoutError:
+        watch_task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(watch_task), _ONE_SHOT_CLEANUP_SECONDS)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        except (asyncio.CancelledError, Exception):
+            return True
+    except (asyncio.CancelledError, Exception):
+        return True
+
+
+async def _wait_one_shot_socket(client: AttachV1Client) -> bool:
+    try:
+        await asyncio.wait_for(client.wait_closed(), _ONE_SHOT_CLEANUP_SECONDS)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def _settle_one_shot_transport(
+    client: AttachV1Client, watch_task: asyncio.Task, spool: AttachSpool
+) -> None:
+    """Close a one-shot client before releasing its exclusive spool lease.
+
+    The normal path waits briefly for a graceful watcher exit.  A pathological
+    watcher cannot make a cancelled cron task hang: it is cancelled after the
+    first bound and its lease is held by a small deferred finalizer until it
+    finally exits.
+    """
+    try:
+        await asyncio.wait_for(client.close(), _ONE_SHOT_CLEANUP_SECONDS)
+    except asyncio.CancelledError:
+        _defer_one_shot_transport_release(client, watch_task, spool)
+        raise
+    except Exception:
+        logger.debug("attach: one-shot client close did not complete cleanly", exc_info=True)
+
+    if not await _wait_one_shot_watcher(watch_task):
+        _defer_one_shot_transport_release(client, watch_task, spool)
+        return
+    if not await _wait_one_shot_socket(client):
+        _defer_one_shot_transport_release(client, watch_task, spool)
+        return
+    _release_one_shot_transport(spool)
+
+
+async def enqueue_proactive_delivery(
+    pconfig: Any,
+    *,
+    thread_id: str,
+    delivery_key: str,
+    message: str,
+    media_files: Optional[List[str]] = None,
+    media_positions: Optional[List[int]] = None,
+    media_policy: str = "atomic",
+    spool_path: Optional[str] = None,
+    canonical_home: bool = False,
+) -> Dict[str, Any]:
+    """Journal one unanchored delivery for any proactive agent trigger.
+
+    ``delivery_key`` is owned by the trigger producer and must stay stable across retries. Hermes
+    cron is the implemented producer; deeper agent hooks may use this public seam with their own
+    durable occurrence ids when they are added.
+    """
+    text = str(message)
+    target_thread = thread_id.strip() if isinstance(thread_id, str) else ""
+    key = delivery_key.strip() if isinstance(delivery_key, str) else ""
+    if not target_thread and not canonical_home:
+        return _proactive_failure("target_required")
+    if not key:
+        return _proactive_failure("delivery_key_required")
+    paths = _normalized_media_paths(media_files)
+    if media_policy not in {"atomic", "allow_partial_media"}:
+        return _proactive_failure("invalid_media_policy")
+    delivery_id, message_id = _proactive_identity(key)
+    if len(paths) > 16:
+        return _proactive_failure("media_count_exceeded", delivery_id, message_id)
+    # Silence is success, not an empty transcript row or a newly-created spool.
+    if not text.strip() and not paths:
+        return {"state": "suppressed", "accepted_pending": False}
+    extra = getattr(pconfig, "extra", {}) or {}
+    try:
+        receipt_timeout = min(2.0, max(0.0, float(extra.get("receipt_timeout_seconds", 0.25))))
+    except (TypeError, ValueError):
+        receipt_timeout = 0.25
+    spool = AttachSpool(_proactive_spool_path(pconfig, spool_path))
+    watch_task: Optional[asyncio.Task] = None
+    try:
+        media_ids: List[str] = []
+        media_errors: List[str] = []
+        # Cron and tools call this under the owning profile's scope; resolve it once, here.
+        settings, owner = _attach_settings(pconfig), _current_owner()
+        configured_token = settings.token
+        client = AttachV1Client(AttachV1ClientConfig(
+            gateway_url=settings.gateway_url,
+            token=configured_token,
+            token_provider=lambda: _fresh_attach_token(configured_token, owner),
+            spool=spool,
+            ca_file=settings.ca_file,
+        ))
+        service = MediaUploadService(
+            client,
+            delivery_id=delivery_id,
+            destination=MediaDestination(
+                "canonical_home" if canonical_home else "thread", target_thread
+            ),
+            spool=spool,
+        )
+        positions: Optional[List[int]] = None
+        if paths:
+            sendable = paths[:16]
+            aligned = (
+                list(media_positions[: len(sendable)])
+                if media_positions is not None and len(media_positions) == len(paths)
+                else None
+            )
+            batch = await service.upload(sendable, aligned)
+            media_ids = batch.media_ids
+            positions = batch.media_positions
+            media_errors = batch.error_lines
+            if media_errors and media_policy == "atomic":
+                # A later upload failure abandons the entire occurrence. Roll
+                # back every earlier successful upload before reporting the
+                # original failure; the client persists failed remote deletes
+                # for safe reconnect retry.
+                try:
+                    await client.rollback_uploaded_media(media_ids)
+                except Exception:  # noqa: BLE001 - preserve the media failure as the public result
+                    logger.warning("attach: atomic scheduled-media rollback failed", exc_info=True)
+                service.mark_blocked(media_ids, "atomic occurrence abandoned before journal")
+                return _proactive_failure("media_upload_failed", delivery_id, message_id, media_errors)
+        blocks = normalize_text_to_blocks(text)
+        if not blocks and not media_ids:
+            return _proactive_failure("media_upload_failed", delivery_id, message_id, media_errors)
+        frame = await client.send_scheduled(
+            target_thread,
+            delivery_id,
+            message_id,
+            blocks,
+            media_ids,
+            canonical_home=canonical_home,
+            media_positions=positions,
+        )
+        if frame is None:
+            return _proactive_failure("scheduled_not_supported", delivery_id, message_id, media_errors)
+        service.mark_journaled(media_ids)
+        result: Dict[str, Any] = {
+            "state": "journaled_partial" if media_errors else "journaled",
+            "accepted_pending": True,
+            "deliveryId": delivery_id,
+            "messageId": message_id,
+            "eventId": frame["eventId"],
+        }
+        if media_errors:
+            result["media_errors"] = media_errors
+        if spool.acquire_transport_lease():
+            try:
+                await client.connect()
+                watch_task = asyncio.create_task(client.watch())
+            except Exception:  # noqa: BLE001 - the durable local journal remains replayable
+                spool.release_transport_lease()
+        receipt = await _proactive_projection(client, delivery_id, receipt_timeout) if watch_task is not None else None
+        return _apply_projection(result, receipt)
+    finally:
+        if watch_task is None:
+            spool.close()
+        else:
+            # Shield only teardown: the caller still receives its original
+            # CancelledError, but cannot release the shared transport lease
+            # while this socket/watch pair remains live.
+            cleanup = _retain_one_shot_cleanup(
+                asyncio.create_task(_settle_one_shot_transport(client, watch_task, spool))
+            )
+            await asyncio.shield(cleanup)
+
+
+def register(ctx: Any) -> None:
+    """Plugin entry point: register the platform and the tool-chip hooks.
+
+    The adapter is built lazily so importing this module (e.g. to call ``register``)
+    never requires the harness to be fully initialized.
+    """
+    try:
+        from .execution_health import start_from_environment
+        start_from_environment()
+    except Exception:
+        logger.debug("attach: execution health server unavailable", exc_info=True)
+    ctx.register_platform(
+        name=PLATFORM_NAME,
+        label="CozyGateway",
+        adapter_factory=lambda cfg: _make_adapter_class()(cfg),
+        check_fn=check_requirements,
+        is_connected=is_connected,
+        env_enablement_fn=_env_enablement,
+        required_env=["COZYGATEWAY_URL", "COZYGATEWAY_TOKEN"],
+        install_hint="Needs the 'websockets' package (pip install websockets)",
+        emoji="🧵",
+        pii_safe=True,
+        cron_deliver_env_var="COZYGATEWAY_HOME_CHANNEL",
+        standalone_sender_fn=_hermes_standalone_send,
+        send_message_handler=_send_message_handler,
+        platform_hint=(
+            "You are in a live session. Your reply streams live and is committed to "
+            "the conversation. Markdown renders richly: use ## headings, - bullet / "
+            "1. numbered / - [ ] task lists, | pipe | tables |, fenced code blocks, "
+            "and $$ math. Inline bold and links show as literal text, so prefer the "
+            "block forms above. For native attachments, prefer the cozy_send_media tool: "
+            "it sends native attachments immediately to this originating conversation, "
+            "and after using it do not repeat MEDIA: directives for the same files. "
+            "A journaled attachment result is pending, not proof of commit or display; "
+            "use cozy_media_delivery_status with its deliveryId before claiming either. "
+            "If the typed tool is unavailable, MEDIA:/absolute/path is the fallback: put "
+            "one MEDIA:/absolute/path directive on each line of your final response; multiple directive lines "
+            "send multiple attachments. Keep directives outside code fences. These "
+            "directives automatically target this originating conversation. Use MEDIA: instead "
+            "of sandbox links or file:// URLs for native delivery."
+        ),
+    )
+    ctx.register_tool(
+        name="cozyapp_upsert", toolset="cozygateway",
+        schema={"name": "cozyapp_upsert", "description": (
+            "Create or update this bot's durable CozyApp using one COMPLETE safe native tree. "
+            "tree is exactly {root: NODE}; every NODE has unique id matching [A-Za-z0-9_-]+ (1-128 chars), "
+            "and is exactly one closed form: stack {id,kind:'stack',children:NODE[]}; "
+            "section {id,kind:'section',title?,children:NODE[]}; "
+            "text {id,kind:'text',text,style?:'body'|'title'|'caption'}; "
+            "image {id,kind:'image',source:'https://...',alt?}; "
+            "list {id,kind:'list',items:string[]}; keyValue {id,kind:'keyValue',key,value}; or "
+            "button {id,kind:'button',label,actionId,role:'primary'|'secondary'|'destructive'}. "
+            "No other node kinds or fields. Use root stack/section for children; image source must be HTTPS. "
+            "Keep the whole tree within 12 nesting levels, 200 nodes, and 128KiB. appId is your stable logical "
+            "identifier; use the same appId to update an app. The Gateway owns creator identity and user rename."
+        ), "parameters": {"type": "object", "properties": {"appId": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$"}, "name": {"type": "string", "minLength": 1, "maxLength": 120}, "tree": {"type": "object", "properties": {"root": {"type": "object"}}, "required": ["root"], "additionalProperties": False}}, "required": ["appId", "name", "tree"], "additionalProperties": False}},
+        handler=_cozyapp_upsert, is_async=True, description="Create or update a durable native CozyApp with the closed v1 node catalog.", emoji="📱",
+    )
+    ctx.register_tool(
+        name="cozy_send_media",
+        toolset="cozygateway",
+        schema={
+            "name": "cozy_send_media",
+            "description": (
+                "Send 1-16 absolute local-path native attachments immediately to the current "
+                "originating CozyGateway conversation. Do not repeat MEDIA: directives for the "
+                "same files after using it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "description": "One to 16 absolute local paths to attach, in delivery order.",
+                        "minItems": 1,
+                        "maxItems": 16,
+                        "items": {
+                            "type": "string",
+                            "description": "An absolute local path.",
+                            "minLength": 1,
+                        },
+                    },
+                    "caption": {
+                        "type": "string",
+                        "description": "Optional caption shown with the attachments.",
+                        "maxLength": _SEND_MEDIA_CAPTION_MAX,
+                    },
+                },
+                "required": ["paths"],
+                "additionalProperties": False,
+            },
+        },
+        handler=_cozy_send_media,
+        is_async=True,
+        description="Send native attachments to the current CozyGateway conversation.",
+        emoji="📤",
+    )
+    ctx.register_tool(
+        name="cozy_media_delivery_status",
+        toolset="cozygateway",
+        schema={
+            "name": "cozy_media_delivery_status",
+            "description": (
+                "Check the receipt for a prior cozy_send_media delivery in this exact live "
+                "conversation. A journaled result remains pending until a receipt confirms it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"deliveryId": {
+                    "type": "string", "description": "The deliveryId returned by cozy_send_media.",
+                    "pattern": "^scheduled:live-media:[0-9a-f]{64}$",
+                }},
+                "required": ["deliveryId"], "additionalProperties": False,
+            },
+        },
+        handler=_cozy_media_delivery_status,
+        is_async=True,
+        description="Check a native attachment delivery receipt in the current live conversation.",
+        emoji="📬",
+    )
+    ctx.register_tool(
+        name="cozy_device_status",
+        toolset="cozygateway",
+        schema={
+            "name": "cozy_device_status",
+            "description": "Request one consented status reading from the phone that started this live chat turn.",
+            "parameters": {
+                "type": "object",
+                "properties": {"purpose": {"type": "string", "minLength": 1, "maxLength": 160}},
+                "required": ["purpose"], "additionalProperties": False,
+            },
+        },
+        handler=_cozy_device_status,
+        is_async=True,
+        description="Request one consented device-status reading in the active CozyGateway turn.",
+        emoji="📱",
+    )
+    ctx.register_tool(
+        name="cozy_request_location",
+        toolset="cozygateway",
+        schema={
+            "name": "cozy_request_location",
+            "description": "Request one consented approximate phone location in the active CozyGateway turn.",
+            "parameters": {
+                "type": "object",
+                "properties": {"purpose": {"type": "string", "minLength": 1, "maxLength": 160}},
+                "required": ["purpose"], "additionalProperties": False,
+            },
+        },
+        handler=_cozy_request_location,
+        is_async=True,
+        description="Request one consented approximate location in the active CozyGateway turn.",
+        emoji="📍",
+    )
+    ctx.register_tool(name="cozy_capture_camera", toolset="cozygateway", schema={"name": "cozy_capture_camera", "description": "Request one foreground camera capture from the phone that started this turn.", "parameters": {"type": "object", "properties": {"purpose": {"type": "string", "minLength": 1, "maxLength": 160}, "camera": {"type": "string", "enum": ["front", "rear"]}, "capture": {"type": "string", "enum": ["photo", "video"]}}, "required": ["purpose", "camera", "capture"], "additionalProperties": False}}, handler=_cozy_capture_camera, is_async=True, description="Request one consented foreground camera capture.", emoji="📷")
+    ctx.register_tool(name="cozy_pick_file", toolset="cozygateway", schema={"name": "cozy_pick_file", "description": "Ask the user to choose one photo or file to share from their phone.", "parameters": {"type": "object", "properties": {"purpose": {"type": "string", "minLength": 1, "maxLength": 160}, "selection": {"type": "string", "enum": ["photo", "file"]}}, "required": ["purpose", "selection"], "additionalProperties": False}}, handler=_cozy_pick_file, is_async=True, description="Request one user-selected phone file.", emoji="📎")
+    ctx.register_tool(name="cozy_present_notification", toolset="cozygateway", schema={"name": "cozy_present_notification", "description": "Present an actionable local notification for this live turn.", "parameters": {"type": "object", "properties": {"purpose": {"type": "string", "minLength": 1, "maxLength": 160}, "title": {"type": "string", "minLength": 1, "maxLength": 80}, "body": {"type": "string", "minLength": 1, "maxLength": 240}}, "required": ["purpose", "title", "body"], "additionalProperties": False}}, handler=_cozy_present_notification, is_async=True, description="Present an actionable local notification.", emoji="🔔")
+    # Register the tool-lifecycle hooks that feed the live tool-chip tap. If the
+    # harness build does not support hook registration, degrade gracefully: the
+    # platform still streams text, only the chips are absent.
+    try:
+        ctx.register_hook("pre_tool_call", _pre_tool_call)
+        ctx.register_hook("post_tool_call", _post_tool_call)
+        ctx.register_hook("pre_approval_request", _pre_approval_request)
+        ctx.register_hook("post_approval_response", _post_approval_response)
+        ctx.register_hook("subagent_start", _subagent_start)
+        ctx.register_hook("subagent_stop", _subagent_stop)
+        # Live thinking preview (capability ``thinking``). Inert until the user opts in
+        # with ``plugins.stream_reasoning_deltas: true`` in the Hermes config.
+        ctx.register_hook("on_stream_delta", _on_stream_delta)
+    except Exception:  # noqa: BLE001 - no chips, never crash
+        logger.debug("attach: tool-lifecycle hooks unavailable; chips disabled", exc_info=True)

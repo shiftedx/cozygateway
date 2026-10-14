@@ -1,0 +1,1168 @@
+#!/usr/bin/env bash
+# Make a freshly created bot actually chattable.
+#
+# THE PROBLEM (issue #183)
+#   POST /bots creates a Hermes profile and a roster row, and that is where it
+#   stopped. Chat rides a NATIVE attach binding that has three halves, none of
+#   which POST /bots could create:
+#
+#     1. The gateway (docker, on the box) builds its nativeBots set at BOOT from
+#        hermes.profiles in the mounted config. A profile absent from that map
+#        has no attach identity, and its token env var has to exist too.
+#     2. The Mac side needs the cozygateway attach plugin SYNCED into
+#        ~/.hermes/profiles/<p>/plugins/ and a token in the profile's .env.
+#     3. A per-profile launchd gateway process (ai.hermes.gateway-<p>) has to be
+#        running, because that process is what dials the attach stream.
+#
+#   The six working bots were hand-provisioned across earlier waves. This script
+#   is that hand work, written down and made idempotent.
+#
+# WHAT IT ASSUMES
+#   Profile config already names the plugin (plugins.enabled contains
+#   cozygateway). The gateway seed writes that at create time
+#   (packages/gateway/src/hermes-bridge/blank-slate-seed.ts). A profile without
+#   it is skipped rather than converted: opting a profile into the phone surface
+#   is a decision, and this script executes decisions, it does not make them.
+#
+# IDEMPOTENCE
+#   Every step is a check-then-act against real state, so a second run is a
+#   no-op and a run interrupted halfway is repaired by the next one. In
+#   particular a token already scoped to this profile home is never rotated,
+#   which is what keeps the existing live bots untouched
+#   when the watcher sweeps every 30 seconds.
+#
+# SHADOW-DIR TRAP (repo memory: hermes-plugin-shadow-dir-gotcha)
+#   Hermes loads ANY dir under plugins/ carrying a plugin.yaml, by manifest name
+#   and scan-order luck, so a backup left inside plugins/ can silently win over
+#   the real one. This script refuses to touch a plugins/ dir containing one.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The installer preserves this repository-relative layout in its staged
+# payload. Do not change SRC_DIR back to the checkout: a LaunchAgent cannot read
+# a checkout under ~/Documents because macOS TCC blocks background access.
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SRC_DIR="$REPO_ROOT/integrations/attach-plugin"
+
+HERMES_HOME_ROOT="${HERMES_HOME_ROOT:-$HOME/.hermes}"
+HERMES_BIN="${HERMES_BIN:-hermes}"
+BOX_SSH="${BOX_SSH:-operator@gateway-host}"
+BOX_REPO="${BOX_REPO:-/home/operator/cozygateway}"
+BOX_CONFIG_REL="${BOX_CONFIG_REL:-local/config/cozygateway.config.json}"
+GATEWAY_URL="${GATEWAY_URL:-https://gateway.example.com}"
+HOME_CHANNEL="${HOME_CHANNEL:-thread}"
+INSTALLER_OWNER="${INSTALLER_OWNER:-cozylabs-v1}"
+VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-90}"
+# Credentials a fresh profile inherits that only ONE gateway may hold at a time.
+# See unclaim_inherited_platforms for what goes wrong when two do.
+SINGLE_HOLDER_CREDENTIALS=(DISCORD_BOT_TOKEN)
+DRY_RUN=0
+SKIP_VERIFY=0
+# Set when this run wrote the box env or config; the recreate is gated on it.
+BOX_CHANGED=0
+PROFILES=()
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'WARN  %s\n' "$*" >&2; }
+die()  { printf 'FAIL  %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  cat <<USAGE
+usage: provision-bot.sh [options] <profile> [profile ...]
+
+Binds a Hermes profile to the CozyGateway attach surface so its bot is
+chattable from the phone: plugin sync, token mint, box config + env entry,
+gateway recreate, per-profile launchd service, live verification.
+
+Idempotent. Safe to re-run. Keeps tokens scoped to existing profile homes.
+
+  -n, --dry-run          print every step, change nothing
+  --no-verify            skip the live attach verification at the end
+  --gateway-url URL      gateway base URL (default $GATEWAY_URL)
+  --box HOST             ssh target for the gateway box (default $BOX_SSH)
+  --box-repo DIR         repo checkout on the box (default $BOX_REPO)
+  --hermes-home DIR      hermes home (default \$HERMES_HOME_ROOT or ~/.hermes)
+  --verify-timeout SEC   how long to wait for the profile to attach (default $VERIFY_TIMEOUT)
+  -h, --help             show this help
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=1; shift ;;
+    --no-verify) SKIP_VERIFY=1; shift ;;
+    --gateway-url) GATEWAY_URL="$2"; shift 2 ;;
+    --box) BOX_SSH="$2"; shift 2 ;;
+    --box-repo) BOX_REPO="$2"; shift 2 ;;
+    --hermes-home) HERMES_HOME_ROOT="$2"; shift 2 ;;
+    --verify-timeout) VERIFY_TIMEOUT="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1" ;;
+    *) PROFILES+=("$1"); shift ;;
+  esac
+done
+for arg in "$@"; do PROFILES+=("$arg"); done
+
+[ "${#PROFILES[@]}" -gt 0 ] || { usage >&2; die "no profile named"; }
+# The same names the watcher and the deprovisioner accept: a profile name becomes a path, a launchd
+# label, an env key and a box config entry, so anything else is refused before any of those.
+for profile in "${PROFILES[@]}"; do
+  [[ "$profile" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || die "invalid profile name: $profile"
+done
+have python3 || die "python3 not found on PATH"
+have openssl || die "openssl not found on PATH"
+have rsync || die "rsync not found on PATH"
+have ssh || die "ssh not found on PATH"
+[ -d "$SRC_DIR" ] || die "plugin source not found: $SRC_DIR"
+
+# The venv python is the one that certainly has PyYAML, because it is the
+# interpreter Hermes itself runs under. Fall back to the system one so a
+# --dry-run on a machine without a Hermes install still reports honestly.
+PYTHON="$HERMES_HOME_ROOT/hermes-agent/venv/bin/python"
+[ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
+# shellcheck source=hermes-host.sh
+. "$SCRIPT_DIR/hermes-host.sh"
+
+# The env-var name the gateway config points at, derived the way the six live
+# entries were: upper-cased, every non-alphanumeric run folded to one _.
+token_env_name() {
+  printf 'COZYGATEWAY_ATTACH_TOKEN_%s\n' \
+    "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' '_' | sed 's/_*$//')"
+}
+
+# --- profile-side reads ---------------------------------------------------
+
+# NOTE on PyYAML: this read, unlike the streaming read below, still REQUIRES
+# PyYAML and stops the run without it. That is deliberate and unchanged: these
+# two scripts are the dev-box provisioner (not shipped to
+# end users), they run beside a Hermes venv that always has PyYAML,
+# and "is this profile opted in" decides whether a bot is touched at all, which
+# is not a question to answer conservatively from a partial parse. The
+# host-PyYAML-free guarantee covers the shipped installer and the streaming keys.
+# True when the profile's own config names the attach plugin. Parsed with YAML
+# rather than grep because "is cozygateway in plugins.enabled" is a structural
+# question and a grep for the bare name matches the disabled list just as well.
+profile_wants_plugin() {
+  "$PYTHON" - "$1" <<'PY'
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(2)
+from pathlib import Path
+path = Path(sys.argv[1]) / "config.yaml"
+if not path.exists():
+    sys.exit(1)
+try:
+    data = yaml.safe_load(path.read_text()) or {}
+except Exception:
+    sys.exit(1)
+plugins = data.get("plugins") or {}
+enabled = plugins.get("enabled") or []
+sys.exit(0 if "cozygateway" in enabled else 1)
+PY
+}
+
+# The keys Hermes reads before it will stream a reply, and before it will stream
+# one often enough to look like a stream, printed one `key=value` per line when
+# the profile does not carry them.
+#
+# Hermes' own default is silence: `StreamingConfig.enabled` is false
+# (gateway/config.py) and `_setup_stream_consumer` asks the runner for stream
+# deltas only when `display.platforms.<platform>.streaming` resolves true for
+# the turn's platform. `cozygateway` has no per-platform default of its own, so
+# a profile that names neither key never emits a single draft frame and the
+# phone only ever receives the finished message.
+#
+# Cadence is the second half, and a separate top-level key. `_should_edit`
+# flushes at most one frame per `streaming.edit_interval` (0.8s) unless
+# `streaming.buffer_threshold` (24) is reached, which is Telegram's
+# one-edit-a-second envelope and turns a minute-long reply into a couple of
+# frames on the wire. Both are read by `StreamingConfig.from_dict`, so seeding
+# them is a value Hermes already understands, not a change to any Hermes source.
+#
+# Structural, not a grep: only a parse can tell an absent key from one an
+# operator deliberately set to false, and only the absent ones may be written.
+# PyYAML does that when the interpreter has it, which the Hermes venv always
+# does because Hermes itself depends on it. It is NOT a requirement: a host
+# whose python has no PyYAML (a hosted CI runner, a plain system python) falls
+# back to a conservative stdlib probe that answers only when the file is simple
+# enough to be certain, and otherwise says the keys are present so nothing is
+# written.
+streaming_keys_absent() {
+  "$PYTHON" - --streaming-keys "$1" <<'PY' | tr -d '\r'
+import re
+import sys
+from pathlib import Path
+
+# Each entry is a config path and the value to write when the profile does not
+# carry it. The two `display` keys turn streaming ON at all; the two top-level
+# `streaming` keys decide how OFTEN an in-flight reply is pushed. Hermes'
+# defaults there are a 0.8 second edit interval and a 24 codepoint buffer
+# threshold (gateway/config.py), which is Telegram's one-edit-a-second envelope
+# and shows up on a phone as two frames for a minute-long answer instead of a
+# stream. Both are read by `StreamingConfig.from_dict`, so this is a value
+# Hermes already understands and not a change to any Hermes source.
+WANTED = (
+    (("display", "streaming"), "true"),
+    (("display", "platforms", "cozygateway", "streaming"), "true"),
+    (("streaming", "edit_interval"), "0.05"),
+    (("streaming", "buffer_threshold"), "1"),
+    # The live thinking preview. Hermes hands the attach plugin's `on_stream_delta`
+    # hook reasoning deltas only when this reads true
+    # (agent/plugin_stream_hooks.py::stream_reasoning_deltas_enabled, default
+    # false), and it reads it from the CURRENT profile's config.yaml, per stream,
+    # even under a multiplexed host. Not a cadence key, so the platform guard
+    # below leaves it alone; an explicit false is kept like every other key here.
+    (("plugins", "stream_reasoning_deltas"), "true"),
+)
+WANTED_PATHS = tuple(path for path, _ in WANTED)
+KEY = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z0-9_][A-Za-z0-9_.\-]*):(?P<rest>[ \t].*|)$")
+BLOCK_SCALAR = re.compile(r"^[|>][0-9+-]*$")
+
+
+def block(parent, key):
+    value = parent.get(key) if isinstance(parent, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def report(path, value):
+    """One line of the answer: the dotted key, then the value to write for it."""
+    return ".".join(path) + "=" + value
+
+
+def absent_with_yaml(text, yaml):
+    data = yaml.safe_load(text) or {}
+    absent = []
+    for path, value in WANTED:
+        parent = data
+        for segment in path[:-1]:
+            parent = block(parent, segment)
+        if not isinstance(parent, dict) or parent.get(path[-1]) is None:
+            absent.append(report(path, value))
+    return absent
+
+
+def on_the_way(path):
+    """True when `path` is a prefix of a key this probe is looking for, so an
+    unjudgeable line there could hide one."""
+    return any(wanted[: len(path)] == path for wanted in WANTED_PATHS)
+
+
+def absent_without_yaml(text):
+    """Conservative block-mapping probe for a host with no PyYAML.
+
+    Returns the wanted keys this file certainly does not carry, or None when it
+    uses something this probe cannot judge WHERE ONE OF THOSE KEYS COULD BE (a
+    flow mapping, an anchor, a tag, a sequence, or any line it cannot parse,
+    which is what a merge key or a quoted key arrives as),
+    or anywhere at all for a tab or a second document. None means "assume they
+    are present", so the caller writes nothing: the only safe way to be unsure
+    about somebody's config file. Everything outside the top-level sections that
+    could hold a wanted key is skipped rather than judged.
+    """
+    stack = []
+    present = set()
+    containers = set()
+    seen_top = set()
+    inside_block_scalar_at = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        leading = line[: len(line) - len(line.lstrip())]
+        indent = len(leading)
+        if inside_block_scalar_at is not None:
+            # A block scalar's body is text, not structure: skip it wholesale
+            # rather than read a line of prose as a key.
+            if indent > inside_block_scalar_at:
+                continue
+            inside_block_scalar_at = None
+        if "\t" in leading:
+            return None
+        if stripped.startswith("---") or stripped.startswith("..."):
+            return None
+        # A sequence item may sit at the SAME indent as the key that owns it
+        # (`enabled:` then `- cozygateway`). Hermes itself saves through its
+        # indenting dumper (utils.py `IndentDumper`), so this is the shape of a
+        # hand-edited file or one dumped with PyYAML's defaults. A dash line
+        # therefore closes only the keys indented deeper than itself; otherwise
+        # such a `plugins.enabled` would read as a sequence directly under
+        # `plugins`, where a wanted key lives, and the probe would give up.
+        dash = stripped.startswith("-")
+        while stack and (indent < stack[-1][0] if dash else indent <= stack[-1][0]):
+            stack.pop()
+        path = tuple(key for _, key in stack)
+        if dash:
+            # A sequence where one of the wanted keys would be a mapping.
+            if on_the_way(path):
+                return None
+            continue
+        match = KEY.match(line)
+        if match is None:
+            if on_the_way(path):
+                return None
+            continue
+        # Every mapping that has a key under it. A wanted key written as
+        # `streaming:` with its value on the following, more indented lines has
+        # an EMPTY value here and is still present: PyYAML reads a dict, not
+        # None. Without this the probe would call it absent and the caller would
+        # replace the operator's block with a boolean.
+        containers.add(path)
+        key = match.group("key")
+        value = match.group("rest").strip()
+        if value.startswith("#"):
+            value = ""
+        here = path + (key,)
+        if BLOCK_SCALAR.match(value):
+            if on_the_way(here):
+                return None
+            inside_block_scalar_at = indent
+            continue
+        if value in ("{}", "[]"):
+            value = "empty"
+        elif value[:1] in ("{", "[", "&", "*", "!"):
+            if on_the_way(here):
+                return None
+            value = "unjudged"
+        if indent == 0:
+            if key in seen_top:
+                return None
+            seen_top.add(key)
+        if here in WANTED_PATHS and value != "":
+            present.add(here)
+        if value == "":
+            stack.append((indent, key))
+    return [
+        report(name, value)
+        for name, value in WANTED
+        if name not in present and name not in containers
+    ]
+
+
+# Never nerf Hermes. `streaming.edit_interval` and `streaming.buffer_threshold`
+# are TOP-LEVEL keys: Hermes has no per-platform override for either one and no
+# adapter seam for them, so tightening them on a profile that also runs Telegram
+# or Discord pushes those bots' edits at the same rate and straight into their
+# flood limits. A profile that serves anything but cozygateway therefore keeps
+# the cadence its operator has, and is told so. The two `display` switches are
+# unaffected: those ARE per-platform and only ever turn cozygateway on.
+#
+# "Serves anything but cozygateway" is answered two ways, both stdlib and both
+# identical with or without PyYAML so the two reader modes cannot disagree here:
+#
+#   * one of Hermes' first-party platform tokens is set in the profile's `.env`
+#     or the Hermes home's `.env`. `_PLATFORM_ENABLE_ENV_VARS` in
+#     hermes_cli/tools_config.py is that list, and env is where Hermes decides
+#     this, not config.yaml.
+#   * a plugin directory in the profile declares `kind: platform` and is not
+#     this one. Deliberately NOT filtered by `plugins.enabled`: a platform
+#     plugin sitting in the profile is enough to leave an operator's cadence
+#     alone, and reading the enabled list would need a YAML sequence parse the
+#     two modes could answer differently.
+#
+# Unsure reads as "another platform", which is the direction that writes nothing.
+# So does a token assigned in the HOME `.env` that the profile `.env` blanks:
+# the union is over names ASSIGNED anywhere, not over the value the profile
+# finally resolves to, so such a profile keeps its own cadence. That is the
+# withholding direction, and cheaper than reimplementing Hermes' env precedence.
+#
+# The two cadence keys are also seeded only TOGETHER. They are one setting read
+# as a disjunction (`(elapsed >= edit_interval and acc) or len(acc) >= threshold`),
+# so writing a threshold of 1 beside an operator's deliberate 2.0 second interval
+# makes that interval unreachable: every tick flushes anyway. An operator who set
+# either half therefore keeps both, and is told so.
+PLATFORM_ENV_VARS = (
+    "TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN",
+    "WHATSAPP_ENABLED", "QQ_APP_ID",
+)
+CADENCE_PREFIX = "streaming."
+CADENCE_KEYS = tuple(
+    ".".join(path) for path, _ in WANTED if path and path[0] == "streaming")
+
+
+def env_names(path):
+    """Names assigned a non-empty value in a dotenv file; empty when unreadable."""
+    names = set()
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return names
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        if value.strip().strip("\"'"):
+            names.add(name.strip().removeprefix("export").strip())
+    return names
+
+
+def other_chat_platform(profile_dir):
+    """Name of another chat platform this profile serves, or "" when only this one."""
+    homes = [profile_dir]
+    if profile_dir.parent.name == "profiles":
+        homes.append(profile_dir.parent.parent)
+    assigned = set()
+    for home in homes:
+        assigned |= env_names(home / ".env")
+    for name in PLATFORM_ENV_VARS:
+        if name in assigned:
+            return name
+    try:
+        entries = sorted(
+            entry for entry in (profile_dir / "plugins").iterdir() if entry.is_dir())
+    except Exception:
+        entries = []
+    for entry in entries:
+        if entry.name == "cozygateway":
+            continue
+        try:
+            manifest = (entry / "plugin.yaml").read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for raw in manifest.splitlines():
+            line = raw.strip()
+            if not line.startswith("kind:"):
+                continue
+            if line.split(":", 1)[1].strip().strip("\"'") == "platform":
+                return entry.name
+    return ""
+
+
+def main():
+    profile_dir = Path(sys.argv[2])
+    path = profile_dir / "config.yaml"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        sys.exit(1)
+    try:
+        import yaml
+    except ImportError:
+        yaml = None
+    if yaml is None:
+        absent = absent_without_yaml(text)
+        if absent is None:
+            return
+    else:
+        try:
+            absent = absent_with_yaml(text, yaml)
+        except Exception:
+            sys.exit(1)
+    cadence = [entry for entry in absent if entry.startswith(CADENCE_PREFIX)]
+    if cadence:
+        # A leading "!" marks a line the caller SAYS; it is never a key to write.
+        note = ""
+        if len(cadence) < len(CADENCE_KEYS):
+            missing = {entry.split("=", 1)[0] for entry in cadence}
+            note = "!cadence-partly-set:" + ",".join(
+                name for name in CADENCE_KEYS if name not in missing)
+        else:
+            other = other_chat_platform(profile_dir)
+            if other:
+                note = "!another-chat-platform:" + other
+        if note:
+            absent = [note] + [
+                entry for entry in absent if not entry.startswith(CADENCE_PREFIX)
+            ]
+    # Written as BYTES on purpose. A Windows interpreter translates "\n" into
+    # CRLF on a text stream, and the caller would then carry a "\r" inside every
+    # key name it went on to write.
+    sys.stdout.buffer.write("".join(name + "\n" for name in absent).encode("utf-8"))
+
+
+main()
+PY
+}
+
+# Reads one key out of an env file without ever echoing another one.
+env_value() {
+  local file="$1" key="$2"
+  [ -f "$file" ] || return 1
+  sed -n "s/^${key}=//p" "$file" | tail -n 1
+}
+
+# Blanks the inherited credentials that only one gateway may hold.
+#
+#   THE THRASH THIS PREVENTS, observed live while building this script:
+#   provcheck inherited cleo's DISCORD_BOT_TOKEN from the launch profile's
+#   .env. Both gateways then claimed the same Discord session, each taking it
+#   with an explicit --replace handoff that SIGTERMs the other, whose launchd
+#   job restarts it and takes it back. The two processes ping-ponged every ~30
+#   seconds, and each takeover tore down the attach adapter with it, so the new
+#   bot reported connectivity_lost / attach_lost on every turn and a LIVE bot
+#   was destabilised alongside it.
+#
+#   A bot created from the phone is a CozyGateway bot. It has no claim on the
+#   launch profile's messaging accounts, so the inherited values are blanked
+#   rather than left to fight. Blanked and not deleted, so the file still says
+#   out loud that this was decided.
+#
+#   Only ever on a FIRST provisioning. A profile the box already knows may have
+#   been given these credentials deliberately since, and taking them back on a
+#   30-second sweep would be the provisioner picking its own fight.
+unclaim_inherited_platforms() {
+  local file="$1" key value
+  for key in "${SINGLE_HOLDER_CREDENTIALS[@]}"; do
+    value="$(env_value "$file" "$key" || true)"
+    [ -n "$value" ] || continue
+    say "  unclaiming inherited $key (only one gateway may hold it)"
+    set_env_line "$file" "$key" ""
+  done
+}
+
+check_shadow_dir() {
+  local plugins_dir="$1" entry
+  [ -d "$plugins_dir" ] || return 0
+  for entry in "$plugins_dir"/*.pre-* "$plugins_dir"/*.bak*; do
+    [ -d "$entry" ] || continue
+    die "shadow-dir trap: backup dir inside plugins/: $entry
+      Hermes loads any dir under plugins/ with a matching plugin.yaml name, by
+      scan-order luck, so this backup can silently win over the real plugin.
+      Move it OUTSIDE plugins/ and re-run."
+  done
+}
+
+# --- steps ----------------------------------------------------------------
+
+# `rsync -a` deliberately preserves timestamps, so neither mtime nor a bare
+# manifest version is enough to decide whether a resident must be restarted.
+# Compare the actual staged file set and bytes first; the same exclusions are
+# used by sync_plugin below.
+plugin_content_matches_source() {
+  local dest="$1" source_files installed_files rel
+  [ -d "$dest" ] || return 1
+  source_files="$(cd "$SRC_DIR" && find . -type f ! -path '*/__pycache__/*' ! -path '*/.pytest_cache/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
+  installed_files="$(cd "$dest" && find . -type f ! -path '*/__pycache__/*' ! -path '*/.pytest_cache/*' ! -name '*.pyc' -print | LC_ALL=C sort)"
+  [ "$source_files" = "$installed_files" ] || return 1
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    cmp -s "$SRC_DIR/$rel" "$dest/$rel" || return 1
+  done <<EOF
+$source_files
+EOF
+}
+
+# Turns streaming on for a profile that never had it, and says nothing when it
+# already does. The write goes through Hermes' own `config set` rather than a
+# YAML rewrite here, so the file keeps whatever shape Hermes gives it and this
+# script never has to own a config writer.
+#
+# Set for the immediately following ensure_service call: Hermes reads the display
+# and cadence keys at gateway start, so a repaired profile streams only after one
+# restart.
+STREAMING_CONFIG_CHANGED=0
+# Keys Hermes re-reads on every reply, so writing one is the whole repair and a
+# restart would only drop in-flight turns. `plugins.stream_reasoning_deltas` is
+# looked up per stream (agent/stream_delivery.py resets its cache per stream)
+# through a config cache keyed on the file's stat signature.
+READ_PER_REPLY_KEYS=" plugins.stream_reasoning_deltas "
+needs_restart() { case "$READ_PER_REPLY_KEYS" in *" $1 "*) return 1 ;; *) return 0 ;; esac; }
+# Set when one of those keys was written AND the read-back found it on disk.
+READ_PER_REPLY_WROTE=0
+# A "!" line from the reader is a note to say, not a key to write. Both reads
+# below drop them, so a profile that keeps its own cadence is not mistaken for a
+# write that failed to land.
+streaming_notes() { printf '%s\n' "$1" | grep '^!' || true; }
+streaming_writes() { printf '%s\n' "$1" | grep -v '^!' || true; }
+ensure_streaming_config() {
+  local profile="$1" dir="$2" answer keys note entry key value rc=0 wrote="" missing="" restart=0
+  STREAMING_CONFIG_CHANGED=0
+  READ_PER_REPLY_WROTE=0
+  answer="$(streaming_keys_absent "$dir")" || rc=$?
+  if [ "$rc" != 0 ]; then
+    warn "[$profile] could not read config.yaml, leaving streaming settings alone"
+    return 0
+  fi
+  for note in $(streaming_notes "$answer"); do
+    case "$note" in
+      '!another-chat-platform:'*)
+        say "  profile also serves ${note#!another-chat-platform:}; leaving the streaming cadence as the operator set it (edit interval and buffer threshold are profile-wide, not per platform)" ;;
+      '!cadence-partly-set:'*)
+        say "  profile already sets ${note#!cadence-partly-set:}; leaving both streaming cadence keys alone (they are one setting: a buffer threshold of 1 would make a tuned edit interval unreachable)" ;;
+      *) say "  ${note#!}" ;;
+    esac
+  done
+  keys="$(streaming_writes "$answer")"
+  if [ -z "$keys" ]; then say "  streaming already decided in config.yaml"; return 0; fi
+  # Each line the reader printed is a key and the value to write for it, so a
+  # cadence knob is seeded with its own number rather than a bare true.
+  for entry in $keys; do
+    key="${entry%%=*}"; value="${entry#*=}"
+    if [ "$DRY_RUN" = 1 ]; then say "  DRY  set $key=$value"; continue; fi
+    # A key whose config cannot be written is one missing setting, not a reason
+    # to abandon the rest of the sweep, nor the other keys: a managed layer
+    # pinning `plugins.*` must not cost the display keys their restart.
+    if ! "$HERMES_BIN" -p "$profile" config set "$key" "$value" >/dev/null; then
+      if needs_restart "$key"; then
+        warn "[$profile] hermes could not set $key, leaving streaming off for this profile"
+      else
+        warn "[$profile] hermes could not set $key, leaving the thinking preview off for this profile"
+      fi
+      continue
+    fi
+    say "  $key set to $value"
+    wrote="$wrote $key"
+  done
+  [ "$DRY_RUN" = 1 ] && return 0
+  [ -n "$wrote" ] || return 0
+  # Read the file back before claiming anything changed. `config set` is not
+  # proof of a write: Hermes' own `set_config_value` returns 0 WITHOUT writing on
+  # a package-managed install (`is_managed()`), and trusting the exit code there
+  # would kickstart this profile on every 30 second tick forever. Only a key that
+  # is now really there, and that Hermes reads at start, earns the restart.
+  rc=0
+  answer="$(streaming_keys_absent "$dir")" || rc=$?
+  if [ "$rc" != 0 ]; then
+    warn "[$profile] could not read config.yaml back after writing it; not restarting"
+    return 0
+  fi
+  keys="$(streaming_writes "$answer")"
+  for key in $wrote; do
+    if printf '%s\n' "$keys" | grep -q "^${key//./\\.}="; then missing="$missing $key"
+    elif needs_restart "$key"; then restart=1
+    else READ_PER_REPLY_WROTE=1
+    fi
+  done
+  if [ -n "$missing" ] && [ "$restart" = 1 ]; then
+    warn "[$profile] hermes reported success but${missing} is still absent; restarting only for the keys that landed"
+  elif [ -n "$missing" ]; then
+    warn "[$profile] hermes reported success but${missing} is still absent; leaving streaming off and not restarting"
+  fi
+  STREAMING_CONFIG_CHANGED=$restart
+}
+
+# Set by sync_plugin for the immediately following ensure_service call. A
+# loaded launchd job does not reload Python code from disk, so a content change
+# must be followed by an explicit kickstart; an unchanged profile stays truly
+# idempotent on the watcher's next 30-second sweep.
+PLUGIN_SYNC_CHANGED=0
+sync_plugin() {
+  local dest="$1"
+  PLUGIN_SYNC_CHANGED=0
+  if plugin_content_matches_source "$dest"; then
+    say "  plugin already current -> $dest"
+    return 0
+  fi
+  PLUGIN_SYNC_CHANGED=1
+  if [ "$DRY_RUN" = 1 ]; then say "  DRY  rsync changed plugin $SRC_DIR/ -> $dest/"; return 0; fi
+  mkdir -p "$dest"
+  rsync -a --delete \
+    --exclude '__pycache__/' --exclude '.pytest_cache/' --exclude '*.pyc' \
+    "$SRC_DIR/" "$dest/"
+  find "$dest" -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+  say "  plugin synced -> $dest"
+}
+
+# Existing local setters operate on lines, so refuse ambiguous multiline values
+# before any profile environment field can be rewritten.
+check_profile_env() {
+  [ -f "$1" ] || return 0
+  python3 - "$1" <<'PYENV'
+import re, sys
+from pathlib import Path
+try:
+    text = Path(sys.argv[1]).read_text()
+    # Line-based mutation is safe only when quoted values end on that line.
+    # Preserve complex operator dotenv files for inspection, never rewrite their interiors.
+    for line in text.splitlines():
+        match = re.match(r"^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.*)$", line)
+        if match:
+            quoted_value = match.group(1)
+            if quoted_value[:1] in ("'", '"', chr(96)) and not re.search(r"(?<!\\)" + re.escape(quoted_value[0]), quoted_value[1:]):
+                raise ValueError("multiline or unterminated dotenv value; environment retained")
+except Exception:
+    print("Profile environment has ambiguous multiline values; existing file retained. Inspect it before retrying provisioning.", file=sys.stderr)
+    sys.exit(1)
+PYENV
+}
+
+# Appends KEY=VALUE only when KEY is absent, so a re-run never rotates a secret
+# and never leaves a duplicate line for the loader to pick between.
+ensure_env_line() {
+  local file="$1" key="$2" value="$3"
+  if [ -f "$file" ] && grep -q "^${key}=" "$file"; then
+    say "  env $key already set, left alone"
+    return 0
+  fi
+  if [ "$DRY_RUN" = 1 ]; then say "  DRY  append $key to $file"; return 0; fi
+  mkdir -p "$(dirname "$file")"
+  [ -f "$file" ] || : > "$file"
+  # A file not ending in a newline would otherwise glue two vars together.
+  [ -s "$file" ] && [ "$(tail -c 1 "$file")" != "" ] && printf '\n' >> "$file"
+  printf '%s=%s\n' "$key" "$value" >> "$file"
+  chmod 600 "$file"
+  say "  env $key written"
+}
+
+# Upsert. For the handful of values that must be EXACTLY right rather than
+# merely present, because a fresh profile arrives holding a copy of the launch
+# profile's .env and an inherited value there is wrong, not pre-existing.
+#
+# SET_ENV_CHANGED goes to 1 whenever a value really changes, so the caller can
+# tell a rewritten COZYGATEWAY_URL (an adapter still dialing the old gateway
+# until its process restarts) from a line that was already right.
+SET_ENV_CHANGED=0
+set_env_line() {
+  local file="$1" key="$2" value="$3"
+  if [ -f "$file" ] && [ "$(env_value "$file" "$key" || true)" = "$value" ]; then
+    say "  env $key already correct"
+    return 0
+  fi
+  SET_ENV_CHANGED=1
+  if [ "$DRY_RUN" = 1 ]; then say "  DRY  set $key in $file"; return 0; fi
+  mkdir -p "$(dirname "$file")"
+  [ -f "$file" ] || : > "$file"
+  local tmp="$file.provision-tmp"
+  grep -v "^${key}=" "$file" > "$tmp" || true
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$file"
+  say "  env $key set"
+}
+
+# A phone-created Hermes profile inherits the launch profile's environment. The default profile
+# deliberately has no CozyGateway binding, so its child has no chat-computer registry either. A
+# configured peer on this same Hermes home is the local authority for that opaque registry. Copy
+# only a complete, valid registry; an operator's partial or malformed values stay visible rather
+# than being silently replaced.
+inherit_chat_registry() {
+  local target="$1" candidate source="" id name projects
+  id="$(env_value "$target" HERMES_CHAT_COMPUTER_ID || true)"
+  name="$(env_value "$target" HERMES_CHAT_COMPUTER_NAME || true)"
+  projects="$(env_value "$target" HERMES_CHAT_PROJECTS_JSON || true)"
+  if [ -n "$id" ] && [ -n "$name" ] && [ -n "$projects" ]; then
+    say "  chat workspace registry already set"
+    return 0
+  fi
+  if [ -n "$id" ] || [ -n "$name" ] || [ -n "$projects" ]; then
+    warn "partial Hermes chat workspace registry is operator-owned; leaving it unchanged"
+    return 0
+  fi
+  for candidate in "$HERMES_HOME_ROOT"/profiles/*/.env; do
+    [ -f "$candidate" ] || continue
+    [ "$candidate" = "$target" ] && continue
+    id="$(env_value "$candidate" HERMES_CHAT_COMPUTER_ID || true)"
+    name="$(env_value "$candidate" HERMES_CHAT_COMPUTER_NAME || true)"
+    projects="$(env_value "$candidate" HERMES_CHAT_PROJECTS_JSON || true)"
+    [ -n "$id" ] && [ -n "$name" ] && [ -n "$projects" ] || continue
+    if printf '%s' "$projects" | "$PYTHON" -c 'import json,sys; value=json.load(sys.stdin); assert isinstance(value, list)' >/dev/null 2>&1; then
+      source="$candidate"
+      break
+    fi
+  done
+  if [ -z "$source" ]; then
+    warn "no configured Hermes chat workspace registry to copy; leaving the new profile without a local workspace choice"
+    return 0
+  fi
+  set_env_line "$target" HERMES_CHAT_COMPUTER_ID "$id"
+  set_env_line "$target" HERMES_CHAT_COMPUTER_NAME "$name"
+  set_env_line "$target" HERMES_CHAT_PROJECTS_JSON "$projects"
+  say "  chat workspace registry copied from an existing configured Hermes profile"
+}
+
+# An inherited token must replace a deleted incarnation's stale env value.
+# Compare and edit structurally; secrets travel on stdin and never in argv.
+shell_quote() { local value="$1"; value=${value//\'/\'\\\'\'}; printf "'%s'" "$value"; }
+ensure_box_env_line() {
+  local key="$1" value="$2" profile="$3" code out
+  if [ "$DRY_RUN" = 1 ]; then say "  DRY  reconcile $key on $BOX_SSH"; return 0; fi
+  code="$(cat <<'PYREMOTE'
+import json, os, re, sys, tempfile
+from pathlib import Path
+path, config_path = map(Path, sys.argv[1:3])
+key, profile = sys.argv[3:5]
+value = sys.stdin.read().strip()
+try:
+    data = json.loads(config_path.read_text())
+    endpoints = data.get("hermesEndpoints")
+    if not isinstance(endpoints, list) or len(endpoints) != 1:
+        raise ValueError("requires one Hermes endpoint")
+    profiles = endpoints[0].get("profiles")
+    if not isinstance(profiles, dict):
+        raise ValueError("invalid profiles")
+    text = path.read_text()
+    # Line-based mutation is safe only when quoted values end on that line.
+    # Preserve complex operator dotenv files for inspection, never rewrite their interiors.
+    for line in text.splitlines():
+        match = re.match(r"^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.*)$", line)
+        if match:
+            quoted_value = match.group(1)
+            if quoted_value[:1] in ("'", '"', chr(96)) and not re.search(r"(?<!\\)" + re.escape(quoted_value[0]), quoted_value[1:]):
+                raise ValueError("multiline or unterminated dotenv value; environment retained")
+    pattern = re.compile(r"^\s*(?:export\s+)?" + re.escape(key) + r"\s*=(.*)$")
+    lines = text.splitlines(keepends=True)
+    matches = [pattern.match(line.rstrip("\r\n")) for line in lines]
+    current = [match.group(1) for match in matches if match]
+    # Dotenv quotes are syntax, not bearer-token bytes. Preserve either spelling
+    # when a conventional literal token is the same so a normal local quoted
+    # value does not rewrite the box file and force-recreate the gateway on every
+    # watcher sweep. Escapes, interpolation, and embedded quotes stay on the
+    # existing conservative rewrite path rather than pretending to parse dotenv.
+    def literal_token_scalar(raw):
+        raw = raw.strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+            raw = raw[1:-1]
+        return raw if re.fullmatch(r"[A-Za-z0-9._~+/\\-]+={0,2}", raw) else None
+    if current == [value] or (
+        len(current) == 1
+        and literal_token_scalar(current[0]) is not None
+        and literal_token_scalar(current[0]) == literal_token_scalar(value)
+    ):
+        print("unchanged")
+        sys.exit(0)
+    if any(not isinstance(entry, dict) or (name != profile and entry.get("tokenEnv") == key)
+           for name, entry in profiles.items()):
+        raise ValueError("refusing to replace a shared or uncertain token key")
+    updated = "".join(line for line, match in zip(lines, matches) if not match)
+    if updated and not updated.endswith("\n"):
+        updated += "\n"
+    updated += key + "=" + value + "\n"
+    fd, tmp = tempfile.mkstemp(prefix=".env.provision-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(updated)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    print("changed")
+except Exception as exc:
+    print("provision token update refused: " + type(exc).__name__, file=sys.stderr)
+    sys.exit(1)
+PYREMOTE
+)"
+  out="$(printf '%s' "$value" | ssh -o BatchMode=yes "$BOX_SSH" \
+    "python3 -c $(shell_quote "$code") $(shell_quote "$BOX_REPO/.env") $(shell_quote "$BOX_REPO/$BOX_CONFIG_REL") $(shell_quote "$key") $(shell_quote "$profile")")" \
+    || die "[$profile] could not reconcile box token"
+  case "$out" in
+    changed) BOX_CHANGED=1 ;;
+    unchanged) ;;
+    *) die "[$profile] unexpected box token update response" ;;
+  esac
+  say "  box env $key: $out"
+}
+
+# Inserts the profile into the configured Hermes endpoint. A json edit rather
+# than a text append because the file is a single object and a sed would have
+# to guess at formatting; python rewrites it whole and stays valid either way.
+ensure_box_config_entry() {
+  local profile="$1" env_name="$2"
+  if [ "$DRY_RUN" = 1 ]; then
+    say "  DRY  ensure hermesEndpoints[0].profiles.$profile.tokenEnv=$env_name in $BOX_CONFIG_REL"
+    return 0
+  fi
+  local out
+  out="$(ssh -o BatchMode=yes "$BOX_SSH" \
+    "python3 - '$BOX_REPO/$BOX_CONFIG_REL' '$profile' '$env_name'" <<'PY'
+import json, sys
+path, profile, env_name = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as fh:
+    data = json.load(fh)
+endpoints = data.get("hermesEndpoints")
+if not isinstance(endpoints, list) or len(endpoints) != 1:
+    raise SystemExit("provision-bot requires exactly one Hermes endpoint")
+profiles = endpoints[0].setdefault("profiles", {})
+if profiles.get(profile, {}).get("tokenEnv") == env_name:
+    print("already present")
+    sys.exit(0)
+profiles[profile] = {"tokenEnv": env_name}
+tmp = path + ".provision-tmp"
+with open(tmp, "w") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+import os
+os.replace(tmp, path)
+print("inserted")
+PY
+)"
+  [ "$out" = inserted ] && BOX_CHANGED=1
+  say "  box config entry: $out"
+}
+
+recreate_box_gateway() {
+  if [ "$DRY_RUN" = 1 ]; then say "  DRY  docker compose up -d --force-recreate gateway on $BOX_SSH"; return 0; fi
+  # --force-recreate, not a bare up -d: compose recreates on its own only when the service
+  # definition or the env_file content changed. The config lives in a bind-mounted DIRECTORY,
+  # so a profile added to it alone leaves the running container untouched and the new bot
+  # unauthorized (observed 2026-09-05). Not --build: the image is unchanged.
+  # Only when this run actually changed the box env or config. A sweep that merely refreshed
+  # a profile's plugin would otherwise bounce the live gateway once per profile.
+  if [ "$BOX_CHANGED" != 1 ]; then say "  box gateway unchanged, not recreated"; return 0; fi
+  ssh -o BatchMode=yes "$BOX_SSH" "cd '$BOX_REPO' && docker compose up -d --force-recreate gateway" >/dev/null
+  BOX_CHANGED=0
+  say "  box gateway recreated"
+}
+
+# Two separate facts, checked separately: whether the plist EXISTS and whether
+# launchd has it LOADED. A loaded service only needs a restart when
+# sync_plugin replaced content; preserving that distinction avoids needless
+# interruption on normal provisioning sweeps.
+#
+#   `hermes gateway install` is a no-op when the plist is already on disk, so a
+#   profile whose service was booted out (a previous run, a manual stop, an
+#   uninstall that left the file) gets a cheerful "installed" and stays dead.
+#   Observed live: install reported success, launchctl print reported nothing,
+#   and the attach never came up. So the load is asserted here rather than
+#   assumed from the installer's exit code.
+# Set by ensure_service when it had to bring a service up that was not loaded:
+# a fresh process, so a fresh attach hello to verify.
+SERVICE_STARTED=0
+ensure_service() {
+  local profile="$1" restart_for_change="${2:-0}"
+  local label="ai.hermes.gateway-$profile"
+  local plist="$HOME/Library/LaunchAgents/$label.plist"
+  SERVICE_STARTED=0
+
+  if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+    if [ "$restart_for_change" = 1 ]; then
+      if [ "$DRY_RUN" = 1 ]; then
+        say "  DRY  restart loaded service $label for changed plugin or config"
+        return 0
+      fi
+      launchctl kickstart -k "gui/$(id -u)/$label" \
+        || die "[$profile] could not restart loaded $label after the change"
+      launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 \
+        || die "[$profile] $label is not loaded after the restart"
+      say "  service $label restarted for changed plugin or config"
+    else
+      say "  service $label already loaded (nothing changed)"
+    fi
+    return 0
+  fi
+  SERVICE_STARTED=1
+  if [ "$DRY_RUN" = 1 ]; then
+    say "  DRY  install and bootstrap $label"
+    return 0
+  fi
+
+  if [ ! -f "$plist" ]; then
+    "$HERMES_BIN" --profile "$profile" gateway install --start-now --start-on-login >/dev/null
+    say "  service $label installed"
+  fi
+  [ -f "$plist" ] || die "[$profile] gateway install left no plist at $plist"
+
+  if ! launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+    launchctl bootstrap "gui/$(id -u)" "$plist"
+    say "  service $label bootstrapped"
+  fi
+  launchctl kickstart "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+  launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 \
+    || die "[$profile] $label still not loaded after bootstrap"
+  say "  service $label running"
+}
+
+# A profile the multiplexed host serves has no service of its own (hermes-host.sh).
+# A newly wired one is hot-added: plugins reloaded for its home before its .env is
+# written (see the loop below), then one rescan. A live one whose plugin or config
+# changed waits for the single host restart after the loop. Either way nothing here
+# ever runs a per-profile gateway verb, which Hermes refuses for a served profile.
+HOST_RESTART_PROFILES=()
+host_reload_before_env() {
+  local profile="$1"
+  if [ "$DRY_RUN" = 1 ]; then say "  DRY  ask the host Hermes gateway to reload plugins for $profile"; return 0; fi
+  if host_control reload-plugins "$profile"; then
+    say "  host Hermes gateway reloaded plugins for $profile"
+    return 0
+  fi
+  say "  host Hermes gateway did not answer reload-plugins; it will be restarted once after this run"
+  return 1
+}
+host_pickup() {
+  local profile="$1" hot_add="$2" reloaded="$3" changed="$4"
+  if [ "$hot_add" = 1 ] && [ "$reloaded" = 1 ]; then
+    if [ "$DRY_RUN" = 1 ]; then say "  DRY  ask the host Hermes gateway to rescan profiles"; return 0; fi
+    if host_control rescan-profiles; then
+      say "  the host Hermes gateway serves it (plugins reloaded, profiles rescanned; no restart)"
+      return 0
+    fi
+    say "  host Hermes gateway did not answer rescan-profiles; it will be restarted once after this run"
+  elif [ "$hot_add" = 0 ] && [ "$changed" = 0 ]; then
+    say "  the host Hermes gateway serves it (nothing changed)"
+    return 0
+  fi
+  HOST_RESTART_PROFILES+=("$profile")
+  return 1
+}
+
+# The only proof that matters: the box says this profile negotiated an attach
+# hello. /ready alone would only say the fleet count moved, which a concurrent
+# reconnect could also explain.
+verify_attached() {
+  local profile="$1" deadline
+  if [ "$DRY_RUN" = 1 ] || [ "$SKIP_VERIFY" = 1 ]; then
+    say "  (verification skipped)"
+    return 0
+  fi
+  deadline=$(( $(date +%s) + VERIFY_TIMEOUT ))
+  while :; do
+    if ssh -o BatchMode=yes "$BOX_SSH" \
+      "docker logs --since 10m cozygateway-gateway-1 2>&1 | grep -q 'attach-v1: profile \"$profile\" negotiated hello'"; then
+      say "  VERIFIED: box logged an attach hello for \"$profile\""
+      curl -fsS --max-time 5 "$GATEWAY_URL/ready" 2>/dev/null \
+        | "$PYTHON" -c 'import json,sys; a=json.load(sys.stdin).get("attach",{}); print("  ready: attach.configured=%s online=%s" % (a.get("configured"), a.get("online")))' \
+        2>/dev/null || true
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      warn "[$profile] no attach hello in the box log within ${VERIFY_TIMEOUT}s"
+      return 1
+    fi
+    sleep 5
+  done
+}
+
+# --- main -----------------------------------------------------------------
+
+overall_rc=0
+for profile in "${PROFILES[@]}"; do
+  say ""
+  say "=== $profile ==="
+  profile_dir="$HERMES_HOME_ROOT/profiles/$profile"
+
+  if [ ! -d "$profile_dir" ]; then
+    warn "[$profile] no profile dir at $profile_dir, skipping"
+    overall_rc=1
+    continue
+  fi
+
+  rc=0
+  profile_wants_plugin "$profile_dir" || rc=$?
+  if [ "$rc" = 2 ]; then
+    die "no PyYAML available to $PYTHON, cannot read profile config safely"
+  elif [ "$rc" != 0 ]; then
+    say "  config.yaml does not list cozygateway in plugins.enabled, skipping"
+    continue
+  fi
+
+  check_shadow_dir "$profile_dir/plugins"
+
+  sync_plugin "$profile_dir/plugins/cozygateway"
+
+  env_file="$profile_dir/.env"
+  check_profile_env "$env_file" || die "[$profile] profile environment repair refused"
+  env_name="$(token_env_name "$profile")"
+  say "  box token env var: $env_name"
+
+  # A deleted name can be recreated before orphan reconciliation. Box config
+  # alone cannot distinguish that incarnation from the old one. Only this
+  # profile's exact spool path proves the local env was already provisioned;
+  # a launch profile's inherited path never does.
+  spool_path="$profile_dir/plugin-data/cozygateway/attach-v1.sqlite"
+  token_changed=0
+  if [ "$(env_value "$env_file" COZYGATEWAY_SPOOL_PATH || true)" = "$spool_path" ]; then
+    token="$(env_value "$env_file" COZYGATEWAY_TOKEN || true)"
+    [ -n "$token" ] || die "[$profile] scoped profile env holds no token"
+    say "  scoped profile env, keeping this profile's token"
+  else
+    token="$(openssl rand -hex 32)"
+    token_changed=1
+    say "  new profile incarnation, minted a fresh attach token"
+    unclaim_inherited_platforms "$env_file"
+  fi
+  provisioning_pending="$profile_dir/.cozygateway-provision-pending"
+  pending_before=0
+  [ ! -f "$provisioning_pending" ] || pending_before=1
+  # Served by a multiplexed host: a profile with no working attach of its own yet is hot-added,
+  # which needs its plugins reloaded in the host BEFORE the .env writes below.
+  served=0; hot_add=0; reloaded=0
+  if served_by_host "$profile"; then
+    served=1
+    if [ "$token_changed" = 1 ] || [ "$pending_before" = 1 ]; then
+      hot_add=1
+      ! host_reload_before_env "$profile" || reloaded=1
+    fi
+  fi
+  if [ "$DRY_RUN" != 1 ]; then
+    # Written before local/remote credentials change; a failed handoff remains
+    # visible even when the next attempt finds matching env and plugin files.
+    touch "$provisioning_pending"
+    chmod 600 "$provisioning_pending"
+  fi
+
+  # Upserted like the token and spool, NOT merely ensured: a fresh profile arrives with a COPY of
+  # the launch profile's .env, and when that launch profile is bound to some other gateway (a
+  # native install on this Mac, say) the copied COZYGATEWAY_URL points there. A plugin that
+  # dials the wrong gateway with this gateway's token is refused forever, and the row on the box
+  # never leaves setup_required (observed 2026-09-05: snug-nimbus and dewy-bayberry).
+  SET_ENV_CHANGED=0
+  set_env_line "$env_file" COZYGATEWAY_URL "$GATEWAY_URL"
+  ensure_env_line "$env_file" COZYGATEWAY_HOME_CHANNEL "$HOME_CHANNEL"
+  ensure_env_line "$env_file" COZYGATEWAY_INSTALLER_OWNER "$INSTALLER_OWNER"
+  set_env_line "$env_file" COZYGATEWAY_TOKEN "$token"
+  # Upserted, not merely ensured: the inherited copy points at the GLOBAL spool
+  # (~/.hermes/plugin-data/...), so two profiles that both kept it would read
+  # and ack each other's events out of one file.
+  set_env_line "$env_file" COZYGATEWAY_SPOOL_PATH \
+    "$profile_dir/plugin-data/cozygateway/attach-v1.sqlite"
+  # The URL, token and spool the adapter dials with are read at process start,
+  # and a multiplexed rescan skips a live adapter, so a changed one is a restart
+  # (and a hello to verify) exactly like a new token.
+  attach_env_changed="$SET_ENV_CHANGED"
+  inherit_chat_registry "$env_file"
+  ensure_streaming_config "$profile" "$profile_dir"
+  ensure_box_env_line "$env_name" "$token" "$profile"
+  ensure_box_config_entry "$profile" "$env_name"
+  [ "$pending_before" = 0 ] || BOX_CHANGED=1
+  box_recreated="$BOX_CHANGED"
+  recreate_box_gateway
+  restart_needed=0
+  { [ "$PLUGIN_SYNC_CHANGED" = 1 ] || [ "$STREAMING_CONFIG_CHANGED" = 1 ] || [ "$token_changed" = 1 ] || [ "$attach_env_changed" = 1 ] || [ "$pending_before" = 1 ]; } && restart_needed=1
+  if [ "$served" = 1 ]; then
+    # The host rebuilds a profile only after its .env or config.yaml changed since its last look,
+    # so mark one change after the reload even when every value above was already right.
+    [ "$hot_add" = 0 ] || [ "$DRY_RUN" = 1 ] || touch "$env_file"
+    # Verified after the one host restart instead, when this profile needs it.
+    host_pickup "$profile" "$hot_add" "$reloaded" "$restart_needed" || continue
+  else
+    ensure_service "$profile" "$restart_needed"
+  fi
+  # This run's only change was a key Hermes reads per reply (the thinking
+  # preview), confirmed on disk: same token, URL, spool and plugin code, no
+  # restart-requiring config, no hot-add, box untouched, service already up.
+  # The live connection stays live and will never log a fresh hello, so waiting
+  # for one would only time out, fail the sweep and leave the pending marker,
+  # whose presence makes the next sweep restart the bot. A run that changed
+  # NOTHING still verifies: that is how a manual run finds a broken attach.
+  if [ "$READ_PER_REPLY_WROTE" = 1 ] && [ "$restart_needed" = 0 ] && [ "$hot_add" = 0 ] \
+    && [ "$box_recreated" = 0 ] && { [ "$served" = 1 ] || [ "$SERVICE_STARTED" = 0 ]; }; then
+    say "  no attach change; not waiting for a new hello"
+    [ "$DRY_RUN" = 1 ] || rm -f "$provisioning_pending"
+    continue
+  fi
+  if verify_attached "$profile"; then
+    [ "$DRY_RUN" = 1 ] || rm -f "$provisioning_pending"
+  else
+    overall_rc=1
+  fi
+done
+
+# One restart of the multiplexed host for every served profile that needed it.
+if [ "${#HOST_RESTART_PROFILES[@]}" -gt 0 ]; then
+  say ""
+  say "=== host Hermes gateway ==="
+  if [ "$DRY_RUN" = 1 ]; then
+    say "  DRY  $HERMES_BIN -p $HOST_PROFILE gateway restart (it serves ${HOST_RESTART_PROFILES[*]})"
+  else
+    host_restart >/dev/null || die "could not restart the host Hermes gateway for ${HOST_RESTART_PROFILES[*]}"
+    say "  restarted the host Hermes gateway once; it serves ${HOST_RESTART_PROFILES[*]}"
+  fi
+  for profile in "${HOST_RESTART_PROFILES[@]}"; do
+    if verify_attached "$profile"; then
+      [ "$DRY_RUN" = 1 ] || rm -f "$HERMES_HOME_ROOT/profiles/$profile/.cozygateway-provision-pending"
+    else
+      overall_rc=1
+    fi
+  done
+fi
+
+say ""
+if [ "$overall_rc" = 0 ]; then say "provision-bot: all profiles provisioned"; fi
+exit "$overall_rc"

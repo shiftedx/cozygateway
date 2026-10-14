@@ -1,0 +1,8 @@
+# Explicit LAN exposure overlay. Compose this only for a trusted private network, or combine it
+# with one of the TLS overlays below. The base compose file publishes gateway only on host loopback.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d
+services:
+  gateway:
+    ports: !override
+      - "8787:8787"

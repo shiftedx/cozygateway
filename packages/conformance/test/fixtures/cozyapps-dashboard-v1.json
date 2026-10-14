@@ -1,0 +1,129 @@
+{
+  "capability": {
+    "id": "com.cozylabs.cozyapps",
+    "minimumVersion": 2
+  },
+  "attachCapability": "cozyapps_dashboard",
+  "note": "com.cozylabs.cozyapps 2, contract/ext-cozyapps-v1.md section CozyApps 2, cross-referenced as row 67 in ext-bots-v1.md. Three additive record kinds: a typed saved input value with its own revision, an action receipt in the four public names with a source-attributed data snapshot, and the small versioned document envelope. Everything a v1 peer or client already had is unchanged: the pre2 app, the pre2 action and the pre2 action request below are byte identical to what they were before this version existed. The gateway validates the document's structure and bounds and never interprets it.",
+  "valueTypes": ["string", "number", "boolean", "date", "selection"],
+  "receiptStates": ["queued", "running", "completed", "failed"],
+  "dataStates": ["fresh", "stale", "error"],
+  "appPre2": {
+    "id": "app_9f2a1c7b4e60_market_3d5f8a1c",
+    "name": "Market watchlist",
+    "creatorBot": "nighty",
+    "revision": 3,
+    "createdAt": 1788638000000,
+    "updatedAt": 1788638400000,
+    "tree": {
+      "root": {
+        "id": "root",
+        "kind": "stack",
+        "children": [
+          { "id": "refresh", "kind": "button", "label": "Refresh", "actionId": "refresh", "role": "primary" }
+        ]
+      }
+    }
+  },
+  "actionPre2": {
+    "id": "action-1",
+    "appId": "app_9f2a1c7b4e60_market_3d5f8a1c",
+    "creatorBot": "nighty",
+    "actionId": "refresh",
+    "status": "requested",
+    "createdAt": 1788638400000,
+    "updatedAt": 1788638400000
+  },
+  "actionRequests": {
+    "pre2": { "idempotencyKey": "tap-1", "actionId": "refresh" },
+    "bound": {
+      "idempotencyKey": "tap-2",
+      "actionId": "refresh",
+      "appRevision": 3,
+      "valueRevisions": [{ "valueId": "ticker", "revision": 8 }]
+    }
+  },
+  "document": {
+    "title": "Market watchlist",
+    "sections": [
+      {
+        "id": "main",
+        "title": "Watchlist",
+        "components": [
+          { "kind": "input", "id": "ticker-input", "label": "Ticker", "valueRef": "ticker", "valueType": "selection", "options": ["AAPL", "MSFT"] },
+          { "kind": "metric", "id": "quote-metric", "label": "Last price", "valueRef": "quote.value" },
+          { "kind": "chart", "id": "quote-chart", "label": "Last 30 days", "valueRef": "quote.history" },
+          { "kind": "text", "id": "quote-note", "valueRef": "quote.note" },
+          { "kind": "list", "id": "quote-headlines", "label": "Headlines", "valueRef": "quote.headlines" },
+          { "kind": "action", "id": "refresh-action", "label": "Refresh", "actionId": "refresh" }
+        ]
+      }
+    ]
+  },
+  "envelope": {
+    "id": "app_9f2a1c7b4e60_market_3d5f8a1c",
+    "revision": 4,
+    "owner": "user",
+    "creatorBot": "nighty",
+    "documentVersion": 1,
+    "document": {
+      "title": "Market watchlist",
+      "sections": [
+        {
+          "id": "main",
+          "title": "Watchlist",
+          "components": [
+            { "kind": "input", "id": "ticker-input", "label": "Ticker", "valueRef": "ticker", "valueType": "selection", "options": ["AAPL", "MSFT"] },
+            { "kind": "metric", "id": "quote-metric", "label": "Last price", "valueRef": "quote.value" },
+            { "kind": "chart", "id": "quote-chart", "label": "Last 30 days", "valueRef": "quote.history" },
+            { "kind": "text", "id": "quote-note", "valueRef": "quote.note" },
+            { "kind": "list", "id": "quote-headlines", "label": "Headlines", "valueRef": "quote.headlines" },
+            { "kind": "action", "id": "refresh-action", "label": "Refresh", "actionId": "refresh" }
+          ]
+        }
+      ]
+    },
+    "data": {
+      "quote.value": { "source": "quotes.example", "asOf": 1788638400000, "value": "214.35", "state": "stale" }
+    },
+    "updatedAt": 1788638400000
+  },
+  "refusedDocuments": [
+    { "title": "x", "sections": [{ "id": "s", "components": [{ "kind": "html", "id": "c", "label": "x", "valueRef": "a" }] }] },
+    { "title": "x", "sections": [{ "id": "s", "components": [{ "kind": "metric", "id": "c", "label": "x", "valueRef": "a", "color": "#ff0000" }] }] },
+    { "title": "x", "sections": [{ "id": "s", "components": [{ "kind": "metric", "id": "c", "label": "x", "valueRef": "a", "font": "Helvetica" }] }] },
+    { "title": "x", "sections": [{ "id": "s", "components": [{ "kind": "metric", "id": "c", "label": "x", "valueRef": "a", "x": 10, "y": 20 }] }] },
+    { "title": "x", "sections": [{ "id": "s", "components": [{ "kind": "metric", "id": "c", "label": "x", "valueRef": "javascript:alert(1)" }] }] },
+    { "title": "x", "sections": [{ "id": "s", "components": [{ "kind": "metric", "id": "c", "label": "x", "valueRef": "https://example.com/a" }] }] },
+    { "title": "x", "sections": [{ "id": "s", "components": [{ "kind": "action", "id": "c", "label": "x", "actionId": "refresh", "tool": "shell" }] }] },
+    { "title": "x", "sections": [{ "id": "s", "components": [{ "kind": "metric", "id": "dupe", "label": "a", "valueRef": "a" }, { "kind": "metric", "id": "dupe", "label": "b", "valueRef": "b" }] }] },
+    { "title": "x", "sections": [{ "id": "s", "components": [] }], "layout": "grid" }
+  ],
+  "values": {
+    "stored": { "appId": "app_9f2a1c7b4e60_market_3d5f8a1c", "valueId": "ticker", "type": "string", "value": "MSFT", "revision": 8, "updatedAt": 1788638400000 },
+    "write": { "expectedRevision": 8, "idempotencyKey": "tap-3", "type": "string", "value": "NVDA" },
+    "first": { "expectedRevision": 0, "idempotencyKey": "tap-0", "type": "string", "value": "AAPL" },
+    "conflict": {
+      "error": { "code": "conflict", "message": "cozy app value changed; refresh and retry" },
+      "current": { "appId": "app_9f2a1c7b4e60_market_3d5f8a1c", "valueId": "ticker", "type": "string", "value": "MSFT", "revision": 8, "updatedAt": 1788638400000 }
+    },
+    "refused": [
+      { "expectedRevision": 8, "idempotencyKey": "tap-3", "type": "string", "value": { "nested": true } },
+      { "expectedRevision": 8, "idempotencyKey": "tap-3", "type": "secret", "value": "x" },
+      { "expectedRevision": -1, "idempotencyKey": "tap-3", "type": "string", "value": "x" },
+      { "expectedRevision": 8, "idempotencyKey": "tap-3", "type": "string", "value": "x", "permissions": ["read"] }
+    ]
+  },
+  "receipts": [
+    { "id": "action-2", "appId": "app_9f2a1c7b4e60_market_3d5f8a1c", "creatorBot": "nighty", "actionId": "refresh", "status": "queued", "appRevision": 3, "valueRevisions": [{ "valueId": "ticker", "revision": 8 }], "createdAt": 1788638400000, "updatedAt": 1788638400000 },
+    { "id": "action-3", "appId": "app_9f2a1c7b4e60_market_3d5f8a1c", "creatorBot": "nighty", "actionId": "refresh", "status": "running", "appRevision": 3, "createdAt": 1788638401000, "updatedAt": 1788638402000 },
+    { "id": "action-4", "appId": "app_9f2a1c7b4e60_market_3d5f8a1c", "creatorBot": "nighty", "actionId": "refresh", "status": "completed", "appRevision": 3, "data": { "quote.value": { "source": "quotes.example", "asOf": 1788638403000, "value": "215.00", "state": "fresh" } }, "createdAt": 1788638403000, "updatedAt": 1788638404000 },
+    { "id": "action-5", "appId": "app_9f2a1c7b4e60_market_3d5f8a1c", "creatorBot": "nighty", "actionId": "refresh", "status": "failed", "data": { "quote.value": { "source": "quotes.example", "asOf": 1788638405000, "value": null, "state": "error" } }, "createdAt": 1788638405000, "updatedAt": 1788638406000 }
+  ],
+  "internalToPublic": {
+    "requested": "queued",
+    "delivered": "running",
+    "completed": "completed",
+    "failed": "failed"
+  }
+}

@@ -1,0 +1,650 @@
+"""Pins the exact Hermes desktop-session adoption seam without a Hermes install.
+
+The plugin only acknowledges a desktop resume after the resident runner verified the raw id in
+the current profile's SessionDB and switched its stable attach lane. These fakes model that narrow
+internal contract so an upstream refactor cannot quietly turn an exact continuation into a fresh
+chat or a cross-profile switch.
+"""
+
+import asyncio
+import os
+import sys
+import tempfile
+import types
+import unittest
+
+# The production dependency is deliberately optional in the harness-free unit suite. The adapter
+# imports only this exception at module load; socket behavior is outside this switch-focused test.
+if "websockets.exceptions" not in sys.modules:
+    websockets = types.ModuleType("websockets")
+    exceptions = types.ModuleType("websockets.exceptions")
+    exceptions.ConnectionClosed = type("ConnectionClosed", (Exception,), {})
+    websockets.exceptions = exceptions
+    sys.modules["websockets"] = websockets
+    sys.modules["websockets.exceptions"] = exceptions
+
+from cozygateway.adapter import AttachAdapter
+from cozygateway.attach_client import TurnFrame
+from cozygateway.attach_spool import AttachSpool
+
+
+class _SessionDb:
+    def __init__(self, rows, resolved=None, source="tui", messages=None, chat_id=None, hidden=False, title=None):
+        self.title = title
+        self.rows = set(rows)
+        self.resolved = resolved or {}
+        self.source = source
+        self.messages = messages or []
+        self.chat_id = chat_id
+        self.hidden = hidden
+        self.lookups = []
+
+    def get_session(self, session_id):
+        self.lookups.append(session_id)
+        return ({"id": session_id, "source": self.source, "chat_id": self.chat_id,
+                 "hidden": self.hidden, "title": self.title} if session_id in self.rows else None)
+
+    def resolve_resume_session_id(self, session_id):
+        return self.resolved.get(session_id, session_id)
+
+    def get_messages(self, _session_id, *, limit, latest=False, after_id=None):
+        rows = list(self.messages)
+        if latest:
+            return rows[-limit:]
+        if after_id is not None:
+            rows = [row for row in rows if row["id"] > after_id]
+        return rows[:limit]
+
+
+class _Store:
+    def __init__(self, session_db, switched=None):
+        self.session_db = session_db
+        self.switched = switched
+        self.created = []
+        self.switches = []
+        self.lookup_session_id = next(iter(session_db.rows))
+
+    async def get_or_create_session(self, source):
+        self.created.append(source)
+
+    async def switch_session(self, key, target):
+        self.switches.append((key, target))
+        return target if self.switched is None else self.switched
+
+    async def lookup_by_session_key(self, _key):
+        return _SessionEntry(self.lookup_session_id)
+
+
+class _SessionEntry:
+    """The real Hermes ``SessionStore.switch_session`` return shape."""
+
+    def __init__(self, session_id):
+        self.session_id = session_id
+
+
+class _AsyncSessionDb:
+    """The real runner exposes this async wrapper, not the raw SessionDB."""
+
+    def __init__(self, db):
+        self._db = db
+
+    async def get_session(self, session_id):  # pragma: no cover - must not be used by plugin
+        return self._db.get_session(session_id)
+
+    async def resolve_resume_session_id(self, session_id):  # pragma: no cover - must not be used
+        return self._db.resolve_resume_session_id(session_id)
+
+
+class _AsyncStore:
+    """Models Hermes' AsyncSessionStore forwarding a synchronous SessionStore."""
+
+    def __init__(self, db, switched=None):
+        self._store = types.SimpleNamespace(_db=db)
+        self.switched = switched
+        self.created = []
+        self.switches = []
+        self.lookup_session_id = next(iter(db.rows))
+
+    async def get_or_create_session(self, source):
+        self.created.append(source)
+
+    async def switch_session(self, key, target):
+        self.switches.append((key, target))
+        return _SessionEntry(target if self.switched is None else self.switched)
+
+    async def lookup_by_session_key(self, _key):
+        return _SessionEntry(self.lookup_session_id)
+
+
+class _Runner:
+    def __init__(self, store, running=False):
+        self.async_session_store = store
+        self.running = running
+        self.evicted = []
+        self.released = []
+
+    def _session_key_for_source(self, source):
+        # Hermes' own runner key is not namespaced by profile in a single-profile install, and
+        # the plugin leaves the synthetic source unstamped so the adapter seam derives the same
+        # key. Modelling that here keeps the recorded binding on the lane both checks demand.
+        assert not getattr(source, "profile", None), "the inbound source must carry no profile"
+        return f"agent:main:cozygateway:dm:{source.chat_id}"
+
+    def _is_session_running(self, _key):
+        return self.running
+
+    def _evict_cached_agent(self, key):
+        self.evicted.append(key)
+
+    def _release_running_agent_state(self, key):
+        self.released.append(key)
+
+
+class _Client:
+    def __init__(self, desktop_session_sync_available=False):
+        self.confirmations = []
+        self.desktop_session_sync_available = desktop_session_sync_available
+        self.mirrored = []
+        self.spool = None
+
+    async def send_desktop_session_resumed(self, thread_id, hermes_session_id, resume_id):
+        self.confirmations.append((thread_id, hermes_session_id, resume_id))
+
+    async def send_desktop_session_message(self, **event):
+        self.mirrored.append(event)
+        if self.spool is not None:
+            self.spool.journal_desktop_session_message(
+                thread_id=event["thread_id"],
+                current_hermes_session_id=event["current_hermes_session_id"],
+                source=event["source"],
+                desktop_session_id=event["desktop_session_id"],
+                expected_current_hermes_session_id=event["expected_current_hermes_session_id"],
+                message_row_id=event["message_row_id"], role=event["role"], text=event["text"], at=event["at"],
+            )
+        return True
+
+
+class _MessageEvent:
+    def __init__(self, text, source, message_id=None, media_urls=None, media_types=None, metadata=None):
+        self.text = text
+        self.source = source
+        self.message_id = message_id
+        self.media_urls = media_urls or []
+        self.media_types = media_types or []
+        self.metadata = metadata or {}
+
+
+class DesktopSessionResumeTests(unittest.IsolatedAsyncioTestCase):
+    _MODULE_KEYS = ("gateway", "gateway.platforms", "gateway.platforms.base")
+
+    def setUp(self):
+        self._saved_modules = {key: sys.modules.get(key) for key in self._MODULE_KEYS}
+        gateway = types.ModuleType("gateway")
+        platforms = types.ModuleType("gateway.platforms")
+        base = types.ModuleType("gateway.platforms.base")
+        base.MessageEvent = _MessageEvent
+        base.cache_media_bytes = lambda *_args, **_kwargs: None
+        gateway.platforms = platforms
+        platforms.base = base
+        sys.modules["gateway"] = gateway
+        sys.modules["gateway.platforms"] = platforms
+        sys.modules["gateway.platforms.base"] = base
+
+    def tearDown(self):
+        for key, value in self._saved_modules.items():
+            if value is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = value
+
+    def _adapter(self, *, rows=("desktop-raw",), resolved=None, running=False, switched=None,
+                 production_shapes=False, source="tui", messages=None, chat_id=None, hidden=False,
+                 title=None):
+        adapter = AttachAdapter()
+        adapter._attach_init(types.SimpleNamespace(extra={}))
+        adapter._profile = "sage"
+        db = _SessionDb(rows, resolved, source, messages, chat_id, hidden, title)
+        store = _AsyncStore(db, switched) if production_shapes else _Store(db, switched)
+        runner = _Runner(store, running)
+        client = _Client()
+        adapter.gateway_runner = runner
+        adapter._client = client
+        adapter.build_source = lambda **kwargs: types.SimpleNamespace(**kwargs)
+        adapter.injected = []
+
+        async def handle_message(event):
+            adapter.injected.append(event)
+
+        adapter.handle_message = handle_message
+        return adapter, runner, store, client
+
+    async def _settle(self, adapter, thread_id, turn_id, writer=None):
+        """Finish an injected turn the way production does: the run task writes its rows, then
+        the final commit's ``_cleanup_turn`` settles it and the owed baseline runs."""
+        if writer is not None:
+            await writer
+        adapter._cleanup_turn(thread_id, turn_id)
+        for task in list(adapter._background_tasks):
+            await task
+
+    def _spool(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        return AttachSpool(os.path.join(temp.name, "spool.sqlite"))
+
+    async def test_switches_the_compressed_profile_local_target_then_confirms(self):
+        adapter, runner, store, client = self._adapter(
+            rows=("desktop-raw", "desktop-tip"), resolved={"desktop-raw": "desktop-tip"},
+        )
+
+        await adapter._handle_desktop_resume_command({
+            "threadId": "native:sage:1", "hermesSessionId": "desktop-raw", "resumeId": "resume-1",
+        })
+
+        key = "agent:main:cozygateway:dm:native:sage:1"
+        self.assertEqual(store.session_db.lookups, ["desktop-raw", "desktop-tip"])
+        self.assertEqual(store.switches, [(key, "desktop-tip")])
+        self.assertEqual(runner.evicted, [key])
+        self.assertEqual(runner.released, [key])
+        self.assertEqual(client.confirmations, [("native:sage:1", "desktop-raw", "resume-1")])
+        self.assertEqual(adapter._desktop_session_bindings["native:sage:1"], (key, "desktop-tip"))
+
+    async def test_a_multiplexed_gateway_binds_the_key_its_own_seams_derive(self):
+        """On a multiplexed gateway both of Hermes' checks namespace the key by the profile this
+        adapter owns. A binding recorded off the raw runner call would sit on another lane and
+        every turn on this thread would be dropped, which is the incident, moved."""
+        adapter, runner, store, client = self._adapter(
+            rows=("desktop-raw", "desktop-tip"), resolved={"desktop-raw": "desktop-tip"},
+        )
+        adapter._event_session_key = lambda event: (
+            f"agent:sage:cozygateway:dm:{event.source.chat_id}")
+
+        await adapter._handle_desktop_resume_command({
+            "threadId": "native:sage:1", "hermesSessionId": "desktop-raw", "resumeId": "resume-1",
+        })
+
+        key = "agent:sage:cozygateway:dm:native:sage:1"
+        self.assertEqual(store.switches, [(key, "desktop-tip")])
+        self.assertEqual(runner.evicted, [key])
+        self.assertEqual(adapter._desktop_session_bindings["native:sage:1"], (key, "desktop-tip"))
+
+    async def test_switches_with_the_real_async_wrapper_and_session_entry_contract(self):
+        adapter, runner, store, client = self._adapter(
+            rows=("desktop-raw", "desktop-tip"),
+            resolved={"desktop-raw": "desktop-tip"},
+            production_shapes=True,
+        )
+        # Production GatewayRunner exposes AsyncSessionDB. The plugin must unwrap its `_db`
+        # for synchronous exact lookups and treat a SessionEntry as a successful switch.
+        runner._session_db = _AsyncSessionDb(store._store._db)
+
+        await adapter._handle_desktop_resume_command({
+            "threadId": "native:sage:1", "hermesSessionId": "desktop-raw", "resumeId": "resume-1",
+        })
+
+        key = "agent:main:cozygateway:dm:native:sage:1"
+        self.assertEqual(store.switches, [(key, "desktop-tip")])
+        self.assertEqual(runner.evicted, [key])
+        self.assertEqual(client.confirmations, [("native:sage:1", "desktop-raw", "resume-1")])
+        self.assertEqual(adapter._desktop_session_bindings["native:sage:1"], (key, "desktop-tip"))
+
+    async def test_refuses_a_mismatched_real_session_entry(self):
+        adapter, runner, store, client = self._adapter(switched="wrong-target", production_shapes=True)
+        runner._session_db = _AsyncSessionDb(store._store._db)
+
+        await adapter._handle_desktop_resume_command({
+            "threadId": "native:sage:1", "hermesSessionId": "desktop-raw", "resumeId": "resume-1",
+        })
+
+        self.assertEqual(runner.evicted, [])
+        self.assertEqual(client.confirmations, [])
+        self.assertNotIn("native:sage:1", adapter._desktop_session_bindings)
+
+    async def test_refuses_unknown_or_path_shaped_ids_without_switch_or_confirmation(self):
+        adapter, runner, store, client = self._adapter(rows=("desktop-raw",))
+
+        await adapter._handle_desktop_resume_command({
+            "threadId": "native:sage:1", "hermesSessionId": "other-profile-session", "resumeId": "resume-1",
+        })
+        await adapter._handle_desktop_resume_command({
+            "threadId": "native:sage:1", "hermesSessionId": "../state.db", "resumeId": "resume-2",
+        })
+
+        self.assertEqual(store.switches, [])
+        self.assertEqual(runner.evicted, [])
+        self.assertEqual(client.confirmations, [])
+        self.assertNotIn("native:sage:1", adapter._desktop_session_bindings)
+
+    async def test_refuses_non_tui_rows_even_if_the_id_exists_in_this_profile(self):
+        adapter, runner, store, client = self._adapter(source="cozygateway")
+
+        await adapter._handle_desktop_resume_command({
+            "threadId": "native:sage:1", "hermesSessionId": "desktop-raw", "resumeId": "resume-1",
+        })
+
+        self.assertEqual(store.switches, [])
+        self.assertEqual(runner.evicted, [])
+        self.assertEqual(client.confirmations, [])
+
+    async def test_readopts_the_canonical_bot_chat_after_gateway_turns_restamped_it(self):
+        # Bot parity S2: once a gateway turn ran, Hermes re-stamps the Bot Chat ``cozygateway``.
+        # Its exact title keeps it adoptable, so a gateway that lost its binding can re-bind it.
+        adapter, _runner, store, client = self._adapter(source="cozygateway", title="Bot Chat")
+        spool = self._spool()
+        self.addCleanup(spool.close)
+        adapter._spool = spool
+
+        await adapter._handle_desktop_resume_command({
+            "threadId": "native:sage:2", "hermesSessionId": "desktop-raw", "resumeId": "resume-bc",
+        })
+
+        self.assertEqual(store.switches, [("agent:main:cozygateway:dm:native:sage:2", "desktop-raw")])
+        self.assertEqual(client.confirmations, [("native:sage:2", "desktop-raw", "resume-bc")])
+
+    async def test_bound_bot_chat_mirrors_external_rows_once_and_never_echoes_gateway_turns(self):
+        # A Bot Chat adopted as desktop and since re-stamped ``cozygateway`` by gateway turns: a
+        # teammate's message_agent DM landing in it still reaches the phone, once; the gateway's
+        # own turn rows never come back as mirror rows.
+        adapter, _runner, store, client = self._adapter(
+            rows=("bot-chat",), source="cozygateway", title="Bot Chat", messages=[],
+        )
+        client.desktop_session_sync_available = True
+        spool = self._spool()
+        self.addCleanup(spool.close)
+        adapter._spool = spool
+        client.spool = spool
+        await adapter._handle_desktop_resume_command({
+            "threadId": "native:sage:1", "hermesSessionId": "bot-chat", "resumeId": "r1",
+        })
+        self.assertEqual(spool.desktop_session_links()[0]["source"], "desktop")
+
+        writers = []
+        released = asyncio.Event()
+
+        async def handle_message(event):
+            adapter.injected.append(event)
+            # Upstream spawns the run and returns; its rows land afterwards.
+            async def run():
+                await released.wait()
+                store.session_db.messages.extend([
+                    {"id": 41, "role": "user", "content": "from phone", "timestamp": 1},
+                    {"id": 42, "role": "assistant", "content": "native reply", "timestamp": 2},
+                ])
+            writers.append(asyncio.ensure_future(run()))
+
+        adapter.handle_message = handle_message
+        # A plugin restart loses the in-process binding; the durable lane and link remain.
+        adapter._desktop_session_bindings.clear()
+        store.lookup_session_id = "bot-chat"
+        await adapter._handle_turn(TurnFrame(thread_id="native:sage:1", turn_id="turn-1", text="from phone"))
+        released.set()  # the spawned run writes only after handle_message returned
+        # Still in flight: the guard holds and a poll mirrors nothing.
+        await writers[0]
+        await adapter._mirror_desktop_session_link(
+            client, spool, store.session_db, spool.desktop_session_links()[0],
+        )
+        self.assertEqual(client.mirrored, [])
+        await self._settle(adapter, "native:sage:1", "turn-1")
+        self.assertEqual(spool.desktop_session_links()[0]["lastMessageRowId"], 42)
+        store.session_db.messages.extend([
+            {"id": 43, "role": "user", "content": "Message from pixel: PONG?", "timestamp": 3},
+            {"id": 44, "role": "assistant", "content": "PONG back to pixel", "timestamp": 4},
+        ])
+        for _ in range(2):
+            await adapter._mirror_desktop_session_link(
+                client, spool, store.session_db, spool.desktop_session_links()[0],
+            )
+
+        self.assertEqual([event["message_row_id"] for event in client.mirrored], [43, 44])
+        self.assertEqual({event["source"] for event in client.mirrored}, {"desktop"})
+
+    async def test_a_quick_next_turn_waits_for_the_previous_turns_baseline(self):
+        # Live, the next phone turn arrived 0.2 s after the previous reply, while that turn's
+        # settle was still waiting for the runner to go idle: its pre-injection flush mirrored the
+        # previous turn's rows back as desktop rows.
+        adapter, runner, store, client = self._adapter(
+            rows=("bot-chat",), source="desktop", title="Bot Chat", messages=[],
+        )
+        client.desktop_session_sync_available = True
+        spool = self._spool()
+        self.addCleanup(spool.close)
+        adapter._spool = spool
+        client.spool = spool
+        await adapter._handle_desktop_resume_command({
+            "threadId": "native:sage:1", "hermesSessionId": "bot-chat", "resumeId": "r1",
+        })
+        idle = asyncio.Event()
+        running = {"flag": True}
+        runner._is_session_running = lambda _key: running["flag"]
+
+        async def handle_message(event):
+            adapter.injected.append(event)
+
+        adapter.handle_message = handle_message
+        await adapter._handle_turn(TurnFrame(thread_id="native:sage:1", turn_id="turn-1", text="hello"))
+        adapter._cleanup_turn("native:sage:1", "turn-1")  # final commit sent, rows still being written
+        store.session_db.messages.extend([
+            {"id": 1, "role": "user", "content": "hello", "timestamp": 1},
+            {"id": 2, "role": "assistant", "content": "hi there", "timestamp": 2},
+        ])
+
+        async def go_idle():
+            await asyncio.sleep(0.3)
+            running["flag"] = False
+        asyncio.ensure_future(go_idle())
+        await adapter._handle_turn(TurnFrame(thread_id="native:sage:1", turn_id="turn-2", text="again"))
+
+        self.assertEqual(client.mirrored, [])
+        self.assertEqual(spool.desktop_session_links()[0]["lastMessageRowId"], 2)
+
+    async def test_a_restamped_session_that_is_not_the_bot_chat_stays_unmirrored(self):
+        adapter, _runner, store, client = self._adapter(
+            rows=("desktop-raw",), source="cozygateway", title="Scratch",
+            messages=[{"id": 5, "role": "assistant", "content": "elsewhere", "timestamp": 1}],
+        )
+        client.desktop_session_sync_available = True
+        spool = self._spool()
+        self.addCleanup(spool.close)
+        spool.upsert_desktop_session_link(
+            thread_id="native:sage:1", current_hermes_session_id="desktop-raw", source="tui",
+            desktop_session_id="desktop-raw", last_message_row_id=0,
+        )
+        await adapter._mirror_desktop_session_link(
+            client, spool, store.session_db, spool.desktop_session_links()[0],
+        )
+        self.assertEqual(client.mirrored, [])
+
+    async def test_a_cozygateway_row_with_any_other_title_is_still_refused(self):
+        for title in (None, "bot chat", "Bot Chat 2"):
+            with self.subTest(title=title):
+                adapter, _runner, store, client = self._adapter(source="cozygateway", title=title)
+                await adapter._handle_desktop_resume_command({
+                    "threadId": "native:sage:1", "hermesSessionId": "desktop-raw", "resumeId": "r",
+                })
+                self.assertEqual(store.switches, [])
+                self.assertEqual(client.confirmations, [])
+
+    async def test_accepts_desktop_tui_and_cli_rows_with_their_exact_origin(self):
+        for origin in ("desktop", "tui", "cli"):
+            with self.subTest(origin=origin):
+                adapter, _runner, store, client = self._adapter(source=origin)
+                spool = self._spool()
+                self.addCleanup(spool.close)
+                adapter._spool = spool
+
+                await adapter._handle_desktop_resume_command({
+                    "threadId": f"native:sage:{origin}",
+                    "hermesSessionId": "desktop-raw",
+                    "resumeId": f"resume-{origin}",
+                })
+
+                self.assertEqual(store.switches, [
+                    (f"agent:main:cozygateway:dm:native:sage:{origin}", "desktop-raw")
+                ])
+                self.assertEqual(client.confirmations, [
+                    (f"native:sage:{origin}", "desktop-raw", f"resume-{origin}")
+                ])
+                self.assertEqual(spool.desktop_session_links()[0]["source"], origin)
+
+    async def test_refuses_when_the_stable_lane_is_running_or_switch_verification_fails(self):
+        running, runner, store, client = self._adapter(running=True)
+        await running._handle_desktop_resume_command({
+            "threadId": "native:sage:1", "hermesSessionId": "desktop-raw", "resumeId": "resume-running",
+        })
+        self.assertEqual(store.switches, [])
+        self.assertEqual(client.confirmations, [])
+
+        mismatched, runner, store, client = self._adapter(switched="unexpected")
+        await mismatched._handle_desktop_resume_command({
+            "threadId": "native:sage:1", "hermesSessionId": "desktop-raw", "resumeId": "resume-mismatch",
+        })
+        self.assertEqual(store.switches, [("agent:main:cozygateway:dm:native:sage:1", "desktop-raw")])
+        self.assertEqual(runner.evicted, [])
+        self.assertEqual(client.confirmations, [])
+
+    async def test_following_turn_carries_strict_binding_metadata(self):
+        adapter, _runner, store, _client = self._adapter()
+        adapter._desktop_session_bindings["native:sage:1"] = (
+            "agent:main:cozygateway:dm:native:sage:1", "desktop-tip",
+        )
+        # The store still resolves the bound key to the pinned session, which is what the
+        # runner's own strict check requires before it dispatches.
+        store.lookup_session_id = "desktop-tip"
+
+        await adapter._handle_turn(TurnFrame(thread_id="native:sage:1", turn_id="turn-1", text="continue"))
+
+        self.assertEqual(len(adapter.injected), 1)
+        event = adapter.injected[0]
+        self.assertEqual(event.source.chat_id, "native:sage:1")
+        self.assertEqual(event.metadata, {
+            "cozygateway_context_turn": True,
+            "gateway_session_key": "agent:main:cozygateway:dm:native:sage:1",
+            "gateway_session_id": "desktop-tip",
+            "gateway_session_strict": True,
+        })
+
+    async def test_mirror_follows_compression_tip_and_skips_non_transcript_rows(self):
+        messages = [
+            {"id": 11, "role": "tool", "content": "ignored", "timestamp": 1},
+            {"id": 12, "role": "assistant", "content": "desktop reply", "timestamp": 1_700_000_000},
+        ]
+        adapter, runner, store, client = self._adapter(
+            rows=("desktop-root", "desktop-tip"), resolved={"desktop-root": "desktop-tip"},
+            source="tui", messages=messages,
+        )
+        client.desktop_session_sync_available = True
+        spool = self._spool()
+        self.addCleanup(spool.close)
+        adapter._spool = spool
+        client.spool = spool
+        spool.upsert_desktop_session_link(
+            thread_id="native:sage:1", current_hermes_session_id="desktop-root", source="tui",
+            desktop_session_id="desktop-root", last_message_row_id=10,
+        )
+
+        await adapter._mirror_desktop_session_link(
+            client, spool, store.session_db, spool.desktop_session_links()[0],
+        )
+
+        self.assertEqual([event["message_row_id"] for event in client.mirrored], [12])
+        self.assertEqual(client.mirrored[0]["current_hermes_session_id"], "desktop-tip")
+        self.assertEqual(client.mirrored[0]["at"], 1_700_000_000_000)
+        self.assertEqual(spool.desktop_session_links()[0]["lastMessageRowId"], 12)
+
+    async def test_mobile_baseline_suppresses_phone_authored_rows_before_next_poll(self):
+        messages = [{"id": 21, "role": "user", "content": "from phone", "timestamp": 1}]
+        adapter, runner, store, client = self._adapter(
+            rows=("native-tip",), source="cozygateway", messages=messages,
+            chat_id="native:sage:1",
+        )
+        client.desktop_session_sync_available = True
+        spool = self._spool()
+        self.addCleanup(spool.close)
+        adapter._spool = spool
+        source = adapter._inbound_source("native:sage:1", message_id="turn-1")
+
+        await adapter._baseline_mobile_mirror_link("native:sage:1", source)
+        await adapter._mirror_desktop_session_link(
+            client, spool, store.session_db, spool.desktop_session_links()[0],
+        )
+
+        self.assertEqual(spool.desktop_session_links()[0]["lastMessageRowId"], 21)
+        self.assertEqual(client.mirrored, [])
+
+    async def test_native_phone_lane_never_replays_rows_written_during_or_after_turn(self):
+        """The CozyGateway session is already projected by native turn/commit frames.
+
+        A mirror link is still retained for its bounded resume cursor, but it is not a
+        second transcript transport.  In particular, a poll after a phone turn must
+        not turn the just-written assistant commit into a desktop-session event.
+        """
+        adapter, _runner, store, client = self._adapter(
+            rows=("native-tip",), source="cozygateway", messages=[],
+            chat_id="native:sage:1",
+        )
+        client.desktop_session_sync_available = True
+        spool = self._spool()
+        self.addCleanup(spool.close)
+        adapter._spool = spool
+        client.spool = spool
+
+        async def handle_message(event):
+            adapter.injected.append(event)
+            # Upstream ``handle_message`` only SPAWNS the run: the phone request and the native
+            # assistant commit are written after it returns.
+            async def run():
+                await released.wait()
+                store.session_db.messages.extend([
+                    {"id": 41, "role": "user", "content": "from phone", "timestamp": 1},
+                    {"id": 42, "role": "assistant", "content": "native reply", "timestamp": 2},
+                ])
+            writers.append(asyncio.ensure_future(run()))
+
+        writers = []
+        released = asyncio.Event()
+        adapter.handle_message = handle_message
+        await adapter._handle_turn(TurnFrame(thread_id="native:sage:1", turn_id="turn-1", text="from phone"))
+        released.set()  # the spawned run writes only after handle_message returned
+        await self._settle(adapter, "native:sage:1", "turn-1", writers[0])
+        self.assertEqual(spool.desktop_session_links()[0]["lastMessageRowId"], 42)
+
+        # A later native commit used to be emitted by the desktop poller and
+        # rendered as a duplicate in CozyChat.
+        store.session_db.messages.extend([
+            {"id": 43, "role": "tool", "content": "ignored", "timestamp": 3},
+            {"id": 44, "role": "assistant", "content": "later native reply", "timestamp": 4},
+        ])
+        adapter._active_turn.clear()  # model the normal terminal cleanup before the next poll
+        await adapter._mirror_desktop_session_link(
+            client, spool, store.session_db, spool.desktop_session_links()[0],
+        )
+
+        self.assertEqual(client.mirrored, [])
+        self.assertEqual(spool.desktop_session_links()[0]["lastMessageRowId"], 44)
+
+    async def test_resumed_tui_baseline_tracks_a_compression_rotated_active_tip(self):
+        adapter, runner, store, client = self._adapter(
+            rows=("desktop-root", "desktop-tip"), resolved={"desktop-root": "desktop-tip"},
+            source="tui", messages=[{"id": 31, "role": "user", "content": "phone turn", "timestamp": 1}],
+        )
+        spool = self._spool()
+        self.addCleanup(spool.close)
+        adapter._spool = spool
+        key = "agent:main:cozygateway:dm:native:sage:1"
+        adapter._desktop_session_bindings["native:sage:1"] = (key, "desktop-root")
+        store.lookup_session_id = "desktop-tip"
+        spool.reset_desktop_session_link(
+            thread_id="native:sage:1", current_hermes_session_id="desktop-root", source="tui",
+            desktop_session_id="desktop-root", last_message_row_id=30,
+        )
+
+        await adapter._baseline_mobile_mirror_link(
+            "native:sage:1", adapter._inbound_source("native:sage:1", message_id="turn-1"),
+        )
+
+        self.assertEqual(spool.desktop_session_links()[0]["currentHermesSessionId"], "desktop-tip")
+        self.assertEqual(spool.desktop_session_links()[0]["lastMessageRowId"], 31)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,21 @@
+{
+  "capability": 64,
+  "event": {
+    "taskId": "task-1", "seq": 1, "at": 1000, "from": null,
+    "to": "queued", "reason": "task_created", "actor": "gateway",
+    "ref": { "kind": "turn", "id": "run-1" }
+  },
+  "view": {
+    "taskId": "task-1", "bot": "sage", "sessionId": "session-1",
+    "originatingTurnId": "run-1", "originatingMessageId": "message-1",
+    "goal": "Check the build", "intentRevision": 1, "state": "queued", "at": 1000,
+    "lastEvent": {
+      "taskId": "task-1", "seq": 1, "at": 1000, "from": null,
+      "to": "queued", "reason": "task_created", "actor": "gateway",
+      "ref": { "kind": "turn", "id": "run-1" }
+    },
+    "canProceedAlone": true, "currentRun": { "runId": "run-1", "intentRevision": 1 },
+    "automaticRetryCount": 0, "automaticRetryBudget": 1,
+    "children": [], "artifacts": []
+  }
+}

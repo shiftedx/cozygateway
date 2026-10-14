@@ -1,0 +1,213 @@
+"""Harness-free tests for inbound steer/interrupt frame parsing and dispatch.
+
+Run with:
+    cd integrations/attach-plugin && python3 -m unittest tests.test_inbound_frames -v
+"""
+
+import sys
+import types
+import unittest
+
+from cozygateway.adapter import INBOUND_USER, AttachAdapter
+from cozygateway.attach_client import (
+    InterruptFrame,
+    SteerFrame,
+    TurnFrame,
+    parse_interrupt_frame,
+    parse_turn_frame,
+    parse_steer_frame,
+)
+
+
+class ParseSteerFrameTests(unittest.TestCase):
+    def test_valid_steer_frame(self):
+        frame = parse_steer_frame({"kind": "steer", "threadId": "t", "turnId": "u", "text": "hi"})
+        self.assertEqual(frame, SteerFrame(thread_id="t", turn_id="u", text="hi"))
+
+    def test_rejects_wrong_kind_or_missing_fields(self):
+        self.assertIsNone(parse_steer_frame({"kind": "turn", "threadId": "t", "turnId": "u", "text": "x"}))
+        self.assertIsNone(parse_steer_frame({"kind": "steer", "threadId": "t", "turnId": "u"}))
+        self.assertIsNone(parse_steer_frame({"kind": "steer", "threadId": "", "turnId": "u", "text": "x"}))
+        self.assertIsNone(parse_steer_frame("nope"))
+
+
+class ParseTurnFrameTests(unittest.TestCase):
+    def test_keeps_bounded_media_ids(self):
+        frame = parse_turn_frame({"kind": "turn", "threadId": "t", "turnId": "u", "text": "hi", "mediaIds": ["m1"]})
+        self.assertEqual(frame, TurnFrame(thread_id="t", turn_id="u", text="hi", media_ids=["m1"]))
+        self.assertIsNone(parse_turn_frame({"kind": "turn", "threadId": "t", "turnId": "u", "text": "hi", "mediaIds": [1]}))
+
+
+class ParseInterruptFrameTests(unittest.TestCase):
+    def test_valid_interrupt_frame(self):
+        frame = parse_interrupt_frame({"kind": "interrupt", "threadId": "t", "turnId": "u"})
+        self.assertEqual(frame, InterruptFrame(thread_id="t", turn_id="u"))
+
+    def test_rejects_wrong_kind_or_missing_fields(self):
+        self.assertIsNone(parse_interrupt_frame({"kind": "steer", "threadId": "t", "turnId": "u"}))
+        self.assertIsNone(parse_interrupt_frame({"kind": "interrupt", "threadId": "t"}))
+
+
+class _FakeMessageEvent:
+    """Stand-in for ``gateway.platforms.base.MessageEvent`` (harness not on the path).
+
+    Records exactly the kwargs the adapter constructs it with so a dispatch test can
+    assert the injected text, source addressing, and (absence of) a reply anchor.
+    """
+
+    def __init__(self, text, source, message_id=None, media_urls=None, media_types=None, metadata=None):
+        self.text = text
+        self.source = source
+        self.message_id = message_id
+        self.media_urls = media_urls or []
+        self.media_types = media_types or []
+        self.metadata = metadata or {}
+
+
+class DispatchInjectionTests(unittest.IsolatedAsyncioTestCase):
+    """Prove the adapter's steer/interrupt handlers inject the right inbound message.
+
+    ``cozygateway.adapter`` imports the harness only lazily inside its methods, so a
+    fake ``gateway.platforms.base`` module supplying ``MessageEvent`` lets these run
+    with no harness installed. ``build_source`` and ``handle_message`` are faked the
+    same way for both handlers, so the interrupt test asserts the new behavior
+    (an injected native ``/stop`` command) with no reference to any harness seam.
+    """
+
+    _MODULE_KEYS = ("gateway", "gateway.platforms", "gateway.platforms.base")
+
+    def setUp(self):
+        # Install a minimal fake harness package tree so the adapter's lazy
+        # ``from gateway.platforms.base import MessageEvent`` resolves to the fake.
+        self._saved_modules = {k: sys.modules.get(k) for k in self._MODULE_KEYS}
+        gateway_mod = types.ModuleType("gateway")
+        platforms_mod = types.ModuleType("gateway.platforms")
+        base_mod = types.ModuleType("gateway.platforms.base")
+        base_mod.MessageEvent = _FakeMessageEvent
+        base_mod.cache_media_bytes = lambda *_args, **_kwargs: None
+        gateway_mod.platforms = platforms_mod
+        platforms_mod.base = base_mod
+        sys.modules["gateway"] = gateway_mod
+        sys.modules["gateway.platforms"] = platforms_mod
+        sys.modules["gateway.platforms.base"] = base_mod
+
+    def tearDown(self):
+        for key, value in self._saved_modules.items():
+            if value is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = value
+
+    def _make_adapter(self):
+        adapter = AttachAdapter()
+        adapter._attach_init(types.SimpleNamespace(extra={}))
+        adapter._profile = "profile-1"
+        adapter.injected = []  # type: ignore[attr-defined]
+
+        def _fake_build_source(**kwargs):
+            return types.SimpleNamespace(**kwargs)
+
+        async def _fake_handle_message(event):
+            adapter.injected.append(event)  # type: ignore[attr-defined]
+
+        adapter.build_source = _fake_build_source  # type: ignore[attr-defined]
+        adapter.handle_message = _fake_handle_message  # type: ignore[attr-defined]
+        return adapter
+
+    async def test_interrupt_injects_native_stop_command(self):
+        adapter = self._make_adapter()
+        # Both frames name the turn this process is running: one it does not hold is answered
+        # with a typed failure on that turn id rather than injected.
+        adapter._active_turn["chat-1"] = "turn-1"
+        await adapter._handle_interrupt(InterruptFrame(thread_id="chat-1", turn_id="turn-1"))
+        self.assertEqual(len(adapter.injected), 1)
+        event = adapter.injected[0]
+        # The injected command text is exactly "/stop" -- the harness recognizes the
+        # bypass command from the message text, hard-stopping the run.
+        self.assertEqual(event.text, "/stop")
+        # A command carries no turn-derived reply anchor.
+        self.assertIsNone(event.message_id)
+        # Addressed to the same thread/session identity the turn/steer handlers use.
+        self.assertEqual(event.source.chat_id, "chat-1")
+        self.assertEqual(event.source.chat_type, "dm")
+        self.assertEqual(event.source.user_id, INBOUND_USER)
+        self.assertTrue(event.source.role_authorized)
+
+    async def test_steer_injects_text_on_the_same_thread(self):
+        # The steer counterpart shares the fake build_source/handle_message shape;
+        # the interrupt test above mirrors it exactly but sends "/stop" and no anchor.
+        adapter = self._make_adapter()
+        adapter._active_turn["chat-1"] = "turn-1"
+        await adapter._handle_steer(
+            SteerFrame(thread_id="chat-1", turn_id="turn-1", text="keep going")
+        )
+        self.assertEqual(len(adapter.injected), 1)
+        event = adapter.injected[0]
+        self.assertEqual(event.text, "keep going")
+        self.assertEqual(event.source.chat_id, "chat-1")
+        # The steer's injected message uses a distinct anchor; the running turn's
+        # reply anchor is deliberately left untouched.
+        self.assertEqual(event.message_id, "turn-1:steer")
+
+    async def test_interrupt_inject_failure_never_raises(self):
+        adapter = self._make_adapter()
+
+        async def _boom(event):
+            raise RuntimeError("handle_message exploded")
+
+        adapter.handle_message = _boom  # type: ignore[attr-defined]
+        adapter._active_turn["chat-1"] = "turn-1"
+        # A failed inject must degrade to a best-effort no-op, not crash the drain loop.
+        await adapter._handle_interrupt(InterruptFrame(thread_id="chat-1", turn_id="turn-1"))
+
+    async def test_turn_carries_trusted_turn_id_on_session_source(self):
+        """The live turn id must reach Hermes through SessionSource.message_id.
+
+        Turn, steer, and interrupt each inject a message on the same thread and must
+        resolve to the same harness session. Only the initial turn may carry the
+        trusted live-turn id used by the phone-node policy; steer/interrupt must not
+        mint or replay that authority.
+        """
+        adapter = self._make_adapter()
+        thread_id = "chat-1"
+
+        await adapter._handle_turn(TurnFrame(thread_id=thread_id, turn_id="turn-1", text="hi"))
+        await adapter._handle_steer(
+            SteerFrame(thread_id=thread_id, turn_id="turn-1", text="more")
+        )
+        await adapter._handle_interrupt(InterruptFrame(thread_id=thread_id, turn_id="turn-1"))
+
+        self.assertEqual(len(adapter.injected), 3)
+        sources = [vars(event.source) for event in adapter.injected]
+        common = {
+                "chat_id": thread_id,
+                "chat_type": "dm",
+                "user_name": INBOUND_USER,
+                "user_id": INBOUND_USER,
+                "role_authorized": True,
+        }
+        # No profile is stamped here: a stamped source makes Hermes' adapter-level session key
+        # profile-namespaced while its runner-level key is not, and a thread carrying a strict
+        # desktop binding then has every turn dropped on the mismatch.
+        self.assertEqual(sources[0], {**common, "message_id": "turn-1"})
+        self.assertEqual(sources[1], {**common, "message_id": None})
+        self.assertEqual(sources[2], {**common, "message_id": None})
+
+    async def test_turn_downloads_and_caches_gateway_media_before_injecting(self):
+        adapter = self._make_adapter()
+
+        class Client:
+            async def download_media(self, media_id):
+                self.last = media_id
+                return b"%PDF-1.7\n", "report.pdf", "application/pdf"
+
+        adapter._client = Client()
+        sys.modules["gateway.platforms.base"].cache_media_bytes = lambda *_args, **_kwargs: types.SimpleNamespace(path="/cache/report.pdf", media_type="application/pdf")
+        await adapter._handle_turn(TurnFrame(thread_id="chat-1", turn_id="turn-file", text="read", media_ids=["media-1"]))
+        event = adapter.injected[0]
+        self.assertEqual(event.media_urls, ["/cache/report.pdf"])
+        self.assertEqual(event.media_types, ["application/pdf"])
+
+
+if __name__ == "__main__":
+    unittest.main()
