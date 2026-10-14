@@ -1,5 +1,7 @@
 # Changelog
 
+The public repository starts with clean source snapshots. Only v0.9.2 is published here; older entries below are historical change records.
+
 CozyGateway is pre-1.0. Each minor series below groups the tags that shipped it; patch tags within
 a series are fixes to the series' own changes. Release notes for each published version live on the
 [releases page](https://github.com/shiftedx/cozygateway/releases).
@@ -200,7 +202,6 @@ Rerun the published installer (or the repair/update command for a full native in
 and enable notifications when prompted. Live Activities also require the phone's Live
 Activities setting and an active Bot Chat run. This fixes the Gateway configuration path;
 it does not add background push to direct Hermes or OpenClaw connections.
-See [#448](https://github.com/shiftedx/cozygateway/pull/448).
 
 ## 0.8.1 (2026-09-08): subagent model settings and guided Windows setup
 
@@ -208,10 +209,10 @@ CozyChat can now configure a separate subagent model during bot onboarding and i
 model settings. Hermes saves the selection in its native delegation configuration and applies
 it to the next delegated task. For CozyAgents, Gateway forwards the selection to a compatible runner;
 update CozyAgents as well to enable this control. Older runners keep their existing behavior
-and do not advertise a writable subagent setting. See [#433](https://github.com/shiftedx/cozygateway/pull/433).
+and do not advertise a writable subagent setting.
 
 Windows setup now detects configured providers and local models, presents numbered model
-choices, and retains saved provider settings across repair. See [#432](https://github.com/shiftedx/cozygateway/pull/432).
+choices, and retains saved provider settings across repair.
 
 Update Gateway with the published installer or the existing repair/update command, and install
 the latest CozyChat to use the new controls. Existing primary model selections are retained.
@@ -223,14 +224,12 @@ navigation, keyboard-accessible tables, and readable refresh-error states. Pairi
 directly from an unpaired dashboard visit. Its bundled black craft-paper scene keeps Ink,
 Galaxy, Chalk, and pyramid Prism clear of the desktop form; mobile and tall windows use a
 compact craft header. Dashboard data and APIs remain protected by read-only pairing.
-See [#430](https://github.com/shiftedx/cozygateway/pull/430).
 
 Windows one-line setup now continues through the verified same-account desktop session,
 updates selected installed harnesses, and checks Gateway/profile readiness before reporting
 success. Interrupted runs retain harness selection, custom homes, and pending pairing.
 Owned-process recovery, bounded downloads, and verified private Git bootstrap improve repair
 without discarding configuration, pairing, or healthy components.
-See [#428](https://github.com/shiftedx/cozygateway/pull/428).
 
 Update with the published installer or your existing repair/update command. Existing
 configuration, pairings, bot history, and automatic deletion safeguards are retained.
@@ -239,7 +238,7 @@ configuration, pairings, bot history, and automatic deletion safeguards are reta
 
 Opening `/observe` in an unpaired browser now goes directly to the styled pairing
 page instead of a plain error page. Revoked credentials return to pairing, while
-dashboard data and APIs still require authorization. See [#426](https://github.com/shiftedx/cozygateway/pull/426).
+dashboard data and APIs still require authorization.
 
 ## 0.7.9 (2026-09-07): automatic deletion and installation repair
 
@@ -277,7 +276,6 @@ It also carries room approval scopes, improves multi-endpoint room ownership and
 recovery, and prevents duplicate reply/completion push banners. Upgrade the gateway and both relay
 services together, then update the Hermes attach plugin from this matching release. Existing
 configuration and pairings are retained; native Hermes streaming remains off by default.
-
 
 - Adds the paired, read-only Observe dashboard with local fonts, strict same-origin CSP, live
   refresh, sparse measurement states, and light/dark layouts. Its assets are embedded in the
